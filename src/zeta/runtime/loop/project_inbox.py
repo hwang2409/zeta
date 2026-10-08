@@ -5,7 +5,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from ...project_inbox import InboxError, ProjectInboxScanner
+from ...project_inbox import (
+    SENT_STATUS_EVENT,
+    InboxError,
+    ProjectInboxScanner,
+    SentMessageTracker,
+)
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import (
     MESSAGE_ORIGIN_METADATA,
@@ -15,7 +20,6 @@ from ...protocol.types import (
     TextContent,
 )
 
-_SENT_STATUS_EVENT = "project_inbox_sent_status"
 _MAX_PENDING_SENT_STATUSES = 100
 _MAX_SENT_STATUS_LINES = 10
 
@@ -45,11 +49,19 @@ class ProjectInboxNotificationMixin:
             raise InboxError(
                 "inbox is unavailable outside a registered project session"
             )
+        tracker = self.tool_registry.sent_message_tracker
+        if tracker is None:
+            tracker = SentMessageTracker(
+                projects.root.parent / "sessions", self.store.session_id
+            )
+            self.tool_registry.sent_message_tracker = tracker
+        tracker.reconcile(self.store.entries)
         return ProjectInboxScanner(
             projects,
             project_id,
             sessions_root=projects.root.parent / "sessions",
             session_id=self.store.session_id,
+            tracker=tracker,
         )
 
     async def _watch_project_inbox(self) -> None:
@@ -114,7 +126,7 @@ class ProjectInboxNotificationMixin:
             MessageRole.USER,
             [TextContent(text)],
             metadata={
-                "zeta_event": _SENT_STATUS_EVENT,
+                "zeta_event": SENT_STATUS_EVENT,
                 MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
                 "sent_statuses": [
                     {"message_id": key[0], "status": key[1]} for key, _record in pending

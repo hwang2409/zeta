@@ -10,14 +10,16 @@ import logging
 import os
 import re
 import stat
+import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
+from .core.checkpoints import ConversationEntry
 from .core.session_files import (
     SessionError,
     atomic_publish_file,
@@ -29,6 +31,7 @@ from .core.session_files import (
 )
 from .project_errors import ProjectNotFoundError
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
+from .protocol.types import Message, is_passive_harness_message
 from .session_liveness import session_is_live
 
 SCHEMA_VERSION = 1
@@ -36,7 +39,8 @@ BODY_SPILL_BYTES = 64 * 1024
 DONE_HISTORY_LIMIT = 100
 SENT_HISTORY_LIMIT = 512
 SENT_PAGE_LIMIT = 100
-_SENT_TRACKING_DIRECTORY = "project-inbox-sent"
+_SENT_TRACKING_FILE = "project-inbox-sent.json"
+SENT_STATUS_EVENT = "project_inbox_sent_status"
 KINDS = frozenset({"bug_report", "change_request", "question", "info", "reply"})
 LOCAL_ORIGIN = "local"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -112,100 +116,162 @@ def _validate_json_shape(value: object) -> None:
 
 
 class SentMessageTracker:
-    """Persist bounded sender-owned message IDs and branch-independent receipts."""
+    """Own the bounded sent-message ledger and its in-memory pending set."""
 
     def __init__(self, sessions_root: Path, session_id: str) -> None:
         self.sessions_root = Path(sessions_root)
         self.session_id = _id(session_id, "session id")
+        self._lock = threading.RLock()
+        self._records = self._load()
+        self._pending = {
+            record["id"] for record in self._records if "done" not in record["reported"]
+        }
 
     @contextmanager
-    def _directory(self, *, create: bool) -> Iterator[int]:
+    def _session_directory(self, *, create: bool) -> Iterator[int]:
         with (
             session_root(self.sessions_root, create=create) as root_fd,
             child_directory(root_fd, self.session_id, create=create) as session_fd,
-            child_directory(
-                session_fd, _SENT_TRACKING_DIRECTORY, create=create
-            ) as tracking_fd,
         ):
-            yield tracking_fd
+            yield session_fd
 
     def record(self, message_id: str, project_id: str) -> None:
         message_id = _id(message_id)
-        record = {
-            "id": message_id,
-            "target_project": _text(project_id, "target project"),
-            "created_at": _now(),
-            "reported": [],
-        }
-        with self._directory(create=True) as directory_fd:
-            name = f"{message_id}.json"
-            try:
-                existing = self._read(directory_fd, name)
-            except FileNotFoundError:
-                write_session_json(directory_fd, name, record)
-            else:
-                if (
-                    existing.get("id") != message_id
-                    or existing.get("target_project") != project_id
-                ):
+        project_id = _text(project_id, "target project")
+        with self._lock:
+            existing = next(
+                (record for record in self._records if record["id"] == message_id),
+                None,
+            )
+            if existing is not None:
+                if existing["target_project"] != project_id:
                     raise InboxError("sent-message tracking record conflicts")
-            self._prune(directory_fd)
+                return
+            self._records.append(
+                {
+                    "id": message_id,
+                    "target_project": project_id,
+                    "created_at": _now(),
+                    "reported": [],
+                }
+            )
+            self._records.sort(key=self._chronology)
+            self._pending.add(message_id)
+            self._prune()
+            self._persist()
 
     def records(self) -> tuple[dict[str, Any], ...]:
-        try:
-            with self._directory(create=False) as directory_fd:
-                names = sorted(
-                    (
-                        name
-                        for name in os.listdir(directory_fd)
-                        if name.endswith(".json")
-                        and _ID.fullmatch(name.removesuffix(".json"))
-                    ),
-                    reverse=True,
-                )
-                return tuple(
-                    self._read(directory_fd, name)
-                    for name in names[:SENT_HISTORY_LIMIT]
-                )
-        except FileNotFoundError:
-            return ()
-        except (OSError, SessionError, ValueError) as exc:
-            raise InboxError("sent-message tracking is unsafe or unavailable") from exc
+        """Return newest first for the read-only ``sent`` action."""
+        with self._lock:
+            return tuple(dict(record) for record in reversed(self._records))
 
-    def mark_reported(self, statuses: Iterator[tuple[str, str]]) -> None:
-        updates = tuple(statuses)
+    def pending_records(self) -> tuple[dict[str, Any], ...]:
+        """Return pending records without filesystem access."""
+        with self._lock:
+            return tuple(
+                dict(record)
+                for record in self._records
+                if record["id"] in self._pending
+            )
+
+    def mark_reported(self, statuses: Iterable[tuple[str, str]]) -> None:
+        updates = {
+            (_id(message_id), status)
+            for message_id, status in statuses
+            if status in {"claimed", "done"}
+        }
         if not updates:
             return
-        try:
-            with self._directory(create=False) as directory_fd:
-                for message_id, status in updates:
-                    if status not in {"claimed", "done"}:
-                        continue
-                    name = f"{_id(message_id)}.json"
-                    try:
-                        record = self._read(directory_fd, name)
-                    except FileNotFoundError:
-                        continue
-                    reported = record.get("reported")
-                    if not isinstance(reported, list):
-                        raise InboxError("invalid sent-message tracking record")
-                    if status not in reported:
-                        record["reported"] = [*reported, status]
-                        write_session_json(directory_fd, name, record)
-        except FileNotFoundError:
-            return
-        except (OSError, SessionError, ValueError) as exc:
-            raise InboxError("sent-message tracking is unsafe or unavailable") from exc
+        with self._lock:
+            changed = False
+            by_id = {record["id"]: record for record in self._records}
+            for message_id, status in updates:
+                record = by_id.get(message_id)
+                if record is None or status in record["reported"]:
+                    continue
+                record["reported"] = [*record["reported"], status]
+                if status == "done":
+                    self._pending.discard(message_id)
+                changed = True
+            if changed:
+                self._persist()
+
+    def reconcile(self, entries: Iterable[ConversationEntry]) -> None:
+        """Recover receipts from all physical passive-note transcript entries."""
+        statuses: list[tuple[str, str]] = []
+        for entry in entries:
+            if entry.type != "message":
+                continue
+            raw = entry.data.get("message")
+            if not isinstance(raw, dict) or not is_passive_harness_message(raw):
+                continue
+            try:
+                message = Message.from_dict(raw)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if message.metadata.get("zeta_event") != SENT_STATUS_EVENT:
+                continue
+            raw_statuses = message.metadata.get("sent_statuses")
+            if not isinstance(raw_statuses, list):
+                continue
+            for item in raw_statuses:
+                if not isinstance(item, dict):
+                    continue
+                message_id = item.get("message_id")
+                status = item.get("status")
+                if (
+                    isinstance(message_id, str)
+                    and _ID.fullmatch(message_id)
+                    and status in {"claimed", "done"}
+                ):
+                    statuses.append((message_id, status))
+        self.mark_reported(statuses)
 
     @staticmethod
-    def _read(directory_fd: int, name: str) -> dict[str, Any]:
-        payload = read_session_file(directory_fd, name)
-        if len(payload) > 64 * 1024:
-            raise InboxError("sent-message tracking record is too large")
+    def _chronology(record: dict[str, Any]) -> tuple[str, str]:
+        return record["created_at"], record["id"]
+
+    def _prune(self) -> None:
+        while len(self._records) > SENT_HISTORY_LIMIT:
+            terminal = next(
+                (
+                    record
+                    for record in self._records
+                    if "done" in record["reported"]
+                ),
+                None,
+            )
+            removed = terminal or self._records[0]
+            self._records.remove(removed)
+            self._pending.discard(removed["id"])
+
+    def _load(self) -> list[dict[str, Any]]:
+        try:
+            with self._session_directory(create=False) as session_fd:
+                payload = read_session_file(session_fd, _SENT_TRACKING_FILE)
+        except FileNotFoundError:
+            return []
+        except (OSError, SessionError, ValueError) as exc:
+            raise InboxError("sent-message tracking is unsafe or unavailable") from exc
+        if len(payload) > _MAX_FILE_BYTES:
+            raise InboxError("sent-message tracking ledger is too large")
         try:
             value = json.loads(payload)
         except (ValueError, RecursionError) as exc:
-            raise InboxError("invalid sent-message tracking record") from exc
+            raise InboxError("invalid sent-message tracking ledger") from exc
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            raise InboxError("invalid sent-message tracking ledger")
+        records = value.get("records")
+        if not isinstance(records, list):
+            raise InboxError("invalid sent-message tracking ledger")
+        validated = [self._validate_record(record) for record in records]
+        if len({record["id"] for record in validated}) != len(validated):
+            raise InboxError("invalid sent-message tracking ledger")
+        validated.sort(key=self._chronology)
+        return validated
+
+    @staticmethod
+    def _validate_record(value: object) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise InboxError("invalid sent-message tracking record")
         message_id = value.get("id")
@@ -219,21 +285,30 @@ class SentMessageTracker:
             or not target
             or not isinstance(created_at, str)
             or not isinstance(reported, list)
-            or any(item not in {"claimed", "done"} for item in reported)
+            or any(
+                not isinstance(item, str) or item not in {"claimed", "done"}
+                for item in reported
+            )
+            or len(set(reported)) != len(reported)
         ):
             raise InboxError("invalid sent-message tracking record")
-        return value
+        return {
+            "id": message_id,
+            "target_project": target,
+            "created_at": created_at,
+            "reported": list(reported),
+        }
 
-    @staticmethod
-    def _prune(directory_fd: int) -> None:
-        names = sorted(
-            name
-            for name in os.listdir(directory_fd)
-            if name.endswith(".json")
-            and _ID.fullmatch(name.removesuffix(".json"))
-        )
-        for name in names[:-SENT_HISTORY_LIMIT]:
-            os.unlink(name, dir_fd=directory_fd)
+    def _persist(self) -> None:
+        try:
+            with self._session_directory(create=True) as session_fd:
+                write_session_json(
+                    session_fd,
+                    _SENT_TRACKING_FILE,
+                    {"schema_version": 1, "records": self._records},
+                )
+        except (OSError, SessionError, ValueError) as exc:
+            raise InboxError("sent-message tracking is unsafe or unavailable") from exc
 
 
 class ProjectInboxScanner:
@@ -246,11 +321,16 @@ class ProjectInboxScanner:
         *,
         sessions_root: Path,
         session_id: str | None = None,
+        tracker: SentMessageTracker | None = None,
     ) -> None:
-        self.inbox = ProjectInbox(registry, sessions_root=sessions_root)
+        if tracker is not None and tracker.session_id != session_id:
+            raise ValueError("sent-message tracker belongs to another session")
+        self.inbox = ProjectInbox(
+            registry, sessions_root=sessions_root, sent_tracker=tracker
+        )
         self.project_id = project_id
         self.session_id = session_id
-        self.tracker = (
+        self.tracker = tracker or (
             SentMessageTracker(sessions_root, session_id)
             if session_id is not None
             else None
@@ -273,11 +353,7 @@ class ProjectInboxScanner:
         """Read only sender-tracked targets; empty tracking has no inbox I/O."""
         if self.tracker is None or self.session_id is None:
             return ()
-        pending = tuple(
-            record
-            for record in self.tracker.records()
-            if "done" not in record["reported"]
-        )
+        pending = self.tracker.pending_records()
         if not pending:
             return ()
         source = self.inbox._resolve_project(self.project_id)
@@ -307,9 +383,16 @@ class ProjectInboxScanner:
 class ProjectInbox:
     """Own inbox storage, validation, claiming, completion, and stale recovery."""
 
-    def __init__(self, registry: ProjectRegistry, *, sessions_root: Path):
+    def __init__(
+        self,
+        registry: ProjectRegistry,
+        *,
+        sessions_root: Path,
+        sent_tracker: SentMessageTracker | None = None,
+    ):
         self.registry = registry
         self.sessions_root = Path(sessions_root)
+        self.sent_tracker = sent_tracker
 
     def known_projects(self) -> list[dict[str, str]]:
         return [
@@ -400,9 +483,12 @@ class ProjectInbox:
                 expected["body"] = body
                 if comparable != expected:
                     raise InboxError("message id already exists with different content")
-        SentMessageTracker(self.sessions_root, session).record(
-            message_id, target.project_id
+        tracker = (
+            self.sent_tracker
+            if self.sent_tracker is not None and self.sent_tracker.session_id == session
+            else SentMessageTracker(self.sessions_root, session)
         )
+        tracker.record(message_id, target.project_id)
         return message_id
 
     def list(
@@ -451,7 +537,13 @@ class ProjectInbox:
         if type(limit) is not int or not 1 <= limit <= SENT_PAGE_LIMIT:
             raise InboxError(f"limit must be an integer from 1 to {SENT_PAGE_LIMIT}")
 
-        tracked = SentMessageTracker(self.sessions_root, session_id).records()
+        tracker = (
+            self.sent_tracker
+            if self.sent_tracker is not None
+            and self.sent_tracker.session_id == session_id
+            else SentMessageTracker(self.sessions_root, session_id)
+        )
+        tracked = tracker.records()
         sent = self._resolve_tracked_sent(source.project_id, session_id, tracked)
         page = sent[offset : offset + limit]
         next_offset = offset + len(page)

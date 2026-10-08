@@ -14,7 +14,12 @@ import zeta.project_inbox as project_inbox_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.inbox import run as run_inbox_cli
 from zeta.core.store import ConversationStore
-from zeta.project_inbox import InboxError, ProjectInbox, ProjectInboxScanner
+from zeta.project_inbox import (
+    InboxError,
+    ProjectInbox,
+    ProjectInboxScanner,
+    SentMessageTracker,
+)
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
@@ -829,7 +834,11 @@ async def test_claim_note_not_redelivered_after_fork_before_note(tmp_path: Path)
         if entry.type == "message"
         and Message.from_dict(entry.data["message"]).role is MessageRole.USER
     )
-    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox = ProjectInbox(
+        registry,
+        sessions_root=home / "sessions",
+        sent_tracker=loop.tool_registry.sent_message_tracker,
+    )
     message_id = inbox.send(
         from_project=project_a.project_id,
         from_session=session_id,
@@ -1027,28 +1036,35 @@ async def test_claim_tracking_is_read_only_for_receiver(
     assert not list(receiver_tree.rglob("*.lock"))
 
 
-def test_passive_scanner_does_no_io_without_pending_sent_messages(
+def test_idle_tracker_does_no_filesystem_io(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home, registry, project_a, _project_b = _projects(tmp_path)
-    calls = 0
-    real_list_projects = registry.list_projects
-
-    def counted_list_projects():
-        nonlocal calls
-        calls += 1
-        return real_list_projects()
-
-    monkeypatch.setattr(registry, "list_projects", counted_list_projects)
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    tracker = SentMessageTracker(home / "sessions", session_id)
+    tracker.record("1" * 32, project_b.project_id)
+    tracker.mark_reported(iter((("1" * 32, "done"),)))
     scanner = ProjectInboxScanner(
         registry,
         project_a.project_id,
         sessions_root=home / "sessions",
-        session_id="a" * 32,
+        session_id=session_id,
+        tracker=tracker,
+    )
+    filesystem_calls = 0
+
+    def unexpected_filesystem_call(*args, **kwargs):
+        nonlocal filesystem_calls
+        filesystem_calls += 1
+        raise AssertionError("idle sent tracker accessed the filesystem")
+
+    monkeypatch.setattr(project_inbox_module.os, "listdir", unexpected_filesystem_call)
+    monkeypatch.setattr(
+        project_inbox_module, "read_session_file", unexpected_filesystem_call
     )
 
     assert scanner.scan_sent() == ()
-    assert calls == 0
+    assert filesystem_calls == 0
 
 
 def test_passive_scanner_io_is_bounded_by_sender_tracking(
@@ -1095,6 +1111,83 @@ def test_passive_scanner_io_is_bounded_by_sender_tracking(
         (message_id, "new")
     ]
     assert reads == [(project_b.project_id, message_id)]
+
+
+def test_newest_record_with_lowest_id_survives_pruning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, _registry, _project_a, project_b = _projects(tmp_path)
+    timestamps = iter(
+        (
+            "2026-01-01T00:00:00.000001Z",
+            "2026-01-01T00:00:00.000002Z",
+            "2026-01-01T00:00:00.000003Z",
+            "2026-01-01T00:00:00.000004Z",
+        )
+    )
+    monkeypatch.setattr(project_inbox_module, "SENT_HISTORY_LIMIT", 2)
+    monkeypatch.setattr(project_inbox_module, "_now", lambda: next(timestamps))
+    tracker = SentMessageTracker(home / "sessions", "a" * 32)
+
+    tracker.record("f" * 32, project_b.project_id)
+    tracker.record("e" * 32, project_b.project_id)
+    tracker.record("0" * 32, project_b.project_id)
+
+    assert {record["id"] for record in tracker.records()} == {"e" * 32, "0" * 32}
+
+    tracker.mark_reported(iter((("e" * 32, "done"),)))
+    tracker.record("1" * 32, project_b.project_id)
+
+    assert {record["id"] for record in tracker.records()} == {"0" * 32, "1" * 32}
+
+
+@pytest.mark.asyncio
+async def test_crash_between_note_append_and_receipt_does_not_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="info",
+        title="Crash-safe receipt",
+        body="body",
+    )
+    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    loop, _backend, store = _sender_loop(
+        home, registry, project_a.project_id, session_id
+    )
+    await loop._check_project_inbox()
+    assert loop._inbox_scanner is not None
+
+    def crash_before_receipt(*args, **kwargs):
+        raise RuntimeError("simulated crash after durable note append")
+
+    monkeypatch.setattr(loop._inbox_scanner, "mark_reported", crash_before_receipt)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await _collect_turn(loop, "first")
+    assert sum(
+        message.metadata.get("zeta_event") == "project_inbox_sent_status"
+        for message in store.entries
+        if message.type == "message"
+        for message in [Message.from_dict(message.data["message"])]
+    ) == 1
+    await loop.close()
+    store.close()
+
+    resumed, resumed_backend, resumed_store = _sender_loop(
+        home, registry, project_a.project_id, session_id
+    )
+    try:
+        await resumed._check_project_inbox()
+        await _collect_turn(resumed, "after crash")
+        assert len(_sent_status_notes(resumed_backend)) == 1
+    finally:
+        await resumed.close()
+        resumed_store.close()
 
 
 @pytest.mark.asyncio

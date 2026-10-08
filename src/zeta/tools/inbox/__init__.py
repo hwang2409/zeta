@@ -5,7 +5,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ...project_inbox import KINDS, LOCAL_ORIGIN, InboxError, ProjectInbox
+from ...project_inbox import (
+    KINDS,
+    LOCAL_ORIGIN,
+    InboxError,
+    ProjectInbox,
+    SentMessageTracker,
+)
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import StructuredToolResult
 from .._results import _success_result, text_block
@@ -149,8 +155,16 @@ def _bound(registry: ToolRegistry) -> tuple[ProjectInbox, str, str]:
     store = registry._session_store
     if store is None:
         raise InboxError("inbox is unavailable before the session is active")
+    tracker = registry.sent_message_tracker
+    if tracker is None:
+        tracker = SentMessageTracker(projects.root.parent / "sessions", store.session_id)
+        registry.sent_message_tracker = tracker
     return (
-        ProjectInbox(projects, sessions_root=projects.root.parent / "sessions"),
+        ProjectInbox(
+            projects,
+            sessions_root=projects.root.parent / "sessions",
+            sent_tracker=tracker,
+        ),
         registry.project_id,
         store.session_id,
     )
