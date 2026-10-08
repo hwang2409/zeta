@@ -129,9 +129,13 @@ def _fork_allocation_lock(
         ) as (_, session_fd),
         child_directory(session_fd, "attention") as attention_fd,
     ):
-        lock_fd = open_session_file(
-            attention_fd, f".{attention_id}.lock", os.O_RDWR | os.O_CREAT
-        )
+        fcntl.flock(attention_fd, fcntl.LOCK_EX)
+        try:
+            lock_fd = open_session_file(
+                attention_fd, f".{attention_id}.lock", os.O_RDWR | os.O_CREAT
+            )
+        finally:
+            fcntl.flock(attention_fd, fcntl.LOCK_UN)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             yield
