@@ -39,7 +39,7 @@ from .cards.agent_list import (
 )
 from .cards.agent_sync import (
     AgentTranscriptSnapshot,
-    refresh_agent_transcript,
+    AgentTranscriptSource,
 )
 from .cards.shared import (
     MAX_CARD_COLUMNS,
@@ -536,7 +536,7 @@ class AgentTranscriptControl(UIControl):
         )
         self._tool_calls: dict[str, ToolCall] = {}
         self._path: Path | None = None
-        self._store: ConversationStore | None = None
+        self._source: AgentTranscriptSource | None = None
         self._snapshot: AgentTranscriptSnapshot | None = None
         self._entry_units: dict[str, list[Any]] = {}
         self._unit_entries: dict[Any, str] = {}
@@ -556,9 +556,9 @@ class AgentTranscriptControl(UIControl):
 
         if path != self._path:
             self._reset_rendered(path)
-        if self._store is None:
+        if self._source is None or self._source.path != path:
             try:
-                await asyncio.to_thread(self._replace_store, path)
+                await asyncio.to_thread(self._replace_source, path)
             except (ConversationIntegrityError, OSError, ValueError):
                 return False
         return await self.sync(path)
@@ -566,11 +566,14 @@ class AgentTranscriptControl(UIControl):
     async def sync(self, path: Path) -> bool:
         """Apply one active-branch snapshot, yielding between render batches."""
 
-        if path != self._path or self._store is None:
+        if path != self._path or self._source is None:
             return await self.load(path)
         try:
-            snapshot = await asyncio.to_thread(refresh_agent_transcript, self._store)
+            tree = await asyncio.to_thread(self._source.refresh)
         except (ConversationIntegrityError, OSError, ValueError):
+            return False
+        snapshot = tree.transcript(path)
+        if snapshot is None:
             return False
         previous = self._snapshot
         if snapshot == previous:
@@ -623,16 +626,14 @@ class AgentTranscriptControl(UIControl):
         self._path = path
         self._snapshot = None
 
-    def _replace_store(self, path: Path) -> None:
-        previous, self._store = self._store, None
+    def _replace_source(self, path: Path) -> None:
+        previous, self._source = self._source, None
         if previous is not None:
             previous.close()
-        self._store = ConversationStore(
-            path.parent,
-            session_id=path.name,
-            _read_only=True,
-            _must_exist=True,
-        )
+        source = AgentTranscriptSource(path)
+        # Open and validate the read-only store before publishing the source.
+        source.refresh()
+        self._source = source
 
     async def _rebuild(
         self, snapshot: AgentTranscriptSnapshot, path: Path

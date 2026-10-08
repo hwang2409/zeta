@@ -193,6 +193,8 @@ def _enable_wheel_reporting(output: Output) -> None:
 
 
 
+
+
 class FullScreenPromptSession(PromptSession[str]):
     """Prompt session that owns the alternate screen for the whole app."""
 
