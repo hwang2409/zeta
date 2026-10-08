@@ -1,8 +1,7 @@
 # Safety and tool policy
 
 Zeta's file and shell tools run on the host as the current user. Zeta is not a
-security sandbox. Use the computer-use mode when you need a separate desktop
-sandbox; see [Computer use](computer-use.md).
+security sandbox.
 
 ## Tool availability
 
@@ -14,7 +13,7 @@ the denylist wins. Name patterns use exact names or shell-style globs, and MCP
 names use the `server__tool` form:
 
 ```sh
-zeta --tools 'computer__*' --disallowed-tools 'computer__shutdown' -p 'inspect the page'
+zeta --tools 'remote__*' --disallowed-tools 'remote__delete' -p 'inspect the service'
 ```
 
 A tool that is not allowed is not advertised to the provider and cannot run.
