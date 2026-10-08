@@ -568,7 +568,7 @@ def test_virtual_markdown_search_uses_rendered_line_coordinates(
             text
             for line in range(content.line_count)
             for style, text in content.get_line(line)
-            if theme.SEARCH_CURRENT in style
+            if theme.prompt_toolkit_style(theme.SEARCH_CURRENT) in style
         )
 
         target = (128, match.first_line)
@@ -732,6 +732,8 @@ def test_unit_search_cache_keeps_at_most_two_widths_per_unit() -> None:
 
 
 def test_virtual_search_next_restyles_occurrences_in_the_same_unit() -> None:
+    current = theme.prompt_toolkit_style(theme.SEARCH_CURRENT)
+    match = theme.prompt_toolkit_style(theme.SEARCH_MATCH)
     transcript = _virtual_search_transcript(Text("needle between needle"))
     transcript.begin_search()
     transcript.update_search("needle")
@@ -742,7 +744,7 @@ def test_virtual_search_next_restyles_occurrences_in_the_same_unit() -> None:
         for line in range(first.line_count)
         for style, text in first.get_line(line)
         for _character in text
-        if style in {theme.SEARCH_CURRENT, theme.SEARCH_MATCH}
+        if style in {current, match}
     ]
     assert transcript.next_search_match()
     second = transcript.create_content(40, 6)
@@ -751,11 +753,11 @@ def test_virtual_search_next_restyles_occurrences_in_the_same_unit() -> None:
         for line in range(second.line_count)
         for style, text in second.get_line(line)
         for _character in text
-        if style in {theme.SEARCH_CURRENT, theme.SEARCH_MATCH}
+        if style in {current, match}
     ]
 
-    assert first_styles == [theme.SEARCH_CURRENT] * 6 + [theme.SEARCH_MATCH] * 6
-    assert second_styles == [theme.SEARCH_MATCH] * 6 + [theme.SEARCH_CURRENT] * 6
+    assert first_styles == [current] * 6 + [match] * 6
+    assert second_styles == [match] * 6 + [current] * 6
 
 
 def test_virtual_search_does_not_match_through_rendered_wrapping() -> None:
@@ -769,7 +771,7 @@ def test_virtual_search_does_not_match_through_rendered_wrapping() -> None:
         text
         for line in range(content.line_count)
         for style, text in content.get_line(line)
-        if style == theme.SEARCH_CURRENT
+        if style == theme.prompt_toolkit_style(theme.SEARCH_CURRENT)
     )
 
     assert transcript.search_status() == (0, 0)
