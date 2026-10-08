@@ -280,8 +280,12 @@ def _create_app_with_root(
         discovery = associate_project_discovery(discovery, manager.project_registry)
     override_on_resume = False
     if resuming:
-        skill_catalog = _session_skill_catalog(metadata, home, manager, repo_root)
-        agent_catalog = _session_agent_catalog(metadata, home, manager, repo_root)
+        if metadata.prompt_recipe == "default":
+            skill_catalog = discover_session_skills(home=home, project_dir=repo_root)
+            agent_catalog = discover_session_agents(home=home, project_dir=repo_root)
+        else:
+            skill_catalog = _session_skill_catalog(metadata, home, manager, repo_root)
+            agent_catalog = _session_agent_catalog(metadata, home, manager, repo_root)
         cli_provider = getattr(args, "provider", None)
         cli_model = getattr(args, "model", None)
         provider_override = cli_provider or loaded_settings.settings.provider
@@ -310,18 +314,12 @@ def _create_app_with_root(
         override_on_resume = (
             system_prompt_override is not None or system_prompt_append is not None
         )
-        # Project memory is human-editable and must be refreshed on resume;
-        # ordinary context remains snapshot-first for prompt stability.
-        if (
-            metadata.system_prompt
-            and not override_on_resume
-            and metadata.project_id is None
-        ):
-            project_context = ProjectContext(
-                metadata.system_prompt,
-                tuple(Path(path) for path in metadata.context_files),
-            )
-        else:
+        should_recompose = (
+            metadata.prompt_recipe == "default"
+            or not metadata.system_prompt
+            or override_on_resume
+        )
+        if should_recompose:
             project_context = _app.load_project_context(
                 cwd=Path(metadata.cwd),
                 repo_root=repo_root,
@@ -332,16 +330,39 @@ def _create_app_with_root(
                 project_id=metadata.project_id,
                 inbox_enabled=config.inbox_enabled,
             )
-            persisted = manager.persist_context_snapshot(
+            manager.persist_prompt_composition(
                 metadata,
                 system_prompt=project_context.system_prompt,
                 context_files=[str(path) for path in project_context.files],
-                overwrite=override_on_resume,
+                skill_catalog=skill_catalog,
+                agent_catalog=agent_catalog,
+                prompt_recipe=project_context.prompt_recipe or "custom",
+                prompt_components=project_context.prompt_components,
+                project_memory_offset=project_context.memory_offset,
+                project_memory_length=project_context.memory_length,
+                project_memory_digest=project_context.memory_digest,
             )
             project_context = ProjectContext(
-                persisted.system_prompt,
-                tuple(Path(path) for path in persisted.context_files),
+                metadata.system_prompt,
+                tuple(Path(path) for path in metadata.context_files),
                 project_context.notices,
+                memory_offset=metadata.project_memory_offset,
+                memory_length=metadata.project_memory_length,
+                memory_project_id=metadata.project_id,
+                memory_digest=metadata.project_memory_digest,
+                has_override=metadata.prompt_recipe == "custom",
+                prompt_recipe=metadata.prompt_recipe,
+                prompt_components=metadata.prompt_components,
+            )
+            if override_on_resume:
+                manager.touch(metadata)
+        else:
+            # Legacy and custom CLI prompts can contain unrecorded bytes. Keep
+            # them intact; compose_runtime may replace only the validated
+            # structured memory span recorded with the session.
+            project_context = ProjectContext(
+                metadata.system_prompt,
+                tuple(Path(path) for path in metadata.context_files),
             )
     else:
         provider = config.provider

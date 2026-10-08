@@ -39,6 +39,8 @@ from html import escape
 from pathlib import Path
 from time import monotonic as _monotonic
 
+from ..memory.entry_store import utc_now
+from ..memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import load_identity, load_packaged_identity, load_runtime_guidance
@@ -71,6 +73,8 @@ class ProjectContext:
     memory_project_id: str | None = None
     memory_digest: str | None = None
     has_override: bool = False
+    prompt_recipe: str | None = None
+    prompt_components: dict[str, dict[str, int | str]] = field(default_factory=dict)
 
 
 def _git_env() -> dict[str, str]:
@@ -700,34 +704,57 @@ def load_project_context(
                         "omitted the memory block"
                     )
                 else:
-                    for entry in registry.load_memory_for_context(project.project_id):
-                        path = registry.root / project.project_id / "memory" / entry.name
-                        section = _format_section(path, entry.content)
-                        candidate_manual = list(manual_memory_sections)
-                        candidate_automatic = list(automatic_memory_sections)
-                        target = (
-                            candidate_automatic if entry.automatic else candidate_manual
+                    try:
+                        context_entries = registry.load_memory_for_context(
+                            project.project_id
                         )
-                        target.append(section)
-                        candidate = _render_memory_block(
-                            project.project_id,
-                            candidate_manual,
-                            candidate_automatic,
+                    except UnsupportedMemoryFormatError:
+                        # Format 2 remains reachable only through the private
+                        # fixture store until the activation PR. Its projection
+                        # is nevertheless complete and directly testable here.
+                        snapshot = registry._entry_memory_state(project.project_id)
+                        projection = render_entry_memory(
+                            snapshot.state,
+                            now=utc_now(),
+                            byte_cap=min(MEMORY_PROMPT_BYTE_CAP, budget_for_memory),
                         )
-                        if len(candidate.encode("utf-8")) <= budget_for_memory:
-                            manual_memory_sections = candidate_manual
-                            automatic_memory_sections = candidate_automatic
-                            loaded.append(path)
-                        else:
-                            notices.append(
-                                "context · project memory exceeded "
-                                f"{byte_cap} byte cap; skipped {entry.name}"
+                        memory_block = projection.block
+                    else:
+                        for entry in context_entries:
+                            path = (
+                                registry.root
+                                / project.project_id
+                                / "memory"
+                                / entry.name
                             )
-                    memory_block = _render_memory_block(
-                        project.project_id,
-                        manual_memory_sections,
-                        automatic_memory_sections,
-                    )
+                            section = _format_section(path, entry.content)
+                            candidate_manual = list(manual_memory_sections)
+                            candidate_automatic = list(automatic_memory_sections)
+                            target = (
+                                candidate_automatic
+                                if entry.automatic
+                                else candidate_manual
+                            )
+                            target.append(section)
+                            candidate = _render_memory_block(
+                                project.project_id,
+                                candidate_manual,
+                                candidate_automatic,
+                            )
+                            if len(candidate.encode("utf-8")) <= budget_for_memory:
+                                manual_memory_sections = candidate_manual
+                                automatic_memory_sections = candidate_automatic
+                                loaded.append(path)
+                            else:
+                                notices.append(
+                                    "context · project memory exceeded "
+                                    f"{byte_cap} byte cap; skipped {entry.name}"
+                                )
+                        memory_block = _render_memory_block(
+                            project.project_id,
+                            manual_memory_sections,
+                            automatic_memory_sections,
+                        )
                     memory_index = len(sections)
                     memory_project_id = project.project_id
                     sections.append(memory_block)
@@ -761,6 +788,20 @@ def load_project_context(
         memory_offset = len(prefix) + (2 if memory_index else 0)
         memory_length = len(memory_block)
         memory_digest = _owned_block_digest(memory_block)
+    has_override = system_override is not None or system_append is not None
+    components: dict[str, dict[str, int | str]] = {}
+    if not has_override:
+        components["default_context"] = {
+            "offset": 0,
+            "length": len(prompt),
+            "digest": _owned_block_digest(prompt),
+        }
+    if memory_offset is not None and memory_length is not None and memory_digest is not None:
+        components["project_memory"] = {
+            "offset": memory_offset,
+            "length": memory_length,
+            "digest": memory_digest,
+        }
     return ProjectContext(
         prompt,
         tuple(loaded),
@@ -769,7 +810,9 @@ def load_project_context(
         memory_length=memory_length,
         memory_project_id=memory_project_id,
         memory_digest=memory_digest,
-        has_override=system_override is not None or system_append is not None,
+        has_override=has_override,
+        prompt_recipe="custom" if has_override else "default",
+        prompt_components=components,
     )
 
 
@@ -816,13 +859,28 @@ def refresh_project_memory(
         project = registry.show_project(project_id)
         if project is None:
             return system_prompt
-        entries = registry.load_memory_for_context(project.project_id)
-    except UnsupportedMemoryFormatError:
-        raise
+        try:
+            entries = registry.load_memory_for_context(project.project_id)
+        except UnsupportedMemoryFormatError:
+            entries = None
+            entry_state = registry._entry_memory_state(project.project_id).state
     except (ProjectRegistryError, OSError):
         return system_prompt
     prefix = system_prompt[:start]
     suffix = system_prompt[end:]
+    if entries is None:
+        remaining = max(
+            0,
+            CONTEXT_BYTE_CAP
+            - len(prefix.encode("utf-8"))
+            - len(suffix.encode("utf-8")),
+        )
+        block = render_entry_memory(
+            entry_state,
+            now=utc_now(),
+            byte_cap=min(MEMORY_PROMPT_BYTE_CAP, remaining),
+        ).block
+        return prefix + block + suffix
     kept_manual: list[str] = []
     kept_automatic: list[str] = []
     for entry in entries:

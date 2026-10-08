@@ -127,6 +127,8 @@ def compose_runtime(
                 project_memory_offset=project_context.memory_offset,
                 project_memory_length=project_context.memory_length,
                 project_memory_digest=project_context.memory_digest,
+                prompt_recipe=project_context.prompt_recipe,
+                prompt_components=project_context.prompt_components,
                 auto_project=(
                     config.auto_project and auto_project and project_discovery is None
                 ),

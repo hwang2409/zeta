@@ -135,7 +135,7 @@ def test_fresh_session_injects_context_and_lists_files(
     assert str((tmp_path / "AGENTS.md").resolve()) in app.slash_status().context_files
 
 
-def test_resume_restores_context_snapshot_across_directories(
+def test_resume_rebuilds_default_context_from_stored_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -159,8 +159,8 @@ def test_resume_restores_context_snapshot_across_directories(
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
-    assert "original rules" in prompt
-    assert "changed rules" not in prompt
+    assert "original rules" not in prompt
+    assert "changed rules" in prompt
     assert "new directory rules" not in prompt
     assert resumed.slash_status().context_files == (str(original_context.resolve()),)
 
@@ -366,7 +366,7 @@ def test_catalog_boundaries_require_explicit_catalog() -> None:
         assert inspect.signature(callable_).parameters[parameter].default is inspect.Parameter.empty
 
 
-def test_legacy_resume_uses_persisted_snapshot_on_second_resume(
+def test_legacy_resume_adopts_default_recipe_for_later_recomposition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -391,8 +391,8 @@ def test_legacy_resume_uses_persisted_snapshot_on_second_resume(
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
-    assert "first rules" in prompt
-    assert "second rules" not in prompt
+    assert "first rules" not in prompt
+    assert "second rules" in prompt
 
 
 def test_partial_context_metadata_is_replaced_with_fallback_snapshot(
@@ -493,7 +493,7 @@ def test_resume_append_flag_composes_over_snapshot_base(
     )
 
 
-def test_resume_without_flags_leaves_snapshot_untouched(
+def test_resume_without_flags_recomposes_default_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -506,7 +506,7 @@ def test_resume_without_flags_leaves_snapshot_untouched(
     metadata_path = home / "sessions" / session_id / "meta.json"
     original = json.loads(metadata_path.read_text(encoding="utf-8"))
 
-    # Mutate the AGENTS.md on disk; snapshot resume must ignore the edit.
+    # A new run rebuilds the default recipe from the session's stored CWD.
     (tmp_path / "AGENTS.md").write_text("mutated rules", encoding="utf-8")
 
     resumed = create_app(
@@ -515,14 +515,15 @@ def test_resume_without_flags_leaves_snapshot_untouched(
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
 
-    assert prompt == original["system_prompt"]
-    assert saved["system_prompt"] == original["system_prompt"]
+    assert prompt != original["system_prompt"]
+    assert "mutated rules" in prompt
+    assert saved["system_prompt"] == prompt
     assert saved["context_files"] == original["context_files"]
     assert resumed._startup_alerts == ()
 
 
 @pytest.mark.asyncio
-async def test_resume_reuses_one_persisted_skill_catalog_for_prompt_and_tool(
+async def test_resume_rebuilds_current_skill_catalog_for_prompt_and_tool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -549,17 +550,17 @@ async def test_resume_reuses_one_persisted_skill_catalog_for_prompt_and_tool(
     loaded = await resumed.loop.tool_registry.execute(
         ToolCall("skill", "skill", {"name": "first"}), _skip_approval=True
     )
-    missing = await resumed.loop.tool_registry.execute(
+    newly_loaded = await resumed.loop.tool_registry.execute(
         ToolCall("skill-missing", "skill", {"name": "second"}),
         _skip_approval=True,
     )
 
     assert "first: first skill" in prompt
-    assert "second: second skill" not in prompt
+    assert "second: second skill" in prompt
     assert loaded["isError"] is False
     assert loaded["content"][0]["text"] == "first body"
-    assert missing["isError"] is True
-    assert "available skills: first" in missing["content"][0]["text"]
+    assert newly_loaded["isError"] is False
+    assert newly_loaded["content"][0]["text"] == "second body"
 
 
 def test_second_resume_after_override_sees_overridden_snapshot(
