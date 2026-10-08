@@ -20,7 +20,7 @@ from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.utils import get_cwidth
 
-from .. import theme
+from .. import overlay, theme
 from .message_finder import FinderRow, Role
 
 _MAX_WIDTH = 96
@@ -200,25 +200,10 @@ class FinderControl(UIControl):
         return len(self._current_lines(width)) + 2
 
     def create_content(self, width: int, height: int | None) -> UIContent:
-        lines = self._current_lines(width)
-        content_width = max(1, width - 2)
-        border = theme.DIM
-
-        def framed(index: int) -> list[tuple[str, str]]:
-            if index == 0:
-                return [(border, "┌" + "─" * content_width + "┐")]
-            if index == len(lines) + 1:
-                return [(border, "└" + "─" * content_width + "┘")]
-            line = lines[index - 1]
-            used = sum(_cells(text) for _style, text in line)
-            padded = list(line)
-            if used < content_width:
-                padded.append((theme.BODY, " " * (content_width - used)))
-            return [(border, "│"), *padded, (border, "│")]
-
+        rows = overlay.frame(self._current_lines(width), width=width)
         return UIContent(
-            get_line=framed,
-            line_count=len(lines) + 2,
+            get_line=rows.__getitem__,
+            line_count=len(rows),
             cursor_position=Point(x=0, y=0),
             show_cursor=False,
         )
