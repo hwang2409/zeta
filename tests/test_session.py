@@ -741,7 +741,7 @@ async def test_removed_browser_tool_session_loads_renders_and_resumes(
         transcript.write(fixture.read_bytes())
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     try:
         assert "browser" not in {
