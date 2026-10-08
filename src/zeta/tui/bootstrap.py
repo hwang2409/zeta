@@ -308,6 +308,7 @@ def _create_app_with_root(
         resumed_prompt = resume_prompt(
             metadata,
             manager=manager,
+            store=opened.store,
             home=home,
             repo_root=repo_root,
             inbox_enabled=config.inbox_enabled,

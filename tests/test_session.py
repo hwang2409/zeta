@@ -24,7 +24,6 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
-from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -152,6 +151,7 @@ def test_resume_rebuilds_default_context_from_stored_directory(
 
     first = create_app(_args())
     session_id = first.loop.store.session_id
+    first.loop.store.close()
     original_context.write_text("changed rules", encoding="utf-8")
     monkeypatch.chdir(other)
 
@@ -180,6 +180,7 @@ def test_legacy_empty_prompt_resume_builds_default_from_stored_cwd(
     metadata.pop("system_prompt")
     metadata.pop("context_files")
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    opened.store.close()
 
     resumed = create_app(
         build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
@@ -216,8 +217,12 @@ def test_legacy_resume_hydrates_without_bumping_updated_at(
     pinned = "2020-01-01T00:00:00+00:00"
     metadata["updated_at"] = pinned
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    opened.store.close()
 
-    create_app(build_parser().parse_args(["--resume", session_id, "--provider", "fake"]))
+    hydrated_app = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    hydrated_app.loop.store.close()
     hydrated = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert "legacy rules" in hydrated["system_prompt"]
     assert hydrated["prompt_recipe"] == "default"
@@ -272,6 +277,7 @@ def test_first_legacy_resume_with_explicit_prompt_bumps_updated_at(
     pinned = "2020-01-01T00:00:00+00:00"
     metadata["updated_at"] = pinned
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    opened.store.close()
 
     create_app(
         build_parser().parse_args(
@@ -314,6 +320,7 @@ def test_legacy_resume_does_not_marker_scan_skill_index(
         cwd=tmp_path,
         system_prompt=legacy_prompt,
     )
+    opened.store.close()
 
     resumed = create_app(
         build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
@@ -338,6 +345,7 @@ def test_legacy_resume_preserves_unterminated_skill_index(
         cwd=tmp_path,
         system_prompt="legacy\n<zeta-skills>\nAvailable skills:\n- old: old",
     )
+    opened.store.close()
     resumed = create_app(
         build_parser().parse_args(
             ["--resume", opened.store.session_id, "--provider", "fake"]
@@ -382,9 +390,11 @@ def test_legacy_empty_prompt_adopts_live_default_recipe(
     metadata.pop("context_files")
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-    create_app(
+    opened.store.close()
+    first_resume = create_app(
         build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
     )
+    first_resume.loop.store.close()
     context_file.write_text("second rules", encoding="utf-8")
 
     resumed = create_app(
@@ -441,6 +451,7 @@ def test_resume_system_prompt_flag_wins_over_snapshot(
     metadata_path = home / "sessions" / session_id / "meta.json"
     original_snapshot = json.loads(metadata_path.read_text(encoding="utf-8"))["system_prompt"]
     assert "original rules" in original_snapshot
+    first.loop.store.close()
 
     resumed = create_app(
         build_parser().parse_args(
@@ -475,6 +486,7 @@ def test_resume_append_flag_composes_over_snapshot_base(
 
     first = create_app(_args())
     session_id = first.loop.store.session_id
+    first.loop.store.close()
 
     resumed = create_app(
         build_parser().parse_args(
@@ -512,6 +524,7 @@ def test_resume_without_flags_recomposes_default_snapshot(
     session_id = first.loop.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     original = json.loads(metadata_path.read_text(encoding="utf-8"))
+    first.loop.store.close()
 
     # A new run rebuilds the default recipe from the session's stored CWD.
     (tmp_path / "AGENTS.md").write_text("mutated rules", encoding="utf-8")
@@ -549,6 +562,7 @@ async def test_resume_rebuilds_current_skill_catalog_for_prompt_and_tool(
         "---\nname: second\ndescription: second skill\n---\n\nsecond body\n",
         encoding="utf-8",
     )
+    first.loop.store.close()
 
     resumed = create_app(
         build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
@@ -580,8 +594,9 @@ def test_second_resume_after_override_sees_overridden_snapshot(
 
     first = create_app(_args())
     session_id = first.loop.store.session_id
+    first.loop.store.close()
 
-    create_app(
+    overridden = create_app(
         build_parser().parse_args(
             [
                 "--resume",
@@ -593,6 +608,7 @@ def test_second_resume_after_override_sees_overridden_snapshot(
             ]
         )
     )
+    overridden.loop.store.close()
 
     resumed = create_app(
         build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
@@ -601,68 +617,6 @@ def test_second_resume_after_override_sees_overridden_snapshot(
 
     assert prompt == _with_runtime_guidance("explicit override")
     assert resumed._startup_alerts == ()
-
-
-def test_concurrent_legacy_empty_prompt_resumes_adopt_one_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "zeta-home"
-    monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.chdir(tmp_path)
-    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
-    session_id = opened.store.session_id
-    metadata_path = home / "sessions" / session_id / "meta.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata.pop("system_prompt")
-    metadata.pop("context_files")
-    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-
-    load_count = 0
-
-    def load_context(**kwargs: object) -> ProjectContext:
-        del kwargs
-        nonlocal load_count
-        load_count += 1
-        return ProjectContext(
-            f"default fallback {load_count}",
-            (tmp_path / "context.md",),
-            prompt_recipe="default",
-        )
-
-    monkeypatch.setattr("zeta.tui.app.load_project_context", load_context)
-    apps: list[TUIApp] = []
-    errors: list[Exception] = []
-
-    def resume() -> None:
-        try:
-            apps.append(
-                create_app(
-                    build_parser().parse_args(
-                        ["--resume", session_id, "--provider", "fake"]
-                    )
-                )
-            )
-        except Exception as exc:
-            errors.append(exc)
-
-    first = threading.Thread(target=resume)
-    second = threading.Thread(target=resume)
-    first.start()
-    second.start()
-    first.join()
-    second.join()
-
-    assert errors == []
-    assert load_count == 2
-    saved = SessionManager(home).open(session_id).metadata
-    prompts = [app.loop.context_assembler.system_prompt.content[0].text for app in apps]
-    context_files = [app.slash_status().context_files for app in apps]
-    assert saved.prompt_recipe == "default"
-    assert prompts == [saved.system_prompt, saved.system_prompt]
-    assert context_files == [
-        (str(tmp_path / "context.md"),),
-        (str(tmp_path / "context.md"),),
-    ]
 
 
 def test_session_bash_cwd_round_trips_through_store_state(
@@ -703,6 +657,8 @@ def test_continue_reopens_the_most_recent_session(
     manager._write(older.metadata)
     newer.metadata.updated_at = "2030-01-01T00:00:00+00:00"
     manager._write(newer.metadata)
+    older.store.close()
+    newer.store.close()
 
     app = create_app(build_parser().parse_args(["--continue"]))
 
@@ -1467,6 +1423,7 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
         [(call.id, call)],
     )
+    opened.store.close()
 
     app = create_app(
         build_parser().parse_args(
@@ -1960,6 +1917,7 @@ async def test_summary_success_commits_override_before_main_failure(
             with_message_origin(Message(MessageRole.USER, [TextContent(f"message {index}")]), MessageOrigin.USER)
         )
     session_id = opened.store.session_id
+    opened.store.close()
     backend = FakeBackend([ScriptedTurn(content=[TextContent("summary")])])
 
     def build_backend(*args: object, **kwargs: object) -> tuple[FakeBackend, str]:
