@@ -389,6 +389,28 @@ async def test_repeated_opaque_fact_does_not_create_duplicate_entry(
 
 
 @pytest.mark.asyncio
+async def test_one_proposal_cannot_add_duplicate_opaque_facts(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(_row(1, "Remember `HERON-RELATED-5B3X`.")),
+        [
+            _proposal(
+                _add("brief", "Related token HERON-RELATED-5B3X."),
+                _add("decisions", "The related value is HERON-RELATED-5B3X."),
+            )
+        ],
+        key="same-proposal-duplicate",
+    )
+    assert len(result.changed_entry_ids) == 1
+    assert result.rejected_groups == (
+        "group[1]: add duplicates an existing active entry",
+    )
+    assert len(_entries(registry, project_id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -> None:
     registry, project_id = _registry(tmp_path)
     initial = registry._entry_memory_state(project_id)

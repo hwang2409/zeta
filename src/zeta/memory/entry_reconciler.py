@@ -771,15 +771,18 @@ def _select_groups(
 ) -> tuple[tuple[MemoryOperation, ...], tuple[str, ...]]:
     accepted: list[MemoryOperation] = []
     rejected: list[str] = []
+    working_state = state
     for group_index, group in enumerate(_dependency_groups(items)):
         errors = tuple(
-            error for item in group if (error := _semantic_error(item, state, now))
+            error
+            for item in group
+            if (error := _semantic_error(item, working_state, now))
         )
         error = errors[0] if errors else None
         if error is None:
             try:
-                apply_operations(
-                    state,
+                working_state, _ = apply_operations(
+                    working_state,
                     tuple(item.operation for item in group),
                     reconciliation_key=key,
                     automatic=True,
