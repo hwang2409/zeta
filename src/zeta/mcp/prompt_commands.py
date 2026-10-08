@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass, field
 from typing import Protocol, Self
 
 from ..mcp.client import MCPPrompt
+from ..model_input import ModelInputEnvelope
+from ..protocol.types import MessageOrigin
 
 
 class SlashPromptError(str):
@@ -99,11 +100,17 @@ async def resolve_prompt(
     session: PromptSession,
     name: str,
     arguments: dict[str, str],
-) -> SlashModelInput | SlashPromptError:
-    """Resolve one MCP prompt into opaque model input."""
+    *,
+    display_text: str,
+) -> ModelInputEnvelope | SlashPromptError:
+    """Resolve one MCP prompt without losing its typed invocation."""
 
     try:
-        return SlashModelInput(await session.slash_mcp_prompt(name, arguments))
+        return ModelInputEnvelope(
+            await session.slash_mcp_prompt(name, arguments),
+            display_text,
+            MessageOrigin.SLASH_EXPANSION,
+        )
     except Exception as exc:  # noqa: BLE001 - composer gets a loud error
         return SlashPromptError(f"mcp error: prompt failed: {exc}")
 
@@ -113,13 +120,17 @@ async def dispatch_prompt(
     name: str,
     prompt: MCPPrompt,
     raw_arguments: str,
-) -> SlashModelInput | SlashPromptError:
+    *,
+    display_text: str,
+) -> ModelInputEnvelope | SlashPromptError:
     """Parse and resolve one MCP prompt command."""
 
     arguments = prompt_arguments(name, prompt, raw_arguments)
     if isinstance(arguments, SlashPromptError):
         return arguments
-    return await resolve_prompt(session, name, arguments)
+    return await resolve_prompt(
+        session, name, arguments, display_text=display_text
+    )
 
 
 def index_prompt_entries(
@@ -150,17 +161,8 @@ class PromptSession(Protocol):
         ...
 
 
-@dataclass(frozen=True, slots=True)
-class SlashModelInput:
-    """Resolved input that should start a model turn."""
-
-    text: str
-    display_text: str | None = field(default=None, compare=False)
-
-
 __all__ = [
     "MCPPromptCommands",
-    "SlashModelInput",
     "SlashPromptError",
     "dispatch_prompt",
     "index_prompt_entries",

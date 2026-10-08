@@ -16,7 +16,14 @@ from rich.text import Text
 from zeta.agent.background import recover_agent_children
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    with_message_origin,
+)
 from zeta.runtime.loop.agent import AgentLoop
 from zeta.skills.catalog import SkillCatalog
 from zeta.tui.app import TUIApp
@@ -229,11 +236,11 @@ def test_completion_notification_query_returns_detached_first_match(
     store = ConversationStore(tmp_path, session_id="notification-query")
     child_id = "notification-query:1"
     store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [TextContent("hello")],
             metadata={"nested": {"value": "original"}},
-        )
+        ), MessageOrigin.USER)
     )
     store.append_agent_notification(
         child_id,

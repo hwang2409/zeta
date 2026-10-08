@@ -23,6 +23,7 @@ from zeta.protocol.types import (
     CompletionBackend,
     ErrorInfo,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -32,6 +33,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.providers.retry_policy import current_retry_budget
@@ -175,7 +177,7 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
     store = ConversationStore(tmp_path)
 
-    events = await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi"))
+    events = await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER))
 
     assert events[-1].type is StreamEventType.AGENT_END
     assert [message.role for message in store.messages()] == [
@@ -203,7 +205,7 @@ async def test_notification_turn_serializes_notification_as_actionable_input(
         request_serializer=request_serializer,
     )
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("waiting")]))
     store.append_agent_notification(
         "child-1",
@@ -266,12 +268,12 @@ async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Pat
     )
     loop = AgentLoop(backend, ConversationStore(tmp_path), tool_schemas=[], skill_catalog=SkillCatalog.empty())
 
-    await collect(loop.run_turn("first prompt"))
+    await collect(loop.run_turn("first prompt", origin=MessageOrigin.USER))
     assert loop.context_assembler.cache_read_input_tokens_this_session == 0
-    await collect(loop.run_turn("second prompt"))
+    await collect(loop.run_turn("second prompt", origin=MessageOrigin.USER))
     second_read = loop.context_assembler.cache_read_input_tokens_this_session
     assert second_read > 0
-    await collect(loop.run_turn("third prompt"))
+    await collect(loop.run_turn("third prompt", origin=MessageOrigin.USER))
 
     assert loop.context_assembler.cache_read_input_tokens_this_session > second_read
     assert loop.context_assembler.cache_creation_input_tokens_this_session > 0
@@ -350,8 +352,8 @@ async def test_opt_in_cache_trace_records_reuse_without_prompt_text(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    await collect(loop.run_turn("private first question"))
-    await collect(loop.run_turn("private second question"))
+    await collect(loop.run_turn("private first question", origin=MessageOrigin.USER))
+    await collect(loop.run_turn("private second question", origin=MessageOrigin.USER))
 
     trace = tmp_path / "home" / "logs" / "cache-trace.jsonl"
     raw = trace.read_text()
@@ -404,7 +406,7 @@ async def test_unsigned_thinking_is_not_persisted_with_assistant_message(
     )
     store = ConversationStore(tmp_path)
 
-    await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi"))
+    await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER))
 
     assert store.messages()[-1].content == [TextContent("answer")]
 
@@ -418,7 +420,7 @@ async def test_header_only_thinking_is_persisted_with_assistant_message(
     )
     store = ConversationStore(tmp_path)
 
-    await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi"))
+    await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER))
 
     # Header-only thinking stays durable even though the empty turn is nudged.
     assert any(
@@ -444,7 +446,7 @@ skill_catalog=SkillCatalog.empty(),
     )
 
     events: list[StreamEvent] = []
-    async for event in loop.run_turn("start"):
+    async for event in loop.run_turn("start", origin=MessageOrigin.USER):
         events.append(event)
         if event.type is StreamEventType.TOOL_APPROVAL_START:
             assert policy.approve(call.id)
@@ -467,7 +469,7 @@ async def test_default_system_prompt_is_zeta_identity(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
     store = ConversationStore(tmp_path)
 
-    await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi"))
+    await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER))
 
     assert backend.calls[0][0][0].content[0].text == load_identity(catalog=SkillCatalog.empty())
 
@@ -477,7 +479,7 @@ async def test_empty_system_prompt_is_not_sent_to_backend(tmp_path: Path) -> Non
     backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
     store = ConversationStore(tmp_path)
 
-    await collect(AgentLoop(backend, store, system_prompt="", skill_catalog=SkillCatalog.empty()).run_turn("hi"))
+    await collect(AgentLoop(backend, store, system_prompt="", skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER))
 
     assert all(
         message.role is not MessageRole.SYSTEM for message in backend.calls[0][0]
@@ -560,7 +562,7 @@ async def test_agent_loop_preserves_mixed_tool_blocks(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("mixed", mixed)
 
-    await collect(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    await collect(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     result = store.messages()[2].tool_result
     assert result is not None
@@ -601,7 +603,7 @@ async def test_agent_loop_rejects_invalid_block_metadata_before_persistence(
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("invalid", invalid)
 
-    await collect(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    await collect(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     result = store.messages()[2].tool_result
     assert result is not None
@@ -626,7 +628,7 @@ async def test_tool_call_then_next_completion(tmp_path: Path) -> None:
     async def echo(arguments: dict[str, str]) -> str:
         return arguments["value"]
 
-    events = await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    events = await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     assert [event.type for event in events] == [
         StreamEventType.AGENT_START,
@@ -684,7 +686,7 @@ async def test_bash_streams_in_order_and_persists_one_result(tmp_path: Path) -> 
     )
     store = ConversationStore(tmp_path)
 
-    events = await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    events = await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     tool_events = [
         event
@@ -753,7 +755,7 @@ async def test_stream_publisher_closes_before_delayed_output(tmp_path: Path) -> 
         max_turns=1,
 skill_catalog=SkillCatalog.empty(),
     )
-    events = await collect(loop.run_turn("start"))
+    events = await collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.gather(*late_tasks)
 
     for call in calls:
@@ -780,7 +782,7 @@ async def test_bash_streams_stdout_and_stderr_labels(tmp_path: Path) -> None:
             ConversationStore(tmp_path),
             max_turns=1,
 skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     updates = [
@@ -806,7 +808,7 @@ async def test_bash_stream_preserves_split_utf8_code_points(tmp_path: Path) -> N
             ConversationStore(tmp_path),
             max_turns=1,
 skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     updates = [
@@ -830,7 +832,7 @@ async def test_bash_cancel_stops_updates_before_terminal_event(tmp_path: Path) -
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     events: list[StreamEvent] = []
 
-    async for event in loop.run_turn("start"):
+    async for event in loop.run_turn("start", origin=MessageOrigin.USER):
         events.append(event)
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
             loop.abort()
@@ -883,7 +885,7 @@ async def test_streamed_message_log_is_cadence_stable(tmp_path: Path) -> None:
         )
         store = ConversationStore(root)
         await collect(
-            AgentLoop(backend, store, tools={"stream": stream}, skill_catalog=SkillCatalog.empty()).run_turn("start")
+            AgentLoop(backend, store, tools={"stream": stream}, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
         )
         messages = [
             entry.data["message"]
@@ -928,7 +930,7 @@ async def test_stream_update_queue_drops_oldest_without_truncating_result(
         max_turns=1,
 skill_catalog=SkillCatalog.empty(),
     )
-    async for event in loop.run_turn("start"):
+    async for event in loop.run_turn("start", origin=MessageOrigin.USER):
         events.append(event)
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
             await asyncio.sleep(0.001)
@@ -969,7 +971,7 @@ async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -
     loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
 
     async def consume() -> None:
-        async for event in loop.run_turn("start"):
+        async for event in loop.run_turn("start", origin=MessageOrigin.USER):
             if (
                 event.type is StreamEventType.TOOL_EXECUTION_END
                 and event.tool_call is not None
@@ -1030,7 +1032,7 @@ async def test_parallel_cancellation_keeps_call_order(
     registry.register("first", first, parallel_safe=True)
     registry.register("second", second, parallel_safe=True)
     loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(collect(loop.run_turn("start")))
+    task = asyncio.create_task(collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     await started[0].wait()
     await started[1].wait()
     await completed.wait()
@@ -1062,7 +1064,7 @@ async def test_parallel_duplicate_ids_fail_before_dispatch(tmp_path: Path) -> No
     store = ConversationStore(tmp_path)
 
     with pytest.raises(ValueError, match="duplicate tool call id"):
-        await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+        await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     assert not (store.session_dir / "agents").exists()
 
@@ -1171,7 +1173,7 @@ async def test_parallel_results_persist_in_call_order(tmp_path: Path) -> None:
     registry.register("second", second, parallel_safe=True)
     loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
 
-    task = asyncio.create_task(collect(loop.run_turn("start")))
+    task = asyncio.create_task(collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     await first_started.wait()
     await second_started.wait()
     second_release.set()
@@ -1201,7 +1203,7 @@ async def test_tool_error_is_a_result_and_loop_continues(tmp_path: Path) -> None
     async def fail(arguments: dict[str, str]) -> str:
         raise RuntimeError("tool broke")
 
-    events = await collect(AgentLoop(backend, store, tools={"fail": fail}, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    events = await collect(AgentLoop(backend, store, tools={"fail": fail}, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     result = store.messages()[2].tool_result
     assert result is not None and result.is_error
@@ -1220,7 +1222,7 @@ async def test_wrong_tool_result_id_becomes_expected_error_result(tmp_path: Path
     def echo(arguments: dict[str, object]) -> ToolResult:
         return ToolResult("wrong", "bad result")
 
-    await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     result = store.messages()[2].tool_result
     assert result is not None
@@ -1240,7 +1242,7 @@ async def test_wrong_typed_tool_result_becomes_valid_error_result(tmp_path: Path
     def echo(arguments: dict[str, object]) -> ToolResult:
         return ToolResult(call.id, 123)  # type: ignore[arg-type]
 
-    await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     result = store.messages()[2].tool_result
     assert result is not None
@@ -1265,7 +1267,7 @@ async def test_invalid_tool_handler_output_becomes_error_result(
     def echo(arguments: dict[str, object]) -> object:
         return output
 
-    await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     result = store.messages()[2].tool_result
     assert result is not None
@@ -1295,7 +1297,7 @@ async def test_aclose_after_message_update_persists_partial_state(tmp_path: Path
     )
     store = ConversationStore(tmp_path)
 
-    stream = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    stream = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     await close_after(
         stream,
         StreamEventType.MESSAGE_UPDATE,
@@ -1318,7 +1320,7 @@ async def test_aclose_after_message_end_persists_complete_state(tmp_path: Path) 
     store = ConversationStore(tmp_path)
 
     await close_after(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start"),
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER),
         StreamEventType.MESSAGE_END,
     )
 
@@ -1344,7 +1346,7 @@ async def test_aclose_during_active_tool_persists_canceled_result(tmp_path: Path
         tools={"blocked": blocked},
         max_turns=1,
 skill_catalog=SkillCatalog.empty(),
-    ).run_turn("start")
+    ).run_turn("start", origin=MessageOrigin.USER)
     async for event in stream:
         if event.type is StreamEventType.TOOL_EXECUTION_START:
             await started.wait()
@@ -1396,7 +1398,7 @@ async def test_plain_async_iterator_completes_without_aclose(tmp_path: Path) -> 
             return PlainCompletion()
 
     events = await collect(
-        AgentLoop(PlainBackend(), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(PlainBackend(), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert all(event.type is not StreamEventType.ERROR for event in events)
@@ -1413,7 +1415,7 @@ async def test_cancellation_persists_partial_state(tmp_path: Path) -> None:
     update_seen = asyncio.Event()
 
     async def collect_after_update() -> None:
-        async for event in AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start"):
+        async for event in AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER):
             if event.type is StreamEventType.MESSAGE_UPDATE:
                 update_seen.set()
 
@@ -1451,7 +1453,7 @@ async def test_cancellation_keeps_control_error_when_partial_persist_fails(
 
     backend = WaitingBackend()
     store = ConversationStore(tmp_path)
-    task = asyncio.create_task(collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")))
+    task = asyncio.create_task(collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)))
     await backend.update_seen.wait()
 
     with patch.object(
@@ -1474,7 +1476,7 @@ async def test_aclose_keeps_control_error_when_partial_persist_fails(
         FakeBackend([ScriptedTurn([TextContent("partial")])]),
         store,
 skill_catalog=SkillCatalog.empty(),
-    ).run_turn("start")
+    ).run_turn("start", origin=MessageOrigin.USER)
 
     async for event in stream:
         if event.type is StreamEventType.MESSAGE_UPDATE:
@@ -1495,7 +1497,7 @@ async def test_max_turns_stops(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
     events = await collect(
-        AgentLoop(backend, store, tools={"echo": lambda arguments: "ok"}, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(backend, store, tools={"echo": lambda arguments: "ok"}, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert events[-2].type is StreamEventType.ERROR
@@ -1529,7 +1531,7 @@ async def test_truncated_stream_persists_stop_reason_metadata(tmp_path: Path) ->
     await collect(
         AgentLoop(
             TruncatedBackend(), store, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     partial = store.messages()[-1]
@@ -1567,7 +1569,7 @@ async def test_cancel_during_retry_backoff_does_not_persist_discarded_partial(
     async def consume() -> None:
         async for event in AgentLoop(
             WaitingRetryBackend(), store, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start"):
+        ).run_turn("start", origin=MessageOrigin.USER):
             events.append(event)
             if event.type is StreamEventType.RETRY:
                 retry_seen.set()
@@ -1612,7 +1614,7 @@ async def test_discarded_partial_is_not_finalized_when_stream_then_ends(
     events = await collect(
         AgentLoop(
             PartialOnlyRetryBackend(), store, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert not any(
@@ -1652,7 +1654,7 @@ async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> No
     async def consume() -> None:
         async for event in AgentLoop(
             WaitingAfterMetadataBackend(), store, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start"):
+        ).run_turn("start", origin=MessageOrigin.USER):
             if event.type is StreamEventType.MESSAGE_END:
                 metadata_seen.set()
 
@@ -1681,7 +1683,7 @@ async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path
             yield
 
     store = ConversationStore(tmp_path)
-    events = await collect(AgentLoop(BrokenBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    events = await collect(AgentLoop(BrokenBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     assert events[-2].type is StreamEventType.ERROR
     assert events[-2].error is not None
@@ -1718,7 +1720,7 @@ async def test_slow_context_assembly_does_not_exhaust_retry_budget(
                 store,
                 context_assembler=assembler,
                 skill_catalog=SkillCatalog.empty(),
-            ).run_turn("start")
+            ).run_turn("start", origin=MessageOrigin.USER)
         )
 
     assert len(backend.calls) == 1
@@ -1801,7 +1803,7 @@ async def test_loop_owned_stall_retry_starts_after_real_90s_silence(
     backend = AlternatingStallBackend()
     store = ConversationStore(tmp_path)
     events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     retries = [event for event in events if event.type is StreamEventType.RETRY]
@@ -1906,7 +1908,7 @@ async def test_metadata_only_provider_events_are_retry_safe(
     backend = MetadataThenStallBackend()
     store = ConversationStore(tmp_path)
     events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert backend.calls == 2
@@ -1962,7 +1964,7 @@ async def test_retry_after_midstream_request_failed_succeeds(tmp_path: Path) -> 
     store = ConversationStore(tmp_path)
 
     events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert backend.calls == 2
@@ -2025,7 +2027,7 @@ async def test_retry_after_codex_stream_error_retryable(tmp_path: Path) -> None:
             backend,
             ConversationStore(tmp_path),
             skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert backend.calls == 2
@@ -2073,7 +2075,7 @@ async def test_stall_after_partial_tool_call_delta_is_retried(
     backend = PartialToolCallBackend()
     store = ConversationStore(tmp_path)
     events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert backend.calls == 2
@@ -2123,7 +2125,7 @@ async def test_stall_after_text_delta_is_retried_with_reset(
     backend = TextThenStallBackend()
     store = ConversationStore(tmp_path)
     events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert backend.calls == 2
@@ -2165,7 +2167,7 @@ async def test_stall_after_completed_tool_call_is_not_retried(tmp_path: Path) ->
     store = ConversationStore(tmp_path)
 
     events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert backend.calls == 1
@@ -2203,7 +2205,7 @@ async def test_stall_after_completed_parallel_call_is_not_retried(tmp_path: Path
     store = ConversationStore(tmp_path)
 
     events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert backend.calls == 1
@@ -2237,7 +2239,7 @@ async def test_stall_after_two_partial_parallel_calls_is_retried(tmp_path: Path)
     store = ConversationStore(tmp_path)
 
     events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert backend.calls == 2
@@ -2270,7 +2272,7 @@ async def test_stall_after_dispatched_tool_call_is_not_retried(tmp_path: Path) -
             ConversationStore(tmp_path),
             tools={"echo": lambda arguments: executions.append(arguments["value"]) or "ok"},
             skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert executions == ["once"]
@@ -2301,7 +2303,7 @@ async def test_stall_after_approval_request_is_not_retried(tmp_path: Path) -> No
         tools={"echo": lambda arguments: arguments["value"]},
         approval_policy=policy,
         skill_catalog=SkillCatalog.empty(),
-    ).run_turn("start")
+    ).run_turn("start", origin=MessageOrigin.USER)
     events: list[StreamEvent] = []
 
     try:
@@ -2341,7 +2343,7 @@ async def test_no_retry_after_user_abort(tmp_path: Path) -> None:
             backend,
             ConversationStore(tmp_path),
             skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start", abort_signal=signal)
+        ).run_turn("start", origin=MessageOrigin.USER, abort_signal=signal)
     )
 
     assert backend.calls == 1
@@ -2378,7 +2380,7 @@ async def test_abort_during_backoff_keeps_ui_and_store_consistent(
     async def consume() -> None:
         async for event in AgentLoop(
             backend, store, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start", abort_signal=signal):
+        ).run_turn("start", origin=MessageOrigin.USER, abort_signal=signal):
             events.append(event)
             if event.type is StreamEventType.RETRY:
                 retry_seen.set()
@@ -2424,7 +2426,7 @@ async def test_retry_budget_exhausted_fails_with_original_error(tmp_path: Path) 
     store = ConversationStore(tmp_path)
 
     events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert backend.calls == 5
@@ -2461,7 +2463,7 @@ async def test_429_retry_after_honored(tmp_path: Path) -> None:
                 backend,
                 ConversationStore(tmp_path),
                 skill_catalog=SkillCatalog.empty(),
-            ).run_turn("start")
+            ).run_turn("start", origin=MessageOrigin.USER)
         )
 
     sleep.assert_awaited_once_with(1.25)
@@ -2504,7 +2506,7 @@ async def test_child_agent_survives_transient_provider_error(tmp_path: Path) -> 
     store = ConversationStore(tmp_path)
 
     await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert backend.calls == 4
@@ -2579,7 +2581,7 @@ async def test_child_retries_post_stream_even_when_root_serve_client_not_negotia
     loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
     loop.post_stream_provider_retry = False
 
-    events = await collect(loop.run_turn("start"))
+    events = await collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert backend.calls == 4
     result = next(
@@ -2615,7 +2617,7 @@ async def test_provider_error_event_persists_partial_state_and_ends_turn(
             )
 
     store = ConversationStore(tmp_path)
-    events = await collect(AgentLoop(ErrorEventBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    events = await collect(AgentLoop(ErrorEventBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     assert [event.type for event in events][-2:] == [
         StreamEventType.ERROR,
@@ -2644,7 +2646,7 @@ async def test_clean_stream_exit_becomes_provider_failure(tmp_path: Path) -> Non
             )
 
     store = ConversationStore(tmp_path)
-    events = await collect(AgentLoop(IncompleteBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    events = await collect(AgentLoop(IncompleteBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     assert events[-2].type is StreamEventType.ERROR
     assert events[-2].error == ErrorInfo(
@@ -2668,7 +2670,7 @@ async def test_no_output_failure_closes_turn_and_persists_marker(tmp_path: Path)
             yield
 
     store = ConversationStore(tmp_path)
-    await collect(AgentLoop(BrokenBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    await collect(AgentLoop(BrokenBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
     messages = store.messages()
     assert messages[-1].content == []
@@ -2680,7 +2682,7 @@ async def test_no_output_failure_closes_turn_and_persists_marker(tmp_path: Path)
 async def test_failed_child_returns_error_and_sibling_survives(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     events = await collect(
-        AgentLoop(ParallelChildFailureBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("delegate")
+        AgentLoop(ParallelChildFailureBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("delegate", origin=MessageOrigin.USER)
     )
 
     assert events[-1].type is StreamEventType.AGENT_END
@@ -2721,7 +2723,7 @@ async def test_child_setup_failure_does_not_cancel_parallel_sibling(
         await original_ensure(self)
 
     with patch.object(AgentLoop, "_ensure_mcp_servers", fail_first_child):
-        await collect(loop.run_turn("delegate"))
+        await collect(loop.run_turn("delegate", origin=MessageOrigin.USER))
 
     assert "1" in child_ids
     results = [
@@ -2753,7 +2755,7 @@ async def test_thinking_only_nudge_runs_even_at_max_turns(tmp_path: Path) -> Non
             store,
             max_turns=1,
             skill_catalog=SkillCatalog.empty(),
-        ).run_turn("hi")
+        ).run_turn("hi", origin=MessageOrigin.USER)
     )
 
     assert len(backend.calls) == 2
@@ -2786,7 +2788,7 @@ async def test_thinking_only_nudge_runs_even_at_max_turns(tmp_path: Path) -> Non
             empty_store,
             max_turns=1,
             skill_catalog=SkillCatalog.empty(),
-        ).run_turn("hi")
+        ).run_turn("hi", origin=MessageOrigin.USER)
     )
 
     assert len(still_empty.calls) == 2
@@ -2805,7 +2807,7 @@ async def test_thinking_only_reply_is_nudged_once_and_recovers(tmp_path: Path) -
     store = ConversationStore(tmp_path)
 
     await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER)
     )
 
     # The thinking-only reply triggered exactly one extra completion.
@@ -2832,7 +2834,7 @@ async def test_thinking_only_reply_nudged_at_most_once_per_turn(tmp_path: Path) 
     store = ConversationStore(tmp_path)
 
     events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER)
     )
 
     # A second thinking-only reply is not nudged again: no unbounded loop.
@@ -2854,7 +2856,7 @@ async def test_thinking_only_max_tokens_is_not_nudged(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
     events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER)
     )
 
     # Truncated at the output-token limit: surfaced via metadata, not nudged.
@@ -2868,3 +2870,14 @@ async def test_thinking_only_max_tokens_is_not_nudged(tmp_path: Path) -> None:
     assert assistant.role is MessageRole.ASSISTANT
     assert assistant.metadata["stop_reason"] == "max_tokens"
     assert events[-1].type is StreamEventType.AGENT_END
+
+
+def test_run_turn_requires_explicit_origin(tmp_path: Path) -> None:
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path),
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    with pytest.raises(TypeError):
+        loop.run_turn("plain string without origin")  # type: ignore[call-arg]
