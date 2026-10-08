@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, TypeGuard
 
 from ...protocol.types import Message
 
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
 
 CLIENT_DELIVERY_METADATA = "zeta_client_delivery_id"
 MAX_RECENT_CLIENT_DELIVERIES = 1_000
+DELIVERY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 DeliveryMethod = Literal["send", "steer"]
 DeliveryStatus = Literal["queued", "delivered"]
@@ -24,6 +26,35 @@ class ClientDelivery:
     method: DeliveryMethod
     status: DeliveryStatus
     outcome: dict[str, object]
+
+
+def valid_client_delivery_id(value: object) -> TypeGuard[str]:
+    return isinstance(value, str) and DELIVERY_ID_PATTERN.fullmatch(value) is not None
+
+
+def validate_client_delivery_data(
+    data: Mapping[str, object], session_id: str
+) -> None:
+    """Validate one internal record before append or after session load."""
+
+    method = data.get("method")
+    status = data.get("status")
+    outcome = data.get("outcome")
+    valid_outcome = (
+        method == "send"
+        and status == "delivered"
+        and outcome == {"accepted": True, "session_id": session_id}
+    ) or (
+        method == "steer"
+        and status == "queued"
+        and outcome == {"accepted": True}
+    )
+    if (
+        set(data) != {"delivery_id", "method", "status", "outcome"}
+        or not valid_client_delivery_id(data.get("delivery_id"))
+        or not valid_outcome
+    ):
+        raise ValueError("invalid client delivery")
 
 
 class ClientDeliveryMixin:

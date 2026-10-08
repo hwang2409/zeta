@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from typing import TYPE_CHECKING, Any
 
-from ..core.store._client_delivery import tag_client_delivery
+from ..core.store._client_delivery import (
+    tag_client_delivery,
+    valid_client_delivery_id,
+)
 from ..protocol.types import (
     Message,
     MessageOrigin,
@@ -19,9 +21,6 @@ from .protocol import ProtocolError
 
 if TYPE_CHECKING:
     from .server import _Client
-
-DELIVERY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
-
 
 class DeliveryRequests:
     """Own feature gating, persistence, deduplication, and status queries."""
@@ -159,7 +158,7 @@ def _required_string(params: dict[str, Any], name: str) -> str:
 
 def _required_delivery_id(params: dict[str, Any]) -> str:
     value = params.get("delivery_id")
-    if not isinstance(value, str) or DELIVERY_ID_PATTERN.fullmatch(value) is None:
+    if not valid_client_delivery_id(value):
         raise ProtocolError(
             -32602,
             "delivery_id must be 1-128 ASCII letters, digits, '.', '_', ':', or '-'",

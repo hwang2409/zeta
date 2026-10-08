@@ -48,7 +48,7 @@ from ._approval_display import (
     validated_approval_display,
 )
 from ._async_writes import AsyncDurableWritesMixin
-from ._client_delivery import ClientDeliveryMixin
+from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
 from ._incremental_validation import IncrementalValidationMixin
 from ._log import ConversationLogMixin, PersistedAppend
 from ._notifications import NotificationStateMixin
@@ -510,17 +510,7 @@ class ConversationStore(
                 elif view is not None or telemetry is not None:
                     raise ValueError("summary compaction cannot contain an eviction view")
             elif entry.type == "client_delivery":
-                delivery_id = entry.data.get("delivery_id")
-                outcome = entry.data.get("outcome")
-                if (
-                    set(entry.data) != {"delivery_id", "method", "status", "outcome"}
-                    or type(delivery_id) is not str
-                    or not delivery_id
-                    or entry.data.get("method") not in {"send", "steer"}
-                    or entry.data.get("status") not in {"queued", "delivered"}
-                    or type(outcome) is not dict
-                ):
-                    raise ValueError("invalid client delivery")
+                validate_client_delivery_data(entry.data, self.session_id)
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:
                     raise ValueError("warning message must be a string")
