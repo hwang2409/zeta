@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -47,7 +48,7 @@ from .reconciler import (
     _unsafe_reason,
     project_transcript_row,
 )
-from .safety import redact_secrets
+from .safety import contains_secret, redact_secrets
 
 if TYPE_CHECKING:
     from zeta.project_registry import ProjectRegistry
@@ -64,6 +65,7 @@ _MAX_OPERATIONS = 64
 _MAX_PROPOSED_TEXT_BYTES = 24 * 1024
 _MAX_REASON_BYTES = 1024
 _COMPLETION_KINDS = frozenset({"state", "backlog", "threads", "commitments"})
+_CODE_LITERAL = re.compile(r"`([^`\\n]{1,256})`")
 _HIGHEST_PRIORITY_WORDS = (
     "correction",
     "actually",
@@ -525,6 +527,27 @@ def _target_kind(state: MemoryState, target: str) -> str:
     return entry.kind if isinstance(entry, MemoryEntry) else ""
 
 
+def _cited_code_literals(
+    operation: MemoryOperation, transcript: Transcript
+) -> tuple[str, ...]:
+    sources = getattr(operation, "sources", ())
+    ranges = tuple((source.seq_start, source.seq_end) for source in sources)
+    if not ranges:
+        return ()
+    literals: list[str] = []
+    for row in _rendered_transcript_rows(transcript):
+        seq = row.get("seq")
+        if type(seq) is not int or not any(start <= seq <= end for start, end in ranges):
+            continue
+        encoded = json.dumps(row, ensure_ascii=False)
+        literals.extend(
+            literal
+            for literal in _CODE_LITERAL.findall(encoded)
+            if not contains_secret(literal)
+        )
+    return tuple(dict.fromkeys(literals))
+
+
 def _parse(
     raw_text: str, state: MemoryState, transcript: Transcript, now: str
 ) -> tuple[_ParsedOperation, ...]:
@@ -554,6 +577,20 @@ def _parse(
             text = getattr(operation.operation, "text", None)
             if isinstance(text, str):
                 text_bytes += len(text.encode())
+                missing_literals = tuple(
+                    literal
+                    for literal in _cited_code_literals(
+                        operation.operation, transcript
+                    )
+                    if literal not in text
+                )
+                if missing_literals:
+                    raise _ProposalError(
+                        (
+                            f"operations[{index}].text omits cited exact code literal(s): "
+                            + ", ".join(missing_literals),
+                        )
+                    )
             parsed.append(operation)
         except _ProposalError as exc:
             errors.extend(exc.errors)

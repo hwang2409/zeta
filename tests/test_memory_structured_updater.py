@@ -307,6 +307,32 @@ async def test_repair_receives_indexed_validation_errors(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_repair_preserves_exact_cited_code_literals(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    result, prompts = await _run(
+        registry,
+        project_id,
+        _transcript(_row(1, "Use opaque token `PROC-QUARTZ-8N3F`.")),
+        [
+            _proposal(_add("decisions", "Use the validated opaque token.")),
+            _proposal(
+                _add(
+                    "decisions",
+                    "The validated token is PROC-QUARTZ-8N3F.",
+                )
+            ),
+        ],
+        key="exact-code-literal",
+    )
+    assert len(prompts) == 2
+    assert "omits cited exact code literal" in prompts[1]
+    assert result.changed_entry_ids
+    assert next(iter(_entries(registry, project_id))).text == (
+        "The validated token is PROC-QUARTZ-8N3F."
+    )
+
+
+@pytest.mark.asyncio
 async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -> None:
     registry, project_id = _registry(tmp_path)
     initial = registry._entry_memory_state(project_id)
