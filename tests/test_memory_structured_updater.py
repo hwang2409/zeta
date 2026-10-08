@@ -333,6 +333,30 @@ async def test_repair_preserves_exact_cited_code_literals(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_exact_literal_validation_ignores_cited_tool_output(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    operation = _add(
+        "decisions",
+        "The validated token is PROC-QUARTZ-8N3F.",
+    )
+    operation["sources"] = [{"seq_start": 1, "seq_end": 2}]
+    result, prompts = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(1, "The validated token is `PROC-QUARTZ-8N3F`."),
+            _row(2, "Write `value` in the output.", origin="tool_output", role="tool"),
+        ),
+        [_proposal(operation)],
+        key="ignore-tool-code-literal",
+    )
+    assert len(prompts) == 1
+    assert result.changed_entry_ids
+
+
+@pytest.mark.asyncio
 async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -> None:
     registry, project_id = _registry(tmp_path)
     initial = registry._entry_memory_state(project_id)

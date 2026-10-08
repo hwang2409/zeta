@@ -544,9 +544,13 @@ def _cited_code_literals(
     if not ranges:
         return ()
     literals: list[str] = []
-    for row in _rendered_transcript_rows(transcript):
+    for row in transcript.rows:
         seq = row.get("seq")
-        if type(seq) is not int or not any(start <= seq <= end for start, end in ranges):
+        if (
+            type(seq) is not int
+            or not _is_user_authored_row(row)
+            or not any(start <= seq <= end for start, end in ranges)
+        ):
             continue
         encoded = json.dumps(row, ensure_ascii=False)
         literals.extend(
