@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+from pathlib import Path
+
+import pytest
+
+from zeta.memory.entry_store import (
+    AddOperation,
+    MemoryEntry,
+    MemorySource,
+    UpdateOperation,
+)
+from zeta.memory.migration import migrate_format_one, reverse_migration
+from zeta.memory.profiles import memory_profile
+from zeta.project_errors import ProjectRegistryError
+from zeta.project_memory_history import PROJECT_MEMORY_FILES
+from zeta.project_registry import ProjectRegistry
+from zeta.remote_sync import LocalTransport, push_project_memory, resolve_project_memory
+from zeta.remote_sync.errors import RemoteSyncError
+
+
+def _source(seq: int = 1) -> tuple[MemorySource, ...]:
+    return (
+        MemorySource(
+            session_id="fixture",
+            seq_start=seq,
+            seq_end=seq,
+            origins=("user",),
+            observed_at=f"2026-10-08T00:00:{seq:02d}Z",
+            evidence_rank=6,
+        ),
+    )
+
+
+def _fixture(home: Path, workspace: Path) -> tuple[ProjectRegistry, str]:
+    workspace.mkdir(parents=True)
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("test", "test", workspace)
+    registry.initialize_memory(project.project_id)
+    registry._create_entry_memory_for_test(project.project_id, memory_profile("zeta"))
+    return registry, project.project_id
+
+
+def _add(registry: ProjectRegistry, project_id: str, text: str, seq: int = 1) -> str:
+    before = registry._entry_memory_state(project_id)
+    result = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=before.digest,
+        operations=(AddOperation("state", text, _source(seq)),),
+        reconciliation_key=None,
+    )
+    return result.receipts[0].result_ids[0]
+
+
+def _active_texts(registry: ProjectRegistry, project_id: str) -> set[str]:
+    state = registry._entry_memory_state(project_id).state
+    return {
+        entry.text
+        for entry in state.entries.values()
+        if isinstance(entry, MemoryEntry) and entry.status == "active"
+    }
+
+
+def test_entry_sync_merges_independent_additions(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    registry, project_id = _fixture(first, tmp_path / "workspace")
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+
+    _add(registry, project_id, "local addition", 1)
+    _add(ProjectRegistry(second / "projects"), project_id, "remote addition", 2)
+
+    result = push_project_memory(first, LocalTransport(second), project_id=project_id)
+
+    assert result.conflicts == ()
+    assert _active_texts(registry, project_id) == {"local addition", "remote addition"}
+    assert _active_texts(ProjectRegistry(second / "projects"), project_id) == {
+        "local addition",
+        "remote addition",
+    }
+
+
+def test_entry_sync_conflicts_concurrent_same_id_edits(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    registry, project_id = _fixture(first, tmp_path / "workspace")
+    entry_id = _add(registry, project_id, "base", 1)
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    remote_registry = ProjectRegistry(second / "projects")
+
+    for owner, text, seq in ((registry, "local edit", 2), (remote_registry, "remote edit", 3)):
+        before = owner._entry_memory_state(project_id)
+        owner._compare_and_swap_entries(
+            project_id,
+            expected_digest=before.digest,
+            operations=(UpdateOperation(entry_id, _source(seq), text=text),),
+            reconciliation_key=None,
+        )
+
+    result = push_project_memory(first, LocalTransport(second), project_id=project_id)
+    assert result.conflicts == (entry_id,)
+    assert _active_texts(registry, project_id) == {"local edit"}
+    assert _active_texts(remote_registry, project_id) == {"remote edit"}
+
+    resolved = resolve_project_memory(
+        first, LocalTransport(second), project_id=project_id, accept="local"
+    )
+    assert resolved.conflicts == ()
+    assert _active_texts(registry, project_id) == {"local edit"}
+    assert _active_texts(remote_registry, project_id) == {"local edit"}
+
+
+def test_entry_sync_propagates_status_and_conflicts_schema(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    registry, project_id = _fixture(first, tmp_path / "workspace")
+    entry_id = _add(registry, project_id, "open", 1)
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    remote_registry = ProjectRegistry(second / "projects")
+
+    before = registry._entry_memory_state(project_id)
+    from zeta.memory.entry_store import ResolveOperation
+
+    registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=before.digest,
+        operations=(ResolveOperation(entry_id, _source(2)),),
+        reconciliation_key=None,
+    )
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    remote_entry = remote_registry._entry_memory_state(project_id).state.entries[entry_id]
+    assert isinstance(remote_entry, MemoryEntry)
+    assert remote_entry.status == "resolved"
+
+    # A schema is one merge unit. Concurrent revisions must not blend kind meanings.
+    local = registry._entry_memory_state(project_id)
+    remote = remote_registry._entry_memory_state(project_id)
+    registry._replace_entry_state_for_test(
+        project_id,
+        dataclasses.replace(local.state, schema=dataclasses.replace(local.state.schema, version=4)),
+        expected_digest=local.digest,
+    )
+    remote_registry._replace_entry_state_for_test(
+        project_id,
+        dataclasses.replace(remote.state, schema=dataclasses.replace(remote.state.schema, version=5)),
+        expected_digest=remote.digest,
+    )
+    result = push_project_memory(first, LocalTransport(second), project_id=project_id)
+    assert result.conflicts == ("schema",)
+
+
+def test_entry_sync_transport_cas_rejects_changed_destination(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    remote = tmp_path / "remote"
+    registry, project_id = _fixture(home, tmp_path / "workspace")
+    push_project_memory(home, LocalTransport(remote), project_id=project_id)
+
+    class RacingTransport(LocalTransport):
+        def publish_project(self, project_id: str, snapshot: Path, *, expected_digest: str) -> None:
+            _add(ProjectRegistry(self.home / "projects"), project_id, "raced", 4)
+            super().publish_project(project_id, snapshot, expected_digest=expected_digest)
+
+    _add(registry, project_id, "source", 3)
+    with pytest.raises(RemoteSyncError, match="changed"):
+        push_project_memory(home, RacingTransport(remote), project_id=project_id)
+
+
+def test_entry_sync_refuses_mixed_formats_without_mutation(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    registry, project_id = _fixture(first, tmp_path / "workspace")
+    legacy = ProjectRegistry(second / "projects")
+    workspace = tmp_path / "legacy-workspace"
+    workspace.mkdir()
+    legacy_project = legacy.create_project("test", "test", workspace)
+    assert legacy_project.project_id != project_id
+    # Copy project metadata under the same fixture ID, but retain format 1 memory.
+    source_record = first / "projects" / project_id / "project.json"
+    target = second / "projects" / project_id
+    target.mkdir(mode=0o700)
+    (target / "project.json").write_bytes(source_record.read_bytes())
+    (target / "memory").mkdir(mode=0o700)
+
+    before = hashlib.sha256(b"".join(path.read_bytes() for path in sorted(target.rglob("*")) if path.is_file())).hexdigest()
+    with pytest.raises(RemoteSyncError, match="mixed.*migration|required",):
+        push_project_memory(first, LocalTransport(second), project_id=project_id)
+    after = hashlib.sha256(b"".join(path.read_bytes() for path in sorted(target.rglob("*")) if path.is_file())).hexdigest()
+    assert after == before
+
+
+def _legacy_fixture(tmp_path: Path) -> tuple[ProjectRegistry, str, dict[str, str]]:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("test", "test", workspace)
+    contents = {
+        name: f"# {name}\n\nExact {name} body.\n" if index != 2 else ""
+        for index, name in enumerate(PROJECT_MEMORY_FILES)
+    }
+    registry.update_memory(project.project_id, contents)
+    return registry, project.project_id, contents
+
+
+def test_legacy_five_file_migration_round_trips_exactly(tmp_path: Path) -> None:
+    registry, project_id, contents = _legacy_fixture(tmp_path)
+    source = registry.memory_snapshot(project_id)
+    plan = migrate_format_one(
+        project_id=project_id,
+        contents=source.contents,
+        source_digest=source.digest,
+        source_version=registry.memory_state(project_id).version,
+        migrated_at="2026-10-08T12:00:00Z",
+    )
+    assert plan.rendered_mirrors == contents
+    assert reverse_migration(plan) == contents
+    assert migrate_format_one(
+        project_id=project_id,
+        contents=source.contents,
+        source_digest=source.digest,
+        source_version=registry.memory_state(project_id).version,
+        migrated_at="2026-10-08T12:00:00Z",
+    ) == plan
+
+
+def test_migration_rollback_restores_format_one_pointer(tmp_path: Path) -> None:
+    registry, project_id, contents = _legacy_fixture(tmp_path)
+    before_version = registry.memory_state(project_id).version
+
+    migrated = registry._migrate_memory_for_test(
+        project_id, migrated_at="2026-10-08T12:00:00Z"
+    )
+    assert registry.memory_format(project_id) == 2
+    assert migrated.source_version == before_version
+    assert registry._migrate_memory_for_test(
+        project_id, migrated_at="2026-10-09T12:00:00Z"
+    ) == migrated
+
+    registry._rollback_memory_migration_for_test(project_id)
+    assert registry.memory_format(project_id) == 1
+    assert registry.memory_state(project_id).version == before_version
+    assert registry.memory_snapshot(project_id).contents == contents
+
+
+def test_migration_engine_is_dormant_from_public_paths(tmp_path: Path) -> None:
+    registry, project_id, _ = _legacy_fixture(tmp_path)
+    assert registry.memory_format(project_id) == 1
+    assert not hasattr(registry, "migrate_memory")
+    assert not hasattr(registry, "rollback_memory_migration")
+    with pytest.raises(ProjectRegistryError):
+        registry.import_memory(project_id, object(), expected_digest="0" * 64)  # type: ignore[arg-type]
+    assert registry.memory_format(project_id) == 1
