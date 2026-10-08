@@ -1,9 +1,9 @@
-"""Scripted offline provider for ``--provider fake`` with ``ZETA_FAKE_SCRIPT``.
+"""Scripted offline provider for ``--provider codex`` with ``ZETA_FAKE_SCRIPT``.
 
 The script is a JSON file. It maps user messages to a list of model responses.
 Tool calls in a response go through the normal agent loop, so the tool
 registry, the approval policy, and the allowlist apply exactly as they do for a
-network provider. See ``docs/fake-provider.md`` for the format.
+network provider. Its fixtures define the test-only script format.
 
 The backend is stateless: it finds the last user message in the request and
 counts the assistant messages after it to select the next response. Replays of
@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..protocol.types import (
+from zeta.protocol.types import (
     CompletionBackend,
     ContentBlock,
     ErrorInfo,

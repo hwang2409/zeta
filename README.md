@@ -2,7 +2,7 @@
 
 Zeta is a terminal agent harness. It owns the agent loop, conversation state,
 context management, tool dispatch, approvals, session persistence, and provider
-connections for Claude, Codex, Ollama, and a fake provider.
+connections for Claude, Codex, and Ollama.
 
 ## Install and first run
 
@@ -17,7 +17,7 @@ Log in to a provider, then start the TUI:
 ```sh
 zeta login                  # Anthropic OAuth
 zeta login --provider codex # or Codex OAuth
-zeta
+zeta --provider claude
 ```
 
 Use `zeta --help` for the complete list of options and subcommands.
@@ -74,7 +74,6 @@ directory.
 - [Attention panel](docs/attention-panel.md)
 - [Automations](docs/automations.md)
 - [Design notes](docs/design.md)
-- [Fake provider](docs/fake-provider.md)
 - [MCP management](docs/mcp-management.md)
 - [Ollama](docs/ollama.md)
 - [Project inbox](docs/project-inbox.md)

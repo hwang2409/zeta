@@ -30,19 +30,42 @@ def test_eval_grades_artifacts_not_model_claims(tmp_path: Path) -> None:
     assert _check(tmp_path, {}, {"path": "result.txt", "nonempty_lines": ["correct"]}) is None
 
 
-def test_eval_replays_pinned_zeta_checkout(tmp_path: Path) -> None:
+def test_eval_replays_pinned_zeta_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ScriptedProcess:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            del timeout
+            return '{"type":"message","role":"assistant","text":"done"}\n', ""
+
     ref = subprocess.check_output(
         ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True
     ).strip()
-    result = eval_run.run_task(
-        {
-            "id": "pinned",
-            "git_ref": ref,
-            "prompt": "hello",
-            "checks": [{"command": ["git", "rev-parse", "HEAD"], "stdout": ref + "\n"}],
-        },
-        provider="fake", model="fake", timeout=20, keep_workspaces=tmp_path,
-    )
+    original_popen = subprocess.Popen
+
+    def start(command: list[str], *args: object, **kwargs: object):
+        if "zeta" in Path(command[0]).name:
+            return ScriptedProcess()
+        return original_popen(command, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(eval_run.subprocess, "Popen", start)
+        result = eval_run.run_task(
+            {
+                "id": "pinned",
+                "git_ref": ref,
+                "prompt": "hello",
+                "checks": [
+                    {"command": ["git", "rev-parse", "HEAD"], "stdout": ref + "\n"}
+                ],
+            },
+            provider="codex",
+            model="gpt-5.6-luna",
+            timeout=20,
+            keep_workspaces=tmp_path,
+        )
     assert result["passed"] is True
     saved = Path(result["saved_workspace"])
     assert saved.is_dir()
@@ -51,7 +74,7 @@ def test_eval_replays_pinned_zeta_checkout(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="full lowercase commit SHA"):
         eval_run.run_task(
             {"id": "invalid", "git_ref": "HEAD", "prompt": "hello", "checks": []},
-            provider="fake", model="fake", timeout=20,
+            provider="codex", model="gpt-5.6-luna", timeout=20,
         )
 
 

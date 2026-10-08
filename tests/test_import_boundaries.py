@@ -156,6 +156,25 @@ def test_websearch_import_does_not_load_providers() -> None:
     assert result.stdout.strip() == "[]"
 
 
+def test_production_does_not_import_test_backends() -> None:
+    violations: list[str] = []
+    for file_path in ROOT.rglob("*.py"):
+        if "tests" in file_path.relative_to(ROOT).parts:
+            continue
+        tree = ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            else:
+                continue
+            if any(name == "tests" or name.startswith("tests.") for name in names):
+                violations.append(f"{file_path.relative_to(ROOT)}:{node.lineno}")
+
+    assert not violations, "production imports test code:\n" + "\n".join(violations)
+
+
 def test_import_boundaries() -> None:
     violations = [
         violation

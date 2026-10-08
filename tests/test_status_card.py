@@ -10,7 +10,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 from rich.text import Text
 
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.skills import SkillCatalog
@@ -43,7 +43,7 @@ async def test_status_card_open_close_preserves_composer_and_transcript(
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
     )
@@ -112,7 +112,7 @@ async def test_status_card_render_is_centered_and_bounded(tmp_path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
     )
@@ -134,7 +134,7 @@ async def test_status_card_small_terminal_scrolls_and_clamps(tmp_path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
     )

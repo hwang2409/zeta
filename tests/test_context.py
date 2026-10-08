@@ -21,7 +21,7 @@ from zeta.context_accounting import (
     compact_json_chunks,
     compact_json_length,
 )
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.providers.anthropic import build_messages_payload
 from zeta.providers.codex_errors import CodexStreamError

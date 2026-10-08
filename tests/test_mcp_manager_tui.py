@@ -13,7 +13,7 @@ from prompt_toolkit.shortcuts import radiolist_dialog as real_radiolist_dialog
 from prompt_toolkit.shortcuts import yes_no_dialog as real_yes_no_dialog
 from rich.console import Console
 
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.mcp.management import ManagedServer, MCPManagementService
 from zeta.runtime.loop import AgentLoop
@@ -37,7 +37,7 @@ async def test_slash_mcp_opens_primary_tui_manager(tmp_path):
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
     app = TUIApp(
-        loop, provider="fake", model="offline",
+        loop, provider="codex", model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=tmp_path / "home",
     )
@@ -87,7 +87,7 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
     app = TUIApp(
-        loop, provider="fake", model="offline",
+        loop, provider="codex", model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=tmp_path / "home",
     )
@@ -168,7 +168,7 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monke
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
     app = TUIApp(
-        loop, provider="fake", model="offline",
+        loop, provider="codex", model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=tmp_path / "home",
     )
@@ -252,7 +252,7 @@ async def test_wizard_cancelled_before_first_run_resets_state(tmp_path, monkeypa
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
-    app = TUIApp(loop, provider="fake", model="offline", zeta_home=tmp_path / "home")
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home")
     app._mcp_manager_open = True
 
     async def wizard():
@@ -278,7 +278,7 @@ async def test_wizard_exception_resets_state(tmp_path, monkeypatch):
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
-    app = TUIApp(loop, provider="fake", model="offline", zeta_home=tmp_path / "home")
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home")
     app._mcp_manager_open = True
 
     async def wizard():
@@ -301,7 +301,7 @@ async def test_second_add_key_ignored_while_wizard_active(tmp_path, monkeypatch)
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
-    app = TUIApp(loop, provider="fake", model="offline", zeta_home=tmp_path / "home")
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home")
     app._mcp_manager_open = True
     gate = asyncio.Event()
     started = 0
@@ -330,7 +330,7 @@ async def test_app_close_cancels_running_wizard(tmp_path, monkeypatch):
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
-    app = TUIApp(loop, provider="fake", model="offline", zeta_home=tmp_path / "home")
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home")
     app._mcp_manager_open = True
     cancelled = asyncio.Event()
 

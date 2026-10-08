@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
-from ..protocol.types import (
+from zeta.protocol.types import (
     CompletionBackend,
     Message,
     MessageRole,
@@ -42,7 +42,7 @@ class FakeInteractiveBackend(CompletionBackend):
                 break
         response = (
             f"you said: {prompt}\n\n"
-            "the fake provider is streaming this response offline.\n"
+            "the scripted test backend is streaming this response offline.\n"
             "try queueing another message while this turn runs."
         )
         yield StreamEvent(StreamEventType.MESSAGE_START)

@@ -29,7 +29,7 @@ def _manager_with_prompt(
 ) -> tuple[SessionManager, str]:
     manager = SessionManager(home)
     opened = manager.create(
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=cwd,
         system_prompt=system_prompt,

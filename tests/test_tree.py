@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -28,7 +28,7 @@ from zeta.tui.app import TUIApp
 def _make_tui(store: ConversationStore) -> TUIApp:
     return TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(
             file=StringIO(), force_terminal=True, color_system="truecolor"

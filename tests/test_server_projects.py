@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend
 from tests.test_server import _close, _connect, _request, _socket_path
-from zeta.core.fake import FakeBackend
 from zeta.project_inbox import ProjectInbox, ProjectInboxScanner
 from zeta.project_registry import ProjectRegistry
 from zeta.server import ZetaServer
@@ -21,7 +21,7 @@ def _server(tmp_path: Path) -> ZetaServer:
     return ZetaServer(
         home=tmp_path / "home",
         cwd=cwd,
-        provider="fake",
+        provider="codex",
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
     )
@@ -377,16 +377,16 @@ async def test_list_sessions_filters_project_and_keeps_lineage(tmp_path: Path) -
     project = registry.create_project("alpha", "repo")
     other = registry.create_project("beta", "repo")
     parent = server.runtime.manager.create(
-        provider="fake", model="offline", cwd=server.runtime.cwd, project_id=project.project_id,
+        provider="codex", model="offline", cwd=server.runtime.cwd, project_id=project.project_id,
         project_role="orchestrator", name="parent", auto_project=False,
     )
     child = server.runtime.manager.create(
-        provider="fake", model="offline", cwd=server.runtime.cwd, project_id=project.project_id,
+        provider="codex", model="offline", cwd=server.runtime.cwd, project_id=project.project_id,
         project_role="worker", parent_session_id=parent.metadata.session_id,
         name="child", auto_project=False,
     )
     server.runtime.manager.create(
-        provider="fake", model="offline", cwd=server.runtime.cwd, project_id=other.project_id,
+        provider="codex", model="offline", cwd=server.runtime.cwd, project_id=other.project_id,
         project_role="session", auto_project=False,
     )
     parent.store.close()

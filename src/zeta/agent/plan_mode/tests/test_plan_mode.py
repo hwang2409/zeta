@@ -8,11 +8,11 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.plan_mode import PLAN_MODE_PREAMBLE, PLAN_MODE_TOOLS, plan_mode_messages
 from zeta.cli.main import build_parser
 from zeta.config.tool_policy import ToolPolicy
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.model_input import ModelInputEnvelope
@@ -52,7 +52,7 @@ def build_app(tmp_path: Path, turns: list[ScriptedTurn]):
 
     return TUIApp(
         build_loop(tmp_path, turns),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
     )
@@ -613,7 +613,7 @@ def test_yolo_has_no_plan_mode_approval_flow(
 ) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
     app = create_app(
-        build_parser().parse_args(["--provider", "fake", "--yolo"])
+        build_parser().parse_args(["--provider", "codex", "--yolo"])
     )
     policy = app.loop.tool_registry.approval_policy
     assert policy is not None
@@ -624,7 +624,7 @@ def test_status_command_reports_plan_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     assert "plan_mode: off" in dispatch(app, "/status")
     app.loop.set_plan_mode(True)
     assert "plan_mode: on" in dispatch(app, "/status")
@@ -635,14 +635,14 @@ def test_plan_mode_persists_and_restores_session_metadata(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     app.loop.set_plan_mode(True)
     session_id = app.loop.store.session_id
     metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
     assert metadata["plan_mode"] is True
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     assert resumed.loop.plan_mode is True
 

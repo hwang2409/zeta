@@ -52,7 +52,6 @@ markers = [
 "src/zeta/__init__.py" = ["I001", "RUF022"]
 "src/zeta/cli/main.py" = ["BLE001"]
 "src/zeta/core/context.py" = ["I001"]
-"src/zeta/core/fake.py" = ["UP035"]
 "src/zeta/core/hooks.py" = ["BLE001", "I001", "UP041"]
 "src/zeta/core/login_flow.py" = ["I001", "UP041", "UP046", "UP047"]
 "src/zeta/core/loop.py" = ["F822", "I001"]

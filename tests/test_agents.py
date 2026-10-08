@@ -6,9 +6,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent import runner as agent_runner
 from zeta.core.abort import AbortGenerationRegistry
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.media.image_policy import ANTHROPIC_IMAGE_POLICY, CODEX_IMAGE_POLICY
@@ -160,7 +160,7 @@ def test_session_metadata_restores_agent_snapshot(tmp_path: Path) -> None:
     _write_agent(home / "agents" / "custom.md", "custom", "custom", "body")
     catalog = discover_session_agents(home=home)
     opened = SessionManager(home).create(
-        provider="fake",
+        provider="codex",
         model="fake",
         cwd=tmp_path,
         skill_catalog=SkillCatalog.empty(),
@@ -180,7 +180,7 @@ async def test_unattended_runtime_uses_packaged_agents_only(tmp_path: Path) -> N
     _write_agent(home / "agents" / "custom.md", "custom", "custom", "body")
     custom_catalog = discover_session_agents(home=home)
     session = SessionManager(home).create(
-        provider="fake",
+        provider="codex",
         model="fake",
         cwd=tmp_path,
         skill_catalog=SkillCatalog.empty(),

@@ -91,12 +91,10 @@ def load_hooks(home: str | Path, *, enabled: bool = True) -> HookManager:
 
 
 def load_hooks_for_provider(home: str | Path, provider: str) -> HookManager:
-    """Keep fake-provider smoke runs isolated from the real hook home."""
+    """Load hooks for a provider-backed session."""
 
-    return load_hooks(
-        home,
-        enabled=provider != "fake" or "ZETA_HOME" in os.environ,
-    )
+    del provider
+    return load_hooks(home)
 
 
 def _parse_hooks(document: object, path: Path) -> tuple[Hook, ...]:
