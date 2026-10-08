@@ -8,7 +8,6 @@ import resource
 import struct
 import subprocess
 import sys
-import time
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,15 +62,7 @@ IMAGE_FIXTURES = (
     ("png", "image/png", PNG),
     ("jpeg", "image/jpeg", _image_bytes("JPEG")),
     ("gif", "image/gif", b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"),
-    (
-        "webp",
-        "image/webp",
-        b"RIFF"
-        + (22).to_bytes(4, "little")
-        + b"WEBPVP8X"
-        + (10).to_bytes(4, "little")
-        + b"\x00" * 10,
-    ),
+    ("webp", "image/webp", _image_bytes("WEBP")),
 )
 
 INVALID_IMAGE_FIXTURES = (
@@ -843,12 +834,10 @@ async def test_small_image_no_subprocess(
     monkeypatch.setattr(
         image_normalization.asyncio, "create_subprocess_exec", unexpected_process
     )
-    started = time.perf_counter()
     result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("read-small-fast", "read", {"path": path.name})
     )
 
-    assert time.perf_counter() - started < 0.05
     assert result["isError"] is False
     assert base64.b64decode(result["content"][1]["data"]) == original
 

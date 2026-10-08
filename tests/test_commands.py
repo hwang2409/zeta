@@ -1026,11 +1026,11 @@ async def test_inline_shell_approval_covers_the_complete_batch(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_preprocessing_timing_cannot_reorder_provider_submissions(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
-    _write_command(home / "commands", "first", "first !`sleep 0.15; printf first`")
-    _write_command(home / "commands", "second", "second !`printf second`")
-    _write_command(home / "commands", "third", "third !`sleep 0.03; printf third`")
+    for name in ("first", "second", "third"):
+        _write_command(home / "commands", name, f"{name} !`controlled`")
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ALLOW)
     backend = FakeBackend(
@@ -1049,17 +1049,41 @@ async def test_preprocessing_timing_cannot_reorder_provider_submissions(
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    app._input_loop_active = True
+    started = {name: asyncio.Event() for name in ("first", "second", "third")}
+    release = {name: asyncio.Event() for name in ("first", "second", "third")}
+    submission_ids: dict[str, int] = {}
 
-    await asyncio.gather(
-        *(app._handle_prompt_value(f"/{name}") for name in ("first", "second", "third"))
+    async def controlled_preprocessing(submission, _commands, _signal):
+        name = submission.text.removeprefix("/")
+        submission_ids[name] = submission.id
+        started[name].set()
+        await release[name].wait()
+        return (name,)
+
+    monkeypatch.setattr(
+        app._submissions, "_resolve_inline_shell", controlled_preprocessing
     )
-    # Provider submission runs in background tasks; allow slow CI runners time
-    # to finish all three submissions before asserting their ordering.
-    for _ in range(1000):
-        if len(backend.calls) == 3:
-            break
-        await asyncio.sleep(0.01)
+    submissions = [
+        asyncio.create_task(app._submissions.submit_text(f"/{name}", steer=False))
+        for name in ("first", "second", "third")
+    ]
+    await asyncio.gather(*(event.wait() for event in started.values()))
+
+    release["second"].set()
+    release["third"].set()
+    await asyncio.gather(
+        *(
+            app._submissions.preprocessing_tasks[submission_ids[name]]
+            for name in ("second", "third")
+        )
+    )
+    assert backend.calls == []
+
+    release["first"].set()
+    await asyncio.gather(*submissions)
+    provider_task = app._submissions.provider_task
+    assert provider_task is not None
+    await provider_task
 
     user_texts = [
         next(
