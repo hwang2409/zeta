@@ -3,7 +3,7 @@
 The script is a JSON file. It maps user messages to a list of model responses.
 Tool calls in a response go through the normal agent loop, so the tool
 registry, the approval policy, and the allowlist apply exactly as they do for a
-network provider. See ``docs/fake-provider.md`` for the format.
+network provider. Its fixtures define the test-only script format.
 
 The backend is stateless: it finds the last user message in the request and
 counts the assistant messages after it to select the next response. Replays of

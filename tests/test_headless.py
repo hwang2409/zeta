@@ -117,15 +117,15 @@ def test_print_mode_runs_session_hook_inside_async_activation(
     )
     environment = os.environ.copy()
     environment["ZETA_HOME"] = str(home)
-    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1]) + os.pathsep + str(Path(__file__).parents[1] / "src")
 
     result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            "from zeta.cli.main import main; raise SystemExit(main())",
+            "-m",
+            "tests.support.scripted_cli",
             "--provider",
-            "fake",
+            "codex",
             "-p",
             "hello",
         ],
@@ -157,15 +157,15 @@ def test_restricted_session_disables_command_hooks_by_default(
     )
     environment = os.environ.copy()
     environment["ZETA_HOME"] = str(home)
-    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1]) + os.pathsep + str(Path(__file__).parents[1] / "src")
 
     result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            "from zeta.cli.main import main; raise SystemExit(main())",
+            "-m",
+            "tests.support.scripted_cli",
             "--provider",
-            "fake",
+            "codex",
             *policy_args,
             "-p",
             "hello",
@@ -194,15 +194,15 @@ def test_allow_hooks_explicitly_enables_hooks_in_restricted_session(
     )
     environment = os.environ.copy()
     environment["ZETA_HOME"] = str(home)
-    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1]) + os.pathsep + str(Path(__file__).parents[1] / "src")
 
     result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            "from zeta.cli.main import main; raise SystemExit(main())",
+            "-m",
+            "tests.support.scripted_cli",
             "--provider",
-            "fake",
+            "codex",
             "--tools",
             "computer__*",
             "--allow-hooks",
@@ -812,7 +812,7 @@ async def test_json_mode_surfaces_error_event(tmp_path: Path) -> None:
     assert "max_turns" in err
 
 
-def test_cli_headless_fake_provider_writes_final_text_to_stdout(
+def test_cli_headless_scripted_provider_writes_final_text_to_stdout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

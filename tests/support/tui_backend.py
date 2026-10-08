@@ -42,7 +42,7 @@ class FakeInteractiveBackend(CompletionBackend):
                 break
         response = (
             f"you said: {prompt}\n\n"
-            "the fake provider is streaming this response offline.\n"
+            "the scripted test backend is streaming this response offline.\n"
             "try queueing another message while this turn runs."
         )
         yield StreamEvent(StreamEventType.MESSAGE_START)

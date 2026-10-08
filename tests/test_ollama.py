@@ -60,6 +60,11 @@ async def _captured_num_ctx(backend: OllamaBackend) -> int:
     return payloads[0]["options"]["num_ctx"]
 
 
+@pytest.fixture(autouse=True)
+def _use_real_ollama_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ZETA_TEST_SCRIPTED_PROVIDER")
+
+
 class _ClosingStream(httpx.AsyncByteStream):
     def __init__(
         self, stream: httpx.AsyncByteStream, transport: _LoopbackAsyncHTTPTransport
@@ -677,6 +682,7 @@ async def test_interactive_composition_resolves_ollama_endpoint_centrally(
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=6_000,
+    default_provider="codex",
     )
     builder_kwargs: dict[str, object] = {}
 
@@ -727,6 +733,7 @@ async def test_interactive_ollama_budget_is_identical_everywhere(
         cli_model="qwen3:4b",
         cli_yolo=None,
         cli_token_budget=requested_budget,
+    default_provider="codex",
     )
     manager = SessionManager(home)
     composition = compose_runtime(
@@ -776,6 +783,7 @@ async def test_resumed_ollama_budget_is_reconciled_everywhere(
         cli_model="qwen3:4b",
         cli_yolo=None,
         cli_token_budget=None,
+    default_provider="codex",
     )
     composition = compose_runtime(
         home=home,

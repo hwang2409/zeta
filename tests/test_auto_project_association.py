@@ -5,6 +5,7 @@ import logging
 import multiprocessing
 import os
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -718,10 +719,28 @@ def test_real_cli_no_session_does_not_create_project(tmp_path: Path) -> None:
         "HOME": str(user_home),
         "ZETA_HOME": str(home),
         "ZETA_TESTING": "1",
+        "PYTHONPATH": os.pathsep.join(
+            filter(
+                None,
+                (
+                    str(Path(__file__).parents[1]),
+                    os.environ.get("PYTHONPATH"),
+                ),
+            )
+        ),
     }
 
     result = subprocess.run(
-        ["zeta", "--provider", "codex", "--no-session", "--print", "hello"],
+        [
+            sys.executable,
+            "-m",
+            "tests.support.scripted_cli",
+            "--provider",
+            "codex",
+            "--no-session",
+            "--print",
+            "hello",
+        ],
         cwd=root,
         env=env,
         capture_output=True,

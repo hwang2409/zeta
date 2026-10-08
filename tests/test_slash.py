@@ -1168,7 +1168,7 @@ async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> N
         await run_task
 
     assert "session_id:" in output.getvalue()
-    assert "provider: fake" in output.getvalue()
+    assert "provider: codex" in output.getvalue()
     assert backend.calls == []
 
 

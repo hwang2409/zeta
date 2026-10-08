@@ -265,6 +265,7 @@ def _create_app_with_root(
             cli_disallowed_tools=getattr(args, "disallowed_tools", None),
             cli_allow_hooks=getattr(args, "allow_hooks", None),
             cli_auto_memory=getattr(args, "auto_memory", None),
+            default_provider=metadata.provider if resuming else None,
         )
     except SettingsError as exc:
         raise SessionError(str(exc)) from exc

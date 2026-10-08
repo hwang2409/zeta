@@ -91,6 +91,7 @@ def _resolve(home: Path, *, cli_auto_memory: bool | None = None):
         cli_yolo=None,
         cli_token_budget=None,
         cli_auto_memory=cli_auto_memory,
+    default_provider="codex",
     )
 
 

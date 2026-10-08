@@ -160,6 +160,9 @@ def _fixed_terminal_env(home: Path) -> dict[str, str]:
         ZETA_HOME=str(home),
         TERM="xterm-256color",
         COLORTERM="truecolor",
+        PYTHONPATH=os.pathsep.join(
+            filter(None, (str(Path(__file__).parents[1]), env.get("PYTHONPATH")))
+        ),
     )
     return env
 
@@ -6044,8 +6047,10 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     process = subprocess.Popen(
         [
             sys.executable,
-            "-c",
-            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'codex']))",
+            "-m",
+            "tests.support.scripted_tui",
+            "--provider",
+            "codex",
         ],
         stdin=slave_fd,
         stdout=slave_fd,
@@ -6091,8 +6096,10 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
     process = subprocess.Popen(
         [
             sys.executable,
-            "-c",
-            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'codex']))",
+            "-m",
+            "tests.support.scripted_tui",
+            "--provider",
+            "codex",
         ],
         stdin=slave_fd,
         stdout=slave_fd,
@@ -6147,8 +6154,10 @@ def test_main_pty_normal_command_then_queued_enter_submits(
     process = subprocess.Popen(
         [
             sys.executable,
-            "-c",
-            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'codex']))",
+            "-m",
+            "tests.support.scripted_tui",
+            "--provider",
+            "codex",
         ],
         stdin=slave_fd,
         stdout=slave_fd,
@@ -7893,7 +7902,7 @@ def test_composer_meta_line_includes_model_approval_and_home_cwd(
 
     meta = "".join(value for _, value in app._status_toolbar())
 
-    assert "fake/offline" in meta
+    assert "codex/offline" in meta
     assert "ask" in meta
     assert "~" in meta
     assert "INSERT" in meta
@@ -8341,7 +8350,6 @@ def test_full_screen_pty_keeps_padded_margins_clean(
     session = f"zeta-pty-{uuid.uuid4().hex[:10]}"
     socket_dir = Path(tempfile.mkdtemp(prefix="zeta-tmux-", dir="/tmp"))
     socket = socket_dir / "sock"
-    zeta = Path(sys.executable).with_name("zeta")
     env = _fixed_terminal_env(tmp_path / "zeta-home")
     def cleanup() -> None:
         subprocess.run(
@@ -8367,13 +8375,13 @@ def test_full_screen_pty_keeps_padded_margins_clean(
                 (
                     "exec env -u NO_COLOR -u FORCE_COLOR -u CLICOLOR "
                     '-u CLICOLOR_FORCE -u PY_COLORS ZETA_HOME="$1" TERM="$2" '
-                    'COLORTERM="$3" "$4" --provider codex'
+                    'COLORTERM="$3" "$4" -m tests.support.scripted_tui --provider codex'
                 ),
                 "zeta-pane",
                 str(tmp_path / "zeta-home"),
                 "xterm-256color",
                 "truecolor",
-                str(zeta),
+                sys.executable,
             ],
             cwd=Path(__file__).parents[1],
             env=env,
@@ -8553,7 +8561,7 @@ skill_catalog=SkillCatalog.empty(),
     toolbar = app._status_toolbar()
     plain = "".join(value for _, value in toolbar)
     assert "5 (0%)" in plain
-    assert "fake/offline" in plain
+    assert "codex/offline" in plain
     assert app.loop.store.session_id[:8] in plain
     assert "\n" not in plain
 

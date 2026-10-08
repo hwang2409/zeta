@@ -779,7 +779,7 @@ def test_cli_flags_reach_context_assembler_system_prompt(
     args = build_parser().parse_args(
         [
             "--provider",
-            "fake",
+            "codex",
             "--system-prompt",
             "operator override",
             "--append-system-prompt",
@@ -803,7 +803,7 @@ def test_cli_append_only_extends_default_system_prompt(
     args = build_parser().parse_args(
         [
             "--provider",
-            "fake",
+            "codex",
             "--append-system-prompt",
             "TAIL EXTENSION",
         ]
@@ -828,7 +828,7 @@ def test_cli_at_file_form_loads_prompt_from_disk(
     args = build_parser().parse_args(
         [
             "--provider",
-            "fake",
+            "codex",
             "--system-prompt",
             f"@{prompt_file}",
         ]
@@ -851,7 +851,7 @@ def test_cli_missing_at_file_surfaces_session_error(
     args = build_parser().parse_args(
         [
             "--provider",
-            "fake",
+            "codex",
             "--system-prompt",
             f"@{tmp_path / 'missing.md'}",
         ]

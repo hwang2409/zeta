@@ -438,7 +438,10 @@ def block_real_http_connections(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _inject_scripted_completion_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep provider-backed tests offline through the production backend seam."""
-    from tests.support.tui_backend import FakeInteractiveBackend
+    try:
+        from tests.support.tui_backend import FakeInteractiveBackend
+    except ModuleNotFoundError:
+        return
     from zeta.tui import app as tui_app
 
     def build_backend(provider: str, model: str | None, **_kwargs: object):

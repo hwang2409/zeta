@@ -985,6 +985,7 @@ def test_resolve_carries_stream_stall_settings_into_resolved_config() -> None:
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
+    default_provider="codex",
     )
     assert resolved.stream_stall_seconds == 45
     assert resolved.stream_stall_retries == 4

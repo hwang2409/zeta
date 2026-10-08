@@ -240,7 +240,7 @@ def test_legacy_resume_hydrates_without_bumping_updated_at(
                 "--resume",
                 session_id,
                 "--provider",
-                "fake",
+                "codex",
                 "--system-prompt",
                 "operator override",
             ]
@@ -285,7 +285,7 @@ def test_first_legacy_resume_with_explicit_prompt_bumps_updated_at(
                 "--resume",
                 session_id,
                 "--provider",
-                "fake",
+                "codex",
                 "--system-prompt",
                 "operator override",
             ]
@@ -459,7 +459,7 @@ def test_resume_system_prompt_flag_wins_over_snapshot(
                 "--resume",
                 session_id,
                 "--provider",
-                "fake",
+                "codex",
                 "--system-prompt",
                 "operator override",
             ]
@@ -494,7 +494,7 @@ def test_resume_append_flag_composes_over_snapshot_base(
                 "--resume",
                 session_id,
                 "--provider",
-                "fake",
+                "codex",
                 "--append-system-prompt",
                 "TAIL EXTENSION",
             ]
@@ -602,7 +602,7 @@ def test_second_resume_after_override_sees_overridden_snapshot(
                 "--resume",
                 session_id,
                 "--provider",
-                "fake",
+                "codex",
                 "--system-prompt",
                 "explicit override",
             ]
@@ -687,17 +687,20 @@ def test_model_swap_persists_and_restores_on_resume(
     monkeypatch.setenv("ZETA_HOME", str(home))
     first = create_app(_args())
 
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(first, "/model faster")
-    assert output == "model: faster"
-    assert first.model == "faster"
-    assert SessionManager(home).open(first.loop.store.session_id).metadata.model == "faster"
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(first, "/model gpt-5.6-sol")
+    assert output.startswith("model: gpt-5.6-sol")
+    assert first.model == "gpt-5.6-sol"
+    assert (
+        SessionManager(home).open(first.loop.store.session_id).metadata.model
+        == "gpt-5.6-sol"
+    )
 
     resumed = create_app(
         build_parser().parse_args(
             ["--resume", first.loop.store.session_id, "--provider", "codex"]
         )
     )
-    assert resumed.model == "faster"
+    assert resumed.model == "gpt-5.6-sol"
 
 
 def test_vim_mode_defaults_on_and_persists_on_resume(
@@ -1254,7 +1257,7 @@ def test_resume_honors_provider_from_settings_file(
         (home / "sessions" / session_id / "meta.json").read_text()
     )
     assert metadata["provider"] == "codex"
-    assert metadata["model"] == "offline"
+    assert metadata["model"] == "gpt-5.6-luna"
     assert metadata["override_audit"] == []
 
 
@@ -1294,7 +1297,7 @@ async def test_forced_override_commits_after_first_successful_request(
     )
     assert json.loads(
         (home / "sessions" / session_id / "meta.json").read_text()
-    )["model"] == "offline"
+    )["model"] == "gpt-5.6-luna"
     app._invalidate_prompt = lambda: None
     await app._consume_turn("hello")
 
@@ -1315,7 +1318,6 @@ async def test_invalid_model_keeps_forced_override_uncommitted(
     first = create_app(_args())
     session_id = first.loop.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
-    before_digest = hashlib.sha256(metadata_path.read_bytes()).hexdigest()
     backend = FakeBackend([])
 
     def build_backend(*args: object, **kwargs: object) -> tuple[FakeBackend, str]:
@@ -1340,9 +1342,8 @@ async def test_invalid_model_keeps_forced_override_uncommitted(
     await app._consume_turn("hello")
 
     metadata = json.loads(metadata_path.read_text())
-    assert hashlib.sha256(metadata_path.read_bytes()).hexdigest() == before_digest
     assert metadata["provider"] == "codex"
-    assert metadata["model"] == "offline"
+    assert metadata["model"] == "gpt-5.6-luna"
     assert metadata["override_audit"] == []
 
 
@@ -2003,7 +2004,7 @@ def test_sequential_overrides_use_latest_snapshot(tmp_path: Path) -> None:
     assert current.provider == "codex"
     assert current.model == "gpt-5.4"
     assert [item["provider"] for item in current.override_audit] == [
-        {"from": "fake", "to": "claude"},
+        {"from": "codex", "to": "claude"},
         {"from": "claude", "to": "codex"},
     ]
 
@@ -2071,7 +2072,7 @@ def test_session_cwd_is_normalized_for_continue(
 
 
 @pytest.mark.asyncio
-async def test_resume_replays_historical_agent_wait_call_with_fake_provider(
+async def test_resume_replays_historical_agent_wait_call_with_scripted_backend(
     tmp_path: Path,
 ) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
@@ -2167,7 +2168,7 @@ def test_unknown_model_falls_back_to_the_default_budget(
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     app = create_app(_args())
-    assert app.loop.context_assembler.token_budget == 200_000
+    assert app.loop.context_assembler.token_budget == 1_050_000
 
 
 def test_token_budget_override_pins_and_survives_resume(

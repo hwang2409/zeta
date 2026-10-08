@@ -139,7 +139,7 @@ async def test_resume_intersects_and_persists_invocation_tool_policy(
                 "--resume",
                 session_id,
                 "--provider",
-                "fake",
+                "codex",
                 "--tools",
                 "computer__*",
                 "--disallowed-tools",
@@ -183,7 +183,7 @@ async def test_resume_intersects_persisted_policy_with_ambient_policy(
         build_parser().parse_args(
             [
                 "--provider",
-                "fake",
+                "codex",
                 "--tools",
                 "computer__*",
                 "--disallowed-tools",
@@ -312,7 +312,7 @@ def test_cli_require_tools_rejects_exact_name_removed_by_resume_policy(
             "--resume",
             session_id,
             "--provider",
-            "fake",
+            "codex",
             "--tools",
             "definitely_missing_tool",
             "--require-tools",
@@ -436,6 +436,7 @@ def test_project_tool_policy_can_only_narrow_global_policy(tmp_path: Path) -> No
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
+    default_provider="codex",
     )
     registry = _registry(
         tmp_path / "registry",
@@ -468,6 +469,7 @@ def test_empty_project_allowlist_allows_nothing(tmp_path: Path) -> None:
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
+    default_provider="codex",
     )
     registry = _registry(
         tmp_path / "registry",
@@ -517,6 +519,7 @@ def test_cli_and_layered_settings_resolve_tool_patterns(tmp_path: Path) -> None:
         cli_token_budget=None,
         cli_tools=None,
         cli_disallowed_tools=None,
+    default_provider="codex",
     )
     assert config.tool_allow == ("read", "computer__*")
     assert config.tool_allow_layers == (("read", "computer__*"),)
@@ -530,6 +533,7 @@ def test_cli_and_layered_settings_resolve_tool_patterns(tmp_path: Path) -> None:
         cli_token_budget=None,
         cli_tools="bash",
         cli_disallowed_tools="read",
+    default_provider="codex",
     )
     assert overridden.tool_allow_layers == (("bash",),)
     assert overridden.tool_deny == ("read",)
@@ -556,6 +560,7 @@ def test_only_global_settings_can_enable_hooks(tmp_path: Path) -> None:
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
+    default_provider="codex",
     )
 
     assert config.allow_hooks is True
@@ -581,6 +586,7 @@ def test_only_global_settings_can_enable_external_tools(tmp_path: Path) -> None:
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
+    default_provider="codex",
     )
 
     assert config.allow_external_tools is True
@@ -634,7 +640,7 @@ def test_require_tools_exits_nonzero_when_exact_allowlisted_tool_is_missing(
     args = build_parser().parse_args(
         [
             "--provider",
-            "fake",
+            "codex",
             "--tools",
             "computer__click",
             "--require-tools",
