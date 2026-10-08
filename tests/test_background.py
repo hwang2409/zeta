@@ -325,10 +325,6 @@ def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
     assert active[0].data["exit_code"] == 1
 
 
-
-
-
-
 def test_tui_presented_notification_remains_available_to_notification_wake(
     tmp_path: Path,
 ) -> None:

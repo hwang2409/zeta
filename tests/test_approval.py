@@ -632,10 +632,6 @@ skill_catalog=SkillCatalog.empty(),
     assert canceled.is_set()
 
 
-
-
-
-
 @pytest.mark.asyncio
 async def test_parallel_pre_aborted_approved_calls_share_one_abort_generation(
     approval_root: Path,

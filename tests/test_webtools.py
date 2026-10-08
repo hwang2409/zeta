@@ -358,8 +358,6 @@ async def test_fetch_returns_partial_when_decompressed_body_exceeds_cap(
     assert Path(result["content"][0]["spill_path"]).read_text() == "x" * 32
 
 
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_stream", [False, True])
 async def test_parallel_fetches_cancel_on_production_dispatch_abort(
