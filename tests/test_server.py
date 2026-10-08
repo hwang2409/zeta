@@ -2980,9 +2980,8 @@ async def test_server_new_session_defaults_to_evict(tmp_path: Path) -> None:
     try:
         metadata = await runtime.create_session()
 
-        assert metadata.compaction == "evict"
+        assert not hasattr(metadata, "compaction")
         assert runtime.loop is not None
-        assert runtime.loop.context_assembler.compaction == "evict"
         assert "recall_history" in runtime.loop.tool_registry.registered_names
     finally:
         await runtime.close()
@@ -4622,46 +4621,17 @@ async def test_server_uses_only_existing_project_without_new_git_discovery(
 
 
 @pytest.mark.asyncio
-async def test_set_compaction_switches_active_session(tmp_path):
+async def test_set_compaction_rejects_removed_summary_mode(tmp_path):
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
-    runtime = server.runtime
     try:
-        assert runtime.loop.context_assembler.compaction == "evict"
         response = (await _request(reader, writer, "c1", "set_compaction", {
             "session_id": sid, "mode": "summary",
         }))[-1]
-        assert response["result"] == {
-            "compaction": "summary",
-            "previous": "evict",
-            "recall_history": False,
-        }
-        assert runtime.loop.context_assembler.compaction == "summary"
-        assert "recall_history" not in runtime.loop.tool_registry.registered_names
-        assert SessionManager(tmp_path).read_metadata(sid).compaction == "summary"
-
-        bad = (await _request(reader, writer, "c2", "set_compaction", {
-            "session_id": sid, "mode": "bogus",
-        }))[-1]
-        assert bad["error"]["code"] == -32602
-        inactive = (await _request(reader, writer, "c3", "set_compaction", {
-            "session_id": "nope", "mode": "evict",
-        }))[-1]
-        assert inactive["error"]["code"] == -32003
-
-        await _request(reader, writer, "r", "resume", {"session_id": sid})
-        assert runtime.loop.context_assembler.compaction == "summary"
-        back = (await _request(reader, writer, "c4", "set_compaction", {
-            "session_id": sid, "mode": "evict",
-        }))[-1]["result"]
-        assert back == {"compaction": "evict", "previous": "summary", "recall_history": True}
-        assert "recall_history" in runtime.loop.tool_registry.registered_names
-
-        shown = (await _request(reader, writer, "s", "slash_run", {
-            "session_id": sid, "text": "/compaction",
-        }))[-1]["result"]
-        assert shown["kind"] == "output"
-        assert "compaction: evict" in shown["text"]
+        assert response["error"]["code"] == -32602
+        assert response["error"]["message"] == (
+            "compaction mode selection was removed; eviction is always used"
+        )
     finally:
         await _close(server, writer)
 

@@ -14,7 +14,6 @@ from zeta.core.context import (
     CompactionPolicy,
     ContextAssembler,
     StaleBranchError,
-    SummaryInputTooLarge,
     SummaryCompletionError,
 )
 from zeta.context_accounting import (
@@ -107,7 +106,7 @@ async def test_append_during_offloop_preparation_is_included(
 ) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("initial")]), MessageOrigin.USER))
-    assembler = ContextAssembler(store, token_budget=10_000, compaction="evict")
+    assembler = ContextAssembler(store, token_budget=10_000)
 
     assembled = await _append_during_preparation(store, assembler, monkeypatch)
 
@@ -137,7 +136,7 @@ async def test_append_during_offloop_preparation_is_included_when_compacting(
     )
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("latest request")]), MessageOrigin.USER))
     assembler = ContextAssembler(
-        store, token_budget=700, retained_tail=1, compaction="evict"
+        store, token_budget=700, retained_tail=1
     )
 
     assembled = await _append_during_preparation(store, assembler, monkeypatch)
@@ -272,140 +271,8 @@ async def test_tool_call_and_result_force_tail_extension(context_root: Path) -> 
     )
 
 
-@pytest.mark.asyncio
-async def test_oversized_retained_tail_shrinks_at_tool_group_boundary(
-    tmp_path: Path,
-) -> None:
-    store = ConversationStore(tmp_path)
-    latest_user = text(MessageRole.USER, "latest request must remain verbatim")
-    store.append_message(latest_user)
-    for index in range(2):
-        call = ToolCall(f"call-{index}", "bash", {"command": f"job {index}"})
-        store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
-        store.append_message(
-            Message(
-                MessageRole.TOOL_RESULT,
-                tool_result=ToolResult(call.id, str(index) * 400),
-            )
-        )
-    backend = FakeBackend([ScriptedTurn([TextContent("summary")]) for _ in range(20)])
-    assembler = ContextAssembler(
-        store,
-        token_budget=290,
-        retained_tail=8,
-        backend=backend,
-    )
-
-    assembled = await assembler.assemble_context()
-
-    assert assembled.compacted
-    assert assembled.token_count <= assembler.token_budget
-    assert [message.role for message in assembled.messages] == [
-        MessageRole.COMPACTION,
-        MessageRole.ASSISTANT,
-        MessageRole.USER,
-        MessageRole.ASSISTANT,
-        MessageRole.TOOL_RESULT,
-    ]
-    assert assembled.messages[2].to_dict() == latest_user.to_dict()
-    assert [
-        block.tool_call.id
-        for message in assembled.messages
-        for block in message.content
-        if isinstance(block, ToolUseContent)
-    ] == ["call-1"]
-    assert assembled.messages[-1].tool_result == ToolResult("call-1", "1" * 400)
-
-    reopened = ContextAssembler(
-        ConversationStore(tmp_path, session_id=store.session_id),
-        token_budget=290,
-        retained_tail=8,
-    )
-    replayed = await reopened.assemble_context()
-    assert [message.to_dict() for message in replayed.messages] == [
-        message.to_dict() for message in assembled.messages
-    ]
-
-    previous_marker = next(
-        entry for entry in store.entries if entry.type == "compaction"
-    )
-    next_request = text(MessageRole.USER, "next request")
-    store.append_message(next_request)
-    replacement = await ContextAssembler(
-        store,
-        token_budget=1_000,
-        retained_tail=1,
-        backend=FakeBackend([ScriptedTurn([TextContent("replacement summary")])]),
-    ).assemble_context(force=True)
-    markers = [entry for entry in store.entries if entry.type == "compaction"]
-    assert markers[-1].data["replaces"] == [previous_marker.id]
-    assert replacement.messages[-1].to_dict() == next_request.to_dict()
-    assert all(
-        "latest request must remain verbatim"
-        not in (block.text if isinstance(block, TextContent) else "")
-        for message in replacement.messages
-        for block in message.content
-    )
 
 
-@pytest.mark.asyncio
-async def test_adaptive_compaction_reuses_marker_with_request_only_truncation(
-    tmp_path: Path,
-) -> None:
-    store = ConversationStore(tmp_path)
-    old_call = ToolCall("old", "bash", {"command": "old"})
-    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(old_call)]))
-    store.append_message(
-        Message(
-            MessageRole.TOOL_RESULT,
-            tool_result=ToolResult(old_call.id, "old" * 100),
-        )
-    )
-    pinned = text(MessageRole.USER, "PINNED-VERBATIM-UNIQUE")
-    store.append_message(pinned)
-    latest_call = ToolCall("latest", "bash", {"command": "latest"})
-    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(latest_call)]))
-    store.append_message(
-        Message(
-            MessageRole.TOOL_RESULT,
-            tool_result=ToolResult(latest_call.id, "latest" * 500),
-        )
-    )
-    backend = FakeBackend(
-        [
-            ScriptedTurn([TextContent("FIRST")]),
-            ScriptedTurn([TextContent("SECOND")]),
-            ScriptedTurn([TextContent("THIRD")]),
-        ]
-    )
-    assembler = ContextAssembler(
-        store,
-        token_budget=500,
-        retained_tail=8,
-        backend=backend,
-    )
-
-    assembled = [await assembler.assemble_context() for _ in range(3)]
-
-    assert len([entry for entry in store.entries if entry.type == "compaction"]) == 1
-    assert len(backend.calls) == 1
-    assert {context.digest for context in assembled} == {assembled[0].digest}
-    assert all(
-        [message.to_dict() for message in context.messages]
-        == [message.to_dict() for message in assembled[0].messages]
-        for context in assembled
-    )
-
-    reopened = await ContextAssembler(
-        ConversationStore(tmp_path, session_id=store.session_id),
-        token_budget=500,
-        retained_tail=8,
-    ).assemble_context()
-
-    assert reopened.digest == assembled[0].digest
-    assert [message.to_dict() for message in reopened.messages] == [
-        message.to_dict() for message in assembled[0].messages
-    ]
 
 
 @pytest.mark.asyncio
@@ -582,46 +449,6 @@ async def test_adaptive_compaction_uses_configured_budget(tmp_path: Path) -> Non
     )
 
 
-@pytest.mark.asyncio
-async def test_post_compaction_overflow_truncates_tool_result(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.ASSISTANT, "old" * 300))
-    store.append_message(with_message_origin(text(MessageRole.USER, "current request"), MessageOrigin.USER))
-    call = ToolCall("call-post", "bash", {"command": "noisy"})
-    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
-    store.append_message(
-        Message(
-            MessageRole.TOOL_RESULT,
-            tool_result=ToolResult(call.id, "result" * 80),
-        )
-    )
-    backend = FakeBackend(
-        [ScriptedTurn([TextContent("summary" * 20)]) for _ in range(20)]
-    )
-    assembler = ContextAssembler(
-        store,
-        token_budget=260,
-        retained_tail=2,
-        backend=backend,
-    )
-
-    assembled = await assembler.assemble_context()
-
-    assert assembled.compacted
-    assert assembled.token_count <= assembler.token_budget
-    result = assembled.messages[-1].tool_result
-    assert result is not None
-    assert "[output truncated for context:" in result.content
-    assert store.messages()[-1].tool_result == ToolResult(call.id, "result" * 80)
-
-    reopened = await ContextAssembler(
-        ConversationStore(tmp_path, session_id=store.session_id),
-        token_budget=260,
-        retained_tail=2,
-    ).assemble_context()
-    assert [message.to_dict() for message in reopened.messages] == [
-        message.to_dict() for message in assembled.messages
-    ]
 
 
 @pytest.mark.asyncio
@@ -676,63 +503,8 @@ async def test_fitting_compaction_output_is_byte_identical(tmp_path: Path) -> No
     ]
 
 
-@pytest.mark.asyncio
-async def test_forced_compaction_excludes_pinned_user_from_summary_source(
-    tmp_path: Path,
-) -> None:
-    store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.ASSISTANT, "older answer"))
-    pinned = text(MessageRole.USER, "PINNED-VERBATIM-UNIQUE")
-    store.append_message(pinned)
-    store.append_message(text(MessageRole.ASSISTANT, "answer tail"))
-    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
-
-    assembled = await ContextAssembler(
-        store,
-        token_budget=10_000,
-        retained_tail=1,
-        backend=backend,
-    ).assemble_context(force=True)
-
-    source_prompt = backend.calls[0][0][-1].content[0]
-    assert isinstance(source_prompt, TextContent)
-    assert "older answer" in source_prompt.text
-    assert "PINNED-VERBATIM-UNIQUE" not in source_prompt.text
-    assert [message.to_dict() for message in assembled.messages][-2:] == [
-        pinned.to_dict(),
-        text(MessageRole.ASSISTANT, "answer tail").to_dict(),
-    ]
 
 
-@pytest.mark.asyncio
-async def test_forced_compaction_uses_empty_source_when_only_pinned_user_precedes_tail(
-    tmp_path: Path,
-) -> None:
-    store = ConversationStore(tmp_path)
-    pinned = text(MessageRole.USER, "PINNED-VERBATIM-UNIQUE")
-    tail = text(MessageRole.ASSISTANT, "answer tail")
-    store.append_message(pinned)
-    store.append_message(tail)
-    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
-
-    assembled = await ContextAssembler(
-        store,
-        token_budget=10_000,
-        retained_tail=1,
-        backend=backend,
-    ).assemble_context(force=True)
-
-    source_prompt = backend.calls[0][0][-1].content[0]
-    assert isinstance(source_prompt, TextContent)
-    assert source_prompt.text.endswith("\n\n[]")
-    assert "PINNED-VERBATIM-UNIQUE" not in source_prompt.text
-    assert [message.to_dict() for message in assembled.messages][-2:] == [
-        pinned.to_dict(),
-        tail.to_dict(),
-    ]
-    assert assembled.compacted
-    assert len(backend.calls) == 1
-    assert len([entry for entry in store.entries if entry.type == "compaction"]) == 1
 
 
 @pytest.mark.asyncio
@@ -1311,18 +1083,6 @@ async def test_stale_branch_discards_summary(context_root: Path) -> None:
     assert not any(entry.type == "compaction" for entry in store.entries)
 
 
-@pytest.mark.asyncio
-async def test_summary_source_bound_rejects_large_input(context_root: Path) -> None:
-    backend = FakeBackend([ScriptedTurn([TextContent("unused")])])
-    policy = CompactionPolicy(backend)
-
-    with pytest.raises(SummaryInputTooLarge):
-        await policy.summarize(
-            [text(MessageRole.USER, "x" * 200)],
-            max_source_tokens=10,
-        )
-
-    assert backend.calls == []
 
 
 @pytest.mark.asyncio
@@ -1443,7 +1203,7 @@ async def test_summary_aclose_error_propagates_after_success() -> None:
             return ClosingStream()
 
     with pytest.raises(RuntimeError, match="close failed"):
-        await CompactionPolicy(Backend()).summarize([text(MessageRole.USER, "source")])
+        await CompactionPolicy(Backend()).summarize_chunked([text(MessageRole.USER, "source")])
 
 
 @pytest.mark.asyncio
@@ -1473,7 +1233,7 @@ async def test_summary_aclose_cancellation_propagates_after_success() -> None:
             return ClosingStream()
 
     task = asyncio.create_task(
-        CompactionPolicy(Backend()).summarize([text(MessageRole.USER, "source")])
+        CompactionPolicy(Backend()).summarize_chunked([text(MessageRole.USER, "source")])
     )
     await close_started.wait()
     task.cancel()
@@ -1502,7 +1262,7 @@ async def test_summary_provider_error_stays_primary_when_aclose_fails() -> None:
             return ClosingStream()
 
     with pytest.raises(SummaryCompletionError, match="provider failed") as raised:
-        await CompactionPolicy(Backend()).summarize([text(MessageRole.USER, "source")])
+        await CompactionPolicy(Backend()).summarize_chunked([text(MessageRole.USER, "source")])
     assert raised.value.code == "provider_failed"
 
 
@@ -1696,7 +1456,7 @@ async def test_compaction_discards_partial_output_before_provider_retry() -> Non
             yield StreamEvent(StreamEventType.ASSISTANT_RESET)
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fresh")
 
-    summary = await CompactionPolicy(RetryBackend()).summarize(
+    summary = await CompactionPolicy(RetryBackend()).summarize_chunked(
         [text(MessageRole.USER, "source")]
     )
 
