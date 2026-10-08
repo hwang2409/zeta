@@ -6,6 +6,18 @@ import asyncio
 from typing import Any
 
 from ...project_inbox import InboxError, ProjectInboxScanner
+from ...project_registry import ProjectRegistryError
+from ...protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+)
+
+_SENT_STATUS_EVENT = "project_inbox_sent_status"
+_MAX_PENDING_SENT_STATUSES = 100
+_MAX_SENT_STATUS_LINES = 10
 
 
 class ProjectInboxNotificationMixin:
@@ -45,8 +57,84 @@ class ProjectInboxNotificationMixin:
             await asyncio.sleep(2)
             await self._check_project_inbox(periodic=True)
 
+    def _reported_sent_statuses(self) -> set[tuple[str, str]]:
+        reported: set[tuple[str, str]] = set()
+        for message in self.store.messages():
+            if message.metadata.get("zeta_event") != _SENT_STATUS_EVENT:
+                continue
+            statuses = message.metadata.get("sent_statuses")
+            if not isinstance(statuses, list):
+                continue
+            for item in statuses:
+                if not isinstance(item, dict):
+                    continue
+                message_id = item.get("message_id")
+                status = item.get("status")
+                if isinstance(message_id, str) and status in {"claimed", "done"}:
+                    reported.add((message_id, status))
+        return reported
+
+    def _record_sent_statuses(self, messages: tuple[dict[str, Any], ...]) -> None:
+        reported = ProjectInboxNotificationMixin._reported_sent_statuses(self)
+        pending: dict[tuple[str, str], dict[str, Any]] = getattr(
+            self, "_pending_sent_statuses", {}
+        )
+        for record in messages:
+            message_id = record.get("id")
+            status = record.get("status")
+            if not isinstance(message_id, str):
+                continue
+            for key in tuple(pending):
+                if key[0] == message_id:
+                    pending.pop(key)
+            if status == "done" and record.get("reply_id") is not None:
+                continue
+            if status not in {"claimed", "done"}:
+                continue
+            key = (message_id, status)
+            if key not in reported:
+                pending[key] = record
+        if len(pending) > _MAX_PENDING_SENT_STATUSES:
+            pending = dict(list(pending.items())[-_MAX_PENDING_SENT_STATUSES:])
+        self._pending_sent_statuses = pending
+
+    def _project_inbox_status_message(self) -> Message | None:
+        reported = ProjectInboxNotificationMixin._reported_sent_statuses(self)
+        pending = [
+            (key, record)
+            for key, record in getattr(self, "_pending_sent_statuses", {}).items()
+            if key not in reported
+        ]
+        if not pending:
+            return None
+        pending.sort(
+            key=lambda item: (
+                str(item[1].get("claimed_at") or item[1].get("done_at") or ""),
+                item[0],
+            )
+        )
+        lines = [
+            _render_sent_status(record)
+            for _key, record in pending[:_MAX_SENT_STATUS_LINES]
+        ]
+        if len(pending) > _MAX_SENT_STATUS_LINES:
+            lines.append(
+                f"inbox: and {len(pending) - _MAX_SENT_STATUS_LINES} more updates"
+            )
+        return Message(
+            MessageRole.USER,
+            [TextContent("\n".join(lines))],
+            metadata={
+                "zeta_event": _SENT_STATUS_EVENT,
+                MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
+                "sent_statuses": [
+                    {"message_id": key[0], "status": key[1]} for key, _record in pending
+                ],
+            },
+        )
+
     async def _check_project_inbox(self, *, periodic: bool = False) -> None:
-        """Coalesce one passive notice and let one peer claim the model wake."""
+        """Coalesce incoming wakes and passive sent-message status."""
 
         projects = self.tool_registry.project_registry
         project_id = self.tool_registry.project_id
@@ -63,9 +151,13 @@ class ProjectInboxNotificationMixin:
             scanner = self._new_project_inbox_scanner()
             self._inbox_scanner = scanner
         try:
-            message_ids = await asyncio.to_thread(scanner.scan)
-        except (InboxError, OSError):
+            message_ids, sent = await asyncio.to_thread(
+                lambda: (scanner.scan(), scanner.scan_sent())
+            )
+        except (InboxError, OSError, ProjectRegistryError):
             return
+        if sent is not None:
+            ProjectInboxNotificationMixin._record_sent_statuses(self, sent)
         if message_ids is None or not message_ids:
             return
         _entry, changed = self.store.append_inbox_notification_if_absent(
@@ -75,3 +167,29 @@ class ProjectInboxNotificationMixin:
             scanner.inbox.claim_wake, project_id, message_ids
         ):
             self.notify_background_persisted()
+
+
+def _bounded_text(value: object, limit: int) -> str:
+    text = str(value).replace("\n", " ")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _render_sent_status(record: dict[str, Any]) -> str:
+    title = _bounded_text(record.get("title", "untitled"), 80)
+    project = _bounded_text(
+        record.get("to_project_name", record.get("to_project", "?")), 80
+    )
+    status = record.get("status")
+    if status == "claimed":
+        session = _bounded_text(record.get("claimer_session", "unknown"), 40)
+        claimed_at = _bounded_text(record.get("claimed_at", "unknown time"), 40)
+        return (
+            f'inbox: your message "{title}" to {project} was claimed '
+            f"by session {session} at {claimed_at}"
+        )
+    done_at = _bounded_text(record.get("done_at", "unknown time"), 40)
+    outcome = _bounded_text(record.get("outcome", ""), 120)
+    return (
+        f'inbox: your message "{title}" to {project} was completed '
+        f"at {done_at} (outcome: {outcome})"
+    )

@@ -31,6 +31,10 @@ from .session_liveness import session_is_live
 SCHEMA_VERSION = 1
 BODY_SPILL_BYTES = 64 * 1024
 DONE_HISTORY_LIMIT = 100
+SENT_HISTORY_LIMIT = 512
+SENT_DIRECTORY_LIMIT = 100
+SENT_PROJECT_LIMIT = 100
+SENT_PAGE_LIMIT = 100
 KINDS = frozenset({"bug_report", "change_request", "question", "info", "reply"})
 LOCAL_ORIGIN = "local"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -114,6 +118,9 @@ class ProjectInboxScanner:
         self.project_id = project_id
         self.session_id = session_id
         self._fingerprint: tuple[tuple[int, int, int, int] | None, ...] | None = None
+        self._sent_fingerprint: (
+            tuple[tuple[str, str, int, int, int, int] | None, ...] | None
+        ) = None
 
     def scan(self) -> tuple[str, ...] | None:
         current = self._directory_fingerprint()
@@ -121,9 +128,25 @@ class ProjectInboxScanner:
             return None
         message_ids = self.inbox.new_ids(self.project_id, session_id=self.session_id)
         self._fingerprint = (
-            current if any(item is not None for item in current) else self._directory_fingerprint()
+            current
+            if any(item is not None for item in current)
+            else self._directory_fingerprint()
         )
         return message_ids
+
+    def scan_sent(self) -> tuple[dict[str, Any], ...] | None:
+        """Read changed status for this session's sent messages without mutation."""
+        current = self._sent_directory_fingerprint()
+        if self._sent_fingerprint is not None and current == self._sent_fingerprint:
+            return None
+        page = self.inbox.sent(
+            self.project_id,
+            session_id=self.session_id,
+            offset=0,
+            limit=SENT_PAGE_LIMIT,
+        )
+        self._sent_fingerprint = current
+        return tuple(page["messages"])
 
     def _directory_fingerprint(self) -> tuple[tuple[int, int, int, int] | None, ...]:
         inbox = self.inbox.registry.root / self.project_id / "inbox"
@@ -134,7 +157,34 @@ class ProjectInboxScanner:
             except FileNotFoundError:
                 result.append(None)
             else:
-                result.append((info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size))
+                result.append(
+                    (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+                )
+        return tuple(result)
+
+    def _sent_directory_fingerprint(
+        self,
+    ) -> tuple[tuple[str, str, int, int, int, int] | None, ...]:
+        result: list[tuple[str, str, int, int, int, int] | None] = []
+        projects = self.inbox.registry.list_projects()[:SENT_PROJECT_LIMIT]
+        for project in projects:
+            inbox = self.inbox.registry.root / project.project_id / "inbox"
+            for name in ("new", "claimed", "done"):
+                try:
+                    info = (inbox / name).stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    result.append(None)
+                else:
+                    result.append(
+                        (
+                            project.project_id,
+                            name,
+                            info.st_dev,
+                            info.st_ino,
+                            info.st_mtime_ns,
+                            info.st_size,
+                        )
+                    )
         return tuple(result)
 
 
@@ -260,6 +310,79 @@ class ProjectInbox:
         result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
         return result
 
+    def sent(
+        self,
+        project: str,
+        *,
+        session_id: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Return one bounded page of messages sent by a project."""
+        source = self._resolve_project(project)
+        if session_id is not None:
+            session_id = _id(session_id, "session id")
+        if type(offset) is not int or offset < 0:
+            raise InboxError("offset must be a nonnegative integer")
+        if type(limit) is not int or not 1 <= limit <= SENT_PAGE_LIMIT:
+            raise InboxError(f"limit must be an integer from 1 to {SENT_PAGE_LIMIT}")
+
+        all_projects = self.registry.list_projects()
+        projects = all_projects[:SENT_PROJECT_LIMIT]
+        names = {item.project_id: item.name for item in projects}
+        sent: list[dict[str, Any]] = []
+        truncated = len(all_projects) > len(projects)
+        for target in projects:
+            state = self._read_bounded(target.project_id, SENT_DIRECTORY_LIMIT)
+            for status in ("new", "claimed", "done"):
+                if len(state[status]) == SENT_DIRECTORY_LIMIT:
+                    truncated = True
+                for record in state[status]:
+                    sender = record.get("from")
+                    if (
+                        not isinstance(sender, dict)
+                        or sender.get("project") != source.project_id
+                    ):
+                        continue
+                    if session_id is not None and sender.get("session") != session_id:
+                        continue
+                    item: dict[str, Any] = {
+                        "id": record["id"],
+                        "status": status,
+                        "to_project": str(record["to_project"])[:200],
+                        "to_project_name": names.get(
+                            record["to_project"], str(record["to_project"])[:200]
+                        )[:200],
+                        "from_session": sender["session"],
+                        "kind": record["kind"],
+                        "title": record["title"][:200],
+                        "created_at": record["created_at"][:64],
+                    }
+                    if status in {"claimed", "done"}:
+                        item["claimed_at"] = str(record.get("claimed_at") or "")[:64]
+                        item["claimer_session"] = record.get("claimer_session")
+                    if status == "done":
+                        item["done_at"] = str(record.get("done_at") or "")[:64]
+                        item["outcome"] = str(record.get("outcome") or "")[:500]
+                        item["reply_id"] = record.get("reply_id")
+                    sent.append(item)
+                    if len(sent) > SENT_HISTORY_LIMIT:
+                        truncated = True
+        sent.sort(key=lambda item: (item["created_at"], item["id"]), reverse=True)
+        if len(sent) > SENT_HISTORY_LIMIT:
+            truncated = True
+            sent = sent[:SENT_HISTORY_LIMIT]
+        page = sent[offset : offset + limit]
+        next_offset = offset + len(page)
+        return {
+            "messages": page,
+            "offset": offset,
+            "limit": limit,
+            "next_offset": next_offset if next_offset < len(sent) else None,
+            "total": len(sent),
+            "truncated": truncated,
+        }
+
     def read(self, project: str) -> dict[str, list[dict[str, Any]]]:
         """Read inbox state without creating storage or recovering claims."""
         target = self._resolve_project(project)
@@ -267,7 +390,7 @@ class ProjectInbox:
         def read(root_fd: int) -> dict[str, list[dict[str, Any]]]:
             try:
                 with self._directory_handles(
-                    root_fd, target.project_id, create=False
+                    root_fd, target.project_id, create=False, lock=False
                 ) as dirs:
                     invalid: list[dict[str, str]] = []
                     result = {
@@ -282,6 +405,34 @@ class ProjectInbox:
                 key=lambda item: item.get("done_at", ""), reverse=True
             )
             return result
+
+        try:
+            return self.registry._read(read)
+        except (OSError, ProjectRegistryError, SessionError) as exc:
+            raise InboxError("inbox storage is unsafe or unavailable") from exc
+
+    def _read_bounded(
+        self, project_id: str, limit: int
+    ) -> dict[str, list[dict[str, Any]]]:
+        def read(root_fd: int) -> dict[str, list[dict[str, Any]]]:
+            try:
+                with self._directory_handles(
+                    root_fd, project_id, create=False, lock=False
+                ) as dirs:
+                    invalid: list[dict[str, str]] = []
+                    return {
+                        status: self._read_directory(
+                            dirs[index],
+                            dirs[3],
+                            status=status,
+                            invalid=invalid,
+                            resolve_body=False,
+                            limit=limit,
+                        )
+                        for index, status in enumerate(("new", "claimed", "done"))
+                    }
+            except _InboxNotFound:
+                return {"new": [], "claimed": [], "done": []}
 
         try:
             return self.registry._read(read)
@@ -468,7 +619,7 @@ class ProjectInbox:
 
     @contextmanager
     def _directory_handles(
-        self, root_fd: int, project_id: str, *, create: bool
+        self, root_fd: int, project_id: str, *, create: bool, lock: bool = True
     ) -> Iterator[tuple[int, int, int, int, int]]:
         with ExitStack() as stack:
             project_fd = self.registry._project_dir(root_fd, project_id)
@@ -481,8 +632,9 @@ class ProjectInbox:
                 if create:
                     raise
                 raise _InboxNotFound from exc
-            fcntl.flock(inbox_fd, fcntl.LOCK_EX)
-            stack.callback(fcntl.flock, inbox_fd, fcntl.LOCK_UN)
+            if lock:
+                fcntl.flock(inbox_fd, fcntl.LOCK_EX)
+                stack.callback(fcntl.flock, inbox_fd, fcntl.LOCK_UN)
             fds = tuple(
                 stack.enter_context(child_directory(inbox_fd, name, create=create))
                 for name in ("new", "claimed", "done", "bodies", "wake")
@@ -621,9 +773,21 @@ class ProjectInbox:
     def _read_directory(
         self, directory_fd: int, bodies_fd: int, *, status: str,
         invalid: list[dict[str, str]], resolve_body: bool = True,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         records = []
-        for name in sorted(os.listdir(directory_fd)):
+        names = os.listdir(directory_fd)
+        if limit is not None:
+            names.sort(
+                key=lambda name: os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                ).st_mtime_ns,
+                reverse=True,
+            )
+            names = names[:limit]
+        else:
+            names.sort()
+        for name in names:
             try:
                 if not name.endswith(".json"):
                     raise InboxError(f"unexpected inbox file: {name}")

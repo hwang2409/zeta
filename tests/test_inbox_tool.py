@@ -186,7 +186,7 @@ def test_exactly_one_action_based_inbox_tool_is_registered(tmp_path: Path) -> No
         assert schema["required"] == ["action"]
         assert "oneOf" not in schema
         assert set(schema["properties"]["action"]["enum"]) == {
-            "send", "list", "claim", "done", "projects"
+            "send", "list", "sent", "claim", "done", "projects"
         }
     finally:
         asyncio.run(registry.close())
@@ -230,12 +230,12 @@ def test_approval_subject_includes_action_and_target_project(tmp_path: Path) -> 
         registry.set_approval_policy(policy)
         assert policy.decide(
             registry.resolve_call(
-                "inbox", {"action": "send", "project": "beta"}
+                "inbox", {"action": "send", "project": "beta", "kind": "info", "title": "title", "body": "body"}
             )
         ) is ApprovalDecision.ALLOW
         assert policy.decide(
             registry.resolve_call(
-                "inbox", {"action": "send", "project": "other"}
+                "inbox", {"action": "send", "project": "other", "kind": "info", "title": "title", "body": "body"}
             )
         ) is not ApprovalDecision.ALLOW
     finally:
@@ -249,4 +249,69 @@ def test_feature_switch_off_removes_inbox_tool(tmp_path: Path) -> None:
         assert "inbox" not in registry.registered_names
     finally:
         asyncio.run(registry.close())
+        store.close()
+
+@pytest.mark.asyncio
+async def test_inbox_sent_reports_states(tmp_path: Path) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    inbox = ProjectInbox(projects, sessions_root=projects.root.parent / "sessions")
+    new_id = inbox.send(
+        from_project=registry.project_id or "",
+        from_session=store.session_id,
+        to_project=beta.project_id,
+        kind="info",
+        title="new",
+        body="body",
+    )
+    claimed_id = inbox.send(
+        from_project=registry.project_id or "",
+        from_session=store.session_id,
+        to_project=beta.project_id,
+        kind="info",
+        title="claimed",
+        body="body",
+    )
+    done_id = inbox.send(
+        from_project=registry.project_id or "",
+        from_session=store.session_id,
+        to_project=beta.project_id,
+        kind="info",
+        title="done",
+        body="body",
+    )
+    claimer = "b" * 32
+    assert inbox.claim(beta.project_id, claimed_id, claimer) is not None
+    assert inbox.claim(beta.project_id, done_id, claimer) is not None
+    inbox.done(beta.project_id, done_id, claimer, "complete")
+
+    try:
+        result = await _inbox(registry, {"action": "sent", "offset": 0, "limit": 2})
+        page = result["structuredContent"]
+        capability = registry.resolve_call("inbox", {"action": "sent"})
+        assert capability.capability_class == "read"
+        assert capability.requires_approval is False
+        assert page["offset"] == 0
+        assert page["limit"] == 2
+        assert page["next_offset"] == 2
+        all_states = await _inbox(
+            registry, {"action": "sent", "offset": 0, "limit": 10}
+        )
+        messages = all_states["structuredContent"]["messages"]
+        assert {message["id"]: message["status"] for message in messages} == {
+            new_id: "new",
+            claimed_id: "claimed",
+            done_id: "done",
+        }
+        claimed = next(message for message in messages if message["id"] == claimed_id)
+        assert claimed["claimer_session"] == claimer
+        assert "claimed_at" in claimed
+        done = next(message for message in messages if message["id"] == done_id)
+        assert done["outcome"] == "complete"
+        assert done["reply_id"] is None
+        assert "done_at" in done
+    finally:
+        await registry.close()
         store.close()

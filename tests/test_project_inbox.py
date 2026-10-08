@@ -11,11 +11,14 @@ from types import SimpleNamespace
 import pytest
 
 import zeta.project_inbox as project_inbox_module
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.inbox import run as run_inbox_cli
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import InboxError, ProjectInbox, ProjectInboxScanner
 from zeta.project_registry import ProjectRegistry
+from zeta.protocol.types import MESSAGE_ORIGIN_METADATA, MessageOrigin, TextContent
 from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
 
 
 def _projects(tmp_path: Path):
@@ -733,3 +736,278 @@ def test_invalid_log_dedup_evicts_before_logging_new_files(
     with caplog.at_level("WARNING", logger="zeta.project_inbox"):
         inbox.list(project_b.project_id)
     assert any(new_name in record.message for record in caplog.records)
+
+async def _collect_turn(loop: AgentLoop, text: str) -> None:
+    async for _event in loop.run_turn(text, origin=MessageOrigin.USER):
+        pass
+
+
+def _sender_loop(
+    home: Path,
+    registry: ProjectRegistry,
+    project_id: str,
+    session_id: str,
+    turns: int = 1,
+):
+    store = ConversationStore(home / "sessions", session_id=session_id, cwd=home)
+    backend = FakeBackend(
+        [ScriptedTurn(content=[TextContent("ok")]) for _ in range(turns)]
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=project_id,
+        project_registry=registry,
+    )
+    return loop, backend, store
+
+
+def _sent_status_notes(backend: FakeBackend) -> list:
+    return [
+        message
+        for call, _tools in backend.calls
+        for message in call
+        if message.metadata.get("zeta_event") == "project_inbox_sent_status"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_claim_injects_note_on_senders_next_turn_without_waking(
+    tmp_path: Path,
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="question",
+        title="Can you review this?",
+        body="Please review it.",
+    )
+    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    loop, backend, store = _sender_loop(
+        home, registry, project_a.project_id, session_id
+    )
+    try:
+        await loop._check_project_inbox()
+        assert backend.calls == []
+        assert store.agent_notifications() == []
+        await _collect_turn(loop, "What changed?")
+        notes = _sent_status_notes(backend)
+        assert len(notes) == 1
+        assert backend.calls[0][0][-1] is notes[0]
+        assert notes[0].content == [
+            TextContent(
+                'inbox: your message "Can you review this?" to beta was claimed '
+                f"by session {'b' * 32} at {inbox.read(project_b.project_id)['claimed'][0]['claimed_at']}"
+            )
+        ]
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_note_delivered_once_across_resume(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="info",
+        title="One time",
+        body="body",
+    )
+    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    loop, _backend, store = _sender_loop(
+        home, registry, project_a.project_id, session_id, turns=2
+    )
+    await loop._check_project_inbox()
+    await _collect_turn(loop, "first")
+    await _collect_turn(loop, "second")
+    assert (
+        sum(
+            message.metadata.get("zeta_event") == "project_inbox_sent_status"
+            for message in store.messages()
+        )
+        == 1
+    )
+    await loop.close()
+    store.close()
+
+    resumed, _resumed_backend, resumed_store = _sender_loop(
+        home, registry, project_a.project_id, session_id
+    )
+    try:
+        await resumed._check_project_inbox()
+        await _collect_turn(resumed, "after resume")
+        assert (
+            sum(
+                message.metadata.get("zeta_event") == "project_inbox_sent_status"
+                for message in resumed_store.messages()
+            )
+            == 1
+        )
+    finally:
+        await resumed.close()
+        resumed_store.close()
+
+
+@pytest.mark.asyncio
+async def test_done_with_reply_does_not_duplicate_signal(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="question",
+        title="Reply to me",
+        body="body",
+    )
+    claimer = "b" * 32
+    assert inbox.claim(project_b.project_id, message_id, claimer) is not None
+    inbox.done(project_b.project_id, message_id, claimer, "answered", reply="done")
+    loop, backend, store = _sender_loop(
+        home, registry, project_a.project_id, session_id
+    )
+    try:
+        await loop._check_project_inbox()
+        assert len(store.agent_notifications()) == 1
+        await _collect_turn(loop, "show me")
+        assert _sent_status_notes(backend) == []
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_note_not_in_system_prompt_and_not_user_origin(
+    tmp_path: Path,
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="info",
+        title="Origin",
+        body="body",
+    )
+    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    loop, backend, store = _sender_loop(
+        home, registry, project_a.project_id, session_id
+    )
+    try:
+        await loop._check_project_inbox()
+        await _collect_turn(loop, "hello")
+        note = _sent_status_notes(backend)[0]
+        assert all(
+            "your message" not in block.text
+            for block in loop.context_assembler.system_prompt.content
+            if isinstance(block, TextContent)
+        )
+        assert (
+            note.metadata[MESSAGE_ORIGIN_METADATA] == MessageOrigin.HARNESS_NUDGE.value
+        )
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_tracking_is_read_only_for_receiver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="info",
+        title="Read only",
+        body="body",
+    )
+    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    receiver_tree = registry.root / project_b.project_id / "inbox"
+
+    def snapshot() -> dict[str, bytes]:
+        return {
+            str(path.relative_to(receiver_tree)): path.read_bytes()
+            for path in receiver_tree.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    inbox_locks: list[bool] = []
+    real_handles = ProjectInbox._directory_handles
+
+    def counted_handles(self, *args, **kwargs):
+        inbox_locks.append(kwargs.get("lock", True))
+        return real_handles(self, *args, **kwargs)
+
+    monkeypatch.setattr(ProjectInbox, "_directory_handles", counted_handles)
+    scanner = ProjectInboxScanner(
+        registry,
+        project_a.project_id,
+        sessions_root=home / "sessions",
+        session_id=session_id,
+    )
+    statuses = scanner.scan_sent()
+
+    assert statuses is not None
+    assert [(item["id"], item["status"]) for item in statuses] == [
+        (message_id, "claimed")
+    ]
+    assert snapshot() == before
+    assert inbox_locks and not any(inbox_locks)
+    assert not list(receiver_tree.rglob("*.lock"))
+
+
+@pytest.mark.asyncio
+async def test_done_without_reply_injects_completed_status(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="change_request",
+        title="Finish this",
+        body="body",
+    )
+    claimer = "b" * 32
+    assert inbox.claim(project_b.project_id, message_id, claimer) is not None
+    completed = inbox.done(
+        project_b.project_id, message_id, claimer, "fixed without a reply"
+    )
+    loop, backend, store = _sender_loop(
+        home, registry, project_a.project_id, session_id
+    )
+    try:
+        await loop._check_project_inbox()
+        assert backend.calls == []
+        assert store.agent_notifications() == []
+        await _collect_turn(loop, "next")
+        notes = _sent_status_notes(backend)
+        assert len(notes) == 1
+        assert notes[0].content == [
+            TextContent(
+                'inbox: your message "Finish this" to beta was completed '
+                f"at {completed['done_at']} (outcome: fixed without a reply)"
+            )
+        ]
+    finally:
+        await loop.close()
+        store.close()

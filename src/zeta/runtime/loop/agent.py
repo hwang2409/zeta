@@ -802,6 +802,7 @@ class AgentLoop(
     ) -> AsyncIterator[StreamEvent]:
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
+        await self._check_project_inbox()
         if self.hooks is not None and system_message is None and not notification_turn:
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None:
@@ -829,6 +830,9 @@ class AgentLoop(
             message_persisted=system_message is not None, message=system_message
         ):
             yield event
+        inbox_status_message = self._project_inbox_status_message()
+        if inbox_status_message is not None:
+            await self._append_turn_message(inbox_status_message)
         if setup_error is not None:
             self._persist_partial_with_cancelled_tools([], None, failure=setup_error)
             yield StreamEvent(StreamEventType.AGENT_START)
