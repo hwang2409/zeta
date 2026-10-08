@@ -87,6 +87,7 @@ def run(
                     args.scope or directory.name,
                     str(directory),
                 )
+            registry.ensure_memory_supported(project.project_id)
             value = project.to_dict()
         elif args.project_verb == "discover":
             project = registry.find_for_directory(args.directory)
@@ -168,10 +169,12 @@ def run(
                 for project in registry.list_projects()
             ]
         elif args.project_verb == "show":
-            value = registry.show_project(
+            project = registry.show_project(
                 args.project if _PROJECT_ID.fullmatch(args.project) else None,
                 name=args.project if not _PROJECT_ID.fullmatch(args.project) else None,
-            ).to_dict()
+            )
+            registry.ensure_memory_supported(project.project_id)
+            value = project.to_dict()
         else:
             print(f"zeta: unknown project verb: {args.project_verb}", file=err)
             return 2
@@ -201,6 +204,7 @@ def _run_index(args: argparse.Namespace, registry: ProjectRegistry) -> object:
         if _PROJECT_ID.fullmatch(args.project)
         else registry.show_project(name=args.project)
     )
+    registry.ensure_memory_supported(project.project_id)
     index = TranscriptIndex(registry.root / project.project_id, project.project_id)
     if args.index_action == "rebuild":
         sources = []

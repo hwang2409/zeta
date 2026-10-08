@@ -12,8 +12,15 @@ import stat
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
-from .core.session_files import atomic_publish_file
+from .memory.entry_history import EntryMemoryHistoryMixin
+from .memory.version_store import (
+    PreparedVersion,
+    PublicationContext,
+    publish_version,
+    require_memory_format,
+)
 from .project_errors import ProjectRegistryError
 
 MAX_MEMORY_FILE_SIZE = 128 * 1024
@@ -100,8 +107,98 @@ class MemoryVersionFile:
     parent_content: str
 
 
-class ProjectMemoryHistoryMixin:
+@dataclass(frozen=True, slots=True)
+class _FormatOnePayloadAdapter:
+    """Prepare the legacy five-file payload for the shared publisher."""
+
+    owner: Any
+    contents: Mapping[str, str]
+    before: Mapping[str, str]
+    kind: str
+    provenance: Mapping[str, object] | None
+    files: list[str] | None
+    target_version: str | None
+    source_digest: str | None
+    source_history: list[dict[str, object]] | None
+    source_automatic_files: set[str] | None
+
+    def prepare(self, context: PublicationContext) -> PreparedVersion[None]:
+        old_records = list(context.old_manifests)
+        before_automatic = self.owner._automatic_files_from_records(old_records)
+        automatic = set(before_automatic)
+        changed = set(self.files or ())
+        if self.kind == "update" and self.provenance is not None:
+            automatic.update(changed)
+        elif self.kind == "accept":
+            automatic.difference_update(changed)
+        elif self.kind == "import":
+            automatic = set(self.source_automatic_files or ())
+        elif self.kind == "undo" and self.target_version is not None:
+            target = next(
+                (
+                    record
+                    for record in old_records
+                    if record.get("version") == self.target_version
+                ),
+                None,
+            )
+            restored = (
+                self.owner._automatic_file_set(target.get("before_automatic_files"))
+                if target is not None
+                else None
+            )
+            if restored is None:
+                target_index = next(
+                    (
+                        index
+                        for index, record in enumerate(old_records)
+                        if record.get("version") == self.target_version
+                    ),
+                    0,
+                )
+                restored = self.owner._automatic_files_from_records(
+                    old_records[:target_index]
+                )
+            automatic = restored
+        fields: dict[str, object] = {
+            "kind": self.kind,
+            "created_at": _now(),
+            "automatic_files": sorted(automatic),
+            "before_automatic_files": sorted(before_automatic),
+        }
+        if self.provenance is not None:
+            fields["provenance"] = dict(self.provenance)
+        if self.files is not None:
+            fields["files"] = sorted(self.files)
+        if self.target_version is not None:
+            fields["target_version"] = self.target_version
+        if self.source_digest is not None:
+            fields["source_digest"] = self.source_digest
+        if self.source_history is not None:
+            fields["source_history"] = self.source_history
+        return PreparedVersion(
+            {name: self.contents.get(name, "").encode() for name in PROJECT_MEMORY_FILES},
+            {name: self.before.get(name, "").encode() for name in PROJECT_MEMORY_FILES},
+            fields,
+            None,
+        )
+
+
+class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
     """Own atomic snapshots, CAS, provenance, dedupe, undo, and retention."""
+
+    @staticmethod
+    def _entry_retention_limit() -> int:
+        return MAX_RETAINED_VERSIONS
+
+    def _require_format_one(self, directory_fd: int) -> None:
+        require_memory_format(
+            directory_fd,
+            1,
+            pointer_reader=self._pointer,
+            version_handles=lambda fd, create: self._version_handles(fd, create=create),
+            manifest_reader=self._manifest,
+        )
 
     @staticmethod
     def _memory_digest_value(memory: Mapping[str, str]) -> str:
@@ -310,6 +407,7 @@ class ProjectMemoryHistoryMixin:
         mirror_path: os.PathLike[str],
     ) -> None:
         """Best-effort refresh of the derived Markdown view."""
+        self._require_format_one(directory_fd)
         try:
             memory_fd = self._memory_fd(directory_fd)
             try:
@@ -328,6 +426,7 @@ class ProjectMemoryHistoryMixin:
             _LOG.warning("could not refresh project memory mirror at %s: %s", mirror_path, exc)
 
     def _snapshot_locked(self, directory_fd: int) -> MemorySnapshot:
+        self._require_format_one(directory_fd)
         pointer = self._pointer(directory_fd)
         if pointer is None:
             contents = self._legacy_contents(directory_fd)
@@ -341,6 +440,17 @@ class ProjectMemoryHistoryMixin:
                 os.close(blobs)
                 os.close(root)
         return MemorySnapshot(contents, self._memory_digest_value(contents))
+
+    def ensure_memory_supported(self, project_id: str) -> None:
+        """Reject a project whose authoritative memory format is not active."""
+        def read(root_fd: int) -> None:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                self._require_format_one(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+        self._read(read)
 
     def memory_snapshot(self, project_id: str) -> MemorySnapshot:
         """Read the complete bounded memory set and digest atomically."""
@@ -378,6 +488,7 @@ class ProjectMemoryHistoryMixin:
         return result
 
     def _records_locked(self, directory_fd: int) -> list[dict[str, object]]:
+        self._require_format_one(directory_fd)
         pointer = self._pointer(directory_fd)
         if pointer is None:
             return []
@@ -555,109 +666,36 @@ class ProjectMemoryHistoryMixin:
         source_history: list[dict[str, object]] | None = None,
         source_automatic_files: set[str] | None = None,
     ) -> str:
-        root, blobs_fd, versions_fd = self._version_handles(directory_fd, create=True)
-        try:
-            def blobs_for(values: Mapping[str, str]) -> dict[str, str]:
-                result: dict[str, str] = {}
-                for name in PROJECT_MEMORY_FILES:
-                    payload = values.get(name, "").encode()
-                    digest = hashlib.sha256(payload).hexdigest()
-                    result[name] = digest
-                    try:
-                        os.stat(digest, dir_fd=blobs_fd, follow_symlinks=False)
-                    except FileNotFoundError:
-                        atomic_publish_file(blobs_fd, digest, payload)
-                return result
-
-            file_blobs = blobs_for(contents)
-            before_blobs = blobs_for(before)
-            os.fsync(blobs_fd)
-            self._memory_transaction_step("snapshot")
-            pointer = self._pointer(directory_fd)
-            old_history = [] if pointer is None else list(pointer["history"])
-            old_records = [self._manifest(versions_fd, item) for item in old_history]
-            before_automatic = self._automatic_files_from_records(old_records)
-            automatic = set(before_automatic)
-            changed = set(files or ())
-            if kind == "update" and provenance is not None:
-                automatic.update(changed)
-            elif kind == "accept":
-                automatic.difference_update(changed)
-            elif kind == "import":
-                automatic = set(source_automatic_files or ())
-            elif kind == "undo" and target_version is not None:
-                target = next(
-                    (
-                        record
-                        for record in old_records
-                        if record.get("version") == target_version
-                    ),
-                    None,
-                )
-                restored = (
-                    self._automatic_file_set(target.get("before_automatic_files"))
-                    if target is not None
-                    else None
-                )
-                if restored is None:
-                    target_index = next(
-                        (
-                            index
-                            for index, record in enumerate(old_records)
-                            if record.get("version") == target_version
-                        ),
-                        0,
-                    )
-                    restored = self._automatic_files_from_records(
-                        old_records[:target_index]
-                    )
-                automatic = restored
-            version = uuid.uuid4().hex
-            manifest: dict[str, object] = {
-                "version": version,
-                "kind": kind,
-                "created_at": _now(),
-                "snapshot": file_blobs,
-                "before_snapshot": before_blobs,
-                "automatic_files": sorted(automatic),
-                "before_automatic_files": sorted(before_automatic),
-            }
-            if provenance is not None:
-                manifest["provenance"] = dict(provenance)
-            if files is not None:
-                manifest["files"] = sorted(files)
-            if target_version is not None:
-                manifest["target_version"] = target_version
-            if source_digest is not None:
-                manifest["source_digest"] = source_digest
-            if source_history is not None:
-                manifest["source_history"] = source_history
-            atomic_publish_file(
-                versions_fd,
-                f"{version}.json",
-                json.dumps(manifest, sort_keys=True).encode(),
-            )
-            os.fsync(versions_fd)
-            self._memory_transaction_step("manifest")
-            history = [*old_history, version][-MAX_RETAINED_VERSIONS:]
-            atomic_publish_file(
-                directory_fd,
-                _CURRENT,
-                json.dumps({"current": version, "history": history}, sort_keys=True).encode(),
-                sync_directory=True,
-            )
-            self._memory_transaction_step("publish")
-            self._refresh_memory_mirror(
-                directory_fd,
-                contents,
-                mirror_path=self.root / project_id / "memory",
-            )
-            self._prune_versions(blobs_fd, versions_fd, set(history))
-            return version
-        finally:
-            os.close(versions_fd)
-            os.close(blobs_fd)
-            os.close(root)
+        self._require_format_one(directory_fd)
+        adapter = _FormatOnePayloadAdapter(
+            self,
+            contents=contents,
+            before=before,
+            kind=kind,
+            provenance=provenance,
+            files=files,
+            target_version=target_version,
+            source_digest=source_digest,
+            source_history=source_history,
+            source_automatic_files=source_automatic_files,
+        )
+        published = publish_version(
+            directory_fd,
+            adapter=adapter,
+            retention_limit=MAX_RETAINED_VERSIONS,
+            reset_history=False,
+            pointer_reader=self._pointer,
+            version_handles=lambda fd, create: self._version_handles(fd, create=create),
+            manifest_reader=self._manifest,
+            transaction_step=self._memory_transaction_step,
+            prune_versions=self._prune_versions,
+        )
+        self._refresh_memory_mirror(
+            directory_fd,
+            contents,
+            mirror_path=self.root / project_id / "memory",
+        )
+        return published.version
 
     def _prune_versions(self, blobs_fd: int, versions_fd: int, retained: set[str]) -> None:
         referenced: set[str] = set()
@@ -675,6 +713,8 @@ class ProjectMemoryHistoryMixin:
                     referenced.update(
                         item for item in values.values() if isinstance(item, str)
                     )
+                elif isinstance(values, str):
+                    referenced.add(values)
         for name in os.listdir(versions_fd):
             if name.endswith(".json") and name[:-5] not in retained:
                 os.unlink(name, dir_fd=versions_fd)
@@ -836,6 +876,7 @@ class ProjectMemoryHistoryMixin:
         def read(root_fd: int) -> MemoryVersionFile:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
+                self._require_format_one(directory_fd)
                 root, blobs_fd, versions_fd = self._version_handles(
                     directory_fd, create=False
                 )

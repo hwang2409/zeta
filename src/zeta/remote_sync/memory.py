@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
+from ..project_errors import UnsupportedMemoryFormatError
 from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
 from .errors import RemoteSyncError
@@ -365,6 +366,8 @@ def _validate_project_snapshot(snapshot: Path, project_id: str) -> None:
             if path.is_file() and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE:
                 raise ProjectRegistryError(f"memory file {name} is too large")
         registry.load_memory(project_id, byte_cap=MAX_RECORD_SIZE)
+    except UnsupportedMemoryFormatError:
+        raise
     except ProjectRegistryError as exc:
         raise RemoteSyncError(f"invalid project snapshot: {exc}") from exc
 

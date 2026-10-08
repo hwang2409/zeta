@@ -39,6 +39,7 @@ from html import escape
 from pathlib import Path
 from time import monotonic as _monotonic
 
+from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import load_identity, load_packaged_identity, load_runtime_guidance
 from ..skills import SkillCatalog
@@ -816,6 +817,8 @@ def refresh_project_memory(
         if project is None:
             return system_prompt
         entries = registry.load_memory_for_context(project.project_id)
+    except UnsupportedMemoryFormatError:
+        raise
     except (ProjectRegistryError, OSError):
         return system_prompt
     prefix = system_prompt[:start]
