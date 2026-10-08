@@ -302,6 +302,22 @@ def test_no_public_path_can_create_or_activate_format_two(tmp_path: Path) -> Non
         project_id,
         expected_digest=snapshot.digest,
         updates={"backlog.md": "# Backlog\nstill format one\n"},
+        provenance={"session_id": "session-1", "seq_start": 1, "seq_end": 1},
+    )
+    source_workspace = tmp_path / "source-workspace"
+    source_workspace.mkdir()
+    source_registry = ProjectRegistry(tmp_path / "source-projects")
+    source_project = source_registry.create_project(
+        "source", "source", source_workspace
+    )
+    source_registry.update_memory(
+        source_project.project_id, {"brief.md": "# Brief\nimported format one\n"}
+    )
+    before_import = registry.memory_snapshot(project_id)
+    registry.import_memory(
+        project_id,
+        source_registry.export_memory(source_project.project_id),
+        expected_digest=before_import.digest,
     )
 
     pointer = json.loads(

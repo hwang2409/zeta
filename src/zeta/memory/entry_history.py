@@ -377,4 +377,3 @@ class EntryMemoryHistoryMixin:
                 )
             finally:
                 os.close(directory_fd)
-

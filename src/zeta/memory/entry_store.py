@@ -27,7 +27,7 @@ MAX_ENTRY_TEXT_BYTES = 4 * 1024
 MAX_STATE_BYTES = 8 * 1024 * 1024
 MAX_KINDS = 32
 MAX_SOURCES_PER_ENTRY = 64
-MAX_OPERATIONS = 1_000
+MAX_OPERATIONS = 128
 MAX_REASON_BYTES = 1024
 
 EntryStatus = Literal["active", "superseded", "resolved", "expired"]
@@ -673,6 +673,9 @@ def apply_operations(
     receipts: list[OperationReceipt] = []
     touched: set[str] = set()
     for operation in operations:
+        operation_sources = getattr(operation, "sources", None)
+        if automatic and operation_sources == ():
+            _fail("automatic memory operation requires durable sources")
         operation_id = operation_id_factory()
         if not _OPERATION_ID.fullmatch(operation_id):
             _fail("invalid generated memory operation identity")
@@ -720,7 +723,9 @@ def apply_operations(
                     else operation.valid_until
                 ),
                 updated_at=now,
-                seen_at=max((source.observed_at for source in operation.sources), default=entry.seen_at),
+                seen_at=max(
+                    (entry.seen_at, *(source.observed_at for source in operation.sources))
+                ),
                 sources=_merged_sources(entry.sources, operation.sources),
                 last_operation_id=operation_id,
             )
@@ -810,6 +815,8 @@ def accept_entry(
     entry = state.entries.get(entry_id)
     if not isinstance(entry, MemoryEntry):
         _fail("memory accept targets a missing entry")
+    if entry.status != "active":
+        _fail("memory accept targets an inactive entry")
     if not entry.automatic or entry.accepted_at is not None:
         _fail("memory accept requires an unaccepted automatic entry")
     operation_id = new_operation_id()
@@ -835,26 +842,42 @@ def compact_inactive_entries(
     """Remove inactive bodies after their transition receipts leave retention."""
 
     entries = dict(state.entries)
-    removable = {
+    active_links = {
+        link
+        for entry in entries.values()
+        if isinstance(entry, MemoryEntry) and entry.status == "active"
+        for link in (*entry.supersedes, *entry.superseded_by)
+    }
+    aged = {
         entry_id
         for entry_id, entry in entries.items()
         if isinstance(entry, MemoryEntry)
         and entry.status != "active"
         and entry.last_operation_id not in retained_operation_ids
     }
-    if not removable:
-        return state
-    linked = {
-        link
+    marker_ids = aged & active_links
+    deleted_ids = (aged - marker_ids) | {
+        entry_id
         for entry_id, entry in entries.items()
-        if entry_id not in removable and isinstance(entry, MemoryEntry)
-        for link in (*entry.supersedes, *entry.superseded_by)
+        if isinstance(entry, MissingEntry) and entry_id not in active_links
     }
-    for entry_id in removable:
-        if entry_id in linked:
-            entries[entry_id] = MissingEntry(entry_id)
-        else:
-            del entries[entry_id]
+    if not marker_ids and not deleted_ids:
+        return state
+    for entry_id in marker_ids:
+        entries[entry_id] = MissingEntry(entry_id)
+    for entry_id in deleted_ids:
+        del entries[entry_id]
+    for entry_id, entry in tuple(entries.items()):
+        if isinstance(entry, MemoryEntry) and entry.status != "active":
+            entries[entry_id] = replace(
+                entry,
+                supersedes=tuple(
+                    target for target in entry.supersedes if target not in deleted_ids
+                ),
+                superseded_by=tuple(
+                    target for target in entry.superseded_by if target not in deleted_ids
+                ),
+            )
     result = replace(
         state, entries=entries, compacted_through_version=compacted_through_version
     )
