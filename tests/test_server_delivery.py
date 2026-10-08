@@ -744,13 +744,12 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
         shutil.copytree(tmp_path, crash_home)
 
         release.set()
-        for _ in range(100):
-            delivery = server.runtime.opened.store.client_delivery("dispatch-steer")
-            if len(backend.calls) == 2 and delivery.status == "delivered":
-                break
-            await asyncio.sleep(0)
-        assert len(backend.calls) == 2
-        assert delivery.status == "delivered"
+        async with asyncio.timeout(TIMEOUT):
+            while True:
+                delivery = server.runtime.opened.store.client_delivery("dispatch-steer")
+                if len(backend.calls) == 2 and delivery.status == "delivered":
+                    break
+                await asyncio.sleep(0.01)
     finally:
         release.set()
         await _close(server, writer)
