@@ -151,6 +151,7 @@ class ConversationLogMixin:
                 )
             self._entries = []
             self._reset_incremental_validation_state()
+            self._rebuild_client_deliveries(self._entries)
             header = {
                 "schema": SCHEMA,
                 "session_id": self.session_id,
@@ -280,6 +281,7 @@ class ConversationLogMixin:
                 if type(task_id) is str and task_id:
                     self._task_notification_ids.add(task_id)
         self._rebuild_incremental_validation_state()
+        self._rebuild_client_deliveries(self._entries)
 
         if torn_offset is not None:
             self._repair_torn_tail(torn_offset)

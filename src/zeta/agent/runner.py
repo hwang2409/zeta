@@ -839,7 +839,7 @@ async def run_agent_tool(
     def request_child_cancel() -> None:
         """Cancel this child without invoking its owner's cancel_all()."""
         child_loop.tool_registry.abort()
-        child_loop._steering_queue.clear()
+        child_loop.store.drop_client_steering("abort")
         if not child_task.done():
             child_task.cancel()
 

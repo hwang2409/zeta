@@ -343,3 +343,42 @@ def test_reconciler_labels_child_and_agent_send_rows_as_non_user() -> None:
 
     assert [row["authorship"] for row in rows] == ["agent_prompt", "agent_send"]
     assert all(row["authorship"] != "user" for row in rows)
+
+
+def test_request_excludes_client_delivery_bookkeeping() -> None:
+    transcript = Transcript(
+        SESSION,
+        (
+            {
+                "seq": 1,
+                "type": "client_delivery",
+                "data": {
+                    "delivery_id": "private-id",
+                    "method": "steer",
+                    "status": "queued",
+                    "outcome": {"accepted": True},
+                },
+            },
+            {
+                "seq": 2,
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "visible"}],
+                        "metadata": {
+                            "zeta.origin": "user",
+                            "zeta_client_delivery_id": "private-id",
+                        },
+                    }
+                },
+            },
+        ),
+    )
+
+    request = prepare_request(transcript, {}, as_of=TODAY)
+
+    assert "client_delivery" not in request.prompt
+    assert "zeta_client_delivery_id" not in request.prompt
+    assert "private-id" not in request.prompt
+    assert "visible" in request.prompt

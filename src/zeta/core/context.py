@@ -15,6 +15,7 @@ from ..context_accounting import (
     message_token_count as _message_token_count,
 )
 from .store import ConversationEntry, ConversationStore
+from .store._client_delivery import without_client_delivery_marker
 from ..context_eviction import (
     EVICTION_KIND,
     HYSTERESIS_RATIO,
@@ -1046,7 +1047,7 @@ class ContextAssembler:
                 and message.tool_result.tool_call_id in failed_tool_call_ids
             ):
                 continue
-            items.append(_ContextItem(entry, message))
+            items.append(_ContextItem(entry, without_client_delivery_marker(message)))
         for marker in markers:
             if marker.id not in emitted_marker_ids:
                 items.extend(self._marker_items(marker))

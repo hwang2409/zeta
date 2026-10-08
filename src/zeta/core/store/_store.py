@@ -48,6 +48,7 @@ from ._approval_display import (
     validated_approval_display,
 )
 from ._async_writes import AsyncDurableWritesMixin
+from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
 from ._incremental_validation import IncrementalValidationMixin
 from ._log import ConversationLogMixin, PersistedAppend
 from ._notifications import NotificationStateMixin
@@ -67,6 +68,7 @@ from ._validation import (
 
 class ConversationStore(
     AsyncDurableWritesMixin,
+    ClientDeliveryMixin,
     ConversationLogMixin,
     IncrementalValidationMixin,
     NotificationStateMixin,
@@ -130,6 +132,7 @@ class ConversationStore(
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
+        self._initialize_client_delivery_lifecycle()
         self._collect_persisted_appends = _collect_persisted_appends
         self._persisted_appends: list[PersistedAppend] = []
         self._persisted_appends_unverified = False
@@ -507,6 +510,8 @@ class ConversationStore(
                         raise ValueError("eviction telemetry must be an object")
                 elif view is not None or telemetry is not None:
                     raise ValueError("summary compaction cannot contain an eviction view")
+            elif entry.type == "client_delivery":
+                validate_client_delivery_data(entry.data, self.session_id)
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:
                     raise ValueError("warning message must be a string")
@@ -660,6 +665,7 @@ class ConversationStore(
                 task_id = entry.data.get("task_id")
                 if type(task_id) is str and task_id:
                     self._task_notification_ids.add(task_id)
+        self._record_client_delivery_entries(entries)
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entries[-1].seq)
         return entries

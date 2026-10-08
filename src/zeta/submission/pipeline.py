@@ -894,7 +894,7 @@ class SubmissionPipeline:
         # the abort path) so it can't resurface at the top of the next fresh
         # turn, and tell the user their echoed steer was not delivered.
         if self._provider_entry.message is not None and self._host.loop.has_pending_steering:
-            self._host.loop.clear_pending_steering()
+            self._host.loop.clear_pending_steering("turn_end")
             self._host._print_system(
                 "steer arrived after the turn ended; not delivered "
                 "(resend if still wanted)"
@@ -1123,7 +1123,7 @@ class SubmissionPipeline:
                 self._provider_task.cancel()
             # Steering messages queued into the aborted turn are dropped so
             # they cannot resurface at the top of the next fresh turn.
-            self._host.loop.clear_pending_steering()
+            self._host.loop.clear_pending_steering("turn_end")
         elif entry.child_task is not None and not entry.child_task.done():
             entry.child_task.cancel()
         entry.state = SubmissionState.CANCELED

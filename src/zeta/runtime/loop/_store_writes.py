@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import warnings
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 from ...core.store import ConversationEntry
 from ...core.store._approval_display import ApprovalAuditRequest
-from ...protocol.types import Message
+from ...protocol.types import ContentBlock, Message
 from ...transcript_search.index import (
     is_indexable_top_level_project_session,
     refresh_transcript_index,
@@ -21,6 +22,25 @@ if TYPE_CHECKING:
 
 class StoreWriteMixin:
     """Offload root writes without reordering parallel child startup."""
+
+    def _persist_partial_for_control(
+        self: AgentLoop,
+        partial_blocks: list[ContentBlock],
+        assistant_message: Message | None,
+    ) -> None:
+        try:
+            self._persist_partial_with_cancelled_tools(
+                partial_blocks, assistant_message
+            )
+        except Exception as exc:  # noqa: BLE001 - warn when persistence fails
+            try:
+                warnings.warn(
+                    f"failed to persist partial state: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            except BaseException:  # noqa: BLE001, S110 - warning failure is ignored
+                pass
 
     def _indexable_project_session(self: AgentLoop) -> bool:
         return self.project_registry is not None and is_indexable_top_level_project_session(

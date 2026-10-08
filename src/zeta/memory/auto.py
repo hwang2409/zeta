@@ -398,11 +398,33 @@ class AutoMemoryReconciler:
         while cursor <= item.end:
             if self._closing:
                 return
-            rows, end_offset, end_tokens = await asyncio.to_thread(
+            rows, end_offset, end_tokens, scanned_end = await asyncio.to_thread(
                 self._transcript_chunk, cursor, item.end
             )
             if not rows:
-                return
+                if scanned_end < cursor:
+                    break
+                if item.key is not None:
+                    retry_outcomes.append(
+                        ReconciliationOutcome(
+                            seq_start=cursor,
+                            seq_end=scanned_end,
+                            end_offset=end_offset,
+                            end_tokens=end_tokens,
+                            usage={},
+                        )
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self.state.record_success,
+                        seq_start=cursor,
+                        seq_end=scanned_end,
+                        reason=reason,
+                        end_offset=end_offset,
+                        end_tokens=end_tokens,
+                    )
+                cursor = scanned_end + 1
+                continue
             raw_transcript = Transcript(self.session_id, tuple(rows))
             first_seq = int(raw_transcript.rows[0]["seq"])
             changed: tuple[str, ...] = ()
@@ -667,13 +689,14 @@ class AutoMemoryReconciler:
 
     def _transcript_chunk(
         self, start: int, end: int
-    ) -> tuple[list[dict[str, object]], int, int]:
+    ) -> tuple[list[dict[str, object]], int, int, int]:
         path = self.session_dir / "conversation.jsonl"
         rows: list[dict[str, object]] = []
         size = 0
         end_offset = self._last_reconciled_bytes
         tokens = 0
         end_tokens = self._last_reconciled_tokens
+        scanned_end = start - 1
         try:
             with path.open("rb") as handle:
                 for raw in handle:
@@ -691,6 +714,11 @@ class AutoMemoryReconciler:
                     if seq > end:
                         break
                     projected = project_transcript_row(value)
+                    if projected is None:
+                        end_offset = offset
+                        end_tokens = tokens
+                        scanned_end = seq
+                        continue
                     projected_size = len(
                         json.dumps(projected, ensure_ascii=False).encode("utf-8")
                     )
@@ -700,6 +728,7 @@ class AutoMemoryReconciler:
                     size += projected_size
                     end_offset = offset
                     end_tokens = tokens
+                    scanned_end = seq
         except FileNotFoundError:
             pass
-        return rows, end_offset, end_tokens
+        return rows, end_offset, end_tokens, scanned_end
