@@ -394,6 +394,68 @@ def recoverable_resolutions(
     return recovered
 
 
+def select_resolution_choices(
+    local: MemoryState,
+    remote: MemoryState,
+    *,
+    candidates: Mapping[str, ResolutionCandidate],
+    stored: Mapping[str, ConflictChoice],
+    conflict_keys: tuple[str, ...],
+    explicit: ConflictChoice | None = None,
+) -> dict[str, ConflictChoice]:
+    """Select safe stored choices, or safely supersede them with an explicit choice."""
+
+    if explicit is not None and (
+        not stored or any(choice != explicit for choice in stored.values())
+    ):
+        return {key: explicit for key in conflict_keys}
+    return recoverable_resolutions(
+        local, remote, candidates=candidates, resolutions=stored
+    )
+
+
+def parse_resolution_candidates(
+    value: object,
+) -> dict[str, ResolutionCandidate] | None:
+    if not isinstance(value, dict):
+        return None
+    parsed: dict[str, ResolutionCandidate] = {}
+    for key, raw in value.items():
+        if not isinstance(key, str) or not isinstance(raw, dict):
+            return None
+        kind = raw.get("kind")
+        expected = {"kind", "local", "remote", "prepared"}
+        entry_ids: tuple[str, ...] = ()
+        if kind == "entries":
+            expected.add("entry_ids")
+            raw_ids = raw.get("entry_ids")
+            if (
+                not isinstance(raw_ids, list)
+                or not raw_ids
+                or raw_ids != sorted(set(raw_ids))
+                or any(
+                    not isinstance(item, str) or not item.startswith("m_")
+                    for item in raw_ids
+                )
+            ):
+                return None
+            entry_ids = tuple(raw_ids)
+        elif kind != "schema":
+            return None
+        if set(raw) != expected or any(
+            not _valid_digest(raw.get(name)) for name in ("local", "remote", "prepared")
+        ):
+            return None
+        parsed[key] = ResolutionCandidate(
+            kind,
+            entry_ids,
+            str(raw["local"]),
+            str(raw["remote"]),
+            str(raw["prepared"]),
+        )
+    return parsed
+
+
 def _entries_valid_for_schema(
     entries: Mapping[str, MemoryEntry | MissingEntry], schema: MemorySchema
 ) -> dict[str, MemoryEntry | MissingEntry]:
@@ -606,6 +668,8 @@ __all__ = [
     "entry_digest",
     "merge_entry_states",
     "merge_version_receipts",
+    "parse_resolution_candidates",
     "recoverable_resolutions",
     "schema_digest",
+    "select_resolution_choices",
 ]
