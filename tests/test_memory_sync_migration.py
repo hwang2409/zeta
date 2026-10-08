@@ -581,8 +581,12 @@ def _cli_args(project_id: str, **overrides: object) -> argparse.Namespace:
         "cli-set",
         "cli-from-file",
         "cli-accept",
-        "tui-memory",
-        "serve-memory",
+        "tui-log",
+        "tui-undo",
+        "tui-accept",
+        "serve-log",
+        "serve-undo",
+        "serve-accept",
         "serve-project-request",
         "sync-push",
         "sync-pull",
@@ -636,22 +640,37 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             assert project_cli.run(
                 args, stdout=io.StringIO(), stderr=io.StringIO()
             ) == 0
-    elif entry_point == "tui-memory":
-        tui = SimpleNamespace(
-            loop=SimpleNamespace(
-                project_registry=registry,
-                session_metadata=SimpleNamespace(project_id=project_id),
-                memory_reconciler=None,
+    elif entry_point.startswith(("tui-", "serve-")):
+        action = entry_point.split("-", 1)[1]
+        if action == "undo":
+            registry.update_memory(
+                project_id, {"state.md": "# Current state\n\nundo target\n"}
             )
-        )
-        SlashHandlerMixin.slash_memory(tui, "log")
-    elif entry_point == "serve-memory":
-        runtime = SimpleNamespace(
-            metadata=SimpleNamespace(project_id=project_id),
-            manager=SimpleNamespace(project_registry=registry),
-            loop=None,
-        )
-        ServerSlashSession(runtime).slash_memory("undo")
+        elif action == "accept":
+            current = registry.memory_snapshot(project_id)
+            registry.compare_and_swap_memory(
+                project_id,
+                expected_digest=current.digest,
+                updates={"state.md": "# Current state\n\nautomatic\n"},
+                provenance={"session_id": "fixture", "seq_start": 1, "seq_end": 1},
+            )
+            action = "accept state.md"
+        if entry_point.startswith("tui-"):
+            tui = SimpleNamespace(
+                loop=SimpleNamespace(
+                    project_registry=registry,
+                    session_metadata=SimpleNamespace(project_id=project_id),
+                    memory_reconciler=None,
+                )
+            )
+            SlashHandlerMixin.slash_memory(tui, action)
+        else:
+            runtime = SimpleNamespace(
+                metadata=SimpleNamespace(project_id=project_id),
+                manager=SimpleNamespace(project_registry=registry),
+                loop=None,
+            )
+            ServerSlashSession(runtime).slash_memory(action)
     elif entry_point == "serve-project-request":
         runtime = SimpleNamespace(
             manager=SimpleNamespace(list_sessions_read_only=list)
