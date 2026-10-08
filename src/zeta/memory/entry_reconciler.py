@@ -69,7 +69,14 @@ _CODE_LITERAL = re.compile(r"`([^`\\n]{1,256})`")
 _DURABLE_LITERAL_CUES = (
     "validated",
     "established",
-    "only valid",
+    "recorded",
+    "current",
+    "in progress",
+    "now complete",
+    "completed",
+    "supersedes",
+    "selected",
+    "verification",
     "decision",
     "remember",
 )
@@ -715,7 +722,9 @@ def _semantic_error(item: _ParsedOperation, state: MemoryState, now: str) -> str
                         r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+){2,}\b", entry.text
                     )
                 )
-                if text == entry.text or proposed_literals & existing_literals:
+                if text == entry.text or (
+                    proposed_literals and proposed_literals <= existing_literals
+                ):
                     return "add duplicates an existing active entry"
     if item.source_rank >= 6:
         return "uncorroborated harness or tool evidence"
