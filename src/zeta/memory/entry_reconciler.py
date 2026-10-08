@@ -63,6 +63,7 @@ _MAX_PRIMARY_REQUEST_BYTES = 28 * 1024
 _MAX_OPERATIONS = 64
 _MAX_PROPOSED_TEXT_BYTES = 24 * 1024
 _MAX_REASON_BYTES = 1024
+_COMPLETION_KINDS = frozenset({"state", "backlog", "threads", "commitments"})
 _HIGHEST_PRIORITY_WORDS = (
     "correction",
     "actually",
@@ -570,7 +571,40 @@ def _stored_rank(entry: MemoryEntry) -> int:
     return min(ranks, default=2 if entry.accepted_at else 6)
 
 
-def _semantic_error(item: _ParsedOperation, state: MemoryState) -> str | None:
+def _target_transition_error(
+    operation: MemoryOperation,
+    entry: MemoryEntry,
+    *,
+    proposal_rank: int | None,
+    direct_user: bool,
+    observed_at: str,
+    now: str,
+) -> str | None:
+    """Authorize every automatic content or status transition in one place."""
+    if isinstance(operation, ExpireOperation):
+        if entry.expires_at is None or datetime.fromisoformat(
+            entry.expires_at
+        ) > datetime.fromisoformat(now):
+            return "entry has not reached its configured expiry"
+        return None
+    if isinstance(operation, ResolveOperation) and entry.kind not in _COMPLETION_KINDS:
+        return "entry kind does not allow completion-based resolution"
+    if proposal_rank is None:
+        return "transition has no durable evidence rank"
+    if entry.accepted_at is not None:
+        if not direct_user:
+            return "accepted entry requires direct user evidence"
+        if observed_at <= entry.seen_at:
+            return "accepted entry requires newer direct user evidence"
+    target_rank = _stored_rank(entry)
+    if proposal_rank > target_rank:
+        return "weaker evidence cannot change stronger evidence"
+    if proposal_rank == target_rank and observed_at <= entry.seen_at:
+        return "non-newer evidence cannot change existing evidence"
+    return None
+
+
+def _semantic_error(item: _ParsedOperation, state: MemoryState, now: str) -> str | None:
     operation = item.operation
     text = getattr(operation, "text", None)
     if isinstance(text, str):
@@ -583,20 +617,16 @@ def _semantic_error(item: _ParsedOperation, state: MemoryState) -> str | None:
         entry = state.entries.get(target)
         if not isinstance(entry, MemoryEntry) or entry.status != "active":
             return "target is missing or inactive"
-        if entry.accepted_at is not None:
-            if not item.direct_user:
-                return "accepted entry requires direct user evidence"
-            if item.observed_at <= entry.seen_at:
-                return "accepted entry requires newer direct user evidence"
-        old_rank = _stored_rank(entry)
-        if isinstance(operation, SupersedeOperation) and item.source_rank > old_rank:
-            return "weaker evidence cannot supersede stronger evidence"
-        if (
-            isinstance(operation, SupersedeOperation)
-            and item.source_rank == old_rank
-            and item.observed_at <= entry.seen_at
-        ):
-            return "non-newer evidence cannot supersede existing evidence"
+        error = _target_transition_error(
+            operation,
+            entry,
+            proposal_rank=item.source_rank,
+            direct_user=item.direct_user,
+            observed_at=item.observed_at,
+            now=now,
+        )
+        if error is not None:
+            return error
     return None
 
 
@@ -628,7 +658,7 @@ def _select_groups(
     rejected: list[str] = []
     for group_index, group in enumerate(_dependency_groups(items)):
         errors = tuple(
-            error for item in group if (error := _semantic_error(item, state))
+            error for item in group if (error := _semantic_error(item, state, now))
         )
         error = errors[0] if errors else None
         if error is None:
@@ -650,15 +680,24 @@ def _select_groups(
 
 
 def _expired_operations(state: MemoryState, now: str) -> tuple[ExpireOperation, ...]:
-    instant = datetime.fromisoformat(now)
-    return tuple(
-        ExpireOperation(entry.id, "configured expiry reached")
-        for entry in state.entries.values()
-        if isinstance(entry, MemoryEntry)
-        and entry.status == "active"
-        and entry.expires_at is not None
-        and datetime.fromisoformat(entry.expires_at) <= instant
-    )
+    operations: list[ExpireOperation] = []
+    for entry in state.entries.values():
+        if not isinstance(entry, MemoryEntry) or entry.status != "active":
+            continue
+        operation = ExpireOperation(entry.id, "configured expiry reached")
+        if (
+            _target_transition_error(
+                operation,
+                entry,
+                proposal_rank=None,
+                direct_user=False,
+                observed_at=now,
+                now=now,
+            )
+            is None
+        ):
+            operations.append(operation)
+    return tuple(operations)
 
 
 def _repair_prompt(

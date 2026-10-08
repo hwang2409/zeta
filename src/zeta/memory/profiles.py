@@ -62,6 +62,18 @@ BUILTIN_PROFILES: MappingProxyType[str, MemorySchema] = MappingProxyType(
     {"zeta": _ZETA, "messaging": _MESSAGING}
 )
 
+_EARLY_UPDATE_DEBOUNCE_SECONDS: MappingProxyType[str, float] = MappingProxyType(
+    {"zeta": 60.0, "messaging": 15.0}
+)
+
+
+def early_update_debounce_seconds(profile: str) -> float:
+    """Return the completed-turn debounce selected by a memory profile."""
+    try:
+        return _EARLY_UPDATE_DEBOUNCE_SECONDS[profile]
+    except KeyError as exc:
+        raise ValueError(f"unknown memory profile: {profile}") from exc
+
 
 def memory_profile(name: str) -> MemorySchema:
     """Return one immutable built-in schema by name."""

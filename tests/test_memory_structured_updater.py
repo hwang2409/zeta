@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import date
@@ -20,7 +21,11 @@ from zeta.memory.entry_store import (
     apply_operations,
     empty_state,
 )
-from zeta.memory.profiles import BUILTIN_PROFILES, memory_profile
+from zeta.memory.profiles import (
+    BUILTIN_PROFILES,
+    early_update_debounce_seconds,
+    memory_profile,
+)
 from zeta.memory.reconciler import ReconciliationResponse, Transcript
 from zeta.project_errors import ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
@@ -44,16 +49,34 @@ def _registry(tmp_path: Path, profile: str = "zeta") -> tuple[ProjectRegistry, s
 
 
 def _row(
-    seq: int, text: str, *, origin: str = "user", role: str = "user"
+    seq: int,
+    text: str,
+    *,
+    origin: str = "user",
+    role: str = "user",
+    created_at: str | None = None,
 ) -> dict[str, object]:
+    data: dict[str, object] = {
+        "message": {
+            "role": role,
+            "content": [{"type": "text", "text": text}],
+            "metadata": {"zeta.origin": origin},
+        }
+    }
+    if created_at is not None:
+        data["created_at"] = created_at
+    return {"seq": seq, "type": "message", "data": data}
+
+
+def _completed_assistant(seq: int) -> dict[str, object]:
     return {
         "seq": seq,
         "type": "message",
         "data": {
             "message": {
-                "role": role,
-                "content": [{"type": "text", "text": text}],
-                "metadata": {"zeta.origin": origin},
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Done."}],
+                "metadata": {"response_state": "completed"},
             }
         },
     }
@@ -84,6 +107,7 @@ async def _run(
     responses: list[str | ReconciliationResponse],
     *,
     key: str = "range",
+    now: str = NOW,
 ):
     prompts: list[str] = []
 
@@ -99,7 +123,7 @@ async def _run(
         invoke=invoke,
         cas_retries=3,
         as_of=date(2026, 10, 8),
-        now=NOW,
+        now=now,
     )
     return result, prompts
 
@@ -110,6 +134,32 @@ def _entries(registry: ProjectRegistry, project_id: str) -> list[MemoryEntry]:
         for entry in registry._entry_memory_state(project_id).state.entries.values()
         if isinstance(entry, MemoryEntry)
     ]
+
+
+def _seed_user_entry(
+    registry: ProjectRegistry,
+    project_id: str,
+    *,
+    kind: str,
+    text: str,
+    observed_at: str = "2026-10-08T11:00:00.000000Z",
+) -> str:
+    initial = registry._entry_memory_state(project_id)
+    result = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=initial.digest,
+        operations=(
+            AddOperation(
+                kind,
+                text,
+                (MemorySource(SESSION, 1, 1, ("user",), observed_at),),
+            ),
+        ),
+        reconciliation_key=_key(f"seed-{kind}-{text}"),
+        automatic=True,
+        now=observed_at,
+    )
+    return next(iter(result.state.entries))
 
 
 def test_zeta_and_messaging_profiles_apply_distinct_defaults() -> None:
@@ -130,6 +180,8 @@ def test_zeta_and_messaging_profiles_apply_distinct_defaults() -> None:
         "threads",
         "commitments",
     )
+    assert early_update_debounce_seconds("zeta") == 60
+    assert early_update_debounce_seconds("messaging") == 15
     assert (
         next(kind for kind in zeta.kinds if kind.key == "state").default_expiry_days
         == 30
@@ -390,6 +442,166 @@ async def test_accepted_entry_requires_direct_user_evidence_to_supersede(
 
 
 @pytest.mark.asyncio
+async def test_agent_update_cannot_change_user_backed_entry(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    target = _seed_user_entry(
+        registry, project_id, kind="decisions", text="Use Postgres."
+    )
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(
+                2,
+                "Use SQLite.",
+                origin="unknown",
+                role="assistant",
+                created_at=NOW,
+            )
+        ),
+        [
+            _proposal(
+                {
+                    "op": "update",
+                    "target": target,
+                    "text": "Use SQLite.",
+                    "sources": [{"seq_start": 2, "seq_end": 2}],
+                    "reason": "agent inference",
+                }
+            )
+        ],
+        key="weak-update",
+    )
+    assert not result.changed_entry_ids
+    assert result.rejected_groups
+    assert next(entry for entry in _entries(registry, project_id) if entry.id == target).text == "Use Postgres."
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_resolve_user_backed_decision(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    target = _seed_user_entry(
+        registry, project_id, kind="decisions", text="Use Postgres."
+    )
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(
+                2,
+                "The decision is complete.",
+                origin="unknown",
+                role="assistant",
+                created_at=NOW,
+            )
+        ),
+        [
+            _proposal(
+                {
+                    "op": "resolve",
+                    "target": target,
+                    "sources": [{"seq_start": 2, "seq_end": 2}],
+                    "reason": "completion",
+                }
+            )
+        ],
+        key="decision-resolve",
+    )
+    assert not result.changed_entry_ids
+    assert result.rejected_groups
+    entry = next(entry for entry in _entries(registry, project_id) if entry.id == target)
+    assert entry.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_newer_user_evidence_can_update_user_backed_entry(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    target = _seed_user_entry(
+        registry, project_id, kind="decisions", text="Use Postgres."
+    )
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(_row(2, "Use SQLite.", created_at=NOW)),
+        [
+            _proposal(
+                {
+                    "op": "update",
+                    "target": target,
+                    "text": "Use SQLite.",
+                    "sources": [{"seq_start": 2, "seq_end": 2}],
+                    "reason": "new user decision",
+                }
+            )
+        ],
+        key="newer-user-update",
+    )
+    assert result.changed_entry_ids == (target,)
+    assert next(entry for entry in _entries(registry, project_id) if entry.id == target).text == "Use SQLite."
+
+
+@pytest.mark.asyncio
+async def test_equal_rank_older_evidence_cannot_update_entry(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    target = _seed_user_entry(
+        registry, project_id, kind="state", text="Deploy on Friday."
+    )
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(
+                2,
+                "Deploy on Thursday.",
+                created_at="2026-10-08T10:00:00.000000Z",
+            )
+        ),
+        [
+            _proposal(
+                {
+                    "op": "update",
+                    "target": target,
+                    "text": "Deploy on Thursday.",
+                    "sources": [{"seq_start": 2, "seq_end": 2}],
+                    "reason": "older user statement",
+                }
+            )
+        ],
+        key="older-equal-rank",
+    )
+    assert not result.changed_entry_ids
+    assert result.rejected_groups
+    assert next(entry for entry in _entries(registry, project_id) if entry.id == target).text == "Deploy on Friday."
+
+
+@pytest.mark.asyncio
+async def test_completion_resolves_backlog_entry(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    target = _seed_user_entry(
+        registry, project_id, kind="backlog", text="Publish the release."
+    )
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(_row(2, "The release is published.", created_at=NOW)),
+        [
+            _proposal(
+                {
+                    "op": "resolve",
+                    "target": target,
+                    "sources": [{"seq_start": 2, "seq_end": 2}],
+                    "reason": "completion",
+                }
+            )
+        ],
+        key="backlog-complete",
+    )
+    assert result.changed_entry_ids == (target,)
+    entry = next(entry for entry in _entries(registry, project_id) if entry.id == target)
+    assert entry.status == "resolved"
+
+
+@pytest.mark.asyncio
 async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> None:
     registry, project_id = _registry(tmp_path)
     _, _ = await _run(
@@ -438,9 +650,16 @@ async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> N
     await _run(
         registry,
         project_id,
-        _transcript(_row(3, "PR 10 is done and post-merge checks passed.")),
+        _transcript(
+            _row(
+                3,
+                "PR 10 is done and post-merge checks passed.",
+                created_at="2026-10-08T13:00:00.000000Z",
+            )
+        ),
         [_proposal(resolve)],
         key="done",
+        now="2026-10-08T13:00:00.000000Z",
     )
     assert (
         next(
@@ -577,9 +796,20 @@ def _write_session(session_dir: Path, *rows: dict[str, object]) -> None:
     )
 
 
+class _MutableClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 def _auto_runner(
     tmp_path: Path,
     invoke,
+    *,
+    clock: _MutableClock | None = None,
+    debounce_seconds: float = 0,
 ) -> tuple[AutoMemoryReconciler, ProjectRegistry, str]:
     registry, project_id = _registry(tmp_path)
     session_dir = tmp_path / "sessions" / SESSION
@@ -594,7 +824,9 @@ def _auto_runner(
             minimum_interval=0,
             retry_backoff_seconds=0,
             cas_retries=3,
+            early_trigger_debounce_seconds=debounce_seconds,
         ),
+        **({"clock": clock} if clock is not None else {}),
     )
     return runner, registry, project_id
 
@@ -634,6 +866,125 @@ async def test_completed_direct_user_turn_queues_early_format_two_update(
     assert [entry.text for entry in _entries(registry, project_id)] == [
         "The project uses SQLite."
     ]
+
+
+@pytest.mark.asyncio
+async def test_five_rapid_user_turns_coalesce_into_one_request(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return _proposal()
+
+    runner, _, _ = _auto_runner(tmp_path, invoke, debounce_seconds=0.05)
+    rows: list[dict[str, object]] = []
+    for turn in range(5):
+        rows.extend(
+            (
+                _row(turn * 2 + 1, f"Fact {turn}."),
+                _completed_assistant(turn * 2 + 2),
+            )
+        )
+        _write_session(runner.session_dir, *rows)
+        runner.activity(turn * 2 + 2)
+        await asyncio.sleep(0.01)
+    await runner.drain()
+    await runner.close()
+
+    assert calls == 1
+    assert runner.last_reconciled_seq == 10
+
+
+@pytest.mark.asyncio
+async def test_user_turns_ninety_seconds_apart_make_two_requests(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return _proposal()
+
+    clock = _MutableClock()
+    runner, _, _ = _auto_runner(
+        tmp_path, invoke, clock=clock, debounce_seconds=0
+    )
+    first = (_row(1, "First fact."), _completed_assistant(2))
+    _write_session(runner.session_dir, *first)
+    runner.activity(2)
+    await runner.drain()
+
+    clock.now = 90
+    second = (*first, _row(3, "Second fact."), _completed_assistant(4))
+    _write_session(runner.session_dir, *second)
+    runner.activity(4)
+    await runner.drain()
+    await runner.close()
+
+    assert calls == 2
+    assert runner.last_reconciled_seq == 4
+
+
+@pytest.mark.asyncio
+async def test_notification_does_not_retrigger_consumed_user_turn(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return _proposal()
+
+    runner, _, _ = _auto_runner(tmp_path, invoke, debounce_seconds=0)
+    completed = (_row(1, "A fact."), _completed_assistant(2))
+    _write_session(runner.session_dir, *completed)
+    runner.activity(2)
+    await runner.drain()
+
+    _write_session(
+        runner.session_dir,
+        *completed,
+        {"seq": 3, "type": "notification", "data": {"text": "background"}},
+    )
+    runner.activity(3)
+    await runner.drain()
+    await runner.close()
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_does_not_retrigger_consumed_user_turn(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return _proposal()
+
+    runner, registry, project_id = _auto_runner(
+        tmp_path, invoke, debounce_seconds=60
+    )
+    _write_session(runner.session_dir, _row(1, "A fact."), _completed_assistant(2))
+    runner.activity(2)
+    while not runner.position_path.exists() or json.loads(
+        runner.position_path.read_text()
+    ).get("early_trigger_seq") != 2:
+        await asyncio.sleep(0)
+    await runner.close()
+
+    replacement = AutoMemoryReconciler(
+        registry=registry,
+        project_id=project_id,
+        session_id=SESSION,
+        session_dir=runner.session_dir,
+        invoke=invoke,
+        config=runner.config,
+    )
+    replacement.activity(2)
+    await replacement.drain()
+    await replacement.close()
+
+    assert calls == 0
 
 
 @pytest.mark.asyncio

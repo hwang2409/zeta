@@ -23,6 +23,7 @@ from ..protocol.types import (
 )
 from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
 from .entry_reconciler import EntryReconciliationFailure, reconcile_entry_range
+from .profiles import early_update_debounce_seconds
 from .reconciler import (
     ReconciliationError,
     ReconciliationResponse,
@@ -79,6 +80,7 @@ class AutoMemoryConfig:
     minimum_interval: float = 1.0
     shutdown_grace_seconds: float = 2.5
     retry_backoff_seconds: float = 60.0
+    early_trigger_debounce_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if self.token_threshold < 1:
@@ -93,6 +95,11 @@ class AutoMemoryConfig:
             raise ValueError("memory shutdown grace cannot be negative")
         if self.retry_backoff_seconds < 0:
             raise ValueError("memory retry backoff cannot be negative")
+        if (
+            self.early_trigger_debounce_seconds is not None
+            and self.early_trigger_debounce_seconds < 0
+        ):
+            raise ValueError("memory early-trigger debounce cannot be negative")
 
 
 @dataclass(slots=True)
@@ -148,6 +155,8 @@ class AutoMemoryReconciler:
         self._activity_generation = 0
         self._seen_activity_generation = 0
         self._idle_deadline: float | None = None
+        self._early_deadline: float | None = None
+        self._early_pending_end: int | None = None
         self._last_request_finished = 0.0
         self._conflict_retries = 0
         self._resume_catch_up = False
@@ -220,6 +229,7 @@ class AutoMemoryReconciler:
             self._busy
             or self._pending
             or self._resume_catch_up
+            or self._early_pending_end is not None
             or bool(self._ready_retries())
             or self._seen_activity_generation < self._activity_generation
         ):
@@ -305,6 +315,18 @@ class AutoMemoryReconciler:
                 self._drained.set()
                 return
             self._queue_ready_retries()
+            if (
+                self._early_pending_end is not None
+                and self._early_deadline is not None
+                and self._clock() >= self._early_deadline
+            ):
+                self._add_pending(
+                    self.last_reconciled_seq + 1,
+                    self._early_pending_end,
+                    "direct-user-turn",
+                )
+                self._early_pending_end = None
+                self._early_deadline = None
             if self._resume_catch_up:
                 self._resume_catch_up = False
                 latest_seq, _, _ = await asyncio.to_thread(self._transcript_state)
@@ -321,15 +343,19 @@ class AutoMemoryReconciler:
                 growth = max(0, transcript_tokens - self._last_reconciled_tokens)
                 if growth >= self.config.token_threshold:
                     self._add_pending(self.last_reconciled_seq + 1, latest_seq, "tokens")
-                early_range = await asyncio.to_thread(
+                early_turn = await asyncio.to_thread(
                     self._completed_direct_user_turn, latest_seq
                 )
-                if early_range is not None:
-                    self._add_pending(
-                        self.last_reconciled_seq + 1,
-                        early_range[1],
-                        "direct-user-turn",
+                if early_turn is not None:
+                    completion_seq, debounce_seconds = early_turn
+                    consumed = await asyncio.to_thread(
+                        self.state.consume_early_trigger, completion_seq
                     )
+                    if consumed:
+                        self._early_pending_end = max(
+                            self._early_pending_end or 0, completion_seq
+                        )
+                        self._early_deadline = self._clock() + debounce_seconds
             if self._pending:
                 item = self._pending.pop(0)
                 if item.key is not None:
@@ -388,6 +414,9 @@ class AutoMemoryReconciler:
             timeout = None
             if self._idle_deadline is not None:
                 timeout = max(0.0, self._idle_deadline - self._clock())
+            if self._early_deadline is not None:
+                early_timeout = max(0.0, self._early_deadline - self._clock())
+                timeout = early_timeout if timeout is None else min(timeout, early_timeout)
             exhausted_retry_keys = frozenset(
                 key
                 for key, attempts in self._retry_attempts_in_cycle.items()
@@ -400,11 +429,15 @@ class AutoMemoryReconciler:
             try:
                 await self._idle_wait(self._wake, timeout)
             except TimeoutError:
-                latest_seq, _, _ = await asyncio.to_thread(self._transcript_state)
-                if latest_seq > self.last_reconciled_seq:
-                    self._add_pending(self.last_reconciled_seq + 1, latest_seq, "idle")
-                    self._drained.clear()
-                self._idle_deadline = self._clock() + self.config.idle_seconds
+                now = self._clock()
+                if self._idle_deadline is not None and now >= self._idle_deadline:
+                    latest_seq, _, _ = await asyncio.to_thread(self._transcript_state)
+                    if latest_seq > self.last_reconciled_seq:
+                        self._add_pending(
+                            self.last_reconciled_seq + 1, latest_seq, "idle"
+                        )
+                        self._drained.clear()
+                    self._idle_deadline = now + self.config.idle_seconds
 
     async def _reconcile_range(self, item: _PendingRange) -> None:
         cursor = item.start
@@ -684,12 +717,15 @@ class AutoMemoryReconciler:
             except FileNotFoundError:
                 pass
 
-    def _completed_direct_user_turn(self, latest_seq: int) -> tuple[int, int] | None:
-        """Return a bounded early-update range for a completed direct-user turn."""
+    def _completed_direct_user_turn(self, latest_seq: int) -> tuple[int, float] | None:
+        """Return the newest unseen completed turn and its profile debounce."""
         try:
-            self.registry._entry_memory_state(self.project_id)
+            snapshot = self.registry._entry_memory_state(self.project_id)
         except UnsupportedMemoryFormatError:
             return None
+        debounce = self.config.early_trigger_debounce_seconds
+        if debounce is None:
+            debounce = early_update_debounce_seconds(snapshot.state.schema.profile)
         path = self.session_dir / "conversation.jsonl"
         try:
             with path.open("rb") as handle:
@@ -702,37 +738,44 @@ class AutoMemoryReconciler:
             rows = [json.loads(line) for line in lines if line.strip()]
         except (OSError, json.JSONDecodeError):
             return None
-        messages = [
-            row
-            for row in rows
-            if isinstance(row, dict)
-            and row.get("type") == "message"
-            and isinstance(row.get("data"), dict)
-            and isinstance(row["data"].get("message"), dict)
-        ]
-        if not messages:
-            return None
-        last = messages[-1]
-        last_message = last["data"]["message"]
-        metadata = last_message.get("metadata")
-        if (
-            last_message.get("role") != "assistant"
-            or not isinstance(metadata, dict)
-            or metadata.get("response_state") != ASSISTANT_RESPONSE_COMPLETED
-        ):
-            return None
-        for row in reversed(messages[:-1]):
-            message = row["data"]["message"]
+        direct_user_pending = False
+        newest_completion = 0
+        for row in rows:
+            if (
+                not isinstance(row, dict)
+                or row.get("type") != "message"
+                or type(row.get("seq")) is not int
+                or int(row["seq"]) > latest_seq
+            ):
+                continue
+            message_data = row.get("data")
+            message = (
+                message_data.get("message")
+                if isinstance(message_data, dict)
+                else None
+            )
+            if not isinstance(message, dict):
+                continue
             metadata = message.get("metadata")
             if (
                 message.get("role") == "user"
                 and message.get("tool_result") is None
                 and isinstance(metadata, dict)
                 and metadata.get(MESSAGE_ORIGIN_METADATA) == MessageOrigin.USER
-                and type(row.get("seq")) is int
             ):
-                return int(row["seq"]), latest_seq
-        return None
+                direct_user_pending = True
+                continue
+            if (
+                direct_user_pending
+                and message.get("role") == "assistant"
+                and isinstance(metadata, dict)
+                and metadata.get("response_state") == ASSISTANT_RESPONSE_COMPLETED
+            ):
+                newest_completion = int(row["seq"])
+                direct_user_pending = False
+        if newest_completion <= self.state.early_trigger_seq:
+            return None
+        return newest_completion, debounce
 
     def _transcript_state(self) -> tuple[int, int, int]:
         path = self.session_dir / "conversation.jsonl"
