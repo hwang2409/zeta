@@ -83,8 +83,8 @@ class FinderRuntimeMixin:
         self._invalidate_prompt()
 
     def _finder_accept(self) -> None:
-        self._transcript.finder_accept()
-        self._cancel_finder_workers()
+        if self._transcript.finder_accept():
+            self._cancel_finder_workers()
         self._invalidate_prompt()
 
     def _finder_cancel(self) -> None:

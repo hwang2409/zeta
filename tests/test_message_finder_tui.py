@@ -159,6 +159,41 @@ def test_finder_jump_works_on_virtual_history() -> None:
 
 
 @pytest.mark.asyncio
+async def test_enter_before_candidate_preparation_keeps_finder_usable() -> None:
+    transcript = TranscriptWidget()
+    for index in range(400):
+        transcript.append(Text(f"history line {index}"))
+    target = transcript.append(Text("the unique zebra marker on the virtual path"))
+    target_index = transcript._units.index(target)
+    for index in range(400):
+        transcript.append(Text(f"tail line {index}"))
+    transcript.create_content(100, 10)
+    app = _app_for_finder(transcript)
+
+    app._finder_open()
+    prepare_task = app._finder_prepare_task
+    assert prepare_task is not None
+
+    app._finder_accept()
+
+    assert transcript.finder_active
+    assert app._finder_prepare_task is prepare_task
+    await prepare_task
+    state = transcript.finder_state()
+    assert state is not None and state.rows
+
+    app._finder_input("zebra")
+    rank_task = app._finder_rank_task
+    assert rank_task is not None
+    await rank_task
+    app._finder_accept()
+
+    assert not transcript.finder_active
+    assert transcript._virtual_start is not None
+    assert transcript._virtual_start[0] == target_index
+
+
+@pytest.mark.asyncio
 async def test_open_does_not_stall_long_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
