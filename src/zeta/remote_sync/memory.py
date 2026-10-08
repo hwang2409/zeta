@@ -7,6 +7,7 @@ publication. Transports only fetch and publish validated project snapshots.
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import hashlib
 import json
@@ -46,6 +47,14 @@ class MemoryTransferResult:
     project_id: str
     updated: tuple[str, ...]
     conflicts: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SharedSyncState:
+    state: dict[str, object]
+    previous_digest: str
+    transition_id: str | None = None
+    resolutions: dict[str, Literal["local", "remote"]] | None = None
 
 
 class _Digest(Protocol):
@@ -121,9 +130,10 @@ def sync_project_memory(
                     "mixed project memory formats cannot synchronize; migration is required"
                 )
             memory_format = 2 if isinstance(source_export, EntryMemoryExport) else 1
-            state = _shared_state(
+            shared = _shared_state(
                 source, destination, state_key, project_id, memory_format=memory_format
             )
+            state = shared.state
             if isinstance(local_export, EntryMemoryExport) and isinstance(
                 remote_export, EntryMemoryExport
             ):
@@ -138,7 +148,9 @@ def sync_project_memory(
                     remote_export,
                     state=state,
                     project_id=project_id,
+                    resolutions=shared.resolutions,
                 )
+                _finish_entry_transition(state, shared, shared.resolutions or {})
                 merged = remote_merged
                 source_merged = local_merged
                 source = local
@@ -219,7 +231,8 @@ def resolve_project_memory(
                 raise RemoteSyncError(f"remote project {project_id} was not found")
             _validate_project_snapshot(remote, project_id)
             remote_export = _materialize_memory_export(remote, project_id)
-            state = _shared_state(local, remote, state_key, project_id)
+            shared = _shared_state(local, remote, state_key, project_id)
+            state = shared.state
             conflicts = state["conflicts"]
             if not conflicts:
                 raise RemoteSyncError("project memory has no unresolved conflicts")
@@ -245,7 +258,14 @@ def resolve_project_memory(
                     remote_export,
                     state=state,
                     project_id=project_id,
-                    resolutions={key: accept for key in conflicts},
+                    resolutions=(
+                        shared.resolutions or {key: accept for key in conflicts}
+                    ),
+                )
+                _finish_entry_transition(
+                    state,
+                    shared,
+                    shared.resolutions or {key: accept for key in conflicts},
                 )
                 _write_state(local, state_key, state)
                 _write_state(remote, state_key, state)
@@ -631,26 +651,118 @@ def _shared_state(
     project_id: str,
     *,
     memory_format: int = 1,
-) -> dict[str, object]:
+) -> _SharedSyncState:
     first_state = _read_state(first, peer, project_id, required=False)
     second_state = _read_state(second, peer, project_id, required=False)
-    if first_state is not None and second_state is not None and first_state != second_state:
+    if first_state is not None and second_state is not None:
+        if first_state == second_state:
+            return _shared_sync_state(first_state)
+        recovered = _recover_partial_entry_transition(first_state, second_state)
+        if recovered is not None:
+            return recovered
         raise RemoteSyncError("memory synchronization state differs between peers")
     if first_state is not None:
-        return first_state
+        return _recover_missing_entry_predecessor(
+            first_state, project_id
+        ) or _shared_sync_state(first_state)
     if second_state is not None:
-        return second_state
+        return _recover_missing_entry_predecessor(
+            second_state, project_id
+        ) or _shared_sync_state(second_state)
     if memory_format == 2:
-        return {
-            "schema": 3,
-            "project_id": project_id,
-            "format": 2,
-            "entries": {},
-            "schema_digest": None,
-            "conflicts": {},
-        }
-    return {"schema": 2, "project_id": project_id, "files": {}, "conflicts": {}}
+        return _shared_sync_state(
+            {
+                "schema": 3,
+                "project_id": project_id,
+                "format": 2,
+                "entries": {},
+                "schema_digest": None,
+                "conflicts": {},
+            }
+        )
+    return _shared_sync_state(
+        {"schema": 2, "project_id": project_id, "files": {}, "conflicts": {}}
+    )
 
+
+def _shared_sync_state(state: dict[str, object]) -> _SharedSyncState:
+    copied = copy.deepcopy(state)
+    return _SharedSyncState(copied, _sync_state_digest(copied))
+
+
+def _recover_partial_entry_transition(
+    first: dict[str, object], second: dict[str, object]
+) -> _SharedSyncState | None:
+    for newer, older in ((first, second), (second, first)):
+        transition = newer.get("transition")
+        if (
+            newer.get("schema") != 3
+            or not isinstance(transition, dict)
+            or transition.get("previous_state") != _sync_state_digest(older)
+        ):
+            continue
+        transition_id = transition.get("id")
+        resolutions = transition.get("resolutions")
+        if not isinstance(transition_id, str) or not isinstance(resolutions, dict):
+            continue
+        return _SharedSyncState(
+            copy.deepcopy(older),
+            _sync_state_digest(older),
+            transition_id=transition_id,
+            resolutions=dict(resolutions),  # validated by _read_state
+        )
+    return None
+
+
+def _recover_missing_entry_predecessor(
+    newer: dict[str, object], project_id: str
+) -> _SharedSyncState | None:
+    transition = newer.get("transition")
+    if newer.get("schema") != 3 or not isinstance(transition, dict):
+        return None
+    predecessor = {
+        "schema": 3,
+        "project_id": project_id,
+        "format": 2,
+        "entries": {},
+        "schema_digest": None,
+        "conflicts": {},
+    }
+    previous_digest = _sync_state_digest(predecessor)
+    if transition.get("previous_state") != previous_digest:
+        return None
+    transition_id = transition.get("id")
+    resolutions = transition.get("resolutions")
+    if not isinstance(transition_id, str) or not isinstance(resolutions, dict):
+        return None
+    return _SharedSyncState(
+        predecessor,
+        previous_digest,
+        transition_id=transition_id,
+        resolutions=dict(resolutions),  # validated by _read_state
+    )
+
+
+def _finish_entry_transition(
+    state: dict[str, object],
+    shared: _SharedSyncState,
+    resolutions: dict[str, Literal["local", "remote"]],
+) -> None:
+    if state.get("schema") != 3:
+        return
+    state["transition"] = {
+        "id": shared.transition_id or uuid.uuid4().hex,
+        "previous_state": shared.previous_digest,
+        "resolutions": dict(sorted(resolutions.items())),
+    }
+
+
+def _sync_state_digest(state: dict[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            state, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
 
 def _read_state(
     project: Path,
@@ -715,14 +827,18 @@ def _valid_state(value: object, project_id: str) -> bool:
 
 
 def _valid_entry_sync_state(value: dict[str, object], project_id: str) -> bool:
-    if set(value) != {
+    required = {
         "schema",
         "project_id",
         "format",
         "entries",
         "schema_digest",
         "conflicts",
-    }:
+    }
+    if set(value) not in {frozenset(required), frozenset((*required, "transition"))}:
+        return False
+    transition = value.get("transition")
+    if transition is not None and not _valid_entry_transition(transition):
         return False
     entries = value.get("entries")
     conflicts = value.get("conflicts")
@@ -781,6 +897,30 @@ def _valid_entry_sync_state(value: dict[str, object], project_id: str) -> bool:
         occupied.update(entry_ids)
     return True
 
+
+
+def _valid_entry_transition(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "id",
+        "previous_state",
+        "resolutions",
+    }:
+        return False
+    transition_id = value.get("id")
+    resolutions = value.get("resolutions")
+    return (
+        isinstance(transition_id, str)
+        and len(transition_id) == 32
+        and all(character in "0123456789abcdef" for character in transition_id)
+        and _valid_digest(value.get("previous_state"))
+        and isinstance(resolutions, dict)
+        and all(
+            isinstance(key, str)
+            and (key == "schema" or key.startswith("m_"))
+            and choice in {"local", "remote"}
+            for key, choice in resolutions.items()
+        )
+    )
 
 def _valid_digest(value: object) -> bool:
     return value == _MISSING or (

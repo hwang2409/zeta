@@ -43,6 +43,7 @@ from zeta.remote_sync import (
     resolve_project_memory,
 )
 from zeta.remote_sync.errors import RemoteSyncError
+from zeta.remote_sync.memory import project_digest
 from zeta.remote_sync.ssh import SshTransport
 from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
@@ -78,6 +79,19 @@ def _add(registry: ProjectRegistry, project_id: str, text: str, seq: int = 1) ->
         project_id,
         expected_digest=before.digest,
         operations=(AddOperation("state", text, _source(seq)),),
+        reconciliation_key=None,
+    )
+    return result.receipts[0].result_ids[0]
+
+
+def _add_kind(
+    registry: ProjectRegistry, project_id: str, kind: str, text: str, seq: int
+) -> str:
+    before = registry._entry_memory_state(project_id)
+    result = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=before.digest,
+        operations=(AddOperation(kind, text, _source(seq)),),
         reconciliation_key=None,
     )
     return result.receipts[0].result_ids[0]
@@ -771,3 +785,287 @@ def test_migration_engine_is_dormant_from_public_paths(tmp_path: Path) -> None:
     with pytest.raises(ProjectRegistryError):
         registry.import_memory(project_id, object(), expected_digest="0" * 64)  # type: ignore[arg-type]
     assert registry.memory_format(project_id) == 1
+
+
+def _replace_schema(registry: ProjectRegistry, project_id: str, schema: object) -> None:
+    current = registry._entry_memory_state(project_id)
+    registry._replace_entry_state_for_test(
+        project_id,
+        dataclasses.replace(current.state, schema=schema),
+        expected_digest=current.digest,
+    )
+
+
+def _supersede(
+    registry: ProjectRegistry, project_id: str, entry_id: str, text: str, seq: int
+) -> str:
+    current = registry._entry_memory_state(project_id)
+    result = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=current.digest,
+        operations=(SupersedeOperation((entry_id,), "state", text, _source(seq)),),
+        reconciliation_key=None,
+    )
+    return result.receipts[0].result_ids[0]
+
+
+def _create_entry_conflict(
+    first: Path, second: Path
+) -> tuple[ProjectRegistry, ProjectRegistry, str, str]:
+    local, project_id = _fixture(first, first.parent / "workspace")
+    entry_id = _add(local, project_id, "base", 1)
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    remote = ProjectRegistry(second / "projects")
+    for owner, text, seq in ((local, "local edit", 2), (remote, "remote edit", 3)):
+        current = owner._entry_memory_state(project_id)
+        owner._compare_and_swap_entries(
+            project_id,
+            expected_digest=current.digest,
+            operations=(UpdateOperation(entry_id, _source(seq), text=text),),
+            reconciliation_key=None,
+        )
+    assert push_project_memory(
+        first, LocalTransport(second), project_id=project_id
+    ).conflicts == (entry_id,)
+    return local, remote, project_id, entry_id
+
+
+def test_resolve_remote_after_post_conflict_supersession(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, remote, project_id, entry_id = _create_entry_conflict(first, second)
+    replacement_id = _supersede(remote, project_id, entry_id, "remote replacement", 4)
+
+    result = resolve_project_memory(
+        first, LocalTransport(second), project_id=project_id, accept="remote"
+    )
+
+    assert result.conflicts == ()
+    assert _active_texts(local, project_id) == {"remote replacement"}
+    assert replacement_id in local._entry_memory_state(project_id).state.entries
+
+
+def test_resolve_local_after_post_conflict_supersession(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, remote, project_id, entry_id = _create_entry_conflict(first, second)
+    replacement_id = _supersede(local, project_id, entry_id, "local replacement", 4)
+
+    result = resolve_project_memory(
+        first, LocalTransport(second), project_id=project_id, accept="local"
+    )
+
+    assert result.conflicts == ()
+    assert _active_texts(remote, project_id) == {"local replacement"}
+    assert replacement_id in remote._entry_memory_state(project_id).state.entries
+
+
+def test_conflict_record_expands_to_current_closure(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    _, remote, project_id, entry_id = _create_entry_conflict(first, second)
+    replacement_id = _supersede(remote, project_id, entry_id, "remote replacement", 4)
+
+    result = push_project_memory(first, LocalTransport(second), project_id=project_id)
+
+    assert result.conflicts == (min(entry_id, replacement_id),)
+    state_path = next((first / "projects" / project_id / "sync").glob("*.json"))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    conflict = next(iter(state["conflicts"].values()))
+    assert set(conflict["entry_ids"]) == {entry_id, replacement_id}
+
+
+def _create_schema_conflict_with_incompatible_remote_entry(
+    first: Path, second: Path
+) -> tuple[ProjectRegistry, ProjectRegistry, str, str]:
+    local, project_id = _fixture(first, first.parent / "workspace")
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    remote = ProjectRegistry(second / "projects")
+    _replace_schema(local, project_id, memory_profile("messaging"))
+    remote_state = remote._entry_memory_state(project_id)
+    _replace_schema(
+        remote,
+        project_id,
+        dataclasses.replace(remote_state.state.schema, version=4),
+    )
+    remote_entry_id = _add(remote, project_id, "remote zeta state", 5)
+    return local, remote, project_id, remote_entry_id
+
+
+def test_concurrent_schema_change_with_incompatible_entry_records_schema_conflict(
+    tmp_path: Path,
+) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, remote, project_id, remote_entry_id = (
+        _create_schema_conflict_with_incompatible_remote_entry(first, second)
+    )
+
+    result = push_project_memory(first, LocalTransport(second), project_id=project_id)
+
+    assert result.conflicts == ("schema",)
+    assert local._entry_memory_state(project_id).state.schema.profile == "messaging"
+    assert remote._entry_memory_state(project_id).state.schema.profile == "zeta"
+    assert remote_entry_id not in local._entry_memory_state(project_id).state.entries
+    assert remote_entry_id in remote._entry_memory_state(project_id).state.entries
+
+
+def test_schema_conflict_resolution_handles_incompatible_kinds(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, remote, project_id, remote_entry_id = (
+        _create_schema_conflict_with_incompatible_remote_entry(first, second)
+    )
+    assert push_project_memory(
+        first, LocalTransport(second), project_id=project_id
+    ).conflicts == ("schema",)
+
+    result = resolve_project_memory(
+        first, LocalTransport(second), project_id=project_id, accept="remote"
+    )
+
+    assert result.conflicts == ()
+    for registry in (local, remote):
+        state = registry._entry_memory_state(project_id).state
+        assert state.schema.profile == "zeta"
+        assert remote_entry_id in state.entries
+
+
+def test_schema_conflict_defers_post_conflict_incompatible_additions(
+    tmp_path: Path,
+) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, remote, project_id, remote_entry_id = (
+        _create_schema_conflict_with_incompatible_remote_entry(first, second)
+    )
+    assert push_project_memory(
+        first, LocalTransport(second), project_id=project_id
+    ).conflicts == ("schema",)
+    local_entry_id = _add_kind(local, project_id, "people", "local person", 6)
+    second_remote_id = _add(remote, project_id, "later remote state", 7)
+
+    unresolved = push_project_memory(
+        first, LocalTransport(second), project_id=project_id
+    )
+
+    assert unresolved.conflicts == ("schema",)
+    assert set(local._entry_memory_state(project_id).state.entries) == {local_entry_id}
+    assert set(remote._entry_memory_state(project_id).state.entries) == {
+        remote_entry_id,
+        second_remote_id,
+    }
+    resolve_project_memory(
+        first, LocalTransport(second), project_id=project_id, accept="local"
+    )
+    assert set(local._entry_memory_state(project_id).state.entries) == {local_entry_id}
+    assert set(remote._entry_memory_state(project_id).state.entries) == {local_entry_id}
+
+
+class _FailingPublishTransport(LocalTransport):
+    def __init__(self, home: Path, *, after_publish: bool) -> None:
+        super().__init__(home)
+        self.after_publish = after_publish
+        self.failed = False
+
+    def publish_project(
+        self, project_id: str, snapshot: Path, *, expected_digest: str
+    ) -> None:
+        if not self.failed and not self.after_publish:
+            self.failed = True
+            raise RemoteSyncError("injected failure before remote publish")
+        super().publish_project(project_id, snapshot, expected_digest=expected_digest)
+        if not self.failed:
+            self.failed = True
+            raise RemoteSyncError("injected failure after remote publish")
+
+
+def test_sync_recovers_after_failure_between_remote_and_local_publish(
+    tmp_path: Path,
+) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, project_id = _fixture(first, tmp_path / "workspace")
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    entry_id = _add(local, project_id, "must survive", 1)
+    transport = _FailingPublishTransport(second, after_publish=True)
+    with pytest.raises(RemoteSyncError, match="after remote publish"):
+        push_project_memory(first, transport, project_id=project_id)
+    newer_entry_id = _add(local, project_id, "newer local change", 2)
+
+    result = push_project_memory(first, LocalTransport(second), project_id=project_id)
+
+    assert result.conflicts == ()
+    for registry in (local, ProjectRegistry(second / "projects")):
+        entries = registry._entry_memory_state(project_id).state.entries
+        assert entry_id in entries
+        assert newer_entry_id in entries
+
+
+def test_initial_sync_recovers_after_remote_only_publish(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, project_id = _fixture(first, tmp_path / "workspace")
+    entry_id = _add(local, project_id, "initial entry", 1)
+    with pytest.raises(RemoteSyncError, match="after remote publish"):
+        push_project_memory(
+            first,
+            _FailingPublishTransport(second, after_publish=True),
+            project_id=project_id,
+        )
+
+    result = push_project_memory(first, LocalTransport(second), project_id=project_id)
+
+    assert result.conflicts == ()
+    for registry in (local, ProjectRegistry(second / "projects")):
+        assert entry_id in registry._entry_memory_state(project_id).state.entries
+
+
+def test_resolution_recovers_after_failure_between_remote_and_local_publish(
+    tmp_path: Path,
+) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, remote, project_id, entry_id = _create_entry_conflict(first, second)
+    transport = _FailingPublishTransport(second, after_publish=True)
+    with pytest.raises(RemoteSyncError, match="after remote publish"):
+        resolve_project_memory(first, transport, project_id=project_id, accept="remote")
+
+    result = push_project_memory(first, LocalTransport(second), project_id=project_id)
+
+    assert result.conflicts == ()
+    assert _active_texts(local, project_id) == {"remote edit"}
+    assert _active_texts(remote, project_id) == {"remote edit"}
+    assert entry_id in local._entry_memory_state(project_id).state.entries
+
+
+def test_sync_failure_before_remote_publish_is_no_op(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, project_id = _fixture(first, tmp_path / "workspace")
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    _add(local, project_id, "pending local", 1)
+    before_local = project_digest(first / "projects" / project_id)
+    before_remote = project_digest(second / "projects" / project_id)
+
+    with pytest.raises(RemoteSyncError, match="before remote publish"):
+        push_project_memory(
+            first,
+            _FailingPublishTransport(second, after_publish=False),
+            project_id=project_id,
+        )
+
+    assert project_digest(first / "projects" / project_id) == before_local
+    assert project_digest(second / "projects" / project_id) == before_remote
+
+
+def test_sync_state_size_bounded_over_add_sync_compact_cycles(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, project_id = _fixture(first, tmp_path / "workspace")
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    for seq in range(1, 41):
+        _add(local, project_id, f"temporary {seq}", seq)
+        push_project_memory(first, LocalTransport(second), project_id=project_id)
+        for registry in (local, ProjectRegistry(second / "projects")):
+            current = registry._entry_memory_state(project_id)
+            registry._replace_entry_state_for_test(
+                project_id,
+                dataclasses.replace(current.state, entries={}),
+                expected_digest=current.digest,
+            )
+        push_project_memory(first, LocalTransport(second), project_id=project_id)
+
+    state_path = next((first / "projects" / project_id / "sync").glob("*.json"))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["entries"] == {}
+    assert state_path.stat().st_size < 4096

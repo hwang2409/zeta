@@ -120,13 +120,7 @@ def merge_entry_states(
     conflicts: Mapping[str, object],
     resolutions: Mapping[str, ConflictChoice] | None = None,
 ) -> EntryMergeResult:
-    """Merge and optionally resolve two complete relationship-connected states.
-
-    ``entry_baseline`` and ``conflicts`` are the private serializable sync
-    record returned by the prior call. A resolution chooses only a recorded
-    conflict set (or schema); all other state still follows normal three-way
-    merge rules against the baseline.
-    """
+    """Merge two states, deciding schema compatibility before entry propagation."""
 
     validate_state(local)
     validate_state(remote)
@@ -140,55 +134,126 @@ def merge_entry_states(
     if any(choice not in {"local", "remote"} for choice in choices.values()):
         raise ProjectRegistryError("entry sync resolution choice is invalid")
 
+    next_conflicts: dict[str, EntryConflict] = {}
+    local_schema = local.schema
+    remote_schema = remote.schema
+    local_schema_changed = False
+    remote_schema_changed = False
+    schema_blocked = False
+    schema_choice = choices.get("schema")
+    existing_schema = existing.get("schema")
+    local_schema_hash = schema_digest(local.schema)
+    remote_schema_hash = schema_digest(remote.schema)
+
+    if existing_schema is not None and schema_choice is None:
+        schema_blocked = True
+        next_conflicts["schema"] = _schema_conflict(local.schema, remote.schema)
+        next_schema_digest = schema_baseline or local_schema_hash
+    elif existing_schema is not None:
+        chosen_schema = local.schema if schema_choice == "local" else remote.schema
+        local_schema_changed = local.schema != chosen_schema
+        remote_schema_changed = remote.schema != chosen_schema
+        local_schema = remote_schema = chosen_schema
+        next_schema_digest = schema_digest(chosen_schema)
+    elif local_schema_hash == remote_schema_hash:
+        next_schema_digest = local_schema_hash
+    else:
+        local_side_changed = (
+            schema_baseline is None or local_schema_hash != schema_baseline
+        )
+        remote_side_changed = (
+            schema_baseline is None or remote_schema_hash != schema_baseline
+        )
+        if local_side_changed and remote_side_changed:
+            schema_blocked = True
+            next_conflicts["schema"] = _schema_conflict(local.schema, remote.schema)
+            next_schema_digest = schema_baseline or local_schema_hash
+        else:
+            chosen_schema = local.schema if local_side_changed else remote.schema
+            local_schema_changed = local.schema != chosen_schema
+            remote_schema_changed = remote.schema != chosen_schema
+            local_schema = remote_schema = chosen_schema
+            next_schema_digest = schema_digest(chosen_schema)
+
     local_entries = dict(local.entries)
     remote_entries = dict(remote.entries)
+    if not schema_blocked and local_schema == remote_schema:
+        local_entries = _entries_valid_for_schema(local_entries, local_schema)
+        remote_entries = _entries_valid_for_schema(remote_entries, remote_schema)
+
     local_result = dict(local_entries)
     remote_result = dict(remote_entries)
-    next_conflicts: dict[str, EntryConflict] = {}
-    local_changed: set[str] = set()
-    remote_changed: set[str] = set()
+    local_changed = {
+        entry_id for entry_id in local.entries if entry_id not in local_entries
+    }
+    remote_changed = {
+        entry_id for entry_id in remote.entries if entry_id not in remote_entries
+    }
 
-    # Resolve only the recorded sets. Independent post-conflict entries remain
-    # outside this loop and are merged normally below.
-    resolved_ids: set[str] = set()
-    for key, conflict in existing.items():
-        choice = choices.get(key)
-        if conflict.kind == "schema":
-            if choice is None:
-                next_conflicts[key] = conflict
-            continue
-        ids = set(conflict.entry_ids)
-        if choice is None:
-            next_conflicts[key] = _entry_conflict(ids, local_entries, remote_entries)
-            resolved_ids.update(ids)
-            continue
-        chosen = local_entries if choice == "local" else remote_entries
-        for entry_id in ids:
-            value = chosen.get(entry_id)
-            if local_result.get(entry_id) != value:
-                _assign(local_result, entry_id, value)
-                local_changed.add(entry_id)
-            if remote_result.get(entry_id) != value:
-                _assign(remote_result, entry_id, value)
-                remote_changed.add(entry_id)
-            baseline[entry_id] = entry_digest(value)
-        resolved_ids.update(ids)
-
+    entry_conflicts = {
+        key: conflict
+        for key, conflict in existing.items()
+        if conflict.kind == "entries"
+    }
     all_ids = (
         set(local_entries)
         | set(remote_entries)
-        | set(baseline)
         | {
             entry_id
-            for conflict in existing.values()
+            for conflict in entry_conflicts.values()
             for entry_id in conflict.entry_ids
         }
     )
     for component in _relationship_components(all_ids, local_entries, remote_entries):
-        if component & resolved_ids:
+        conflict_keys = [
+            key
+            for key, conflict in entry_conflicts.items()
+            if component.intersection(conflict.entry_ids)
+        ]
+        component_choices = {choices[key] for key in conflict_keys if key in choices}
+        if len(component_choices) > 1:
+            raise ProjectRegistryError(
+                "entry sync relationship component has conflicting resolutions"
+            )
+        choice = next(iter(component_choices), None)
+
+        if schema_blocked and not _component_valid_under_both_schemas(
+            component, local_entries, remote_entries, local.schema, remote.schema
+        ):
+            if conflict_keys:
+                key = min(component)
+                next_conflicts[key] = _entry_conflict(
+                    component, local_entries, remote_entries
+                )
             continue
-        local_hashes = {entry_id: entry_digest(local_entries.get(entry_id)) for entry_id in component}
-        remote_hashes = {entry_id: entry_digest(remote_entries.get(entry_id)) for entry_id in component}
+
+        if conflict_keys and choice is None:
+            key = min(component)
+            next_conflicts[key] = _entry_conflict(
+                component, local_entries, remote_entries
+            )
+            continue
+        if choice is not None:
+            chosen = local_entries if choice == "local" else remote_entries
+            _propagate_component(
+                component,
+                chosen,
+                local_result,
+                remote_result,
+                baseline,
+                local_changed,
+                remote_changed,
+            )
+            continue
+
+        local_hashes = {
+            entry_id: entry_digest(local_entries.get(entry_id))
+            for entry_id in component
+        }
+        remote_hashes = {
+            entry_id: entry_digest(remote_entries.get(entry_id))
+            for entry_id in component
+        }
         if local_hashes == remote_hashes:
             baseline.update(local_hashes)
             continue
@@ -207,59 +272,42 @@ def merge_entry_states(
             )
             continue
         chosen = local_entries if local_side_changed else remote_entries
-        for entry_id in component:
-            value = chosen.get(entry_id)
-            if local_result.get(entry_id) != value:
-                _assign(local_result, entry_id, value)
-                local_changed.add(entry_id)
-            if remote_result.get(entry_id) != value:
-                _assign(remote_result, entry_id, value)
-                remote_changed.add(entry_id)
-            baseline[entry_id] = entry_digest(value)
+        _propagate_component(
+            component,
+            chosen,
+            local_result,
+            remote_result,
+            baseline,
+            local_changed,
+            remote_changed,
+        )
 
-    local_schema = local.schema
-    remote_schema = remote.schema
-    local_schema_changed = False
-    remote_schema_changed = False
-    existing_schema = existing.get("schema")
-    schema_choice = choices.get("schema")
-    if existing_schema is not None and schema_choice is None:
-        next_conflicts["schema"] = _schema_conflict(local.schema, remote.schema)
-        next_schema_digest = schema_baseline or schema_digest(local.schema)
-    elif existing_schema is not None:
-        chosen_schema = local.schema if schema_choice == "local" else remote.schema
-        local_schema_changed = local.schema != chosen_schema
-        remote_schema_changed = remote.schema != chosen_schema
-        local_schema = remote_schema = chosen_schema
-        next_schema_digest = schema_digest(chosen_schema)
-    else:
-        local_hash = schema_digest(local.schema)
-        remote_hash = schema_digest(remote.schema)
-        if local_hash == remote_hash:
-            next_schema_digest = local_hash
-        else:
-            local_side_changed = schema_baseline is None or local_hash != schema_baseline
-            remote_side_changed = schema_baseline is None or remote_hash != schema_baseline
-            if local_side_changed and remote_side_changed:
-                next_conflicts["schema"] = _schema_conflict(local.schema, remote.schema)
-                next_schema_digest = schema_baseline or local_hash
-            else:
-                chosen_schema = local.schema if local_side_changed else remote.schema
-                local_schema_changed = local.schema != chosen_schema
-                remote_schema_changed = remote.schema != chosen_schema
-                local_schema = remote_schema = chosen_schema
-                next_schema_digest = schema_digest(chosen_schema)
+    retained_ids = set(local_result) | set(remote_result)
+    retained_ids.update(
+        entry_id
+        for conflict in next_conflicts.values()
+        for entry_id in conflict.entry_ids
+    )
+    baseline = {
+        entry_id: digest
+        for entry_id, digest in baseline.items()
+        if entry_id in retained_ids
+    }
 
     generation = max(local.generation, remote.generation) + 1
     local_merged = dataclasses.replace(
         local,
-        generation=generation if local_changed or local_schema_changed else local.generation,
+        generation=(
+            generation if local_changed or local_schema_changed else local.generation
+        ),
         schema=local_schema,
         entries=local_result,
     )
     remote_merged = dataclasses.replace(
         remote,
-        generation=generation if remote_changed or remote_schema_changed else remote.generation,
+        generation=(
+            generation if remote_changed or remote_schema_changed else remote.generation
+        ),
         schema=remote_schema,
         entries=remote_result,
     )
@@ -276,6 +324,60 @@ def merge_entry_states(
         schema_changed_local=local_schema_changed,
         schema_changed_remote=remote_schema_changed,
     )
+
+
+def _entries_valid_for_schema(
+    entries: Mapping[str, MemoryEntry | MissingEntry], schema: MemorySchema
+) -> dict[str, MemoryEntry | MissingEntry]:
+    allowed = {kind.key for kind in schema.kinds}
+    result: dict[str, MemoryEntry | MissingEntry] = {}
+    for component in _relationship_components(set(entries), entries, {}):
+        if all(
+            isinstance(entries[entry_id], MissingEntry)
+            or entries[entry_id].kind in allowed
+            for entry_id in component
+        ):
+            result.update((entry_id, entries[entry_id]) for entry_id in component)
+    return result
+
+
+def _component_valid_under_both_schemas(
+    component: set[str],
+    local_entries: Mapping[str, MemoryEntry | MissingEntry],
+    remote_entries: Mapping[str, MemoryEntry | MissingEntry],
+    local_schema: MemorySchema,
+    remote_schema: MemorySchema,
+) -> bool:
+    local_kinds = {kind.key for kind in local_schema.kinds}
+    remote_kinds = {kind.key for kind in remote_schema.kinds}
+    return all(
+        isinstance(entry, MissingEntry)
+        or entry.kind in local_kinds
+        and entry.kind in remote_kinds
+        for entry_id in component
+        for entry in (local_entries.get(entry_id), remote_entries.get(entry_id))
+        if entry is not None
+    )
+
+
+def _propagate_component(
+    component: set[str],
+    chosen: Mapping[str, MemoryEntry | MissingEntry],
+    local_result: dict[str, MemoryEntry | MissingEntry],
+    remote_result: dict[str, MemoryEntry | MissingEntry],
+    baseline: dict[str, str],
+    local_changed: set[str],
+    remote_changed: set[str],
+) -> None:
+    for entry_id in component:
+        value = chosen.get(entry_id)
+        if local_result.get(entry_id) != value:
+            _assign(local_result, entry_id, value)
+            local_changed.add(entry_id)
+        if remote_result.get(entry_id) != value:
+            _assign(remote_result, entry_id, value)
+            remote_changed.add(entry_id)
+        baseline[entry_id] = entry_digest(value)
 
 
 def _validate_baseline(value: Mapping[str, str]) -> dict[str, str]:
