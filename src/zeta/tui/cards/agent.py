@@ -444,11 +444,6 @@ class AgentCard:
         if type(depth) is int and depth >= 1:
             self._depth = depth
 
-    @classmethod
-    def render_end(cls, event: StreamEvent) -> RenderableType | None:
-        if event.type is not StreamEventType.TOOL_EXECUTION_END:
-            return None
-        return cls.render_receipt(event)
 
     def _elapsed(self) -> float:
         return max(0.0, time.monotonic() - self._started_at)

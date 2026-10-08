@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -18,7 +18,6 @@ from typing import Any
 
 from zeta.memory.safety import contains_secret
 from zeta.project_memory_history import PROJECT_MEMORY_FILES
-from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 from zeta.protocol.types import (
     ASSISTANT_RESPONSE_SYNTHETIC,
     MESSAGE_ORIGIN_METADATA,
@@ -132,9 +131,6 @@ class Proposal:
     replacements: tuple[FileReplacement, ...]
     rejected_files: tuple[str, ...] = ()
 
-    @property
-    def proposed_characters(self) -> int:
-        return sum(len(item.content) for item in self.replacements)
 
 
 @dataclass(frozen=True, slots=True)
@@ -644,38 +640,3 @@ def parse_proposal(
             continue
         replacements.append(FileReplacement(name, content, tuple(parsed_sources)))
     return Proposal(expected_digest, tuple(replacements), tuple(rejected))
-
-
-def reconcile_session(
-    transcript_path: Path,
-    session_id: str,
-    memory: Mapping[str, str],
-    invoke: Callable[[str], str],
-    *,
-    as_of: date,
-) -> Proposal:
-    """Produce a filtered proposal without applying it or requesting approval."""
-    transcript = read_transcript(transcript_path, session_id)
-    raw = invoke(build_prompt(transcript, memory, as_of=as_of))
-    return parse_proposal(
-        raw,
-        expected_digest=memory_digest(memory),
-        transcript=transcript,
-        as_of=as_of,
-    )
-
-
-def apply_proposal(
-    registry: ProjectRegistry, project_id: str, proposal: Proposal
-) -> list[tuple[str, str]]:
-    """Apply an accepted grouped proposal only if its complete base is unchanged."""
-    updates = {item.name: item.content for item in proposal.replacements}
-    if not updates:
-        return registry.load_memory(project_id)
-    try:
-        result = registry.compare_and_swap_memory(
-            project_id, expected_digest=proposal.base_digest, updates=updates
-        )
-        return result.contents
-    except ProjectRegistryError as exc:
-        raise ReconciliationError("project memory changed before approval") from exc
