@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .core.session_files import atomic_publish_file
+from .memory.entry_history import EntryMemoryHistoryMixin
 from .project_errors import ProjectRegistryError
 
 MAX_MEMORY_FILE_SIZE = 128 * 1024
@@ -100,8 +101,12 @@ class MemoryVersionFile:
     parent_content: str
 
 
-class ProjectMemoryHistoryMixin:
+class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
     """Own atomic snapshots, CAS, provenance, dedupe, undo, and retention."""
+
+    @staticmethod
+    def _entry_retention_limit() -> int:
+        return MAX_RETAINED_VERSIONS
 
     @staticmethod
     def _memory_digest_value(memory: Mapping[str, str]) -> str:
@@ -675,6 +680,8 @@ class ProjectMemoryHistoryMixin:
                     referenced.update(
                         item for item in values.values() if isinstance(item, str)
                     )
+                elif isinstance(values, str):
+                    referenced.add(values)
         for name in os.listdir(versions_fd):
             if name.endswith(".json") and name[:-5] not in retained:
                 os.unlink(name, dir_fd=versions_fd)
