@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -86,10 +87,9 @@ class AgentCard:
         self._expanded = True
         self._receipt: RenderableType | None = None
         self._depth = 1
-        self._tail: list[str] = []
+        self._tail: tuple[str, ...] = ()
         self._tail_loaded = False
         self._transcript_source: AgentTranscriptSource | None = None
-        self._tree_snapshot: AgentTranscriptTreeSnapshot | None = None
         self._final_tail_pending = False
 
     @property
@@ -268,7 +268,7 @@ class AgentCard:
     def _expanded_panel(
         cls,
         call: ToolCall,
-        tail: list[str],
+        tail: Sequence[str],
         *,
         elapsed_seconds: float,
         turns_used: int,
@@ -485,9 +485,8 @@ class AgentCard:
         if path == self._child_session_path:
             return
         previous = self._transcript_source
-        self._tail = []
+        self._tail = ()
         self._tail_loaded = False
-        self._tree_snapshot = None
         self._child_session_path = path
         self._transcript_source = (
             AgentTranscriptSource(Path(path), message_limit=64) if path else None
@@ -511,9 +510,8 @@ class AgentCard:
 
         if Path(self._child_session_path) != snapshot.root:
             return False
-        tail = type(self)._tail_lines(snapshot, snapshot.root, MAX_TAIL_LINES)
+        tail = tuple(type(self)._tail_lines(snapshot, snapshot.root, MAX_TAIL_LINES))
         changed = not self._tail_loaded or tail != self._tail
-        self._tree_snapshot = snapshot
         self._tail = tail
         self._tail_loaded = True
         return changed
@@ -526,16 +524,39 @@ class AgentCard:
             return False
         try:
             snapshot = await asyncio.to_thread(source.refresh, recursive=True)
-        except (ConversationIntegrityError, OSError, ValueError):
+        except (ConversationIntegrityError, OSError, RuntimeError, ValueError):
             return False
         return self.apply_transcript_snapshot(snapshot)
 
+    def release_transcript_source(self) -> None:
+        """Detach this card's source and close it outside the owner loop."""
+
+        source, self._transcript_source = self._transcript_source, None
+        self._final_tail_pending = False
+        if source is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            source.close()
+        else:
+            loop.create_task(asyncio.to_thread(source.close))
+
     async def finish_tail(self) -> RenderableType | None:
-        """Load the final snapshot before publishing the terminal card."""
+        """Publish one final tail, then close its source off-loop."""
 
         if not self._final_tail_pending:
             return None
-        await self.refresh_tail(final=True)
+        source, self._transcript_source = self._transcript_source, None
+        self._final_tail_pending = False
+        if source is not None:
+            try:
+                snapshot = await asyncio.to_thread(source.refresh, recursive=True)
+                self.apply_transcript_snapshot(snapshot)
+            except (ConversationIntegrityError, OSError, RuntimeError, ValueError):
+                pass
+            finally:
+                await asyncio.to_thread(source.close)
         return self.terminal_render()
 
     def update(self, rendered: RenderableType, event: StreamEvent | None = None) -> RenderableType | None:
@@ -589,8 +610,10 @@ class AgentCard:
         if isinstance(path, str):
             self.set_child_session_path(path)
         self._final_tail_pending = bool(
-            self._expanded and self._transcript_source is not None and not self._tail_loaded
+            self._expanded and self._transcript_source is not None
         )
+        if not self._final_tail_pending:
+            self.release_transcript_source()
         self._receipt = type(self).render_receipt(
             event,
             elapsed_seconds=self._elapsed_seconds,

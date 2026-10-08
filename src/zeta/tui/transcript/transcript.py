@@ -346,8 +346,10 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._append_unit(None)
 
     def clear(self) -> None:
-        """Remove all rendered transcript units."""
+        """Remove all rendered transcript units and release child sources."""
 
+        for unit in self._card_units.values():
+            unit.card.release_transcript_source()
         self._units.clear()
         self._tools.clear()
         self._background_tools.clear()
@@ -501,6 +503,8 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             if call_id not in self._background_tools
         }
         active_ids = {id(unit) for unit in active}
+        for unit in active:
+            unit.card.release_transcript_source()
         removed_keys = {
             unit.key
             for unit in self._units

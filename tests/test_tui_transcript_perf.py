@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import shutil
 import threading
 import time
 from collections import OrderedDict
@@ -229,21 +231,27 @@ async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
 async def test_production_agent_refresh_keeps_event_loop_responsive(
     tmp_path: Path,
 ) -> None:
+    template = ConversationStore(tmp_path / "template", session_id="0")
+    template.append_many(
+        (
+            "message",
+            {
+                "message": Message(
+                    MessageRole.ASSISTANT,
+                    [TextContent("child output line")],
+                ).to_dict()
+            },
+        )
+        for _ in range(22_000)
+    )
+    template.close()
+    fixture_size = template.path.stat().st_size
+    assert 4_000_000 < fixture_size < 6_000_000
+
     transcript = TranscriptWidget()
     for index in range(8):
-        child = ConversationStore(tmp_path / "agents", session_id=str(index))
-        child.append_many(
-            (
-                "message",
-                {
-                    "message": Message(
-                        MessageRole.ASSISTANT,
-                        [TextContent(f"child {index} output")],
-                    ).to_dict()
-                },
-            )
-            for _ in range(1_000)
-        )
+        child_path = tmp_path / "agents" / str(index) / "0"
+        shutil.copytree(template.session_dir, child_path)
         call = ToolCall(
             f"agent-{index}",
             "agent",
@@ -257,10 +265,9 @@ async def test_production_agent_refresh_keeps_event_loop_responsive(
             StreamEvent(
                 StreamEventType.TOOL_EXECUTION_UPDATE,
                 tool_call=call,
-                data={"child_session_path": str(child.session_dir)},
+                data={"child_session_path": str(child_path)},
             ),
         )
-        child.close()
 
     gaps: list[float] = []
     done = False
@@ -281,6 +288,101 @@ async def test_production_agent_refresh_keeps_event_loop_responsive(
 
     assert gaps
     assert max(gaps) < 0.05
+
+
+def test_bounded_agent_source_reads_only_active_branch_tail(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "agents", session_id="child")
+    first = store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("first")])
+    )
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("abandoned")])
+    )
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("new branch")]),
+        parent_id=first.id,
+    )
+    store.close()
+
+    source = agent_sync_module.AgentTranscriptSource(
+        store.session_dir, message_limit=2
+    )
+    snapshot = source.refresh().transcript(store.session_dir)
+
+    assert snapshot is not None
+    assert [message["content"][0]["text"] for _, message in snapshot.messages] == [
+        "first",
+        "new branch",
+    ]
+    assert source._stores == {}
+    source.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        source.refresh()
+
+
+@pytest.mark.asyncio
+async def test_finished_agent_cards_release_transcript_sources(
+    tmp_path: Path,
+) -> None:
+    await asyncio.to_thread(lambda: None)
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    baseline = len(os.listdir(fd_root))
+    transcript = TranscriptWidget()
+
+    for index in range(100):
+        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"answer {index}")])
+        )
+        child.close()
+        call = ToolCall(
+            f"agent-{index}",
+            "agent",
+            {"prompt": "inspect", "description": f"agent {index}"},
+        )
+        start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        transcript.start_tool(call.id, call, render_module.render_event(start), start)
+        transcript.update_tool(
+            call.id,
+            Text("turn 1"),
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_UPDATE,
+                tool_call=call,
+                data={"child_session_path": str(child.session_dir)},
+            ),
+        )
+        end = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "done",
+                structured_content={"child_session_path": str(child.session_dir)},
+            ),
+        )
+        transcript.finish_tool(call.id, render_module.render_event(end), end)
+
+    final_card = transcript._card_units[(None, "agent-99")].card
+    for _ in range(200):
+        sources_closed = all(
+            unit.card.transcript_source is None
+            for unit in transcript._card_units.values()
+        )
+        final_tail_published = final_card._tail == ("assistant: answer 99",)
+        if (
+            sources_closed
+            and final_tail_published
+            and len(os.listdir(fd_root)) == baseline
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    assert len(os.listdir(fd_root)) == baseline
+    assert all(
+        unit.card.transcript_source is None
+        for unit in transcript._card_units.values()
+    )
+    assert final_card._tail == ("assistant: answer 99",)
 
 
 def test_follow_tail_redraw_does_not_rebuild_location_map() -> None:
