@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ...session_liveness import (
+    ProcessIdentity,
+    current_process_identity,
+    process_is_live,
+)
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
 from ..session_files import SessionError
@@ -56,6 +62,35 @@ def parse_prompt_recipe(
     return recipe, components
 
 
+def parse_prompt_composition_owner(
+    value: Mapping[str, Any], *, path: Path
+) -> tuple[int, int | None, str | None]:
+    """Validate a persisted prompt composition epoch and its process owner."""
+
+    epoch = value.get("prompt_composition_epoch", 0)
+    owner_pid = value.get("prompt_composition_owner_pid")
+    owner_started = value.get("prompt_composition_owner_started")
+    owner_present = (owner_pid is not None, owner_started is not None)
+    if (
+        type(epoch) is not int
+        or epoch < 0
+        or any(owner_present) != all(owner_present)
+        or (not any(owner_present) and epoch != 0)
+        or (
+            all(owner_present)
+            and (
+                type(owner_pid) is not int
+                or owner_pid <= 0
+                or type(owner_started) is not str
+                or not owner_started
+                or epoch == 0
+            )
+        )
+    ):
+        raise SessionError(f"session prompt composition owner is invalid: {path}")
+    return epoch, owner_pid, owner_started
+
+
 def clone_prompt_composition(metadata: Any) -> dict[str, Any]:
     """Return the complete prompt-composition arguments for a cloned session."""
 
@@ -83,24 +118,64 @@ def clone_prompt_composition(metadata: Any) -> dict[str, Any]:
     }
 
 
-def _composition_state(metadata: Any) -> tuple[object, ...]:
-    """Return the persisted fields owned by prompt composition."""
+@dataclass(frozen=True, slots=True)
+class PromptComposition:
+    """One complete prompt composition returned by a resume composer."""
 
+    system_prompt: str
+    context_files: tuple[str, ...]
+    skill_catalog: SkillCatalog
+    agent_catalog: AgentCatalog
+    prompt_recipe: str | None
+    prompt_components: dict[str, dict[str, int | str]]
+    project_memory_offset: int | None
+    project_memory_length: int | None
+    project_memory_digest: str | None
+    notices: tuple[str, ...] = ()
+
+
+def _composition_from_metadata(metadata: Any) -> PromptComposition:
+    return PromptComposition(
+        system_prompt=metadata.system_prompt,
+        context_files=tuple(metadata.context_files),
+        skill_catalog=SkillCatalog.from_snapshot(metadata.skill_catalog or []),
+        agent_catalog=AgentCatalog.from_snapshot(metadata.agent_catalog or []),
+        prompt_recipe=metadata.prompt_recipe,
+        prompt_components={
+            key: dict(component)
+            for key, component in metadata.prompt_components.items()
+        },
+        project_memory_offset=metadata.project_memory_offset,
+        project_memory_length=metadata.project_memory_length,
+        project_memory_digest=metadata.project_memory_digest,
+    )
+
+
+def _persisted_fields(composition: PromptComposition) -> tuple[object, ...]:
     return (
-        metadata.system_prompt,
-        tuple(metadata.context_files),
-        metadata.skill_catalog,
-        metadata.agent_catalog,
-        metadata.prompt_recipe,
-        metadata.prompt_components,
-        metadata.project_memory_offset,
-        metadata.project_memory_length,
-        metadata.project_memory_digest,
+        composition.system_prompt,
+        composition.context_files,
+        composition.skill_catalog,
+        composition.agent_catalog,
+        composition.prompt_recipe,
+        composition.prompt_components,
+        composition.project_memory_offset,
+        composition.project_memory_length,
+        composition.project_memory_digest,
+    )
+
+
+def _owner(metadata: Any) -> ProcessIdentity | None:
+    if metadata.prompt_composition_owner_pid is None:
+        return None
+    return ProcessIdentity(
+        metadata.prompt_composition_owner_pid,
+        metadata.prompt_composition_owner_started or "",
     )
 
 
 class PromptCompositionMixin:
-    """Persist complete prompt compositions without exposing storage details."""
+    """Own prompt composition persistence and concurrent resume coordination."""
 
     def persist_context_snapshot(
         self,
@@ -123,45 +198,48 @@ class PromptCompositionMixin:
         self._copy_metadata(metadata, current)
         return current
 
-    def persist_prompt_composition(
+    def resume_prompt_composition(
         self,
         metadata: Any,
-        *,
-        system_prompt: str,
-        context_files: list[str] | tuple[str, ...],
-        skill_catalog: SkillCatalog,
-        agent_catalog: AgentCatalog,
-        prompt_recipe: str | None,
-        prompt_components: dict[str, dict[str, int | str]],
-        project_memory_offset: int | None,
-        project_memory_length: int | None,
-        project_memory_digest: str | None,
-    ) -> Any:
-        """Compare-and-set one resume composition without changing recency.
+        compose: Callable[[Any], PromptComposition],
+    ) -> PromptComposition:
+        """Atomically decide, compose, persist, and return a resumed prompt.
 
-        A concurrent resumer can calculate a different default or refreshed
-        memory span from the same snapshot. The first complete composition
-        persisted wins; every loser adopts that exact persisted composition.
+        The metadata lock covers the complete sequence. If another live process
+        owns the persisted epoch, this runtime adopts that composition without
+        calling ``compose``. A dead owner permits a fresh composition.
         """
 
-        expected_state = _composition_state(metadata)
-
-        def update(item: Any) -> Any:
-            if _composition_state(item) != expected_state:
-                return item
-            item.system_prompt = system_prompt
-            item.context_files = list(context_files)
-            item.skill_catalog = skill_catalog.to_snapshot()
-            item.agent_catalog = agent_catalog.to_snapshot()
-            item.prompt_recipe = prompt_recipe
-            item.prompt_components = {
-                key: dict(component) for key, component in prompt_components.items()
-            }
-            item.project_memory_offset = project_memory_offset
-            item.project_memory_length = project_memory_length
-            item.project_memory_digest = project_memory_digest
-            return item
-
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)
-        return current
+        owner = current_process_identity()
+        with self._metadata_lock(metadata.session_id) as directory_fd:
+            current = self._read(metadata.session_id, directory_fd=directory_fd)
+            persisted_owner = _owner(current)
+            if (
+                persisted_owner is not None
+                and persisted_owner != owner
+                and process_is_live(persisted_owner)
+            ):
+                composition = _composition_from_metadata(current)
+            else:
+                composition = compose(current)
+                if _persisted_fields(composition) != _persisted_fields(
+                    _composition_from_metadata(current)
+                ):
+                    current.system_prompt = composition.system_prompt
+                    current.context_files = list(composition.context_files)
+                    current.skill_catalog = composition.skill_catalog.to_snapshot()
+                    current.agent_catalog = composition.agent_catalog.to_snapshot()
+                    current.prompt_recipe = composition.prompt_recipe
+                    current.prompt_components = {
+                        key: dict(component)
+                        for key, component in composition.prompt_components.items()
+                    }
+                    current.project_memory_offset = composition.project_memory_offset
+                    current.project_memory_length = composition.project_memory_length
+                    current.project_memory_digest = composition.project_memory_digest
+                    current.prompt_composition_owner_pid = owner.pid
+                    current.prompt_composition_owner_started = owner.started
+                    current.prompt_composition_epoch += 1
+                    self._write_unlocked(current, directory_fd=directory_fd)
+            self._copy_metadata(metadata, current)
+            return composition

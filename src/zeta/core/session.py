@@ -27,7 +27,11 @@ from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
 from .store import ConversationStore
-from .store.prompt_composition import PromptCompositionMixin, parse_prompt_recipe
+from .store.prompt_composition import (
+    PromptCompositionMixin,
+    parse_prompt_composition_owner,
+    parse_prompt_recipe,
+)
 from .session_files import (
     SessionError,
     SessionInUseError,
@@ -124,6 +128,9 @@ class SessionMetadata:
     project_memory_digest: str | None = None
     prompt_recipe: str | None = None
     prompt_components: dict[str, dict[str, int | str]] = field(default_factory=dict)
+    prompt_composition_epoch: int = 0
+    prompt_composition_owner_pid: int | None = None
+    prompt_composition_owner_started: str | None = None
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
@@ -315,6 +322,11 @@ class SessionMetadata:
             has_context_snapshot=has_context_snapshot,
             path=path,
         )
+        (
+            composition_epoch,
+            composition_owner_pid,
+            composition_owner_started,
+        ) = parse_prompt_composition_owner(value, path=path)
         if (
             type(system_prompt) is not str
             or type(context_files) is not list
@@ -389,6 +401,9 @@ class SessionMetadata:
             project_memory_digest=memory_digest,
             prompt_recipe=prompt_recipe,
             prompt_components=prompt_components,
+            prompt_composition_epoch=composition_epoch,
+            prompt_composition_owner_pid=composition_owner_pid,
+            prompt_composition_owner_started=composition_owner_started,
             tool_allow=tool_allow,
             tool_deny=tool_deny,
             tool_allow_layers=tool_allow_layers,
@@ -444,6 +459,9 @@ class SessionMetadata:
             "model_fallback": list(self.model_fallback)
             if self.model_fallback
             else None,
+            "prompt_composition_epoch": self.prompt_composition_epoch,
+            "prompt_composition_owner_pid": self.prompt_composition_owner_pid,
+            "prompt_composition_owner_started": self.prompt_composition_owner_started,
         }
 
 
