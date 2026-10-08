@@ -1041,16 +1041,15 @@ def test_idle_tracker_does_no_filesystem_io(
 ) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     session_id = "a" * 32
-    tracker = SentMessageTracker(home / "sessions", session_id)
-    tracker.record("1" * 32, project_b.project_id)
-    tracker.mark_reported(iter((("1" * 32, "done"),)))
     scanner = ProjectInboxScanner(
         registry,
         project_a.project_id,
         sessions_root=home / "sessions",
         session_id=session_id,
-        tracker=tracker,
     )
+    assert scanner.tracker is not None
+    scanner.tracker.record("1" * 32, project_b.project_id)
+    scanner.tracker.mark_reported(iter((("1" * 32, "done"),)))
     filesystem_calls = 0
 
     def unexpected_filesystem_call(*args, **kwargs):
