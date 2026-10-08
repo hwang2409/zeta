@@ -22,6 +22,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
+from ..memory.entry_store import state_digest
+from ..memory.entry_sync import (
+    EntryMemoryExport,
+    merge_entry_states,
+    merge_version_receipts,
+    schema_digest,
+)
+from ..memory.entry_sync import (
+    entry_digest as _entry_record_digest,
+)
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
@@ -31,7 +41,8 @@ MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
 _MACHINE_ID = ".machine-id"
-_MAX_STATE_BYTES = 64 * 1024
+_MAX_STATE_BYTES = 512 * 1024
+MemorySyncExport = MemoryExport | EntryMemoryExport
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +95,7 @@ def sync_project_memory(
             remote_root.mkdir(mode=0o700)
             local = local_root / project_id
             remote = remote_root / project_id
-            local_export: MemoryExport | None = None
+            local_export: MemorySyncExport | None = None
             if local_expected != _MISSING:
                 copy_project_snapshot(local_project, local)
                 _validate_project_snapshot(local, project_id)
@@ -109,8 +120,15 @@ def sync_project_memory(
                 if direction == "push"
                 else (remote_export, local_export)
             )
-            state = _shared_state(source, destination, state_key, project_id)
-            result, merged = _merge(
+            if type(source_export) is not type(destination_export):
+                raise RemoteSyncError(
+                    "mixed project memory formats cannot synchronize; migration is required"
+                )
+            memory_format = 2 if isinstance(source_export, EntryMemoryExport) else 1
+            state = _shared_state(
+                source, destination, state_key, project_id, memory_format=memory_format
+            )
+            result, merged, source_merged = _merge(
                 source,
                 destination,
                 source_export=source_export,
@@ -127,6 +145,13 @@ def sync_project_memory(
                 merged,
                 provenance={"source": "remote_sync", "peer": peer},
             )
+            if source_merged is not None:
+                _import_merged_memory(
+                    source,
+                    project_id,
+                    source_merged,
+                    provenance={"source": "remote_sync", "peer": peer},
+                )
             transport.publish_project(
                 project_id, remote, expected_digest=remote_expected
             )
@@ -180,6 +205,56 @@ def resolve_project_memory(
             other = remote if accept == "local" else local
             chosen_export = local_export if accept == "local" else remote_export
             other_export = remote_export if accept == "local" else local_export
+            if type(chosen_export) is not type(other_export):
+                raise RemoteSyncError(
+                    "mixed project memory formats cannot synchronize; migration is required"
+                )
+            if isinstance(chosen_export, EntryMemoryExport) and isinstance(
+                other_export, EntryMemoryExport
+            ):
+                entries = {
+                    entry_id: _entry_record_digest(entry)
+                    for entry_id, entry in chosen_export.state.entries.items()
+                }
+                state["entries"] = entries
+                state["schema_digest"] = schema_digest(chosen_export.state.schema)
+                state["conflicts"] = {}
+                _write_state(local, state_key, state)
+                _write_state(remote, state_key, state)
+                merged_versions = merge_version_receipts(
+                    local_export.versions, remote_export.versions
+                )
+                merged = EntryMemoryExport(
+                    chosen_export.state,
+                    chosen_export.digest,
+                    chosen_export.version,
+                    merged_versions,
+                )
+                _import_merged_memory(
+                    other,
+                    project_id,
+                    merged,
+                    provenance={"source": "remote_sync", "peer": peer},
+                )
+                _import_merged_memory(
+                    chosen,
+                    project_id,
+                    merged,
+                    provenance={"source": "remote_sync", "peer": peer},
+                )
+                transport.publish_project(
+                    project_id, remote, expected_digest=remote_expected
+                )
+                if project_digest(local_project) != local_expected:
+                    raise RemoteSyncError(
+                        "local project changed during memory resolution; retry"
+                    )
+                _atomic_replace_directory(local, local_project)
+                return MemoryTransferResult(
+                    project_id, tuple(sorted(conflicts)), ()
+                )
+            assert isinstance(chosen_export, MemoryExport)
+            assert isinstance(other_export, MemoryExport)
             contents = dict(other_export.contents)
             automatic = set(other_export.automatic_files)
             updated: list[str] = []
@@ -309,23 +384,35 @@ def copy_project_snapshot(source: Path, destination: Path) -> None:
 def _import_merged_memory(
     target: Path,
     project_id: str,
-    merged: MemoryExport,
+    merged: MemorySyncExport,
     *,
     provenance: dict[str, str],
 ) -> None:
     registry = ProjectRegistry(target.parent)
-    current = registry.export_memory(project_id)
-    registry.import_memory(
-        project_id,
-        merged,
-        expected_digest=current.digest,
-        provenance=provenance,
-    )
+    if isinstance(merged, EntryMemoryExport):
+        current = registry._export_entry_memory(project_id)
+        registry._import_entry_memory(
+            project_id,
+            merged,
+            expected_digest=current.digest,
+            provenance=provenance,
+        )
+    else:
+        current = registry.export_memory(project_id)
+        registry.import_memory(
+            project_id,
+            merged,
+            expected_digest=current.digest,
+            provenance=provenance,
+        )
 
 
-def _materialize_memory_export(snapshot: Path, project_id: str) -> MemoryExport:
+def _materialize_memory_export(snapshot: Path, project_id: str) -> MemorySyncExport:
     try:
-        exported = ProjectRegistry(snapshot.parent).export_memory(project_id)
+        registry = ProjectRegistry(snapshot.parent)
+        if registry.memory_format(project_id) == 2:
+            return registry._export_entry_memory(project_id)
+        exported = registry.export_memory(project_id)
     except ProjectRegistryError as exc:
         raise RemoteSyncError("invalid project memory store") from exc
     for name, content in exported.contents.items():
@@ -365,7 +452,10 @@ def _validate_project_snapshot(snapshot: Path, project_id: str) -> None:
             path = snapshot / "memory" / name
             if path.is_file() and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE:
                 raise ProjectRegistryError(f"memory file {name} is too large")
-        registry.load_memory(project_id, byte_cap=MAX_RECORD_SIZE)
+        if registry.memory_format(project_id) == 2:
+            registry._entry_memory_state(project_id)
+        else:
+            registry.load_memory(project_id, byte_cap=MAX_RECORD_SIZE)
     except UnsupportedMemoryFormatError:
         raise
     except ProjectRegistryError as exc:
@@ -376,12 +466,27 @@ def _merge(
     source: Path,
     destination: Path,
     *,
-    source_export: MemoryExport,
-    destination_export: MemoryExport,
+    source_export: MemorySyncExport,
+    destination_export: MemorySyncExport,
     state: dict[str, object],
     project_id: str,
     source_label: str,
-) -> tuple[MemoryTransferResult, MemoryExport]:
+) -> tuple[MemoryTransferResult, MemorySyncExport, EntryMemoryExport | None]:
+    if isinstance(source_export, EntryMemoryExport) and isinstance(
+        destination_export, EntryMemoryExport
+    ):
+        return _merge_entries(
+            source_export,
+            destination_export,
+            state=state,
+            project_id=project_id,
+        )
+    if not isinstance(source_export, MemoryExport) or not isinstance(
+        destination_export, MemoryExport
+    ):
+        raise RemoteSyncError(
+            "mixed project memory formats cannot synchronize; migration is required"
+        )
     files = state["files"]
     unresolved = state["conflicts"]
     updated: list[str] = []
@@ -423,7 +528,77 @@ def _merge(
         _merge_versions(destination_export.versions, source_export.versions),
         tuple(sorted(automatic)),
     )
-    return MemoryTransferResult(project_id, tuple(updated), tuple(conflicts)), merged
+    return (
+        MemoryTransferResult(project_id, tuple(updated), tuple(conflicts)),
+        merged,
+        None,
+    )
+
+
+def _merge_entries(
+    source: EntryMemoryExport,
+    destination: EntryMemoryExport,
+    *,
+    state: dict[str, object],
+    project_id: str,
+) -> tuple[MemoryTransferResult, EntryMemoryExport, EntryMemoryExport]:
+    baseline = state.get("entries")
+    schema_baseline = state.get("schema_digest")
+    unresolved = state.get("conflicts")
+    if (
+        not isinstance(baseline, dict)
+        or not all(isinstance(key, str) and _valid_digest(value) for key, value in baseline.items())
+        or schema_baseline is not None
+        and not _valid_digest(schema_baseline)
+        or not isinstance(unresolved, dict)
+    ):
+        raise RemoteSyncError("memory synchronization state is invalid")
+    result = merge_entry_states(
+        source.state,
+        destination.state,
+        entry_baseline=dict(baseline),
+        schema_baseline=schema_baseline,
+        unresolved=set(unresolved),
+    )
+    state["entries"] = result.entry_baseline
+    state["schema_digest"] = result.schema_baseline
+    state["conflicts"] = {
+        key: {
+            "digests": sorted(
+                {
+                    (
+                        schema_digest(source.state.schema)
+                        if key == "schema"
+                        else _entry_record_digest(source.state.entries.get(key))
+                    ),
+                    (
+                        schema_digest(destination.state.schema)
+                        if key == "schema"
+                        else _entry_record_digest(destination.state.entries.get(key))
+                    ),
+                }
+            )
+        }
+        for key in result.conflicts
+    }
+    versions = merge_version_receipts(destination.versions, source.versions)
+    destination_export = EntryMemoryExport(
+        result.destination,
+        state_digest(result.destination),
+        destination.version,
+        versions,
+    )
+    source_export = EntryMemoryExport(
+        result.source,
+        state_digest(result.source),
+        source.version,
+        versions,
+    )
+    return (
+        MemoryTransferResult(project_id, result.updated, result.conflicts),
+        destination_export,
+        source_export,
+    )
 
 
 def _merge_versions(
@@ -442,8 +617,13 @@ def _merge_versions(
 
 
 def _shared_state(
-    first: Path, second: Path, peer: str, project_id: str
-) -> dict[str, dict[str, object] | object]:
+    first: Path,
+    second: Path,
+    peer: str,
+    project_id: str,
+    *,
+    memory_format: int = 1,
+) -> dict[str, object]:
     first_state = _read_state(first, peer, project_id, required=False)
     second_state = _read_state(second, peer, project_id, required=False)
     if first_state is not None and second_state is not None and first_state != second_state:
@@ -452,6 +632,15 @@ def _shared_state(
         return first_state
     if second_state is not None:
         return second_state
+    if memory_format == 2:
+        return {
+            "schema": 3,
+            "project_id": project_id,
+            "format": 2,
+            "entries": {},
+            "schema_digest": None,
+            "conflicts": {},
+        }
     return {"schema": 2, "project_id": project_id, "files": {}, "conflicts": {}}
 
 
@@ -481,6 +670,8 @@ def _read_state(
 
 
 def _valid_state(value: object, project_id: str) -> bool:
+    if isinstance(value, dict) and value.get("schema") == 3:
+        return _valid_entry_sync_state(value, project_id)
     if not isinstance(value, dict) or set(value) != {
         "schema",
         "project_id",
@@ -500,6 +691,52 @@ def _valid_state(value: object, project_id: str) -> bool:
     ):
         return False
     if any(not _valid_digest(digest) for digest in files.values()):
+        return False
+    for conflict in conflicts.values():
+        if not isinstance(conflict, dict) or set(conflict) != {"digests"}:
+            return False
+        digests = conflict.get("digests")
+        if (
+            not isinstance(digests, list)
+            or len(digests) != 2
+            or digests != sorted(set(digests))
+            or any(not _valid_digest(digest) for digest in digests)
+        ):
+            return False
+    return True
+
+
+def _valid_entry_sync_state(value: dict[str, object], project_id: str) -> bool:
+    if set(value) != {
+        "schema",
+        "project_id",
+        "format",
+        "entries",
+        "schema_digest",
+        "conflicts",
+    }:
+        return False
+    entries = value.get("entries")
+    conflicts = value.get("conflicts")
+    schema_value = value.get("schema_digest")
+    if (
+        value.get("project_id") != project_id
+        or value.get("format") != 2
+        or not isinstance(entries, dict)
+        or not isinstance(conflicts, dict)
+        or schema_value is not None
+        and not _valid_digest(schema_value)
+        or any(
+            not isinstance(entry_id, str)
+            or not entry_id.startswith("m_")
+            or not _valid_digest(digest)
+            for entry_id, digest in entries.items()
+        )
+        or any(
+            key != "schema" and (not isinstance(key, str) or not key.startswith("m_"))
+            for key in conflicts
+        )
+    ):
         return False
     for conflict in conflicts.values():
         if not isinstance(conflict, dict) or set(conflict) != {"digests"}:

@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
+import os
+from datetime import date
 from pathlib import Path
 
 import pytest
 
+from zeta.memory.entry_reconciler import reconcile_entry_range
 from zeta.memory.entry_store import (
     AddOperation,
     MemoryEntry,
@@ -14,11 +18,16 @@ from zeta.memory.entry_store import (
 )
 from zeta.memory.migration import migrate_format_one, reverse_migration
 from zeta.memory.profiles import memory_profile
+from zeta.memory.prompt_projection import render_entry_memory
+from zeta.memory.reconciler import Transcript
+from zeta.memory.user_authorization import MemoryMutationAuthorization
 from zeta.project_errors import ProjectRegistryError
+from zeta.project_memory_commands import run_memory_command
 from zeta.project_memory_history import PROJECT_MEMORY_FILES
 from zeta.project_registry import ProjectRegistry
 from zeta.remote_sync import LocalTransport, push_project_memory, resolve_project_memory
 from zeta.remote_sync.errors import RemoteSyncError
+from zeta.remote_sync.ssh import SshTransport
 
 
 def _source(seq: int = 1) -> tuple[MemorySource, ...]:
@@ -151,6 +160,77 @@ def test_entry_sync_propagates_status_and_conflicts_schema(tmp_path: Path) -> No
     assert result.conflicts == ("schema",)
 
 
+@pytest.mark.asyncio
+async def test_format_two_fixture_end_to_end_updater_prompt_commands_and_sync(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    registry, project_id = _fixture(first, tmp_path / "workspace")
+    transcript = Transcript(
+        "fixture-session",
+        (
+            {
+                "seq": 1,
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "PR 5 is ready."}],
+                        "metadata": {"zeta.origin": "user"},
+                    }
+                },
+            },
+        ),
+    )
+
+    async def invoke(_prompt: str) -> str:
+        return json.dumps(
+            {
+                "operations": [
+                    {
+                        "op": "add",
+                        "kind": "state",
+                        "text": "PR 5 is ready.",
+                        "sources": [{"seq_start": 1, "seq_end": 1}],
+                        "reason": "direct user state",
+                    }
+                ]
+            }
+        )
+
+    result = await reconcile_entry_range(
+        registry=registry,
+        project_id=project_id,
+        transcript=transcript,
+        reconciliation_key=hashlib.sha256(b"fixture-range").hexdigest(),
+        invoke=invoke,
+        cas_retries=3,
+        as_of=date(2026, 10, 8),
+        now="2026-10-08T12:00:00.000000Z",
+    )
+    entry_id = result.changed_entry_ids[0]
+    projection = render_entry_memory(
+        registry._entry_memory_state(project_id).state,
+        now="2026-10-08T12:00:00.000000Z",
+    )
+    assert "PR 5 is ready." in projection.block
+    assert run_memory_command(
+        registry,
+        project_id,
+        f"accept {entry_id}",
+        authorization=MemoryMutationAuthorization.direct_slash(),
+    ) == f"memory accepted: {entry_id}"
+
+    synced = push_project_memory(first, LocalTransport(second), project_id=project_id)
+    assert synced.conflicts == ()
+    remote_entry = ProjectRegistry(second / "projects")._entry_memory_state(
+        project_id
+    ).state.entries[entry_id]
+    assert isinstance(remote_entry, MemoryEntry)
+    assert remote_entry.accepted_by == "user"
+
+
 def test_entry_sync_transport_cas_rejects_changed_destination(tmp_path: Path) -> None:
     home = tmp_path / "home"
     remote = tmp_path / "remote"
@@ -165,6 +245,36 @@ def test_entry_sync_transport_cas_rejects_changed_destination(tmp_path: Path) ->
     _add(registry, project_id, "source", 3)
     with pytest.raises(RemoteSyncError, match="changed"):
         push_project_memory(home, RacingTransport(remote), project_id=project_id)
+
+
+def test_entry_sync_uses_python_only_ssh_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "ssh"
+    shim.write_text(
+        "#!/bin/sh\n[ \"$1\" = -- ] && shift\nshift\nexec /bin/sh -c \"$1\"\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    second.mkdir()
+    registry, project_id = _fixture(first, tmp_path / "workspace")
+    _add(registry, project_id, "through ssh", 1)
+
+    result = push_project_memory(
+        first,
+        SshTransport("fixture", str(second), name="fixture"),
+        project_id=project_id,
+    )
+
+    assert result.conflicts == ()
+    assert _active_texts(ProjectRegistry(second / "projects"), project_id) == {
+        "through ssh"
+    }
 
 
 def test_entry_sync_refuses_mixed_formats_without_mutation(tmp_path: Path) -> None:

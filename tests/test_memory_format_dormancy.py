@@ -194,8 +194,9 @@ def test_format_two_views_are_dormant_while_activation_paths_reject(
 
     remote = tmp_path / "remote"
     remote.mkdir()
-    with pytest.raises(UnsupportedMemoryFormatError, match=UNSUPPORTED_FORMAT_2):
-        push_project_memory(home, LocalTransport(remote), project_id=project_id)
+    synced = push_project_memory(home, LocalTransport(remote), project_id=project_id)
+    assert synced.conflicts == ()
+    before = _snapshot(project_root)
 
     prompt = "prefix<zeta-project-memory></zeta-project-memory>suffix"
     block = "<zeta-project-memory></zeta-project-memory>"

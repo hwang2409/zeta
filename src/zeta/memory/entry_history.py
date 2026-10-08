@@ -29,12 +29,14 @@ from zeta.memory.entry_store import (
     new_operation_id,
     receipt_from_dict,
     receipt_to_dict,
+    state_digest,
     state_from_bytes,
     utc_now,
 )
 from zeta.memory.entry_store import (
     MemoryState as EntryMemoryState,
 )
+from zeta.memory.entry_sync import EntryMemoryExport
 from zeta.memory.entry_undo import plan_entry_transaction_undo
 from zeta.memory.entry_views import render_all_kinds
 from zeta.memory.migration import MigrationPlan, migrate_format_one
@@ -61,9 +63,17 @@ class _FormatTwoPayloadAdapter:
     reconciliation_key: str | None
     target_version: str | None
     rejected_groups: tuple[str, ...] = ()
+    source_history: tuple[dict[str, object], ...] = ()
+    provenance: Mapping[str, object] | None = None
 
     def prepare(self, context: PublicationContext) -> PreparedVersion[EntryMemoryState]:
         retained_operation_ids = {receipt.operation_id for receipt in self.receipts}
+        for record in self.source_history:
+            operations = record.get("operations", ())
+            if isinstance(operations, list):
+                retained_operation_ids.update(
+                    receipt_from_dict(value).operation_id for value in operations
+                )
         retained_versions = set(context.retained_history)
         for version, record in zip(
             context.old_history, context.old_manifests, strict=True
@@ -73,6 +83,16 @@ class _FormatTwoPayloadAdapter:
                     receipt.operation_id
                     for receipt in EntryMemoryHistoryMixin._entry_receipts(record)
                 )
+                imported = record.get("source_history", ())
+                if isinstance(imported, list):
+                    for source_record in imported:
+                        if isinstance(source_record, dict):
+                            retained_operation_ids.update(
+                                receipt.operation_id
+                                for receipt in EntryMemoryHistoryMixin._entry_receipts(
+                                    source_record
+                                )
+                            )
         compacted_through = (
             context.dropped_history[-1]
             if context.dropped_history
@@ -100,6 +120,10 @@ class _FormatTwoPayloadAdapter:
             fields["entry_target_version"] = self.target_version
         if self.rejected_groups:
             fields["rejected_groups"] = list(self.rejected_groups)
+        if self.source_history:
+            fields["source_history"] = [dict(item) for item in self.source_history]
+        if self.provenance is not None:
+            fields["provenance"] = dict(self.provenance)
         return PreparedVersion(
             {"state": canonical_state_bytes(state)},
             {"state": canonical_state_bytes(before)},
@@ -198,6 +222,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         target_version: str | None = None,
         reset_history: bool = False,
         rejected_groups: tuple[str, ...] = (),
+        source_history: tuple[dict[str, object], ...] = (),
+        provenance: Mapping[str, object] | None = None,
     ) -> EntryMemorySnapshot:
         adapter = _FormatTwoPayloadAdapter(
             state=state,
@@ -207,6 +233,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             reconciliation_key=reconciliation_key,
             target_version=target_version,
             rejected_groups=rejected_groups,
+            source_history=source_history,
+            provenance=provenance,
         )
         published = publish_version(
             directory_fd,
@@ -230,6 +258,109 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             mirror_path=self.root / snapshot.state.project_id / "memory",
         )
         return snapshot
+
+    @staticmethod
+    def _logical_entry_history(
+        records: list[dict[str, object]],
+    ) -> tuple[dict[str, object], ...]:
+        fields = (
+            "version",
+            "kind",
+            "created_at",
+            "operations",
+            "reconciliation_key",
+            "source_digest",
+            "provenance",
+        )
+        logical: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for record in records:
+            imported = record.get("source_history")
+            candidates = [*imported, record] if isinstance(imported, list) else [record]
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                version = candidate.get("version")
+                if isinstance(version, str) and version in seen:
+                    continue
+                summary = {key: candidate[key] for key in fields if key in candidate}
+                if isinstance(version, str):
+                    seen.add(version)
+                logical.append(summary)
+        return tuple(logical)
+
+    def _export_entry_memory(self, project_id: str) -> EntryMemoryExport:
+        """Export one format-2 fixture without exposing storage layout."""
+        def read(root_fd: int) -> EntryMemoryExport:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                snapshot = self._entry_snapshot_locked(directory_fd)
+                pointer = self._pointer(directory_fd)
+                assert pointer is not None
+                root, blobs_fd, versions_fd = self._version_handles(
+                    directory_fd, create=False
+                )
+                try:
+                    records = [
+                        self._manifest(versions_fd, version)
+                        for version in pointer["history"]
+                    ]
+                finally:
+                    os.close(versions_fd)
+                    os.close(blobs_fd)
+                    os.close(root)
+                return EntryMemoryExport(
+                    snapshot.state,
+                    snapshot.digest,
+                    snapshot.version,
+                    self._logical_entry_history(records),
+                )
+            finally:
+                os.close(directory_fd)
+
+        return self._read(read)
+
+    def _import_entry_memory(
+        self,
+        project_id: str,
+        exported: EntryMemoryExport,
+        *,
+        expected_digest: str,
+        provenance: Mapping[str, object],
+    ) -> EntryMemorySnapshot:
+        """CAS-import one validated format-2 fixture snapshot."""
+        if (
+            not isinstance(exported, EntryMemoryExport)
+            or exported.state.project_id != project_id
+            or exported.digest != state_digest(exported.state)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+        ):
+            raise ProjectRegistryError("invalid format-2 memory export")
+        try:
+            encoded_history = json.dumps(exported.versions, sort_keys=True).encode()
+        except (TypeError, ValueError) as exc:
+            raise ProjectRegistryError("invalid format-2 memory export") from exc
+        if len(encoded_history) > 512 * 1024 or any(
+            not isinstance(record, dict) for record in exported.versions
+        ):
+            raise ProjectRegistryError("format-2 memory export history is too large")
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                current = self._entry_snapshot_locked(directory_fd)
+                if current.digest != expected_digest:
+                    raise ProjectRegistryError("project memory digest mismatch")
+                return self._publish_entry_version(
+                    directory_fd,
+                    state=exported.state,
+                    before=current.state,
+                    kind="entry-import",
+                    receipts=(),
+                    source_history=exported.versions,
+                    provenance=provenance,
+                )
+            finally:
+                os.close(directory_fd)
 
     def _migrate_memory_for_test(
         self, project_id: str, *, migrated_at: str
