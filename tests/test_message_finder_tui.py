@@ -100,6 +100,8 @@ def test_selected_finder_row_uses_valid_prompt_toolkit_styles() -> None:
 
 def test_representative_transcript_fragment_styles_parse() -> None:
     transcript, _ = _seeded_transcript()
+    for index in range(128):
+        transcript.append(Text(f"history row {index}"))
     transcript.begin_search()
     transcript.update_search("pytest")
 
