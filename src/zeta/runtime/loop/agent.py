@@ -163,6 +163,7 @@ class AgentLoop(
         agent_depth: int = 0,
         agent_instance_id: str | None = None,
         root_project_id: str | None = None,
+        parent_session_id: str | None = None,
         root_session_dir: Any = None,
         project_registry: Any = None,
         background_owner: BackgroundAgentOwner | None = None,
@@ -175,6 +176,7 @@ class AgentLoop(
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
+        self.parent_session_id = parent_session_id
         # Directory of the ROOT session that owns the durable child-link index;
         # threaded down every loop so nested children publish their lineage
         # intent into a single flat directory the root can reconcile.

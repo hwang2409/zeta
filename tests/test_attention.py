@@ -325,6 +325,9 @@ def test_concurrent_fork_creators_reuse_one_usable_session(
     assert {path.name for path in manager.sessions_dir.iterdir()} == sessions_before | {
         fork_ids[0]
     }
+    assert {
+        path.name for path in (opened.store.session_dir / "attention").glob("*.lock")
+    } == {".fork-allocation.lock"}
     fork = manager.open(fork_ids[0], _read_only=True)
     validated = validate_attention_fork(
         home=tmp_path,

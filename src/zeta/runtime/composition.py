@@ -257,6 +257,7 @@ def compose_runtime(
             registry=registry,
             skill_catalog=skill_catalog,
             root_project_id=metadata.project_id,
+            parent_session_id=metadata.parent_session_id,
             project_registry=manager.project_registry,
             **loop_kwargs,
         )

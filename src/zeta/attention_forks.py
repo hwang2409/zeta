@@ -116,13 +116,7 @@ def attention_decision_message_id(attention_id: str) -> str:
 
 
 @contextmanager
-def _fork_allocation_lock(
-    attention_store: AttentionStore, attention_id: str
-) -> Iterator[None]:
-    if len(attention_id) != 32 or any(
-        character not in "0123456789abcdef" for character in attention_id
-    ):
-        raise ValueError("invalid attention id")
+def _fork_allocation_lock(attention_store: AttentionStore) -> Iterator[None]:
     with (
         session_directory(
             attention_store.session_dir.parent, attention_store.session_dir.name
@@ -132,7 +126,7 @@ def _fork_allocation_lock(
         fcntl.flock(attention_fd, fcntl.LOCK_EX)
         try:
             lock_fd = open_session_file(
-                attention_fd, f".{attention_id}.lock", os.O_RDWR | os.O_CREAT
+                attention_fd, ".fork-allocation.lock", os.O_RDWR | os.O_CREAT
             )
         finally:
             fcntl.flock(attention_fd, fcntl.LOCK_UN)
@@ -247,7 +241,7 @@ def create_discussion_fork(
     source = manager.open(source_session_id, _read_only=True)
     try:
         attention_store = AttentionStore(source.store.session_dir)
-        with _fork_allocation_lock(attention_store, attention_id):
+        with _fork_allocation_lock(attention_store):
             record = attention_store.get(attention_id)
             if record.session_id != source_session_id:
                 raise ValueError("attention record does not belong to the source session")

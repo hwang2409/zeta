@@ -9,7 +9,10 @@ from typing import TYPE_CHECKING
 from ...core.store import ConversationEntry
 from ...core.store._approval_display import ApprovalAuditRequest
 from ...protocol.types import Message
-from ...transcript_search.index import refresh_transcript_index
+from ...transcript_search.index import (
+    is_indexable_top_level_project_session,
+    refresh_transcript_index,
+)
 
 if TYPE_CHECKING:
     from ...core.session import SessionMetadata
@@ -19,12 +22,16 @@ if TYPE_CHECKING:
 class StoreWriteMixin:
     """Offload root writes without reordering parallel child startup."""
 
+    def _indexable_project_session(self: AgentLoop) -> bool:
+        return self.project_registry is not None and is_indexable_top_level_project_session(
+            agent_depth=self.agent_depth,
+            project_id=self.root_project_id,
+            parent_session_id=self.parent_session_id,
+            session_dir=self.store.session_dir,
+        )
+
     def _configure_transcript_index(self: AgentLoop) -> None:
-        if (
-            self.agent_depth == 0
-            and self.root_project_id is not None
-            and self.project_registry is not None
-        ):
+        if self._indexable_project_session():
             self.store.enable_persisted_append_tracking()
         else:
             self.store.disable_persisted_append_tracking()
@@ -33,6 +40,7 @@ class StoreWriteMixin:
         """Apply changed session-project metadata to the active runtime."""
         self.session_metadata = metadata
         self.root_project_id = metadata.project_id
+        self.parent_session_id = metadata.parent_session_id
         self._configure_transcript_index()
         tool_registry = getattr(self, "tool_registry", None)
         if tool_registry is not None:
@@ -42,7 +50,7 @@ class StoreWriteMixin:
 
     def _schedule_transcript_index(self: AgentLoop) -> None:
         """Refresh completed turns after their transcript rows are durable."""
-        if self.agent_depth > 0 or self.root_project_id is None:
+        if not self._indexable_project_session():
             return
         registry = self.project_registry
         if registry is None:
