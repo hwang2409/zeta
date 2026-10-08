@@ -43,7 +43,7 @@ from zeta.mcp.client import (
     translate_call_result,
 )
 from zeta.mcp.commands import rewrite_mcp_file
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -557,7 +557,7 @@ async def test_agent_loop_bootstrap_checks_missing_mcp_config(
     loop = AgentLoop(
         backend, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()
     )
-    events = [event async for event in loop.run_turn("hello")]
+    events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
     await loop.close()
 
     assert calls == 1

@@ -22,6 +22,7 @@ from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -61,6 +62,7 @@ async def consume_child(
     child_loop: AgentLoop,
     prompt: str,
     *,
+    origin: MessageOrigin,
     child_path: str,
     publish: Callable[[str], None],
     child_turns: Callable[[], int],
@@ -96,7 +98,7 @@ async def consume_child(
         return child_loop.agent_depth
 
     try:
-        async for event in child_loop.run_turn(prompt):
+        async for event in child_loop.run_turn(prompt, origin=origin):
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
                 update_step(status)
@@ -260,7 +262,9 @@ async def consume_run(
         return receipt
 
     try:
-        result = await consume_child(child_loop, prompt, **kwargs)
+        result = await consume_child(
+            child_loop, prompt, origin=MessageOrigin.AGENT_PROMPT, **kwargs
+        )
         while not result.get("isError"):
             # Ack only after a follow-up actually reached the child. A cancel or
             # backend error mid-consume_child leaves the prompt pending, so the
@@ -274,7 +278,10 @@ async def consume_run(
                 return terminal_result
             current_entry = pending[0]
             result = await consume_child(
-                child_loop, current_entry.data["text"], **kwargs
+                child_loop,
+                current_entry.data["text"],
+                origin=MessageOrigin.AGENT_SEND,
+                **kwargs,
             )
         terminal_result = finalize(result)
         return terminal_result
@@ -804,9 +811,10 @@ async def run_agent_tool(
         }
         if is_run
         else {
+            "origin": MessageOrigin.AGENT_PROMPT,
             "record_report": lambda report: receipt_components.setdefault(
                 "report", report
-            )
+            ),
         }
     )
     child_task = loop._create_task(

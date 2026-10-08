@@ -4,7 +4,15 @@ from __future__ import annotations
 import json
 from typing import IO, TYPE_CHECKING, Any
 
-from ..protocol.types import Message, StreamEventType, TextContent, assistant_text
+from ..protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    StreamEventType,
+    TextContent,
+    assistant_text,
+    with_message_origin,
+)
 
 if TYPE_CHECKING:
     from .loop import AgentLoop
@@ -46,6 +54,7 @@ async def drive_turn(
     format: str,
     stdout: IO[str],
     stderr: IO[str],
+    origin: MessageOrigin,
     denial_hint: str = "headless approval-required tools are denied; pass --yolo to allow",
 ) -> int:
     """Drain one turn against ``loop`` and write results to the given streams.
@@ -63,7 +72,12 @@ async def drive_turn(
     if format == "json":
         _emit_jsonl(stdout, {"type": "turn_start", "prompt": prompt})
 
-    async for event in loop.run_turn(prompt):
+    user_message = with_message_origin(
+        Message(MessageRole.USER, [TextContent(prompt)]), origin
+    )
+    async for event in loop.run_turn(
+        prompt, origin=origin, user_message=user_message
+    ):
         if event.type is StreamEventType.MESSAGE_UPDATE:
             text = event.delta
             if isinstance(event.content, TextContent):

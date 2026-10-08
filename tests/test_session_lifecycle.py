@@ -21,6 +21,7 @@ from zeta.core.session import (
     normalize_session_name,
 )
 from zeta.core.slash import create_slash_registry
+from zeta.protocol.types import MessageOrigin, with_message_origin
 from zeta.skills import SkillCatalog
 from zeta.tui.app import create_app, format_picker_row
 
@@ -204,7 +205,7 @@ def test_session_list_shows_id_name_age_preview(
 
     first = create_app(_args())
     first.loop.store.append_message(
-        Message(MessageRole.USER, [TextContent("first prompt")])
+        with_message_origin(Message(MessageRole.USER, [TextContent("first prompt")]), MessageOrigin.USER)
     )
     manager = SessionManager(home)
     manager.record_name(
@@ -286,7 +287,7 @@ def test_session_export_writes_portable_jsonl(
 
     app = create_app(_args())
     session_id = app.loop.store.session_id
-    app.loop.store.append_message(Message(MessageRole.USER, [TextContent("hi world")]))
+    app.loop.store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("hi world")]), MessageOrigin.USER))
 
     exit_code = main(["session", "export", session_id])
     output = capsys.readouterr().out

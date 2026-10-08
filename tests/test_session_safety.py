@@ -15,7 +15,13 @@ from zeta.cli.main import main
 from zeta.core import session as session_module
 from zeta.core.session import SessionError, SessionInUseError, SessionManager
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
 
 
 def closed_session(tmp_path):
@@ -77,7 +83,7 @@ def test_delete_refuses_every_open_store_until_last_close(tmp_path, monkeypatch)
         with pytest.raises(SessionInUseError):
             manager.delete(sid)
         assert main(["session", "delete", sid, "--force"]) == 1
-        first.append_message(Message(MessageRole.USER, [TextContent("still writable")]))
+        first.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("still writable")]), MessageOrigin.USER))
         first.close()
         with pytest.raises(SessionInUseError):
             manager.delete(sid)
@@ -87,7 +93,7 @@ def test_delete_refuses_every_open_store_until_last_close(tmp_path, monkeypatch)
     assert main(["session", "delete", sid, "--force"]) == 0
     assert not (manager.sessions_dir / sid).exists()
     with pytest.raises(ValueError, match="closed"):
-        second.append_message(Message(MessageRole.USER, [TextContent("too late")]))
+        second.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("too late")]), MessageOrigin.USER))
 
 
 def test_crashed_store_releases_lease(tmp_path):
@@ -257,13 +263,13 @@ def test_store_uses_lifetime_descriptor_after_directory_swap(tmp_path, operation
     original.symlink_to(outside, target_is_directory=True)
     try:
         if operation == "append":
-            store.append_message(Message(MessageRole.USER, [TextContent("saved")]))
+            store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("saved")]), MessageOrigin.USER))
             assert b"saved" in (pinned / "conversation.jsonl").read_bytes()
         elif operation == "repair":
             with (pinned / "conversation.jsonl").open("ab") as handle:
                 handle.write(b'{"torn')
             with pytest.warns(RuntimeWarning, match="torn"):
-                store.append_message(Message(MessageRole.USER, [TextContent("saved")]))
+                store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("saved")]), MessageOrigin.USER))
             assert b'"torn' not in (pinned / "conversation.jsonl").read_bytes()
         elif operation == "state":
             store.set_bash_cwd("/saved")
@@ -405,7 +411,7 @@ def test_storage_operations_never_pass_full_session_paths_to_os(tmp_path, monkey
         opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
         sid = opened.metadata.session_id
         store = opened.store
-        store.append_message(Message(MessageRole.USER, [TextContent("saved")]))
+        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("saved")]), MessageOrigin.USER))
         store.set_bash_cwd(str(tmp_path))
         store.allocate_agent_index()
         store._agent_lifecycle = {"state": "completed"}
@@ -540,7 +546,7 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
         await runtime.create_session()
         store = runtime.opened.store
         sid = store.session_id
-        turn = [event async for event in runtime.loop.run_turn("hello")]
+        turn = [event async for event in runtime.loop.run_turn("hello", origin=MessageOrigin.USER)]
         assert any(event.type == StreamEventType.MESSAGE_UPDATE for event in turn)
         tasks = runtime.loop.tool_registry.background_tasks
         task_id, _ = await tasks.start("printf background", tmp_path, log_path=store.session_dir / "background.log")

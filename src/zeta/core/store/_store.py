@@ -17,7 +17,14 @@ from pathlib import Path
 from typing import Any, Self
 
 from ...agent.receipt import encode_json
-from ...protocol.types import Message, MessageRole, ToolCall, ToolResult, ToolUseContent
+from ...protocol.types import (
+    Message,
+    MessageRole,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
+    require_new_message_origin,
+)
 from ..agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
 from ..checkpoints import (
     CheckpointForkMixin,
@@ -714,7 +721,7 @@ class ConversationStore(
     def append_message(
         self, message: Message, *, parent_id: str | None = None
     ) -> ConversationEntry:
-        return self._append_row("message", {"message": message.to_dict()}, parent_id)
+        return self._append_row("message", {"message": require_new_message_origin(message).to_dict()}, parent_id)
 
     async def append_message_async(
         self, message: Message, *, parent_id: str | None = None
@@ -725,54 +732,6 @@ class ConversationStore(
         return await self._to_thread_durable(
             self.append_message, message, parent_id=parent_id
         )
-
-    def append_task_notification(
-        self,
-        *,
-        task_id: str,
-        command: str,
-        exit_code: int | None,
-        output_tail: str = "",
-        log_path: str | None = None,
-        note: str | None = None,
-        background_metadata: tuple[str, str] = ("run_background", "natural_exit"),
-    ) -> ConversationEntry:
-        """Persist a bounded notification for a model-owned process exit."""
-        if not task_id or not command or type(exit_code) not in {int, type(None)}:
-            raise ValueError("invalid task notification")
-        with self._append_lock():
-            self._load()
-            # Confirm id-set hits against the branch, preserving old scan behavior.
-            if task_id in self._task_notification_ids:
-                existing = next(
-                    (
-                        entry
-                        for entry in self.agent_notifications(pending_only=False)
-                        if entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
-                        and entry.data.get("task_id") == task_id
-                    ),
-                    None,
-                )
-                if existing is not None:
-                    return existing
-            if len(output_tail) > 2_048:
-                raise ValueError("task notification output is too long")
-            data: dict[str, Any] = {
-                "kind": TASK_EXITED_NOTIFICATION_KIND,
-                "task_id": task_id,
-                "headline": command,
-                "exit_code": exit_code,
-                "output_tail": output_tail,
-                "background_owner": background_metadata[0],
-                "background_phase": background_metadata[1],
-            }
-            if log_path is not None:
-                data["log_path"] = log_path
-            if note is not None:
-                data["note"] = note
-            entry = self._append_row_unlocked("notification", data)
-            self._task_notification_ids.add(task_id)
-            return self._snapshot_entry(entry)
 
     def append_pending_prompt(self, text: str) -> ConversationEntry:
         """Queue a follow-up through the pending-prompt queue owner."""
@@ -932,7 +891,7 @@ class ConversationStore(
         parent_id: str | None = None,
     ) -> ConversationEntry:
         request_data = normalize_approval_requests(message, approval_requests)
-        data: dict[str, Any] = {"message": message.to_dict()}
+        data: dict[str, Any] = {"message": require_new_message_origin(message).to_dict()}
         if request_data:
             data["approval_requests"] = request_data
         with self._append_lock():

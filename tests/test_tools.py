@@ -24,6 +24,7 @@ from zeta.core.loop import AgentLoop
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
+    MessageOrigin,
     MessageRole,
     StreamEventType,
     TextContent,
@@ -51,7 +52,7 @@ def _descendant_command(marker: Path, delay: float = 0.3) -> str:
 
 
 async def _collect_loop(loop: AgentLoop) -> list[object]:
-    return [event async for event in loop.run_turn("go")]
+    return [event async for event in loop.run_turn("go", origin=MessageOrigin.USER)]
 
 
 @pytest.mark.asyncio
@@ -1867,7 +1868,7 @@ async def test_agent_loop_executes_tool_calls_through_registry(tmp_path: Path) -
 
     events = [
         event
-        async for event in AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("read it")
+        async for event in AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("read it", origin=MessageOrigin.USER)
     ]
 
     result_message = store.messages()[2]
@@ -1913,7 +1914,7 @@ async def test_agent_loop_mapping_tools_still_validate_through_registry(
             tools={"typed": typed},
             tool_schemas=[schema],
 skill_catalog=SkillCatalog.empty(),
-        ).run_turn("go")
+        ).run_turn("go", origin=MessageOrigin.USER)
     ]
 
     result = store.messages()[2].tool_result
@@ -1965,7 +1966,7 @@ async def test_agent_loop_keeps_boundary_abort_for_pending_tools(tmp_path: Path)
     registry.register("step", lambda arguments: "ran")
     aborted = False
 
-    async for event in AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("go"):
+    async for event in AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("go", origin=MessageOrigin.USER):
         if event.type is StreamEventType.MESSAGE_END and not aborted:
             registry.abort()
             aborted = True

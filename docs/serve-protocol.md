@@ -241,10 +241,12 @@ fake-mode servers; real sessions can resume across real providers.
 
 ### `send`
 
-Params: required `text`, a non-empty string. The result acknowledges scheduling
-with `accepted` (`true`) and `session_id`. Streaming starts as notifications.
-Only one turn can run at a time. With the `user_message_event` feature, a
-`user_message` event with `mode: "send"` precedes the acknowledgement.
+Params: exactly one of `text` or `input_id`. `text` is a non-empty direct user
+message. `input_id` is available only with `model_input_ids` and refers to a
+server-owned `model_input` returned by `slash_run`. The result acknowledges
+scheduling with `accepted` (`true`) and `session_id`. Streaming starts as
+notifications. Only one turn can run at a time. With the `user_message_event`
+feature, a `user_message` event with `mode: "send"` precedes the acknowledgement.
 
 ```json
 {"jsonrpc":"2.0","id":5,"method":"send","params":{"text":"hello"}}
@@ -778,9 +780,10 @@ implementation for the frontend client. Two RPCs cover the surface.
   starting with `/`). Rejects the request when a turn is running with
   `-32004`. Returns a `kind` discriminator:
   - `output`: `text` is the composed notice to render as a quiet receipt.
-  - `model_input`: `text` is the resolved prompt to send with `send`. The
-    server does not enqueue it; the client sends normally so the composer
-    stays authoritative.
+  - `model_input`: without `model_input_ids`, `text` is the resolved prompt
+    to send as normal text. With `model_input_ids`, the server instead returns
+    an opaque `input_id` and the typed `display_text`; the resolved text and
+    its authorship stay server-side.
   - `client_only`: the command exists but must run in the client (name is
     echoed back for the client's dispatch table).
   - `unknown`: no command matched the leading token.
@@ -794,6 +797,14 @@ picker surface, while `/model <name>` dispatches server-side through the
 shared settings-apply path. Exec macros and every command in the
 `client_only` set report themselves as client-only rather than
 half-executing here.
+
+When `model_input_ids` is negotiated, `send` accepts `input_id` instead of
+`text`. IDs are bounded, single-use, and valid only for the active session on
+the connection. An unknown, expired, reused, or cross-session ID returns
+`-32602`. A client cannot supply expansion text or an origin with the ID, so it
+cannot label arbitrary text as a server-generated expansion. Plain
+`send {text}` remains direct user input. Frontend clients should use this flow
+for every `model_input` result.
 
 Legacy clients receive `-32601` for both requests, matching every other
 1.1 extension. A protocol-1.1 frontend client talking to a 1.0 server hides the menu
@@ -814,6 +825,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `memory_updated` | automatic reconciliation emits `memory_updated` with a short `message` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
 | `assistant_reset` | enables post-stream provider retry; `assistant_reset` removes failed attempt output before replacement deltas |
+| `model_input_ids` | `slash_run` stores generated model input server-side and returns a single-use `input_id` accepted by `send` |
 | `projects` | adds `list_projects`, `project_show`, `project_memory_log`, and `project_inbox`; `list_sessions` accepts `project_id` |
 
 Features keep the protocol version at `1.1`. A version bump would make a new

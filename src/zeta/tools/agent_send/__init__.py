@@ -12,6 +12,7 @@ from ...core.store import (
     PendingPromptCommitTimeoutError,
     PendingPromptsClosedError,
 )
+from ...protocol.types import MessageOrigin
 from ..registry import ToolRegistry, text_block
 
 AGENT_SEND_COMMIT_TIMEOUT_SECONDS = 1.0
@@ -54,7 +55,9 @@ def send_to_run(
             cwd=parent_store.cwd,
             _lock_deadline=deadline,
         ) as child_store:
-            child_store.pending_prompt_queue.append(message, deadline=deadline)
+            child_store.pending_prompt_queue.append(
+                message, origin=MessageOrigin.AGENT_SEND, deadline=deadline
+            )
     except PendingPromptCommitTimeoutError:
         return "pending prompt commit timed out before the queue could be changed"
     except PendingPromptsClosedError:
