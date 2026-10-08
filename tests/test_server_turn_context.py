@@ -78,7 +78,7 @@ def _context_messages(backend: FakeBackend, call: int) -> list:
 
 @pytest.mark.asyncio
 async def test_indexed_notification_append_keeps_receipt_and_callback(tmp_path) -> None:
-    server, reader, writer, _ = await _ready(tmp_path, FakeBackend([]))
+    server, _reader, writer, _ = await _ready(tmp_path, FakeBackend([]))
     store = server.runtime.opened.store
     store.enable_persisted_append_tracking()
     callback_calls = 0

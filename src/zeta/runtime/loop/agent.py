@@ -794,7 +794,7 @@ class AgentLoop(
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
         system_message: Message | None = None,
-        on_system_message_persisted: Callable[[], None] | None = None,
+        on_persisted: Callable[[], None] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         notification_turn = system_message is not None
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
@@ -802,9 +802,7 @@ class AgentLoop(
         if self.hooks is not None and system_message is None:
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None:
-            await self._append_turn_message(
-                system_message, on_persisted=on_system_message_persisted
-            )
+            await self._append_turn_message(system_message, on_persisted=on_persisted)
         elif user_message is None:
             user_message = Message(MessageRole.USER, [TextContent(user_text)])
         elif user_message.role is not MessageRole.USER:

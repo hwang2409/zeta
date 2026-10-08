@@ -249,7 +249,7 @@ class AgentNotificationMixin:
             persist_user_message=persist_user_message,
             abort_signal=abort_signal,
             system_message=system_message,
-            on_system_message_persisted=system_message_persisted,
+            on_persisted=system_message_persisted,
         )
         success = True
         try:
