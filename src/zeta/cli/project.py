@@ -114,7 +114,7 @@ def run(
                 )
                 if registry.memory_format(project_id) == 2:
                     registry._accept_memory_entry(project_id, args.remote)
-                    value = registry.entry_memory_view(project_id)
+                    value = registry._entry_memory_view(project_id)
                 else:
                     registry.accept_memory(project_id, args.remote)
                     value = {name: content for name, content in registry.load_memory(project_id)}
@@ -133,7 +133,7 @@ def run(
                 )
                 if registry.memory_format(project_id) == 2:
                     registry._accept_memory_entry(project_id, args.action)
-                    value = registry.entry_memory_view(project_id)
+                    value = registry._entry_memory_view(project_id)
                 else:
                     registry.accept_memory(project_id, args.action)
                     value = {name: content for name, content in registry.load_memory(project_id)}
@@ -160,13 +160,13 @@ def run(
             memory_format = registry.memory_format(project_id)
             if not supplied:
                 if memory_format == 2:
-                    structured = registry.entry_memory_view(project_id)
+                    structured = registry._entry_memory_view(project_id)
                     value = (
                         structured
                         if getattr(args, "json", False)
                         else {
                             f"{kind}.md": rendered
-                            for kind, rendered in registry.entry_memory_mirrors(
+                            for kind, rendered in registry._entry_memory_mirrors(
                                 project_id
                             ).items()
                         }
@@ -188,7 +188,7 @@ def run(
                 )
                 if memory_format == 2:
                     registry._replace_entry_kind(project_id, name, content)
-                    value = registry.entry_memory_view(project_id)
+                    value = registry._entry_memory_view(project_id)
                 else:
                     registry.update_memory(project_id, {name: content})
                     value = {

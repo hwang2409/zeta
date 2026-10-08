@@ -76,7 +76,7 @@ class EntryProjectViews:
         limit = self._integer(
             params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
         )
-        records = self.registry.entry_memory_log(
+        records = self.registry._entry_memory_log(
             project.project_id, entry_id=entry_id, limit=10_000
         )
         return self._page(request_id, "versions", records, offset, limit)
@@ -93,7 +93,7 @@ class EntryProjectViews:
             raise self.invalid("version_id must be a non-empty string")
         if "offset" in params or "limit" in params:
             raise self.invalid("offset and limit cannot be used with version_id")
-        record, before, after = self.registry.entry_memory_version(
+        record, before, after = self.registry._entry_memory_version(
             project.project_id, version
         )
         touched = {

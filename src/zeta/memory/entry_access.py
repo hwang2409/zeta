@@ -54,7 +54,7 @@ class EntryMemoryViewMixin:
                 "could not refresh project memory mirror at %s: %s", mirror_path, exc
             )
 
-    def repair_entry_memory_mirror(self, project_id: str) -> None:
+    def _repair_entry_memory_mirror(self, project_id: str) -> None:
         """Repair a fixture-created format-2 mirror without changing authority."""
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
@@ -105,7 +105,7 @@ class EntryMemoryViewMixin:
             raise ProjectRegistryError("unsupported project memory format")
         return value
 
-    def entry_memory_view(
+    def _entry_memory_view(
         self, project_id: str, *, byte_cap: int | None = None
     ) -> dict[str, object]:
         snapshot = self._entry_memory_state(project_id)
@@ -115,10 +115,10 @@ class EntryMemoryViewMixin:
             "version_id": snapshot.version,
         }
 
-    def entry_memory_mirrors(self, project_id: str) -> dict[str, str]:
+    def _entry_memory_mirrors(self, project_id: str) -> dict[str, str]:
         return render_all_kinds(self._entry_memory_state(project_id).state)
 
-    def entry_memory_log(
+    def _entry_memory_log(
         self,
         project_id: str,
         *,
@@ -201,7 +201,7 @@ class EntryMemoryViewMixin:
 
         return self._read(read)
 
-    def entry_memory_version(
+    def _entry_memory_version(
         self, project_id: str, version: str
     ) -> tuple[dict[str, object], EntryMemoryState, EntryMemoryState]:
         """Read one retained receipt and its structured before/after states."""

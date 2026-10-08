@@ -249,7 +249,7 @@ def test_project_inspect_entry_view_is_bounded(tmp_path: Path) -> None:
         ),
         reconciliation_key="d" * 64,
     )
-    value = registry.entry_memory_view(project_id, byte_cap=64 * 1024)
+    value = registry._entry_memory_view(project_id, byte_cap=64 * 1024)
     assert value["entries_truncated"] is True
     assert len(json.dumps(value, separators=(",", ":")).encode()) <= 64 * 1024 + 200
 
@@ -282,7 +282,7 @@ def test_entry_mirrors_are_repaired_and_edits_never_change_state(tmp_path: Path)
     mirror.chmod(0o600)
     mirror.write_text(_MEMORY_MIRROR_HEADER + "user edit\n")
     before = registry._entry_memory_state(project_id)
-    registry.repair_entry_memory_mirror(project_id)
+    registry._repair_entry_memory_mirror(project_id)
     after = registry._entry_memory_state(project_id)
     assert "user edit" not in mirror.read_text()
     assert after.digest == before.digest

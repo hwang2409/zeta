@@ -26,7 +26,7 @@ def confirm_memory_accept(
     preview = ""
     memory_format = getattr(registry, "memory_format", lambda _project_id: 1)(project_id)
     if memory_format == 2:
-        value = registry.entry_memory_view(project_id)
+        value = registry._entry_memory_view(project_id)
         preview = next(
             (
                 str(entry.get("text", ""))[:240]
