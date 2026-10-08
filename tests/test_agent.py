@@ -43,6 +43,7 @@ from zeta.protocol.types import (
     CompletionBackend,
     ErrorInfo,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -52,6 +53,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
@@ -115,7 +117,7 @@ async def test_context_overflow_compacts_and_retries_same_turn(
 
     backend = ContextLimitBackend()
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old work")]), MessageOrigin.USER))
     loop = AgentLoop(
         backend,
         store,
@@ -125,7 +127,7 @@ async def test_context_overflow_compacts_and_retries_same_turn(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    events = await _collect(loop.run_turn("current request"))
+    events = await _collect(loop.run_turn("current request", origin=MessageOrigin.USER))
 
     assert len(backend.calls) == 3
     assert store.compaction_marker_count() == 1
@@ -142,7 +144,7 @@ async def test_agent_loop_uses_fallback_after_empty_summary_retries(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("old request")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old request")]), MessageOrigin.USER))
     backend = FakeBackend(
         [
             ScriptedTurn([TextContent(" ")]),
@@ -176,7 +178,7 @@ async def test_agent_loop_uses_fallback_after_empty_summary_retries(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    events = await _collect(loop.run_turn("current request"))
+    events = await _collect(loop.run_turn("current request", origin=MessageOrigin.USER))
 
     assert len(backend.calls) == 4
     assert not any(event.type is StreamEventType.ERROR for event in events)
@@ -197,7 +199,7 @@ async def test_agent_loop_compacts_oversized_tool_output_instead_of_failing(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("inspect the output")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("inspect the output")]), MessageOrigin.USER))
     call = ToolCall("call-noisy", "bash", {"command": "print lots"})
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
@@ -221,7 +223,7 @@ async def test_agent_loop_compacts_oversized_tool_output_instead_of_failing(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    events = await _collect(loop.run_turn("continue"))
+    events = await _collect(loop.run_turn("continue", origin=MessageOrigin.USER))
 
     assert any(event.type is StreamEventType.TURN_END for event in events)
     assert not any(event.type is StreamEventType.ERROR for event in events)
@@ -251,7 +253,7 @@ async def test_context_overflow_after_partial_output_is_not_retried(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    events = await _collect(loop.run_turn("current request"))
+    events = await _collect(loop.run_turn("current request", origin=MessageOrigin.USER))
 
     assert backend.calls == 1
     assert store.compaction_marker_count() == 0
@@ -753,7 +755,7 @@ async def test_background_agent_returns_handle_and_parent_continues(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
     )
@@ -762,7 +764,7 @@ async def test_background_agent_returns_handle_and_parent_continues(
     assert result.structured_content["description"] == "background research"
     assert backend.child_started.is_set()
 
-    parent_events = await _collect(loop.run_turn("follow up"))
+    parent_events = await _collect(loop.run_turn("follow up", origin=MessageOrigin.USER))
     assert any(event.type is StreamEventType.TURN_END for event in parent_events)
     assert store.agent_notifications() == []
 
@@ -795,7 +797,7 @@ async def test_background_completion_wakes_idle_parent(
 
     loop.set_background_wake_callback(wake)
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
     while wake_task is None:
         await asyncio.sleep(0)
@@ -976,7 +978,7 @@ async def test_cancel_before_tool_dispatch_persists_canceled_receipt(
         yield  # pragma: no cover
 
     monkeypatch.setattr(agent_loop_module, "dispatch_tool_calls", stalled_dispatch)
-    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     await assistant_persisted.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1031,7 +1033,7 @@ async def test_generator_exit_before_tool_dispatch_persists_canceled_receipts(
         lambda *args, **kwargs: GeneratorExitDispatch(),
     )
     with pytest.raises(GeneratorExit):
-        await _collect(loop.run_turn("start"))
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert policy.pending_requests() == []
     receipts = [message for message in store.messages() if message.tool_result is not None]
@@ -1060,7 +1062,7 @@ async def test_notification_batch_reaches_provider_context(tmp_path: Path) -> No
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("follow up"))
+    await _collect(loop.run_turn("follow up", origin=MessageOrigin.USER))
 
     assert any(
         message.metadata.get("zeta_event") == "agent_notifications"
@@ -1071,7 +1073,7 @@ async def test_notification_batch_reaches_provider_context(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_aborted_notification_wake_signals_remaining_notifications(
+async def test_aborted_notification_wake_commits_durable_notifications(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -1111,16 +1113,18 @@ async def test_aborted_notification_wake_signals_remaining_notifications(
     with pytest.raises(asyncio.CancelledError):
         await wake_task
     try:
-        assert [
-            entry.data["child_instance_id"] for entry in store.agent_notifications()
-        ] == ["child-1", "child-2"]
+        assert store.agent_notifications() == []
+        assert sum(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in store.messages()
+        ) == 2
         assert not wake.is_set()
     finally:
         await loop.close()
 
 
 @pytest.mark.asyncio
-async def test_failed_notification_wake_keeps_claimed_batch_pending(
+async def test_failed_notification_wake_commits_durable_batch(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -1140,9 +1144,11 @@ async def test_failed_notification_wake_keeps_claimed_batch_pending(
     events = await _collect(loop.run_notification_turn())
 
     assert any(event.type is StreamEventType.ERROR for event in events)
-    assert [entry.data["child_instance_id"] for entry in store.agent_notifications()] == [
-        "child-1"
-    ]
+    assert store.agent_notifications() == []
+    assert sum(
+        message.metadata.get("zeta_event") == "agent_notifications"
+        for message in store.messages()
+    ) == 1
     assert loop.notification_turn_state == "idle"
     await loop.close()
 
@@ -1213,7 +1219,7 @@ async def test_background_multibyte_receipt_fits_persisted_limit(
     background_events: list[StreamEvent] = []
     loop.set_background_event_sink(background_events.append)
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
 
@@ -1267,7 +1273,7 @@ async def test_background_large_configured_receipt_fits_notification_store(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
     notification = await _wait_for_notification(store, "completed")
 
@@ -1350,7 +1356,7 @@ async def test_background_completion_during_setup_is_drained_at_turn_start(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     setup_started = asyncio.Event()
 
     async def delayed_setup() -> None:
@@ -1360,7 +1366,7 @@ async def test_background_completion_during_setup_is_drained_at_turn_start(
             await asyncio.sleep(0)
 
     loop._ensure_mcp_servers = delayed_setup
-    events = await _collect(loop.run_turn("follow up"))
+    events = await _collect(loop.run_turn("follow up", origin=MessageOrigin.USER))
 
     assert setup_started.is_set()
     assert events[0].type is StreamEventType.AGENT_NOTIFICATION
@@ -1379,7 +1385,7 @@ async def test_background_completion_leaves_no_pending_abort_waiter(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
     for _ in range(100):
@@ -1402,7 +1408,7 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     background_events: list[StreamEvent] = []
     loop.set_background_event_sink(background_events.append)
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     loop.abort()
     notification = await _wait_for_notification(store, "canceled")
     assert "parent session exited" not in notification.data["text"]
@@ -1437,7 +1443,7 @@ async def test_parent_abort_cancels_background_grandchild(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
     loop.abort()
     await _wait_for_notification(store, "canceled")
@@ -1464,7 +1470,7 @@ async def test_foreground_cancel_cancels_owned_background_descendant_only(
     backend = ForegroundNestedBackgroundBackend()
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
 
     await asyncio.wait_for(backend.grandchild_started.wait(), timeout=5)
     sibling_done = asyncio.Event()
@@ -1501,7 +1507,7 @@ async def test_foreground_child_does_not_wait_for_background_grandchild(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
     events = await asyncio.wait_for(task, timeout=1)
 
@@ -1530,7 +1536,7 @@ async def test_background_and_foreground_tools_mix_in_one_turn(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     results = [
         message.tool_result for message in store.messages() if message.tool_result
     ]
@@ -1550,7 +1556,7 @@ async def test_background_and_foreground_tools_mix_in_one_turn(
 def _persist_background_receipt(
     store: ConversationStore, call: ToolCall, child: ConversationStore
 ) -> None:
-    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
         Message(
@@ -1800,7 +1806,7 @@ async def test_background_persistence_failure_does_not_block_close(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     def fail_notification(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -1822,7 +1828,7 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     await asyncio.wait_for(backend.children_started.wait(), timeout=1)
     backend.release_children.set()
     await asyncio.wait_for(task, timeout=1)
@@ -1853,7 +1859,7 @@ async def test_parallel_nested_lifecycle_events_survive_large_batch(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    events = await asyncio.wait_for(_collect(loop.run_turn("start")), timeout=30)
+    events = await asyncio.wait_for(_collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=30)
 
     read_lifecycle = [
         event
@@ -1894,7 +1900,7 @@ async def test_duplicate_parallel_agent_ids_fail_before_child_dispatch(
         await _collect(
             AgentLoop(
                 backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-            ).run_turn("start")
+            ).run_turn("start", origin=MessageOrigin.USER)
         )
 
     assert not (store.session_dir / "agents").exists()
@@ -1907,7 +1913,7 @@ async def test_parent_abort_cancels_all_parallel_children(tmp_path: Path) -> Non
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     await asyncio.wait_for(backend.children_started.wait(), timeout=1)
     loop.abort()
     await asyncio.wait_for(task, timeout=1)
@@ -1946,7 +1952,7 @@ async def test_parallel_delegated_approvals_resolve_by_child_instance(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     for _ in range(100):
         if len(policy.pending_requests()) == 2:
             break
@@ -1976,7 +1982,7 @@ async def test_agent_returns_child_text_and_persists_child_session(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -2028,8 +2034,8 @@ async def test_provider_tool_order_is_canonical_across_registry_insertion_order(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    await _collect(first_loop.run_turn("start"))
-    await _collect(second_loop.run_turn("start"))
+    await _collect(first_loop.run_turn("start", origin=MessageOrigin.USER))
+    await _collect(second_loop.run_turn("start", origin=MessageOrigin.USER))
 
     first_names = [schema["name"] for schema in first_backend.calls[0][1]]
     assert first_names == sorted(first_names)
@@ -2126,12 +2132,12 @@ async def test_general_agent_markers_keep_legacy_state_bytes(tmp_path: Path) -> 
     await _collect(
         AgentLoop(
             omitted_backend, omitted, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
     await _collect(
         AgentLoop(
             explicit_backend, explicit, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     omitted_child_state = omitted.session_dir / "agents" / "1" / "session_state.json"
@@ -2158,7 +2164,7 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     child_schemas = {schema["name"] for schema in backend.calls[1][1]}
@@ -2233,7 +2239,7 @@ async def test_restricted_child_cannot_use_mounted_mcp_write_tool(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert mount_calls == 1
@@ -2263,7 +2269,7 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert {schema["name"] for schema in backend.calls[1][1]} == {
@@ -2299,7 +2305,7 @@ async def test_typed_child_exceeds_former_turn_cap_and_completes(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -2352,7 +2358,7 @@ async def test_typed_preamble_composes_with_child_system_prompt(tmp_path: Path) 
             max_turns=1,
             system_prompt="existing child instructions",
             skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     child_system = backend.calls[1][0][0]
@@ -2393,7 +2399,7 @@ async def test_child_registry_preserves_parent_pre_execution_hook(
             registry=registry,
             max_turns=1,
             skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert observed[-1] == "bash"
@@ -2472,7 +2478,7 @@ async def test_plan_child_writes_todo_items_to_its_own_store(tmp_path: Path) -> 
         skill_catalog=SkillCatalog.empty(),
     )
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     assert store.todo_items() == [{"content": "parent work", "status": "pending"}]
@@ -2888,7 +2894,7 @@ async def test_child_loop_inherits_argument_scoped_approval_rules(
             approval_policy=policy,
             max_turns=1,
             skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     child_messages = ConversationStore(
@@ -2932,7 +2938,7 @@ async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
         skill_catalog=SkillCatalog.empty(),
     )
     baseline = set(asyncio.all_tasks())
-    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     await started.wait()
     loop.abort()
 
@@ -2962,7 +2968,7 @@ async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -2998,7 +3004,7 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     child_tools = {schema["name"] for schema in backend.calls[1][1]}
@@ -3042,7 +3048,7 @@ async def test_nested_and_parallel_children_do_not_share_a_terminating_budget(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -3102,7 +3108,7 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     loop.set_background_wake_callback(root_woke.set)
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await _wait_for_notification(store, "completed")
     await asyncio.wait_for(root_woke.wait(), timeout=1)
 
@@ -3128,7 +3134,7 @@ async def test_abort_propagates_through_two_nested_levels(tmp_path: Path) -> Non
     backend = NestedBlockingBackend()
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
 
     await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
     loop.abort()
@@ -3250,7 +3256,7 @@ async def test_child_approval_uses_parent_policy(tmp_path: Path) -> None:
         approval_policy=policy,
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
-    ).run_turn("start"):
+    ).run_turn("start", origin=MessageOrigin.USER):
         events.append(event)
         if event.type is StreamEventType.TOOL_APPROVAL_START:
             assert [request.tool_call.id for request in policy.pending_requests()] == [
@@ -3319,7 +3325,7 @@ async def test_grandchild_approval_composes_with_parent_policy(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     for _ in range(100):
         pending = policy.pending_requests()
         if pending:
@@ -3353,7 +3359,7 @@ async def test_agent_result_metadata_survives_parent_replay(tmp_path: Path) -> N
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     replayed = ConversationStore(tmp_path, session_id=store.session_id)
@@ -3384,7 +3390,7 @@ async def test_agent_normal_completion_reports_all_child_turns(tmp_path: Path) -
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -3407,7 +3413,7 @@ async def test_typed_child_type_survives_completion_and_reopen(tmp_path: Path) -
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     child = ConversationStore(store.session_dir / "agents", session_id="1")
@@ -3434,7 +3440,7 @@ async def test_empty_child_final_message_returns_error(tmp_path: Path) -> None:
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -3460,7 +3466,7 @@ async def test_child_answer_with_cancellation_prefix_is_success(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -3481,7 +3487,7 @@ async def test_failed_agent_receipt_stats_match_is_error(tmp_path: Path) -> None
     events = await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -3518,7 +3524,7 @@ async def test_failed_background_receipt_matches_error_flag(
     background_events: list[StreamEvent] = []
     loop.set_background_event_sink(background_events.append)
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await loop._background_owner.wait()
     notification = store.agent_notifications(pending_only=False)[0]
     terminal = next(
@@ -3555,7 +3561,7 @@ async def test_multibyte_agent_receipt_stays_within_response_limit(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     persisted = next(message for message in store.messages() if message.tool_result)
@@ -3597,7 +3603,7 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     )
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     await asyncio.wait_for(child_started.wait(), timeout=10)
     loop.abort()
 
@@ -3652,7 +3658,7 @@ async def test_parent_abort_after_child_turn_reports_completed_turns(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    async for event in loop.run_turn("start"):
+    async for event in loop.run_turn("start", origin=MessageOrigin.USER):
         if (
             event.type is StreamEventType.TOOL_EXECUTION_UPDATE
             and event.delta is not None
@@ -3682,7 +3688,7 @@ async def test_typed_child_type_survives_cancellation_and_reopen(
     )
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     await asyncio.sleep(0.05)
     loop.abort()
 
@@ -3715,7 +3721,7 @@ async def test_parent_result_append_precedes_marker_cleanup(
         await _collect(
             AgentLoop(
                 backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-            ).run_turn("start")
+            ).run_turn("start", origin=MessageOrigin.USER)
         )
 
     assert store.agent_children()
@@ -3766,7 +3772,7 @@ async def test_resume_reuses_exact_foreground_terminal_receipt(
                 registry=registry,
                 max_turns=1,
                 skill_catalog=SkillCatalog.empty(),
-            ).run_turn("start")
+            ).run_turn("start", origin=MessageOrigin.USER)
         )
 
     assert len(original_receipts) == 1
@@ -3810,7 +3816,7 @@ async def test_setup_failure_persists_canonical_terminal_receipt(
             registry=registry,
             max_turns=1,
             skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -3989,7 +3995,7 @@ async def test_agent_without_a_model_still_inherits_the_parent_backend(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -4014,7 +4020,7 @@ async def test_agent_with_a_model_runs_the_child_on_that_provider(
     await _collect(
         AgentLoop(
             parent_backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert requested == [("codex", "gpt-5.4")]
@@ -4056,7 +4062,7 @@ async def test_child_usage_is_counted_separately_from_parent(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert loop.context_assembler.descendant_usage == {
         "input_tokens": 20,
@@ -4144,7 +4150,7 @@ async def test_agent_model_implies_background(
         parent_backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -4169,7 +4175,7 @@ async def test_agent_rejects_an_unknown_model_before_spawning(tmp_path: Path) ->
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -4247,7 +4253,7 @@ async def test_agent_reports_a_missing_provider_login(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -4284,7 +4290,7 @@ async def test_background_start_text_names_handle_and_polling_tools(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
     )
@@ -4325,7 +4331,7 @@ async def test_delegated_turn_count_stays_accurate_without_a_denominator(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
@@ -4434,8 +4440,8 @@ async def test_a_run_does_not_draw_on_the_shared_sibling_budget(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
-    await _collect(loop.run_turn("now start the run"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await _collect(loop.run_turn("now start the run", origin=MessageOrigin.USER))
     await _wait_for_notification(store, "completed")
     await loop.close()
 
@@ -4448,7 +4454,7 @@ async def test_a_run_goes_to_the_background_without_being_asked(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -4795,7 +4801,7 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
     handle = _run_handle_from_receipt(store)
 
@@ -4821,7 +4827,7 @@ async def test_a_queued_prompt_stays_out_of_the_run_context(tmp_path: Path) -> N
     """Only messages reach the model; a queued follow-up must not leak in early."""
 
     store = ConversationStore(tmp_path, session_id="run")
-    store.append_message(Message(MessageRole.USER, [TextContent("work the big task")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("work the big task")]), MessageOrigin.USER))
     store.append_pending_prompt("secret follow-up")
     loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
 
@@ -4859,7 +4865,7 @@ async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> N
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
 
     # The model queues follow-ups by the child_instance_id it saw in the tool
@@ -4880,7 +4886,7 @@ async def test_a_run_with_an_empty_queue_finishes_normally(tmp_path: Path) -> No
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
 
@@ -4948,7 +4954,7 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
 
     assert commands.slash_runs("") == "no live runs"
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
 
     listing = commands.slash_runs("")
@@ -5002,7 +5008,7 @@ async def test_child_thinking_only_reply_with_pending_notification_is_nudged(
     loop = AgentLoop(
         backend, store, max_turns=1, agent_depth=1, skill_catalog=SkillCatalog.empty()
     )
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     nudges = [
         message
@@ -5047,7 +5053,7 @@ async def test_context_retry_of_notification_consumption_is_never_nudged(
             )
 
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old work")]), MessageOrigin.USER))
     backend = Backend(store)
     loop = AgentLoop(
         backend,
@@ -5058,7 +5064,7 @@ async def test_context_retry_of_notification_consumption_is_never_nudged(
         retained_tail=1,
         skill_catalog=SkillCatalog.empty(),
     )
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert not any(
         message.metadata.get("zeta_event") == "empty_turn_nudge"
@@ -5095,7 +5101,7 @@ async def test_context_retry_of_ordinary_empty_reply_still_nudged_once(
             )
 
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old work")]), MessageOrigin.USER))
     backend = Backend()
     loop = AgentLoop(
         backend,
@@ -5106,7 +5112,7 @@ async def test_context_retry_of_ordinary_empty_reply_still_nudged_once(
         retained_tail=1,
         skill_catalog=SkillCatalog.empty(),
     )
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     nudges = [
         message
@@ -5150,7 +5156,7 @@ async def test_notification_consumption_reply_is_never_nudged(tmp_path: Path) ->
     loop = AgentLoop(
         backend, store, max_turns=1, agent_depth=1, skill_catalog=SkillCatalog.empty()
     )
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert not any(
         message.metadata.get("zeta_event") == "empty_turn_nudge"
@@ -5188,7 +5194,7 @@ async def test_nudge_notification_provider_shape(provider: str, tmp_path: Path) 
     loop = AgentLoop(
         backend, store, max_turns=1, agent_depth=1, skill_catalog=SkillCatalog.empty()
     )
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     request_messages = backend.calls[-1]
     assert any(
         message.metadata.get("zeta_event") == "empty_turn_nudge"
@@ -5235,7 +5241,7 @@ async def test_subagent_thinking_only_reply_is_nudged_before_failing(
     await _collect(
         AgentLoop(
             backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = next(
@@ -5338,7 +5344,7 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     events = []
     loop.set_background_event_sink(events.append)
-    events.extend(await _collect(loop.run_turn("start")))
+    events.extend(await _collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     notification = await _wait_completion(store)
     text = notification.data["text"]
     assert "background tasks killed on child completion" in text
@@ -5466,7 +5472,7 @@ async def test_child_consumes_pending_task_notification_before_completing(
         background_owner=root._background_owner,
         skill_catalog=SkillCatalog.empty(),
     )
-    await _collect(child.run_turn("do work"))
+    await _collect(child.run_turn("do work", origin=MessageOrigin.USER))
     assert backend.saw_notification is True
     assert child_store.agent_notifications() == []
     assert any(
@@ -5713,7 +5719,7 @@ async def test_agent_cwd_sets_child_bash_session_cwd(tmp_path: Path) -> None:
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert (worktree / "bash_marker").exists()
     assert not (parent_dir / "bash_marker").exists()
@@ -5741,7 +5747,7 @@ async def test_agent_cwd_relative_paths_resolve_in_child_cwd(tmp_path: Path) -> 
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert (worktree / "notes.txt").read_text(encoding="utf-8") == "from child"
     assert not (parent_dir / "notes.txt").exists()
@@ -5764,7 +5770,7 @@ async def test_agent_cwd_rejects_missing_directory(tmp_path: Path) -> None:
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     result = _first_tool_result(store)
     assert result.is_error is True
@@ -5786,7 +5792,7 @@ async def test_agent_cwd_defaults_to_parent_cwd(tmp_path: Path) -> None:
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert (parent_dir / "default_marker").exists()
     await loop.close()
@@ -5815,7 +5821,7 @@ async def test_grandchild_inherits_child_cwd(tmp_path: Path) -> None:
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert (worktree / "gc_marker").exists()
     assert not (parent_dir / "gc_marker").exists()
@@ -5887,7 +5893,7 @@ async def test_agent_cwd_relative_to_parent_cwd(tmp_path: Path) -> None:
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert (parent_dir / "worktree" / "relative_marker").exists()
     assert not (parent_dir / "relative_marker").exists()
@@ -5923,7 +5929,7 @@ async def test_agent_cwd_applies_to_read_and_edit(tmp_path: Path) -> None:
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     child_messages = _child_store_for(store).messages()
     results = {
@@ -6032,7 +6038,7 @@ async def test_agent_cwd_applies_to_child_run_background(tmp_path: Path) -> None
     backend = ChildRunBackgroundBackend(cwd=str(worktree), command="touch bg_marker")
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert (worktree / "bg_marker").exists()
     assert not (parent_dir / "bg_marker").exists()
@@ -6103,7 +6109,7 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
         ),
     )
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(child_execute_entered.wait(), timeout=5)
     child_store = _child_store_for(store)
     for _ in range(100):
@@ -6184,7 +6190,7 @@ async def test_child_generator_close_after_allowed_edit_does_not_crash(
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
     )
-    turn = loop.run_turn("edit the file")
+    turn = loop.run_turn("edit the file", origin=MessageOrigin.USER)
 
     async for event in turn:
         if (
@@ -6227,7 +6233,7 @@ async def test_agent_cwd_with_explore_preset(tmp_path: Path) -> None:
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     child_messages = _child_store_for(store).messages()
     read_result = next(
@@ -6260,7 +6266,7 @@ async def test_agent_cwd_rejects_symlinked_directory(tmp_path: Path) -> None:
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     result = _first_tool_result(store)
     assert result.is_error is True
@@ -6317,7 +6323,7 @@ async def test_agent_cwd_uses_child_worktree_agents_md(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     child_system = backend.calls[1][0][0]
     system_text = " ".join(
@@ -6402,7 +6408,7 @@ async def test_child_cwd_context_uses_active_home_and_skills(
     loop.set_mcp_scope(home=custom_home, project_dir=parent_dir)
     assert loop.active_home == str(custom_home)
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     child_system = backend.calls[1][0][0]
     system_text = " ".join(
@@ -6517,3 +6523,52 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
     await parent_tools.close()
     child_store.close()
     parent_store.close()
+
+
+@pytest.mark.asyncio
+async def test_child_assignment_origin_is_agent_prompt(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call()]),
+            ScriptedTurn([TextContent("child done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    assignment = next(
+        message for message in child_store.messages() if message.role is MessageRole.USER
+    )
+    assert assignment.metadata["zeta.origin"] == MessageOrigin.AGENT_PROMPT.value
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_run_followup_message_row_origin_is_agent_send(tmp_path: Path) -> None:
+    backend = RunBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    handle = _run_handle_from_receipt(store)
+    marker = store.agent_children()[handle]
+    child_path = Path(str(marker["child_session_path"]))
+    assert send_to_run(store, handle, "also check the tests") is None
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+
+    child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+    followup = next(
+        message
+        for message in child_store.messages()
+        if any(
+            isinstance(block, TextContent) and block.text == "also check the tests"
+            for block in message.content
+        )
+    )
+    assert followup.metadata["zeta.origin"] == MessageOrigin.AGENT_SEND.value
+    await loop.close()

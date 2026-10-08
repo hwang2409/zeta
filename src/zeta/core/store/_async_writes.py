@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -40,9 +41,11 @@ class AsyncDurableWritesMixin:
                 self.root_dir,
                 session_id=self.session_id,
                 _must_exist=True,
+                _collect_persisted_appends=self._collect_persisted_appends,
             )
             try:
-                return getattr(writer, method_name)(*args, **kwargs)
+                result = getattr(writer, method_name)(*args, **kwargs)
+                return result, writer.take_persisted_appends()
             finally:
                 writer.close()
         finally:
@@ -51,7 +54,12 @@ class AsyncDurableWritesMixin:
                 self._durable_write_condition.notify_all()
 
     async def _to_thread_durable(
-        self: ConversationStore, function: Any, /, *args: Any, **kwargs: Any
+        self: ConversationStore,
+        function: Any,
+        /,
+        *args: Any,
+        _on_persisted: Callable[[], None] | None = None,
+        **kwargs: Any,
     ) -> Any:
         """Serialize a blocking write and defer cancellation until it finishes."""
         async with self._async_write_lock:
@@ -80,7 +88,7 @@ class AsyncDurableWritesMixin:
             cancelled = False
             while True:
                 try:
-                    result = await asyncio.shield(write)
+                    result, receipts = await asyncio.shield(write)
                     break
                 except asyncio.CancelledError:
                     # Repeated cancellation must not release the caller while a
@@ -90,7 +98,10 @@ class AsyncDurableWritesMixin:
             # on-loop unless close has already started draining this store.
             with self._durable_write_condition:
                 if not self._closing and not self._closed:
+                    self._accept_persisted_appends(receipts)
                     self.refresh()
+            if _on_persisted is not None:
+                _on_persisted()
             if cancelled:
                 raise asyncio.CancelledError
             return result

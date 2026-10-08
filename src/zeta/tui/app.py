@@ -101,7 +101,13 @@ from .slash_handlers.tasks_panel import BackgroundTasksMixin
 from .status_card import StatusCardControl
 from .theme import RICH_THEME
 from .todo import TodoWidget
-from .transcript import TranscriptPresenter, TranscriptWidget, stream_key
+from .transcript import (
+    FinderControl,
+    TranscriptPresenter,
+    TranscriptWidget,
+    stream_key,
+)
+from .transcript.finder_runtime import FinderRuntimeMixin
 
 
 def _register_tui_slash_commands(registry: SlashCommandRegistry) -> None:
@@ -142,6 +148,7 @@ class TUIApp(
     MCPManagerMixin,
     BackgroundTasksMixin,
     AgentRunCommandMixin,
+    FinderRuntimeMixin,
 ):
     """Full-screen transcript, persistent composer, and follow-up queue."""
 
@@ -278,6 +285,9 @@ class TUIApp(
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._status_card = StatusCardControl()
+        self._finder_control = FinderControl(self._transcript.finder_state)
+        self._finder_prepare_task: asyncio.Task[None] | None = None
+        self._finder_rank_task: asyncio.Task[None] | None = None
         self._status_card_open = False
         self._mcp_manager_open = False
         self._init_background_tasks_panel()
@@ -493,13 +503,17 @@ class TUIApp(
             on_tasks_key=lambda key: app._tasks_key(key),
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
-            on_search_start=self._transcript.begin_search,
+            on_finder_open=lambda: app._finder_open(),
+            finder_active=lambda: app._transcript.finder_active,
+            on_finder_input=lambda query: app._finder_input(query),
+            on_finder_move=lambda delta: app._finder_move(delta),
+            on_finder_accept=lambda: app._finder_accept(),
+            on_finder_cancel=lambda: app._finder_cancel(),
+            on_finder_toggle_preview=lambda: app._finder_toggle_preview(),
             search_active=lambda: app._transcript.search_active,
-            on_search_input=self._transcript.update_search,
-            on_search_backspace=self._transcript.search_backspace,
-            on_search_next=self._transcript.next_search_match,
-            on_search_previous=self._transcript.previous_search_match,
-            on_search_end=self._transcript.end_search,
+            on_search_next=lambda: app._transcript.next_search_match(),
+            on_search_previous=lambda: app._transcript.previous_search_match(),
+            on_search_end=lambda: app._transcript.end_search(),
             on_previous_user=self._transcript.previous_user_message,
             on_next_user=self._transcript.next_user_message,
             on_toggle_agent=lambda: (
@@ -1055,6 +1069,8 @@ class TUIApp(
                 status_active=lambda: app.status_card_active,
                 tasks_window=self._tasks_panel_window,
                 tasks_active=lambda: app.tasks_panel_active,
+                finder_window=self._finder_control.window(),
+                finder_active=lambda: app._transcript.finder_active,
             )
         ]
         self._agent_navigation.bind_layout(
@@ -1132,6 +1148,7 @@ class TUIApp(
 
     async def close(self) -> None:
         self._closed = True
+        await self._close_finder_workers()
         pending_before = {
             entry.id for entry in self.loop.store.agent_notifications()
         } if self._terminal_restored else set()

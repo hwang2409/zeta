@@ -20,14 +20,15 @@ from zeta.core.slash import (
     COMMAND_FILE_SIZE_LIMIT,
     INIT_PROMPT,
     CustomCommand,
-    SlashModelInput,
     create_slash_registry,
     load_custom_commands,
 )
 from zeta.core.store import ConversationStore
 from zeta.mcp import MCPPrompt, MCPPromptArgument
+from zeta.model_input import ModelInputEnvelope
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     TextContent,
     ToolCall,
@@ -73,8 +74,11 @@ def test_loads_home_and_project_commands_with_project_precedence(tmp_path: Path)
 
     registry = create_slash_registry(zeta_home=home, project_dir=project, skill_catalog=SkillCatalog.empty())
 
-    assert registry.input_for_model("/shared first second") == "project first"
-    assert registry.input_for_model("/home-only") == "home command"
+    shared = registry.input_for_model("/shared first second")
+    assert shared.text == "project first"
+    assert shared.display_text == "/shared first second"
+    assert shared.origin is MessageOrigin.SLASH_EXPANSION
+    assert registry.input_for_model("/home-only").text == "home command"
     assert {command.name for command in registry.custom_commands} == {
         "home-only",
         "project-only",
@@ -94,10 +98,10 @@ def test_substitution_uses_empty_missing_positions_and_keeps_raw_tail(
 
     registry = create_slash_registry(zeta_home=tmp_path, project_dir=tmp_path / "empty", skill_catalog=SkillCatalog.empty())
 
-    assert registry.input_for_model("/args alpha  beta") == (
+    assert registry.input_for_model("/args alpha  beta").text == (
         "one=alpha two=beta nine= raw=[alpha  beta]"
     )
-    assert registry.input_for_model("/args") == "one= two= nine= raw=[]"
+    assert registry.input_for_model("/args").text == "one= two= nine= raw=[]"
 
 
 def test_builtin_shadow_is_ignored_and_notices_include_bad_files(tmp_path: Path) -> None:
@@ -109,7 +113,7 @@ def test_builtin_shadow_is_ignored_and_notices_include_bad_files(tmp_path: Path)
 
     registry = create_slash_registry(zeta_home=home, project_dir=project, skill_catalog=SkillCatalog.empty())
 
-    assert registry.input_for_model("/status") == "/status"
+    assert registry.input_for_model("/status").text == "/status"
     assert any("status.md" in notice for notice in registry.notices)
     assert any("broken.md" in notice for notice in registry.notices)
     assert any("shadows built-in" in notice for notice in registry.warning_notices)
@@ -186,7 +190,7 @@ def test_init_returns_canned_prompt_inside_project(tmp_path: Path) -> None:
         skill_catalog=SkillCatalog.empty(),
     ).dispatch(object(), "/init")
 
-    assert isinstance(result, SlashModelInput)
+    assert isinstance(result, ModelInputEnvelope)
     assert result.text == INIT_PROMPT
     assert "improve or extend" in result.text
     assert "Do not overwrite" in result.text
@@ -247,8 +251,10 @@ async def test_mcp_prompt_completion_and_resolution() -> None:
     result = await registry.dispatch_async(Session(), "/server:review tests")
 
     assert completions[0].display_meta[0][1] == "[server] review code"
-    assert isinstance(result, SlashModelInput)
+    assert isinstance(result, ModelInputEnvelope)
     assert result.text == "resolved tests"
+    assert result.display_text == "/server:review tests"
+    assert result.origin is MessageOrigin.SLASH_EXPANSION
 
 
 @pytest.mark.asyncio
@@ -464,20 +470,20 @@ skill_catalog=SkillCatalog.empty(),
     ]
 
 
-async def test_transcript_search_cancels_completion_before_up_navigation(
+async def test_message_finder_cancels_completion_before_up_navigation(
     tmp_path: Path,
 ) -> None:
     _write_command(tmp_path / ".zeta" / "commands", "review", "review")
     output_text = StringIO()
-    search_active = False
+    finder_active = False
 
-    def start_search() -> None:
-        nonlocal search_active
-        search_active = True
+    def open_finder() -> None:
+        nonlocal finder_active
+        finder_active = True
 
-    def end_search() -> None:
-        nonlocal search_active
-        search_active = False
+    def cancel_finder() -> None:
+        nonlocal finder_active
+        finder_active = False
 
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
@@ -489,11 +495,10 @@ async def test_transcript_search_cancels_completion_before_up_navigation(
             key_bindings=build_key_bindings(
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
-                on_search_start=start_search,
-                search_active=lambda: search_active,
-                on_search_input=lambda _value: None,
-                on_search_next=lambda: None,
-                on_search_end=end_search,
+                on_finder_open=open_finder,
+                finder_active=lambda: finder_active,
+                on_finder_input=lambda _value: None,
+                on_finder_cancel=cancel_finder,
             ),
             completer=SlashCompleter(
                 create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path, skill_catalog=SkillCatalog.empty())
@@ -512,21 +517,19 @@ async def test_transcript_search_cancels_completion_before_up_navigation(
 
         pipe.send_text("\x06")
         for _ in range(100):
-            if search_active and session.app.current_buffer.complete_state is None:
+            if finder_active and session.app.current_buffer.complete_state is None:
                 break
             await asyncio.sleep(0.01)
         else:
-            raise AssertionError("transcript search did not cancel completion")
+            raise AssertionError("message finder did not cancel completion")
 
-        pipe.send_text("\r")
-        await asyncio.sleep(0.05)
         pipe.send_text("\x1b")
         for _ in range(100):
-            if not search_active:
+            if not finder_active:
                 break
             await asyncio.sleep(0.01)
         else:
-            raise AssertionError("transcript search did not end")
+            raise AssertionError("message finder did not close")
 
         pipe.send_text("\x1b[A")
         await asyncio.sleep(0.05)
@@ -839,6 +842,30 @@ async def test_failed_approval_action_acknowledges_waiter(
     )
     assert "submission failed: forced approval write failure" in app.console.file.getvalue()
     await app.close()
+
+
+@pytest.mark.asyncio
+async def test_custom_inline_shell_preserves_typed_authorship(tmp_path: Path) -> None:
+    _write_command(
+        tmp_path / "commands",
+        "inspect",
+        "rendered !`printf generated`",
+    )
+    registry = create_slash_registry(
+        zeta_home=tmp_path,
+        project_dir=tmp_path / "project",
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    envelope = await registry.resolve_for_model(
+        "/inspect exact typed input",
+        lambda commands: asyncio.sleep(0, result=("generated",)),
+    )
+
+    assert envelope is not None
+    assert envelope.text == "rendered generated"
+    assert envelope.display_text == "/inspect exact typed input"
+    assert envelope.origin is MessageOrigin.SLASH_EXPANSION
 
 
 async def test_tui_always_allow_remembers_only_the_current_action(

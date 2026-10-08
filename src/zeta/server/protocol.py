@@ -16,8 +16,10 @@ FEATURES = (
     "memory_updated",
     "ping",
     "assistant_reset",
+    "model_input_ids",
     "projects",
     "abort_scope",
+    "turn_context",
 )
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128

@@ -1,6 +1,6 @@
 """Conversation store public API."""
 
-from ._log import SCHEMA
+from ._log import SCHEMA, PersistedAppend
 from ._store import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,
@@ -70,6 +70,7 @@ __all__ = [
     "PendingPromptCommitTimeoutError",
     "PendingPromptQueue",
     "PendingPromptsClosedError",
+    "PersistedAppend",
     "Self",
     "TodoItem",
     "ToolCall",

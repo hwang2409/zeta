@@ -17,12 +17,20 @@ from pathlib import Path
 from typing import Any, Self
 
 from ...agent.receipt import encode_json
-from ...protocol.types import Message, MessageRole, ToolCall, ToolResult, ToolUseContent
+from ...protocol.types import (
+    Message,
+    MessageRole,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
+    require_new_message_origin,
+)
 from ..agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
 from ..checkpoints import (
     CheckpointForkMixin,
     ConversationEntry,
     ConversationIntegrityError,
+    active_branch,
     load_session_json,
 )
 from ..session_files import (
@@ -41,7 +49,7 @@ from ._approval_display import (
 )
 from ._async_writes import AsyncDurableWritesMixin
 from ._incremental_validation import IncrementalValidationMixin
-from ._log import ConversationLogMixin
+from ._log import ConversationLogMixin, PersistedAppend
 from ._notifications import NotificationStateMixin
 from ._pending_prompts import (
     MAX_PENDING_PROMPT_TEXT,
@@ -75,6 +83,7 @@ class ConversationStore(
         _lock_deadline: float | None = None,
         _read_only: bool = False,
         _must_exist: bool = False,
+        _collect_persisted_appends: bool = False,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -121,6 +130,9 @@ class ConversationStore(
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
+        self._collect_persisted_appends = _collect_persisted_appends
+        self._persisted_appends: list[PersistedAppend] = []
+        self._persisted_appends_unverified = False
         # Task-exit task ids for O(1) append_task_notification dedupe (task ids
         # are unique and exit once, so this mirrors the active-branch scan).
         self._task_notification_ids: set[str] = set()
@@ -159,6 +171,7 @@ class ConversationStore(
         with nullcontext() if self._read_only else self._append_lock():
             self._load()
             self._load_session_state()
+
     def __enter__(self) -> Self:
         return self
     def __exit__(self, *_exc: object) -> None:
@@ -708,65 +721,17 @@ class ConversationStore(
     def append_message(
         self, message: Message, *, parent_id: str | None = None
     ) -> ConversationEntry:
-        return self._append_row("message", {"message": message.to_dict()}, parent_id)
+        return self._append_row("message", {"message": require_new_message_origin(message).to_dict()}, parent_id)
 
     async def append_message_async(
-        self, message: Message, *, parent_id: str | None = None
+        self, message: Message, *, parent_id: str | None = None,
+        on_persisted: Callable[[], None] | None = None,
     ) -> ConversationEntry:
-        """Append off the event loop, serialized with other async writes."""
-        if parent_id is None:
-            return await self._to_thread_durable(self.append_message, message)
+        """Append off-loop and run ``on_persisted`` before deferred cancellation."""
+        kwargs = {"parent_id": parent_id} if parent_id is not None else {}
         return await self._to_thread_durable(
-            self.append_message, message, parent_id=parent_id
+            self.append_message, message, _on_persisted=on_persisted, **kwargs
         )
-
-    def append_task_notification(
-        self,
-        *,
-        task_id: str,
-        command: str,
-        exit_code: int | None,
-        output_tail: str = "",
-        log_path: str | None = None,
-        note: str | None = None,
-        background_metadata: tuple[str, str] = ("run_background", "natural_exit"),
-    ) -> ConversationEntry:
-        """Persist a bounded notification for a model-owned process exit."""
-        if not task_id or not command or type(exit_code) not in {int, type(None)}:
-            raise ValueError("invalid task notification")
-        with self._append_lock():
-            self._load()
-            # Confirm id-set hits against the branch, preserving old scan behavior.
-            if task_id in self._task_notification_ids:
-                existing = next(
-                    (
-                        entry
-                        for entry in self.agent_notifications(pending_only=False)
-                        if entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
-                        and entry.data.get("task_id") == task_id
-                    ),
-                    None,
-                )
-                if existing is not None:
-                    return existing
-            if len(output_tail) > 2_048:
-                raise ValueError("task notification output is too long")
-            data: dict[str, Any] = {
-                "kind": TASK_EXITED_NOTIFICATION_KIND,
-                "task_id": task_id,
-                "headline": command,
-                "exit_code": exit_code,
-                "output_tail": output_tail,
-                "background_owner": background_metadata[0],
-                "background_phase": background_metadata[1],
-            }
-            if log_path is not None:
-                data["log_path"] = log_path
-            if note is not None:
-                data["note"] = note
-            entry = self._append_row_unlocked("notification", data)
-            self._task_notification_ids.add(task_id)
-            return self._snapshot_entry(entry)
 
     def append_pending_prompt(self, text: str) -> ConversationEntry:
         """Queue a follow-up through the pending-prompt queue owner."""
@@ -926,7 +891,7 @@ class ConversationStore(
         parent_id: str | None = None,
     ) -> ConversationEntry:
         request_data = normalize_approval_requests(message, approval_requests)
-        data: dict[str, Any] = {"message": message.to_dict()}
+        data: dict[str, Any] = {"message": require_new_message_origin(message).to_dict()}
         if request_data:
             data["approval_requests"] = request_data
         with self._append_lock():
@@ -1189,21 +1154,7 @@ class ConversationStore(
     def _active_branch(self) -> tuple[ConversationEntry, ...]:
         """Return resident active-branch entries for store-internal queries."""
 
-        if not self._entries:
-            return ()
-        by_id = {entry.id: entry for entry in self._entries}
-        current = self._entries[-1]
-        branch: list[ConversationEntry] = []
-        seen: set[str] = set()
-        while current is not None:
-            if current.id in seen:
-                raise ConversationIntegrityError(
-                    f"conversation parent cycle at {current.id}"
-                )
-            seen.add(current.id)
-            branch.append(current)
-            current = by_id.get(current.parent_id) if current.parent_id else None
-        return tuple(reversed(branch))
+        return active_branch(self._entries)
 
     def replay(self) -> list[ConversationEntry]:
         return self._snapshot_branch(self._active_branch())

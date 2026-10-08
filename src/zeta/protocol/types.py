@@ -36,6 +36,24 @@ class MessageRole(StrEnum):
     COMPACTION = "compaction"
 
 
+MESSAGE_ORIGIN_METADATA = "zeta.origin"
+
+
+class MessageOrigin(StrEnum):
+    """Durable authorship source, independent of provider-facing message role."""
+
+    USER = "user"
+    SKILL_EXPANSION = "skill_expansion"
+    SLASH_EXPANSION = "slash_expansion"
+    AGENT_PROMPT = "agent_prompt"
+    AGENT_SEND = "agent_send"
+    HARNESS_NUDGE = "harness_nudge"
+    AUTOMATION_PROMPT = "automation_prompt"
+    AUTOMATION_RECEIPT = "automation_receipt"
+    NOTIFICATION = "notification"
+    UNKNOWN = "unknown"
+
+
 FAILED_TURN_MARKER = "turn_failed"
 FAILED_TURN_ERROR = "turn_error"
 ASSISTANT_RESPONSE_STATE = "response_state"
@@ -683,6 +701,60 @@ class Message:
             ),
             metadata=dict(metadata_value),
         )
+
+
+def require_new_message_origin(message: Message) -> Message:
+    """Return a new message after validating its durable user origin."""
+
+    if message.role is not MessageRole.USER:
+        return message
+    value = message.metadata.get(MESSAGE_ORIGIN_METADATA)
+    if type(value) is not str:
+        raise ValueError("new user message must have a valid zeta.origin")
+    try:
+        origin = MessageOrigin(value)
+    except ValueError as exc:
+        raise ValueError("new user message must have a valid zeta.origin") from exc
+    if origin is MessageOrigin.UNKNOWN:
+        raise ValueError("new user message cannot have unknown zeta.origin")
+    return message
+
+
+def with_message_origin(message: Message, origin: MessageOrigin) -> Message:
+    """Return a message with one explicit durable authorship origin."""
+
+    return Message(
+        message.role,
+        message.content,
+        tool_result=message.tool_result,
+        metadata={**message.metadata, MESSAGE_ORIGIN_METADATA: origin.value},
+    )
+
+
+def user_message_for_turn(
+    text: str,
+    *,
+    origin: MessageOrigin,
+    message: Message | None = None,
+    reuse_persisted: bool = False,
+) -> Message:
+    """Build or validate one user turn, including verified historical reuse."""
+
+    if message is None:
+        return require_new_message_origin(
+            with_message_origin(Message(MessageRole.USER, [TextContent(text)]), origin)
+        )
+    if message.role is not MessageRole.USER:
+        raise ValueError("user_message must have the user role")
+    stored_origin = message.metadata.get(MESSAGE_ORIGIN_METADATA)
+    if reuse_persisted and origin is MessageOrigin.UNKNOWN:
+        if stored_origin not in {None, MessageOrigin.UNKNOWN.value}:
+            raise ValueError("user_message origin must match turn origin")
+        return message
+    require_new_message_origin(message)
+    if stored_origin != origin.value:
+        raise ValueError("user_message origin must match turn origin")
+    return message
 
 
 def assistant_text(message: Message) -> str:

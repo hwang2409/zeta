@@ -13,7 +13,9 @@ from collections.abc import Mapping
 from typing import Any
 
 from ...protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
     Message,
+    MessageOrigin,
     MessageRole,
     TextContent,
     ToolUseContent,
@@ -93,7 +95,10 @@ def build_nudge_message() -> Message:
     return Message(
         MessageRole.USER,
         [TextContent(EMPTY_TURN_NUDGE_TEXT)],
-        metadata={"zeta_event": EMPTY_TURN_NUDGE_EVENT},
+        metadata={
+            "zeta_event": EMPTY_TURN_NUDGE_EVENT,
+            MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
+        },
     )
 
 

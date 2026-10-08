@@ -51,6 +51,7 @@ from typing import IO, Any
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
+from ..protocol.types import MessageOrigin
 from ..providers.scripted_fake import FakeScriptError
 from .compaction_mode import persist_compaction
 from .driver import (
@@ -173,6 +174,7 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
                 prompt,
                 format=args.format,
                 stdout=sys.stdout,
+                origin=MessageOrigin.USER,
                 stderr=sys.stderr,
             )
         finally:

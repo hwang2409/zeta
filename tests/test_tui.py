@@ -95,6 +95,7 @@ from zeta.protocol.types import (
     ErrorInfo,
     ImageContent,
     Message,
+    MessageOrigin,
     MessageRole,
     RedactedThinkingContent,
     StreamEvent,
@@ -105,6 +106,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.tui import theme
 from zeta.tui.bootstrap import surface_shutdown_notifications
@@ -1314,13 +1316,13 @@ def test_render_event_compacts_tool_call_and_result() -> None:
 @pytest.mark.asyncio
 async def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="child")
-    store.append_message(Message(MessageRole.USER, [TextContent("visible prompt")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("visible prompt")]), MessageOrigin.USER))
     store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [TextContent("hidden recovery prompt")],
             metadata={"zeta_event": "empty_turn_nudge"},
-        )
+        ), MessageOrigin.USER)
     )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("visible answer")]))
 
@@ -3729,7 +3731,7 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
             )
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
     backend = CompactionBackend()
     assembler = ContextAssembler(
         store,
@@ -3793,7 +3795,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
             )
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
     baseline = [entry.id for entry in store.replay()]
     backend = PartialThenErrorBackend()
     assembler = ContextAssembler(
@@ -3860,7 +3862,7 @@ async def test_manual_compact_error_event_aborts_and_preserves_source(
             )
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("tail")]))
     baseline = [entry.id for entry in store.replay()]
     backend = PartialThenErrorBackend()
@@ -3896,8 +3898,13 @@ async def test_manual_compact_error_event_aborts_and_preserves_source(
 async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     tmp_path: Path,
 ) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("prompt")]))
+    root = tmp_path / "sessions"
+    store = ConversationStore(root)
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("prompt")]), MessageOrigin.USER
+        )
+    )
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -3908,6 +3915,19 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
             },
         )
     )
+    store.close()
+    rows = [json.loads(line) for line in store.path.read_text().splitlines()]
+    user_row = next(
+        row
+        for row in rows
+        if row["type"] == "message" and row["data"]["message"]["role"] == "user"
+    )
+    user_row["data"]["message"].pop("metadata")
+    store.path.write_text(
+        "".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8"
+    )
+    store = ConversationStore(root, session_id=store.session_id)
+    historical = store.messages()[0]
     output = StringIO()
     backend = ErrorThenSuccessBackend()
     app = TUIApp(
@@ -3929,7 +3949,11 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     assert app._active_task is not None
     await app._active_task
 
-    assert [message.role for message in store.messages()].count(MessageRole.USER) == 1
+    users = [
+        message for message in store.messages() if message.role is MessageRole.USER
+    ]
+    assert users == [historical]
+    assert users[0].metadata == {}
     assert [
         message.role
         for message in backend.request_messages[0]
@@ -3941,7 +3965,7 @@ def test_resumed_failure_followed_by_success_is_not_retryable(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("prompt")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("prompt")]), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -3971,7 +3995,7 @@ def test_resumed_failure_followed_by_new_user_is_not_retryable(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("first")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("first")]), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -3981,7 +4005,7 @@ def test_resumed_failure_followed_by_new_user_is_not_retryable(
             },
         )
     )
-    store.append_message(Message(MessageRole.USER, [TextContent("second")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("second")]), MessageOrigin.USER))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
@@ -4422,7 +4446,7 @@ async def test_nested_agent_lifecycle_reaches_tui_with_depth(
         async for event in AgentLoop(
             backend, ConversationStore(tmp_path), max_turns=1,
             skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     ]
 
     starts = [
@@ -4879,7 +4903,7 @@ def test_agent_card_toggle_is_symmetric_during_and_after_execution(
 
 def test_canceled_agent_card_can_expand_with_persisted_child_tail(tmp_path: Path) -> None:
     child = ConversationStore(tmp_path / "agents", session_id="1")
-    child.append_message(Message(MessageRole.USER, [TextContent("cancelled task")]))
+    child.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("cancelled task")]), MessageOrigin.USER))
     call = ToolCall(
         "agent-canceled-expand",
         "agent",
@@ -5037,9 +5061,10 @@ def test_transcript_navigation_bindings_are_full_screen_only() -> None:
     bindings = build_key_bindings(
         on_interrupt=lambda: None,
         on_exit=lambda: None,
-        on_search_start=lambda: None,
+        on_finder_open=lambda: None,
+        finder_active=lambda: False,
+        on_finder_input=lambda _value: None,
         search_active=lambda: False,
-        on_search_input=lambda _value: None,
         on_search_end=lambda: None,
         on_previous_user=lambda: None,
         on_next_user=lambda: None,
@@ -5054,18 +5079,20 @@ def test_transcript_navigation_bindings_are_full_screen_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transcript_search_query_accepts_navigation_key_text() -> None:
+async def test_finder_captures_typed_text_and_navigation_keys() -> None:
     active = False
     values: list[str] = []
-    actions: list[str] = []
+    moves: list[int] = []
+    accepts = 0
 
-    def start_search() -> None:
+    def open_finder() -> None:
         nonlocal active
         active = True
 
-    def end_search() -> None:
-        nonlocal active
+    def accept() -> None:
+        nonlocal active, accepts
         active = False
+        accepts += 1
 
     with create_pipe_input() as pipe:
         session = PromptSession(
@@ -5074,43 +5101,48 @@ async def test_transcript_search_query_accepts_navigation_key_text() -> None:
             key_bindings=build_key_bindings(
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
-                on_search_start=start_search,
-                search_active=lambda: active,
-                on_search_input=values.append,
-                on_search_next=lambda: actions.append("next"),
-                on_search_previous=lambda: actions.append("previous"),
-                on_search_end=end_search,
+                on_finder_open=open_finder,
+                finder_active=lambda: active,
+                on_finder_input=values.append,
+                on_finder_move=moves.append,
+                on_finder_accept=accept,
+                on_finder_cancel=lambda: None,
             ),
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0.05)
         session.app.full_screen = True
-        pipe.send_text("\x06nN\x12")
-        await wait_until(lambda: values == ["n", "nN", "nN\x12"])
-        pipe.send_text("\rN\x1b")
-        await wait_until(lambda: actions == ["next", "previous"])
+        pipe.send_text("\x06")  # Ctrl-F opens the finder.
+        await wait_until(lambda: active)
+        # Letters that also drive navigation elsewhere are plain query text.
+        pipe.send_text("nN")
+        await wait_until(lambda: values == ["n", "nN"])
+        pipe.send_text("\x0e\x10")  # Ctrl-N / Ctrl-P move the selection.
+        await wait_until(lambda: moves == [1, -1])
+        pipe.send_text("\r")  # Enter accepts and closes the finder.
+        await wait_until(lambda: accepts == 1 and not active)
         session.app.exit()
         await task
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("editing_mode", [EditingMode.EMACS, EditingMode.VI])
-async def test_history_search_acceptance_survives_transcript_search(
+async def test_history_search_acceptance_survives_message_finder(
     editing_mode: EditingMode,
     tmp_path: Path,
 ) -> None:
     history = history_for(tmp_path / "history")
     history.append_string("history target")
-    transcript_search_active = False
-    actions: list[str] = []
+    finder_active = False
+    values: list[str] = []
 
-    def start_search() -> None:
-        nonlocal transcript_search_active
-        transcript_search_active = True
+    def open_finder() -> None:
+        nonlocal finder_active
+        finder_active = True
 
-    def end_search() -> None:
-        nonlocal transcript_search_active
-        transcript_search_active = False
+    def cancel_finder() -> None:
+        nonlocal finder_active
+        finder_active = False
 
     with create_pipe_input() as pipe:
         session = PromptSession(
@@ -5121,26 +5153,28 @@ async def test_history_search_acceptance_survives_transcript_search(
             key_bindings=build_key_bindings(
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
-                on_search_start=start_search,
-                search_active=lambda: transcript_search_active,
-                on_search_input=lambda _value: None,
-                on_search_next=lambda: actions.append("next"),
-                on_search_end=end_search,
+                on_finder_open=open_finder,
+                finder_active=lambda: finder_active,
+                on_finder_input=values.append,
+                on_finder_cancel=cancel_finder,
+                search_active=lambda: False,
+                on_search_end=lambda: None,
             ),
             multiline=True,
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0.05)
         session.app.full_screen = True
-        pipe.send_text("\x06query\r")
-        await wait_until(lambda: actions == ["next"])
-        pipe.send_text("\x12history")
+        pipe.send_text("\x06query")  # Open the finder and type a query.
+        await wait_until(lambda: values == ["q", "qu", "que", "quer", "query"])
+        pipe.send_text("\x1b")  # Esc closes the finder and releases the keyboard.
+        await wait_until(lambda: not finder_active)
+        pipe.send_text("\x12history")  # Ctrl-R history search still works.
         await wait_until(lambda: session.search_buffer.text == "history")
         pipe.send_text("\r")
         await wait_until(
             lambda: session.default_buffer.text == "history target"
         )
-        assert actions == ["next"]
         session.app.exit()
         await task
 
@@ -6600,7 +6634,7 @@ async def test_startup_replay_rejects_actions_and_defers_runtime_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("remembered")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("remembered")]), MessageOrigin.USER))
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -6773,7 +6807,7 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     for index in range(100):
-        store.append_message(Message(MessageRole.USER, [TextContent(str(index))]))
+        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent(str(index))]), MessageOrigin.USER))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
@@ -6811,7 +6845,7 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("remembered")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("remembered")]), MessageOrigin.USER))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
@@ -6876,7 +6910,7 @@ async def test_async_rebuild_freezes_once_per_process_only_for_resume(
         store = ConversationStore(tmp_path / name)
         for index in range(25):
             store.append_message(
-                Message(MessageRole.USER, [TextContent(f"message {index}")])
+                with_message_origin(Message(MessageRole.USER, [TextContent(f"message {index}")]), MessageOrigin.USER)
             )
         return TUIApp(
             AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -6957,7 +6991,7 @@ async def test_run_replays_resumed_transcript_before_prompt(
     tmp_path: Path, full_screen: bool
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("remembered user")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("remembered user")]), MessageOrigin.USER))
     call = ToolCall("resume-read", "read", {"path": "README.md"})
     store.append_message(
         Message(
@@ -7052,7 +7086,7 @@ skill_catalog=SkillCatalog.empty(),
 
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("old user")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old user")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("old reply")]))
     store.append_compaction_marker("provider summary", 1, 2)
     app = TUIApp(
@@ -7108,7 +7142,7 @@ async def test_run_keeps_empty_resumed_transcript_blank(
 def _representative_fork_store(tmp_path: Path) -> ConversationStore:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [
                 TextContent("inspect notes.txt and [Image #1]"),
@@ -7124,7 +7158,7 @@ def _representative_fork_store(tmp_path: Path) -> ConversationStore:
                     68,
                 ),
             ],
-        )
+        ), MessageOrigin.USER)
     )
     read_call = ToolCall("resume-read", "read", {"path": "README.md"})
     agent_call = ToolCall(
@@ -7168,12 +7202,12 @@ def _representative_fork_store(tmp_path: Path) -> ConversationStore:
     store.append_compaction_marker("provider summary", 1, 4)
     store._append_row("warning", {"message": "filtered warning"})
     checkpoint = store.append_checkpoint("base")
-    store.append_message(Message(MessageRole.USER, [TextContent("abandoned branch")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("abandoned branch")]), MessageOrigin.USER))
     store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("abandoned reply")])
     )
     store.append_fork(str(checkpoint.seq))
-    store.append_message(Message(MessageRole.USER, [TextContent("new branch")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("new branch")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply")]))
     store.append_checkpoint("saved")
     return store
@@ -7421,7 +7455,7 @@ def test_rebuild_user_attachment_hides_file_content(
     monkeypatch.setenv("COLORTERM", "truecolor")
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [
                 TextContent("inspect @notes.txt"),
@@ -7431,7 +7465,7 @@ def test_rebuild_user_attachment_hides_file_content(
                     12,
                 ),
             ],
-        )
+        ), MessageOrigin.USER)
     )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -10542,7 +10576,7 @@ def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("do the thing")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("do the thing")]), MessageOrigin.USER))
     store.append_message(
         Message(MessageRole.ASSISTANT, [ThinkingContent("planning", "sig-1")])
     )
@@ -10568,7 +10602,7 @@ def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_notification_turn_empty_reply_is_silent(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("working")]))
     store.append_agent_notification(
         "child-1",
