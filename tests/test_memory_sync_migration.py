@@ -399,6 +399,10 @@ def test_migration_rollback_restores_format_one_pointer(tmp_path: Path) -> None:
     assert registry._migrate_memory_for_test(
         project_id, migrated_at="2026-10-09T12:00:00Z"
     ) == migrated
+    pointer_path = registry.root / project_id / "memory-current.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["history"] = [pointer["current"]]
+    pointer_path.write_text(json.dumps(pointer))
 
     registry._rollback_memory_migration_for_test(project_id)
     assert registry.memory_format(project_id) == 1

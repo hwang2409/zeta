@@ -472,8 +472,11 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                         blobs_fd, source_manifest
                     )
                     history = list(pointer["history"])
-                    source_index = history.index(source_version)
-                    restored = history[: source_index + 1]
+                    restored = (
+                        history[: history.index(source_version) + 1]
+                        if source_version in history
+                        else [source_version]
+                    )
                 finally:
                     os.close(versions_fd)
                     os.close(blobs_fd)
