@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import time
 from itertools import pairwise
 from typing import Any
@@ -216,6 +217,7 @@ async def test_open_does_not_stall_long_session(
 
     monkeypatch.setattr(transcript, "_finder_source_parts", slow_extract_parts)
     app = _app_for_finder(transcript)
+    gc.collect()
     ticks = [(time.perf_counter(), time.thread_time())]
     running = True
 
