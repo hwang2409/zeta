@@ -56,7 +56,7 @@ _zeta() {
         '(-c --continue --resume --no-session)'{-c,--continue}'[resume the most recent session]' \
         '(-c --continue --resume --no-session)--resume=[resume a session]:session id:' \
         '(-c --continue --resume --no-session)--no-session[run without persistence]' \
-        '--provider=[completion provider]:provider:(fake claude codex ollama)' \
+        '--provider=[completion provider]:provider:(claude codex ollama)' \
         '--model=[provider model override]:model:' \
         '--force-provider[allow provider or model overrides during resume]' \
         '--verbose[show raw stream events]' \
@@ -88,7 +88,7 @@ _zeta() {
                     _arguments '--provider=[OAuth provider]:provider:(anthropic codex)'
                     ;;
                 serve)
-                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(fake claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]' '--auto-memory[enable automatic project memory]' '--no-auto-memory[disable automatic project memory]'
+                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]' '--auto-memory[enable automatic project memory]' '--no-auto-memory[disable automatic project memory]'
                     ;;
                 stalls)
                     _arguments '--top=[top stacks]:count:' '--json[print JSON]'

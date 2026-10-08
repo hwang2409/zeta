@@ -13,9 +13,9 @@ from typing import Any
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser, main
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRule
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager, env_home
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -117,15 +117,15 @@ def test_print_mode_runs_session_hook_inside_async_activation(
     )
     environment = os.environ.copy()
     environment["ZETA_HOME"] = str(home)
-    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1]) + os.pathsep + str(Path(__file__).parents[1] / "src")
 
     result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            "from zeta.cli.main import main; raise SystemExit(main())",
+            "-m",
+            "tests.support.scripted_cli",
             "--provider",
-            "fake",
+            "codex",
             "-p",
             "hello",
         ],
@@ -157,15 +157,15 @@ def test_restricted_session_disables_command_hooks_by_default(
     )
     environment = os.environ.copy()
     environment["ZETA_HOME"] = str(home)
-    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1]) + os.pathsep + str(Path(__file__).parents[1] / "src")
 
     result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            "from zeta.cli.main import main; raise SystemExit(main())",
+            "-m",
+            "tests.support.scripted_cli",
             "--provider",
-            "fake",
+            "codex",
             *policy_args,
             "-p",
             "hello",
@@ -194,15 +194,15 @@ def test_allow_hooks_explicitly_enables_hooks_in_restricted_session(
     )
     environment = os.environ.copy()
     environment["ZETA_HOME"] = str(home)
-    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1]) + os.pathsep + str(Path(__file__).parents[1] / "src")
 
     result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            "from zeta.cli.main import main; raise SystemExit(main())",
+            "-m",
+            "tests.support.scripted_cli",
             "--provider",
-            "fake",
+            "codex",
             "--tools",
             "remote__*",
             "--allow-hooks",
@@ -234,7 +234,7 @@ def test_headless_json_reports_mcp_mount_failure(
         )
     )
     args = build_parser().parse_args(
-        ["--provider", "fake", "--format", "json", "-p", "hi"]
+        ["--provider", "codex", "--format", "json", "-p", "hi"]
     )
 
     assert run_headless(args, args.prompt) == 0
@@ -255,7 +255,7 @@ def test_headless_json_excludes_background_notices(
     home.mkdir()
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args(["--provider", "fake", "--format", "json", "-p", "hi"])
+    args = build_parser().parse_args(["--provider", "codex", "--format", "json", "-p", "hi"])
 
     async def emit_notices(loop: AgentLoop, _prompt: str, **kwargs: Any) -> int:
         loop.tool_registry.background_tasks._notice("background task exited")
@@ -333,7 +333,7 @@ def test_headless_waits_for_cross_model_agent(
             loop=loop, approval_policy=None, ephemeral_root=None, close=close
         ),
     )
-    args = build_parser().parse_args(["--provider", "fake", "--format", "json", "-p", "go"])
+    args = build_parser().parse_args(["--provider", "codex", "--format", "json", "-p", "go"])
 
     assert run_headless(args, args.prompt) == 0
     result = next(message.tool_result for message in store.messages() if message.tool_result)
@@ -539,7 +539,7 @@ def test_headless_run_headless_hard_denies_always_ask_tools(
     from zeta.runtime.headless import run_headless
 
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args(["--provider", "fake", "-p", "hi"])
+    args = build_parser().parse_args(["--provider", "codex", "-p", "hi"])
 
     import zeta.tui.app as tui_app
 
@@ -584,7 +584,7 @@ def test_headless_respects_settings_yolo_without_cli_flag(
     (home / "settings.toml").write_text("yolo = true\n")
 
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args(["--provider", "fake", "-p", "hi"])
+    args = build_parser().parse_args(["--provider", "codex", "-p", "hi"])
     assert args.yolo is None
 
     import zeta.tui.app as tui_app
@@ -626,7 +626,7 @@ def test_headless_no_yolo_flag_beats_settings_yolo(
     (home / "settings.toml").write_text("yolo = true\n")
 
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args(["--provider", "fake", "--no-yolo", "-p", "hi"])
+    args = build_parser().parse_args(["--provider", "codex", "--no-yolo", "-p", "hi"])
     assert args.yolo is False
 
     import zeta.tui.app as tui_app
@@ -670,7 +670,7 @@ def test_headless_hard_denies_argument_scoped_ask_rules(
     (home / "settings.toml").write_text('[approval]\nask = ["bash(git push*)"]\n', encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args(["--provider", "fake", "-p", "hi"])
+    args = build_parser().parse_args(["--provider", "codex", "-p", "hi"])
 
     import zeta.tui.app as tui_app
 
@@ -711,7 +711,7 @@ def test_headless_reports_dropped_scoped_rules_on_stderr(
     (home / "settings.toml").write_text('[approval]\nallow = ["todo(*)"]\n', encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args(["--provider", "fake", "-p", "hi"])
+    args = build_parser().parse_args(["--provider", "codex", "-p", "hi"])
 
     code = run_headless(args, args.prompt)
     captured = capsys.readouterr()
@@ -785,13 +785,13 @@ async def test_json_mode_surfaces_error_event(tmp_path: Path) -> None:
     assert "max_turns" in err
 
 
-def test_cli_headless_fake_provider_writes_final_text_to_stdout(
+def test_cli_headless_scripted_provider_writes_final_text_to_stdout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args(["--provider", "fake", "-p", "hello"])
+    args = build_parser().parse_args(["--provider", "codex", "-p", "hello"])
     assert args.prompt == "hello"
 
     code = run_headless(args, args.prompt)
@@ -812,7 +812,7 @@ def test_cli_headless_json_mode_yields_valid_jsonl(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args(["--provider", "fake", "-p", "greet", "--format", "json"])
+    args = build_parser().parse_args(["--provider", "codex", "-p", "greet", "--format", "json"])
 
     code = run_headless(args, args.prompt)
 
@@ -834,7 +834,7 @@ def test_cli_headless_resume_reuses_persisted_session(
     monkeypatch.chdir(tmp_path)
     parser = build_parser()
 
-    first = parser.parse_args(["--provider", "fake", "-p", "first turn"])
+    first = parser.parse_args(["--provider", "codex", "-p", "first turn"])
     assert run_headless(first, first.prompt) == 0
     capsys.readouterr()
 
@@ -844,7 +844,7 @@ def test_cli_headless_resume_reuses_persisted_session(
     assert len(sessions) == 1
     session_id = sessions[0].session_id
 
-    second = parser.parse_args(["--provider", "fake", "--resume", session_id, "-p", "second turn"])
+    second = parser.parse_args(["--provider", "codex", "--resume", session_id, "-p", "second turn"])
     assert run_headless(second, second.prompt) == 0
     capsys.readouterr()
 
@@ -864,7 +864,7 @@ def test_cli_rejects_empty_prompt(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args(["--provider", "fake", "-p", "   "])
+    args = build_parser().parse_args(["--provider", "codex", "-p", "   "])
     code = run_headless(args, args.prompt)
     captured = capsys.readouterr()
     assert code == 2
@@ -878,7 +878,7 @@ def test_cli_format_requires_print_flag(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     with pytest.raises(SystemExit) as excinfo:
-        main(["--provider", "fake", "--format", "json"])
+        main(["--provider", "codex", "--format", "json"])
     assert excinfo.value.code == 2
     captured = capsys.readouterr()
     assert "--format requires --print" in captured.err

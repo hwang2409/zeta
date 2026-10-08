@@ -62,7 +62,7 @@ def _streaming_transcript() -> tuple[TranscriptWidget, TranscriptPresenter]:
 def _streaming_app() -> tuple[TUIApp, TranscriptWidget]:
     transcript, presenter = _streaming_transcript()
     app = TUIApp.__new__(TUIApp)
-    app.provider = "fake"
+    app.provider = "codex"
     app._presenter = presenter
     app._stream_kind = app._stream_identity = None
     app._assistant_chunks = []

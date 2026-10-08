@@ -16,14 +16,12 @@ from ..providers.anthropic import AnthropicCredentialStore
 
 
 MODEL_CATALOGS = {
-    "fake": frozenset({"offline", "faster"}),
     "ollama": frozenset({"qwen3:4b", "qwen3:4b-instruct"}),
 }
 _MODEL_CATALOG_TIMEOUT = 2.0
 _WRONG_PROVIDER_PREFIXES = {
     "claude": ("gpt-", "o1", "o3", "o4", "gemini-", "llama-"),
     "codex": ("claude-", "gemini-", "llama-"),
-    "fake": ("claude-", "gpt-", "gemini-", "llama-"),
     "ollama": (),
 }
 
@@ -106,8 +104,6 @@ def load_model_catalog(
 ) -> frozenset[str] | None:
     """Load a provider catalog, returning None when it cannot be obtained."""
 
-    if provider == "fake":
-        return MODEL_CATALOGS["fake"]
     if provider == "codex":
         return _load_codex_model_catalog()
     if provider != "claude":

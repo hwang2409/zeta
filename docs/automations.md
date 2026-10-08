@@ -40,8 +40,7 @@ Example (substitute actual mounted tool names and an actual Slack recipient):
 `provider`, `model`, and `cwd` can be omitted when drafting; the stored draft
 resolves them from the originating session, home settings, and working directory.
 Without configured provider defaults, CLI import uses Claude Sonnet 4.6. Review
-these values for the daemon host before approving. `fake` is for injected test
-backends, not a production automation provider.
+these values for the daemon host before approving.
 
 ```text
 /automations

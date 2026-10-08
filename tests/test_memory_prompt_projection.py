@@ -310,7 +310,7 @@ async def test_serve_resume_rebuilds_identity_and_memory_components(tmp_path: Pa
     registry.initialize_memory(project.project_id)
     registry.update_memory(project.project_id, {"state.md": "# State\n\nmemory before\n"})
 
-    first_runtime = ServerRuntime(home, cwd=workspace, provider="fake")
+    first_runtime = ServerRuntime(home, cwd=workspace, provider="codex")
     metadata = await first_runtime.create_session()
     first_prompt = first_runtime.loop.context_assembler.system_prompt.content[0].text
     assert metadata.prompt_recipe == "default"
@@ -322,7 +322,7 @@ async def test_serve_resume_rebuilds_identity_and_memory_components(tmp_path: Pa
     assert first_runtime.loop.context_assembler.system_prompt.content[0].text == first_prompt
     await first_runtime.close()
 
-    resumed_runtime = ServerRuntime(home, cwd=tmp_path, provider="fake")
+    resumed_runtime = ServerRuntime(home, cwd=tmp_path, provider="codex")
     resumed_metadata = await resumed_runtime.resume_session(metadata.session_id)
     resumed_prompt = resumed_runtime.loop.context_assembler.system_prompt.content[0].text
     assert resumed_metadata.prompt_recipe == "default"
@@ -356,7 +356,7 @@ async def test_serve_unknown_recipe_preserves_custom_bytes_and_refreshes_owned_m
     custom_prefix = "CUSTOM-LEGACY-PROMPT\n"
     manager = SessionManager(home)
     opened = manager.create(
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=workspace,
         system_prompt=custom_prefix + context.system_prompt,
@@ -373,7 +373,7 @@ async def test_serve_unknown_recipe_preserves_custom_bytes_and_refreshes_owned_m
     opened.store.close()
     _add(registry, project_id, (AddOperation("state", "memory after", _source(2)),))
 
-    runtime = ServerRuntime(home, cwd=tmp_path, provider="fake")
+    runtime = ServerRuntime(home, cwd=tmp_path, provider="codex")
     metadata = await runtime.resume_session(session_id)
     resumed_prompt = runtime.loop.context_assembler.system_prompt.content[0].text
     await runtime.close()

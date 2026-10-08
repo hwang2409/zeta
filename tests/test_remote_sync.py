@@ -78,7 +78,7 @@ def _session(home: Path, repo: Path):
     project = projects.create_project("test", "test", str(repo))
     projects.update_memory(project.project_id, {"brief.md": "shared\n"})
     opened = SessionManager(home).create(
-        provider="fake", model="fake", cwd=repo, project_id=project.project_id
+        provider="codex", model="fake", cwd=repo, project_id=project.project_id
     )
     opened.store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("root transcript")]), MessageOrigin.USER))
     child = ConversationStore(
@@ -141,7 +141,7 @@ async def test_session_push_agent_tool_marks_registry_busy_as_retryable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     opened = SessionManager(tmp_path / "home").create(
-        provider="fake", model="fake", cwd=tmp_path
+        provider="codex", model="fake", cwd=tmp_path
     )
     registry = ToolRegistry(
         tmp_path,
@@ -479,7 +479,7 @@ def test_ssh_remote_install_rejects_byte_bomb_and_cleans_staging(
     repo = tmp_path / "repo"
     _install_ssh_shim(tmp_path, monkeypatch)
     _git_repo(repo)
-    opened = SessionManager(local).create(provider="fake", model="fake", cwd=repo)
+    opened = SessionManager(local).create(provider="codex", model="fake", cwd=repo)
     opened.store.append_message(
         with_message_origin(Message(MessageRole.USER, [TextContent("content larger than one byte")]), MessageOrigin.USER)
     )

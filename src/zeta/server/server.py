@@ -356,7 +356,7 @@ class _Client:
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
         if method in login.REQUESTS:
-            if self.protocol_version != "1.1" or self.server.runtime.fake_catalog:
+            if self.protocol_version != "1.1":
                 raise ProtocolError(-32601, "login is unavailable on this server")
             return await self.logins.request(method, params)
         if method in ergonomics.EXTENSION_REQUESTS:
@@ -472,8 +472,7 @@ class _Client:
         ]
         if extended:
             requests += ergonomics.EXTENSION_REQUESTS
-            if not self.server.runtime.fake_catalog:
-                requests += login.REQUESTS
+            requests += login.REQUESTS
             if "ping" in self.features:
                 requests.append("ping")
             self.server.turn_contexts.add_request(requests, self.features)
@@ -993,7 +992,7 @@ class _Client:
             login_provider = None
             if (foreground and event.error is not None and event.error.provider_error
                     and (event.error.code == "auth_error" or event.error.status_code == 401)
-                    and self.protocol_version == "1.1" and not self.server.runtime.fake_catalog):
+                    and self.protocol_version == "1.1"):
                 login_provider = self.server.runtime.metadata.provider
             if foreground and event.error is not None:
                 recovered = model_selection.recover(self.server.runtime, event.error)

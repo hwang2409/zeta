@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.project_context import load_project_context, refresh_project_memory
 from zeta.core.session import SessionManager
@@ -78,7 +78,7 @@ def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -
     assert "shipping the first version" in context.system_prompt
     assert any(path.name == "state.md" for path in context.files)
 
-    session = SessionManager(home).create(provider="fake", model="fake", cwd=repository)
+    session = SessionManager(home).create(provider="codex", model="fake", cwd=repository)
     assert session.metadata.project_id == project.project_id
     assert session.metadata.parent_session_id is None
     references = (home / "projects" / project.project_id / "sessions.jsonl").read_text()
@@ -217,7 +217,7 @@ def test_root_link_pending_intent_dir_fsync_precedes_record_session(
 
     monkeypatch.setattr(manager.project_registry, "record_session", spy_record)
 
-    session = manager.create(provider="fake", model="fake", cwd=repository)
+    session = manager.create(provider="codex", model="fake", cwd=repository)
     session.store.close()
 
     assert "record_session" in events
@@ -241,7 +241,7 @@ def test_root_link_reconstructs_from_metadata(tmp_path: Path, case: str) -> None
     )
 
     manager = SessionManager(home)
-    session = manager.create(provider="fake", model="fake", cwd=repository)
+    session = manager.create(provider="codex", model="fake", cwd=repository)
     session_id = session.metadata.session_id
     session.store.close()
 
@@ -300,7 +300,7 @@ def _nested_spawn_turns() -> list[ScriptedTurn]:
 
 
 async def _run_root_with_child_and_grandchild(manager: SessionManager, repository: Path):
-    opened = manager.create(provider="fake", model="fake", cwd=repository)
+    opened = manager.create(provider="codex", model="fake", cwd=repository)
     loop = AgentLoop(
         FakeBackend(_nested_spawn_turns()),
         opened.store,
@@ -360,7 +360,7 @@ async def test_child_lineage_reconciled_after_registry_failure(
     )
 
     manager = SessionManager(home)
-    opened = manager.create(provider="fake", model="fake", cwd=repository)
+    opened = manager.create(provider="codex", model="fake", cwd=repository)
     root_id = opened.metadata.session_id
 
     # Inject a registry-append failure for the child lineage records: the
@@ -428,7 +428,7 @@ async def test_project_tools_use_session_manager_home_not_ambient_zeta_home(
     registry_a.initialize_memory(project.project_id)
 
     manager = SessionManager(home_a)
-    opened = manager.create(provider="fake", model="fake", cwd=repository)
+    opened = manager.create(provider="codex", model="fake", cwd=repository)
 
     # The ambient environment points at a different home; the tools must ignore
     # it and use the registry bound to the SessionManager's home instead.
@@ -592,7 +592,7 @@ def _reconcile_fixture(tmp_path: Path):
     registry = ProjectRegistry(home / "projects")
     project = registry.create_project("demo", "scope", repository)
     manager = SessionManager(home)
-    opened = manager.create(provider="fake", model="fake", cwd=repository)
+    opened = manager.create(provider="codex", model="fake", cwd=repository)
     root_id = opened.metadata.session_id
     opened.store.close()
     return manager, project, root_id
@@ -1349,7 +1349,7 @@ async def test_child_with_explicit_cwd_records_lineage_to_root_project(
     child_project = registry.create_project("child", "child scope", child_repository)
 
     manager = SessionManager(home)
-    opened = manager.create(provider="fake", model="fake", cwd=root_repository)
+    opened = manager.create(provider="codex", model="fake", cwd=root_repository)
     root_id = opened.metadata.session_id
     turns = [
         ScriptedTurn(

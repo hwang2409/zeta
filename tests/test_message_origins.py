@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_agent import (
     RunBackend,
     _agent_call,
@@ -31,7 +32,6 @@ from tests.test_steering import SteerToolBackend
 from zeta.automations.runner import _receipt, run_claimed
 from zeta.automations.store import SQLiteStore
 from zeta.automations.tick import tick
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -424,7 +424,7 @@ async def _audit_tui_row(path: str, tmp_path: Path) -> dict[str, object]:
     loop = AgentLoop(backend, store, tools=tools, max_turns=3, skill_catalog=catalog)
     app = TUIApp(
         loop,
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=tmp_path / "home",
         console=Console(file=StringIO(), force_terminal=False),
@@ -490,7 +490,7 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
         home=tmp_path / "home",
         cwd=project,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda *_args, **_kwargs: (FakeBackend(turns), "offline"),
     )
     reader, writer = await _connect(server)
@@ -666,7 +666,7 @@ def test_headless_entry_persists_user_origin(
             store,
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     monkeypatch.setattr("zeta.tui.app.create_app", lambda _args: app)

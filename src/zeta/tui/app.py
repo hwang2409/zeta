@@ -77,7 +77,6 @@ from .composer import (
     build_key_bindings,
     copy_to_clipboard,
 )
-from .fake_backend import FakeInteractiveBackend
 from .layout import (
     CONTENT_MARGIN,
     content_width,
@@ -1187,7 +1186,6 @@ class TUIApp(
 from .bootstrap import create_app, format_picker_row
 
 __all__ = [
-    "FakeInteractiveBackend",
     "TUIApp",
     "build_backend",
     "create_app",
