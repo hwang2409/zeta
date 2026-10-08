@@ -15,7 +15,7 @@ import zeta.providers.retry_policy as retry_policy_module
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.prompts import load_identity

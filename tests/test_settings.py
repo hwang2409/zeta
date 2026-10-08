@@ -157,6 +157,7 @@ def test_cli_flags_override_settings(tmp_path: Path) -> None:
         cli_model=None,
         cli_yolo=False,
         cli_token_budget=None,
+        default_provider="codex",
     )
     assert overridden.yolo is False
     # Explicit --yolo (True) beats settings.yolo=false too.
@@ -167,26 +168,40 @@ def test_cli_flags_override_settings(tmp_path: Path) -> None:
         cli_model=None,
         cli_yolo=True,
         cli_token_budget=None,
+        default_provider="codex",
     )
     assert forced_on.yolo is True
 
 
-def test_resolve_falls_back_to_defaults_when_nothing_configured(tmp_path: Path) -> None:
+def test_resolve_requires_provider_or_model_on_first_run(tmp_path: Path) -> None:
     loaded = load_settings(home=tmp_path / "home", project_dir=None)
+    with pytest.raises(
+        SettingsError,
+        match="no provider or model is configured; choose claude, codex or ollama",
+    ):
+        resolve(
+            loaded.settings,
+            cli_provider=None,
+            cli_model=None,
+            cli_yolo=None,
+            cli_token_budget=None,
+        )
+
+
+def test_resolve_derives_default_provider_from_configured_model(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write(home, 'model = "gpt-5.6-luna"\n')
+
     config = resolve(
-        loaded.settings,
+        load_settings(home=home).settings,
         cli_provider=None,
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
     )
-    assert config.provider == "fake"
-    assert config.model is None
-    assert config.yolo is False
-    assert config.token_budget is None
-    assert config.compaction == "evict"
-    assert config.compaction_pinned is False
-    assert config.approval_allow == ()
+
+    assert config.provider == "codex"
+    assert config.model == "gpt-5.6-luna"
 
 
 @pytest.mark.parametrize("scope", ["global", "project"])
@@ -232,6 +247,17 @@ def test_invalid_types_are_dropped_with_notices(tmp_path: Path) -> None:
     assert "token_budget" in notice_targets
     assert "approval.allow" in notice_targets
     assert "approval.deny" in notice_targets
+
+
+def test_removed_fake_provider_has_clear_settings_error(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write(home, 'provider = "fake"\n')
+
+    with pytest.raises(
+        SettingsError,
+        match="the fake provider was removed; choose claude, codex or ollama",
+    ):
+        load_settings(home=home)
 
 
 def test_unknown_provider_is_rejected(tmp_path: Path) -> None:
@@ -334,6 +360,7 @@ def test_yolo_from_settings_flows_into_approval_default(tmp_path: Path) -> None:
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
+        default_provider="codex",
     )
     assert config.yolo is True
     default = ApprovalDecision.ALLOW if config.yolo else ApprovalDecision.ASK
@@ -350,13 +377,13 @@ def test_resolve_returns_resolved_config(tmp_path: Path) -> None:
     loaded = load_settings(home=tmp_path, project_dir=None)
     config = resolve(
         loaded.settings,
-        cli_provider="fake",
+        cli_provider="codex",
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
     )
     assert isinstance(config, ResolvedConfig)
-    assert config.provider == "fake"
+    assert config.provider == "codex"
 
 
 def test_project_and_global_pointing_to_same_dir_is_read_once(tmp_path: Path) -> None:
@@ -611,7 +638,7 @@ def test_scoped_rules_reach_the_live_policy_through_create_app(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
 
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
 
     policy = app.approval_policy
     assert policy is not None
@@ -637,6 +664,7 @@ def test_compaction_setting_is_project_safe_and_cli_wins(tmp_path: Path) -> None
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
+        default_provider="codex",
     )
     overridden = resolve(
         loaded.settings,
@@ -645,6 +673,7 @@ def test_compaction_setting_is_project_safe_and_cli_wins(tmp_path: Path) -> None
         cli_yolo=None,
         cli_token_budget=None,
         cli_compaction="summary",
+        default_provider="codex",
     )
 
     assert configured.compaction == "evict"
@@ -661,6 +690,7 @@ def test_inbox_feature_switch_defaults_on_and_can_be_disabled(tmp_path: Path) ->
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
+        default_provider="codex",
     ).inbox_enabled is True
 
     _write(home, "[inbox]\nenabled = false\n")
@@ -670,4 +700,5 @@ def test_inbox_feature_switch_defaults_on_and_can_be_disabled(tmp_path: Path) ->
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
+        default_provider="codex",
     ).inbox_enabled is False

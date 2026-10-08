@@ -19,7 +19,7 @@ from zeta.skills import SkillCatalog
 from zeta.tui import theme as theme_module
 from zeta.tui.app import TUIApp
 from zeta.tui.bootstrap import _apply_startup_theme, _validate_keybindings
-from zeta.tui.fake_backend import FakeInteractiveBackend
+from tests.support.tui_backend import FakeInteractiveBackend
 from zeta.tui.key_bindings import (
     ACTIONS,
     DEFAULTS,
@@ -317,7 +317,7 @@ def test_slash_theme_switches_and_rebuilds(tmp_path: Path) -> None:
             skip_mcp_mount=True,
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=tmp_path / "zeta-home",
     )
@@ -347,7 +347,7 @@ def test_slash_theme_lists_available(tmp_path: Path) -> None:
             skip_mcp_mount=True,
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
     )
@@ -367,7 +367,7 @@ def test_slash_theme_unknown_name_is_not_applied(tmp_path: Path) -> None:
             skip_mcp_mount=True,
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
     )

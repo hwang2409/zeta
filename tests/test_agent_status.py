@@ -10,7 +10,7 @@ import pytest
 import zeta.tools.agent as agent_tools
 from zeta.agent.receipt import encode_json
 from zeta.core.abort import AbortGenerationRegistry
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,

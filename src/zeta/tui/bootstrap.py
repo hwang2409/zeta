@@ -27,9 +27,9 @@ from ..core.session import (
     env_home,
     format_relative_age,
 )
+from ..models.catalog import REMOVED_PROVIDER_ERROR
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
-from ..providers.scripted_fake import ScriptedFakeBackend, fake_script_from_env
 from ..runtime import compose_runtime
 from ..runtime.compaction_mode import apply_compaction, persist_compaction
 from ..runtime.prompt_resume import resume_prompt
@@ -42,7 +42,6 @@ from ..tools._shared.process import (
     BackgroundTaskShutdownNotice,
 )
 from . import theme as _theme
-from .fake_backend import FakeInteractiveBackend
 from .key_bindings import KeybindingError, resolve_keybindings
 from .layout import content_width, resume_picker_line
 from .render import render_event
@@ -139,14 +138,8 @@ def build_backend(
     ollama_base_url: str | None = None,
     token_budget: int | None = None,
 ) -> tuple[CompletionBackend, str]:
-    """Build the selected provider without loading network credentials for fake."""
+    """Build the selected network provider."""
 
-    if provider == "fake":
-        selected_model = model or "offline"
-        script = fake_script_from_env()
-        if script is not None:
-            return ScriptedFakeBackend(script, model=selected_model), selected_model
-        return FakeInteractiveBackend(model=selected_model), selected_model
     return build_network_backend(
         provider,
         model,
@@ -250,6 +243,8 @@ def _create_app_with_root(
             opened = manager.open(recent.session_id)
         cleanup.enter_context(opened.store)
         metadata = opened.metadata
+        if metadata.provider == "fake":
+            raise SessionError(REMOVED_PROVIDER_ERROR)
     effective_cwd = (
         Path(metadata.cwd) if resuming and explicit_resume else invocation_cwd
     )
@@ -259,20 +254,20 @@ def _create_app_with_root(
     project_dir = settings_root / ".zeta"
     try:
         loaded_settings = _app.load_settings(home=home, project_dir=project_dir)
+        config: ResolvedConfig = resolve_settings(
+            loaded_settings.settings,
+            cli_provider=getattr(args, "provider", None),
+            cli_model=getattr(args, "model", None),
+            cli_yolo=getattr(args, "yolo", None),
+            cli_token_budget=getattr(args, "token_budget", None),
+            cli_compaction=getattr(args, "compaction", None),
+            cli_tools=getattr(args, "tools", None),
+            cli_disallowed_tools=getattr(args, "disallowed_tools", None),
+            cli_allow_hooks=getattr(args, "allow_hooks", None),
+            cli_auto_memory=getattr(args, "auto_memory", None),
+        )
     except SettingsError as exc:
         raise SessionError(str(exc)) from exc
-    config: ResolvedConfig = resolve_settings(
-        loaded_settings.settings,
-        cli_provider=getattr(args, "provider", None),
-        cli_model=getattr(args, "model", None),
-        cli_yolo=getattr(args, "yolo", None),
-        cli_token_budget=getattr(args, "token_budget", None),
-        cli_compaction=getattr(args, "compaction", None),
-        cli_tools=getattr(args, "tools", None),
-        cli_disallowed_tools=getattr(args, "disallowed_tools", None),
-        cli_allow_hooks=getattr(args, "allow_hooks", None),
-        cli_auto_memory=getattr(args, "auto_memory", None),
-    )
     if config.auto_project and not ephemeral and not resuming:
         discovery = associate_project_discovery(discovery, manager.project_registry)
     override_on_resume = False

@@ -16,7 +16,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 from rich.panel import Panel
 
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.models.catalog import PROVIDER_MODELS
@@ -83,7 +83,6 @@ def test_known_models_merges_static_table_and_live_catalog() -> None:
     assert merged == tuple(sorted({*PROVIDER_MODELS["claude"], "claude-opus-4-1-20250805"}))
     assert known_models("codex") == tuple(sorted(PROVIDER_MODELS["codex"]))
     assert known_models("ollama") == ("qwen3:4b", "qwen3:4b-instruct")
-    assert known_models("fake") == ("faster", "offline")
 
 
 def test_match_models_is_a_case_insensitive_substring_filter() -> None:
@@ -128,10 +127,10 @@ def test_model_substring_with_several_matches_narrows_the_picker(tmp_path: Path)
 
 
 def test_model_unique_substring_switches_directly(tmp_path: Path) -> None:
-    app, _ = _app(tmp_path, provider="fake", model="offline")
+    app, _ = _app(tmp_path, provider="codex", model="gpt-5.6-luna")
 
-    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model fast") == "model: faster"
-    assert app.model == "faster"
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model terra") == "model: gpt-5.6-terra"
+    assert app.model == "gpt-5.6-terra"
     assert app._model_picker is None
 
 
@@ -159,7 +158,7 @@ def test_model_name_matching_nothing_is_still_used_as_typed(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_picker_does_not_open_while_a_turn_is_active(tmp_path: Path) -> None:
-    app, _ = _app(tmp_path, provider="fake", model="offline")
+    app, _ = _app(tmp_path, provider="codex", model="offline")
     app._active_task = asyncio.create_task(asyncio.sleep(1))
 
     try:
@@ -178,23 +177,23 @@ async def test_picker_does_not_open_while_a_turn_is_active(tmp_path: Path) -> No
 async def test_picker_navigation_wraps_and_select_switches_the_model(
     tmp_path: Path,
 ) -> None:
-    app, output = _app(tmp_path, provider="fake", model="offline")
+    app, output = _app(tmp_path, provider="codex", model="gpt-5.6-luna")
     create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
     picker = app._model_picker
-    assert picker is not None and picker.selected == "offline"
+    assert picker is not None and picker.selected == "gpt-5.6-luna"
 
     app.model_picker_move(1)
-    assert picker.selected == "faster"
-    app.model_picker_move(1)
-    assert picker.selected == "offline"
+    assert picker.selected == "gpt-5.6-sol"
     app.model_picker_move(-1)
-    assert picker.selected == "faster"
+    assert picker.selected == "gpt-5.6-luna"
+    app.model_picker_move(1)
+    assert picker.selected == "gpt-5.6-sol"
 
     app.model_picker_select()
     assert app._model_picker is None
     try:
-        await wait_until(lambda: app.model == "faster")
-        await wait_until(lambda: "model: faster" in output.getvalue())
+        await wait_until(lambda: app.model == "gpt-5.6-sol")
+        await wait_until(lambda: "model: gpt-5.6-sol" in output.getvalue())
     finally:
         await app.loop.close()
 
@@ -222,15 +221,15 @@ def test_picker_cancel_removes_the_card_and_its_spacer_in_full_screen(
 
 
 def test_picker_moves_repaint_the_card_in_full_screen(tmp_path: Path) -> None:
-    app, _ = _app(tmp_path, provider="fake", model="offline", full_screen=True)
+    app, _ = _app(tmp_path, provider="codex", model="gpt-5.6-luna", full_screen=True)
     create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
     unit = app._model_picker_unit
-    assert "❯ offline" in _plain(unit.value)
+    assert "❯ gpt-5.6-luna" in _plain(unit.value)
 
     app.model_picker_move(1)
 
     assert app._model_picker_unit is unit
-    assert "❯ faster" in _plain(unit.value)
+    assert "❯ gpt-5.6-sol" in _plain(unit.value)
 
 
 @pytest.mark.asyncio
@@ -253,7 +252,7 @@ async def test_open_picker_folds_in_the_catalog_when_it_arrives(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_any_other_submission_dismisses_an_open_picker(tmp_path: Path) -> None:
-    app, output = _app(tmp_path, provider="fake", model="offline")
+    app, output = _app(tmp_path, provider="codex", model="offline")
     create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
     assert app._model_picker is not None
 

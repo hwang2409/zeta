@@ -18,7 +18,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolUseContent,
 )
-from zeta.providers.scripted_fake import (
+from tests.support.scripted_provider import (
     FAKE_SCRIPT_ENV,
     FakeScriptError,
     ScriptedFakeBackend,
@@ -28,10 +28,10 @@ from zeta.providers.scripted_fake import (
 )
 from zeta.runtime.headless import run_headless
 from zeta.server import ZetaServer
-from zeta.server.fake_backend import ServerFakeBackend
+from tests.support.server_backend import ServerFakeBackend
 from zeta.server.runtime import default_backend
 from zeta.tui.bootstrap import build_backend
-from zeta.tui.fake_backend import FakeInteractiveBackend
+from tests.support.tui_backend import FakeInteractiveBackend
 
 DOCS = Path(__file__).parents[1] / "docs" / "fake-scripts"
 TIMEOUT = 5
@@ -211,7 +211,7 @@ def test_script_selects_scripted_backend_only_for_fake(
     monkeypatch.setenv(FAKE_SCRIPT_ENV, str(_write(tmp_path, BASH_SCRIPT)))
     tui_backend, _ = build_backend("fake", "offline")
     assert isinstance(tui_backend, ScriptedFakeBackend)
-    server = ZetaServer(home=tmp_path, socket_path=tmp_path / "s.sock", provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=tmp_path / "s.sock", provider="codex")
     backend, _ = server.runtime._build_backend("fake", "offline", tmp_path)
     assert isinstance(backend, ScriptedFakeBackend)
     real = ZetaServer(home=tmp_path, socket_path=tmp_path / "r.sock", provider="claude")
@@ -223,7 +223,7 @@ def test_invalid_script_fails_server_startup(
 ) -> None:
     monkeypatch.setenv(FAKE_SCRIPT_ENV, str(_write(tmp_path, {"version": 1})))
     with pytest.raises(FakeScriptError, match="missing field 'rules'"):
-        ZetaServer(home=tmp_path, socket_path=tmp_path / "s.sock", provider="fake")
+        ZetaServer(home=tmp_path, socket_path=tmp_path / "s.sock", provider="codex")
 
 
 async def _events(backend: ScriptedFakeBackend, messages: list[Message]) -> list[Any]:
@@ -360,7 +360,7 @@ async def _event(reader: asyncio.StreamReader, name: str) -> dict[str, Any]:
 
 async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
     server = ZetaServer(
-        home=tmp_path / "home", cwd=tmp_path, socket_path=_socket_path(tmp_path), provider="fake"
+        home=tmp_path / "home", cwd=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
     )
     await asyncio.wait_for(server.start(), TIMEOUT)
     reader, writer = await asyncio.wait_for(
@@ -368,7 +368,7 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
     )
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "run the check"})
         approval = await _event(reader, "approval_request")
         request_id = approval["request_id"]
@@ -416,7 +416,7 @@ async def test_serve_scripted_provider_error_reaches_client(
         "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
     )
     server = ZetaServer(
-        home=tmp_path / "home", cwd=tmp_path, socket_path=_socket_path(tmp_path), provider="fake"
+        home=tmp_path / "home", cwd=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
     )
     await asyncio.wait_for(server.start(), TIMEOUT)
     reader, writer = await asyncio.wait_for(
@@ -424,7 +424,7 @@ async def test_serve_scripted_provider_error_reaches_client(
     )
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": " fail "})
         error = await _event(reader, "error")
         assert error["error"]["code"] == "rate_limit_error"
@@ -445,7 +445,7 @@ def test_headless_scripted_tool_respects_allowlist_and_approval(
 
     def run(*flags: str) -> list[dict[str, Any]]:
         args = build_parser().parse_args(
-            ["--provider", "fake", "--no-session", "--format", "json", *flags, "-p", "run"]
+            ["--provider", "codex", "--no-session", "--format", "json", *flags, "-p", "run"]
         )
         assert run_headless(args, args.prompt) == 0
         out = capsys.readouterr().out
@@ -472,6 +472,6 @@ def test_headless_reports_invalid_script(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv(FAKE_SCRIPT_ENV, str(tmp_path / "missing.json"))
-    args = build_parser().parse_args(["--provider", "fake", "--no-session", "-p", "hi"])
+    args = build_parser().parse_args(["--provider", "codex", "--no-session", "-p", "hi"])
     assert run_headless(args, args.prompt) == 1
     assert "ZETA_FAKE_SCRIPT: cannot read" in capsys.readouterr().err

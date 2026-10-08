@@ -16,7 +16,7 @@ from tests.test_server import (
     _request,
     _socket_path,
 )
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionMetadata
 from zeta.protocol.types import TextContent, ToolCall
 from zeta.server import ZetaServer
@@ -36,7 +36,7 @@ def _server(tmp_path: Path, backend: FakeBackend | None, cwd: Path) -> ZetaServe
     return ZetaServer(
         home=tmp_path / "home",
         cwd=cwd,
-        provider="fake",
+        provider="codex",
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
@@ -402,7 +402,7 @@ def test_documented_session_metadata_matches_the_serializer() -> None:
     required, optional = _schema_fields("SessionMetadata")
     common = {
         "session_id": "a" * 32,
-        "provider": "fake",
+        "provider": "codex",
         "model": "offline",
         "cwd": "/tmp",
         "retained_tail": 8,

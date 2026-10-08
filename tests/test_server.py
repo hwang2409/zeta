@@ -17,8 +17,9 @@ from typing import Any
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -42,6 +43,14 @@ from zeta.server.server import _approval_display_fields, _Client
 from zeta.server.slash_commands import ServerSlashSession
 
 TIMEOUT = 3
+
+
+def test_removed_fake_provider_has_clear_serve_error(tmp_path: Path) -> None:
+    with pytest.raises(
+        SettingsError,
+        match="the fake provider was removed; choose claude, codex or ollama",
+    ):
+        ZetaServer(home=tmp_path, cwd=tmp_path, provider="fake", port=0)
 
 
 @pytest.fixture(autouse=True)
@@ -310,7 +319,7 @@ async def _provider_retry_frames(
     server = ZetaServer(
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _connect(server)
@@ -321,7 +330,7 @@ async def _provider_retry_frames(
         hello = (await _request(reader, writer, 1, "hello", hello_params))[-1][
             "result"
         ]
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         frames = await _request(reader, writer, 3, "send", {"text": "hello"})
         while not any(
             frame.get("params", {}).get("event") == "agent_end" for frame in frames
@@ -335,13 +344,13 @@ async def _provider_retry_frames(
 async def _ready(server: ZetaServer):
     reader, writer = await _connect(server)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-    await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+    await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     return reader, writer
 
 
 @pytest.mark.asyncio
 async def test_server_streams_fake_turn_over_real_socket(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _ready(server)
     try:
         frames = await _request(reader, writer, 3, "send", {"text": "hello"})
@@ -379,7 +388,7 @@ async def test_server_streams_display_safe_thinking_body_without_metadata(
     server = ZetaServer(
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
@@ -922,7 +931,7 @@ async def test_approval_scope_rejects_invalid_values(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_resumed_approval_finishes_idle_after_terminal_event(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     target = tmp_path / "input.txt"
     target.write_text("approved")
     call = ToolCall("resumed-call", "read", {"path": str(target)})
@@ -934,7 +943,7 @@ async def test_resumed_approval_finishes_idle_after_terminal_event(tmp_path: Pat
     backend = FakeBackend([])
     server = ZetaServer(
         home=tmp_path,
-        provider="fake",
+        provider="codex",
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
@@ -994,7 +1003,7 @@ async def test_abort_captures_turn_before_approval_end_write(
             "hello",
             {"protocol_version": "1.1", "features": ["abort_scope"]},
         )
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "wait for approval"})
         await _event(reader, "approval_request")
 
@@ -1049,7 +1058,7 @@ async def test_foreground_abort_only_ends_foreground_approval(
             "hello",
             {"protocol_version": "1.1", "features": ["abort_scope"]},
         )
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "wait for approval"})
         foreground = await _event(reader, "approval_request")
 
@@ -1115,7 +1124,7 @@ async def test_foreground_abort_mid_stream_keeps_pending_steering(
             {"protocol_version": "1.1", "features": ["abort_scope"]},
         )
         assert hello[-1]["result"]["capabilities"]["features"] == ["abort_scope"]
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "start"})
         await asyncio.wait_for(backend.started.wait(), TIMEOUT)
         await _request(reader, writer, 4, "steer", {"text": "keep this"})
@@ -1160,7 +1169,7 @@ async def test_clear_steering_returns_cleared_count(tmp_path: Path) -> None:
             {"protocol_version": "1.1", "features": ["abort_scope"]},
         )
         assert "clear_steering" in hello[-1]["result"]["capabilities"]["requests"]
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "start"})
         await asyncio.wait_for(backend.started.wait(), TIMEOUT)
         await _request(reader, writer, 4, "steer", {"text": "discard one"})
@@ -1180,7 +1189,7 @@ async def test_clear_steering_returns_cleared_count(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_clear_steering_requires_abort_scope_feature(tmp_path: Path) -> None:
     server = ZetaServer(
-        home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake"
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
     )
     reader, writer = await _ready(server)
     try:
@@ -1219,7 +1228,7 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
             "hello",
             {"protocol_version": "1.1", "features": ["abort_scope"]},
         )
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "start child"})
         await _event(reader, "agent_end")
         await asyncio.wait_for(backend.child_started.wait(), TIMEOUT)
@@ -1252,7 +1261,7 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
 async def test_abort_scope_requires_negotiation_and_rejects_unknown_scope(
     tmp_path: Path,
 ) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _ready(server)
     try:
         unnegotiated = await _request(
@@ -1262,7 +1271,7 @@ async def test_abort_scope_requires_negotiation_and_rejects_unknown_scope(
     finally:
         await _close(server, writer)
 
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _connect(server)
     try:
         await _request(
@@ -1272,7 +1281,7 @@ async def test_abort_scope_requires_negotiation_and_rejects_unknown_scope(
             "hello",
             {"protocol_version": "1.1", "features": ["abort_scope"]},
         )
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         unknown = await _request(reader, writer, 3, "abort", {"scope": "turn"})
         assert unknown[-1]["error"]["code"] == -32602
     finally:
@@ -1281,7 +1290,7 @@ async def test_abort_scope_requires_negotiation_and_rejects_unknown_scope(
 
 @pytest.mark.asyncio
 async def test_resume_second_client_and_malformed_frame(tmp_path: Path) -> None:
-    first = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    first = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _ready(first)
     session = (await _request(reader, writer, 3, "status"))[-1]["result"]["session"]["session_id"]
     second_reader, second_writer = await asyncio.wait_for(
@@ -1297,7 +1306,7 @@ async def test_resume_second_client_and_malformed_frame(tmp_path: Path) -> None:
     assert malformed["error"]["code"] == -32700
     await _close(first, writer)
 
-    resumed = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    resumed = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _connect(resumed)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
@@ -1309,7 +1318,7 @@ async def test_resume_second_client_and_malformed_frame(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_server_can_bind_localhost_port(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
     try:
         assert server.port != 0
@@ -1324,7 +1333,7 @@ async def test_server_can_bind_localhost_port(tmp_path: Path) -> None:
 async def test_oversized_frame_returns_error_and_keeps_connection_usable(
     tmp_path: Path,
 ) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _ready(server)
     try:
         oversized = (
@@ -1347,10 +1356,10 @@ async def test_oversized_frame_returns_error_and_keeps_connection_usable(
 async def test_maximum_legal_frame_gets_bounded_error_response(
     tmp_path: Path,
 ) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _connect(server)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-    await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+    await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     assert server.runtime.opened is not None
     server.runtime.opened.metadata.system_prompt = "x" * MAX_FRAME_BYTES
     request_id = "legal-frame"
@@ -1424,7 +1433,7 @@ def test_request_id_limit_is_inclusive() -> None:
 async def test_huge_numeric_request_id_returns_error_and_keeps_connection_usable(
     tmp_path: Path,
 ) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _ready(server)
     try:
         writer.write(
@@ -1444,7 +1453,7 @@ async def test_huge_numeric_request_id_returns_error_and_keeps_connection_usable
 async def test_malformed_and_wrong_type_frames_keep_connection_usable(
     tmp_path: Path,
 ) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _ready(server)
     try:
         writer.write(
@@ -1491,10 +1500,10 @@ def test_protocol_schema_documents_all_reviewed_event_contracts() -> None:
 async def test_list_sessions_marks_oversized_result_as_truncated(
     tmp_path: Path,
 ) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     huge = SessionMetadata.new(
         session_id="a" * 32,
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=str(tmp_path),
         retained_tail=8,
@@ -1520,7 +1529,7 @@ async def test_list_sessions_uses_maximum_request_id_for_boundary(
     codec = FrameCodec()
     probe = SessionMetadata.new(
         session_id="a" * 32,
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=str(tmp_path),
         retained_tail=8,
@@ -1529,20 +1538,20 @@ async def test_list_sessions_uses_maximum_request_id_for_boundary(
     base_size = len(codec.response(0, {"sessions": [probe.to_dict()]}))
     huge = SessionMetadata.new(
         session_id=probe.session_id,
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=str(tmp_path),
         retained_tail=8,
         compaction_budget=200_000,
         system_prompt="x" * (MAX_FRAME_BYTES - 128 - base_size),
     )
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     server.runtime.list_sessions = lambda: [huge]
     reader, writer = await _connect(server)
     request_id = "x" * MAX_REQUEST_ID_BYTES
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         frames = await _request(reader, writer, request_id, "list_sessions")
         assert frames[-1]["result"] == {
             "sessions": [],
@@ -1555,7 +1564,7 @@ async def test_list_sessions_uses_maximum_request_id_for_boundary(
 
 @pytest.mark.asyncio
 async def test_invalid_utf8_tail_preserves_request_id(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _ready(server)
     try:
         writer.write(
@@ -1576,7 +1585,7 @@ async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
 ) -> None:
     socket_path = _socket_path(tmp_path)
     socket_path.write_text("do not delete")
-    server = ZetaServer(home=tmp_path, socket_path=socket_path, provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=socket_path, provider="codex")
     with pytest.raises(RuntimeError, match="non-socket"):
         await server.start()
     socket_path.unlink()
@@ -1594,7 +1603,7 @@ async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
 
 @pytest.mark.asyncio
 async def test_rejected_pre_hello_request_closes_connection(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _connect(server)
     try:
         writer.write(b'{"jsonrpc":"2.0","id":1,"method":"status","params":{}}\n')
@@ -1834,7 +1843,7 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
 
 @pytest.mark.asyncio
 async def test_bad_resume_preserves_current_session(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _ready(server)
     try:
         before = (await _request(reader, writer, 3, "status"))[-1]["result"]["session"][
@@ -1857,7 +1866,7 @@ async def test_session_switch_clears_delegated_mappings(tmp_path: Path) -> None:
     server = ZetaServer(
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
-        provider="fake",
+        provider="codex",
     )
     reader, writer = await _ready(server)
     first_session = server.runtime.session_id
@@ -1865,7 +1874,7 @@ async def test_session_switch_clears_delegated_mappings(tmp_path: Path) -> None:
         assert server._client is not None
         approvals = server._client._approvals
         first_wire = approvals.wire_id(("child-a", "same"))
-        await _request(reader, writer, 3, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 3, "new_session", {"provider": "codex"})
         assert approvals.core_key(first_wire) == first_wire
 
         second_wire = approvals.wire_id(("child-b", "same"))
@@ -1887,7 +1896,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
     )
     server = ZetaServer(
         home=tmp_path,
-        provider="fake",
+        provider="codex",
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
@@ -1898,7 +1907,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
         await _event(reader, "usage")
         assert (await _request(reader, writer, 4, "status"))[-1]["result"]["usage"]
 
-        await _request(reader, writer, 5, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 5, "new_session", {"provider": "codex"})
         assert (await _request(reader, writer, 6, "status"))[-1]["result"]["usage"] == {}
 
         await _request(reader, writer, 7, "send", {"text": "second"})
@@ -1924,20 +1933,20 @@ async def test_parameterless_new_session_uses_server_defaults_after_override(
     server = ZetaServer(
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
-        provider="fake",
+        provider="codex",
         model="server-default",
         backend_factory=build_backend,
     )
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(
             reader,
             writer,
             3,
             "new_session",
-            {"provider": "fake", "model": "session-override"},
+            {"provider": "codex", "model": "session-override"},
         )
         result = await _request(reader, writer, 4, "new_session")
         assert result[-1]["result"]["session"]["model"] == "server-default"
@@ -1982,7 +1991,7 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
         # A child approval and per-provider turn_end do not signal that the
         # parent agent loop is idle. agent_end is the session-swap handoff.
         await _event(reader, "agent_end")
-        swap_frames = await _request(reader, writer, 4, "new_session", {"provider": "fake"})
+        swap_frames = await _request(reader, writer, 4, "new_session", {"provider": "codex"})
         new_session_id = swap_frames[-1]["result"]["session"]["session_id"]
         assert new_session_id != old_session_id
         assert all(
@@ -2185,7 +2194,7 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
     home = tmp_path / "zeta-home"
     home.mkdir()
     (home / "settings.toml").write_text(
-        'provider = "fake"\n'
+        'provider = "codex"\n'
         "token_budget = 12345\n"
         "stream_stall_seconds = 45\n"
         "stream_stall_retries = 4\n",
@@ -2198,9 +2207,9 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
     serve_calls: list[tuple[object, ...]] = []
     from zeta.cli.main import build_parser
     from zeta.server import runtime as server_runtime
-    from zeta.server.fake_backend import ServerFakeBackend
+    from tests.support.server_backend import ServerFakeBackend
     from zeta.tui import app as tui_app
-    from zeta.tui.fake_backend import FakeInteractiveBackend
+    from tests.support.tui_backend import FakeInteractiveBackend
 
     def tui_backend(
         provider: str,
@@ -2236,8 +2245,8 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
 
     monkeypatch.setattr(tui_app, "build_backend", tui_backend)
     monkeypatch.setattr(server_runtime, "default_backend", serve_backend)
-    tui = tui_app.create_app(build_parser().parse_args(["--provider", "fake"]))
-    server = ZetaServer(home=home, socket_path=_socket_path(tmp_path), provider="fake")
+    tui = tui_app.create_app(build_parser().parse_args(["--provider", "codex"]))
+    server = ZetaServer(home=home, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
@@ -2269,7 +2278,7 @@ from zeta.server import ZetaServer, run_server
 
 async def main() -> None:
     server = ZetaServer(
-        home=sys.argv[1], socket_path=sys.argv[2], provider="fake"
+        home=sys.argv[1], socket_path=sys.argv[2], provider="codex"
     )
     await run_server(server)
 
@@ -2293,7 +2302,7 @@ asyncio.run(main())
             await asyncio.sleep(0.01)
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "hello"})
         assert (await _event(reader, "assistant_delta"))["delta"]
         process.send_signal(signal.SIGTERM)
@@ -2313,14 +2322,14 @@ async def _ready_extensions(server):
     hello = (await _request(reader, writer, 1, "hello", {"protocol_version": "1.0", "client_version": "1.1"}))[-1]["result"]
     assert hello["protocol_version"] == "1.1"
     assert "send_images" in hello["capabilities"]["requests"]
-    session = (await _request(reader, writer, 2, "new_session", {"provider": "fake"}))[-1]["result"]["session"]
+    session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
     return reader, writer, session["session_id"]
 
 
 @pytest.mark.asyncio
 async def test_extensions_negotiate_and_old_clients_remain_unchanged(tmp_path):
     from zeta.server.ergonomics import EXTENSION_REQUESTS
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
     try:
         hello = (await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"}))[-1]["result"]
@@ -2328,14 +2337,14 @@ async def test_extensions_negotiate_and_old_clients_remain_unchanged(tmp_path):
         assert not set(EXTENSION_REQUESTS) & set(hello["capabilities"]["requests"])
         for method in EXTENSION_REQUESTS:
             assert (await _request(reader, writer, method, method))[-1]["error"]["code"] == -32601
-        assert "result" in (await _request(reader, writer, 3, "new_session", {"provider": "fake"}))[-1]
+        assert "result" in (await _request(reader, writer, 3, "new_session", {"provider": "codex"}))[-1]
     finally:
         await _close(server, writer)
 
 
 @pytest.mark.asyncio
 async def test_tree_fork_switch_and_history_persist(tmp_path):
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     async def rpc(method, **params):
         return (await _request(reader, writer, method, method, {"session_id": sid, **params}))[-1]
@@ -2369,7 +2378,7 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
 
 @pytest.mark.asyncio
 async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
         store = server.runtime.opened.store
@@ -2430,7 +2439,7 @@ async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
 async def test_history_projects_bounded_failed_turn_state(
     tmp_path: Path, code: str, status_code: int | None, expected_code: str
 ) -> None:
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
         server.runtime.opened.store.append_message(
@@ -2475,7 +2484,7 @@ async def test_reconnect_streams_pending_notification_turn(tmp_path: Path) -> No
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, session_id = await _ready_extensions(server)
@@ -2525,7 +2534,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
 ) -> None:
     # S7: session_history renders task_exited, legacy (no kind), and unknown
     # notification kinds, preserving each kind on the row.
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     store = server.runtime.opened.store
     store.append_task_notification(
@@ -2571,7 +2580,7 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
@@ -2619,7 +2628,7 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
 @pytest.mark.parametrize("block_count,text", [(0, ""), (20, "\x00" * 8000), (130, "x" * 8000)],
                          ids=["large-tools", "json-escaping", "near-limit-message"])
 async def test_history_pages_large_messages_with_bounded_tool_arguments(tmp_path, block_count, text):
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     # The default asyncio reader limit is only 64 KiB.
     reader._limit = MAX_FRAME_BYTES
@@ -2670,7 +2679,7 @@ async def test_history_pages_large_messages_with_bounded_tool_arguments(tmp_path
 
 @pytest.mark.asyncio
 async def test_history_advances_past_single_oversized_persisted_message(tmp_path):
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
         store = server.runtime.opened.store
@@ -2690,7 +2699,7 @@ async def test_history_advances_past_single_oversized_persisted_message(tmp_path
 
 @pytest.mark.asyncio
 async def test_settings_apply_to_active_session_and_resume(tmp_path):
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     async def rpc(method, **params):
         return (await _request(reader, writer, method, method, {"session_id": sid, **params}))[-1]
@@ -2704,7 +2713,7 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
         assert server.runtime.metadata.model_fallback is None
         assert server.runtime.loop.backend.model == "faster"
         assert server.runtime.policy.default.value == "deny"
-        await _request(reader, writer, "new", "new_session", {"provider": "fake"})
+        await _request(reader, writer, "new", "new_session", {"provider": "codex"})
         assert (await rpc("set_settings", **settings))["error"]["code"] == -32003
         assert server.runtime.policy.default.value == "ask"
         await _request(reader, writer, "resume", "resume", {"session_id": sid})
@@ -2725,11 +2734,11 @@ async def test_new_session_resume_and_status_report_effective_yolo_mode(tmp_path
     # emits `approval_mode: null`, which the frontend client treats as "no update"
     # and the indicator stays hidden.
     (tmp_path / "settings.toml").write_text("yolo = true\n", encoding="utf-8")
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-        first = (await _request(reader, writer, 2, "new_session", {"provider": "fake"}))[-1]["result"]["session"]
+        first = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
         sid_a = first["session_id"]
         assert first["approval_mode"] == "allow"
         # A first `status` right after new_session — the production order.
@@ -2737,7 +2746,7 @@ async def test_new_session_resume_and_status_report_effective_yolo_mode(tmp_path
         assert status_a["session"]["session_id"] == sid_a
         assert status_a["session"]["approval_mode"] == "allow"
         # Switch: a second `new_session` returns a distinct id, same mode.
-        second = (await _request(reader, writer, 4, "new_session", {"provider": "fake"}))[-1]["result"]["session"]
+        second = (await _request(reader, writer, 4, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
         sid_b = second["session_id"]
         assert sid_b != sid_a
         assert second["approval_mode"] == "allow"
@@ -2804,7 +2813,7 @@ async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, 
     monkeypatch.setitem(MODEL_CONTEXT_WINDOWS, "fake", {"offline": 1_050_000, "faster": 400_000})
     if pinned:
         (tmp_path / "settings.toml").write_text("token_budget = 123456\n")
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     runtime = server.runtime
     metadata_before = runtime.metadata.to_dict()
@@ -2858,7 +2867,7 @@ async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, 
 async def test_server_new_session_defaults_to_evict(tmp_path: Path) -> None:
     from zeta.server.runtime import ServerRuntime
 
-    runtime = ServerRuntime(tmp_path, provider="fake")
+    runtime = ServerRuntime(tmp_path, provider="codex")
     try:
         metadata = await runtime.create_session()
 
@@ -2878,7 +2887,7 @@ async def test_image_names_match_verified_types(tmp_path):
     from zeta.server.protocol import ProtocolError
     from zeta.server.runtime import ServerRuntime
 
-    runtime = ServerRuntime(tmp_path, provider="fake")
+    runtime = ServerRuntime(tmp_path, provider="codex")
     await runtime.create_session()
     png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
     item = {"name": "safe.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
@@ -2914,7 +2923,7 @@ async def test_attachment_failure_removes_entire_batch(tmp_path, monkeypatch, fa
     from zeta.server import ergonomics
     from zeta.server.runtime import ServerRuntime
 
-    runtime = ServerRuntime(tmp_path, provider="fake")
+    runtime = ServerRuntime(tmp_path, provider="codex")
     await runtime.create_session()
     png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
     item = {"name": "same.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
@@ -3067,7 +3076,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(tmp_path, mon
 
 @pytest.mark.asyncio
 async def test_cross_provider_settings_reject_mid_turn_then_apply_when_idle(tmp_path):
-    from zeta.server.fake_backend import ServerFakeBackend
+    from tests.support.server_backend import ServerFakeBackend
 
     server = ZetaServer(home=tmp_path, port=0, provider="claude", model="claude-sonnet-4-6",
                         backend_factory=lambda p, m, h: (ServerFakeBackend(delay=0.2, model=m), m))
@@ -3185,8 +3194,8 @@ async def test_cross_mode_resume_rejected_without_session_mutation(
             )[-1]
             assert response["error"] == {
                 "code": -32602,
-                "message": "session uses the offline test provider; open it with --provider fake"
-                if session_provider == "fake"
+                "message": "session uses the offline test provider; open it with --provider codex"
+                if session_provider == "codex"
                 else f"session uses a real provider; open it with --provider {session_provider}",
             }
             assert server.runtime.state is state
@@ -3227,7 +3236,7 @@ async def test_session_listing_isolates_fake_provider(tmp_path, server_provider)
         expected = {
             sid
             for provider, sid in sessions.items()
-            if (provider == "fake") == (server_provider in (None, "fake"))
+            if (provider == "codex") == (server_provider in (None, "fake"))
         }
         assert {s["session_id"] for s in response["sessions"]} == expected
         for sid in expected:
@@ -3254,7 +3263,7 @@ def test_plain_serve_uses_effective_provider_mode(
     if settings_provider is not None:
         (home / "settings.toml").write_text(f'provider = "{settings_provider}"\n')
     expected_provider = settings_provider or "fake"
-    foreign_provider = "claude" if expected_provider == "fake" else "fake"
+    foreign_provider = "claude" if expected_provider == "codex" else "fake"
     foreign = (
         SessionManager(home)
         .create(
@@ -3285,7 +3294,7 @@ def test_plain_serve_uses_effective_provider_mode(
             catalog = (
                 await _request(reader, writer, 3, "model_catalog", {"session_id": sid})
             )[-1]["result"]
-            if expected_provider == "fake":
+            if expected_provider == "codex":
                 assert catalog == {"models": ["faster", "offline"]}
             else:
                 assert catalog == {
@@ -3315,7 +3324,7 @@ def test_plain_serve_uses_effective_provider_mode(
 
 @pytest.mark.asyncio
 async def test_session_list_includes_single_line_first_message_preview(tmp_path):
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _ready(server)
     try:
         await _request(reader, writer, 3, "send", {"text": "first\nmessage\tpreview"})
@@ -3736,7 +3745,7 @@ async def test_stream_access_recovery_does_not_depend_on_message(
 
 @pytest.mark.asyncio
 async def test_session_management_lifecycle_and_active_delete(tmp_path):
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
     try:
         hello = (await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"}))[-1]["result"]
@@ -3764,7 +3773,7 @@ async def test_session_management_lifecycle_and_active_delete(tmp_path):
         await _close(server, writer)
 
     # A fresh server reads the saved name; management needs no active session.
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
@@ -3795,7 +3804,7 @@ async def test_session_management_lifecycle_and_active_delete(tmp_path):
 
 @pytest.mark.asyncio
 async def test_session_management_legacy_gate_and_preview(tmp_path):
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _ready(server)
     try:
         sid = server.runtime.session_id
@@ -3819,7 +3828,7 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("session_id", ["../outside", "/tmp/outside", ".", "..", "", "bad\x00id"])
 async def test_session_delete_rpc_rejects_unsafe_ids(tmp_path, session_id):
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
@@ -3838,7 +3847,7 @@ async def test_resume_does_not_bump_updated_at(tmp_path):
     """
     from zeta.server.runtime import ServerRuntime
 
-    runtime = ServerRuntime(tmp_path, cwd=tmp_path, provider="fake")
+    runtime = ServerRuntime(tmp_path, cwd=tmp_path, provider="codex")
     try:
         first = await runtime.create_session()
         first_id = first.session_id
@@ -3856,7 +3865,7 @@ async def test_resume_does_not_bump_updated_at(tmp_path):
 async def test_runtime_failure_releases_all_session_leases(tmp_path, monkeypatch, failure):
     from zeta.server.runtime import ServerRuntime
 
-    runtime = ServerRuntime(tmp_path, cwd=tmp_path, provider="fake")
+    runtime = ServerRuntime(tmp_path, cwd=tmp_path, provider="codex")
     await runtime.create_session()
     old_id = runtime.session_id
     old_store = runtime.opened.store
@@ -3909,7 +3918,7 @@ async def test_runtime_failure_releases_all_session_leases(tmp_path, monkeypatch
 @pytest.mark.asyncio
 async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
     from zeta.protocol.types import StreamEventType
-    from zeta.server.fake_backend import ServerFakeBackend
+    from tests.support.server_backend import ServerFakeBackend
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -3923,7 +3932,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
                     await release.wait()
 
     server = ZetaServer(
-        home=tmp_path, cwd=tmp_path, port=0, provider="fake",
+        home=tmp_path, cwd=tmp_path, port=0, provider="codex",
         backend_factory=lambda *_args: (PausedBackend(delay=0), "offline"),
     )
     reader, writer = await _connect(server)
@@ -3931,7 +3940,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         sid = (await _request(reader, writer, 2, "new_session"))[-1]["result"]["session"]["session_id"]
         # Also check an inactive target so the streaming guard, not the active guard, decides deletion.
-        other = server.runtime.manager.create(provider="fake", model="offline", cwd=tmp_path)
+        other = server.runtime.manager.create(provider="codex", model="offline", cwd=tmp_path)
         other.store.close()
         await _request(reader, writer, 3, "send", {"text": "slow response"})
         await asyncio.wait_for(started.wait(), TIMEOUT)
@@ -3956,7 +3965,7 @@ async def test_attachment_symlink_cannot_write_outside_session(tmp_path):
     from zeta.server.ergonomics import image_message
     from zeta.server.runtime import ServerRuntime
 
-    runtime = ServerRuntime(tmp_path / "home", cwd=tmp_path, provider="fake")
+    runtime = ServerRuntime(tmp_path / "home", cwd=tmp_path, provider="codex")
     await runtime.create_session()
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -4009,7 +4018,7 @@ def _seed_slash_fixtures(tmp_path: Path) -> Path:
 @pytest.mark.asyncio
 async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path) -> None:
     project = _seed_slash_fixtures(tmp_path)
-    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
         result = (
@@ -4051,7 +4060,7 @@ async def test_serve_does_not_advertise_or_run_tui_approval_commands(
     tmp_path: Path,
 ) -> None:
     project = _seed_slash_fixtures(tmp_path)
-    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
         run_result = (
@@ -4088,7 +4097,7 @@ async def test_serve_slash_memory_accept(tmp_path: Path) -> None:
         updates={"state.md": "automatic\n"},
         provenance={"session_id": "s", "seq_start": 1, "seq_end": 1},
     )
-    server = ZetaServer(home=home, cwd=project, port=0, provider="fake")
+    server = ZetaServer(home=home, cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
         result = (await _request(
@@ -4148,7 +4157,7 @@ def test_memory_command_parity_tui_and_serve() -> None:
 
 async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
     project = _seed_slash_fixtures(tmp_path)
-    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
 
     async def run(text: str) -> dict:
@@ -4241,7 +4250,7 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_slash_extensions_reject_legacy_clients(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
@@ -4268,7 +4277,7 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
     mutation RPC guards with the exact same check."""
 
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     # Seed one outstanding tool call so ``pending_requests()`` returns it
     # even though no turn task is running — this is the scenario the fix
     # closes: _require_idle passes, require_mutable must not.
@@ -4280,7 +4289,7 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
     opened.store.close()
     server = ZetaServer(
         home=tmp_path,
-        provider="fake",
+        provider="codex",
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
     )
@@ -4329,7 +4338,7 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
 @pytest.mark.asyncio
 async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
     from zeta.protocol.types import StreamEventType
-    from zeta.server.fake_backend import ServerFakeBackend
+    from tests.support.server_backend import ServerFakeBackend
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -4346,7 +4355,7 @@ async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
         home=tmp_path,
         cwd=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda *_args: (PausedBackend(delay=0), "offline"),
     )
     reader, writer, sid = await _ready_extensions(server)
@@ -4440,7 +4449,7 @@ async def test_server_uses_only_existing_project_without_new_git_discovery(
         raise AssertionError("server must not run automatic project discovery")
 
     monkeypatch.setattr(project_context, "_run_discovery_git", fail_new_discovery)
-    runtime = ServerRuntime(home, cwd=cwd, provider="fake")
+    runtime = ServerRuntime(home, cwd=cwd, provider="codex")
     try:
         metadata = await runtime.create_session()
         assert metadata.project_id == (
@@ -4453,7 +4462,7 @@ async def test_server_uses_only_existing_project_without_new_git_discovery(
 
 @pytest.mark.asyncio
 async def test_set_compaction_switches_active_session(tmp_path):
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     runtime = server.runtime
     try:
@@ -4498,7 +4507,7 @@ async def test_set_compaction_switches_active_session(tmp_path):
 
 @pytest.mark.asyncio
 async def test_set_compaction_requires_protocol_1_1(tmp_path):
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _ready(server)
     try:
         response = (await _request(reader, writer, 3, "set_compaction", {"mode": "summary"}))[-1]
@@ -4509,8 +4518,8 @@ async def test_set_compaction_requires_protocol_1_1(tmp_path):
 
 @pytest.mark.asyncio
 async def test_same_session_resume_preserves_background_child(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
-    await server.runtime.create_session(provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    await server.runtime.create_session(provider="codex")
     loop = server.runtime.loop
     assert loop is not None
     owner = loop._background_owner
@@ -4534,10 +4543,10 @@ async def test_same_session_resume_preserves_background_child(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_resume_other_session_keeps_existing_semantics(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
-    await server.runtime.create_session(provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    await server.runtime.create_session(provider="codex")
     first_session = server.runtime.session_id
-    await server.runtime.create_session(provider="fake")
+    await server.runtime.create_session(provider="codex")
     second_session = server.runtime.session_id
     second_loop = server.runtime.loop
     assert second_loop is not None
@@ -4586,7 +4595,7 @@ async def test_failed_wake_turn_keeps_durable_notification_input(tmp_path: Path)
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
@@ -4621,7 +4630,7 @@ async def test_foreground_abort_retries_interrupted_notification_turn(
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
@@ -4672,7 +4681,7 @@ async def test_foreground_abort_before_notification_persistence_delivers_once(
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
@@ -4736,7 +4745,7 @@ async def test_session_abort_does_not_retry_notification_turn(
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
@@ -4784,7 +4793,7 @@ async def test_repeated_foreground_notification_aborts_schedule_one_retry_each(
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
@@ -4846,7 +4855,7 @@ async def test_immediate_foreground_aborts_keep_one_notification_retry(
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
@@ -4899,7 +4908,7 @@ async def test_disconnected_wake_turn_reuses_durable_notification_input(
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
@@ -4946,7 +4955,7 @@ async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
@@ -4992,7 +5001,7 @@ async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
 
 @pytest.mark.asyncio
 async def test_disconnected_child_survives_client_reconnect(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     loop = server.runtime.loop
     assert loop is not None
@@ -5018,7 +5027,7 @@ async def test_reconnect_runs_pending_notification_turn_once(tmp_path: Path) -> 
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
@@ -5057,7 +5066,7 @@ async def test_repeated_resume_does_not_duplicate_notification_turn(tmp_path: Pa
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, session_id = await _ready_extensions(server)
@@ -5083,7 +5092,7 @@ async def test_repeated_resume_does_not_duplicate_notification_turn(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_resume_missing_session_structured_error(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _ready(server)
     try:
         response = (

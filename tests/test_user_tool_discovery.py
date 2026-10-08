@@ -9,7 +9,7 @@ import pytest
 from rich.console import Console
 
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
@@ -176,7 +176,7 @@ async def test_runtime_blocks_user_tool_import_in_restricted_session(
 
     app = create_app(
         build_parser().parse_args(
-            ["--provider", "fake", "--tools", "computer__*"]
+            ["--provider", "codex", "--tools", "computer__*"]
         )
     )
     try:
@@ -657,7 +657,7 @@ skill_catalog=SkillCatalog.empty(),
     )
     return TUIApp(
         loop,
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
         external_tools=discovery,

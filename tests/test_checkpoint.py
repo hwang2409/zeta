@@ -9,7 +9,7 @@ from rich.text import Text
 
 from zeta.core.checkpoints import CheckpointForkMixin
 from zeta.core.context import ContextAssembler
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.protocol.types import (
@@ -318,7 +318,7 @@ def test_naive_checkpoint_timestamp_is_normalized_at_jsonl_boundary(
 
     app = TUIApp(
         AgentLoop(FakeBackend([]), reopened, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
     )
@@ -345,7 +345,7 @@ def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
 
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
     )
@@ -463,7 +463,7 @@ def test_live_and_replay_agent_notification_bytes_match(
 
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
     )
@@ -502,7 +502,7 @@ def test_padded_agent_notification_keeps_live_and_replay_bytes_equal(
 
     live_app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
     )
@@ -513,7 +513,7 @@ def test_padded_agent_notification_keeps_live_and_replay_bytes_equal(
 
     replay_app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
     )
@@ -533,7 +533,7 @@ def test_fork_rejects_running_background_agents_then_allows_completion(
     store.append_checkpoint("saved")
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
     )

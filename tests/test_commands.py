@@ -15,7 +15,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.slash import (
     COMMAND_FILE_SIZE_LIMIT,
     INIT_PROMPT,
@@ -167,7 +167,7 @@ async def test_init_rejects_non_project_without_model_input(tmp_path: Path) -> N
             ConversationStore(tmp_path / "sessions", cwd=tmp_path),
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=tmp_path / "home",
         console=Console(file=output, force_terminal=False),
@@ -399,7 +399,7 @@ def test_tui_command_loading_uses_configured_home(
             ConversationStore(tmp_path / "sessions", cwd=tmp_path),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=fake_home,
         console=Console(file=StringIO(), force_terminal=False),
@@ -436,7 +436,7 @@ def test_tui_command_loading_skips_host_home_without_configured_home(
             ConversationStore(tmp_path / "sessions", cwd=tmp_path),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -460,7 +460,7 @@ def test_tui_command_loading_uses_repository_root_from_nested_cwd(tmp_path: Path
             ConversationStore(tmp_path / "sessions", cwd=nested),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -548,7 +548,7 @@ async def test_custom_command_becomes_the_model_user_message(
     )
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions", cwd=tmp_path), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
@@ -578,7 +578,7 @@ async def test_init_becomes_the_model_user_message(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", cwd=project)
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=tmp_path / "zeta-home",
         console=Console(file=StringIO(), force_terminal=False),
@@ -614,7 +614,7 @@ async def test_input_loop_control_commands_exclude_their_own_submission(
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -638,7 +638,7 @@ async def test_handler_failure_acknowledges_entry_and_advances_pipeline(
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -677,7 +677,7 @@ async def test_provider_start_failure_rolls_back_and_advances_pipeline(
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=tmp_path / "home",
         history_path=tmp_path / "history",
@@ -732,7 +732,7 @@ async def test_same_tick_provider_failure_dispatches_the_next_submission(
     )
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -786,7 +786,7 @@ async def test_approval_shortcut_does_not_enter_history(tmp_path: Path) -> None:
             approval_policy=policy,
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         history_path=history_path,
         approval_policy=policy,
@@ -823,7 +823,7 @@ async def test_failed_approval_action_acknowledges_waiter(
     policy = ApprovalPolicy(store=store)
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=tmp_path / "home",
         history_path=tmp_path / "history",
@@ -918,7 +918,7 @@ async def test_tui_always_allow_remembers_only_the_current_action(
             approval_policy=policy,
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=tmp_path / "home",
         history_path=tmp_path / "history",
@@ -957,7 +957,7 @@ async def test_prompt_macro_resolves_inline_shell_and_template_attachments(
             ConversationStore(tmp_path / "sessions", cwd=tmp_path),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=True),
@@ -993,7 +993,7 @@ async def test_inline_shell_approval_covers_the_complete_batch(tmp_path: Path) -
     output = StringIO()
     app = TUIApp(
         AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         approval_policy=policy,
@@ -1042,7 +1042,7 @@ async def test_preprocessing_timing_cannot_reorder_provider_submissions(
     )
     app = TUIApp(
         AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         history_path=tmp_path / "history",
@@ -1113,7 +1113,7 @@ async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
         AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         approval_policy=policy,
@@ -1155,7 +1155,7 @@ async def test_unmapped_durable_approval_is_finalized(
 
     app = TUIApp(
         AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         history_path=home / "history",
@@ -1242,7 +1242,7 @@ async def test_resumed_durable_tool_abort_is_processed_by_submission_consumer(
             approval_policy=policy,
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
@@ -1304,7 +1304,7 @@ async def test_submission_waits_for_resumed_durable_tool_result(
             approval_policy=policy,
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
@@ -1348,7 +1348,7 @@ async def test_close_resolves_pending_submission_ack_and_rejects_new_sends(
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ALLOW)
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         approval_policy=policy,
@@ -1381,7 +1381,7 @@ async def test_inline_approval_queues_unrelated_submission(
     )
     app = TUIApp(
         AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         approval_policy=policy,
@@ -1440,7 +1440,7 @@ async def test_undo_second_inline_submission_keeps_first_alive(
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
         AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         approval_policy=policy,
@@ -1510,7 +1510,7 @@ async def test_scoped_inline_abort_keeps_other_submission_alive(
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
         AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         approval_policy=policy,
@@ -1572,7 +1572,7 @@ async def test_inline_shell_abort_stops_before_provider_dispatch(tmp_path: Path)
             ConversationStore(tmp_path / "sessions", cwd=tmp_path),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=True),
@@ -1676,7 +1676,7 @@ async def test_inline_shell_failure_and_output_are_bounded(tmp_path: Path) -> No
             ConversationStore(tmp_path / "sessions", cwd=tmp_path),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=True),
@@ -1728,7 +1728,7 @@ async def test_background_macro_exit_produces_exactly_one_notification_and_one_w
             store,
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=True),
@@ -1769,7 +1769,7 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
     output = StringIO()
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=output, force_terminal=True, color_system="truecolor"),
@@ -1794,7 +1794,7 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
     slow_store = ConversationStore(tmp_path / "slow-sessions", cwd=tmp_path)
     slow_app = TUIApp(
         AgentLoop(FakeBackend([]), slow_store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=slow_home,
         console=Console(file=StringIO(), force_terminal=True),
@@ -1871,7 +1871,7 @@ async def test_exec_macro_streams_receipt_writes_log_and_skips_provider(
     output = StringIO()
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=output, force_terminal=False),
@@ -1901,7 +1901,7 @@ async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         approval_policy=policy,
@@ -1982,7 +1982,7 @@ async def test_exec_macro_approval_card_shows_argv_via_trusted_display(
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         approval_policy=policy,
@@ -2018,7 +2018,7 @@ async def test_exec_macro_deny_renders_denied_receipt(tmp_path: Path) -> None:
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         approval_policy=policy,
@@ -2053,7 +2053,7 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
             FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path),
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=output, force_terminal=False),
@@ -2117,7 +2117,7 @@ async def test_macro_input_loop_keeps_processing_approval_input(tmp_path: Path) 
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         approval_policy=policy,
@@ -2148,7 +2148,7 @@ async def test_macro_receipts_queue_until_the_next_provider_turn(tmp_path: Path)
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
@@ -2175,7 +2175,7 @@ async def test_macro_receipts_commit_in_submission_order_when_completion_reverse
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
@@ -2222,7 +2222,7 @@ async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
@@ -2268,7 +2268,7 @@ async def test_two_macros_queued_prompt_and_abort_keep_receipt_order(
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
@@ -2316,7 +2316,7 @@ async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> N
     _write_command(home / "commands", "wait", "---\nkind: exec\n---\nsleep 30")
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
@@ -2360,7 +2360,7 @@ async def test_exec_macro_timeout_has_a_distinct_receipt_status(tmp_path: Path) 
             FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path),
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=home,
         console=Console(file=output, force_terminal=False),

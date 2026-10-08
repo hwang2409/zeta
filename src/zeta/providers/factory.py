@@ -3,9 +3,8 @@
 The agent tool lets a child run on a different model than its parent, so backend
 construction has to be reachable from outside the TUI, where it used to live.
 
-Only the real providers are built here. The offline "fake" provider lives in the
-TUI layer, which this layer must not import, so tui.app wraps this factory and
-handles that case itself.
+Only real providers are built here. Test backends are injected at the runtime
+composition seam and are not part of this module.
 """
 
 from __future__ import annotations

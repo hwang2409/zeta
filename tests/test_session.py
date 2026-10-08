@@ -22,7 +22,7 @@ from zeta.cli.main import build_parser, main
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
@@ -47,7 +47,7 @@ from zeta.tui.layout import CONTENT_MARGIN, content_width
 
 
 def _args(*values: str):
-    return build_parser().parse_args([*values, "--provider", "fake"])
+    return build_parser().parse_args([*values, "--provider", "codex"])
 
 
 def _with_runtime_guidance(prompt: str) -> str:
@@ -115,7 +115,7 @@ def test_fresh_cli_session_writes_versioned_directory(
     metadata = json.loads((session_dir / "meta.json").read_text())
     assert metadata["version"] == 1
     assert metadata["session_id"] == app.loop.store.session_id
-    assert metadata["provider"] == "fake"
+    assert metadata["provider"] == "codex"
     assert metadata["cwd"] == str(tmp_path)
 
 
@@ -156,7 +156,7 @@ def test_resume_rebuilds_default_context_from_stored_directory(
     monkeypatch.chdir(other)
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
@@ -174,7 +174,7 @@ def test_legacy_empty_prompt_resume_builds_default_from_stored_cwd(
     context_file.write_text("legacy rules", encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    opened = SessionManager(home).create(provider="codex", model="offline", cwd=tmp_path)
     metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata.pop("system_prompt")
@@ -183,7 +183,7 @@ def test_legacy_empty_prompt_resume_builds_default_from_stored_cwd(
     opened.store.close()
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "codex"])
     )
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
 
@@ -208,7 +208,7 @@ def test_legacy_resume_hydrates_without_bumping_updated_at(
     (tmp_path / "AGENTS.md").write_text("legacy rules", encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    opened = SessionManager(home).create(provider="codex", model="offline", cwd=tmp_path)
     session_id = opened.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -220,7 +220,7 @@ def test_legacy_resume_hydrates_without_bumping_updated_at(
     opened.store.close()
 
     hydrated_app = create_app(
-        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     hydrated_app.loop.store.close()
     hydrated = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -268,7 +268,7 @@ def test_first_legacy_resume_with_explicit_prompt_bumps_updated_at(
     (tmp_path / "AGENTS.md").write_text("legacy rules", encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    opened = SessionManager(home).create(provider="codex", model="offline", cwd=tmp_path)
     session_id = opened.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -315,7 +315,7 @@ def test_legacy_resume_does_not_marker_scan_skill_index(
         "</zeta-skills>\n\nlegacy tail"
     )
     opened = SessionManager(home).create(
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=tmp_path,
         system_prompt=legacy_prompt,
@@ -323,7 +323,7 @@ def test_legacy_resume_does_not_marker_scan_skill_index(
     opened.store.close()
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "codex"])
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
@@ -340,7 +340,7 @@ def test_legacy_resume_preserves_unterminated_skill_index(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
     opened = SessionManager(home).create(
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=tmp_path,
         system_prompt="legacy\n<zeta-skills>\nAvailable skills:\n- old: old",
@@ -348,7 +348,7 @@ def test_legacy_resume_preserves_unterminated_skill_index(
     opened.store.close()
     resumed = create_app(
         build_parser().parse_args(
-            ["--resume", opened.store.session_id, "--provider", "fake"]
+            ["--resume", opened.store.session_id, "--provider", "codex"]
         )
     )
 
@@ -383,7 +383,7 @@ def test_legacy_empty_prompt_adopts_live_default_recipe(
     context_file.write_text("first rules", encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    opened = SessionManager(home).create(provider="codex", model="offline", cwd=tmp_path)
     metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata.pop("system_prompt")
@@ -392,13 +392,13 @@ def test_legacy_empty_prompt_adopts_live_default_recipe(
 
     opened.store.close()
     first_resume = create_app(
-        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "codex"])
     )
     first_resume.loop.store.close()
     context_file.write_text("second rules", encoding="utf-8")
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "codex"])
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
@@ -427,7 +427,7 @@ def test_partial_context_metadata_preserves_recorded_prompt_bytes(
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
@@ -530,7 +530,7 @@ def test_resume_without_flags_recomposes_default_snapshot(
     (tmp_path / "AGENTS.md").write_text("mutated rules", encoding="utf-8")
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -565,7 +565,7 @@ async def test_resume_rebuilds_current_skill_catalog_for_prompt_and_tool(
     first.loop.store.close()
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
     loaded = await resumed.loop.tool_registry.execute(
@@ -611,7 +611,7 @@ def test_second_resume_after_override_sees_overridden_snapshot(
     overridden.loop.store.close()
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
@@ -623,7 +623,7 @@ def test_session_bash_cwd_round_trips_through_store_state(
     tmp_path: Path,
 ) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
 
     opened.store.set_bash_cwd("/tmp")
     resumed = manager.open(opened.store.session_id)
@@ -651,8 +651,8 @@ def test_continue_reopens_the_most_recent_session(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
     manager = SessionManager(home)
-    older = manager.create(provider="fake", model="offline", cwd=tmp_path)
-    newer = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    older = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    newer = manager.create(provider="codex", model="offline", cwd=tmp_path)
     older.metadata.updated_at = "2020-01-01T00:00:00+00:00"
     manager._write(older.metadata)
     newer.metadata.updated_at = "2030-01-01T00:00:00+00:00"
@@ -674,7 +674,7 @@ def test_resume_reopens_an_explicit_session(
     session_id = first.loop.store.session_id
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
 
     assert resumed.loop.store.session_id == session_id
@@ -694,7 +694,7 @@ def test_model_swap_persists_and_restores_on_resume(
 
     resumed = create_app(
         build_parser().parse_args(
-            ["--resume", first.loop.store.session_id, "--provider", "fake"]
+            ["--resume", first.loop.store.session_id, "--provider", "codex"]
         )
     )
     assert resumed.model == "faster"
@@ -717,7 +717,7 @@ def test_vim_mode_defaults_on_and_persists_on_resume(
 
     resumed = create_app(
         build_parser().parse_args(
-            ["--resume", first.loop.store.session_id, "--provider", "fake"]
+            ["--resume", first.loop.store.session_id, "--provider", "codex"]
         )
     )
     assert resumed.vim_mode is False
@@ -736,7 +736,7 @@ def test_legacy_session_metadata_defaults_vim_mode_on(
 
     resumed = create_app(
         build_parser().parse_args(
-            ["--resume", first.loop.store.session_id, "--provider", "fake"]
+            ["--resume", first.loop.store.session_id, "--provider", "codex"]
         )
     )
     assert resumed.vim_mode is True
@@ -905,7 +905,7 @@ def test_wrong_provider_model_prefix_is_rejected(tmp_path: Path) -> None:
 async def test_model_swap_is_rejected_during_active_turn(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_task = asyncio.create_task(asyncio.sleep(1))
@@ -930,7 +930,7 @@ def test_model_swap_is_rejected_with_pending_approval(tmp_path: Path) -> None:
     )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
     )
@@ -957,7 +957,7 @@ async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Pat
     )
     app = TUIApp(
         AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
 
@@ -971,8 +971,8 @@ async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Pat
 
 def test_session_previews_are_ordered_and_ansi_safe(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    older = manager.create(provider="fake", model="offline", cwd=tmp_path)
-    newer = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    older = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    newer = manager.create(provider="codex", model="offline", cwd=tmp_path)
     older.store.append_message(
         with_message_origin(Message(MessageRole.USER, [TextContent("older message")]), MessageOrigin.USER)
     )
@@ -1001,7 +1001,7 @@ def test_session_preview_strips_c1_controls_and_truncates_by_cell_width(
     tmp_path: Path,
 ) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     opened.store.append_message(
         with_message_origin(Message(
             MessageRole.USER,
@@ -1020,7 +1020,7 @@ def test_session_preview_strips_zero_width_and_bidi_controls_before_capping(
     tmp_path: Path,
 ) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     opened.store.append_message(
         with_message_origin(Message(
             MessageRole.USER,
@@ -1042,7 +1042,7 @@ def test_session_preview_strips_zero_width_and_bidi_controls_before_capping(
 
 def test_session_preview_keeps_combining_and_emoji_text_safe(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     opened.store.append_message(
         with_message_origin(Message(
             MessageRole.USER,
@@ -1066,7 +1066,7 @@ def test_session_preview_with_no_user_message_returns_empty_string(
     message)) can take over without string-matching the server text."""
 
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     opened.store.close()
 
     previews = manager.list_session_previews()
@@ -1105,7 +1105,7 @@ def test_resume_picker_rejects_zero_and_negative_choices(
     for choice in ("0", "-1"):
         monkeypatch.setattr("builtins.input", lambda prompt, choice=choice: choice)
         with pytest.raises(SessionError, match="invalid resume session selection"):
-            create_app(build_parser().parse_args(["--resume", "--provider", "fake"]))
+            create_app(build_parser().parse_args(["--resume", "--provider", "codex"]))
 
 
 def test_resume_picker_matches_direct_resume(
@@ -1132,11 +1132,11 @@ def test_resume_picker_matches_direct_resume(
     monkeypatch.setattr("builtins.input", lambda prompt: "2")
 
     picked = create_app(
-        build_parser().parse_args(["--resume", "--provider", "fake"])
+        build_parser().parse_args(["--resume", "--provider", "codex"])
     )
     direct = create_app(
         build_parser().parse_args(
-            ["--resume", first.loop.store.session_id, "--provider", "fake"]
+            ["--resume", first.loop.store.session_id, "--provider", "codex"]
         )
     )
 
@@ -1170,7 +1170,7 @@ def test_resume_picker_stays_within_shared_content_width(
         lambda prompt: prompts.append(prompt) or "1",
     )
 
-    create_app(build_parser().parse_args(["--resume", "--provider", "fake"]))
+    create_app(build_parser().parse_args(["--resume", "--provider", "codex"]))
 
     output = capsys.readouterr().out.splitlines()
     assert output
@@ -1253,7 +1253,7 @@ def test_resume_honors_provider_from_settings_file(
     metadata = json.loads(
         (home / "sessions" / session_id / "meta.json").read_text()
     )
-    assert metadata["provider"] == "fake"
+    assert metadata["provider"] == "codex"
     assert metadata["model"] == "offline"
     assert metadata["override_audit"] == []
 
@@ -1341,7 +1341,7 @@ async def test_invalid_model_keeps_forced_override_uncommitted(
 
     metadata = json.loads(metadata_path.read_text())
     assert hashlib.sha256(metadata_path.read_bytes()).hexdigest() == before_digest
-    assert metadata["provider"] == "fake"
+    assert metadata["provider"] == "codex"
     assert metadata["model"] == "offline"
     assert metadata["override_audit"] == []
 
@@ -1417,7 +1417,7 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    opened = SessionManager(home).create(provider="codex", model="offline", cwd=tmp_path)
     call = ToolCall("approval-resume", "bash", {"command": "danger"})
     opened.store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -1427,7 +1427,7 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
 
     app = create_app(
         build_parser().parse_args(
-            ["--resume", opened.store.session_id, "--provider", "fake"]
+            ["--resume", opened.store.session_id, "--provider", "codex"]
         )
     )
     app.console = Console(file=StringIO(), force_terminal=False)
@@ -1447,7 +1447,7 @@ async def test_slash_approve_and_deny_answer_pending_by_key(
     loop = AgentLoop(FakeBackend([]), parent_store, approval_policy=policy, skill_catalog=SkillCatalog.empty())
     app = TUIApp(
         loop,
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
     )
@@ -1506,7 +1506,7 @@ async def test_slash_approve_and_deny_answer_pending_by_key(
 @pytest.mark.asyncio
 async def test_cancel_then_approve_does_not_resume_tool(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     policy = ApprovalPolicy(store=opened.store)
     executed: list[str] = []
 
@@ -1524,7 +1524,7 @@ async def test_cancel_then_approve_does_not_resume_tool(tmp_path: Path) -> None:
             max_turns=1,
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
     )
@@ -1551,7 +1551,7 @@ async def test_cancel_honors_approval_won_by_other_writer(
 ) -> None:
     root = tmp_path / "zeta-home" / "sessions"
     opened = SessionManager(tmp_path / "zeta-home").create(
-        provider="fake", model="offline", cwd=tmp_path
+        provider="codex", model="offline", cwd=tmp_path
     )
     policy = ApprovalPolicy(store=opened.store)
     call = ToolCall("approval-concurrent-cancel", "echo", {"value": "approved"})
@@ -1564,7 +1564,7 @@ async def test_cancel_honors_approval_won_by_other_writer(
             max_turns=1,
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
     )
@@ -1608,7 +1608,7 @@ async def test_resume_pending_tool_executes_and_persists_result(
     tmp_path: Path, decision: str
 ) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     policy = ApprovalPolicy(store=opened.store)
     executed: list[str] = []
 
@@ -1649,7 +1649,7 @@ skill_catalog=SkillCatalog.empty(),
 @pytest.mark.asyncio
 async def test_resumed_tool_abort_active_persists_canceled_result(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     policy = ApprovalPolicy(store=opened.store)
     started = asyncio.Event()
 
@@ -1673,7 +1673,7 @@ skill_catalog=SkillCatalog.empty(),
     )
     app = TUIApp(
         loop,
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
     )
@@ -1690,7 +1690,7 @@ skill_catalog=SkillCatalog.empty(),
 @pytest.mark.asyncio
 async def test_resumed_tool_direct_cancel_persists_canceled_result(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     policy = ApprovalPolicy(store=opened.store)
     started = asyncio.Event()
 
@@ -1733,7 +1733,7 @@ async def test_resumed_tool_immediate_abort_persists_canceled_result(
     tmp_path: Path,
 ) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     policy = ApprovalPolicy(store=opened.store)
 
     async def never_runs(arguments: dict[str, str]) -> str:
@@ -1765,7 +1765,7 @@ skill_catalog=SkillCatalog.empty(),
 
 def test_finalize_canceled_is_idempotent(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     call = ToolCall("approval-idempotent-cancel", "never", {})
     opened.store.append_message_with_approval_requests(
@@ -1788,7 +1788,7 @@ def test_finalize_canceled_is_idempotent(tmp_path: Path) -> None:
 
 def test_completion_edge_idempotence_preserves_success(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     call = ToolCall("approval-completion-edge", "never", {})
     opened.store.append_message_with_approval_requests(
@@ -1861,7 +1861,7 @@ async def test_resume_does_not_act_on_stale_state_while_writer_holds_lock(
 @pytest.mark.asyncio
 async def test_resume_pending_tool_rejects_existing_result(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     policy = ApprovalPolicy(store=opened.store)
     executed: list[str] = []
 
@@ -1906,7 +1906,7 @@ async def test_summary_success_commits_override_before_main_failure(
     home = tmp_path / "zeta-home"
     manager = SessionManager(home)
     opened = manager.create(
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=tmp_path,
         retained_tail=35,
@@ -1950,7 +1950,7 @@ async def test_summary_success_commits_override_before_main_failure(
 
 def test_concurrent_overrides_are_first_writer_wins(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     session_id = opened.store.session_id
     managers = [SessionManager(manager.home), SessionManager(manager.home)]
     metadata = [item.open(session_id).metadata for item in managers]
@@ -1985,7 +1985,7 @@ def test_concurrent_overrides_are_first_writer_wins(tmp_path: Path) -> None:
 def test_sequential_overrides_use_latest_snapshot(tmp_path: Path) -> None:
     home = tmp_path / "zeta-home"
     manager = SessionManager(home)
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
 
     manager.record_override(
         opened.metadata,
@@ -2011,7 +2011,7 @@ def test_sequential_overrides_use_latest_snapshot(tmp_path: Path) -> None:
 def test_metadata_override_and_touch_are_serialized(tmp_path: Path) -> None:
     home = tmp_path / "zeta-home"
     manager = SessionManager(home)
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     session_id = opened.store.session_id
     override_manager = SessionManager(home)
     touch_manager = SessionManager(home)
@@ -2054,8 +2054,8 @@ def test_session_id_collision_retries(
 
     calls = iter([collision, collision, unique])
     monkeypatch.setattr("zeta.core.session.uuid", SimpleNamespace(uuid4=lambda: next(calls)))
-    manager.create(provider="fake", model="offline", cwd=tmp_path)
-    created = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    manager.create(provider="codex", model="offline", cwd=tmp_path)
+    created = manager.create(provider="codex", model="offline", cwd=tmp_path)
 
     assert created.store.session_id == unique.hex
 
@@ -2065,7 +2065,7 @@ def test_session_cwd_is_normalized_for_continue(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=Path("."))
+    opened = manager.create(provider="codex", model="offline", cwd=Path("."))
 
     assert manager.find_most_recent(cwd=Path.cwd()).session_id == opened.store.session_id
 
@@ -2075,7 +2075,7 @@ async def test_resume_replays_historical_agent_wait_call_with_fake_provider(
     tmp_path: Path,
 ) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     historical = ToolCall("old-wait", "agent_wait", {"handles": ["child"]})
     opened.store.append_message(
         Message(MessageRole.ASSISTANT, [ToolUseContent(historical)])
@@ -2102,7 +2102,7 @@ async def test_resume_replays_historical_agent_wait_call_with_fake_provider(
 @pytest.mark.asyncio
 async def test_resume_replays_the_same_context_branch(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("first")])])
     loop = AgentLoop(backend, opened.store, skill_catalog=SkillCatalog.empty())
     [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
@@ -2116,7 +2116,7 @@ async def test_resume_replays_the_same_context_branch(tmp_path: Path) -> None:
 
 def test_resume_reemits_pending_approval_state(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     call = ToolCall("approval-1", "bash", {"command": "danger"})
     opened.store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -2279,7 +2279,7 @@ def test_copy_metadata_adopts_every_dataclass_field(tmp_path: Path) -> None:
 
     target = SessionMetadata.new(
         session_id="a" * 32,
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=str(tmp_path),
         retained_tail=8,
@@ -2303,7 +2303,7 @@ def test_prompt_component_digest_must_match_owned_span(tmp_path: Path) -> None:
 
     metadata = SessionMetadata.new(
         session_id="a" * 32,
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=str(tmp_path),
         retained_tail=8,
@@ -2339,7 +2339,7 @@ def test_invalid_model_fallback_metadata_fails_closed(tmp_path, fallback):
 def test_session_rename_cli_persists_and_clears(tmp_path, monkeypatch):
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
     manager = SessionManager(tmp_path)
-    session = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    session = manager.create(provider="codex", model="offline", cwd=tmp_path)
     sid = session.metadata.session_id
     assert main(["session", "rename", sid[:8], "  useful   name "]) == 0
     assert SessionManager(tmp_path).open(sid).metadata.name == "useful name"
@@ -2379,7 +2379,7 @@ def test_session_delete_does_not_follow_links(tmp_path, link_location):
 @pytest.mark.parametrize("corruption", ["missing_metadata", "bad_metadata", "bad_conversation"])
 def test_session_delete_does_not_read_corrupt_data(tmp_path, corruption):
     manager = SessionManager(tmp_path)
-    session = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    session = manager.create(provider="codex", model="offline", cwd=tmp_path)
     sid = session.metadata.session_id
     directory = manager.sessions_dir / sid
     if corruption == "missing_metadata":
@@ -2398,7 +2398,7 @@ def test_new_session_defaults_to_evict(
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
 
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
 
     assert app.loop.context_assembler.compaction == "evict"
     assert "recall_history" in app.loop.tool_registry.registered_names
@@ -2417,7 +2417,7 @@ def test_new_session_can_select_summary(
 
     app = create_app(
         build_parser().parse_args(
-            ["--provider", "fake", "--compaction", "summary"]
+            ["--provider", "codex", "--compaction", "summary"]
         )
     )
 
@@ -2436,7 +2436,7 @@ def test_compaction_mode_persists_and_survives_resume(
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     first = create_app(
-        build_parser().parse_args(["--provider", "fake", "--compaction", "evict"])
+        build_parser().parse_args(["--provider", "codex", "--compaction", "evict"])
     )
     session_id = first.loop.store.session_id
     assert first.loop.context_assembler.compaction == "evict"
@@ -2466,7 +2466,7 @@ def test_legacy_session_without_compaction_resumes_as_summary(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    first = create_app(build_parser().parse_args(["--provider", "fake"]))
+    first = create_app(build_parser().parse_args(["--provider", "codex"]))
     session_id = first.loop.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text())

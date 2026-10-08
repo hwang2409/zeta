@@ -864,7 +864,7 @@ def test_status_lists_loaded_context_files() -> None:
     output = _format_status(
         SlashStatus(
             session_id="session",
-            provider="fake",
+            provider="codex",
             model="offline",
             retained_tail=8,
             tokens_used_this_session=0,
@@ -1191,7 +1191,7 @@ def test_session_metadata_partial_memory_span_is_legacy(
     from zeta.core.session import SessionManager, SessionMetadata
 
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     data = opened.metadata.to_dict()
     opened.store.close()
     data["project_memory_offset"] = offset
@@ -1213,7 +1213,7 @@ def test_session_metadata_rejects_malformed_digest(tmp_path: Path, digest) -> No
     from zeta.core.session import SessionError, SessionManager, SessionMetadata
 
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     data = opened.metadata.to_dict()
     opened.store.close()
     # All three components present, so the span is authoritative; only the

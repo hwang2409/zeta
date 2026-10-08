@@ -127,7 +127,7 @@ def test_eval_replays_pinned_zeta_checkout(tmp_path: Path) -> None:
             "prompt": "hello",
             "checks": [{"command": ["git", "rev-parse", "HEAD"], "stdout": ref + "\n"}],
         },
-        provider="fake", model="fake", timeout=20, keep_workspaces=tmp_path,
+        provider="codex", model="fake", timeout=20, keep_workspaces=tmp_path,
     )
     assert result["passed"] is True
     saved = Path(result["saved_workspace"])
@@ -137,7 +137,7 @@ def test_eval_replays_pinned_zeta_checkout(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="full lowercase commit SHA"):
         eval_run.run_task(
             {"id": "invalid", "git_ref": "HEAD", "prompt": "hello", "checks": []},
-            provider="fake", model="fake", timeout=20,
+            provider="codex", model="fake", timeout=20,
         )
 
 

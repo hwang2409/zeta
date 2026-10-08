@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     ErrorInfo,
@@ -116,7 +116,7 @@ async def test_duplicate_send_starts_one_turn(tmp_path: Path) -> None:
             {"protocol_version": "1.1", "features": ["delivery_id"]},
         )
         assert hello[-1]["result"]["capabilities"]["features"] == ["delivery_id"]
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         first = await _request(
             reader,
             writer,
@@ -171,7 +171,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
             "hello",
             {"protocol_version": "1.1", "features": ["delivery_id"]},
         )
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "read"})
         await _event(reader, "approval_request")
         accepted = await _request(
@@ -241,7 +241,7 @@ async def test_server_restart_keeps_delivery_deduplication(tmp_path: Path) -> No
         "hello",
         {"protocol_version": "1.1", "features": ["delivery_id"]},
     )
-    created = await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+    created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     session_id = created[-1]["result"]["session"]["session_id"]
     await _request(
         reader,
@@ -295,7 +295,7 @@ async def test_delivery_status_unknown_and_feature_gate(tmp_path: Path) -> None:
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         rejected = await _request(
             reader,
             writer,
@@ -465,7 +465,7 @@ async def test_evicted_delivery_status_and_send_reuse_are_distinct(
             "hello",
             {"protocol_version": "1.1", "features": ["delivery_id"]},
         )
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         _evict_delivery(server.runtime.opened.store, "old-send")
 
         status = await _request(
@@ -515,7 +515,7 @@ async def test_evicted_dropped_steer_status_and_reuse_are_distinct(
             "hello",
             {"protocol_version": "1.1", "features": ["delivery_id"]},
         )
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         _evict_delivery(
             server.runtime.opened.store,
             "old-steer",
@@ -560,7 +560,7 @@ async def test_restart_rebuilds_evicted_delivery_outcome(tmp_path: Path) -> None
         "hello",
         {"protocol_version": "1.1", "features": ["delivery_id"]},
     )
-    created = await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+    created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     session_id = created[-1]["result"]["session"]["session_id"]
     _evict_delivery(first.runtime.opened.store, "restart-old")
     await _close(first, writer)
@@ -623,7 +623,7 @@ async def _queued_steer_server(tmp_path: Path, suffix: str):
             "features": ["delivery_id", "abort_scope"],
         },
     )
-    await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+    await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     await _request(reader, writer, 3, "send", {"text": "wait"})
     await asyncio.wait_for(backend.started.wait(), TIMEOUT)
     accepted = await _request(
@@ -727,7 +727,7 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
     first = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-restart-1"))
     reader, writer = await _connect(first)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
-    created = await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+    created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     session_id = created[-1]["result"]["session"]["session_id"]
     await _close(first, writer)
 
@@ -774,7 +774,7 @@ async def test_orphan_steer_is_rejected_without_acceptance(tmp_path: Path) -> No
             "hello",
             {"protocol_version": "1.1", "features": ["delivery_id"]},
         )
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         rejected = await _request(
             reader,
             writer,
@@ -846,7 +846,7 @@ async def test_failed_turn_drops_queued_steering_before_next_turn(tmp_path: Path
             reader, writer, 1, "hello",
             {"protocol_version": "1.1", "features": ["delivery_id"]},
         )
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "first"})
         await asyncio.wait_for(backend.started.wait(), TIMEOUT)
         await _request(
@@ -900,7 +900,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
             {"protocol_version": "1.1", "features": ["delivery_id"]},
         )
         created = await _request(
-            reader, writer, 2, "new_session", {"provider": "fake"}
+            reader, writer, 2, "new_session", {"provider": "codex"}
         )
         session_id = created[-1]["result"]["session"]["session_id"]
         original = server.runtime.loop.context_assembler.assemble

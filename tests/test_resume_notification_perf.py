@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.text import Text
 
 from zeta.agent.background import recover_agent_children
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -339,7 +339,7 @@ def _notification_replay_app(
     ]
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
         resumed=True,
@@ -426,7 +426,7 @@ async def test_tui_replay_scans_notifications_constant_times_and_batches_markers
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
         resumed=True,
@@ -462,7 +462,7 @@ async def test_tui_replay_scans_notifications_constant_times_and_batches_markers
     second_output = StringIO()
     second_app = TUIApp(
         AgentLoop(FakeBackend([]), reopened, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=second_output, force_terminal=False),
         resumed=True,

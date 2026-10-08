@@ -17,8 +17,8 @@ from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.login_flow import run_login
 from ..core.session import SessionError, env_home
+from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..providers.login import build_login_provider, pkce_values
-from ..providers.scripted_fake import FakeScriptError
 from ..tui.app import create_app
 
 
@@ -91,6 +91,18 @@ class _ArgumentParser(argparse.ArgumentParser):
         return parsed
 
 
+def _provider_name(value: str) -> str:
+    if value == "fake":
+        raise argparse.ArgumentTypeError(
+            REMOVED_PROVIDER_ERROR
+        )
+    if value not in PROVIDERS:
+        raise argparse.ArgumentTypeError(
+            f"invalid provider {value!r}; choose claude, codex or ollama"
+        )
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(
         description="chat with the zeta harness",
@@ -98,7 +110,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--provider",
-        choices=("fake", "claude", "codex", "ollama"),
+        type=_provider_name,
+        choices=("claude", "codex", "ollama"),
         help="completion provider",
     )
     parser.add_argument("--model", help="provider model override")
@@ -315,7 +328,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument(
         "--provider",
         dest="serve_provider",
-        choices=("fake", "claude", "codex", "ollama"),
+        type=_provider_name,
+        choices=("claude", "codex", "ollama"),
     )
     serve_parser.add_argument("--model", dest="serve_model")
     serve_parser.add_argument("--cwd", help="working directory for new sessions")
@@ -597,7 +611,7 @@ def main(argv: list[str] | None = None) -> int:
                 app = asyncio.run(asyncio.to_thread(create_app, args))
             else:
                 app = create_app(args)
-        except (SessionError, FakeScriptError) as exc:
+        except SessionError as exc:
             parser.error(str(exc))
         try:
             with patch_stdout(raw=True):

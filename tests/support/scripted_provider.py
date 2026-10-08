@@ -1,4 +1,4 @@
-"""Scripted offline provider for ``--provider fake`` with ``ZETA_FAKE_SCRIPT``.
+"""Scripted offline provider for ``--provider codex`` with ``ZETA_FAKE_SCRIPT``.
 
 The script is a JSON file. It maps user messages to a list of model responses.
 Tool calls in a response go through the normal agent loop, so the tool
@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..protocol.types import (
+from zeta.protocol.types import (
     CompletionBackend,
     ContentBlock,
     ErrorInfo,

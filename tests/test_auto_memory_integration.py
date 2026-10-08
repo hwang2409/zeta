@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from zeta.config.settings import load_settings, resolve
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import OpenedSession, SessionManager
 from zeta.core.slash import create_slash_registry
@@ -160,7 +160,7 @@ async def test_composed_runtime_reconciles_real_persisted_trigger_and_notices(
         cwd=workspace,
         manager=manager,
         config=config,
-        provider="fake",
+        provider="codex",
         model="unused-main",
         project_context=ProjectContext("system", ()),
         backend_builder=backend_builder,
@@ -249,7 +249,7 @@ async def test_attention_fork_composition_cannot_write_project_memory(
     project = manager.project_registry.create_project("demo", "scope", workspace)
     manager.project_registry.initialize_memory(project.project_id)
     original = manager.create(
-        provider="fake",
+        provider="codex",
         model="fake",
         cwd=workspace,
         project_id=project.project_id,
@@ -285,7 +285,7 @@ async def test_attention_fork_composition_cannot_write_project_memory(
         cwd=workspace,
         manager=manager,
         config=config,
-        provider="fake",
+        provider="codex",
         model="fake",
         project_context=ProjectContext("system", ()),
         backend_builder=backend_builder,
@@ -332,7 +332,7 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
     manager = SessionManager(home)
     project = manager.project_registry.create_project("demo", "scope", workspace)
     original = manager.create(
-        provider="fake",
+        provider="codex",
         model="fake",
         cwd=workspace,
         project_id=project.project_id,
@@ -365,7 +365,7 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
             cwd=workspace,
             manager=manager,
             config=config,
-            provider="fake",
+            provider="codex",
             model="fake",
             project_context=ProjectContext("system", ()),
             backend_builder=backend_builder,

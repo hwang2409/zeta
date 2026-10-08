@@ -17,7 +17,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -273,7 +273,7 @@ async def test_pipeline_routes_default_submission_as_steer(tmp_path: Path) -> No
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -317,7 +317,7 @@ async def test_backslash_prefix_defers_to_after_turn_end(tmp_path: Path) -> None
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -361,7 +361,7 @@ async def test_abort_drops_pending_steering(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -421,7 +421,7 @@ async def test_toolless_turn_drops_orphan_steer_and_notifies(
     output = StringIO()
     app = TUIApp(
         AgentLoop(backend, store, max_turns=3, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -601,7 +601,7 @@ async def test_passthrough_runs_shell_without_provider_call(tmp_path: Path) -> N
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -631,7 +631,7 @@ async def test_passthrough_repeat_uses_last_command(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -658,7 +658,7 @@ async def test_passthrough_repeat_without_history_notes_error(tmp_path: Path) ->
     output = StringIO()
     app = TUIApp(
         AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -682,7 +682,7 @@ async def test_passthrough_respects_approval_policy(tmp_path: Path) -> None:
     policy = ApprovalPolicy(default=ApprovalDecision.DENY, store=store)
     app = TUIApp(
         AgentLoop(backend, store, approval_policy=policy, max_turns=1, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),

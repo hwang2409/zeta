@@ -67,7 +67,7 @@ def _spy_mcp_server(home: Path, marker: Path) -> None:
 
 
 def _args(*extra: str) -> object:
-    return build_parser().parse_args(["--provider", "fake", "--computer", *extra])
+    return build_parser().parse_args(["--provider", "codex", "--computer", *extra])
 
 
 @pytest.mark.asyncio
@@ -214,14 +214,14 @@ async def test_disallowed_tools_still_narrow_a_computer_session(
 async def test_computer_restart_narrows_an_existing_session(
     home: Path, removed_sessions: list[str]
 ) -> None:
-    args = build_parser().parse_args(["--provider", "fake", "-p", "go"])
+    args = build_parser().parse_args(["--provider", "codex", "-p", "go"])
     plain = create_app(args)
     session_id = plain.loop.store.session_id
     assert "bash" in plain.loop.tool_registry.registered_names
     assert plain.computer_session is None
     await plain.close()
 
-    restart_args(args, session_id=session_id, provider="fake", model=plain.model)
+    restart_args(args, session_id=session_id, provider="codex", model=plain.model)
     assert args.tools == TOOLS_ARGUMENT and args.require_tools is True
     reopened = create_app(args)
     try:

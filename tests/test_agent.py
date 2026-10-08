@@ -32,7 +32,7 @@ from zeta.agent.runner import _child_base_system_prompt
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
     ConversationStore,
@@ -845,7 +845,7 @@ async def test_user_submission_waits_behind_notification_wake(
     )
     app = TUIApp(
         AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )

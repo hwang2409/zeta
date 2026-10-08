@@ -29,6 +29,7 @@ def pytest_configure(config: pytest.Config) -> None:
     fake_home = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-home-"))
     monkeypatch = cleanup.enter_context(pytest.MonkeyPatch.context())
     monkeypatch.setenv("HOME", fake_home)
+    monkeypatch.setenv("ZETA_TEST_SCRIPTED_PROVIDER", "1")
     # Toolchain caches (rustup/cargo) invoked by any subprocess belong outside
     # the watched home; the guard polices zeta's writes, not toolchain caches.
     toolchain = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-toolchain-"))
@@ -433,3 +434,19 @@ def block_real_http_connections(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", blocked_sync)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", blocked_async)
+
+@pytest.fixture(autouse=True)
+def _inject_scripted_completion_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep provider-backed tests offline through the production backend seam."""
+    from tests.support.tui_backend import FakeInteractiveBackend
+    from zeta.tui import app as tui_app
+
+    def build_backend(provider: str, model: str | None, **_kwargs: object):
+        selected = model or {
+            "claude": "claude-sonnet-4-6",
+            "codex": "gpt-5.6-luna",
+            "ollama": "qwen3:4b",
+        }[provider]
+        return FakeInteractiveBackend(delay=0, model=selected), selected
+
+    monkeypatch.setattr(tui_app, "build_backend", build_backend)

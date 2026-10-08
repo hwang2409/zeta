@@ -112,10 +112,10 @@ def test_entrypoint_shutdown_releases_every_lease(
         monkeypatch.setattr(TUIApp, "_read_prompt", prompt)
     monkeypatch.setattr(TUIApp, "_rebuild_transcript_async", startup_async)
     monkeypatch.setattr("zeta.runtime.headless.drive_turn", turn)
-    args = build_parser().parse_args(["--provider", "fake"])
+    args = build_parser().parse_args(["--provider", "codex"])
 
     async def server():
-        server = ZetaServer(home=home, cwd=tmp_path, provider="fake", port=0)
+        server = ZetaServer(home=home, cwd=tmp_path, provider="codex", port=0)
         monkeypatch.setattr(server.runtime, "_bind_background_event_sink", startup)
         try:
             await server.start()
@@ -130,7 +130,7 @@ def test_entrypoint_shutdown_releases_every_lease(
         elif entry == "headless":
             assert run_headless(args, "hello") == 0
         elif entry == "tui-new":
-            assert main(["--provider", "fake"]) == 0
+            assert main(["--provider", "codex"]) == 0
         else:
             asyncio.run(build_app(args).run())
 
@@ -155,7 +155,7 @@ async def test_closed_app_rejects_snapshot_access(
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     if opened_snapshots:
         app._snapshots()
     await app.close()
@@ -172,7 +172,7 @@ async def test_server_cleanup_continues_after_close_error(
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    server = ZetaServer(home=home, cwd=tmp_path, provider="fake", port=0)
+    server = ZetaServer(home=home, cwd=tmp_path, provider="codex", port=0)
     await server.start()
     await server.runtime.create_session()
     loop = server.runtime.loop
@@ -225,7 +225,7 @@ def test_construction_failure_releases_storage(
     manager = SessionManager(home)
     session_id = None
     if resume:
-        opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+        opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
         session_id = opened.metadata.session_id
         opened.store.close()
     retained = []
@@ -242,10 +242,10 @@ def test_construction_failure_releases_storage(
         monkeypatch.setattr(ServerRuntime, "_bind_background_event_sink", fail)
     else:
         monkeypatch.setattr("zeta.tui.bootstrap._validate_keybindings", fail)
-    argv = ["--provider", "fake"] + (["--resume", session_id] if resume else [])
+    argv = ["--provider", "codex"] + (["--resume", session_id] if resume else [])
 
     async def server():
-        runtime = ServerRuntime(home, cwd=tmp_path, provider="fake")
+        runtime = ServerRuntime(home, cwd=tmp_path, provider="codex")
         if session_id:
             await runtime.resume_session(session_id)
         else:
@@ -266,7 +266,7 @@ def test_construction_failure_releases_storage(
 @pytest.mark.usefixtures("no_gc")
 def test_snapshot_close_releases_its_independent_lease(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     snapshots = WorkspaceSnapshotStore(opened.store.session_dir, opened.store.session_id)
     opened.store.close()
     with pytest.raises(SessionInUseError):
@@ -283,7 +283,7 @@ async def test_tui_cleanup_continues_after_close_error(
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     snapshots = app._snapshots()
     registry = app.loop.tool_registry.background_tasks
     original_registry_close = registry.close
@@ -322,13 +322,13 @@ async def test_shutdown_releases_child_stores(
     startup_failure: bool,
 ) -> None:
     from zeta.core.abort import AbortSignal
-    from zeta.core.fake import FakeBackend, ScriptedTurn
+    from tests.support.fake_backend import FakeBackend, ScriptedTurn
     from zeta.protocol.types import TextContent, ToolCall
 
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    runtime = ServerRuntime(home, cwd=tmp_path, provider="fake")
+    runtime = ServerRuntime(home, cwd=tmp_path, provider="codex")
     await runtime.create_session()
     loop = runtime.loop
     assert loop is not None
@@ -355,12 +355,12 @@ def test_recovery_and_send_release_borrowed_child_stores(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from zeta.agent.background import recover_agent_children
-    from zeta.core.fake import FakeBackend
+    from tests.support.fake_backend import FakeBackend
     from zeta.protocol.types import ToolCall
     from zeta.tools.agent_send import send_to_run
 
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     call = ToolCall("child", "agent", {"prompt": "hello", "description": "child"})
     with ConversationStore(opened.store.session_dir / "agents", session_id="1") as child:
@@ -403,7 +403,7 @@ async def test_closed_tui_drops_callbacks_without_gc(
 
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
     monkeypatch.chdir(tmp_path)
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     app._snapshots()
     loop = app.loop
     reference = weakref.ref(app)

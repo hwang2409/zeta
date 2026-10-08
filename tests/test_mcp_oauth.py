@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from zeta.core.abort import AbortSignal
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.mcp import (
     MCPServerConfig,

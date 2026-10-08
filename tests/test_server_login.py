@@ -217,7 +217,7 @@ async def test_unknown_provider_rejected_and_idle_cancel_is_safe(tmp_path):
 ])
 async def test_login_action_uses_failed_provider_before_model_revert(tmp_path, version, provider_error, background, status, expected):
     from tests.test_server import _event
-    from zeta.core.fake import FakeBackend
+    from tests.support.fake_backend import FakeBackend
     from zeta.protocol.types import ErrorInfo, StreamEvent, StreamEventType
     from zeta.server import model_selection
 

@@ -9,7 +9,7 @@ import pytest
 
 from zeta.agent.durable import durable_message
 from zeta.config.settings import load_settings, resolve
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
@@ -839,7 +839,7 @@ async def test_server_provider_switch_resolves_ollama_endpoint_centrally(
     home = tmp_path / "home"
     project = tmp_path / "project"
     expected = _endpoint_sources(home, project / ".zeta", monkeypatch, environment_wins)
-    runtime = ServerRuntime(home, cwd=project, provider="fake")
+    runtime = ServerRuntime(home, cwd=project, provider="codex")
     backend = runtime.backend_for_model("ollama", "locally-created-model")
     assert isinstance(backend, OllamaBackend)
     assert backend.base_url == expected

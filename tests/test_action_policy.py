@@ -19,7 +19,7 @@ from zeta.core.approval import (
     ApprovedCwdExecution,
     parse_approval_rule,
 )
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,

@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.text import Text
 
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -1723,7 +1723,7 @@ def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) ->
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     calls: list[object] = []
@@ -1767,7 +1767,7 @@ async def test_child_approval_surfaces_when_view_is_closed_or_open(
             skip_mcp_mount=True,
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
         console=Console(file=output, force_terminal=False),
@@ -1816,7 +1816,7 @@ async def test_child_approval_exits_navigation_in_full_screen(
             skip_mcp_mount=True,
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
         console=Console(force_terminal=False),

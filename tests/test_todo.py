@@ -11,7 +11,7 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.core.todo import TODO_STATUSES, todo_items_for_display
@@ -486,7 +486,7 @@ async def test_todo_widget_keeps_overflow_summary_in_an_80_by_24_terminal(
     )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="standard"),
     )
@@ -531,7 +531,7 @@ def test_status_includes_todo_counts_only_when_nonempty(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -554,7 +554,7 @@ def test_full_screen_layout_places_todo_between_transcript_and_composer(
             ConversationStore(tmp_path / "sessions"),
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )

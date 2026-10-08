@@ -19,7 +19,7 @@ from zeta.cli.main import main
 from zeta.compaction import fallback_summary
 from zeta.context_eviction import recall_history
 from zeta.core.context import ContextAssembler
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,

@@ -20,7 +20,7 @@ from zeta.context_eviction import (
     recall_history,
 )
 from zeta.core.context import CompactionPolicy, ContextAssembler
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,

@@ -102,7 +102,7 @@ def test_child_registry_can_narrow_but_cannot_widen_tool_policy(tmp_path: Path) 
 def test_tool_policy_round_trips_in_session_metadata(tmp_path: Path) -> None:
     metadata = SessionMetadata.new(
         session_id="session-1",
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=str(tmp_path),
         retained_tail=8,
@@ -129,7 +129,7 @@ async def test_resume_intersects_and_persists_invocation_tool_policy(
     home.mkdir()
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    first = create_app(build_parser().parse_args(["--provider", "fake"]))
+    first = create_app(build_parser().parse_args(["--provider", "codex"]))
     session_id = first.loop.store.session_id
     await first.close()
 
@@ -159,7 +159,7 @@ async def test_resume_intersects_and_persists_invocation_tool_policy(
         await narrowed.close()
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     try:
         assert "bash" not in resumed.loop.tool_registry.registered_names
@@ -198,7 +198,7 @@ async def test_resume_intersects_persisted_policy_with_ambient_policy(
     )
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     try:
         assert resumed.loop.tool_registry.tool_policy.allow_layers == (
@@ -219,7 +219,7 @@ async def test_server_resume_applies_server_policy_as_upper_bound(tmp_path: Path
     from zeta.server.runtime import ServerRuntime
 
     home = tmp_path / "home"
-    first = ServerRuntime(home, cwd=tmp_path, provider="fake")
+    first = ServerRuntime(home, cwd=tmp_path, provider="codex")
     try:
         metadata = await first.create_session()
         session_id = metadata.session_id
@@ -227,7 +227,7 @@ async def test_server_resume_applies_server_policy_as_upper_bound(tmp_path: Path
         await first.close()
 
     restricted = ServerRuntime(
-        home, cwd=tmp_path, provider="fake", tools="computer__*"
+        home, cwd=tmp_path, provider="codex", tools="computer__*"
     )
     try:
         await restricted.resume_session(session_id)
@@ -246,7 +246,7 @@ async def test_server_require_tools_checks_effective_resume_policy(
     from zeta.server.runtime import ServerRuntime
 
     home = tmp_path / "home"
-    first = ServerRuntime(home, cwd=tmp_path, provider="fake", tools="read")
+    first = ServerRuntime(home, cwd=tmp_path, provider="codex", tools="read")
     try:
         metadata = await first.create_session()
         session_id = metadata.session_id
@@ -256,7 +256,7 @@ async def test_server_require_tools_checks_effective_resume_policy(
     restricted = ServerRuntime(
         home,
         cwd=tmp_path,
-        provider="fake",
+        provider="codex",
         tools="definitely_missing_tool",
         require_tools=True,
     )
@@ -272,7 +272,7 @@ async def test_server_require_tools_keeps_persisted_exact_requirements(
 
     home = tmp_path / "home"
     first = ServerRuntime(
-        home, cwd=tmp_path, provider="fake", tools="definitely_missing_tool"
+        home, cwd=tmp_path, provider="codex", tools="definitely_missing_tool"
     )
     try:
         metadata = await first.create_session()
@@ -283,7 +283,7 @@ async def test_server_require_tools_keeps_persisted_exact_requirements(
     resumed = ServerRuntime(
         home,
         cwd=tmp_path,
-        provider="fake",
+        provider="codex",
         require_tools=True,
     )
     with pytest.raises(ValueError, match="definitely_missing_tool"):
@@ -302,7 +302,7 @@ def test_cli_require_tools_rejects_exact_name_removed_by_resume_policy(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
     first = create_app(
-        build_parser().parse_args(["--provider", "fake", "--tools", "read"])
+        build_parser().parse_args(["--provider", "codex", "--tools", "read"])
     )
     session_id = first.loop.store.session_id
     asyncio.run(first.close())
@@ -511,7 +511,7 @@ def test_cli_and_layered_settings_resolve_tool_patterns(tmp_path: Path) -> None:
     loaded = load_settings(home=home, project_dir=project)
     config = resolve(
         loaded.settings,
-        cli_provider="fake",
+        cli_provider="codex",
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
@@ -611,7 +611,7 @@ async def test_mcp_start_failure_with_allowlist_does_not_advertise_builtins(
         encoding="utf-8",
     )
     args = build_parser().parse_args(
-        ["--provider", "fake", "--tools", "computer__*", "-p", "go"]
+        ["--provider", "codex", "--tools", "computer__*", "-p", "go"]
     )
     app = create_app(args)
     try:
