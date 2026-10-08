@@ -7,7 +7,7 @@ from typing import Any
 
 
 class FinderRuntimeMixin:
-    """Keep candidate extraction and fuzzy ranking away from the UI loop."""
+    """Keep finder preparation responsive and fuzzy ranking off the UI loop."""
 
     def _finder_open(self) -> None:
         request = self._transcript.open_finder()
@@ -23,9 +23,7 @@ class FinderRuntimeMixin:
 
         task = asyncio.current_task()
         try:
-            candidates = await asyncio.to_thread(
-                self._transcript.build_finder_candidates, request
-            )
+            candidates = await self._transcript.build_finder_candidates(request)
             if self._transcript.finder_publish_candidates(request, candidates):
                 self._invalidate_prompt()
                 state = self._transcript.finder_state()
@@ -85,8 +83,8 @@ class FinderRuntimeMixin:
         self._invalidate_prompt()
 
     def _finder_accept(self) -> None:
-        self._transcript.finder_accept()
-        self._cancel_finder_workers()
+        if self._transcript.finder_accept():
+            self._cancel_finder_workers()
         self._invalidate_prompt()
 
     def _finder_cancel(self) -> None:
