@@ -247,10 +247,18 @@ class TranscriptVirtualMixin:
                     self._virtual_search_by_unit.setdefault(unit, []).append(
                         (index, occurrence)
                     )
+                    if unit is self._search_anchor_unit:
+                        self._search_index = index
+                        self._search_anchor_unit = None
+                        self._focus_virtual_search_match()
             if bounded and time.perf_counter() - started >= 0.02:
                 break
         self._virtual_search_complete = self._virtual_search_cursor >= len(self._units)
-        if before == 0 and self._virtual_search_occurrences:
+        if (
+            before == 0
+            and self._virtual_search_occurrences
+            and self._search_anchor_unit is None
+        ):
             self._focus_virtual_search_match()
         if self._virtual_search_complete:
             self._virtual_search_scheduled = False

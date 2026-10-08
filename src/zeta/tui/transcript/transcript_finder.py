@@ -22,6 +22,7 @@ from .finder_overlay import FinderState
 from .fuzzy import highlight_literal
 from .message_finder import Candidate, MessageFinder, RankingResult, Role
 from .streaming_text import StreamingText
+from .transcript_search import find_matches
 
 _FINDER_TEXT_LIMIT = 2_000
 _FINDER_PREVIEW_LINES = 60
@@ -185,9 +186,9 @@ class TranscriptFinderMixin:
         self._finder_restore = None
         self.jump_to_index(unit_index)
         literal = highlight_literal(query, row.candidate.text) if query else None
-        if literal:
+        if literal and self._unit_contains_literal(unit_index, literal):
             self.begin_search()
-            self.update_search(literal)
+            self.update_search(literal, anchor_unit=self._units[unit_index])
             self._focus_search_on_unit(unit_index)
         return True
 
@@ -301,8 +302,19 @@ class TranscriptFinderMixin:
             previous = index
         return previous
 
+    def _unit_contains_literal(self, unit_index: int, literal: str) -> bool:
+        """Return whether the resolved live unit contains the finder literal."""
+
+        if unit_index < 0 or unit_index >= len(self._units):
+            return False
+        unit = self._units[unit_index]
+        if unit is None or unit.value is None:
+            return False
+        plain_lines = self._searchable_text(unit, self._content_width).splitlines()
+        return bool(find_matches(plain_lines, literal))
+
     def _focus_search_on_unit(self, unit_index: int) -> None:
-        """Make the match inside ``unit_index`` the current one, if any exists."""
+        """Make the match inside ``unit_index`` current when it is indexed."""
 
         if unit_index >= len(self._units):
             return
@@ -314,17 +326,19 @@ class TranscriptFinderMixin:
             for index, occurrence in enumerate(self._virtual_search_occurrences):
                 if occurrence.unit is unit:
                     self._search_index = index
+                    self._search_anchor_unit = None
+                    self._focus_search_match()
                     break
-            self._focus_search_match()
             return
         locations = self._locations(self._content_width)
         for index, match in enumerate(matches):
             line = match.first_line
             if 0 <= line < len(locations) and locations[line][0] is unit:
                 self._search_index = index
+                self._search_anchor_unit = None
+                self._refresh_search_render_cache()
+                self._focus_search_match()
                 break
-        self._refresh_search_render_cache()
-        self._focus_search_match()
 
     def jump_to_index(self, unit_index: int) -> bool:
         """Scroll so the unit at ``unit_index`` is at the top of the viewport."""
