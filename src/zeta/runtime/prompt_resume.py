@@ -30,22 +30,11 @@ class ResumedPrompt:
     agent_catalog: AgentCatalog
 
 
-def _catalogs(
-    metadata: SessionMetadata,
-    *,
-    home: Path,
-    repo_root: Path,
-    refresh: bool,
-) -> tuple[SkillCatalog, AgentCatalog]:
-    if refresh or metadata.skill_catalog is None:
-        skills = discover_session_skills(home=home, project_dir=repo_root)
-    else:
-        skills = SkillCatalog.from_snapshot(metadata.skill_catalog)
-    if refresh or metadata.agent_catalog is None:
-        agents = discover_session_agents(home=home, project_dir=repo_root)
-    else:
-        agents = AgentCatalog.from_snapshot(metadata.agent_catalog)
-    return skills, agents
+def _catalogs(*, home: Path, repo_root: Path) -> tuple[SkillCatalog, AgentCatalog]:
+    return (
+        discover_session_skills(home=home, project_dir=repo_root),
+        discover_session_agents(home=home, project_dir=repo_root),
+    )
 
 
 def _conservative_context(metadata: SessionMetadata, *, home: Path) -> ProjectContext:
@@ -149,9 +138,7 @@ def resume_prompt(
             or (current.prompt_recipe is None and not current.system_prompt)
             or explicit_custom
         )
-        skills, agents = _catalogs(
-            current, home=home, repo_root=repo_root, refresh=rebuild
-        )
+        skills, agents = _catalogs(home=home, repo_root=repo_root)
         if rebuild:
             context = context_loader(
                 cwd=Path(current.cwd),
