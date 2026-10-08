@@ -289,7 +289,7 @@ def test_first_legacy_resume_with_explicit_prompt_bumps_updated_at(
     )
 
 
-def test_legacy_resume_migrates_prompt_index_with_skill_catalog(
+def test_legacy_resume_does_not_marker_scan_skill_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -317,13 +317,13 @@ def test_legacy_resume_migrates_prompt_index_with_skill_catalog(
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
-    assert "legacy prompt" in prompt
-    assert "legacy: legacy skill" in prompt
-    assert "- old: old skill" not in prompt
-    assert "legacy tail" in prompt
+    assert prompt == legacy_prompt
+    assert SessionManager(home).read_metadata(
+        opened.store.session_id
+    ).skill_catalog is not None
 
 
-def test_legacy_resume_rejects_unterminated_skill_index_without_mutation(
+def test_legacy_resume_preserves_unterminated_skill_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -335,17 +335,15 @@ def test_legacy_resume_rejects_unterminated_skill_index_without_mutation(
         cwd=tmp_path,
         system_prompt="legacy\n<zeta-skills>\nAvailable skills:\n- old: old",
     )
-    metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
-    original = metadata_path.read_bytes()
-
-    with pytest.raises(ValueError, match="unterminated skill index"):
-        create_app(
-            build_parser().parse_args(
-                ["--resume", opened.store.session_id, "--provider", "fake"]
-            )
+    resumed = create_app(
+        build_parser().parse_args(
+            ["--resume", opened.store.session_id, "--provider", "fake"]
         )
+    )
 
-    assert metadata_path.read_bytes() == original
+    assert resumed.loop.context_assembler.system_prompt.content[0].text == (
+        "legacy\n<zeta-skills>\nAvailable skills:\n- old: old"
+    )
 
 
 def test_catalog_boundaries_require_explicit_catalog() -> None:

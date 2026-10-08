@@ -28,7 +28,6 @@ from ..runtime.loop import AgentLoop
 from ..skills import (
     SkillCatalog,
     discover_session_skills,
-    replace_skill_index,
 )
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
 from .fake_backend import ServerFakeBackend
@@ -331,15 +330,7 @@ class ServerRuntime:
                         home=self.home, project_dir=repo_root
                     )
                     self.manager.persist_skill_catalog(
-                        opened.metadata,
-                        skill_catalog,
-                        system_prompt=(
-                            replace_skill_index(
-                                opened.metadata.system_prompt, skill_catalog
-                            )
-                            if opened.metadata.system_prompt
-                            else None
-                        ),
+                        opened.metadata, skill_catalog
                     )
                 else:
                     skill_catalog = SkillCatalog.from_snapshot(

@@ -37,7 +37,6 @@ from ..runtime.compaction_mode import apply_compaction, persist_compaction
 from ..skills import (
     SkillCatalog,
     discover_session_skills,
-    replace_skill_index,
 )
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
 from ..tools._shared.process import (
@@ -536,15 +535,7 @@ def _session_skill_catalog(
 ) -> SkillCatalog:
     if metadata.skill_catalog is None:
         catalog = discover_session_skills(home=home, project_dir=repo_root)
-        persisted = manager.persist_skill_catalog(
-            metadata,
-            catalog,
-            system_prompt=(
-                replace_skill_index(metadata.system_prompt, catalog)
-                if metadata.system_prompt
-                else None
-            ),
-        )
+        persisted = manager.persist_skill_catalog(metadata, catalog)
         try:
             return SkillCatalog.from_snapshot(persisted.skill_catalog)
         except ValueError as exc:
