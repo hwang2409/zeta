@@ -9,6 +9,7 @@ import pytest
 
 from zeta.agent.runner import _child_base_system_prompt
 from zeta.core.project_context import load_project_context
+from zeta.core.session import SessionManager
 from zeta.memory.entry_store import (
     AddOperation,
     MemoryEntry,
@@ -21,6 +22,7 @@ from zeta.memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_m
 from zeta.project_registry import ProjectRegistry
 from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
+from zeta.skills.agent_catalog import AgentCatalog
 
 
 def _source(seq: int, *, observed_at: str = "2026-10-08T12:00:00Z") -> tuple[MemorySource, ...]:
@@ -200,6 +202,31 @@ def test_format_one_prompt_block_is_byte_identical_golden(tmp_path: Path) -> Non
     )
 
 
+def test_format_two_outer_budget_keeps_short_complete_entry(tmp_path: Path) -> None:
+    home, workspace, registry, project_id = _entry_project(tmp_path)
+    _add(
+        registry,
+        project_id,
+        (
+            AddOperation("decisions", "short retained entry", _source(1)),
+            AddOperation("state", "large omitted entry " + "x" * 4_000, _source(2)),
+        ),
+    )
+
+    context = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=home,
+        byte_cap=1_000,
+        catalog=SkillCatalog.empty(),
+        project_id=project_id,
+    )
+
+    assert "short retained entry" in context.system_prompt
+    assert "large omitted entry" not in context.system_prompt
+    assert context.memory_offset is not None
+
+
 def test_active_run_prompt_is_byte_stable_after_memory_commit(tmp_path: Path) -> None:
     home, workspace, registry, project_id = _entry_project(tmp_path)
     _add(registry, project_id, (AddOperation("state", "before", _source(1)),))
@@ -292,14 +319,65 @@ async def test_serve_resume_rebuilds_identity_and_memory_components(tmp_path: Pa
     await first_runtime.close()
 
     resumed_runtime = ServerRuntime(home, cwd=tmp_path, provider="fake")
-    await resumed_runtime.resume_session(metadata.session_id)
+    resumed_metadata = await resumed_runtime.resume_session(metadata.session_id)
     resumed_prompt = resumed_runtime.loop.context_assembler.system_prompt.content[0].text
+    assert resumed_metadata.prompt_recipe == "default"
+    default_component = resumed_metadata.prompt_components["default_context"]
+    assert default_component["digest"] == hashlib.sha256(resumed_prompt.encode()).hexdigest()
+    assert default_component["length"] == len(resumed_prompt)
     await resumed_runtime.close()
 
     assert "identity after" in resumed_prompt
     assert "identity before" not in resumed_prompt
     assert "memory after" in resumed_prompt
     assert "memory before" not in resumed_prompt
+
+
+@pytest.mark.asyncio
+async def test_serve_unknown_recipe_preserves_custom_bytes_and_refreshes_owned_memory(
+    tmp_path: Path,
+) -> None:
+    home, workspace, registry, project_id = _entry_project(tmp_path)
+    _add(registry, project_id, (AddOperation("state", "memory before", _source(1)),))
+    context = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        project_id=project_id,
+    )
+    assert context.memory_offset is not None
+    assert context.memory_length is not None
+    assert context.memory_digest is not None
+    custom_prefix = "CUSTOM-LEGACY-PROMPT\n"
+    manager = SessionManager(home)
+    opened = manager.create(
+        provider="fake",
+        model="offline",
+        cwd=workspace,
+        system_prompt=custom_prefix + context.system_prompt,
+        context_files=context.files,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+        project_id=project_id,
+        auto_project=False,
+        project_memory_offset=context.memory_offset + len(custom_prefix),
+        project_memory_length=context.memory_length,
+        project_memory_digest=context.memory_digest,
+    )
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    _add(registry, project_id, (AddOperation("state", "memory after", _source(2)),))
+
+    runtime = ServerRuntime(home, cwd=tmp_path, provider="fake")
+    metadata = await runtime.resume_session(session_id)
+    resumed_prompt = runtime.loop.context_assembler.system_prompt.content[0].text
+    await runtime.close()
+
+    assert resumed_prompt.startswith(custom_prefix)
+    assert "memory before" in resumed_prompt
+    assert "memory after" in resumed_prompt
+    assert metadata.prompt_recipe is None
 
 
 def test_format_two_projection_is_fixture_only(tmp_path: Path) -> None:

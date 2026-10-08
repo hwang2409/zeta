@@ -56,6 +56,33 @@ def parse_prompt_recipe(
     return recipe, components
 
 
+def clone_prompt_composition(metadata: Any) -> dict[str, Any]:
+    """Return the complete prompt-composition arguments for a cloned session."""
+
+    return {
+        "system_prompt": metadata.system_prompt,
+        "context_files": list(metadata.context_files),
+        "skill_catalog": (
+            SkillCatalog.from_snapshot(metadata.skill_catalog)
+            if metadata.skill_catalog is not None
+            else None
+        ),
+        "agent_catalog": (
+            AgentCatalog.from_snapshot(metadata.agent_catalog)
+            if metadata.agent_catalog is not None
+            else None
+        ),
+        "project_memory_offset": metadata.project_memory_offset,
+        "project_memory_length": metadata.project_memory_length,
+        "project_memory_digest": metadata.project_memory_digest,
+        "prompt_recipe": metadata.prompt_recipe,
+        "prompt_components": {
+            key: dict(component)
+            for key, component in metadata.prompt_components.items()
+        },
+    }
+
+
 class PromptCompositionMixin:
     """Persist complete prompt compositions without exposing storage details."""
 
@@ -88,7 +115,7 @@ class PromptCompositionMixin:
         context_files: list[str] | tuple[str, ...],
         skill_catalog: SkillCatalog,
         agent_catalog: AgentCatalog,
-        prompt_recipe: str,
+        prompt_recipe: str | None,
         prompt_components: dict[str, dict[str, int | str]],
         project_memory_offset: int | None,
         project_memory_length: int | None,

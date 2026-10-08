@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +20,7 @@ from zeta.attention_forks import (
 from zeta.attention_panel import panel_snapshot
 from zeta.attention_records import AttentionStore
 from zeta.config.tool_policy import ToolPolicy
+from zeta.core.project_context import ProjectContext, load_project_context
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -29,7 +31,9 @@ from zeta.protocol.types import (
     TextContent,
     ToolCall,
 )
+from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
+from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tools.registry import ToolDefinition, ToolRegistry
 
 
@@ -284,6 +288,89 @@ def test_fork_copies_active_branch_through_anchor_without_modifying_source(
     )
     fork.store.close()
     opened.store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recipe", ["default", "custom"])
+async def test_attention_fork_preserves_prompt_composition_on_resume(
+    tmp_path: Path, recipe: str
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home.mkdir()
+    (home / "AGENTS.md").write_text("identity before", encoding="utf-8")
+    skills = SkillCatalog.empty()
+    agents = AgentCatalog.empty()
+    if recipe == "default":
+        context = load_project_context(
+            cwd=workspace,
+            repo_root=workspace,
+            zeta_home=home,
+            catalog=skills,
+        )
+    else:
+        prompt = "CUSTOM-FORK-PROMPT"
+        context = ProjectContext(
+            prompt,
+            (),
+            has_override=True,
+            prompt_recipe="custom",
+            prompt_components={
+                "custom": {
+                    "offset": 0,
+                    "length": len(prompt),
+                    "digest": hashlib.sha256(prompt.encode()).hexdigest(),
+                }
+            },
+        )
+    manager = SessionManager(home)
+    source = manager.create(
+        provider="fake",
+        model="offline",
+        cwd=workspace,
+        system_prompt=context.system_prompt,
+        context_files=context.files,
+        skill_catalog=skills,
+        agent_catalog=agents,
+        project_memory_offset=context.memory_offset,
+        project_memory_length=context.memory_length,
+        project_memory_digest=context.memory_digest,
+        prompt_recipe=context.prompt_recipe,
+        prompt_components=context.prompt_components,
+        auto_project=False,
+    )
+    anchor = source.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("choose")])
+    )
+    attention = AttentionStore(source.store.session_dir).request(
+        session_id=source.store.session_id,
+        project_id=None,
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+        title="Question",
+        why="Need a choice.",
+    )
+    fork_id = create_discussion_fork(home, source.store.session_id, attention.id)
+    source.store.close()
+    fork = manager.open(fork_id, _read_only=True)
+    try:
+        assert fork.metadata.prompt_recipe == recipe
+        assert fork.metadata.prompt_components == context.prompt_components
+    finally:
+        fork.store.close()
+
+    (home / "AGENTS.md").write_text("identity after", encoding="utf-8")
+    runtime = ServerRuntime(home, cwd=tmp_path, provider="fake")
+    await runtime.resume_session(fork_id)
+    resumed = runtime.loop.context_assembler.system_prompt.content[0].text
+    await runtime.close()
+
+    if recipe == "default":
+        assert "identity after" in resumed
+        assert "identity before" not in resumed
+    else:
+        assert resumed == "CUSTOM-FORK-PROMPT"
 
 
 def test_concurrent_fork_creators_reuse_one_usable_session(

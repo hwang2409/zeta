@@ -25,9 +25,8 @@ from .core.session_files import (
     session_directory,
     write_session_file,
 )
+from .core.store.prompt_composition import clone_prompt_composition
 from .protocol.types import Message, MessageRole, TextContent
-from .skills import SkillCatalog
-from .skills.agent_catalog import AgentCatalog
 
 ATTENTION_FORK_POLICY = ToolPolicy.create(
     (
@@ -155,18 +154,7 @@ def _create_fork_session(
         compaction_budget=metadata.compaction_budget,
         compaction=metadata.compaction,
         compaction_pinned=metadata.compaction_pinned,
-        system_prompt=metadata.system_prompt,
-        context_files=metadata.context_files,
-        skill_catalog=(
-            SkillCatalog.from_snapshot(metadata.skill_catalog)
-            if metadata.skill_catalog is not None
-            else None
-        ),
-        agent_catalog=(
-            AgentCatalog.from_snapshot(metadata.agent_catalog)
-            if metadata.agent_catalog is not None
-            else None
-        ),
+        **clone_prompt_composition(metadata),
         vim_mode=metadata.vim_mode,
         budget_pinned=metadata.budget_pinned,
         name=f"Discussion: {record.title}",

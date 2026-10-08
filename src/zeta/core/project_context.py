@@ -716,7 +716,7 @@ def load_project_context(
                         projection = render_entry_memory(
                             snapshot.state,
                             now=utc_now(),
-                            byte_cap=MEMORY_PROMPT_BYTE_CAP,
+                            byte_cap=min(MEMORY_PROMPT_BYTE_CAP, budget_for_memory),
                         )
                         if len(projection.block.encode("utf-8")) <= budget_for_memory:
                             memory_block = projection.block

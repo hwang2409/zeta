@@ -11,7 +11,7 @@ import re
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -250,9 +250,14 @@ class SessionMetadata:
             or fallback[2] <= 0
         ):
             raise SessionError(f"session model fallback is invalid: {path}")
-        has_context_snapshot = "system_prompt" in value and "context_files" in value
-        system_prompt = value.get("system_prompt", "") if has_context_snapshot else ""
-        context_files = value.get("context_files", []) if has_context_snapshot else []
+        has_system_prompt = "system_prompt" in value
+        has_context_files = "context_files" in value
+        has_context_snapshot = has_system_prompt and has_context_files
+        # Preserve whichever legacy bytes exist even when the old snapshot is
+        # incomplete. An incomplete snapshot has no recorded recipe ownership,
+        # so resume treats it conservatively instead of rebuilding it.
+        system_prompt = value.get("system_prompt", "") if has_system_prompt else ""
+        context_files = value.get("context_files", []) if has_context_files else []
         skill_catalog = value.get("skill_catalog")
         agent_catalog = value.get("agent_catalog")
         vim_mode = value.get("vim_mode", True)
@@ -1109,39 +1114,14 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
 
     @staticmethod
     def _copy_metadata(target: SessionMetadata, source: SessionMetadata) -> None:
-        target.version = source.version
-        target.session_id = source.session_id
-        target.created_at = source.created_at
-        target.updated_at = source.updated_at
-        target.provider = source.provider
-        target.model = source.model
-        target.cwd = source.cwd
-        target.retained_tail = source.retained_tail
-        target.compaction_budget = source.compaction_budget
-        target.compaction = source.compaction
-        target.compaction_pinned = source.compaction_pinned
-        target.override_audit = [dict(item) for item in source.override_audit]
-        target.system_prompt = source.system_prompt
-        target.context_files = list(source.context_files)
-        target.skill_catalog = (
-            [dict(item) for item in source.skill_catalog]
-            if source.skill_catalog is not None
-            else None
-        )
-        target.agent_catalog = (
-            [dict(item) for item in source.agent_catalog]
-            if source.agent_catalog is not None
-            else None
-        )
-        target.vim_mode = source.vim_mode
-        target.budget_pinned = source.budget_pinned
-        target.plan_mode = source.plan_mode
-        target.name = source.name
-        target.approval_mode = source.approval_mode
-        target.model_fallback = source.model_fallback
-        target.tool_allow = source.tool_allow
-        target.tool_deny = source.tool_deny
-        target.tool_allow_layers = source.tool_allow_layers
+        """Adopt every persisted field into the caller's live metadata object."""
+
+        for metadata_field in fields(SessionMetadata):
+            setattr(
+                target,
+                metadata_field.name,
+                copy.deepcopy(getattr(source, metadata_field.name)),
+            )
 
     def _read(
         self, session_id: str, *, directory_fd: int | None = None
