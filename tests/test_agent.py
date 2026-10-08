@@ -5007,7 +5007,7 @@ async def test_context_retry_of_notification_consumption_is_never_nudged(
                 self.store.append_task_notification(
                     task_id="task", command="work", exit_code=0
                 )
-                blocks = [TextContent("visible")]
+                blocks = [TextContent("visible work " * 100)]
             elif call == 2:
                 error = RuntimeError("context_length_exceeded: stream error")
                 error.code = "context_length_exceeded"

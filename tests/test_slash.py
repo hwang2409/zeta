@@ -539,8 +539,10 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_manual_compact_avoids_summarization_cost(tmp_path: Path) -> None:
     def token_count(message: Message) -> int:
-        if message.role is MessageRole.COMPACTION or message.metadata.get(
-            "compaction_summary"
+        if (
+            message.role is MessageRole.COMPACTION
+            or message.metadata.get("compaction_summary")
+            or message.metadata.get("context_evicted")
         ):
             return 1
         return 40

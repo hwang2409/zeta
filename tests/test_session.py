@@ -1078,7 +1078,9 @@ async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Pat
         token_budget=1000,
         retained_tail=1,
         system_prompt="stable identity",
-        token_counter=lambda message: 10,
+        token_counter=lambda message: 1
+        if message.metadata.get("context_evicted")
+        else 10,
     )
     app = TUIApp(
         AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()),
