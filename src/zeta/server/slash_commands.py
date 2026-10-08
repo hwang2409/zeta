@@ -28,7 +28,6 @@ from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
-from ..runtime.compaction_mode import run_compaction_command
 from ..skills import SkillCatalog
 from . import ergonomics
 from .model_selection import apply as apply_settings
@@ -145,7 +144,6 @@ class ServerSlashSession:
                 opened.metadata.model
             ),
             mcp_summary=loop.mcp_summary,
-            compaction=assembler.compaction,
             automatic_memory_failure=(
                 loop.memory_reconciler.last_failure.status_line()
                 if loop.memory_reconciler is not None
@@ -202,14 +200,6 @@ class ServerSlashSession:
 
     def _client_only(self, name: str) -> str:
         return f"/{name}: {_CLIENT_ONLY_NOTICE}"
-
-    def slash_compaction(self, args: str) -> str:
-        """Show or switch compaction; ``run_command`` guarded mutation."""
-
-        loop = self._runtime.loop
-        if loop is None:
-            raise ProtocolError(-32003, "no active session")
-        return run_compaction_command(loop, args, busy=None)
 
     def slash_vim(self, args: str) -> str:
         runtime = self._runtime
@@ -379,7 +369,7 @@ async def run_command(
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
     if (name == "vim" and tail.strip().lower() in {"on", "off", "toggle"}) or name == "compact" or (
-        name in {"model", "compaction"} and tail.strip()
+        name == "model" and tail.strip()
     ):
         # Guard mutation-capable dispatch on the same seam session-mutation
         # RPCs use. Without this, `/compact` or `/model <name>` could edit

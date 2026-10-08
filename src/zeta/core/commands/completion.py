@@ -15,7 +15,7 @@ _zeta() {
     local -a commands session_verbs automation_verbs project_verbs project_index_verbs webhook_verbs mcp_verbs original_words
     typeset -A opt_args
     commands=(login serve session project inbox panel automation mcp stalls completion)
-    session_verbs=(list rename delete export stats push pull)
+    session_verbs=(list rename delete export push pull)
     automation_verbs=(list show approve disable import daemon webhook)
     project_verbs=(create init discover list show memory index)
     project_index_verbs=(status rebuild search)
@@ -27,10 +27,10 @@ _zeta() {
     while (( command_index <= $#original_words )); do
         token=$original_words[command_index]
         case $token in
-            --provider|--model|--resume|--token-budget|--compaction|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|-p|--print)
+            --provider|--model|--resume|--token-budget|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|-p|--print)
                 (( command_index += 2 ))
                 ;;
-            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|-p*)
+            --provider=*|--model=*|--resume=*|--token-budget=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|-p*)
                 (( command_index++ ))
                 ;;
             --)
@@ -65,7 +65,6 @@ _zeta() {
         '--auto-memory[enable automatic project memory]' \
         '--no-auto-memory[disable automatic project memory]' \
         '--token-budget=[context token budget]:tokens:' \
-        '--compaction=[context compaction mode]:mode:(summary evict)' \
         '--tools=[tool allowlist]:pattern list:' \
         '--disallowed-tools=[tool denylist]:pattern list:' \
         '--require-tools[fail when exact allowlisted tools are unavailable]' \
@@ -102,7 +101,6 @@ _zeta() {
                         rename) _arguments '1:session id:' '2:display name:' ;;
                         delete) _arguments '--force[skip confirmation]' '1:session id:' ;;
                         export) _arguments '--out=[output file]:file:_files' '1:session id:' ;;
-                        stats) _arguments '--compaction[compaction report]' '--since=[window or date]:since:' '--session=[session id or prefix]:session id:' '--top=[top sessions]:count:' '--json[print JSON]' ;;
                         push) _arguments '--force[replace divergent remote state]' '--remote-home=[remote ZETA_HOME]:directory:' '1:host:' '2:session id:' ;;
                         pull) _arguments '--force[replace divergent local state]' '--remote-home=[remote ZETA_HOME]:directory:' '--cwd=[mapped working directory]:directory:_directories' '1:host:' '2:session id:' ;;
                         *) _describe 'verb' session_verbs ;;
@@ -176,14 +174,14 @@ def bash_script() -> str:
     while (( index < COMP_CWORD )); do
         token="${COMP_WORDS[index]}"
         case "$token" in
-            --provider|--model|--resume|--token-budget|--compaction|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
+            --provider|--model|--resume|--token-budget|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
                 if [[ "${COMP_WORDS[index+1]:-}" == "=" ]]; then
                     (( index += 3 ))
                 else
                     (( index += 2 ))
                 fi
                 ;;
-            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
+            --provider=*|--model=*|--resume=*|--token-budget=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
                 (( index++ ))
                 ;;
             --)
@@ -207,7 +205,7 @@ def bash_script() -> str:
     if (( command_index > 0 && COMP_CWORD > command_index + 1 )); then
         verb="${COMP_WORDS[command_index+1]}"
     fi
-    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --auto-memory --no-auto-memory --token-budget --compaction --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt"
+    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --auto-memory --no-auto-memory --token-budget --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt"
     local commands="login serve session project inbox panel automation mcp stalls completion"
 
     if (( command_index == 0 )); then
@@ -239,7 +237,6 @@ def bash_script() -> str:
                 case "$verb" in
                     delete) COMPREPLY=( $(compgen -W "--force" -- "$cur") ) ;;
                     export) COMPREPLY=( $(compgen -W "--out" -- "$cur") ) ;;
-                    stats) COMPREPLY=( $(compgen -W "--compaction --since --session --top --json" -- "$cur") ) ;;
                     push) COMPREPLY=( $(compgen -W "--force --remote-home" -- "$cur") ) ;;
                     pull) COMPREPLY=( $(compgen -W "--force --remote-home --cwd" -- "$cur") ) ;;
                 esac

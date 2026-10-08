@@ -27,6 +27,18 @@ def _tool_patterns_arg(value: str) -> str:
     return value
 
 
+class _RemovedCompactionAction(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | None,
+        option_string: str | None = None,
+    ) -> None:
+        del namespace, values, option_string
+        parser.error("summary compaction mode was removed; eviction is always used")
+
+
 class _ArgumentParser(argparse.ArgumentParser):
     """Parse the ``mcp add --`` command tail independently of argparse internals."""
 
@@ -161,12 +173,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--compaction",
-        choices=("summary", "evict"),
-        default=None,
-        help=(
-            "compaction mode (default: evict; summary keeps model-written "
-            "compaction); with --resume/--continue it switches the stored mode"
-        ),
+        nargs="?",
+        action=_RemovedCompactionAction,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--tools",
@@ -506,7 +515,6 @@ def main(argv: list[str] | None = None) -> int:
                 port=args.port,
                 provider=args.serve_provider or args.provider,
                 model=args.serve_model or args.model,
-                compaction=args.compaction,
                 tools=args.serve_tools if args.serve_tools is not None else args.tools,
                 disallowed_tools=(
                     args.serve_disallowed_tools

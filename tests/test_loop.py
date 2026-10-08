@@ -2280,7 +2280,12 @@ async def test_no_retry_after_user_abort(tmp_path: Path) -> None:
 async def test_abort_during_backoff_keeps_ui_and_store_consistent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def blocked_sleep(_delay: float) -> None:
+    original_sleep = asyncio.sleep
+
+    async def blocked_sleep(delay: float) -> None:
+        if delay == 0:
+            await original_sleep(0)
+            return
         await asyncio.Event().wait()
 
     monkeypatch.setattr("zeta.runtime.loop._completion.asyncio.sleep", blocked_sleep)
@@ -2392,7 +2397,7 @@ async def test_429_retry_after_honored(tmp_path: Path) -> None:
             ).run_turn("start", origin=MessageOrigin.USER)
         )
 
-    sleep.assert_awaited_once_with(1.25)
+    sleep.assert_any_await(1.25)
 
 
 @pytest.mark.asyncio

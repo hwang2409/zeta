@@ -1,4 +1,4 @@
-"""``zeta session`` subcommands: list, rename, delete, export, stats."""
+"""``zeta session`` subcommands for stored-session management."""
 
 from __future__ import annotations
 
@@ -13,12 +13,6 @@ from ..core.session import (
     SessionManager,
     env_home,
     format_relative_age,
-)
-from .compaction_stats import (
-    DEFAULT_SINCE,
-    ReportError,
-    compaction_report,
-    render_report,
 )
 
 
@@ -45,29 +39,6 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
         default=None,
         help="write to a file instead of stdout",
     )
-    stats = verbs.add_parser(
-        "stats",
-        help="read-only report over stored session logs",
-        description=(
-            "Scan stored session logs, including child agents, without writing "
-            "or locking anything."
-        ),
-    )
-    stats.add_argument(
-        "--compaction",
-        action="store_true",
-        required=True,
-        help="report compaction, eviction, recall_history, and budget activity",
-    )
-    stats.add_argument(
-        "--since",
-        default=DEFAULT_SINCE,
-        help="sessions updated within 7d/12h/30m/2w, since an ISO date, or all "
-        f"(default: {DEFAULT_SINCE}; ignored with --session)",
-    )
-    stats.add_argument("--session", default=None, help="one session id or unique prefix")
-    stats.add_argument("--top", type=int, default=10, help="top sessions to list (default: 10)")
-    stats.add_argument("--json", action="store_true", help="print the report as JSON")
     push = verbs.add_parser("push", help="upload a session through SSH")
     push.add_argument("host", help="configured remote alias or explicit SSH host")
     push.add_argument("session_id", nargs="?", help="session id (default: most recent)")
@@ -94,8 +65,6 @@ def run(
     err = stderr if stderr is not None else sys.stderr
     reader = input_reader if input_reader is not None else input
     verb = args.session_verb
-    if verb == "stats":
-        return _run_stats(args, out, err)
     if verb in {"push", "pull"}:
         return _run_transfer(args, out, err)
     manager = SessionManager(env_home())
@@ -236,22 +205,6 @@ def _run_transfer(args: argparse.Namespace, out: IO[str], err: IO[str]) -> int:
     }, indent=2, sort_keys=True), file=out)
     return 0
 
-
-def _run_stats(args: argparse.Namespace, out: IO[str], err: IO[str]) -> int:
-    try:
-        report = compaction_report(
-            env_home(), since=args.since, session=args.session, top=args.top
-        )
-    except ReportError as exc:
-        print(f"zeta: {exc}", file=err)
-        return 1
-    if args.json:
-        json.dump(report, out, indent=2)
-        out.write("\n")
-    else:
-        out.write(render_report(report))
-    out.flush()
-    return 0
 
 
 __all__ = ["add_subcommand", "run"]
