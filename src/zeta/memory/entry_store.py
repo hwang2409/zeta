@@ -43,7 +43,14 @@ _OPERATION_ID = re.compile(r"op_[0-9a-f]{32}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _VERSION_ID = re.compile(r"[0-9a-f]{32}")
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}")
-_ALLOWED_ORIGINS = {origin.value for origin in MessageOrigin}
+_ALLOWED_ORIGINS = {
+    *(origin.value for origin in MessageOrigin),
+    "agent",
+    "tool_output",
+    "harness",
+    "harness_unknown",
+    "harness_notification",
+}
 
 
 @dataclass(frozen=True, slots=True)

@@ -16,7 +16,13 @@ from pathlib import Path
 from ..context_eviction import estimated_text_tokens
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import ProjectRegistry, ProjectRegistryError
+from ..protocol.types import (
+    ASSISTANT_RESPONSE_COMPLETED,
+    MESSAGE_ORIGIN_METADATA,
+    MessageOrigin,
+)
 from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
+from .entry_reconciler import reconcile_entry_range
 from .reconciler import (
     ReconciliationError,
     ReconciliationResponse,
@@ -130,7 +136,9 @@ class AutoMemoryReconciler:
             self.position_path,
             project_id=project_id,
             session_id=session_id,
-            diagnostics_path=registry.root.parent / "logs" / "memory-reconciliation.jsonl",
+            diagnostics_path=registry.root.parent
+            / "logs"
+            / "memory-reconciliation.jsonl",
         )
         self._pending: list[_PendingRange] = []
         self._wake = asyncio.Event()
@@ -228,9 +236,7 @@ class AutoMemoryReconciler:
         task = self._worker_task
         if task is None:
             return
-        done, _ = await asyncio.wait(
-            {task}, timeout=self.config.shutdown_grace_seconds
-        )
+        done, _ = await asyncio.wait({task}, timeout=self.config.shutdown_grace_seconds)
         if done:
             await asyncio.gather(task, return_exceptions=True)
             return
@@ -254,8 +260,7 @@ class AutoMemoryReconciler:
         return tuple(
             work
             for work in self.state.ready_retries(self._retry_clock())
-            if self._retry_attempts_in_cycle.get(work.key, 0)
-            < MAX_SCHEDULED_ATTEMPTS
+            if self._retry_attempts_in_cycle.get(work.key, 0) < MAX_SCHEDULED_ATTEMPTS
         )
 
     def _ensure_worker(self) -> None:
@@ -308,13 +313,26 @@ class AutoMemoryReconciler:
                     )
             generation = self._activity_generation
             if generation != self._seen_activity_generation:
-                latest_seq, _transcript_bytes, transcript_tokens = await asyncio.to_thread(
-                    self._transcript_state
-                )
+                (
+                    latest_seq,
+                    _transcript_bytes,
+                    transcript_tokens,
+                ) = await asyncio.to_thread(self._transcript_state)
                 self._seen_activity_generation = generation
                 growth = max(0, transcript_tokens - self._last_reconciled_tokens)
                 if growth >= self.config.token_threshold:
-                    self._add_pending(self.last_reconciled_seq + 1, latest_seq, "tokens")
+                    self._add_pending(
+                        self.last_reconciled_seq + 1, latest_seq, "tokens"
+                    )
+                early_range = await asyncio.to_thread(
+                    self._completed_direct_user_turn, latest_seq
+                )
+                if early_range is not None:
+                    self._add_pending(
+                        self.last_reconciled_seq + 1,
+                        early_range[1],
+                        "direct-user-turn",
+                    )
             if self._pending:
                 item = self._pending.pop(0)
                 if item.key is not None:
@@ -381,7 +399,9 @@ class AutoMemoryReconciler:
             retry_after = self.state.next_retry_after(exclude=exhausted_retry_keys)
             if retry_after is not None:
                 retry_timeout = max(0.0, retry_after - self._retry_clock())
-                timeout = retry_timeout if timeout is None else min(timeout, retry_timeout)
+                timeout = (
+                    retry_timeout if timeout is None else min(timeout, retry_timeout)
+                )
             try:
                 await self._idle_wait(self._wake, timeout)
             except TimeoutError:
@@ -413,10 +433,29 @@ class AutoMemoryReconciler:
             usage: dict[str, int] = {}
             for attempt in range(self.config.cas_retries):
                 try:
-                    snapshot = await asyncio.to_thread(
-                        self.registry.memory_snapshot, self.project_id
-                    )
                     today = datetime.now(UTC).date()
+                    try:
+                        snapshot = await asyncio.to_thread(
+                            self.registry.memory_snapshot, self.project_id
+                        )
+                    except UnsupportedMemoryFormatError:
+                        entry_result = await reconcile_entry_range(
+                            registry=self.registry,
+                            project_id=self.project_id,
+                            transcript=raw_transcript,
+                            reconciliation_key=self.state.reconciliation_key,
+                            invoke=self.invoke,
+                            cas_retries=self.config.cas_retries,
+                            as_of=today,
+                            now=datetime.now(UTC)
+                            .isoformat(timespec="microseconds")
+                            .replace("+00:00", "Z"),
+                        )
+                        selected_start = entry_result.seq_start
+                        selected_end = entry_result.seq_end
+                        usage = dict(entry_result.usage)
+                        changed = entry_result.changed_entry_ids
+                        break
                     request = prepare_request(
                         raw_transcript,
                         snapshot.contents,
@@ -580,9 +619,7 @@ class AutoMemoryReconciler:
         return raw, {}
 
     @staticmethod
-    def _sum_usage(
-        total: dict[str, int], addition: dict[str, int]
-    ) -> dict[str, int]:
+    def _sum_usage(total: dict[str, int], addition: dict[str, int]) -> dict[str, int]:
         result = dict(total)
         for key, value in addition.items():
             if type(value) is int and value >= 0:
@@ -608,16 +645,19 @@ class AutoMemoryReconciler:
 
     def _append_failure_log(self, failure: ReconciliationFailure) -> None:
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(
-            {
-                "occurred_at": failure.occurred_at,
-                "message": failure.message,
-                "seq_start": failure.seq_start,
-                "seq_end": failure.seq_end,
-                "terminal": failure.terminal,
-            },
-            sort_keys=True,
-        ).encode() + b"\n"
+        line = (
+            json.dumps(
+                {
+                    "occurred_at": failure.occurred_at,
+                    "message": failure.message,
+                    "seq_start": failure.seq_start,
+                    "seq_end": failure.seq_end,
+                    "terminal": failure.terminal,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
         try:
             previous = self.failure_log_path.read_bytes()
         except FileNotFoundError:
@@ -645,6 +685,56 @@ class AutoMemoryReconciler:
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
+
+    def _completed_direct_user_turn(self, latest_seq: int) -> tuple[int, int] | None:
+        """Return a bounded early-update range for a completed direct-user turn."""
+        try:
+            self.registry._entry_memory_state(self.project_id)
+        except UnsupportedMemoryFormatError:
+            return None
+        path = self.session_dir / "conversation.jsonl"
+        try:
+            with path.open("rb") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                start = max(0, size - _MAX_TRANSCRIPT_CHUNK_BYTES)
+                handle.seek(start)
+                if start:
+                    handle.readline()
+                lines = handle.readlines()
+            rows = [json.loads(line) for line in lines if line.strip()]
+        except (OSError, json.JSONDecodeError):
+            return None
+        messages = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and row.get("type") == "message"
+            and isinstance(row.get("data"), dict)
+            and isinstance(row["data"].get("message"), dict)
+        ]
+        if not messages:
+            return None
+        last = messages[-1]
+        last_message = last["data"]["message"]
+        metadata = last_message.get("metadata")
+        if (
+            last_message.get("role") != "assistant"
+            or not isinstance(metadata, dict)
+            or metadata.get("response_state") != ASSISTANT_RESPONSE_COMPLETED
+        ):
+            return None
+        for row in reversed(messages[:-1]):
+            message = row["data"]["message"]
+            metadata = message.get("metadata")
+            if (
+                message.get("role") == "user"
+                and message.get("tool_result") is None
+                and isinstance(metadata, dict)
+                and metadata.get(MESSAGE_ORIGIN_METADATA) == MessageOrigin.USER
+                and type(row.get("seq")) is int
+            ):
+                return int(row["seq"]), latest_seq
+        return None
 
     def _transcript_state(self) -> tuple[int, int, int]:
         path = self.session_dir / "conversation.jsonl"
