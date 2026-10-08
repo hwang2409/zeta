@@ -64,7 +64,6 @@ from .agent_card import (
 )
 from .bootstrap import background_notice, build_backend, surface_shutdown_notifications
 from .cards.mcp_manager import MCPManager
-from .cards.tasks_panel import tasks_panel_style_rules
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ClipboardError,
@@ -476,7 +475,6 @@ class TUIApp(
                         f"fg:{theme.BODY}", theme.SURFACE
                     ),
                     **agent_navigation_style_rules(),
-                    **tasks_panel_style_rules(),
                 }
             )
             self._prompt_styles[focused] = style

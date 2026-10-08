@@ -13,10 +13,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol
 
-from prompt_toolkit.data_structures import Point
-from prompt_toolkit.layout.containers import Window
-from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.utils import get_cwidth
+
+from .. import overlay, theme
 
 # A long command wraps at this content width so the float settles near, but not
 # beyond, the shared status-card cap. Rendering stays deterministic regardless
@@ -93,6 +92,21 @@ def _status(info: TaskSnapshot) -> tuple[str, str]:
 
 def _one_line(command: str) -> str:
     return " ".join(command.split())
+
+
+def _status_style(suffix: str) -> str:
+    """Map a status suffix to a shared theme token, read at paint time.
+
+    Theme constants are rebuilt in place on a palette switch, so the lookup
+    stays here instead of a module-level dict that would pin the first palette.
+    """
+
+    return {
+        "running": f"bold {theme.ACCENT}",
+        "exited": theme.SUCCESS,
+        "failed": theme.ERROR,
+        "killed": theme.DIM,
+    }[suffix]
 
 
 def _wrap(text: str, width: int) -> list[str]:
@@ -282,17 +296,15 @@ class BackgroundTasksPanel:
 
     def _render_list(self) -> list[FragmentLine]:
         lines: list[FragmentLine] = [
-            [("class:tasks-panel.title", "Background tasks")],
-            [("class:tasks-panel", "")],
+            overlay.title("Background tasks"),
+            overlay.rule(),
         ]
         if not self._tasks:
+            lines.append(overlay.hint("No background tasks in this session."))
             lines.append(
-                [("class:tasks-panel.hint", "No background tasks in this session.")]
+                overlay.hint("Start one with run_background or a /command macro.")
             )
-            lines.append(
-                [("class:tasks-panel.hint", "Start one with run_background or a /command macro.")]
-            )
-            lines.append([("class:tasks-panel", "")])
+            lines.append(overlay.rule())
             lines.append(self._list_hint())
             return lines
         for task in self._tasks:
@@ -300,36 +312,33 @@ class BackgroundTasksPanel:
             if self._kill_pending == task.task_id:
                 lines.append(
                     [
-                        ("class:tasks-panel", "    "),
-                        ("class:tasks-panel.killed", f"kill {short_id(task.task_id)}? press k again · n cancel"),
+                        overlay.value(
+                            f"      kill {short_id(task.task_id)}? "
+                            "press k again · n cancel",
+                            theme.WARNING,
+                        )
                     ]
                 )
-        lines.append([("class:tasks-panel", "")])
+        lines.append(overlay.rule())
         lines.append(self._list_hint())
         return lines
 
     def _list_row(self, task: TaskSnapshot) -> FragmentLine:
         selected = task.task_id == self._selected_id
-        marker = "›" if selected else " "
         label, suffix = _status(task)
         runtime = format_runtime(self._runtime(task))
-        base = "class:tasks-panel.selected" if selected else "class:tasks-panel"
-        row: FragmentLine = [
-            (base, f" {marker} "),
-            (base, f"{short_id(task.task_id):<8}  "),
-            (f"class:tasks-panel.{suffix}", f"{label:<10}"),
-            (base, f" {runtime:>6}  "),
-            (base, _one_line(task.command)),
-        ]
-        return row
+        return overlay.row(
+            [
+                (theme.BODY, f"{short_id(task.task_id):<8}  "),
+                (_status_style(suffix), f"{label:<10}"),
+                (theme.DIM, f" {runtime:>6}  "),
+                (theme.BODY, _one_line(task.command)),
+            ],
+            selected=selected,
+        )
 
     def _list_hint(self) -> FragmentLine:
-        return [
-            (
-                "class:tasks-panel.hint",
-                "↑/↓ select · enter details · k kill · esc close",
-            )
-        ]
+        return overlay.hint("↑/↓ select · enter details · k kill · esc close")
 
     def _render_detail(self) -> list[FragmentLine]:
         task = self.detail_task()
@@ -338,50 +347,40 @@ class BackgroundTasksPanel:
         label, suffix = _status(task)
         runtime = format_runtime(self._runtime(task))
         lines: list[FragmentLine] = [
-            [("class:tasks-panel.title", "Shell details")],
-            [("class:tasks-panel", "")],
-            self._field("Status", label, f"class:tasks-panel.{suffix}"),
-            self._field("Runtime", runtime),
-            self._field("PID", str(task.pid)),
+            overlay.title("Shell details"),
+            overlay.rule(),
+            overlay.field("Status", label, width=8, value_style=_status_style(suffix)),
+            overlay.field("Runtime", runtime, width=8),
+            overlay.field("PID", str(task.pid), width=8),
         ]
         if task.owner != "run_background":
-            lines.append(self._field("Owner", task.owner))
+            lines.append(overlay.field("Owner", task.owner, width=8))
         if not task.running and task.exit_code is not None:
-            lines.append(self._field("Exit", str(task.exit_code)))
+            lines.append(overlay.field("Exit", str(task.exit_code), width=8))
         if task.note:
-            lines.append(self._field("Note", task.note))
-        lines.append([("class:tasks-panel", "")])
-        lines.append([("class:tasks-panel.label", "Command")])
+            lines.append(overlay.field("Note", task.note, width=8))
+        lines.append(overlay.blank())
+        lines.append([overlay.label("Command")])
         for wrapped in _wrap(_one_line(task.command), CONTENT_WIDTH - 2):
-            lines.append([("class:tasks-panel", f"  {wrapped}")])
-        lines.append([("class:tasks-panel", "")])
+            lines.append([overlay.value(f"  {wrapped}")])
+        lines.append(overlay.blank())
         display = self._output_display_lines()
         lines.append(
             [
-                ("class:tasks-panel.label", "Output  "),
-                (
-                    "class:tasks-panel.hint",
-                    f"showing {len(display)} of {self._output_total} lines",
+                overlay.label("Output  "),
+                overlay.value(
+                    f"showing {len(display)} of {self._output_total} lines", theme.DIM
                 ),
             ]
         )
         if display:
             for raw in display:
-                lines.append([("class:tasks-panel.output", f"  {raw}")])
+                lines.append([overlay.value(f"  {raw}")])
         else:
-            lines.append([("class:tasks-panel.hint", "  (no output yet)")])
-        lines.append([("class:tasks-panel", "")])
-        lines.append(
-            [("class:tasks-panel.hint", "↑/↓ scroll · esc back")]
-        )
+            lines.append([overlay.value("  (no output yet)", theme.DIM)])
+        lines.append(overlay.blank())
+        lines.append(overlay.hint("↑/↓ scroll · esc back"))
         return lines
-
-    @staticmethod
-    def _field(label: str, value: str, value_style: str = "class:tasks-panel") -> FragmentLine:
-        return [
-            ("class:tasks-panel.label", f"{label:<8}"),
-            (value_style, value),
-        ]
 
     def _runtime(self, task: TaskSnapshot) -> float | None:
         if task.started_at is None:
@@ -390,164 +389,12 @@ class BackgroundTasksPanel:
         return max(0.0, end - task.started_at)
 
 
-def _fit_fragments(fragments: FragmentLine, width: int) -> FragmentLine:
-    """Truncate fragments to ``width`` cells and pad the remainder with blanks."""
-
-    if width <= 0:
-        return []
-    result: FragmentLine = []
-    cells = 0
-    for style, text in fragments:
-        if cells >= width:
-            break
-        kept: list[str] = []
-        for ch in text:
-            step = max(0, get_cwidth(ch))
-            if cells + step > width:
-                break
-            kept.append(ch)
-            cells += step
-        if kept:
-            result.append((style, "".join(kept)))
-    if cells < width:
-        result.append(("class:tasks-panel", " " * (width - cells)))
-    return result
-
-
-class BackgroundTasksControl(UIControl):
-    """A bounded, keyboard-scrollable view of styled panel lines."""
-
-    def __init__(self) -> None:
-        self._lines: tuple[FragmentLine, ...] = ()
-        self._offset = 0
-        self._height = 1
-
-    @property
-    def is_focusable(self) -> bool:
-        return True
-
-    @property
-    def offset(self) -> int:
-        return self._offset
-
-    @property
-    def line_count(self) -> int:
-        return len(self._lines)
-
-    def set_lines(self, lines: Sequence[FragmentLine], *, keep_offset: bool = False) -> None:
-        self._lines = tuple(lines)
-        if not keep_offset:
-            self._offset = 0
-        self._clamp_offset()
-
-    def scroll(self, amount: int) -> None:
-        maximum = max(0, len(self._lines) - self._height)
-        self._offset = min(max(0, self._offset + amount), maximum)
-
-    def page(self, amount: int) -> None:
-        self.scroll(amount * max(1, self._height - 2))
-
-    def top(self) -> None:
-        self._offset = 0
-
-    def bottom(self) -> None:
-        self._offset = max(0, len(self._lines) - self._height)
-
-    def _clamp_offset(self) -> None:
-        maximum = max(0, len(self._lines) - self._height)
-        self._offset = min(max(0, self._offset), maximum)
-
-    @staticmethod
-    def _line_cells(line: FragmentLine) -> int:
-        return sum(
-            max(0, get_cwidth(ch)) for _, text in line for ch in text
-        )
-
-    def preferred_width(self, max_available_width: int) -> int:
-        del max_available_width
-        natural = max((self._line_cells(line) for line in self._lines), default=0)
-        return natural + 4
-
-    def preferred_height(
-        self,
-        width: int,
-        max_available_height: int,
-        wrap_lines: bool,
-        get_line_prefix: object | None,
-    ) -> int:
-        del width, max_available_height, wrap_lines, get_line_prefix
-        return max(1, len(self._lines))
-
-    def create_content(self, width: int, height: int | None) -> UIContent:
-        self._height = max(1, height or 1)
-        self._clamp_offset()
-        content_width = max(0, width - 4)
-        lines = self._lines
-
-        def get_line(index: int) -> FragmentLine:
-            if width < 4 or index >= len(lines):
-                return [("class:tasks-panel", " " * width)]
-            body = _fit_fragments(lines[index], content_width)
-            rendered: FragmentLine = [("class:tasks-panel", "│ "), *body]
-            rendered.append(("class:tasks-panel", " │"))
-            return rendered
-
-        return UIContent(
-            get_line=get_line,
-            line_count=len(lines),
-            cursor_position=Point(x=0, y=0),
-            show_cursor=False,
-        )
-
-    def vertical_scroll(self, window: Window) -> int:
-        del window
-        return self._offset
-
-    def window(self) -> Window:
-        return Window(
-            self,
-            wrap_lines=False,
-            get_vertical_scroll=self.vertical_scroll,
-            style="class:tasks-panel",
-        )
-
-
 __all__ = [
     "CONTENT_WIDTH",
     "MAX_OUTPUT_LINES",
     "OUTPUT_TAIL_BYTES",
-    "BackgroundTasksControl",
     "BackgroundTasksPanel",
     "TaskSnapshot",
     "format_runtime",
     "short_id",
-    "tasks_panel_style_rules",
 ]
-
-
-def tasks_panel_style_rules() -> dict[str, str]:
-    """Return the prompt-toolkit style rules for the panel over its surface.
-
-    Defined next to the control it styles so the composition root does not grow
-    a second copy of every class name.
-    """
-
-    from .. import theme
-
-    surface = f"bg:{theme.SURFACE}" if theme.SURFACE else ""
-
-    def rule(foreground: str) -> str:
-        return " ".join(part for part in (foreground, surface) if part)
-
-    return {
-        "tasks-panel": rule(f"fg:{theme.BODY}"),
-        "tasks-panel.title": rule(f"fg:{theme.ACCENT} bold"),
-        "tasks-panel.label": rule(f"fg:{theme.DIM}"),
-        "tasks-panel.hint": rule(f"fg:{theme.CHROME}"),
-        "tasks-panel.selected": rule(f"fg:{theme.BODY} bold"),
-        "tasks-panel.running": rule(f"fg:{theme.ACCENT} bold"),
-        "tasks-panel.exited": rule(f"fg:{theme.SUCCESS}"),
-        "tasks-panel.failed": rule(theme.ERROR),
-        "tasks-panel.killed": rule(f"fg:{theme.CHROME}"),
-        "tasks-panel.output": rule(f"fg:{theme.BODY}"),
-    }
