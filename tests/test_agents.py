@@ -471,5 +471,5 @@ async def test_custom_agent_model_selects_the_child_backend(
     )
     parent_tools = {schema["name"] for schema in parent_backend.calls[0][1]}
     child_tools = {schema["name"] for schema in child_backend.calls[0][1]}
-    assert child_tools == parent_tools - {"agent"}
+    assert child_tools == parent_tools - {"agent", "request_attention"}
     await loop.close()

@@ -17,7 +17,7 @@ from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
 from ..protocol.types import MessageOrigin, StreamEvent, StreamEventType, TextContent
 from ..runtime.compaction_mode import switch_compaction
-from . import ergonomics, login, model_selection, slash_commands
+from . import abort_scope, ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
 from .model_inputs import PendingModelInputs
 from .project_requests import (
@@ -402,21 +402,17 @@ class _Client:
             return await self._send(params)
         if method == "steer":
             return await self._steer(_required_string(params, "text"))
+        if method == "clear_steering":
+            return abort_scope.clear_pending_steering(self.features, self.server.runtime.loop)
         if method in {"approve", "deny"}:
             scope = params.get("scope", "once")
             if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
-                raise ProtocolError(
-                    -32602, "scope must be 'once' or 'always_tool'"
-                )
+                raise ProtocolError(-32602, "scope must be 'once' or 'always_tool'")
             if scope == "always_tool" and method != "approve":
-                raise ProtocolError(
-                    -32602, "scope 'always_tool' requires approve"
-                )
-            return await self._approval(
-                method, _required_string(params, "request_id"), scope
-            )
+                raise ProtocolError(-32602, "scope 'always_tool' requires approve")
+            return await self._approval(method, _required_string(params, "request_id"), scope)
         if method == "abort":
-            return await self._abort()
+            return await self._abort(abort_scope.parse_abort_scope(params, self.features))
         if method == "status":
             return self._status()
         raise ProtocolError(-32601, f"method not found: {method}")
@@ -467,6 +463,8 @@ class _Client:
             self.server.turn_contexts.add_request(requests, self.features)
             if "projects" in self.features:
                 requests += PROJECT_REQUESTS
+            if "abort_scope" in self.features:
+                requests.append("clear_steering")
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],
@@ -651,24 +649,19 @@ class _Client:
             result["scope"] = scope
         return result
 
-    async def _abort(self) -> dict[str, object]:
-        if self._turn_task is None or self._turn_task.done():
-            return {"aborted": False}
-        await self._terminate_pending_approvals()
-        loop = self.server.runtime.loop
-        if loop is not None:
-            loop.abort()
-        self._turn_task.cancel()
-        await asyncio.gather(self._turn_task, return_exceptions=True)
-        await self._notify("turn_aborted", self.server.runtime.session_id)
-        return {"aborted": True}
+    async def _abort(self, scope: abort_scope.AbortScope = "session") -> dict[str, object]:
+        session_id = self.server.runtime.session_id
+        aborted = await abort_scope.abort_active_turn(
+            self._turn_task,
+            scope=scope,
+            loop=self.server.runtime.loop,
+            terminate_approvals=self._terminate_pending_approvals,
+        )
+        if aborted:
+            await self._notify("turn_aborted", session_id)
+        return {"aborted": aborted}
 
     def _session_snapshot(self) -> dict[str, object] | None:
-        # Stored `approval_mode` is None until an explicit `set_settings`
-        # writes it. Under `yolo` composition sets the live policy to
-        # `allow` without touching disk, so raw metadata emits null and
-        # the frontend client header indicator stays hidden — project the live default
-        # onto the wire snapshot instead.
         runtime = self.server.runtime
         if runtime.opened is None:
             return None
@@ -802,7 +795,7 @@ class _Client:
             )
         finally:
             if not started and loop.notification_turn_state == "scheduled":
-                await loop.notification_wake.finish(success=False)
+                await loop.finish_notification_turn(success=False)
             self._finalize_turn(
                 session_id, state, success=success, schedule_wake=agent_end is None
             )
@@ -1122,14 +1115,21 @@ class _Client:
                 await self._end_approval(key, session_id)
 
     async def _terminate_pending_approvals(
-        self, *, suppress_write_errors: bool = False
+        self,
+        *,
+        foreground_only: bool = False,
+        suppress_write_errors: bool = False,
     ) -> None:
         policy = self.server.runtime.policy
         if policy is not None:
             for request in policy.pending_requests():
+                if foreground_only and request.child_instance_id is not None:
+                    continue
                 with contextlib.suppress(ValueError, RuntimeError):
                     policy.abort(request.key)
         for key in self._approvals.active_keys():
+            if foreground_only and not isinstance(key, str):
+                continue
             await self._end_approval(
                 key,
                 self.server.runtime.session_id if self.server.runtime.opened else None,

@@ -163,6 +163,7 @@ class AgentLoop(
         agent_depth: int = 0,
         agent_instance_id: str | None = None,
         root_project_id: str | None = None,
+        parent_session_id: str | None = None,
         root_session_dir: Any = None,
         project_registry: Any = None,
         background_owner: BackgroundAgentOwner | None = None,
@@ -175,6 +176,7 @@ class AgentLoop(
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
+        self.parent_session_id = parent_session_id
         # Directory of the ROOT session that owns the durable child-link index;
         # threaded down every loop so nested children publish their lineage
         # intent into a single flat directory the root can reconcile.
@@ -337,11 +339,14 @@ class AgentLoop(
         if isinstance(self.backend, ContextWindowBackend):
             self.backend.set_token_budget(token_budget)
 
-    def abort(self) -> None:
-        """Signal the active tool batch before the caller cancels the turn."""
+    def abort(self, *, foreground_only: bool = False) -> None:
+        """Signal active tools; optionally preserve background work and steering."""
         self.tool_registry.abort()
-        self._background_owner.cancel_all()
-        self._steering_queue.clear()
+        if foreground_only:
+            self.notification_wake.retry_after_foreground_abort()
+        else:
+            self._background_owner.cancel_all()
+            self._steering_queue.clear()
 
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
@@ -357,8 +362,10 @@ class AgentLoop(
     def has_pending_steering(self) -> bool:
         return bool(self._steering_queue)
 
-    def clear_pending_steering(self) -> None:
+    def clear_pending_steering(self) -> int:
+        cleared = len(self._steering_queue)
         self._steering_queue.clear()
+        return cleared
 
     def set_background_event_sink(
         self, sink: Callable[[StreamEvent], None] | None
@@ -784,15 +791,15 @@ class AgentLoop(
         abort_signal: ToolAbortSignal | None = None,
         system_message: Message | None = None,
         on_persisted: Callable[[], None] | None = None,
+        notification_turn: bool = False,
     ) -> AsyncIterator[StreamEvent]:
-        notification_turn = system_message is not None
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
-        if self.hooks is not None and system_message is None:
+        if self.hooks is not None and system_message is None and not notification_turn:
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None:
             await self._append_turn_message(system_message, on_persisted=on_persisted)
-        else:
+        elif not notification_turn:
             reuse_persisted = not persist_user_message
             if reuse_persisted and user_message not in self.store.messages():
                 raise ValueError("cannot reuse a user message that is not persisted")

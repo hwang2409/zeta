@@ -361,12 +361,38 @@ server executes the pending tool through the existing loop seam.
 
 ### `abort`
 
-Params: none. The result contains `aborted` (`true` when a turn was canceled).
-Abort cancels the active provider or tool task and persists the loop's partial
-state. When `aborted` is `true`, the server emits one `turn_aborted` event
-after the canceled task stops and before the `abort` response. This applies
-while the model streams, while an approval waits, and while a tool runs. When
-no turn runs, the result is `{"aborted": false}` and no event is emitted.
+Params: optional `scope` with the `abort_scope` feature. It is `"session"`
+(default) or `"foreground"`. Sending `scope` without the negotiated feature
+returns `-32602`. An unknown scope also returns `-32602`.
+
+Session scope keeps the existing behavior: it cancels the active provider or
+tool task, aborts all session-owned background children, and clears pending
+steering. Foreground scope cancels only the active provider request and
+in-flight foreground tool calls in the current turn. It leaves background
+children, background tasks, their later completion notifications, and pending
+steering untouched. A background task that an in-flight `run_background` call
+already started therefore continues. Foreground approvals for the canceled
+turn are aborted; delegated approvals owned by running background children
+remain pending.
+
+Pending steering is kept because the client queued it for work after the
+current boundary; the loop applies it to the next turn. A client that does not
+want that work can call `clear_steering` after the foreground abort.
+Session-scope abort clears pending steering as part of aborting an active turn.
+
+If foreground abort interrupts a notification turn, its notification lifecycle
+schedules one follow-up turn. A claim that was not persisted is released and
+delivered normally. A notification input that was already persisted stays in
+history, and the follow-up uses that input without appending it again. Each
+foreground abort schedules at most one follow-up. Session-scope abort does not
+schedule one.
+
+The result contains `aborted` (`true` when a turn was canceled). Abort persists
+the loop's partial state. When `aborted` is `true`, the server emits one
+`turn_aborted` event after the canceled task stops and before the `abort`
+response. This applies while the model streams, while an approval waits, and
+while a tool runs. When no turn runs, the result is `{"aborted": false}` and no
+event is emitted.
 
 ```json
 {"jsonrpc":"2.0","id":8,"method":"abort","params":{}}
@@ -374,6 +400,20 @@ no turn runs, the result is `{"aborted": false}` and no event is emitted.
 
 ```json
 {"jsonrpc":"2.0","id":8,"result":{"aborted":true}}
+```
+
+### `clear_steering`
+
+Available only with the negotiated `abort_scope` feature. Params: none. It
+removes messages queued by `steer` without canceling foreground or background
+work. The result contains `cleared`, the number of removed messages.
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"clear_steering","params":{}}
+```
+
+```json
+{"jsonrpc":"2.0","id":9,"result":{"cleared":2}}
 ```
 
 ### `status`
@@ -872,6 +912,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `assistant_reset` | enables post-stream provider retry; `assistant_reset` removes failed attempt output before replacement deltas |
 | `model_input_ids` | `slash_run` stores generated model input server-side and returns a single-use `input_id` accepted by `send` |
 | `projects` | adds `list_projects`, `project_show`, `project_memory_log`, and `project_inbox`; `list_sessions` accepts `project_id` |
+| `abort_scope` | `abort` accepts `scope: "session" \| "foreground"`; adds `clear_steering` |
 | `turn_context` | adds `set_turn_context` for one-shot context on the next server-started turn |
 
 Features keep the protocol version at `1.1`. A version bump would make a new

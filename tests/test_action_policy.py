@@ -218,19 +218,22 @@ def test_existing_tool_payloads_match_pre_action_policy_snapshots(
 ) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     messages = [Message(MessageRole.USER, [TextContent("go")])]
+    existing_schemas = [
+        schema for schema in registry.schemas if schema["name"] != "request_attention"
+    ]
     snapshots = {
-        "schemas": registry.schemas,
+        "schemas": existing_schemas,
         "anthropic": build_request_payload(
             messages,
-            registry.schemas,
+            existing_schemas,
             model="claude-test",
             max_tokens=2048,
             thinking_budget=1024,
         ),
         "codex": build_responses_payload(
-            messages, registry.schemas, model="codex-test"
+            messages, existing_schemas, model="codex-test"
         ),
-        "ollama": ollama_tools(registry.schemas),
+        "ollama": ollama_tools(existing_schemas),
     }
     expected = {
         "schemas": "424464b3f6cb3c604c18f629a52c5679a541d171868dd9d66f3f9dd443ba7885",

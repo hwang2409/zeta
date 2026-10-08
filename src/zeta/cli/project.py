@@ -193,7 +193,11 @@ def run(
 
 
 def _run_index(args: argparse.Namespace, registry: ProjectRegistry) -> object:
-    from ..transcript_search.index import TranscriptIndex, TranscriptSource
+    from ..transcript_search.index import (
+        TranscriptIndex,
+        TranscriptSource,
+        is_indexable_top_level_project_session,
+    )
 
     project = (
         registry.show_project(args.project)
@@ -205,11 +209,18 @@ def _run_index(args: argparse.Namespace, registry: ProjectRegistry) -> object:
     if args.index_action == "rebuild":
         sources = []
         for link in registry.list_session_links(project.project_id, limit=10_000):
-            if link.get("parent_session_id") is not None:
-                continue
             session_id = link.get("session_id")
             transcript_path = link.get("transcript_path")
-            if isinstance(session_id, str) and isinstance(transcript_path, str):
+            if (
+                isinstance(session_id, str)
+                and isinstance(transcript_path, str)
+                and is_indexable_top_level_project_session(
+                    agent_depth=0,
+                    project_id=project.project_id,
+                    parent_session_id=link.get("parent_session_id"),
+                    session_dir=Path(transcript_path),
+                )
+            ):
                 sources.append(
                     TranscriptSource(
                         session_id, Path(transcript_path), project.project_id

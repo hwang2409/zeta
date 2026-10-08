@@ -26,6 +26,7 @@ from .core.session_files import (
 )
 from .project_errors import ProjectNotFoundError
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
+from .session_liveness import session_is_live
 
 SCHEMA_VERSION = 1
 BODY_SPILL_BYTES = 64 * 1024
@@ -102,17 +103,23 @@ class ProjectInboxScanner:
     """Skip validated inbox scans while watched directories are unchanged."""
 
     def __init__(
-        self, registry: ProjectRegistry, project_id: str, *, sessions_root: Path
+        self,
+        registry: ProjectRegistry,
+        project_id: str,
+        *,
+        sessions_root: Path,
+        session_id: str | None = None,
     ) -> None:
         self.inbox = ProjectInbox(registry, sessions_root=sessions_root)
         self.project_id = project_id
+        self.session_id = session_id
         self._fingerprint: tuple[tuple[int, int, int, int] | None, ...] | None = None
 
     def scan(self) -> tuple[str, ...] | None:
         current = self._directory_fingerprint()
         if self._fingerprint is not None and current == self._fingerprint:
             return None
-        message_ids = self.inbox.new_ids(self.project_id)
+        message_ids = self.inbox.new_ids(self.project_id, session_id=self.session_id)
         self._fingerprint = (
             current if any(item is not None for item in current) else self._directory_fingerprint()
         )
@@ -155,6 +162,7 @@ class ProjectInbox:
         body: str,
         in_reply_to: str | None = None,
         message_id: str | None = None,
+        to_session: str | None = None,
     ) -> str:
         sender = self._resolve_project(from_project)
         target = self._resolve_project(to_project)
@@ -166,12 +174,15 @@ class ProjectInbox:
         if in_reply_to is not None:
             in_reply_to = _id(in_reply_to, "in_reply_to")
         message_id = _id(message_id or uuid.uuid4().hex)
+        if to_session is not None:
+            to_session = _id(to_session, "target session id")
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "id": message_id,
             "origin": LOCAL_ORIGIN,
             "from": {"project": sender.project_id, "session": session},
             "to_project": target.project_id,
+            "to_session": to_session,
             "kind": kind,
             "title": title,
             "body": body,
@@ -202,13 +213,20 @@ class ProjectInbox:
                     "origin",
                     "from",
                     "to_project",
+                    "to_session",
                     "kind",
                     "title",
                     "body",
                     "in_reply_to",
                 }
                 comparable = {
-                    key: existing.get(key, LOCAL_ORIGIN) if key == "origin" else existing[key]
+                    key: (
+                        existing.get(key, LOCAL_ORIGIN)
+                        if key == "origin"
+                        else existing.get(key)
+                        if key == "to_session"
+                        else existing[key]
+                    )
                     for key in immutable_fields
                 }
                 expected = {key: record[key] for key in immutable_fields}
@@ -218,7 +236,9 @@ class ProjectInbox:
                     raise InboxError("message id already exists with different content")
             return message_id
 
-    def list(self, project: str) -> dict[str, list[dict[str, Any]]]:
+    def list(
+        self, project: str, *, session_id: str | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
         target = self._resolve_project(project)
         invalid: list[dict[str, str]] = []
         with self._directories(target.project_id, create=True) as dirs:
@@ -229,6 +249,14 @@ class ProjectInbox:
                 "done": self._read_directory(dirs[2], dirs[3], status="done", invalid=invalid),
                 "invalid": invalid,
             }
+        if session_id is not None:
+            session_id = _id(session_id, "session id")
+            for status in ("new", "claimed", "done"):
+                result[status] = [
+                    record
+                    for record in result[status]
+                    if record.get("to_session") in {None, session_id}
+                ]
         result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
         return result
 
@@ -260,7 +288,9 @@ class ProjectInbox:
         except (OSError, ProjectRegistryError, SessionError) as exc:
             raise InboxError("inbox storage is unsafe or unavailable") from exc
 
-    def new_ids(self, project: str) -> tuple[str, ...]:
+    def new_ids(
+        self, project: str, *, session_id: str | None = None
+    ) -> tuple[str, ...]:
         """Return validated new-message IDs without loading spilled bodies."""
         target = self._resolve_project(project)
         self._ensure_directories(target.project_id)
@@ -270,6 +300,13 @@ class ProjectInbox:
             records = self._read_directory(
                 dirs[0], dirs[3], status="new", invalid=invalid, resolve_body=False
             )
+        if session_id is not None:
+            session_id = _id(session_id, "session id")
+            records = [
+                record
+                for record in records
+                if record.get("to_session") in {None, session_id}
+            ]
         return tuple(record["id"] for record in records)
 
     def claim_wake(self, project: str, message_ids: tuple[str, ...]) -> bool:
@@ -313,6 +350,9 @@ class ProjectInbox:
                 record = self._read_record(
                     new_fd, name, bodies_fd, resolve_body=False
                 )
+                target_session = record.get("to_session")
+                if target_session is not None and target_session != session_id:
+                    return None
                 os.rename(name, name, src_dir_fd=new_fd, dst_dir_fd=claimed_fd)
             except FileNotFoundError:
                 return None
@@ -536,6 +576,8 @@ class ProjectInbox:
             raise InboxError(f"invalid inbox message fields: {name}")
         origin = value.setdefault("origin", LOCAL_ORIGIN)
         _text(origin, "message origin")
+        if value.get("to_session") is not None:
+            _id(value["to_session"], "target session")
         sender = value["from"]
         if not isinstance(sender, dict) or not {"project", "session"}.issubset(sender):
             raise InboxError("invalid message sender")
@@ -546,8 +588,6 @@ class ProjectInbox:
             raise InboxError("invalid message kind")
         _text(value.get("title"), "title")
         _text(value.get("created_at"), "created_at")
-        if "to_session" in value:
-            _id(value["to_session"], "target session")
         if "claimer_session" in value:
             _id(value["claimer_session"], "claimer session")
         for field in ("claimed_at", "recovery_note", "outcome", "done_at"):
@@ -648,20 +688,7 @@ class ProjectInbox:
         )
 
     def _session_alive(self, session_id: str) -> bool:
-        try:
-            fd = os.open(self.sessions_root / session_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        except OSError:
-            return False
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            else:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                return False
-        finally:
-            os.close(fd)
+        return session_is_live(self.sessions_root / session_id)
 
     def _recover_stale(
         self, new_fd: int, claimed_fd: int, done_fd: int, *, bodies_fd: int,

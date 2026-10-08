@@ -565,7 +565,7 @@ async def run_agent_tool(
             )
         # Project inboxes belong to peer top-level sessions. Children report
         # through their parent instead of claiming or completing project work.
-        excluded_names = {"inbox"}
+        excluded_names = {"inbox", "request_attention", "resolve_attention"}
         if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation:
             excluded_names.add("agent")
         if preset.tool_names is not None:
