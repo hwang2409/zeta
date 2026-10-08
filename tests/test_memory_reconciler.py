@@ -259,9 +259,9 @@ def test_request_is_bounded_and_preserves_sequence_provenance() -> None:
         ),
     )
 
-    request = prepare_request(transcript, {}, as_of=TODAY, max_bytes=4_000)
+    request = prepare_request(transcript, {}, as_of=TODAY, max_bytes=5_000)
 
-    assert len(request.prompt.encode()) <= 4_000
+    assert len(request.prompt.encode()) <= 5_000
     assert request.transcript.rows
     assert request.transcript.rows[0]["seq"] == 1
     assert request.transcript.rows[-1]["seq"] < 19
@@ -278,6 +278,39 @@ def test_parser_rejects_source_range_outside_transcript() -> None:
             transcript=_transcript(),
             as_of=TODAY,
         )
+
+
+def test_compaction_row_omits_embedded_view_and_uses_top_level_sequence() -> None:
+    transcript = Transcript(
+        SESSION,
+        (
+            {
+                "seq": 1281,
+                "type": "compaction",
+                "data": {
+                    "summary": "bounded summary",
+                    "source_seq_start": 1,
+                    "source_seq_end": 1280,
+                    "view": [
+                        {"seq": seq, "message": {"content": "x" * 2000}}
+                        for seq in range(1000)
+                    ],
+                },
+            },
+        ),
+    )
+
+    request = prepare_request(
+        transcript,
+        {},
+        as_of=TODAY,
+        max_bytes=64 * 1024,
+    )
+
+    assert len(request.prompt.encode()) <= 64 * 1024
+    assert request.transcript.sequences == {1281}
+    assert "omitted_compaction_entries" in request.prompt
+    assert '"seq": 100' not in request.prompt
 
 
 def test_reconciler_labels_child_and_agent_send_rows_as_non_user() -> None:

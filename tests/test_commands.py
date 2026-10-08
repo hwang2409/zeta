@@ -470,20 +470,20 @@ skill_catalog=SkillCatalog.empty(),
     ]
 
 
-async def test_transcript_search_cancels_completion_before_up_navigation(
+async def test_message_finder_cancels_completion_before_up_navigation(
     tmp_path: Path,
 ) -> None:
     _write_command(tmp_path / ".zeta" / "commands", "review", "review")
     output_text = StringIO()
-    search_active = False
+    finder_active = False
 
-    def start_search() -> None:
-        nonlocal search_active
-        search_active = True
+    def open_finder() -> None:
+        nonlocal finder_active
+        finder_active = True
 
-    def end_search() -> None:
-        nonlocal search_active
-        search_active = False
+    def cancel_finder() -> None:
+        nonlocal finder_active
+        finder_active = False
 
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
@@ -495,11 +495,10 @@ async def test_transcript_search_cancels_completion_before_up_navigation(
             key_bindings=build_key_bindings(
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
-                on_search_start=start_search,
-                search_active=lambda: search_active,
-                on_search_input=lambda _value: None,
-                on_search_next=lambda: None,
-                on_search_end=end_search,
+                on_finder_open=open_finder,
+                finder_active=lambda: finder_active,
+                on_finder_input=lambda _value: None,
+                on_finder_cancel=cancel_finder,
             ),
             completer=SlashCompleter(
                 create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path, skill_catalog=SkillCatalog.empty())
@@ -518,21 +517,19 @@ async def test_transcript_search_cancels_completion_before_up_navigation(
 
         pipe.send_text("\x06")
         for _ in range(100):
-            if search_active and session.app.current_buffer.complete_state is None:
+            if finder_active and session.app.current_buffer.complete_state is None:
                 break
             await asyncio.sleep(0.01)
         else:
-            raise AssertionError("transcript search did not cancel completion")
+            raise AssertionError("message finder did not cancel completion")
 
-        pipe.send_text("\r")
-        await asyncio.sleep(0.05)
         pipe.send_text("\x1b")
         for _ in range(100):
-            if not search_active:
+            if not finder_active:
                 break
             await asyncio.sleep(0.01)
         else:
-            raise AssertionError("transcript search did not end")
+            raise AssertionError("message finder did not close")
 
         pipe.send_text("\x1b[A")
         await asyncio.sleep(0.05)

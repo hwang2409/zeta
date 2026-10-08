@@ -537,6 +537,7 @@ class SlashStatus:
     model_window: int | None = None
     mcp_summary: str = "mcp: 0 mounted, 0 failed"
     compaction: str = "summary"
+    automatic_memory_failure: str | None = None
 
 
 class SlashSession(Protocol):
@@ -969,6 +970,8 @@ def _format_status(status: SlashStatus) -> str:
         [
             "context_files: " + (", ".join(status.context_files) or "none"),
             "hooks: " + (", ".join(status.hooks) or "none"),
+            "automatic_memory_failure: "
+            + (status.automatic_memory_failure or "none"),
         ]
     )
     if status.todo_counts is not None:
@@ -1220,7 +1223,7 @@ def create_slash_registry(
     )
     registry.register(SlashCommand("inbox", _run_inbox, "list this project's inbox"))
     registry.register(
-        SlashCommand("memory", _run_memory, "show or undo automatic memory updates")
+        SlashCommand("memory", _run_memory, "show, retry, or undo automatic memory updates")
     )
     registry.register(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")

@@ -35,6 +35,7 @@ from .protocol import (
     bounded,
 )
 from .runtime import BackendFactory, ServerRuntime, SessionState
+from .turn_context import PendingTurnContexts
 
 # Echoed user text stays well inside the 1 MiB frame after JSON escaping.
 USER_MESSAGE_MAX_BYTES = 262_144
@@ -90,6 +91,7 @@ class ZetaServer:
         self._client_active = False
         self._client: _Client | None = None
         self._socket_created = False
+        self.turn_contexts = PendingTurnContexts()
 
     @property
     def address(self) -> str:
@@ -355,6 +357,9 @@ class _Client:
             if "ping" not in self.features:
                 raise ProtocolError(-32601, "ping requires the negotiated ping feature")
             return {"pong": True}
+        if method == "set_turn_context":
+            contexts = self.server.turn_contexts
+            return contexts.set_request(self.features, self.server.runtime, params)
         if method in PROJECT_REQUESTS:
             if "projects" not in self.features:
                 raise ProtocolError(
@@ -459,6 +464,7 @@ class _Client:
                 requests += login.REQUESTS
             if "ping" in self.features:
                 requests.append("ping")
+            self.server.turn_contexts.add_request(requests, self.features)
             if "projects" in self.features:
                 requests += PROJECT_REQUESTS
         capabilities: dict[str, object] = {
@@ -780,14 +786,9 @@ class _Client:
             await asyncio.sleep(0.01)
             state.turn_started()
             started = True
-            success = True
-            async for event in loop.run_notification_turn():
-                if event.type is StreamEventType.ERROR:
-                    success = False
-                if event.type is StreamEventType.AGENT_END:
-                    agent_end = event
-                else:
-                    await self._event(event, session_id=session_id)
+            success, agent_end = await self.server.turn_contexts.run_notification_turn(
+                session_id, loop, self._event
+            )
         except asyncio.CancelledError:
             success = False
             raise
