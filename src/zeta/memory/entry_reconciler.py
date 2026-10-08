@@ -602,7 +602,7 @@ def _parse(
         except _ProposalError as exc:
             errors.extend(exc.errors)
     if not parsed:
-        for row in _rendered_transcript_rows(transcript):
+        for row in transcript.rows:
             encoded = json.dumps(row, ensure_ascii=False)
             lowered = encoded.lower()
             if not _is_user_authored_row(row) or not any(
