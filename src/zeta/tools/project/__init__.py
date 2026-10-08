@@ -93,10 +93,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "project",
         _inspect_project,
-        description=(
-            "Read the current project's bounded memory (standard filename-to-text "
-            "files or typed entries) or recorded session references."
-        ),
+        description="Read the current project's bounded memory (standard filename-to-text files) or recorded session references.",
         parameters={
             "type": "object",
             "properties": {
