@@ -129,16 +129,12 @@ class ContextAssembler:
         telemetry_sink: Callable[[Mapping[str, Any]], None] | None = None,
         on_token_growth: Callable[[int], None] | None = None,
         on_before_eviction: Callable[[int, int], None] | None = None,
-        compaction: str = "summary",
     ) -> None:
         if token_budget <= 0:
             raise ValueError("token budget must be positive")
         if retained_tail < 1:
             raise ValueError("retained tail must be at least one")
-        if compaction not in {"summary", "evict"}:
-            raise ValueError("compaction must be 'summary' or 'evict'")
         self.store = store
-        self.compaction = compaction
         self.token_budget = token_budget
         self.retained_tail = retained_tail
         self.backend = backend
@@ -316,22 +312,17 @@ class ContextAssembler:
         deterministic eviction pass without switching to model summarization.
         """
 
-        if self.compaction == "evict":
-            while True:
-                branch = self.store.active_branch_snapshot()
-                branch_id = self._branch_id(branch)
-                preparation = await asyncio.to_thread(
-                    _cooperative_call, self._prepare_assembly, branch, force=force
-                )
-                # Cancellation is observed before accepting preparation derived
-                # from a branch that may have changed while the worker ran.
-                await asyncio.sleep(0)
-                if self.store.active_branch_head_id() == branch_id:
-                    break
-        else:
-            branch = self.store.replay()
+        while True:
+            branch = self.store.active_branch_snapshot()
             branch_id = self._branch_id(branch)
-            preparation = self._prepare_assembly(branch, force=force)
+            preparation = await asyncio.to_thread(
+                _cooperative_call, self._prepare_assembly, branch, force=force
+            )
+            # Cancellation is observed before accepting preparation derived
+            # from a branch that may have changed while the worker ran.
+            await asyncio.sleep(0)
+            if self.store.active_branch_head_id() == branch_id:
+                break
         items = preparation.items
         result_seqs = preparation.result_seqs
         boundary = preparation.boundary
@@ -365,19 +356,18 @@ class ContextAssembler:
         candidates = [
             item for index, item in enumerate(items[:boundary]) if index != latest_user
         ]
-        if self.compaction == "evict":
-            evicted = await self._evict_context(
-                backend=backend,
-                force=force,
-                branch=branch,
-                branch_id=branch_id,
-                items=items,
-                latest_user=latest_user,
-                system_messages=system_messages,
-                bypass_hysteresis=bypass_eviction_hysteresis,
-            )
-            if evicted is not None:
-                return evicted
+        evicted = await self._evict_context(
+            backend=backend,
+            force=force,
+            branch=branch,
+            branch_id=branch_id,
+            items=items,
+            latest_user=latest_user,
+            system_messages=system_messages,
+            bypass_hysteresis=bypass_eviction_hysteresis,
+        )
+        if evicted is not None:
+            return evicted
         if not candidates and adaptive_tail:
             truncated = self._truncate_tool_results(
                 committed_messages,

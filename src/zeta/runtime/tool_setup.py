@@ -21,7 +21,6 @@ def select_tool_registry(
     tool_schemas: Sequence[ToolSchema] | None,
     project_id: str | None = None,
     project_registry: object | None = None,
-    compaction: str = "summary",
 ) -> ToolRegistry:
     """Select or construct the loop's registry and validate its catalogs."""
 
@@ -42,8 +41,6 @@ def select_tool_registry(
             and selected_registry.agent_catalog != agent_catalog
         ):
             raise ValueError("loop agent catalog must match the tool registry catalog")
-        if getattr(selected_registry, "compaction", compaction) != compaction:
-            raise ValueError("loop compaction mode must match the tool registry")
         return selected_registry
     if isinstance(tools, Mapping):
         selected_registry = ToolRegistry(
@@ -86,7 +83,6 @@ def select_tool_registry(
             agent_catalog=agent_catalog,
             project_id=project_id,
             project_registry=project_registry,
-            compaction=compaction,
         )
     raise TypeError("tools must be a mapping or ToolRegistry")
 

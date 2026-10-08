@@ -154,7 +154,6 @@ class AgentLoop(
         system_prompt: str | Message | None = None,
         token_budget: int = 200_000,
         retained_tail: int = 8,
-        compaction: str = "summary",
         on_completion_success: Callable[[], None] | None = None,
         on_plan_mode_change: Callable[[bool], None] | None = None,
         hooks: HookManager | None = None,
@@ -215,7 +214,6 @@ class AgentLoop(
             tool_schemas=tool_schemas,
             project_id=root_project_id,
             project_registry=project_registry,
-            compaction=compaction,
         )
         self._mcp_mount: MCPMount | None = None
         self._mcp_mount_attempted = skip_mcp_mount
@@ -255,7 +253,6 @@ class AgentLoop(
             store,
             token_budget=token_budget,
             retained_tail=retained_tail,
-            compaction=compaction,
             system_prompt=system_prompt,
             backend=backend,
             on_completion_success=on_completion_success,

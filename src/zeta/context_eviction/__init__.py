@@ -103,6 +103,7 @@ def normalize_evicted_tool_result(message: Message) -> Message:
             result.tool_call_id,
             result.content,
             is_error=result.is_error,
+            content_blocks=result.content_blocks,
             is_canceled=result.is_canceled,
         ),
         metadata=message.metadata,

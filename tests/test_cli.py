@@ -149,7 +149,8 @@ def _parser_surface(parser: argparse.ArgumentParser) -> set[str]:
 
     def visit(current: argparse.ArgumentParser) -> None:
         for action in current._actions:
-            surface.update(action.option_strings)
+            if action.help != argparse.SUPPRESS:
+                surface.update(action.option_strings)
             if isinstance(action, argparse._SubParsersAction):
                 surface.update(action.choices)
                 for subparser in action.choices.values():
@@ -163,6 +164,7 @@ def _parser_options(parser: argparse.ArgumentParser) -> set[str]:
     return {
         option
         for action in parser._actions
+        if action.help != argparse.SUPPRESS
         for option in action.option_strings
     }
 
