@@ -362,13 +362,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="run trusted global command hooks in restricted served sessions",
     )
-    stalls_parser = commands.add_parser(
-        "stalls", help="summarize the opt-in TUI stall log"
-    )
-    stalls_parser.add_argument(
-        "--top", type=int, default=10, help="top stacks to list (default: 10)"
-    )
-    stalls_parser.add_argument("--json", action="store_true", help="print JSON")
     completion_parser = commands.add_parser(
         "completion",
         help="print a static shell completion script",
@@ -401,24 +394,7 @@ def _print_exit_hint(app: object) -> None:
 
 
 async def _run_tui(app: object) -> None:
-    from ..stall_trace import StallWatchdog
-
-    store = app.loop.store
-    background_tasks = app.loop.tool_registry.background_tasks
-    watchdog = StallWatchdog.from_environment(
-        lambda: {
-            "transcript_entries": len(store._entries),
-            "child_agents": len(store._agent_children),
-            "background_tasks": background_tasks.running_count,
-        }
-    )
-    if watchdog is not None:
-        watchdog.start(asyncio.get_running_loop())
-    try:
-        await app.run()
-    finally:
-        if watchdog is not None:
-            watchdog.close()
+    await app.run()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -568,17 +544,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "completion":
         print(completion_script(args.shell), end="")
-        return 0
-    if args.command == "stalls":
-        from ..stall_trace import read_stall_summary, render_stall_summary
-
-        if args.top < 1:
-            parser.error("--top must be positive")
-        report = read_stall_summary(env_home() / "logs" / "stalls.jsonl", top=args.top)
-        if args.json:
-            print(json.dumps(report, indent=2))
-        else:
-            print(render_stall_summary(report), end="")
         return 0
     if args.prompt is not None:
         from ..runtime.headless import run_headless
