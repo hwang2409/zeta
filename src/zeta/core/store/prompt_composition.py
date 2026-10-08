@@ -83,6 +83,22 @@ def clone_prompt_composition(metadata: Any) -> dict[str, Any]:
     }
 
 
+def _composition_state(metadata: Any) -> tuple[object, ...]:
+    """Return the persisted fields owned by prompt composition."""
+
+    return (
+        metadata.system_prompt,
+        tuple(metadata.context_files),
+        metadata.skill_catalog,
+        metadata.agent_catalog,
+        metadata.prompt_recipe,
+        metadata.prompt_components,
+        metadata.project_memory_offset,
+        metadata.project_memory_length,
+        metadata.project_memory_digest,
+    )
+
+
 class PromptCompositionMixin:
     """Persist complete prompt compositions without exposing storage details."""
 
@@ -121,14 +137,17 @@ class PromptCompositionMixin:
         project_memory_length: int | None,
         project_memory_digest: str | None,
     ) -> Any:
-        """Persist one automatic resume recomposition without changing recency."""
+        """Compare-and-set one resume composition without changing recency.
 
-        expected_recipe = metadata.prompt_recipe
+        A concurrent resumer can calculate a different default or refreshed
+        memory span from the same snapshot. The first complete composition
+        persisted wins; every loser adopts that exact persisted composition.
+        """
+
+        expected_state = _composition_state(metadata)
 
         def update(item: Any) -> Any:
-            # Concurrent first resumes of a legacy session adopt one complete
-            # composition. Established recipes may be recomposed on each run.
-            if expected_recipe is None and item.prompt_recipe is not None:
+            if _composition_state(item) != expected_state:
                 return item
             item.system_prompt = system_prompt
             item.context_files = list(context_files)

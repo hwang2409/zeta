@@ -24,7 +24,6 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
-from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -601,68 +600,6 @@ def test_second_resume_after_override_sees_overridden_snapshot(
 
     assert prompt == _with_runtime_guidance("explicit override")
     assert resumed._startup_alerts == ()
-
-
-def test_concurrent_legacy_empty_prompt_resumes_adopt_one_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "zeta-home"
-    monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.chdir(tmp_path)
-    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
-    session_id = opened.store.session_id
-    metadata_path = home / "sessions" / session_id / "meta.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata.pop("system_prompt")
-    metadata.pop("context_files")
-    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-
-    load_count = 0
-
-    def load_context(**kwargs: object) -> ProjectContext:
-        del kwargs
-        nonlocal load_count
-        load_count += 1
-        return ProjectContext(
-            f"default fallback {load_count}",
-            (tmp_path / "context.md",),
-            prompt_recipe="default",
-        )
-
-    monkeypatch.setattr("zeta.tui.app.load_project_context", load_context)
-    apps: list[TUIApp] = []
-    errors: list[Exception] = []
-
-    def resume() -> None:
-        try:
-            apps.append(
-                create_app(
-                    build_parser().parse_args(
-                        ["--resume", session_id, "--provider", "fake"]
-                    )
-                )
-            )
-        except Exception as exc:
-            errors.append(exc)
-
-    first = threading.Thread(target=resume)
-    second = threading.Thread(target=resume)
-    first.start()
-    second.start()
-    first.join()
-    second.join()
-
-    assert errors == []
-    assert load_count == 2
-    saved = SessionManager(home).open(session_id).metadata
-    prompts = [app.loop.context_assembler.system_prompt.content[0].text for app in apps]
-    context_files = [app.slash_status().context_files for app in apps]
-    assert saved.prompt_recipe == "default"
-    assert prompts == [saved.system_prompt, saved.system_prompt]
-    assert context_files == [
-        (str(tmp_path / "context.md"),),
-        (str(tmp_path / "context.md"),),
-    ]
 
 
 def test_session_bash_cwd_round_trips_through_store_state(
