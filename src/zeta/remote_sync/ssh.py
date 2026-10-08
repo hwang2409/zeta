@@ -24,6 +24,7 @@ from . import (
     _safe_component,
     _tree_state,
     _write_json,
+    project_publish,
 )
 
 _HOST = re.compile(r"[A-Za-z0-9_.@-]+\Z")
@@ -175,6 +176,61 @@ finally:
 '''
 
 
+_PROJECT_INSTALL_WRAPPER = r"""
+import sys, tarfile, tempfile
+home = Path(sys.argv[1]).expanduser().resolve()
+ident, expected = sys.argv[2], sys.argv[3]
+max_members, max_bytes = int(sys.argv[4]), int(sys.argv[5])
+if Path(ident).parts != (ident,): sys.exit(45)
+home.mkdir(parents=True, exist_ok=True, mode=0o700)
+with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as temporary:
+    staging = Path(temporary) / ident
+    staging.mkdir(mode=0o700)
+    members = declared = extracted = 0
+    with tarfile.open(fileobj=sys.stdin.buffer, mode="r|gz") as archive:
+        for member in archive:
+            members += 1
+            if members > max_members: sys.exit(49)
+            if member.size < 0: sys.exit(46)
+            declared += member.size
+            if declared > max_bytes: sys.exit(50)
+            if shutil.disk_usage(home).free < declared - extracted: sys.exit(51)
+            parts = Path(member.name).parts
+            if not parts or parts[0] != "payload" or any(p in {"", ".", ".."} for p in parts) or member.issym() or member.islnk(): sys.exit(46)
+            target = staging.joinpath(*parts[1:])
+            if member.isdir(): target.mkdir(parents=True, exist_ok=True, mode=0o700)
+            elif member.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                source = archive.extractfile(member)
+                if source is None: sys.exit(46)
+                with target.open("wb") as output:
+                    remaining = member.size
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk: sys.exit(46)
+                        extracted += len(chunk); remaining -= len(chunk)
+                        if extracted > max_bytes: sys.exit(50)
+                        output.write(chunk)
+                    if source.read(1): sys.exit(50)
+                target.chmod(0o600)
+            else: sys.exit(46)
+    try:
+        publish_local_project(home, ident, staging, expected_digest=expected)
+    except ProjectPublicationError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(47)
+"""
+
+
+def _project_install_script() -> str:
+    """Ship the exact destination publication module to an uninstalled peer."""
+
+    filename = project_publish.__file__
+    if filename is None:
+        raise RemoteSyncError("project publication module source is unavailable")
+    return Path(filename).read_text(encoding="utf-8") + "\n" + _PROJECT_INSTALL_WRAPPER
+
+
 @dataclass(slots=True)
 class SshTransport:
     """Transfer snapshots through one configured SSH host and remote ZETA_HOME."""
@@ -246,16 +302,13 @@ class SshTransport:
             if "was not found" in str(exc):
                 return "missing"
             raise
-        return _directory_digest(destination)
+        return project_publish.project_digest(destination)
 
     def publish_project(
         self, project_id: str, snapshot: Path, *, expected_digest: str
     ) -> None:
-        self._install(
-            "projects",
-            _safe_component(project_id, "project id"),
-            snapshot,
-            expected_digest,
+        self._install_project(
+            _safe_component(project_id, "project id"), snapshot, expected_digest
         )
 
     def _existing_state(
@@ -316,6 +369,25 @@ class SshTransport:
                 max_bytes=self.max_archive_bytes,
             )
 
+    def _install_project(self, ident: str, source: Path, expected: str) -> None:
+        with tempfile.TemporaryDirectory(prefix="zeta-ssh-install-") as temporary:
+            archive = Path(temporary) / "snapshot.tar.gz"
+            _pack(source, archive)
+            with archive.open("rb") as incoming:
+                result = self._run(
+                    _project_install_script(),
+                    [
+                        self._home(),
+                        ident,
+                        expected,
+                        str(self.max_archive_members),
+                        str(self.max_archive_bytes),
+                    ],
+                    stdin=incoming,
+                    check=False,
+                )
+        self._raise_install_error(result, project=True)
+
     def _install(self, kind: str, ident: str, source: Path, expected: str) -> None:
         with tempfile.TemporaryDirectory(prefix="zeta-ssh-install-") as temporary:
             archive = Path(temporary) / "snapshot.tar.gz"
@@ -334,10 +406,19 @@ class SshTransport:
                     stdin=incoming,
                     check=False,
                 )
+        self._raise_install_error(result, project=False)
+
+    def _raise_install_error(
+        self, result: subprocess.CompletedProcess[bytes], *, project: bool
+    ) -> None:
         if result.returncode == 47:
-            raise RemoteSyncError("remote changed during transfer; retry after inspection")
+            raise RemoteSyncError(
+                "remote changed during transfer; retry after inspection"
+            )
         if result.returncode == 48:
-            raise RemoteSyncError("remote session is active; stop it before replacement")
+            raise RemoteSyncError(
+                "remote session is active; stop it before replacement"
+            )
         if result.returncode == 49:
             raise RemoteSyncError("remote archive exceeds the member limit")
         if result.returncode == 50:
@@ -345,8 +426,10 @@ class SshTransport:
         if result.returncode == 51:
             raise RemoteSyncError("remote has insufficient free space for the archive")
         if result.returncode:
+            kind = "project" if project else "session"
             raise RemoteSyncError(
-                f"SSH publication failed on {self.host} (exit {result.returncode}): "
+                f"SSH {kind} publication failed on {self.host} "
+                f"(exit {result.returncode}): "
                 f"{result.stderr.decode(errors='replace').strip()}"
             )
 

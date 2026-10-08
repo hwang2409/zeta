@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import stat
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -776,6 +777,141 @@ def test_memory_conflict_requires_explicit_resolution(tmp_path: Path) -> None:
     assert not retried.conflicts
     assert dict(remote_projects.load_memory(project.project_id))["brief.md"] == "accepted local\n"
 
+
+def test_ssh_memory_sync_keeps_project_directory_and_side_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    transport = SshTransport("fake", str(remote), name="cloud")
+    push_project_memory(local, transport, project_id=project.project_id)
+    destination = remote / "projects" / project.project_id
+    inode = destination.stat().st_ino
+    unrelated = destination / "inbox" / "unrelated.json"
+    unrelated.parent.mkdir()
+    unrelated.write_text('{"kept": true}\n', encoding="utf-8")
+    ProjectRegistry(local / "projects").update_memory(
+        project.project_id, {"brief.md": "second sync\n"}
+    )
+
+    push_project_memory(local, transport, project_id=project.project_id)
+
+    assert destination.stat().st_ino == inode
+    assert unrelated.read_text(encoding="utf-8") == '{"kept": true}\n'
+
+
+def test_interrupted_initial_creation_leaves_no_incoming_artifacts_local(
+    tmp_path: Path,
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    script = """
+import os
+import sys
+from pathlib import Path
+from zeta.remote_sync import LocalTransport, push_project_memory
+import zeta.remote_sync.project_publish as publication
+real_copy = publication.shutil.copytree
+def kill_after_copy(source, destination, *args, **kwargs):
+    result = real_copy(source, destination, *args, **kwargs)
+    if Path(destination).name.startswith('.' + sys.argv[3] + '.incoming-'):
+        os._exit(86)
+    return result
+publication.shutil.copytree = kill_after_copy
+push_project_memory(Path(sys.argv[1]), LocalTransport(Path(sys.argv[2])), project_id=sys.argv[3])
+"""
+    killed = subprocess.run(
+        [sys.executable, "-c", script, str(local), str(remote), project.project_id],
+        check=False,
+    )
+    assert killed.returncode == 86
+
+    push_project_memory(local, LocalTransport(remote), project_id=project.project_id)
+
+    assert not list((remote / "projects").glob(f".{project.project_id}.incoming-*"))
+
+
+def test_interrupted_initial_creation_leaves_no_incoming_artifacts_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    transport = SshTransport("fake", str(remote), name="cloud")
+    project_script = ssh_module._project_install_script
+    script = project_script()
+    marker = (
+        "                shutil.copytree(snapshot, incoming, copy_function=_copy_file)\n"
+    )
+    assert marker in script
+    killed_script = script.replace(marker, marker + "                os._exit(86)\n", 1)
+    monkeypatch.setattr(ssh_module, "_project_install_script", lambda: killed_script)
+    with pytest.raises(RemoteSyncError, match="exit 86"):
+        push_project_memory(local, transport, project_id=project.project_id)
+    monkeypatch.setattr(ssh_module, "_project_install_script", project_script)
+
+    push_project_memory(local, transport, project_id=project.project_id)
+
+    assert not list((remote / "projects").glob(f".{project.project_id}.incoming-*"))
+
+
+@pytest.mark.parametrize(
+    ("step", "exit_code"), (("snapshot", 91), ("manifest", 92), ("publish", 93))
+)
+def test_ssh_interrupted_memory_publication_keeps_valid_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    step: str,
+    exit_code: int,
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    transport = SshTransport("fake", str(remote), name="cloud")
+    push_project_memory(local, transport, project_id=project.project_id)
+    ProjectRegistry(local / "projects").update_memory(
+        project.project_id, {"brief.md": "interrupted sync\n"}
+    )
+    project_script = ssh_module._project_install_script
+    script = project_script()
+    marker = '    """Expose durable publication boundaries for crash testing."""\n'
+    assert marker in script
+    killed_script = script.replace(
+        marker,
+        marker + f"    if step == {step!r}: os._exit({exit_code})\n",
+        1,
+    )
+    monkeypatch.setattr(ssh_module, "_project_install_script", lambda: killed_script)
+
+    with pytest.raises(RemoteSyncError, match=f"exit {exit_code}"):
+        push_project_memory(local, transport, project_id=project.project_id)
+
+    fresh = ProjectRegistry(remote / "projects")
+    assert project.project_id in {item.project_id for item in fresh.list_projects()}
+    assert fresh.show_project(project.project_id).project_id == project.project_id
+    assert dict(fresh.load_memory(project.project_id))["brief.md"] in {
+        "shared\n",
+        "interrupted sync\n",
+    }
 
 def test_ssh_memory_pull_publishes_baseline_for_consecutive_remote_edits(
     tmp_path: Path,

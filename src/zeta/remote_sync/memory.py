@@ -31,6 +31,13 @@ from ..project_errors import UnsupportedMemoryFormatError
 from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
 from .errors import RemoteSyncError
+from .project_publish import (
+    ProjectPublicationError,
+    project_digest,
+)
+from .project_publish import (
+    publish_local_project as _publish_local_project,
+)
 
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
@@ -386,39 +393,15 @@ def publish_local_project(
     *,
     expected_digest: str,
 ) -> None:
-    """CAS-publish one local-adapter snapshot through the memory store."""
+    """Validate, then use the shared destination-side publisher."""
 
     _validate_project_snapshot(snapshot, project_id)
-    project = home / "projects" / project_id
-    if expected_digest == _MISSING:
-        with _registry_lock(home / "projects"):
-            if project.exists():
-                raise RemoteSyncError(
-                    "remote changed during transfer; retry after inspection"
-                )
-            project.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            staging = project.parent / f".{project_id}.incoming-{os.getpid()}"
-            if staging.exists():
-                shutil.rmtree(staging)
-            copy_project_snapshot(snapshot, staging)
-            try:
-                os.rename(staging, project)
-                _fsync_directory(project.parent)
-            except FileExistsError as exc:
-                raise RemoteSyncError(
-                    "remote changed during transfer; retry after inspection"
-                ) from exc
-        return
-    with _registry_lock(home / "projects"):
-        if project_digest(project) != expected_digest:
-            raise RemoteSyncError("remote changed during transfer; retry after inspection")
-    expected_export = _materialize_memory_export(project, project_id)
-    _publish_memory_snapshot(
-        project,
-        snapshot,
-        expected_export=expected_export,
-        provenance={"source": "remote_sync", "peer": "remote"},
-    )
+    try:
+        _publish_local_project(
+            home, project_id, snapshot, expected_digest=expected_digest
+        )
+    except ProjectPublicationError as exc:
+        raise RemoteSyncError(str(exc)) from exc
 
 
 def copy_project_snapshot(source: Path, destination: Path) -> None:
@@ -564,28 +547,6 @@ def _materialize_memory_export(snapshot: Path, project_id: str) -> MemorySyncExp
     for name, content in exported.contents.items():
         _atomic_write_file(content.encode("utf-8"), snapshot / "memory" / name)
     return exported
-
-
-def project_digest(root: Path) -> str:
-    digest = hashlib.sha256()
-    if not root.exists():
-        return _MISSING
-    has_version_store = (root / "memory-current.json").is_file()
-    for path in sorted(root.rglob("*")):
-        if (
-            not path.is_file()
-            or path.is_symlink()
-            or path.name in _EXCLUDED_NAMES
-            or (
-                has_version_store
-                and path.parent == root / "memory"
-                and path.name in MEMORY_FILES
-            )
-        ):
-            continue
-        digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
-        _update_digest_from_file(digest, path)
-    return digest.hexdigest()
 
 
 def _validate_project_snapshot(snapshot: Path, project_id: str) -> None:
