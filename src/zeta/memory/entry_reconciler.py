@@ -265,9 +265,11 @@ def _message_text(row: Mapping[str, Any]) -> str:
 
 def _source_rank(rows: Sequence[Mapping[str, Any]]) -> tuple[int, bool]:
     authorships = [_transcript_authorship(row) for row in rows]
-    direct = "user" in authorships
-    if direct:
-        text = " ".join(_message_text(row).lower() for row in rows)
+    direct_user_rows = [
+        row for row, authorship in zip(rows, authorships, strict=True) if authorship == "user"
+    ]
+    if direct_user_rows:
+        text = " ".join(_message_text(row).lower() for row in direct_user_rows)
         return (
             1 if any(word in text for word in _HIGHEST_PRIORITY_WORDS) else 2
         ), True
@@ -310,7 +312,7 @@ def _sources(
     by_seq = {
         row.get("seq"): row for row in transcript.rows if type(row.get("seq")) is int
     }
-    parsed_ranges: list[tuple[int, int, tuple[str, ...], str]] = []
+    parsed_ranges: list[tuple[int, int, tuple[str, ...], str, int, bool]] = []
     all_rows: list[Mapping[str, Any]] = []
     for source_index, item in enumerate(raw):
         source = _exact(item, {"seq_start", "seq_end"}, {"seq_start", "seq_end"}, index)
@@ -328,14 +330,19 @@ def _sources(
             )
         origins = tuple(dict.fromkeys(_transcript_authorship(row) for row in rows))
         observed_at = _observed_at(rows, now)
-        parsed_ranges.append((start, end, origins, observed_at))
+        rank, direct = _source_rank(rows)
+        parsed_ranges.append((start, end, origins, observed_at, rank, direct))
         all_rows.extend(rows)
-    rank, direct = _source_rank(all_rows)
+    operation_rank = min(item[4] for item in parsed_ranges)
+    operation_direct = any(
+        direct and rank == operation_rank
+        for _, _, _, _, rank, direct in parsed_ranges
+    )
     sources = tuple(
         MemorySource(transcript.session_id, start, end, origins, observed_at, rank)
-        for start, end, origins, observed_at in parsed_ranges
+        for start, end, origins, observed_at, rank, _ in parsed_ranges
     )
-    return sources, rank, direct, _observed_at(all_rows, now)
+    return sources, operation_rank, operation_direct, _observed_at(all_rows, now)
 
 
 def _text(value: object, label: str, index: int) -> str:

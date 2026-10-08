@@ -1103,6 +1103,124 @@ async def test_stored_correction_rejects_newer_ordinary_user_statement(
 
 
 @pytest.mark.asyncio
+async def test_agent_correction_language_cannot_inflate_ordinary_user_evidence(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    added, _ = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(
+                1,
+                "Actually, use Postgres.",
+                created_at="2026-10-08T11:00:00.000000Z",
+            )
+        ),
+        [_proposal(_add("decisions", "Use Postgres."))],
+        key="stored-user-correction",
+        now="2026-10-08T11:00:00.000000Z",
+    )
+    target = added.changed_entry_ids[0]
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(2, "Use SQLite.", created_at=NOW),
+            _row(
+                3,
+                "Actually, I can record that.",
+                role="assistant",
+                created_at=NOW,
+            ),
+        ),
+        [
+            _proposal(
+                {
+                    "op": "update",
+                    "target": target,
+                    "text": "Use SQLite.",
+                    "sources": [
+                        {"seq_start": 2, "seq_end": 2},
+                        {"seq_start": 3, "seq_end": 3},
+                    ],
+                    "reason": "ordinary statement with agent narration",
+                }
+            )
+        ],
+        key="mixed-weaker-evidence",
+    )
+
+    assert not result.changed_entry_ids
+    assert result.rejected_groups
+    stored = next(
+        entry for entry in _entries(registry, project_id) if entry.id == target
+    )
+    assert stored.text == "Use Postgres."
+
+
+@pytest.mark.asyncio
+async def test_each_source_range_keeps_its_own_code_derived_rank(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(1, "Actually, use SQLite instead.", created_at=NOW),
+            _row(2, "I will record that.", role="assistant", created_at=NOW),
+        ),
+        [
+            _proposal(
+                {
+                    "op": "add",
+                    "kind": "decisions",
+                    "text": "Use SQLite.",
+                    "sources": [
+                        {"seq_start": 1, "seq_end": 1},
+                        {"seq_start": 2, "seq_end": 2},
+                    ],
+                    "reason": "direct user correction",
+                }
+            )
+        ],
+        key="independent-source-ranks",
+    )
+
+    entry = next(
+        entry
+        for entry in _entries(registry, project_id)
+        if entry.id == result.changed_entry_ids[0]
+    )
+    assert [source.evidence_rank for source in entry.sources] == [1, 5]
+
+
+@pytest.mark.asyncio
+async def test_agent_correction_language_remains_agent_evidence(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(
+                1,
+                "Actually, use SQLite instead.",
+                role="assistant",
+                created_at=NOW,
+            )
+        ),
+        [_proposal(_add("decisions", "Use SQLite."))],
+        key="agent-correction-language",
+    )
+
+    entry = next(
+        entry
+        for entry in _entries(registry, project_id)
+        if entry.id == result.changed_entry_ids[0]
+    )
+    assert entry.sources[0].evidence_rank == 5
+
+
+@pytest.mark.asyncio
 async def test_newer_correction_can_replace_older_correction(tmp_path: Path) -> None:
     registry, project_id = _registry(tmp_path)
     added, _ = await _run(
