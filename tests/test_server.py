@@ -4828,6 +4828,61 @@ async def test_repeated_foreground_notification_aborts_schedule_one_retry_each(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("abort_count", [2, 5])
+async def test_immediate_foreground_aborts_keep_one_notification_retry(
+    tmp_path: Path,
+    abort_count: int,
+) -> None:
+    backend = BlockingThenCaptureBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_agent_notification(
+        "child",
+        child_session_path="/tmp/child",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(
+            reader,
+            writer,
+            4,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
+        await asyncio.wait_for(backend.started.wait(), TIMEOUT)
+        for offset in range(abort_count):
+            frames = await _request(
+                reader,
+                writer,
+                5 + offset,
+                "abort",
+                {"scope": "foreground"},
+            )
+            assert frames[-1]["result"]["aborted"] is True
+
+        await _frames_until_event(reader, "agent_end")
+        while server.runtime.loop.notification_turn_state != "idle":
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
+        assert len(backend.calls) == 2
+        assert server.runtime.loop.schedule_notification_turn() is False
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_disconnected_wake_turn_reuses_durable_notification_input(
     tmp_path: Path,
 ) -> None:

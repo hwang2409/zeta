@@ -323,12 +323,17 @@ class AgentNotificationMixin:
             raise
         finally:
             await close_completion(stream)
-            retry_after_abort = await self.notification_wake.finish(success=success)
-            self._turn_active = False
-            if retry_after_abort or (
-                success and self.notification_wake.pending_message() is not None
-            ):
-                self.notify_background_persisted()
+            await self.finish_notification_turn(success=success)
+
+    async def finish_notification_turn(self, *, success: bool) -> None:
+        """Finalize notification state and request any required follow-up."""
+
+        retry_after_abort = await self.notification_wake.finish(success=success)
+        self._turn_active = False
+        if retry_after_abort or (
+            success and self.notification_wake.pending_message() is not None
+        ):
+            self.notify_background_persisted()
 
     def set_background_wake_callback(self, callback: Callable[[], None] | None) -> None:
         if callback is None:

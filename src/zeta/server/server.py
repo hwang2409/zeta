@@ -795,7 +795,7 @@ class _Client:
             )
         finally:
             if not started and loop.notification_turn_state == "scheduled":
-                await loop.notification_wake.finish(success=False)
+                await loop.finish_notification_turn(success=False)
             self._finalize_turn(
                 session_id, state, success=success, schedule_wake=agent_end is None
             )
