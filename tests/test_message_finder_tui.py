@@ -16,11 +16,15 @@ from zeta.tui.transcript import TranscriptWidget
 from zeta.tui.transcript.message_finder import Role
 
 
-def _open_finder(transcript: TranscriptWidget) -> None:
+async def _open_finder_async(transcript: TranscriptWidget) -> None:
     request = transcript.open_finder()
     assert request is not None
-    candidates = transcript.build_finder_candidates(request)
+    candidates = await transcript.build_finder_candidates(request)
     assert transcript.finder_publish_candidates(request, candidates)
+
+
+def _open_finder(transcript: TranscriptWidget) -> None:
+    asyncio.run(_open_finder_async(transcript))
 
 
 def _rank_finder(transcript: TranscriptWidget, query: str) -> None:
@@ -155,7 +159,7 @@ def test_finder_jump_works_on_virtual_history() -> None:
 
 
 @pytest.mark.asyncio
-async def test_open_and_keypress_bursts_stay_below_40ms_on_long_session() -> None:
+async def test_open_does_not_stall_long_session() -> None:
     transcript = TranscriptWidget()
     long_tail = " x" * 2_000
     for index in range(5000):
@@ -165,27 +169,27 @@ async def test_open_and_keypress_bursts_stay_below_40ms_on_long_session() -> Non
         transcript.mark_user(unit)
     transcript.create_content(100, 40)
     app = _app_for_finder(transcript)
+    ticks = [time.perf_counter()]
+    running = True
 
-    started = time.perf_counter()
+    async def ticker() -> None:
+        while running:
+            await asyncio.sleep(0.01)
+            ticks.append(time.perf_counter())
+
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)
     app._finder_open()
-    open_seconds = time.perf_counter() - started
-    # Allow normal shared-runner scheduling variance; the ticker test below
-    # separately detects meaningful event-loop stalls.
-    assert open_seconds < 0.04, open_seconds
-
     prepare_task = app._finder_prepare_task
     assert prepare_task is not None
     await prepare_task
-    started = time.perf_counter()
-    app._finder_input("pytest")
-    keypress_seconds = time.perf_counter() - started
-    assert keypress_seconds < 0.02, keypress_seconds
+    running = False
+    await ticker_task
 
-    rank_task = app._finder_rank_task
-    assert rank_task is not None
-    await rank_task
     state = transcript.finder_state()
     assert state is not None and state.rows
+    gaps = [later - earlier for earlier, later in pairwise(ticks)]
+    assert gaps and max(gaps) < 0.04, max(gaps)
 
 
 @pytest.mark.asyncio
@@ -201,19 +205,22 @@ async def test_pathological_query_does_not_stall_10ms_ticker() -> None:
     await prepare_task
 
     ticks = [time.perf_counter()]
+    running = True
 
     async def ticker() -> None:
-        while app._finder_rank_task is not None:
+        while running:
             await asyncio.sleep(0.01)
             ticks.append(time.perf_counter())
 
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)
     started = time.perf_counter()
     app._finder_input("a" * 50)
     keypress_seconds = time.perf_counter() - started
-    ticker_task = asyncio.create_task(ticker())
     rank_task = app._finder_rank_task
     assert rank_task is not None
     await rank_task
+    running = False
     await ticker_task
 
     gaps = [later - earlier for earlier, later in pairwise(ticks)]
@@ -358,7 +365,7 @@ async def test_virtual_accept_stays_on_target_while_search_index_builds() -> Non
     later = transcript.append(Text("a later zebra match"))
     transcript.create_content(80, 1)
 
-    _open_finder(transcript)
+    await _open_finder_async(transcript)
     _rank_finder(transcript, "zebra")
     state = transcript.finder_state()
     assert state is not None
@@ -400,7 +407,7 @@ async def test_removed_virtual_search_anchor_keeps_navigation_working(
     later = transcript.append(Text("a later zebra match"))
     transcript.create_content(80, 1)
 
-    _open_finder(transcript)
+    await _open_finder_async(transcript)
     _rank_finder(transcript, "zebra")
     state = transcript.finder_state()
     assert state is not None
@@ -492,18 +499,13 @@ def test_removed_search_anchor_resolves_when_indexing_has_not_started(
     assert transcript._locations(80)[transcript.scroll_offset][0] is later
 
 
-def test_candidate_worker_request_contains_only_immutable_plain_data() -> None:
+def test_candidate_request_does_not_carry_transcript_data() -> None:
     transcript = TranscriptWidget()
     transcript.append(Text("plain candidate"))
 
     request = transcript.open_finder()
 
     assert request is not None
-    assert request.sources
-    source = request.sources[0]
-    assert isinstance(source.key, int)
-    assert isinstance(source.index, int)
-    assert isinstance(source.role, str)
-    assert isinstance(source.parts, tuple)
-    assert all(isinstance(part, str) for part in source.parts)
+    assert isinstance(request.generation, int)
+    assert not hasattr(request, "sources")
     assert not hasattr(request, "units")

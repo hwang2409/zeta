@@ -1,9 +1,9 @@
 """The transcript side of the fuzzy message finder.
 
 :class:`TranscriptFinderMixin` adds the finder lifecycle to the transcript
-widget: snapshotting candidate sources for off-thread extraction and ranking,
-and jumping to a chosen message. It relies on the widget for unit storage,
-scroll state, and the existing substring highlight
+widget: preparing candidate snapshots in bounded batches, coordinating
+out-of-loop ranking, and jumping to a chosen message. It relies on the widget
+for unit storage, scroll state, and the existing substring highlight
 that the post-jump next/previous keys reuse.
 
 Kept in its own module so the main transcript stays within the module-size
@@ -13,6 +13,7 @@ widget's private state through ``self`` the same way the virtual mixin does.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,7 @@ from .transcript_search import find_matches
 _FINDER_TEXT_LIMIT = 2_000
 _FINDER_PREVIEW_LINES = 60
 _FINDER_PREVIEW_TEXT_LIMIT = 12_000
+_FINDER_PREPARE_BATCH_SIZE = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,21 +43,19 @@ class _FinderRestore:
 
 @dataclass(frozen=True, slots=True)
 class _FinderCandidateSource:
-    """Immutable plain data for one off-thread candidate extraction."""
+    """Immutable plain data for one candidate extraction."""
 
     key: int
     index: int
-    role: str
     marker: str
     parts: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class FinderCandidateRequest:
-    """An immutable plain-data snapshot for off-thread candidate extraction."""
+    """Identity of one generation's incrementally prepared candidate snapshot."""
 
     generation: int
-    sources: tuple[_FinderCandidateSource, ...]
 
 
 def _is_tool_unit(value: Any) -> bool:
@@ -72,7 +72,7 @@ class TranscriptFinderMixin:
         return self._finder is not None
 
     def open_finder(self) -> FinderCandidateRequest | None:
-        """Open immediately and return bounded extraction work for a worker."""
+        """Open immediately and identify extraction work for an async worker."""
 
         if self._finder is not None:
             return None
@@ -82,38 +82,47 @@ class TranscriptFinderMixin:
             self._anchor,
             self._virtual_start,
         )
-        finder = MessageFinder(())
-        self._finder = finder
+        self._finder = MessageFinder(())
         self._finder_generation += 1
+        return FinderCandidateRequest(generation=self._finder_generation)
+
+    async def build_finder_candidates(
+        self, request: FinderCandidateRequest
+    ) -> tuple[Candidate, ...]:
+        """Build a stable-key snapshot in batches that keep the UI responsive."""
+
+        units = tuple(self._units)
         user_unit_ids = frozenset(id(unit) for unit in self._user_units)
-        sources: list[_FinderCandidateSource] = []
+        candidates: list[Candidate] = []
         turn = 0
-        for index, unit in enumerate(self._units):
-            if unit is None or unit.value is None:
-                continue
-            role = self._finder_role(unit, user_unit_ids)
-            if role is Role.USER:
-                turn += 1
-            sources.append(
-                _FinderCandidateSource(
+        for batch_start in range(0, len(units), _FINDER_PREPARE_BATCH_SIZE):
+            batch = units[batch_start : batch_start + _FINDER_PREPARE_BATCH_SIZE]
+            for index, unit in enumerate(batch, start=batch_start):
+                if unit is None or unit.value is None:
+                    continue
+                role = self._finder_role(unit, user_unit_ids)
+                if role is Role.USER:
+                    turn += 1
+                source = _FinderCandidateSource(
                     key=unit.key,
                     index=index,
-                    role=role.value,
                     marker=f"#{turn}" if turn else "#0",
                     parts=self._finder_source_parts(unit),
                 )
-            )
-        return FinderCandidateRequest(
-            generation=self._finder_generation,
-            sources=tuple(sources),
-        )
-
-    def build_finder_candidates(
-        self, request: FinderCandidateRequest
-    ) -> tuple[Candidate, ...]:
-        """Extract bounded candidates from ``request`` away from the UI thread."""
-
-        return tuple(self._build_finder_candidates(request))
+                text, preview = self._finder_text(source)
+                if text:
+                    candidates.append(
+                        Candidate(
+                            key=source.key,
+                            index=source.index,
+                            role=role,
+                            marker=source.marker,
+                            text=text,
+                            preview=preview,
+                        )
+                    )
+            await asyncio.sleep(0)
+        return tuple(candidates)
 
     def finder_publish_candidates(
         self,
@@ -267,26 +276,6 @@ class TranscriptFinderMixin:
         if len(flat) > _FINDER_TEXT_LIMIT:
             flat = flat[:_FINDER_TEXT_LIMIT]
         return flat, tuple(lines[:_FINDER_PREVIEW_LINES])
-
-    def _build_finder_candidates(
-        self, request: FinderCandidateRequest
-    ) -> list[Candidate]:
-        candidates: list[Candidate] = []
-        for source in request.sources:
-            text, preview = self._finder_text(source)
-            if not text:
-                continue
-            candidates.append(
-                Candidate(
-                    key=source.key,
-                    index=source.index,
-                    role=Role(source.role),
-                    marker=source.marker,
-                    text=text,
-                    preview=preview,
-                )
-            )
-        return candidates
 
     def _unit_contains_literal(self, unit_index: int, literal: str) -> bool:
         """Return whether the resolved live unit contains the finder literal."""
