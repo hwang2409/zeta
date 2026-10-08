@@ -182,6 +182,9 @@ def sse(events: list[dict[str, object]]) -> str:
 
 def message_stream(
     usage: dict[str, object] | None = None,
+    *,
+    completed_status: str = "completed",
+    response_status: str = "completed",
 ) -> list[dict[str, object]]:
     return [
         event(
@@ -218,7 +221,7 @@ def message_stream(
             item={
                 "type": "message",
                 "id": "message-test",
-                "status": "completed",
+                "status": completed_status,
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": "hello"}],
             },
@@ -227,7 +230,7 @@ def message_stream(
             "response.completed",
             response={
                 "id": "response-test",
-                "status": "completed",
+                "status": response_status,
                 "usage": usage or {"input_tokens": 3, "output_tokens": 2},
             },
         ),
@@ -240,6 +243,7 @@ def tool_stream(
     completed_arguments: str | None = None,
     completed_name: str = "read",
     completed_call_id: str = "call-test",
+    completed_status: str = "completed",
 ) -> list[dict[str, object]]:
     if completed_arguments is None:
         completed_arguments = arguments_done
@@ -271,7 +275,7 @@ def tool_stream(
             item={
                 "type": "function_call",
                 "id": "function-test",
-                "status": "completed",
+                "status": completed_status,
                 "call_id": completed_call_id,
                 "name": completed_name,
                 "arguments": completed_arguments,
@@ -282,7 +286,11 @@ def tool_stream(
 
 
 def reasoning_content_stream(
-    *, summary: str = "", raw: str = "raw", completed_raw: str | None = None
+    *,
+    summary: str = "",
+    raw: str = "raw",
+    completed_raw: str | None = None,
+    completed_status: str = "completed",
 ) -> list[dict[str, object]]:
     events: list[dict[str, object]] = [
         event("response.created", response={"id": "response-test"}),
@@ -353,7 +361,7 @@ def reasoning_content_stream(
                 item={
                     "type": "reasoning",
                     "id": "reasoning-test",
-                    "status": "completed",
+                    "status": completed_status,
                     "summary": (
                         [{"type": "summary_text", "text": summary}]
                         if summary
@@ -1657,6 +1665,244 @@ async def test_completed_tool_metadata_mismatch_retries_without_execution(
     assert executed == []
     retry = next(item for item in events if item.type is StreamEventType.RETRY)
     assert retry.data["reason"] == "stream_inconsistent"
+    assert store.messages()[-1].content == [TextContent("hello")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_completed_function_call_incomplete_status_is_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    executed: list[dict[str, object]] = []
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = (
+            tool_stream(completed_status="incomplete")
+            if len(requests) == 1
+            else message_stream()
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(stream),
+            request=request,
+        )
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = ConversationStore(tmp_path / "sessions")
+    events = [
+        item
+        async for item in AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=store_for(tmp_path / "codex.json"),
+            ),
+            store,
+            tools={"read": lambda arguments: executed.append(arguments)},
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("read", origin=MessageOrigin.USER)
+    ]
+
+    assert len(requests) == 2
+    assert executed == []
+    retry = next(item for item in events if item.type is StreamEventType.RETRY)
+    assert retry.data["reason"] == "stream_inconsistent"
+    assert store.messages()[-1].content == [TextContent("hello")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_completed_message_incomplete_status_is_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = (
+            message_stream(completed_status="incomplete")
+            if len(requests) == 1
+            else message_stream()
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(stream),
+            request=request,
+        )
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = ConversationStore(tmp_path / "sessions")
+    events = [
+        item
+        async for item in AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=store_for(tmp_path / "codex.json"),
+            ),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("read", origin=MessageOrigin.USER)
+    ]
+
+    assert len(requests) == 2
+    retry = next(item for item in events if item.type is StreamEventType.RETRY)
+    assert retry.data["reason"] == "stream_inconsistent"
+    assert any(item.type is StreamEventType.ASSISTANT_RESET for item in events)
+    assert store.messages()[-1].content == [TextContent("hello")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_completed_reasoning_incomplete_status_is_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = (
+            reasoning_content_stream(completed_status="incomplete")
+            if len(requests) == 1
+            else message_stream()
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(stream),
+            request=request,
+        )
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = ConversationStore(tmp_path / "sessions")
+    events = [
+        item
+        async for item in AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=store_for(tmp_path / "codex.json"),
+            ),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("read", origin=MessageOrigin.USER)
+    ]
+
+    assert len(requests) == 2
+    retry = next(item for item in events if item.type is StreamEventType.RETRY)
+    assert retry.data["reason"] == "stream_inconsistent"
+    assert any(item.type is StreamEventType.ASSISTANT_RESET for item in events)
+    assert store.messages()[-1].content == [TextContent("hello")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_response_completion_incomplete_status_is_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = (
+            message_stream(response_status="incomplete")
+            if len(requests) == 1
+            else message_stream()
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(stream),
+            request=request,
+        )
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = ConversationStore(tmp_path / "sessions")
+    events = [
+        item
+        async for item in AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=store_for(tmp_path / "codex.json"),
+            ),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("read", origin=MessageOrigin.USER)
+    ]
+
+    assert len(requests) == 2
+    retry = next(item for item in events if item.type is StreamEventType.RETRY)
+    assert retry.data["reason"] == "stream_inconsistent"
+    assert store.messages()[-1].content == [TextContent("hello")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_completed_function_call_status_retry_executes_second_attempt_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    executed: list[dict[str, object]] = []
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        streams = [
+            tool_stream(completed_status="incomplete"),
+            tool_stream(),
+            message_stream(),
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(streams[len(requests) - 1]),
+            request=request,
+        )
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = ConversationStore(tmp_path / "sessions")
+    events = [
+        item
+        async for item in AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=store_for(tmp_path / "codex.json"),
+            ),
+            store,
+            tools={"read": lambda arguments: executed.append(arguments)},
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("read", origin=MessageOrigin.USER)
+    ]
+
+    assert len(requests) == 3
+    assert executed == [{"path": "README.md"}]
+    retries = [item for item in events if item.type is StreamEventType.RETRY]
+    assert len(retries) == 1
+    assert retries[0].data["reason"] == "stream_inconsistent"
+    completed = [
+        item for item in events if item.data.get("tool_call_completed") is True
+    ]
+    assert len(completed) == 1
     assert store.messages()[-1].content == [TextContent("hello")]
     await client.aclose()
 
@@ -3035,13 +3281,17 @@ async def test_stream_rejects_in_progress_completed_message(tmp_path: Path) -> N
     events = message_stream()
     events[6]["item"]["status"] = "in_progress"  # type: ignore[index]
     client = client_for(sse(events))
-    with pytest.raises(CodexStreamError, match="completed message status is invalid"):
+    with pytest.raises(
+        CodexStreamError, match="completed message status 'in_progress' is invalid"
+    ) as raised:
         [
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "in-progress.json")
             ).complete([], [])
         ]
+    assert raised.value.retryable is True
+    assert raised.value.retry_reason == "stream_inconsistent"
     await client.aclose()
 
 
@@ -3103,13 +3353,18 @@ async def test_stream_rejects_in_progress_completed_items(
         ]
 
     client = client_for(sse(events))
-    with pytest.raises(CodexStreamError, match="completed .* status is invalid"):
+    with pytest.raises(
+        CodexStreamError,
+        match=f"completed {kind} status 'in_progress' is invalid",
+    ) as raised:
         [
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / f"{kind}.json")
             ).complete([], [])
         ]
+    assert raised.value.retryable is True
+    assert raised.value.retry_reason == "stream_inconsistent"
     await client.aclose()
 
 
@@ -3118,13 +3373,18 @@ async def test_stream_rejects_non_completed_response_status(tmp_path: Path) -> N
     events = message_stream()
     events[7]["response"]["status"] = "in_progress"  # type: ignore[index]
     client = client_for(sse(events))
-    with pytest.raises(CodexStreamError, match="response completion status is invalid"):
+    with pytest.raises(
+        CodexStreamError,
+        match="response completion status 'in_progress' is invalid",
+    ) as raised:
         [
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "response-status.json")
             ).complete([], [])
         ]
+    assert raised.value.retryable is True
+    assert raised.value.retry_reason == "stream_inconsistent"
     await client.aclose()
 
 
