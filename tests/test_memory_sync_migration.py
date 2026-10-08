@@ -1133,11 +1133,14 @@ def _run_killed_publication(
 
         def killing_publish(directory_fd, name, data, **kwargs):
             result = real_publish(directory_fd, name, data, **kwargs)
-            directory = Path(
-                fcntl.fcntl(directory_fd, 50, b"\\0" * 1024)
-                .split(b"\\0", 1)[0]
-                .decode()
-            )
+            if sys.platform == "darwin":
+                directory = Path(
+                    fcntl.fcntl(directory_fd, 50, b"\\0" * 1024)
+                    .split(b"\\0", 1)[0]
+                    .decode()
+                )
+            else:
+                directory = Path(os.readlink(f"/proc/self/fd/{directory_fd}"))
             if target_project == directory or target_project in directory.parents:
                 if boundary in {"blob", "orphan"} and directory.name == "blobs":
                     os._exit(91)
