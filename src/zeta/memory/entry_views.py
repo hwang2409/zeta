@@ -41,6 +41,15 @@ def render_kind(state: MemoryState, kind_key: str) -> str:
     if kind is None:
         raise ValueError(f"unknown memory kind: {kind_key}")
     entries = active_entries(state, kind=kind_key)
+    migrating_legacy_documents = any(
+        isinstance(entry, MemoryEntry) and entry.representation == "legacy_document"
+        for entry in state.entries.values()
+    )
+    if migrating_legacy_documents:
+        legacy = [entry for entry in entries if entry.representation == "legacy_document"]
+        if len(legacy) > 1 or len(legacy) != len(entries):
+            raise ValueError("legacy migration kind contains mixed memory entries")
+        return legacy[0].text if legacy else ""
     accepted = [entry for entry in entries if _accepted(entry)]
     automatic = [entry for entry in entries if not _accepted(entry)]
     lines = [f"# {kind.name}", ""]

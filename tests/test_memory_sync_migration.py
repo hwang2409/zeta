@@ -170,7 +170,7 @@ def test_entry_sync_transport_cas_rejects_changed_destination(tmp_path: Path) ->
 def test_entry_sync_refuses_mixed_formats_without_mutation(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
-    registry, project_id = _fixture(first, tmp_path / "workspace")
+    _registry, project_id = _fixture(first, tmp_path / "workspace")
     legacy = ProjectRegistry(second / "projects")
     workspace = tmp_path / "legacy-workspace"
     workspace.mkdir()
@@ -200,7 +200,8 @@ def _legacy_fixture(tmp_path: Path) -> tuple[ProjectRegistry, str, dict[str, str
         name: f"# {name}\n\nExact {name} body.\n" if index != 2 else ""
         for index, name in enumerate(PROJECT_MEMORY_FILES)
     }
-    registry.update_memory(project.project_id, contents)
+    for name, content in contents.items():
+        registry.update_memory(project.project_id, {name: content})
     return registry, project.project_id, contents
 
 

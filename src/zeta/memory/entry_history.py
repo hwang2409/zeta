@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import os
 import re
 import stat
 from collections.abc import Mapping
 
+from zeta.core.session_files import atomic_publish_file
 from zeta.memory.entry_access import EntryMemoryViewMixin
 from zeta.memory.entry_store import (
     AddOperation,
@@ -34,6 +36,8 @@ from zeta.memory.entry_store import (
     MemoryState as EntryMemoryState,
 )
 from zeta.memory.entry_undo import plan_entry_transaction_undo
+from zeta.memory.entry_views import render_all_kinds
+from zeta.memory.migration import MigrationPlan, migrate_format_one
 from zeta.memory.version_store import (
     PreparedVersion,
     PublicationContext,
@@ -105,11 +109,35 @@ class _FormatTwoPayloadAdapter:
         )
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _MigrationPayloadAdapter:
+    plan: MigrationPlan
+
+    def prepare(self, context: PublicationContext) -> PreparedVersion[EntryMemoryState]:
+        return PreparedVersion(
+            {"state": canonical_state_bytes(self.plan.state)},
+            {name: content.encode() for name, content in self.plan.source_contents.items()},
+            {
+                "format": 2,
+                "kind": "migrate",
+                "created_at": self.plan.migrated_at,
+                "operations": [receipt_to_dict(self.plan.receipt)],
+                "source_digest": self.plan.source_digest,
+                "source_version": self.plan.source_version,
+                "target_version": self.plan.source_version,
+            },
+            self.plan.state,
+            scalar_payload=False,
+        )
+
+
 class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
     """Adapt the format-2 domain module to the existing version protocol."""
 
     @staticmethod
     def _entry_blob(blobs_fd: int, digest: object) -> tuple[EntryMemoryState, str]:
+        if isinstance(digest, dict) and set(digest) == {"state"}:
+            digest = digest["state"]
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ProjectRegistryError("format-2 memory version is malformed")
         try:
@@ -202,6 +230,156 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             mirror_path=self.root / snapshot.state.project_id / "memory",
         )
         return snapshot
+
+    def _migrate_memory_for_test(
+        self, project_id: str, *, migrated_at: str
+    ) -> MigrationPlan:
+        """Run the dormant migration only through an explicit fixture seam."""
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                pointer = self._pointer(directory_fd)
+                if pointer is not None:
+                    root, blobs_fd, versions_fd = self._version_handles(
+                        directory_fd, create=False
+                    )
+                    try:
+                        current_manifest = self._manifest(
+                            versions_fd, str(pointer["current"])
+                        )
+                        if current_manifest.get("format", 1) == 2:
+                            if current_manifest.get("kind") != "migrate":
+                                raise ProjectRegistryError(
+                                    "format-2 memory is not a migration fixture"
+                                )
+                            source = self._contents_from_manifest(
+                                blobs_fd, current_manifest, key="before_snapshot"
+                            )
+                            return migrate_format_one(
+                                project_id=project_id,
+                                contents=source,
+                                source_digest=str(current_manifest["source_digest"]),
+                                source_version=(
+                                    str(current_manifest["source_version"])
+                                    if current_manifest.get("source_version") is not None
+                                    else None
+                                ),
+                                migrated_at=str(current_manifest["created_at"]),
+                            )
+                    finally:
+                        os.close(versions_fd)
+                        os.close(blobs_fd)
+                        os.close(root)
+                before = self._snapshot_locked(directory_fd)
+                source_version = None if pointer is None else str(pointer["current"])
+                plan = migrate_format_one(
+                    project_id=project_id,
+                    contents=before.contents,
+                    source_digest=before.digest,
+                    source_version=source_version,
+                    migrated_at=migrated_at,
+                )
+                published = publish_version(
+                    directory_fd,
+                    adapter=_MigrationPayloadAdapter(plan),
+                    retention_limit=self._entry_retention_limit(),
+                    reset_history=False,
+                    pointer_reader=self._pointer,
+                    version_handles=lambda fd, create: self._version_handles(
+                        fd, create=create
+                    ),
+                    manifest_reader=self._manifest,
+                    transaction_step=self._memory_transaction_step,
+                    prune_versions=self._prune_versions,
+                )
+                if published.value != plan.state:
+                    raise AssertionError("migration publication changed its state")
+                rendered = {
+                    f"{kind}.md": content
+                    for kind, content in render_all_kinds(plan.state).items()
+                }
+                if rendered != plan.source_contents:
+                    raise ProjectRegistryError("migration mirror comparison failed")
+                self._refresh_entry_memory_mirror(
+                    directory_fd,
+                    plan.state,
+                    mirror_path=self.root / project_id / "memory",
+                )
+                return plan
+            finally:
+                os.close(directory_fd)
+
+    def _rollback_memory_migration_for_test(self, project_id: str) -> None:
+        """Restore the protected format-1 pointer for a fixture migration."""
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                pointer = self._pointer(directory_fd)
+                if pointer is None:
+                    raise ProjectRegistryError("memory migration is not initialized")
+                root, blobs_fd, versions_fd = self._version_handles(
+                    directory_fd, create=False
+                )
+                try:
+                    manifest = self._manifest(versions_fd, str(pointer["current"]))
+                    source_version = manifest.get("source_version")
+                    if manifest.get("kind") != "migrate" or not isinstance(
+                        source_version, str
+                    ):
+                        raise ProjectRegistryError(
+                            "memory is not a reversible migration fixture"
+                        )
+                    source_manifest = self._manifest(versions_fd, source_version)
+                    source_contents = self._contents_from_manifest(
+                        blobs_fd, source_manifest
+                    )
+                    history = list(pointer["history"])
+                    source_index = history.index(source_version)
+                    restored = history[: source_index + 1]
+                finally:
+                    os.close(versions_fd)
+                    os.close(blobs_fd)
+                    os.close(root)
+                atomic_publish_file(
+                    directory_fd,
+                    _CURRENT,
+                    json.dumps(
+                        {"current": source_version, "history": restored},
+                        sort_keys=True,
+                    ).encode(),
+                    sync_directory=True,
+                )
+                self._refresh_memory_mirror(
+                    directory_fd,
+                    source_contents,
+                    mirror_path=self.root / project_id / "memory",
+                )
+            finally:
+                os.close(directory_fd)
+
+    def _replace_entry_state_for_test(
+        self,
+        project_id: str,
+        state: EntryMemoryState,
+        *,
+        expected_digest: str,
+    ) -> EntryMemorySnapshot:
+        """Publish a complete dormant fixture state through CAS."""
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                current = self._entry_snapshot_locked(directory_fd)
+                if current.digest != expected_digest:
+                    raise ProjectRegistryError("project memory digest mismatch")
+                return self._publish_entry_version(
+                    directory_fd,
+                    state=state,
+                    before=current.state,
+                    kind="entry-fixture-replace",
+                    receipts=(),
+                )
+            finally:
+                os.close(directory_fd)
 
     def _create_entry_memory_for_test(
         self, project_id: str, schema: MemorySchema
