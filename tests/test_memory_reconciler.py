@@ -12,6 +12,7 @@ from zeta.memory.reconciler import (
     parse_proposal,
     prepare_request,
 )
+from zeta.protocol.types import MessageOrigin
 
 TODAY = date(2026, 10, 6)
 SESSION = "a" * 32
@@ -204,6 +205,51 @@ def test_project_fact_is_allowed_on_input_and_output(fact: str) -> None:
     assert proposal.replacements[0].content.endswith(f"{fact}\n")
 
 
+def test_reconciler_prompt_labels_user_vs_notification_text() -> None:
+    transcript = Transcript(
+        SESSION,
+        (
+            {
+                "seq": 1,
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "binding user choice"}],
+                        "metadata": {"zeta.origin": "user"},
+                    }
+                },
+            },
+            {
+                "seq": 2,
+                "type": "notification",
+                "data": {
+                    "kind": "agent_completion",
+                    "text": "reported agent conclusion",
+                },
+            },
+        ),
+    )
+
+    request = prepare_request(transcript, {}, as_of=TODAY)
+    rendered_rows = json.loads(
+        request.prompt.split("Completed transcript rows:\n", 1)[1]
+    )
+
+    assert rendered_rows[0]["authorship"] == "user"
+    assert rendered_rows[1]["authorship"] == "harness_notification"
+    assert "Only rows labeled `user`, or nested `user_authored_input`" in request.prompt
+
+
+def test_reconciler_prompt_has_durable_memory_priorities() -> None:
+    request = prepare_request(_transcript(), {}, as_of=TODAY)
+
+    assert "The user's own words matter most" in request.prompt
+    assert "Anything with lasting effect comes next" in request.prompt
+    assert "Tool calls and outputs have the lowest priority" in request.prompt
+    assert "decisions.md: user rulings and their reasons" in request.prompt
+
+
 def test_request_is_bounded_and_preserves_sequence_provenance() -> None:
     transcript = Transcript(
         SESSION,
@@ -232,3 +278,35 @@ def test_parser_rejects_source_range_outside_transcript() -> None:
             transcript=_transcript(),
             as_of=TODAY,
         )
+
+
+def test_reconciler_labels_child_and_agent_send_rows_as_non_user() -> None:
+    transcript = Transcript(
+        SESSION,
+        tuple(
+            {
+                "seq": seq,
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": text}],
+                        "metadata": {"zeta.origin": origin},
+                    }
+                },
+            }
+            for seq, (origin, text) in enumerate(
+                (
+                    (MessageOrigin.AGENT_PROMPT.value, "delegated task"),
+                    (MessageOrigin.AGENT_SEND.value, "follow-up"),
+                ),
+                start=1,
+            )
+        ),
+    )
+
+    request = prepare_request(transcript, {}, as_of=TODAY)
+    rows = json.loads(request.prompt.split("Completed transcript rows:\n", 1)[1])
+
+    assert [row["authorship"] for row in rows] == ["agent_prompt", "agent_send"]
+    assert all(row["authorship"] != "user" for row in rows)

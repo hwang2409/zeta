@@ -45,7 +45,7 @@ from zeta.mcp.resources import (
     format_resource_list,
     list_resources,
 )
-from zeta.protocol.types import TextContent
+from zeta.protocol.types import MessageOrigin, TextContent
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools._spill import SpillStore
@@ -599,9 +599,9 @@ async def test_resources_list_and_attach_round_trip(
     assert "mime=text/plain" in listing
 
     attachment = await loop.slash_mcp("resources live mcp://doc/1")
-    from zeta.mcp.prompt_commands import SlashModelInput
+    from zeta.model_input import ModelInputEnvelope
 
-    assert isinstance(attachment, SlashModelInput)
+    assert isinstance(attachment, ModelInputEnvelope)
     assert "[mcp-resource: live:mcp://doc/1" in attachment.text
     assert "payload for mcp://doc/1" in attachment.text
     await loop.close()
@@ -752,7 +752,7 @@ async def test_tokens_do_not_appear_in_conversation_store(
     store = ConversationStore(project)
     backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
     loop = AgentLoop(backend, store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty())
-    events = [event async for event in loop.run_turn("please answer")]
+    events = [event async for event in loop.run_turn("please answer", origin=MessageOrigin.USER)]
     await loop.close()
 
     haystack = ""

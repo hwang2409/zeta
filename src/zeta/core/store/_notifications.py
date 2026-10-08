@@ -7,11 +7,12 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from ...agent.receipt import valid_killed_task_fields
-from ...protocol.types import Message, ToolUseContent
+from ...protocol.types import Message, MessageOrigin, ToolUseContent
 from ..checkpoints import ConversationEntry
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,
+    TASK_EXITED_NOTIFICATION_KIND,
     valid_agent_stats,
     validate_agent_notification_data,
 )
@@ -68,6 +69,7 @@ class NotificationStateMixin:
         if not valid_killed_task_fields(fields):
             raise ValueError("invalid killed task fields")
         data: dict[str, Any] = {
+            "origin": MessageOrigin.NOTIFICATION.value,
             "kind": AGENT_COMPLETION_NOTIFICATION_KIND,
             "child_instance_id": child_instance_id,
             "child_session_path": child_session_path,
@@ -87,6 +89,55 @@ class NotificationStateMixin:
         validate_agent_notification_data(data)
         return data
 
+    def append_task_notification(
+        self: ConversationStore,
+        *,
+        task_id: str,
+        command: str,
+        exit_code: int | None,
+        output_tail: str = "",
+        log_path: str | None = None,
+        note: str | None = None,
+        background_metadata: tuple[str, str] = ("run_background", "natural_exit"),
+    ) -> ConversationEntry:
+        """Persist a bounded notification for a model-owned process exit."""
+        if not task_id or not command or type(exit_code) not in {int, type(None)}:
+            raise ValueError("invalid task notification")
+        with self._append_lock():
+            self._load()
+            # Confirm id-set hits against the branch, preserving old scan behavior.
+            if task_id in self._task_notification_ids:
+                existing = next(
+                    (
+                        entry
+                        for entry in self.agent_notifications(pending_only=False)
+                        if entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+                        and entry.data.get("task_id") == task_id
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    return existing
+            if len(output_tail) > 2_048:
+                raise ValueError("task notification output is too long")
+            data: dict[str, Any] = {
+                "origin": MessageOrigin.NOTIFICATION.value,
+                "kind": TASK_EXITED_NOTIFICATION_KIND,
+                "task_id": task_id,
+                "headline": command,
+                "exit_code": exit_code,
+                "output_tail": output_tail,
+                "background_owner": background_metadata[0],
+                "background_phase": background_metadata[1],
+            }
+            if log_path is not None:
+                data["log_path"] = log_path
+            if note is not None:
+                data["note"] = note
+            entry = self._append_row_unlocked("notification", data)
+            self._task_notification_ids.add(task_id)
+            return self._snapshot_entry(entry)
+
     def append_inbox_notification_if_absent(
         self: ConversationStore, project_id: str, message_ids: list[str]
     ) -> tuple[ConversationEntry | None, bool]:
@@ -94,6 +145,7 @@ class NotificationStateMixin:
         if not project_id or not message_ids or any(not item for item in message_ids):
             raise ValueError("invalid inbox notification")
         data: dict[str, Any] = {
+            "origin": MessageOrigin.NOTIFICATION.value,
             "kind": "project_inbox",
             "project_id": project_id,
             "message_ids": list(message_ids),

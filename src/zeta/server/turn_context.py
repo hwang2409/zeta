@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 
+from ..protocol.types import StreamEvent, StreamEventType
 from .protocol import ProtocolError
+
+if TYPE_CHECKING:
+    from ..runtime.loop.agent import AgentLoop
+    from .runtime import ServerRuntime
 
 MAX_BYTES = 4_096
 
@@ -13,6 +18,12 @@ MAX_BYTES = 4_096
 class TurnContextDelivery(TypedDict, total=False):
     turn_context: str
     on_turn_context_persisted: Callable[[], None]
+
+
+class _EventSink(Protocol):
+    def __call__(
+        self, event: StreamEvent, *, session_id: str
+    ) -> Awaitable[None]: ...
 
 
 @dataclass(frozen=True)
@@ -28,6 +39,44 @@ class PendingTurnContexts:
     def __init__(self) -> None:
         self._pending: dict[str, _PendingContext] = {}
         self._next_version = 1
+
+    def set_request(
+        self,
+        features: set[str],
+        runtime: ServerRuntime,
+        params: dict[str, Any],
+    ) -> dict[str, object]:
+        """Validate negotiation and set context for the active session."""
+        if "turn_context" not in features:
+            raise ProtocolError(
+                -32601, "set_turn_context requires negotiated turn_context feature"
+            )
+        session_id = runtime.session_id if runtime.opened is not None else None
+        return self.set(session_id, params)
+
+    def add_request(self, requests: list[str], features: set[str]) -> None:
+        """Advertise the request only when its feature was negotiated."""
+        if "turn_context" in features:
+            requests.append("set_turn_context")
+
+    async def run_notification_turn(
+        self,
+        session_id: str,
+        loop: AgentLoop,
+        emit: _EventSink,
+    ) -> tuple[bool, StreamEvent | None]:
+        """Deliver claimed context and classify notification-turn events."""
+        success = True
+        agent_end = None
+        with self.delivery(session_id) as context:
+            async for event in loop.run_notification_turn(**context):
+                if event.type is StreamEventType.ERROR:
+                    success = False
+                if event.type is StreamEventType.AGENT_END:
+                    agent_end = event
+                else:
+                    await emit(event, session_id=session_id)
+        return success, agent_end
 
     def set(self, session_id: str | None, params: dict[str, Any]) -> dict[str, object]:
         if session_id is None:

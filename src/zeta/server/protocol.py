@@ -16,6 +16,7 @@ FEATURES = (
     "memory_updated",
     "ping",
     "assistant_reset",
+    "model_input_ids",
     "projects",
     "turn_context",
 )

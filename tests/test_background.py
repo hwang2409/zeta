@@ -25,11 +25,13 @@ from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     TextContent,
     ToolCall,
     ToolSchema,
+    with_message_origin,
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -298,7 +300,7 @@ async def test_task_kill_produces_exactly_one_notification(tmp_path: Path) -> No
 def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="task-fork")
     store.append_message(
-        Message(MessageRole.USER, [TextContent("before notification")])
+        with_message_origin(Message(MessageRole.USER, [TextContent("before notification")]), MessageOrigin.USER)
     )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
     store.append_checkpoint("before-task")
@@ -477,8 +479,8 @@ async def test_agent_store_closes_after_each_foreground_completion(
     )
 
     try:
-        await _collect(loop.run_turn("first"))
-        await _collect(loop.run_turn("second"))
+        await _collect(loop.run_turn("first", origin=MessageOrigin.USER))
+        await _collect(loop.run_turn("second", origin=MessageOrigin.USER))
 
         for child_store in child_stores:
             with pytest.raises(OSError):
@@ -510,7 +512,7 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
     owner.track_store = lambda child_store: (
         child_stores.append(child_store), track_store(child_store)
     )
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     for _ in range(100):
         if not owner._stores:
             break
@@ -559,7 +561,7 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
     )
 
     try:
-        await _collect(loop.run_turn("start"))
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
         for _ in range(100):
             if len(tracked) == 2:
                 break

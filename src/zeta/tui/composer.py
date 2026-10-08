@@ -25,13 +25,16 @@ from ..core.abort import AbortSignal
 from ..core.approval import ApprovalRequest
 from ..core.process_env import subprocess_env
 from ..protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
     ErrorInfo,
     ImageContent,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
     TextContent,
+    with_message_origin,
 )
 from ..runtime.loop.empty_turn import MAX_TOKENS_THINKING_NOTICE
 from . import theme
@@ -155,9 +158,21 @@ class TurnConsumerMixin:
         )
         self._standalone_abort_signal = turn_abort_signal
         spinner_task = asyncio.create_task(self._pulse_spinner())
-        retry_message = user_message or Message(
-            role=MessageRole.USER,
-            content=[TextContent(user_text)],
+        origin = (
+            MessageOrigin(
+                user_message.metadata.get(
+                    MESSAGE_ORIGIN_METADATA, MessageOrigin.UNKNOWN.value
+                )
+            )
+            if user_message is not None
+            else MessageOrigin.USER
+        )
+        retry_message = user_message or with_message_origin(
+            Message(
+                role=MessageRole.USER,
+                content=[TextContent(user_text)],
+            ),
+            origin,
         )
         turn_failed = False
         try:
@@ -166,6 +181,7 @@ class TurnConsumerMixin:
                 if notification
                 else self.loop.run_turn(
                     user_text,
+                    origin=origin,
                     user_message=user_message,
                     persist_user_message=persist_user_message,
                     abort_signal=turn_abort_signal,

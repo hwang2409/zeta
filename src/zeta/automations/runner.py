@@ -16,8 +16,10 @@ from ..project_registry import ProjectRegistryError
 from ..prompts import load_identity
 from ..protocol.types import (
     ASSISTANT_RESPONSE_SYNTHETIC,
+    MESSAGE_ORIGIN_METADATA,
     CompletionBackend,
     Message,
+    MessageOrigin,
     MessageRole,
     TextContent,
 )
@@ -85,7 +87,10 @@ def _receipt(session_store, text: str) -> None:
         Message(
             role=MessageRole.ASSISTANT,
             content=[TextContent(text)],
-            metadata={"response_state": ASSISTANT_RESPONSE_SYNTHETIC},
+            metadata={
+                "response_state": ASSISTANT_RESPONSE_SYNTHETIC,
+                MESSAGE_ORIGIN_METADATA: MessageOrigin.AUTOMATION_RECEIPT.value,
+            },
         )
     )
 
@@ -165,6 +170,7 @@ async def run_claimed(
                     stdout=output,
                     stderr=errors,
                     denial_hint="automation allow-list denied this call",
+                    origin=MessageOrigin.AUTOMATION_PROMPT,
                 )
                 failed_tools = [
                     message.tool_result

@@ -10,6 +10,7 @@ from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.store import ConversationStore
 from ..protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -217,10 +218,28 @@ class NotificationWake:
 class AgentNotificationMixin:
     """Add durable notification wake inputs to an agent loop."""
 
+    def run_turn(
+        self,
+        user_text: str,
+        *,
+        origin: MessageOrigin,
+        user_message: Message | None = None,
+        persist_user_message: bool = True,
+        abort_signal: ToolAbortSignal | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        return self._run_turn(
+            user_text,
+            origin=origin,
+            user_message=user_message,
+            persist_user_message=persist_user_message,
+            abort_signal=abort_signal,
+        )
+
     async def _run_turn(
         self,
         user_text: str,
         *,
+        origin: MessageOrigin,
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
@@ -245,6 +264,7 @@ class AgentNotificationMixin:
         self._turn_active = True
         stream = self._run_turn_impl(
             user_text,
+            origin=origin,
             user_message=user_message,
             persist_user_message=persist_user_message,
             abort_signal=abort_signal,
@@ -324,6 +344,7 @@ class AgentNotificationMixin:
             raise RuntimeError("no pending agent notifications")
         return self._run_turn(
             "",
+            origin=MessageOrigin.NOTIFICATION,
             persist_user_message=False,
             abort_signal=abort_signal,
             notification_turn=True,

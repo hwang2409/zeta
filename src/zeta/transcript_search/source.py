@@ -15,6 +15,7 @@ from typing import Any
 from zeta.core.checkpoints import ConversationEntry
 from zeta.core.store import PersistedAppend
 from zeta.memory.safety import redact_secrets
+from zeta.protocol.types import MESSAGE_ORIGIN_METADATA
 
 MAX_DIAGNOSTIC_CHARS = 240
 MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024 * 1024
@@ -98,7 +99,7 @@ def _project_message(message: Mapping[str, Any]) -> dict[str, Any] | None:
     metadata = message.get("metadata")
     projected_metadata = {
         key: value
-        for key in ("zeta.origin", "response_state", "turn_failed")
+        for key in (MESSAGE_ORIGIN_METADATA, "response_state", "turn_failed")
         if isinstance(metadata, Mapping)
         and isinstance((value := metadata.get(key)), (str, bool))
     }

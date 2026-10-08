@@ -22,10 +22,11 @@ from ...core.slash import (
     compaction_history,
 )
 from ...core.todo import todo_count_tuple
-from ...mcp.prompt_commands import SlashModelInput
+from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
+from ...protocol.types import MessageOrigin
 from ...runtime.compaction_mode import run_compaction_command
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
@@ -247,7 +248,7 @@ class SlashHandlerMixin:
         )
         return run_compaction_command(self.loop, args, busy=busy)
 
-    def slash_plan(self, args: str) -> str | SlashModelInput:
+    def slash_plan(self, args: str) -> str | ModelInputEnvelope:
         """Toggle plan mode or submit a prompt while entering it."""
 
         requested = args.strip()
@@ -272,9 +273,13 @@ class SlashHandlerMixin:
         if not self.loop.plan_mode:
             self.loop.set_plan_mode(True)
             self._invalidate_prompt()
-        return SlashModelInput(requested)
+        return ModelInputEnvelope(
+            requested,
+            f"/plan {requested}",
+            MessageOrigin.SLASH_EXPANSION,
+        )
 
-    def slash_implement(self, args: str) -> str | SlashModelInput:
+    def slash_implement(self, args: str) -> str | ModelInputEnvelope:
         """Exit plan mode and submit the explicit implementation request."""
 
         if args:
@@ -288,7 +293,11 @@ class SlashHandlerMixin:
             )
         self.loop.set_plan_mode(False)
         self._invalidate_prompt()
-        return SlashModelInput("implement the plan you proposed above")
+        return ModelInputEnvelope(
+            "implement the plan you proposed above",
+            "/implement",
+            MessageOrigin.SLASH_EXPANSION,
+        )
 
     def _set_plan_mode_from_command(self, enabled: bool) -> str:
         if enabled == self.loop.plan_mode:

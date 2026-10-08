@@ -13,7 +13,7 @@ from zeta.mcp.config import load_mcp_config_overlay
 from zeta.mcp.http import StreamableHTTPMCPClient
 from zeta.mcp.management import MCPManagementError, MCPManagementService
 from zeta.mcp.mount import MCPMount, mount_mcp_servers
-from zeta.protocol.types import TextContent
+from zeta.protocol.types import MessageOrigin, TextContent
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -408,7 +408,7 @@ for line in sys.stdin:
     )
     loop.set_mcp_scope(home=home)
 
-    events = [event async for event in loop.run_turn("hello")]
+    events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
 
     assert events[-1].type.value == "agent_end"
     assert loop._mcp_mount is not None

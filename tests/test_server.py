@@ -25,6 +25,7 @@ from zeta.protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -32,6 +33,7 @@ from zeta.protocol.types import (
     ThinkingContent,
     ToolCall,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import ApprovalLifecycle
@@ -1566,7 +1568,7 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
     assert server.runtime.opened is not None
     for index in range(300):
         server.runtime.opened.store.append_message(
-            Message(MessageRole.USER, [TextContent(f"history-{index}")])
+            with_message_origin(Message(MessageRole.USER, [TextContent(f"history-{index}")]), MessageOrigin.USER)
         )
     try:
         await _request(reader, writer, 3, "send", {"text": "start"})
@@ -1970,11 +1972,11 @@ async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
         for index in range(9):
             if index == 4:
                 store.append_message(
-                    Message(
+                    with_message_origin(Message(
                         MessageRole.USER,
                         [TextContent("hidden recovery prompt")],
                         metadata={"zeta_event": "empty_turn_nudge"},
-                    )
+                    ), MessageOrigin.USER)
                 )
             expected.append(
                 store.append_message(
@@ -2267,8 +2269,8 @@ async def test_history_advances_past_single_oversized_persisted_message(tmp_path
     reader, writer, sid = await _ready_extensions(server)
     try:
         store = server.runtime.opened.store
-        oversized = store.append_message(Message(MessageRole.USER, [TextContent("x" * 8000)] * 140))
-        following = store.append_message(Message(MessageRole.USER, [TextContent("after")]))
+        oversized = store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("x" * 8000)] * 140), MessageOrigin.USER))
+        following = store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("after")]), MessageOrigin.USER))
         response = (await _request(reader, writer, "history", "session_history", {"session_id": sid}))[-1]
         assert "error" not in response
         page = response["result"]
@@ -2614,7 +2616,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(tmp_path, mon
         backend = loop.backend
         metadata_before = runtime.metadata.to_dict()
         budget_before = loop.context_assembler.token_budget
-        opened.store.append_message(Message(MessageRole.USER, [TextContent("keep history")]))
+        opened.store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("keep history")]), MessageOrigin.USER))
         history = opened.store.messages()
         runtime.usage["input_tokens"] = 123
         with monkeypatch.context() as patch:
@@ -3788,7 +3790,12 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
 
         # Prompt macros return model input, not chat text.
         result = (await run("/hi Henry"))["result"]
-        assert result == {"kind": "model_input", "text": "Say hi to Henry"}
+        assert result == {
+            "kind": "model_input",
+            "text": "Say hi to Henry",
+            "display_text": "/hi Henry",
+            "origin": "slash_expansion",
+        }
 
         # A named skill loads and returns its prompt body as model input so a
         # frontend client can send it up the shared send path. The test seeds a

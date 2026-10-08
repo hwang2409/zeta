@@ -1,0 +1,1 @@
+When tool output teaches you something that will matter later—a finding, a cause, or a location—state it briefly in your reply. Old tool output can be evicted or summarized, while your reply persists.

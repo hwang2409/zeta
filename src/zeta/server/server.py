@@ -15,10 +15,11 @@ from typing import Any
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
-from ..protocol.types import StreamEvent, StreamEventType, TextContent
+from ..protocol.types import MessageOrigin, StreamEvent, StreamEventType, TextContent
 from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
+from .model_inputs import PendingModelInputs
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
     PROJECT_REQUESTS,
@@ -222,6 +223,7 @@ class _Client:
         self._closed = False
         self._turn_task: asyncio.Task[None] | None = None
         self._read_buffer = bytearray()
+        self._model_inputs = PendingModelInputs()
         self.codec = FrameCodec()
         self.projects = ProjectRequests(home=server.home, runtime=server.runtime, codec=self.codec)
         self._approvals = ApprovalLifecycle()
@@ -356,14 +358,8 @@ class _Client:
                 raise ProtocolError(-32601, "ping requires the negotiated ping feature")
             return {"pong": True}
         if method == "set_turn_context":
-            if "turn_context" not in self.features:
-                raise ProtocolError(
-                    -32601, "set_turn_context requires negotiated turn_context feature"
-                )
-            runtime = self.server.runtime
-            return self.server.turn_contexts.set(
-                runtime.session_id if runtime.opened is not None else None, params
-            )
+            contexts = self.server.turn_contexts
+            return contexts.set_request(self.features, self.server.runtime, params)
         if method in PROJECT_REQUESTS:
             if "projects" not in self.features:
                 raise ProtocolError(
@@ -403,7 +399,7 @@ class _Client:
             await self._attach_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "send":
-            return await self._send(_required_string(params, "text"))
+            return await self._send(params)
         if method == "steer":
             return await self._steer(_required_string(params, "text"))
         if method in {"approve", "deny"}:
@@ -468,8 +464,7 @@ class _Client:
                 requests += login.REQUESTS
             if "ping" in self.features:
                 requests.append("ping")
-            if "turn_context" in self.features:
-                requests.append("set_turn_context")
+            self.server.turn_contexts.add_request(requests, self.features)
             if "projects" in self.features:
                 requests += PROJECT_REQUESTS
         capabilities: dict[str, object] = {
@@ -534,8 +529,9 @@ class _Client:
             return slash_commands.list_commands(runtime)
         await self._require_idle()
         if method == "slash_run":
+            register = self._model_inputs.registrar(runtime.session_id, enabled="model_input_ids" in self.features)
             return await slash_commands.run_command(
-                runtime, _required_string(params, "text")
+                runtime, _required_string(params, "text"), register_model_input=register
             )
         ergonomics.require_mutable(runtime)
         if method == "send_images":
@@ -564,17 +560,17 @@ class _Client:
             if not current or current[-1].id != head:
                 store.switch_to_branch(head)
         return ergonomics.tree(runtime)
-
-    async def _send(self, text: str) -> dict[str, object]:
+    async def _send(self, params: dict[str, Any]) -> dict[str, object]:
         runtime = self.server.runtime
-        if not text.strip():
-            raise ProtocolError(-32602, "text must be a nonempty string")
         if runtime.loop is None:
             raise ProtocolError(-32003, "no active session")
         if self._turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
-        await self._user_message(text, "send")
-        self._turn_task = asyncio.create_task(self._run_turn(text))
+        value = self._model_inputs.resolve(runtime.session_id, params, enabled="model_input_ids" in self.features)
+        await self._user_message(value.display_text, "send")
+        self._turn_task = asyncio.create_task(self._run_turn(
+            value.text, origin=value.origin, user_message=value.message
+        ))
         return {"accepted": True, "session_id": runtime.session_id}
 
     async def _steer(self, text: str) -> dict[str, object]:
@@ -583,9 +579,18 @@ class _Client:
             raise ProtocolError(-32003, "no active session")
         if not self._turn_busy():
             raise ProtocolError(-32005, "no turn is running")
-        from ..protocol.types import Message, MessageRole
+        from ..protocol.types import (
+            Message,
+            MessageOrigin,
+            MessageRole,
+            with_message_origin,
+        )
 
-        loop.steer(Message(MessageRole.USER, [TextContent(text)]))
+        loop.steer(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
+            )
+        )
         await self._user_message(text, "steer")
         return {"accepted": True}
 
@@ -696,7 +701,7 @@ class _Client:
             ),
         }
 
-    async def _run_turn(self, text: str, user_message=None) -> None:
+    async def _run_turn(self, text: str, user_message=None, *, origin: MessageOrigin = MessageOrigin.USER) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
         if loop is None or state is None:
@@ -706,7 +711,9 @@ class _Client:
         success = True
         agent_end: StreamEvent | None = None
         try:
-            async for event in loop.run_turn(text, user_message=user_message):
+            async for event in loop.run_turn(
+                text, origin=origin, user_message=user_message
+            ):
                 if event.type is StreamEventType.ERROR:
                     success = False
                 if event.type is StreamEventType.AGENT_END:
@@ -779,16 +786,9 @@ class _Client:
             await asyncio.sleep(0.01)
             state.turn_started()
             started = True
-            success = True
-            with self.server.turn_contexts.delivery(session_id) as context:
-                events = loop.run_notification_turn(**context)
-                async for event in events:
-                    if event.type is StreamEventType.ERROR:
-                        success = False
-                    if event.type is StreamEventType.AGENT_END:
-                        agent_end = event
-                    else:
-                        await self._event(event, session_id=session_id)
+            success, agent_end = await self.server.turn_contexts.run_notification_turn(
+                session_id, loop, self._event
+            )
         except asyncio.CancelledError:
             success = False
             raise
