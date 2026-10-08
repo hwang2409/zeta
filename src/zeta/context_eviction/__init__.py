@@ -28,6 +28,7 @@ EVICTION_KIND = "evict"
 TARGET_RATIO = 0.55
 HYSTERESIS_RATIO = 0.15
 DIGEST_LIMIT = 440
+WORKFLOW_MESSAGE_LIMIT = 4
 BASH_CALL_TAIL = 20
 NOTIFICATION_TAIL = 3
 RECALL_DEFAULT_MAX_CHARS = 8_000
@@ -258,6 +259,25 @@ def evict_messages(
         ):
             continue
         replace(index, _orchestration_result_receipt(message, call, seq))
+        if running_total <= target_tokens:
+            return _result(messages, changed, before, running_total, True)
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        result = message.tool_result
+        call = calls.get(result.tool_call_id) if result is not None else None
+        if (
+            not eligibility.allows(seq)
+            or result is None
+            or call is None
+            or message.metadata.get("context_evicted")
+            or call.name not in {"inbox", "project", "recall_history", "run_background"}
+        ):
+            continue
+        replacement = _workflow_result_receipt(message, call, seq)
+        if token_counter(replacement) >= message_tokens[index]:
+            continue
+        replace(index, replacement)
         if running_total <= target_tokens:
             return _result(messages, changed, before, running_total, True)
 
@@ -698,6 +718,176 @@ def _orchestration_result_receipt(
             "eviction_content_digest": _content_digest(result.content),
         },
     )
+
+
+def _workflow_result_receipt(message: Message, call: ToolCall, seq: int) -> Message:
+    result = message.tool_result
+    if result is None:
+        return message
+    structured = result.structured_content or {}
+    if call.name == "inbox":
+        payload = _inbox_receipt_payload(call, structured)
+    elif call.name == "project":
+        payload = _project_receipt_payload(call, structured)
+    elif call.name == "recall_history":
+        payload = _recall_receipt_payload(call, result.content)
+    else:
+        payload = _background_receipt_payload(call, structured, result)
+    receipt = _structured_receipt("workflow result receipt", payload, seq, "result")
+    return Message(
+        message.role,
+        tool_result=ToolResult(
+            result.tool_call_id,
+            receipt,
+            is_error=result.is_error,
+            is_canceled=result.is_canceled,
+        ),
+        metadata={
+            **message.metadata,
+            "context_evicted": True,
+            "source_seq": seq,
+            "eviction_content_digest": _content_digest(result.content),
+        },
+    )
+
+
+def _inbox_receipt_payload(
+    call: ToolCall, structured: Mapping[str, object]
+) -> dict[str, object]:
+    action = _one_line(call.arguments.get("action")) or "unknown"
+    payload: dict[str, object] = {"action": action}
+    if action == "send":
+        if target := _one_line(call.arguments.get("project")):
+            payload["target_project"] = target
+        if message_id := _one_line(structured.get("id")):
+            payload["id"] = message_id
+        return payload
+    if action == "projects":
+        raw_projects = structured.get("projects")
+        projects = (
+            [item for item in raw_projects if isinstance(item, Mapping)]
+            if isinstance(raw_projects, list)
+            else []
+        )
+        payload["projects"] = [
+            {
+                key: compact
+                for key in ("id", "name", "scope")
+                if (compact := _one_line(project.get(key)))
+            }
+            for project in projects[:WORKFLOW_MESSAGE_LIMIT]
+        ]
+        if len(projects) > WORKFLOW_MESSAGE_LIMIT:
+            payload["omitted_projects"] = len(projects) - WORKFLOW_MESSAGE_LIMIT
+        return payload
+
+    raw_message = structured.get("message")
+    raw_messages = structured.get("messages")
+    if isinstance(raw_message, Mapping):
+        messages: list[Mapping[str, object]] = [raw_message]
+    elif isinstance(raw_messages, list):
+        messages = [item for item in raw_messages if isinstance(item, Mapping)]
+    else:
+        messages = []
+    if (
+        not messages
+        and action in {"claim", "done"}
+        and (message_id := _one_line(call.arguments.get("id")))
+    ):
+        messages = [{"id": message_id}]
+    summaries: list[dict[str, object]] = []
+    default_status = _one_line(structured.get("status"))
+    for raw in messages[:WORKFLOW_MESSAGE_LIMIT]:
+        status = _one_line(raw.get("status")) or (
+            "done"
+            if raw.get("done_at") is not None or action == "done"
+            else "claimed"
+            if raw.get("claimer_session") is not None or action == "claim"
+            else default_status or "new"
+        )
+        summary: dict[str, object] = {
+            "id": _one_line(raw.get("id")),
+            "kind": _one_line(raw.get("kind")),
+            "title": _one_line(raw.get("title"), limit=80),
+            "status": status,
+            "claimed": status in {"claimed", "done"}
+            or raw.get("claimer_session") is not None,
+            "done": status == "done" or raw.get("done_at") is not None,
+        }
+        sender = raw.get("from")
+        if isinstance(sender, Mapping):
+            if project := _one_line(sender.get("project")):
+                summary["from_project"] = project
+            if session := _one_line(sender.get("session")):
+                summary["from_session"] = session
+        if outcome := _one_line(raw.get("outcome"), limit=120):
+            summary["outcome"] = outcome
+        summaries.append(summary)
+    payload["messages"] = summaries
+    if len(messages) > WORKFLOW_MESSAGE_LIMIT:
+        payload["omitted_messages"] = len(messages) - WORKFLOW_MESSAGE_LIMIT
+    return payload
+
+
+def _project_receipt_payload(
+    call: ToolCall, structured: Mapping[str, object]
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "action": _one_line(call.arguments.get("action")) or "inspect"
+    }
+    project = structured.get("project")
+    if isinstance(project, Mapping):
+        if project_id := _one_line(project.get("project_id")):
+            payload["project_id"] = project_id
+        if name := _one_line(project.get("name")):
+            payload["project_name"] = name
+    sections = sorted(key for key in structured if key != "project")
+    payload["sections"] = sections
+    memory = structured.get("memory")
+    if isinstance(memory, Mapping):
+        payload["files"] = sorted(_one_line(name) for name in memory)[:16]
+    return payload
+
+
+def _recall_receipt_payload(call: ToolCall, content: str) -> dict[str, object]:
+    arguments = call.arguments
+    payload: dict[str, object] = {
+        "action": "query" if arguments.get("query") is not None else "range",
+        "result_chars": len(content),
+    }
+    for key in ("seq_start", "seq_end", "offset", "max_chars"):
+        value = arguments.get(key)
+        if type(value) is int:
+            payload[key] = value
+    if query := _one_line(arguments.get("query")):
+        payload["query"] = query
+    return payload
+
+
+def _background_receipt_payload(
+    call: ToolCall, structured: Mapping[str, object], result: ToolResult
+) -> dict[str, object]:
+    running = structured.get("running")
+    status = (
+        "canceled"
+        if result.is_canceled
+        else "error"
+        if result.is_error
+        else "running"
+        if running is True
+        else "started"
+    )
+    payload: dict[str, object] = {
+        "command": _one_line(call.arguments.get("command"), limit=120),
+        "status": status,
+    }
+    task_id = _one_line(structured.get("task_id"))
+    if not task_id:
+        match = re.search(r"\bstarted background task ([^\s()]+)", result.content)
+        task_id = _one_line(match.group(1)) if match is not None else ""
+    if task_id:
+        payload["task_id"] = task_id
+    return payload
 
 
 def _is_notification_message(message: Message) -> bool:
