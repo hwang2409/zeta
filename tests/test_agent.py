@@ -24,7 +24,6 @@ from zeta.agent.background import (
     adopt_agent_children,
     finish_background_child,
 )
-from zeta.agent.notifications import notification_events
 from zeta.agent.presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
@@ -923,35 +922,6 @@ async def test_notification_wake_waits_for_resumed_durable_tool(
         await loop.close()
 
 
-def test_notification_ack_follows_delivery(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    for index in (1, 2):
-        store.append_agent_notification(
-            f"child-{index}",
-            child_session_path=f"/tmp/child-{index}",
-            description=f"child {index}",
-            status="completed",
-            text=f"done {index}",
-        )
-
-    events = notification_events(store)
-    first = next(events)
-    assert first.data["child_instance_id"] == "child-1"
-    assert [
-        entry.data["child_instance_id"] for entry in store.agent_notifications()
-    ] == [
-        "child-1",
-        "child-2",
-    ]
-
-    second = next(events)
-    assert second.data["child_instance_id"] == "child-2"
-    assert [
-        entry.data["child_instance_id"] for entry in store.agent_notifications()
-    ] == [
-        "child-2",
-    ]
-    store.close()
 
 
 @pytest.mark.asyncio

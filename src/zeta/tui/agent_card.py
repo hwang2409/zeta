@@ -497,12 +497,6 @@ def _read_bounded_messages(
     return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
 
 
-def read_agent_messages(
-    path: Path, limit: int = MAX_AGENT_VIEW_LINES
-) -> BoundedAgentMessages:
-    """Read a bounded, renderable tail of one agent's direct messages."""
-
-    return _read_bounded_messages(path, limit)
 
 
 def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list[str]:

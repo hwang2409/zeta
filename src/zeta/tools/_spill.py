@@ -59,15 +59,6 @@ class SpillStore:
             self.root = Path(session_dir).absolute() / SPILL_DIRECTORY
         self._closed = False
 
-    async def awrite_text(
-        self, tool: str, call_id: str, index: int, text: str
-    ) -> Path:
-        """Persist complete text without blocking the calling event loop."""
-
-        artifacts = await self.awrite_text_group(
-            tool, call_id, {str(index): text}
-        )
-        return artifacts[str(index)].path
 
     async def awrite_text_group(
         self,

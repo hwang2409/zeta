@@ -789,44 +789,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self._copy_metadata(metadata, current)
         return current
 
-    def persist_skill_catalog(
-        self,
-        metadata: SessionMetadata,
-        catalog: SkillCatalog,
-        *,
-        system_prompt: str | None = None,
-        context_files: list[str] | tuple[str, ...] | None = None,
-    ) -> SessionMetadata:
-        """Snapshot the session catalog once so resumes do not rediscover it."""
 
-        def update(item: SessionMetadata) -> SessionMetadata:
-            if item.skill_catalog is not None:
-                return item
-            item.skill_catalog = catalog.to_snapshot()
-            if system_prompt is not None:
-                item.system_prompt = system_prompt
-            if context_files is not None:
-                item.context_files = list(context_files)
-            return item
-
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)
-        return current
-
-    def persist_agent_catalog(
-        self, metadata: SessionMetadata, catalog: AgentCatalog
-    ) -> SessionMetadata:
-        """Snapshot the session agent catalog so resumes do not rediscover it."""
-
-        def update(item: SessionMetadata) -> SessionMetadata:
-            if item.agent_catalog is not None:
-                return item
-            item.agent_catalog = catalog.to_snapshot()
-            return item
-
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)
-        return current
 
     def record_override(
         self,

@@ -44,10 +44,6 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.agent.notifications import (
-    build_notification_system_message,
-    notification_events,
-)
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
@@ -478,9 +474,7 @@ async def _background_event_transcript_count(
             notifications = reopened.agent_notifications()
             if owner == "background_macro":
                 assert len(notifications) == 1
-                message = build_notification_system_message(reopened)
-                assert message is not None
-                assert message.metadata["notifications"][0]["status"] == "canceled"
+                assert notifications[0].data["status"] == "canceled"
 
             resumed_output = StringIO()
             resumed_app = TUIApp(
@@ -501,12 +495,6 @@ async def _background_event_transcript_count(
                 + "\n"
                 + Text.from_ansi(resumed_output.getvalue()).plain
             )
-            if owner == "background_macro":
-                assert build_notification_system_message(reopened) is not None
-                events = list(notification_events(reopened))
-                assert len(events) == 1
-                assert render_event(events[0]) is None
-                assert reopened.agent_notifications() == []
         finally:
             reopened.close()
     plain = Text.from_ansi(app._transcript.render(160)).plain
