@@ -101,7 +101,7 @@ class BlockingBackend:
 @pytest.mark.asyncio
 async def test_duplicate_send_starts_one_turn(tmp_path: Path) -> None:
     backend = BlockingBackend()
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -157,7 +157,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -225,7 +225,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
 @pytest.mark.asyncio
 async def test_server_restart_keeps_delivery_deduplication(tmp_path: Path) -> None:
     first_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
-    first_server = ZetaServer(provider="codex", 
+    first_server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path, "-1"),
         backend_factory=lambda provider, model, home: (
@@ -254,7 +254,7 @@ async def test_server_restart_keeps_delivery_deduplication(tmp_path: Path) -> No
     await _close(first_server, writer)
 
     second_backend = FakeBackend([])
-    second_server = ZetaServer(provider="codex", 
+    second_server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path, "-2"),
         backend_factory=lambda provider, model, home: (
@@ -451,7 +451,7 @@ async def test_evicted_delivery_status_and_send_reuse_are_distinct(
     tmp_path: Path,
 ) -> None:
     backend = BlockingBackend()
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -607,7 +607,7 @@ def test_delivery_record_accepts_tagged_user_message_atomically(tmp_path: Path) 
 
 async def _queued_steer_server(tmp_path: Path, suffix: str):
     backend = BlockingBackend()
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path, suffix),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -835,7 +835,7 @@ class _FailingActiveTurnBackend:
 @pytest.mark.asyncio
 async def test_failed_turn_drops_queued_steering_before_next_turn(tmp_path: Path) -> None:
     backend = _FailingActiveTurnBackend()
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path, "-failed"),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -885,7 +885,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path, "-dispatch"),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -941,7 +941,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
         release.set()
         await _close(server, writer)
 
-    resumed = ZetaServer(provider="codex", 
+    resumed = ZetaServer(provider="codex",
         home=crash_home,
         socket_path=_socket_path(tmp_path, "-restarted"),
         backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),

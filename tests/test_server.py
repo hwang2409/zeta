@@ -437,7 +437,7 @@ async def test_server_streams_display_safe_thinking_body_without_metadata(
 async def test_unexpected_turn_error_matches_event_schema(tmp_path: Path) -> None:
     duplicate = ToolCall("duplicate-id", "read", {})
     backend = FakeBackend([ScriptedTurn(tool_calls=[duplicate, duplicate])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -465,7 +465,7 @@ async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
     target.write_text("approved")
     call = ToolCall("call-1", "read", {"path": str(target)})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -491,7 +491,7 @@ async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
 async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -515,7 +515,7 @@ async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> N
 async def test_client_close_emits_approval_end_once(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -539,7 +539,7 @@ async def test_client_close_emits_approval_end_once(tmp_path: Path) -> None:
 async def test_server_shutdown_emits_approval_end_once(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -577,7 +577,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -621,7 +621,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[agent]), ScriptedTurn(tool_calls=[child_call])]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -656,7 +656,7 @@ async def test_status_pending_delegated_identity_matches_event(tmp_path: Path) -
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[agent]), ScriptedTurn(tool_calls=[child_call])]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -681,7 +681,7 @@ async def test_status_pending_foreground_has_delegated_false_and_no_child_id(
 ) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -704,7 +704,7 @@ async def test_status_pending_foreground_has_delegated_false_and_no_child_id(
 async def test_decision_then_loop_end_emits_single_approval_end(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -744,7 +744,7 @@ async def test_lifecycle_prunes_ended_approvals(tmp_path: Path) -> None:
             )
         ]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -778,7 +778,7 @@ async def test_approval_and_steer_continue_the_same_turn(tmp_path: Path) -> None
     target.write_text("approved")
     call = ToolCall("call-1", "read", {"path": str(target)})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -823,7 +823,7 @@ async def test_approval_scope_always_tool_records_session_policy_and_skips_next_
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -872,7 +872,7 @@ async def test_approval_without_scope_keeps_legacy_shape(tmp_path: Path) -> None
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -905,7 +905,7 @@ async def test_approval_scope_rejects_invalid_values(tmp_path: Path) -> None:
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -989,7 +989,7 @@ async def test_resumed_approval_finishes_idle_after_terminal_event(tmp_path: Pat
 @pytest.mark.asyncio
 async def test_abort_mid_stream(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("first"), TextContent("second")], delay=0.2)])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1013,7 +1013,7 @@ async def test_abort_captures_turn_before_approval_end_write(
 ) -> None:
     call = ToolCall("approval-race", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1066,7 +1066,7 @@ async def test_foreground_abort_only_ends_foreground_approval(
 ) -> None:
     call = ToolCall("foreground-approval", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1133,7 +1133,7 @@ async def test_foreground_abort_mid_stream_keeps_pending_steering(
     tmp_path: Path,
 ) -> None:
     backend = BlockingThenCaptureBackend()
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1178,7 +1178,7 @@ async def test_foreground_abort_mid_stream_keeps_pending_steering(
 @pytest.mark.asyncio
 async def test_clear_steering_returns_cleared_count(tmp_path: Path) -> None:
     backend = BlockingThenCaptureBackend()
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1236,7 +1236,7 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
         f"pathlib.Path({str(marker)!r}).write_text('done')\""
     )
     backend = BackgroundChildAndForegroundToolBackend(command)
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         cwd=tmp_path,
         socket_path=_socket_path(tmp_path),
@@ -1647,7 +1647,7 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
 ) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1667,7 +1667,7 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
 async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1698,7 +1698,7 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
 @pytest.mark.asyncio
 async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("first"), TextContent("second")], delay=0.2)])
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1996,7 +1996,7 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
             ScriptedTurn([TextContent("parent done")]),
         ]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -2088,7 +2088,7 @@ async def test_delegated_approval_stream_carries_captured_execution_facts(
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path / "home",
         cwd=repository,
         socket_path=_socket_path(tmp_path),
@@ -2140,7 +2140,7 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -4435,7 +4435,7 @@ async def test_server_approval_carries_trusted_project_display(tmp_path: Path) -
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
     )
-    server = ZetaServer(provider="codex", 
+    server = ZetaServer(provider="codex",
         home=home,
         cwd=repository,
         socket_path=_socket_path(tmp_path),
