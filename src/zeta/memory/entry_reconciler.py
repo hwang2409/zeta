@@ -32,6 +32,7 @@ from .entry_store import (
     UpdateOperation,
     apply_operations,
 )
+from .provider import use_response_byte_limit
 from .reconciler import (
     PreparedRequest,
     ReconciliationError,
@@ -681,18 +682,22 @@ def _repair_prompt(
 
 async def _invoke(
     invoke: EntryInvoke, prompt: str, budget: ProviderRetryBudget
-) -> tuple[str, dict[str, int]]:
-    with use_retry_budget(budget):
+) -> tuple[str, dict[str, int], bool]:
+    with use_retry_budget(budget), use_response_byte_limit(_MAX_RESPONSE_BYTES):
         response = invoke(prompt)
         if inspect.isawaitable(response):
             response = await response
     if isinstance(response, ReconciliationResponse):
-        return response.text, {
-            key: value
-            for key, value in response.usage.items()
-            if type(value) is int and value >= 0
-        }
-    return response, {}
+        return (
+            response.text,
+            {
+                key: value
+                for key, value in response.usage.items()
+                if type(value) is int and value >= 0
+            },
+            response.truncated,
+        )
+    return response, {}, False
 
 
 def _sum_usage(total: dict[str, int], addition: Mapping[str, int]) -> dict[str, int]:
@@ -726,16 +731,22 @@ async def reconcile_entry_range(
             if callable(reconciliation_key)
             else reconciliation_key
         )
-        raw, first_usage = await _invoke(invoke, request.prompt, budget)
+        raw, first_usage, first_truncated = await _invoke(
+            invoke, request.prompt, budget
+        )
         usage = _sum_usage(usage, first_usage)
         try:
+            if first_truncated:
+                raise _ProposalError(("response exceeds 32768 bytes",))
             parsed = _parse(raw, snapshot.state, request.transcript, now)
         except _ProposalError as first_error:
             try:
-                repaired, repair_usage = await _invoke(
+                repaired, repair_usage, repair_truncated = await _invoke(
                     invoke, _repair_prompt(request, first_error, raw), budget
                 )
                 usage = _sum_usage(usage, repair_usage)
+                if repair_truncated:
+                    raise _ProposalError(("response exceeds 32768 bytes",))
                 parsed = _parse(repaired, snapshot.state, request.transcript, now)
             except Exception as exc:
                 raise EntryReconciliationFailure(str(exc), usage) from exc
