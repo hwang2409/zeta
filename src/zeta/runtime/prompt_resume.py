@@ -130,14 +130,20 @@ def resume_prompt(
 ) -> ResumedPrompt:
     """Classify, safely recompose, persist, and adopt one resumed prompt.
 
-    A recorded default recipe is fully rebuilt. Every other stored recipe uses
-    the conservative flow: unknown prompt bytes remain unchanged and only a
-    digest-validated project-memory span can be replaced. Explicit prompt flags
-    are a new user-authored custom recipe rather than a default rebuild.
+    A recorded default recipe is fully rebuilt. A recipe-less empty prompt is
+    also default because it has no unknown bytes to preserve. Every other
+    stored recipe uses the conservative flow: unknown prompt bytes remain
+    unchanged and only a digest-validated project-memory span can be replaced.
+    Explicit prompt flags are a new user-authored custom recipe rather than a
+    default rebuild.
     """
 
     explicit_custom = system_override is not None or system_append is not None
-    rebuild = metadata.prompt_recipe == "default" or explicit_custom
+    rebuild = (
+        metadata.prompt_recipe == "default"
+        or (metadata.prompt_recipe is None and not metadata.system_prompt)
+        or explicit_custom
+    )
     skills, agents = _catalogs(
         metadata, home=home, repo_root=repo_root, refresh=rebuild
     )

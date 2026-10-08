@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
+from ..core.path_identity import same_physical_path
 from ..core.project_context import discover_repo_root, load_project_context
 from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
@@ -989,9 +990,7 @@ def _child_base_system_prompt(
 ) -> str | Message:
     """Compose project context from an explicit cwd that differs from the parent."""
 
-    if cwd_override is None or os.path.abspath(cwd_override) == os.path.abspath(
-        loop.store.cwd
-    ):
+    if cwd_override is None or same_physical_path(cwd_override, loop.store.cwd):
         return loop.context_assembler.system_prompt
     if child_registry is not None:
         child_registry.verify_cwd_identity()

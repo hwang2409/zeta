@@ -21,6 +21,7 @@ from ..protocol.types import (
     ToolUseContent,
 )
 from .abort import AbortSignal
+from .path_identity import same_physical_path
 from .store import ConversationStore
 
 
@@ -506,7 +507,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 return ApprovalDecision.DENY, None
             if self._matches(self._always_ask, capability, unreadable=True):
                 return ApprovalDecision.ASK, None
-            same_cwd = os.path.realpath(parent_cwd) == os.path.realpath(child_cwd)
+            same_cwd = same_physical_path(parent_cwd, child_cwd)
             matching_rules = [
                 rule
                 for rule in self._always_allow

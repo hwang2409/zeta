@@ -166,7 +166,7 @@ def test_resume_rebuilds_default_context_from_stored_directory(
     assert resumed.slash_status().context_files == (str(original_context.resolve()),)
 
 
-def test_legacy_resume_preserves_unknown_prompt_snapshot(
+def test_legacy_empty_prompt_resume_builds_default_from_stored_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -186,9 +186,11 @@ def test_legacy_resume_preserves_unknown_prompt_snapshot(
     )
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
 
-    assert saved["system_prompt"] == ""
-    assert resumed.loop.context_assembler.system_prompt.content[0].text == ""
-    assert saved["context_files"] == []
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+    assert "legacy rules" in prompt
+    assert saved["system_prompt"] == prompt
+    assert saved["prompt_recipe"] == "default"
+    assert saved["context_files"] == [str(context_file.resolve())]
 
 
 def test_legacy_resume_hydrates_without_bumping_updated_at(
@@ -196,9 +198,9 @@ def test_legacy_resume_hydrates_without_bumping_updated_at(
 ) -> None:
     """Conservative legacy adoption must not reorder the sidebar.
 
-    A recipe-less session keeps its unknown prompt bytes, including an absent
-    legacy snapshot. An explicit --system-prompt override is user activity, so
-    it replaces that snapshot and bumps updated_at.
+    A recipe-less empty prompt adopts the default recipe without user activity.
+    An explicit --system-prompt override is user activity, so it replaces that
+    snapshot and bumps updated_at.
     """
 
     home = tmp_path / "zeta-home"
@@ -217,7 +219,8 @@ def test_legacy_resume_hydrates_without_bumping_updated_at(
 
     create_app(build_parser().parse_args(["--resume", session_id, "--provider", "fake"]))
     hydrated = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert hydrated["system_prompt"] == ""
+    assert "legacy rules" in hydrated["system_prompt"]
+    assert hydrated["prompt_recipe"] == "default"
     assert hydrated["updated_at"] == pinned, (
         "automatic legacy hydration must not bump updated_at"
     )
@@ -364,7 +367,7 @@ def test_catalog_boundaries_require_explicit_catalog() -> None:
         assert inspect.signature(callable_).parameters[parameter].default is inspect.Parameter.empty
 
 
-def test_legacy_resume_never_adopts_default_recipe(
+def test_legacy_empty_prompt_adopts_live_default_recipe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -390,8 +393,11 @@ def test_legacy_resume_never_adopts_default_recipe(
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
     assert "first rules" not in prompt
-    assert "second rules" not in prompt
-    assert SessionManager(home).read_metadata(opened.store.session_id).prompt_recipe is None
+    assert "second rules" in prompt
+    assert (
+        SessionManager(home).read_metadata(opened.store.session_id).prompt_recipe
+        == "default"
+    )
 
 
 def test_partial_context_metadata_preserves_recorded_prompt_bytes(
@@ -597,7 +603,7 @@ def test_second_resume_after_override_sees_overridden_snapshot(
     assert resumed._startup_alerts == ()
 
 
-def test_concurrent_legacy_resumes_preserve_unknown_prompt(
+def test_concurrent_legacy_empty_prompt_resumes_adopt_one_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -617,7 +623,11 @@ def test_concurrent_legacy_resumes_preserve_unknown_prompt(
         del kwargs
         nonlocal load_count
         load_count += 1
-        return ProjectContext("unsafe fallback", (tmp_path / "context.md",))
+        return ProjectContext(
+            f"default fallback {load_count}",
+            (tmp_path / "context.md",),
+            prompt_recipe="default",
+        )
 
     monkeypatch.setattr("zeta.tui.app.load_project_context", load_context)
     apps: list[TUIApp] = []
@@ -643,13 +653,16 @@ def test_concurrent_legacy_resumes_preserve_unknown_prompt(
     second.join()
 
     assert errors == []
-    assert load_count == 0
+    assert load_count == 2
     saved = SessionManager(home).open(session_id).metadata
     prompts = [app.loop.context_assembler.system_prompt.content[0].text for app in apps]
     context_files = [app.slash_status().context_files for app in apps]
-    assert saved.system_prompt == ""
-    assert prompts == ["", ""]
-    assert context_files == [(), ()]
+    assert saved.prompt_recipe == "default"
+    assert prompts == [saved.system_prompt, saved.system_prompt]
+    assert context_files == [
+        (str(tmp_path / "context.md"),),
+        (str(tmp_path / "context.md"),),
+    ]
 
 
 def test_session_bash_cwd_round_trips_through_store_state(

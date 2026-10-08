@@ -272,6 +272,9 @@ def test_same_cwd_child_inherits_parent_memory_snapshot(tmp_path: Path) -> None:
     assert _child_base_system_prompt(loop, str(workspace)) is parent_prompt
     equivalent_cwd = str(workspace / ".." / workspace.name)
     assert _child_base_system_prompt(loop, equivalent_cwd) is parent_prompt
+    symlink_cwd = tmp_path / "workspace-link"
+    symlink_cwd.symlink_to(workspace, target_is_directory=True)
+    assert _child_base_system_prompt(loop, str(symlink_cwd)) is parent_prompt
     assert "new memory" not in parent_prompt
 
 
