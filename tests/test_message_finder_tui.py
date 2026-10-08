@@ -9,11 +9,12 @@ from itertools import pairwise
 from typing import Any
 
 import pytest
+from prompt_toolkit.styles import Style
 from rich.text import Text
 
 from zeta.protocol.types import ToolCall
 from zeta.tui.app import TUIApp
-from zeta.tui.transcript import TranscriptWidget
+from zeta.tui.transcript import FinderControl, TranscriptWidget
 from zeta.tui.transcript.message_finder import Role
 
 
@@ -69,6 +70,40 @@ def test_open_finder_lists_messages_with_roles() -> None:
     roles = {row.candidate.role for row in state.rows}
     assert Role.USER in roles
     assert Role.TOOL in roles
+
+
+def _assert_fragment_styles_parse(content: Any) -> None:
+    style = Style([])
+    for line_index in range(content.line_count):
+        for fragment_style, _text, *_handler in content.get_line(line_index):
+            style.get_attrs_for_style_str(fragment_style)
+
+
+def test_selected_finder_row_uses_valid_prompt_toolkit_styles() -> None:
+    transcript, _ = _seeded_transcript()
+    _open_finder(transcript)
+    state = transcript.finder_state()
+    assert state is not None and state.rows
+
+    content = FinderControl(lambda: state).create_content(80, 20)
+
+    _assert_fragment_styles_parse(content)
+    selected_styles = {
+        fragment_style
+        for line_index in range(content.line_count)
+        for fragment_style, _text, *_handler in content.get_line(line_index)
+        if "bg:" in fragment_style
+    }
+    assert selected_styles
+    assert all(" on " not in style for style in selected_styles)
+
+
+def test_representative_transcript_fragment_styles_parse() -> None:
+    transcript, _ = _seeded_transcript()
+    transcript.begin_search()
+    transcript.update_search("pytest")
+
+    _assert_fragment_styles_parse(transcript.create_content(80, 10))
 
 
 def test_typing_filters_to_matching_messages() -> None:

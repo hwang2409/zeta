@@ -107,14 +107,23 @@ class FinderControl(UIControl):
         prefix_cells = len(gutter) + _LABEL_WIDTH + 1 + _cells(marker) + 1
         excerpt = _truncate(row.excerpt, max(1, width - prefix_cells))
         row_bg = f" on {theme.MENU_BG}" if selected else ""
-        base = (theme.BODY if selected else theme.DIM) + row_bg
-        match_style = (f"bold {theme.ACCENT}" if selected else theme.ACCENT) + row_bg
+        base = theme.prompt_toolkit_style(
+            (theme.BODY if selected else theme.DIM) + row_bg
+        )
+        match_style = theme.prompt_toolkit_style(
+            (f"bold {theme.ACCENT}" if selected else theme.ACCENT) + row_bg
+        )
         highlights = set(row.highlights)
         fragments: list[tuple[str, str]] = [
-            ((theme.ACCENT + row_bg) if selected else base, gutter),
-            (_role_style(row.candidate.role) + row_bg, label),
+            (
+                theme.prompt_toolkit_style(theme.ACCENT + row_bg)
+                if selected
+                else base,
+                gutter,
+            ),
+            (theme.prompt_toolkit_style(_role_style(row.candidate.role) + row_bg), label),
             (base, " "),
-            (theme.DIM + row_bg, marker),
+            (theme.prompt_toolkit_style(theme.DIM + row_bg), marker),
             (base, " "),
         ]
         run: list[str] = []
