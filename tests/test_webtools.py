@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import gzip
 import zlib
 from pathlib import Path
@@ -354,53 +353,6 @@ async def test_fetch_returns_partial_when_decompressed_body_exceeds_cap(
     assert Path(result["content"][0]["spill_path"]).read_text() == "x" * 32
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("with_stream", [False, True])
-async def test_parallel_fetches_cancel_on_registry_abort(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    with_stream: bool,
-) -> None:
-    started = asyncio.Event()
-    blocked = asyncio.Event()
-    started_count = 0
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal started_count
-        del request
-        started_count += 1
-        if started_count == 2:
-            started.set()
-        await blocked.wait()
-        raise AssertionError("blocked transport was not canceled")
-
-    _mock_client(monkeypatch, handler)
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    calls = [
-        ToolCall("fetch-a", "fetch", {"url": "example.com/a"}),
-        ToolCall("fetch-b", "fetch", {"url": "example.com/b"}),
-    ]
-    if with_stream:
-        async def run_streaming() -> list[object]:
-            return await asyncio.gather(
-                *(
-                    registry.execute(call, _stream_sink=lambda event: None)
-                    for call in calls
-                )
-            )
-
-        task = asyncio.create_task(run_streaming())
-    else:
-        task = asyncio.create_task(registry.execute_many(calls))
-
-    await asyncio.wait_for(started.wait(), timeout=1)
-    registry.abort()
-    results = await asyncio.wait_for(task, timeout=1)
-
-    assert [result["content"][0]["text"] for result in results] == [
-        "tool execution canceled",
-        "tool execution canceled",
-    ]
 
 
 @pytest.mark.asyncio

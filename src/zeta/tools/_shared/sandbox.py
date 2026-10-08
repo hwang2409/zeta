@@ -254,26 +254,6 @@ def _open_parent_in_cwd(
         os.close(sandbox_fd)
 
 
-@contextmanager
-def open_parent(
-    registry: ToolRegistry,
-    raw_path: str,
-    *,
-    create_parents: bool,
-) -> Iterator[tuple[list[str], int, Path]]:
-    """Open the target's parent directory descriptor for an inside-cwd path."""
-
-    resolved = registry.policy.resolve(raw_path)
-    if not resolved.in_cwd:
-        raise _escape_error(registry.policy)
-    components = _cwd_relative_components(registry.cwd, resolved.absolute)
-    with _open_parent_in_cwd(
-        registry,
-        components,
-        resolved.absolute,
-        create_parents=create_parents,
-    ) as (parent_fd, absolute):
-        yield components, parent_fd, absolute
 
 
 @contextmanager
