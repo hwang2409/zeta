@@ -1117,94 +1117,116 @@ def _run_killed_publication(
 ) -> subprocess.CompletedProcess[str]:
     script = textwrap.dedent(
         """
+        import fcntl
         import os
         import sys
         from pathlib import Path
 
         from zeta.remote_sync import LocalTransport, push_project_memory
+        import zeta.memory.version_store as version_store
         import zeta.remote_sync.memory as memory
 
         first, second, project_id, boundary = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
-        destination = second / "projects" / project_id
+        target_project = second / "projects" / project_id
+        real_publish = version_store.atomic_publish_file
         real_replace = memory.os.replace
 
-        def killing_replace(source, target, *args, **kwargs):
-            if args or kwargs:
-                return real_replace(source, target, *args, **kwargs)
-            source_path, target_path = Path(source), Path(target)
-            if boundary == "before_backup" and target_path.name.startswith(f".{project_id}.replace-"):
-                real_replace(source, target)
-                os._exit(91)
-            if target_path.name.startswith(f".{project_id}.backup-"):
-                real_replace(source, target)
-                if boundary == "between":
+        def killing_publish(directory_fd, name, data, **kwargs):
+            result = real_publish(directory_fd, name, data, **kwargs)
+            directory = Path(
+                fcntl.fcntl(directory_fd, 50, b"\\0" * 1024)
+                .split(b"\\0", 1)[0]
+                .decode()
+            )
+            if target_project == directory or target_project in directory.parents:
+                if boundary in {"blob", "orphan"} and directory.name == "blobs":
+                    os._exit(91)
+                if boundary == "manifest" and directory.name == "versions":
                     os._exit(92)
-                return
-            real_replace(source, target)
-            if target_path == destination and source_path.name.startswith(f".{project_id}.install-") and boundary == "after_install":
-                os._exit(93)
+                if boundary == "pointer" and name == "memory-current.json":
+                    os._exit(93)
+            return result
 
+        def killing_replace(source, target, *args, **kwargs):
+            result = real_replace(source, target, *args, **kwargs)
+            if args or kwargs:
+                return result
+            source_path, target_path = Path(source), Path(target)
+            if boundary == "orphan" and ".install-" in target_path.name:
+                os._exit(94)
+            if boundary in {"blob", "manifest", "pointer"} and target_path.name.startswith(f".{project_id}.backup-"):
+                os._exit(95)
+            return result
+
+        version_store.atomic_publish_file = killing_publish
         memory.os.replace = killing_replace
         push_project_memory(first, LocalTransport(second), project_id=project_id)
         """
     )
-    killed = subprocess.run(
+    return subprocess.run(
         [sys.executable, "-c", script, str(first), str(second), project_id, boundary],
         text=True,
         capture_output=True,
         check=False,
     )
-    assert killed.returncode in {91, 92, 93}, killed.stderr
-    return killed
 
 
-def _retry_sync_in_fresh_process(first: Path, second: Path, project_id: str) -> None:
-    script = textwrap.dedent(
-        """
-        import sys
-        from pathlib import Path
-        from zeta.remote_sync import LocalTransport, push_project_memory
-
-        result = push_project_memory(Path(sys.argv[1]), LocalTransport(Path(sys.argv[2])), project_id=sys.argv[3])
-        assert not result.conflicts
-        """
-    )
-    subprocess.run(
-        [sys.executable, "-c", script, str(first), str(second), project_id],
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-
-
-def _assert_killed_publication_recovers(tmp_path: Path, boundary: str) -> None:
+@pytest.mark.parametrize("boundary", ("blob", "manifest", "pointer"))
+def test_registry_reads_never_see_missing_project_during_memory_sync(
+    tmp_path: Path, boundary: str
+) -> None:
     first, second = tmp_path / "first", tmp_path / "second"
     local, project_id = _fixture(first, tmp_path / "workspace")
     push_project_memory(first, LocalTransport(second), project_id=project_id)
-    entry_id = _add(local, project_id, "pending publication", 1)
+    _add(local, project_id, "pending publication", 1)
 
-    _run_killed_publication(first, second, project_id, boundary)
-    _retry_sync_in_fresh_process(first, second, project_id)
+    killed = _run_killed_publication(first, second, project_id, boundary)
+
+    assert killed.returncode in {91, 92, 93, 95}, killed.stderr
+    fresh = ProjectRegistry(second / "projects")
+    assert project_id in {project.project_id for project in fresh.list_projects()}
+    assert fresh.show_project(project_id).project_id == project_id
+    assert fresh._entry_memory_state(project_id).state.project_id == project_id
+
+
+def test_memory_sync_does_not_replace_project_directory(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, project_id = _fixture(first, tmp_path / "workspace")
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    _add(local, project_id, "pending publication", 1)
+    project = first / "projects" / project_id
+    inode = project.stat().st_ino
+    concurrent = project / "inbox" / "during-sync.json"
+
+    class ConcurrentWriter(LocalTransport):
+        def publish_project(
+            self, project_id: str, snapshot: Path, *, expected_digest: str
+        ) -> None:
+            super().publish_project(project_id, snapshot, expected_digest=expected_digest)
+            concurrent.parent.mkdir()
+            concurrent.write_text('{"kept": true}\n', encoding="utf-8")
+
+    push_project_memory(first, ConcurrentWriter(second), project_id=project_id)
+
+    assert project.stat().st_ino == inode
+    assert concurrent.read_text(encoding="utf-8") == '{"kept": true}\n'
+
+
+def test_interrupted_sync_leaves_no_orphan_artifacts(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, project_id = _fixture(first, tmp_path / "workspace")
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    _add(local, project_id, "pending publication", 1)
+
+    killed = _run_killed_publication(first, second, project_id, "orphan")
+    assert killed.returncode in {91, 94}, killed.stderr
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
 
     for home in (first, second):
-        project = home / "projects" / project_id
-        assert project.is_dir()
-        assert entry_id in ProjectRegistry(home / "projects")._entry_memory_state(
-            project_id
-        ).state.entries
-
-
-def test_kill_between_backup_and_install_recovers(tmp_path: Path) -> None:
-    _assert_killed_publication_recovers(tmp_path, "between")
-
-
-def test_kill_after_install_before_cleanup_recovers(tmp_path: Path) -> None:
-    _assert_killed_publication_recovers(tmp_path, "after_install")
-
-
-def test_kill_before_backup_is_noop(tmp_path: Path) -> None:
-    _assert_killed_publication_recovers(tmp_path, "before_backup")
-
+        projects = home / "projects"
+        assert not list(projects.glob(f".{project_id}.install-*"))
+        assert not list(projects.glob(f".{project_id}.backup-*"))
+        assert not list(projects.glob(f".{project_id}.replace-*"))
 
 def test_sync_state_size_bounded_over_add_sync_compact_cycles(tmp_path: Path) -> None:
     first, second = tmp_path / "first", tmp_path / "second"
