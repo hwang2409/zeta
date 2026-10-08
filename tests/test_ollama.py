@@ -7,9 +7,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.support.fake_backend import FakeBackend
 from zeta.agent.durable import durable_message
 from zeta.config.settings import load_settings, resolve
-from zeta.core.fake import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
@@ -58,6 +58,11 @@ async def _captured_num_ctx(backend: OllamaBackend) -> int:
         backend.client = client
         [event async for event in backend.complete([], [])]
     return payloads[0]["options"]["num_ctx"]
+
+
+@pytest.fixture(autouse=True)
+def _use_real_ollama_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ZETA_TEST_SCRIPTED_PROVIDER")
 
 
 class _ClosingStream(httpx.AsyncByteStream):
@@ -677,6 +682,7 @@ async def test_interactive_composition_resolves_ollama_endpoint_centrally(
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=6_000,
+    default_provider="codex",
     )
     builder_kwargs: dict[str, object] = {}
 
@@ -727,6 +733,7 @@ async def test_interactive_ollama_budget_is_identical_everywhere(
         cli_model="qwen3:4b",
         cli_yolo=None,
         cli_token_budget=requested_budget,
+    default_provider="codex",
     )
     manager = SessionManager(home)
     composition = compose_runtime(
@@ -776,6 +783,7 @@ async def test_resumed_ollama_budget_is_reconciled_everywhere(
         cli_model="qwen3:4b",
         cli_yolo=None,
         cli_token_budget=None,
+    default_provider="codex",
     )
     composition = compose_runtime(
         home=home,
@@ -839,7 +847,7 @@ async def test_server_provider_switch_resolves_ollama_endpoint_centrally(
     home = tmp_path / "home"
     project = tmp_path / "project"
     expected = _endpoint_sources(home, project / ".zeta", monkeypatch, environment_wins)
-    runtime = ServerRuntime(home, cwd=project, provider="fake")
+    runtime = ServerRuntime(home, cwd=project, provider="codex")
     backend = runtime.backend_for_model("ollama", "locally-created-model")
     assert isinstance(backend, OllamaBackend)
     assert backend.base_url == expected

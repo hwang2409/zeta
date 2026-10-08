@@ -79,9 +79,9 @@ session has never had a default set, and clients must fall back to their own
 configured default in that case.
 
 Server mode uses the effective launch provider after CLI and settings resolution.
-Without either override, `zeta serve` uses fake mode.
-Real-provider servers omit fake-provider sessions. A server whose effective launch
-provider is `fake` lists only fake-provider sessions.
+When no provider is configured, Zeta derives it from the configured model. If
+neither is configured, startup fails and asks the user to choose Claude, Codex,
+or Ollama.
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"list_sessions","params":{}}
@@ -196,11 +196,11 @@ settings layer, context files, skills, agents, and project association. No
 other trust grant occurs. Project MCP servers still need `zeta mcp trust`.
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"new_session","params":{"provider":"fake","model":"offline"}}
+{"jsonrpc":"2.0","id":3,"method":"new_session","params":{"provider":"claude","model":"claude-sonnet-4-6"}}
 ```
 
 ```json
-{"jsonrpc":"2.0","id":3,"result":{"session":{"session_id":"abc123","provider":"fake","model":"offline"}}}
+{"jsonrpc":"2.0","id":3,"result":{"session":{"session_id":"abc123","provider":"claude","model":"claude-sonnet-4-6"}}}
 ```
 
 The example omits metadata fields for readability. A real response includes
@@ -224,19 +224,17 @@ the message `session working directory no longer exists: <cwd>`, and the active
 session does not change. The project settings layer for a resumed session
 comes from the server launch directory, as for an explicit CLI `--resume`.
 
-Real-provider servers reject fake sessions with RPC error `-32602`:
-`session uses the offline test provider; open it with --provider fake`.
-Fake-mode servers reject real sessions with the same code and a message
-naming the required `--provider`. Both errors preserve the active session and
-leave the rejected session's files untouched. Fake sessions still resume on
-fake-mode servers; real sessions can resume across real providers.
+Sessions recorded with the removed fake provider return RPC error `-32602` with
+a message that asks the user to choose Claude, Codex, or Ollama. The error
+preserves the active session and leaves the rejected session's files untouched.
+Real sessions can resume across real providers.
 
 ```json
 {"jsonrpc":"2.0","id":4,"method":"resume","params":{"session_id":"abc123"}}
 ```
 
 ```json
-{"jsonrpc":"2.0","id":4,"result":{"session":{"session_id":"abc123","provider":"fake","model":"offline"}}}
+{"jsonrpc":"2.0","id":4,"result":{"session":{"session_id":"abc123","provider":"claude","model":"claude-sonnet-4-6"}}}
 ```
 
 ### `send`
@@ -862,8 +860,6 @@ error code and message. Provider status and origin remain internal.
   response. Tool-use content retains the existing `tool_call` shape.
 - `model_catalog`: returns `models`, sorted names from both built-in real provider
   catalogs, and `providers`, a model-name-to-provider map (`claude` or `codex`).
-  Only a server whose effective launch provider is `fake` returns `faster` and
-  `offline` instead, without a provider map; real models cannot enter that catalog.
 - `session_settings`: returns `model` and `approval_mode`.
 - `set_settings`: takes `model` from that catalog and `approval_mode` (`ask`,
   `allow`, or `deny`). Both persist atomically in session metadata and apply to

@@ -27,7 +27,7 @@ from zeta.tui.app import create_app, format_picker_row
 
 
 def _args(*values: str) -> argparse.Namespace:
-    return build_parser().parse_args([*values, "--provider", "fake"])
+    return build_parser().parse_args([*values, "--provider", "codex"])
 
 
 def test_normalize_session_name_accepts_and_rejects() -> None:
@@ -59,7 +59,7 @@ def test_format_relative_age_covers_ranges() -> None:
 def test_session_metadata_persists_name_field(tmp_path: Path) -> None:
     home = tmp_path / "zeta-home"
     manager = SessionManager(home)
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
 
     manager.record_name(opened.metadata, name="planning")
     reopened = SessionManager(home).open(opened.store.session_id)
@@ -127,7 +127,7 @@ def test_slash_new_requests_restart_only_when_idle(
 
 def test_slash_new_rejected_during_active_turn(tmp_path: Path) -> None:
     async def rejected() -> None:
-        from zeta.core.fake import FakeBackend
+        from tests.support.fake_backend import FakeBackend
         from zeta.core.loop import AgentLoop
         from zeta.core.store import ConversationStore
         from zeta.tui.app import TUIApp
@@ -138,7 +138,7 @@ def test_slash_new_rejected_during_active_turn(tmp_path: Path) -> None:
                 ConversationStore(tmp_path / "sessions"),
                 skill_catalog=SkillCatalog.empty(),
             ),
-            provider="fake",
+            provider="codex",
             model="offline",
         )
         app._active_task = asyncio.create_task(asyncio.sleep(1))
@@ -165,7 +165,7 @@ def test_ephemeral_creates_and_cleans_up_tempdir(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
 
-    app = create_app(build_parser().parse_args(["--provider", "fake", "--no-session"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex", "--no-session"]))
     root = app.ephemeral_root
     assert root is not None and root.exists()
     assert not (home / "sessions").exists()
@@ -184,7 +184,7 @@ def test_ephemeral_headless_mode_leaves_no_store(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
 
-    exit_code = main(["--provider", "fake", "--no-session", "-p", "hi"])
+    exit_code = main(["--provider", "codex", "--no-session", "-p", "hi"])
     captured = capsys.readouterr()
 
     assert exit_code == 0
@@ -353,7 +353,7 @@ def test_exit_hint_suppressed_for_ephemeral_session(
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    app = create_app(build_parser().parse_args(["--provider", "fake", "--no-session"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex", "--no-session"]))
 
     _print_exit_hint(app)
     captured = capsys.readouterr()
@@ -386,7 +386,7 @@ def test_resume_picker_shows_names(
     )
     monkeypatch.setattr("builtins.input", lambda prompt: "1")
 
-    create_app(build_parser().parse_args(["--resume", "--provider", "fake"]))
+    create_app(build_parser().parse_args(["--resume", "--provider", "codex"]))
     output = capsys.readouterr().out
 
     assert "[planning]" in output
@@ -397,7 +397,7 @@ def test_session_metadata_rejects_bad_name_type(
 ) -> None:
     home = tmp_path / "zeta-home"
     manager = SessionManager(home)
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text())
     metadata["name"] = 42
@@ -419,7 +419,7 @@ def test_ephemeral_history_does_not_touch_shared_history(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
 
-    app = create_app(build_parser().parse_args(["--provider", "fake", "--no-session"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex", "--no-session"]))
     root = app.ephemeral_root
     assert root is not None
     assert app._history_path is not None
@@ -550,7 +550,7 @@ def test_ephemeral_cleanup_when_create_app_raises(
     monkeypatch.setattr("zeta.tui.app.load_settings", _boom)
 
     with pytest.raises(RuntimeError, match="simulated create_app failure"):
-        create_app(build_parser().parse_args(["--provider", "fake", "--no-session"]))
+        create_app(build_parser().parse_args(["--provider", "codex", "--no-session"]))
 
     leaks = glob.glob(str(fake_tmp / "zeta-ephemeral-*"))
     assert leaks == [], f"leaked ephemeral roots: {leaks}"

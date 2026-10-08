@@ -12,7 +12,6 @@ from .core.context import (
     SummaryCompletionError,
     SummaryInputTooLarge,
 )
-from .core.fake import FakeBackend, ScriptedTurn
 from .core.session import (
     META_VERSION,
     OpenedSession,
@@ -93,7 +92,6 @@ __all__ = [
     "ConversationStore",
     "ContextAssembler",
     "ErrorInfo",
-    "FakeBackend",
     "ImageContent",
     "Message",
     "MessageRole",
@@ -101,7 +99,6 @@ __all__ = [
     "OpenedSession",
     "OAuthTokens",
     "RedactedThinkingContent",
-    "ScriptedTurn",
     "SessionError",
     "SessionManager",
     "SessionMetadata",

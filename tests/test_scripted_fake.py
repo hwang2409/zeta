@@ -9,6 +9,14 @@ from typing import Any
 
 import pytest
 
+from tests.support.scripted_provider import (
+    FAKE_SCRIPT_ENV,
+    FakeScriptError,
+    ScriptedFakeBackend,
+    fake_script_from_env,
+    load_fake_script,
+    parse_fake_script,
+)
 from zeta.cli.main import build_parser
 from zeta.protocol.types import (
     Message,
@@ -18,22 +26,10 @@ from zeta.protocol.types import (
     ToolResult,
     ToolUseContent,
 )
-from zeta.providers.scripted_fake import (
-    FAKE_SCRIPT_ENV,
-    FakeScriptError,
-    ScriptedFakeBackend,
-    fake_script_from_env,
-    load_fake_script,
-    parse_fake_script,
-)
 from zeta.runtime.headless import run_headless
 from zeta.server import ZetaServer
-from zeta.server.fake_backend import ServerFakeBackend
-from zeta.server.runtime import default_backend
-from zeta.tui.bootstrap import build_backend
-from zeta.tui.fake_backend import FakeInteractiveBackend
 
-DOCS = Path(__file__).parents[1] / "docs" / "fake-scripts"
+FIXTURES = Path(__file__).parent / "fixtures" / "scripted-provider"
 TIMEOUT = 5
 
 BASH_SCRIPT = {
@@ -174,8 +170,8 @@ def test_load_reports_missing_file_and_bad_json(tmp_path: Path) -> None:
         load_fake_script(bad)
 
 
-@pytest.mark.parametrize("path", sorted(DOCS.glob("*.json")), ids=lambda path: path.name)
-def test_documented_example_scripts_are_valid(path: Path) -> None:
+@pytest.mark.parametrize("path", sorted(FIXTURES.glob("*.json")), ids=lambda path: path.name)
+def test_scripted_provider_fixtures_are_valid(path: Path) -> None:
     assert load_fake_script(path).rules
 
 
@@ -187,43 +183,18 @@ def test_env_lookup_is_explicit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert fake_script_from_env({FAKE_SCRIPT_ENV: str(path)}) is not None
 
 
-def test_default_fake_backends_are_unchanged_without_script(
+def test_hidden_serve_hook_uses_scripted_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv(FAKE_SCRIPT_ENV, raising=False)
-    server_backend, model = default_backend("fake", None, tmp_path)
-    assert type(server_backend) is ServerFakeBackend
-    assert model == "offline"
-    tui_backend, _ = build_backend("fake", None)
-    assert type(tui_backend) is FakeInteractiveBackend
+    monkeypatch.setenv("ZETA_TEST_SCRIPTED_PROVIDER", "1")
+    server = ZetaServer(
+        home=tmp_path, socket_path=tmp_path / "s.sock", provider="codex"
+    )
 
-    async def collect() -> list[str]:
-        backend = ServerFakeBackend(delay=0)
-        events = backend.complete([Message(MessageRole.USER, [TextContent("hi")])], [])
-        return [event.delta async for event in events if event.delta]
+    backend, model = server.runtime._build_backend("codex", None, tmp_path)
 
-    assert "".join(asyncio.run(collect())) == "you said: hi"
-
-
-def test_script_selects_scripted_backend_only_for_fake(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv(FAKE_SCRIPT_ENV, str(_write(tmp_path, BASH_SCRIPT)))
-    tui_backend, _ = build_backend("fake", "offline")
-    assert isinstance(tui_backend, ScriptedFakeBackend)
-    server = ZetaServer(home=tmp_path, socket_path=tmp_path / "s.sock", provider="fake")
-    backend, _ = server.runtime._build_backend("fake", "offline", tmp_path)
-    assert isinstance(backend, ScriptedFakeBackend)
-    real = ZetaServer(home=tmp_path, socket_path=tmp_path / "r.sock", provider="claude")
-    assert real.runtime._fake_script is None
-
-
-def test_invalid_script_fails_server_startup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv(FAKE_SCRIPT_ENV, str(_write(tmp_path, {"version": 1})))
-    with pytest.raises(FakeScriptError, match="missing field 'rules'"):
-        ZetaServer(home=tmp_path, socket_path=tmp_path / "s.sock", provider="fake")
+    assert model == "gpt-5.6-luna"
+    assert type(backend).__name__ == "_TestScriptedBackend"
 
 
 async def _events(backend: ScriptedFakeBackend, messages: list[Message]) -> list[Any]:
@@ -359,8 +330,16 @@ async def _event(reader: asyncio.StreamReader, name: str) -> dict[str, Any]:
 
 
 async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
+    script = parse_fake_script(BASH_SCRIPT)
     server = ZetaServer(
-        home=tmp_path / "home", cwd=tmp_path, socket_path=_socket_path(tmp_path), provider="fake"
+        home=tmp_path / "home",
+        cwd=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda _provider, model, _home: (
+            ScriptedFakeBackend(script, model=model or "gpt-5.6-luna"),
+            model or "gpt-5.6-luna",
+        ),
     )
     await asyncio.wait_for(server.start(), TIMEOUT)
     reader, writer = await asyncio.wait_for(
@@ -368,7 +347,7 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
     )
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "run the check"})
         approval = await _event(reader, "approval_request")
         request_id = approval["request_id"]
@@ -415,8 +394,16 @@ async def test_serve_scripted_provider_error_reaches_client(
     monkeypatch.setattr(
         "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
     )
+    script = parse_fake_script(BASH_SCRIPT)
     server = ZetaServer(
-        home=tmp_path / "home", cwd=tmp_path, socket_path=_socket_path(tmp_path), provider="fake"
+        home=tmp_path / "home",
+        cwd=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda _provider, model, _home: (
+            ScriptedFakeBackend(script, model=model or "gpt-5.6-luna"),
+            model or "gpt-5.6-luna",
+        ),
     )
     await asyncio.wait_for(server.start(), TIMEOUT)
     reader, writer = await asyncio.wait_for(
@@ -424,7 +411,7 @@ async def test_serve_scripted_provider_error_reaches_client(
     )
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": " fail "})
         error = await _event(reader, "error")
         assert error["error"]["code"] == "rate_limit_error"
@@ -441,11 +428,17 @@ def test_headless_scripted_tool_respects_allowlist_and_approval(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv(FAKE_SCRIPT_ENV, str(_write(tmp_path, BASH_SCRIPT)))
+    script = parse_fake_script(BASH_SCRIPT)
+
+    def build_scripted(_provider: str, model: str | None, **_kwargs: object):
+        selected = model or "gpt-5.6-luna"
+        return ScriptedFakeBackend(script, model=selected), selected
+
+    monkeypatch.setattr("zeta.tui.app.build_backend", build_scripted)
 
     def run(*flags: str) -> list[dict[str, Any]]:
         args = build_parser().parse_args(
-            ["--provider", "fake", "--no-session", "--format", "json", *flags, "-p", "run"]
+            ["--provider", "codex", "--no-session", "--format", "json", *flags, "-p", "run"]
         )
         assert run_headless(args, args.prompt) == 0
         out = capsys.readouterr().out
@@ -463,15 +456,3 @@ def test_headless_scripted_tool_respects_allowlist_and_approval(
     restricted = run("--yolo", "--tools", "read")
     result = next(event for event in restricted if event["type"] == "tool_result")
     assert result["is_error"] is True and "scripted-ok" not in result["content"]
-
-
-def test_headless_reports_invalid_script(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv(FAKE_SCRIPT_ENV, str(tmp_path / "missing.json"))
-    args = build_parser().parse_args(["--provider", "fake", "--no-session", "-p", "hi"])
-    assert run_headless(args, args.prompt) == 1
-    assert "ZETA_FAKE_SCRIPT: cannot read" in capsys.readouterr().err

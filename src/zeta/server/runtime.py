@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+import os
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,21 +16,63 @@ from ..core.approval import ApprovalPolicy
 from ..core.project_context import discover_repo_root, load_project_context
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
 from ..core.slash import effective_budget_for_model, resolve_session_budget
+from ..models.catalog import REMOVED_PROVIDER_ERROR
 from ..project_registry import ProjectRegistryError
-from ..protocol.types import CompletionBackend, StreamEvent
-from ..providers.scripted_fake import ScriptedFakeBackend, fake_script_from_env
+from ..protocol.types import (
+    CompletionBackend,
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+)
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import discover_session_skills
 from ..skills.agent_catalog import discover_session_agents
-from .fake_backend import ServerFakeBackend
 
 BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]]
 SessionEventSink = Callable[[str, StreamEvent], None]
 SessionWakeSink = Callable[[str], None]
 MemoryNoticeSink = Callable[[str, str], None]
+TEST_SCRIPTED_PROVIDER_ENV = "ZETA_TEST_SCRIPTED_PROVIDER"
+
+
+class _TestScriptedBackend(CompletionBackend):
+    """Minimal serve adapter enabled only by the external test-harness hook."""
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[dict[str, Any]],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        prompt = next(
+            (
+                "".join(
+                    block.text
+                    for block in message.content
+                    if isinstance(block, TextContent)
+                )
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+            ),
+            "",
+        )
+        text = f"you said: {prompt}"
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        await asyncio.sleep(0.1)
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=text)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent(text)]),
+            data={"usage": {"input_tokens": len(prompt), "output_tokens": len(text)}},
+        )
 
 
 def default_backend(
@@ -44,8 +87,7 @@ def default_backend(
     token_budget: int | None = None,
 ) -> tuple[CompletionBackend, str]:
     if provider == "fake":
-        selected = model or "offline"
-        return ServerFakeBackend(model=selected), selected
+        raise ValueError(REMOVED_PROVIDER_ERROR)
     from ..providers.factory import build_backend
 
     kwargs: dict[str, object] = {
@@ -136,8 +178,7 @@ class ServerRuntime:
         self._auto_memory = auto_memory
         self._cli_yolo = cli_yolo
         self._server_provider = self._config(None, None).provider
-        # Read once at launch so an invalid script fails ``zeta serve`` startup.
-        self._fake_script = fake_script_from_env() if self.fake_catalog else None
+        self._test_scripted_provider = os.environ.get(TEST_SCRIPTED_PROVIDER_ENV) == "1"
         self.backend_factory = backend_factory
         self.manager = SessionManager(self.home)
         self._state: SessionState | None = None
@@ -145,10 +186,6 @@ class ServerRuntime:
         self._background_wake_sink: SessionWakeSink | None = None
         self._memory_notice_sink: MemoryNoticeSink | None = None
         self._post_stream_provider_retry = False
-
-    @property
-    def fake_catalog(self) -> bool:
-        return self._server_provider == "fake"
 
     def backend_for_model(
         self, provider: str, model: str, *, token_budget: int | None = None
@@ -217,18 +254,10 @@ class ServerRuntime:
         return self.metadata.session_id
 
     def list_sessions(self) -> list[SessionMetadata]:
-        return [
-            session
-            for session in self.manager.list_sessions()
-            if (session.provider == "fake") == self.fake_catalog
-        ]
+        return self.manager.list_sessions()
 
     def list_sessions_read_only(self) -> list[SessionMetadata]:
-        return [
-            session
-            for session in self.manager.list_sessions_read_only()
-            if (session.provider == "fake") == self.fake_catalog
-        ]
+        return self.manager.list_sessions_read_only()
 
     def set_post_stream_provider_retry(self, enabled: bool) -> None:
         """Apply the serve client's negotiated retry display capability."""
@@ -299,14 +328,8 @@ class ServerRuntime:
         if self._state is not None and self._state.session_id == session_id:
             return self.metadata
         metadata = self.manager.read_metadata(session_id)
-        if (metadata.provider == "fake") != self.fake_catalog:
-            if metadata.provider == "fake":
-                raise ValueError(
-                    "session uses the offline test provider; open it with --provider fake"
-                )
-            raise ValueError(
-                f"session uses a real provider; open it with --provider {metadata.provider}"
-            )
+        if metadata.provider == "fake":
+            raise ValueError(REMOVED_PROVIDER_ERROR)
         session_cwd = Path(metadata.cwd)
         if not session_cwd.is_dir():
             raise ValueError(
@@ -423,9 +446,13 @@ class ServerRuntime:
     ) -> tuple[CompletionBackend, str]:
         if self.backend_factory is not None:
             return self.backend_factory(provider, model, home)
-        if provider == "fake" and self._fake_script is not None:
-            selected = model or "offline"
-            return ScriptedFakeBackend(self._fake_script, model=selected), selected
+        if self._test_scripted_provider:
+            from ..models.catalog import default_model
+
+            selected = model or default_model(provider)
+            if selected is None:
+                raise ValueError(f"no default model for provider {provider!r}")
+            return _TestScriptedBackend(selected), selected
         kwargs: dict[str, object] = {
             "stall_seconds": stall_seconds,
             "stall_retries": stall_retries,

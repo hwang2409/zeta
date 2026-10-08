@@ -69,6 +69,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.automations import commands
 from zeta.automations.authoring import import_jobs, listing, resolve_job
 from zeta.automations.daemon import daemon_lock, serve
@@ -79,7 +80,6 @@ from zeta.automations.services import validate_permissions
 from zeta.automations.store import SQLiteStore
 from zeta.automations.tick import tick
 from zeta.automations.trigger import Schedule, cron_matches, parse_trigger
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.mcp.config import load_mcp_config, server_to_json
@@ -104,7 +104,7 @@ def _job(tmp_path: Path, name: str = "brief", *, poll: bool = False):
             "servers": ["slack"],
             "allow": [],
             "deliver": "slack:U123",
-            "provider": "fake",
+            "provider": "codex",
             "model": "fake",
             "cwd": str(tmp_path),
         },
@@ -265,7 +265,7 @@ async def test_draft_approve_fire_deliver_inspect_and_resume_round_trip(
 ) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
     origin = SessionManager(tmp_path).create(
-        provider="fake", model="fake", cwd=tmp_path
+        provider="codex", model="fake", cwd=tmp_path
     )
     registry = ToolRegistry(tmp_path, session_store=origin.store, skill_catalog=SkillCatalog.empty())
     job = _job(tmp_path)
@@ -459,7 +459,7 @@ async def test_unattended_runtime_preserves_persisted_allow_layers(
 ) -> None:
     marker = tmp_path / "must-not-exist"
     session = SessionManager(tmp_path).create(
-        provider="fake",
+        provider="codex",
         model="fake",
         cwd=tmp_path,
         skill_catalog=discover_session_skills(home=tmp_path),
@@ -489,7 +489,7 @@ async def test_unattended_runtime_ignores_global_yolo_hooks_and_project_tools(
     )
     catalog = discover_session_skills(home=tmp_path)
     session = SessionManager(tmp_path).create(
-        provider="fake",
+        provider="codex",
         model="fake",
         cwd=tmp_path,
         system_prompt=load_identity(catalog=catalog),
@@ -518,7 +518,7 @@ async def test_automation_catalog_excludes_project_skills_from_prompt_and_tool(
     )
     catalog = discover_session_skills(home=tmp_path)
     session = SessionManager(tmp_path).create(
-        provider="fake",
+        provider="codex",
         model="fake",
         cwd=tmp_path,
         system_prompt=load_identity(catalog=catalog),

@@ -51,6 +51,7 @@ from types import MappingProxyType
 from typing import Any
 
 from ..core.approval import parse_approval_rule
+from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR, provider_for_model
 from .tool_policy import parse_tool_patterns, validate_tool_patterns
 
 SETTINGS_FILENAME = "settings.toml"
@@ -60,7 +61,7 @@ class SettingsError(ValueError):
     """A security-sensitive settings value is invalid."""
 
 
-_PROVIDER_CHOICES = frozenset({"fake", "claude", "codex", "ollama"})
+_PROVIDER_CHOICES = PROVIDERS
 _TOP_KEYS = frozenset(
     {
         "provider",
@@ -225,7 +226,7 @@ def resolve(
     cli_disallowed_tools: str | None = None,
     cli_allow_hooks: bool | None = None,
     cli_auto_memory: bool | None = None,
-    default_provider: str = "fake",
+    default_provider: str | None = None,
 ) -> ResolvedConfig:
     """Layer CLI flags over the loaded settings; CLI wins where set.
 
@@ -234,7 +235,23 @@ def resolve(
     the flag was omitted (settings value inherited).
     """
 
+    model = cli_model or settings.model
     provider = cli_provider or settings.provider or default_provider
+    if provider == "fake":
+        raise SettingsError(REMOVED_PROVIDER_ERROR)
+    if provider is None:
+        if model is None:
+            raise SettingsError(
+                "no provider or model is configured; choose claude, codex or ollama "
+                "with --provider or settings.toml"
+            )
+        try:
+            provider = provider_for_model(model)
+        except ValueError as exc:
+            raise SettingsError(
+                f"cannot derive a provider from configured model {model!r}; "
+                "choose claude, codex or ollama"
+            ) from exc
     yolo = bool(settings.yolo) if cli_yolo is None else cli_yolo
     token_budget = (
         cli_token_budget if cli_token_budget is not None else settings.token_budget
@@ -245,7 +262,7 @@ def resolve(
     )
     return ResolvedConfig(
         provider=provider,
-        model=cli_model or settings.model,
+        model=model,
         yolo=yolo,
         token_budget=token_budget,
         theme=settings.theme,
@@ -446,6 +463,8 @@ def _validate(
 ) -> Settings:
     for key in data.keys() - _TOP_KEYS:
         notices.append(f"settings · ignored unknown key '{key}'")
+    if data.get("provider") == "fake":
+        raise SettingsError(REMOVED_PROVIDER_ERROR)
     provider = _validated_choice(data, "provider", _PROVIDER_CHOICES, notices)
     model = _validated_string(data, "model", notices)
     theme = _validated_string(data, "theme", notices)

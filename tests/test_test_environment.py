@@ -397,7 +397,7 @@ def test_teardown_guard_rejects_stripped_home_child(
                 "-c",
                 (
                     "from zeta.core.session import SessionManager; "
-                    "SessionManager().create(provider='fake', model='fake')"
+                    "SessionManager().create(provider='codex', model='fake')"
                 ),
             ],
             check=True,
@@ -473,7 +473,7 @@ def test_teardown_guard_rejects_tmux_session_manager_child(
     child_env["HOME"] = str(live_home.parent)
     child_code = (
         "from zeta.core.session import SessionManager; "
-        "SessionManager().create(provider='fake', model='fake')"
+        "SessionManager().create(provider='codex', model='fake')"
     )
     command = (
         f"{shlex.quote(sys.executable)} -c {shlex.quote(child_code)}; "

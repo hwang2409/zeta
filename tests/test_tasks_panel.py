@@ -11,7 +11,7 @@ from prompt_toolkit.document import Document
 from rich.console import Console
 from rich.text import Text
 
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.skills import SkillCatalog
@@ -293,7 +293,7 @@ def _app(tmp_path: Path) -> TUIApp:
     store = ConversationStore(tmp_path / "sessions")
     return TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
     )

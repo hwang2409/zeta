@@ -16,7 +16,7 @@ from rich.console import Console
 
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
-from zeta.core.fake import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.model_input import ModelInputEnvelope
 from zeta.core.slash import (
     MODEL_CONTEXT_WINDOWS,
@@ -68,7 +68,7 @@ def session() -> FakeSlashSession:
     return FakeSlashSession(
         SlashStatus(
             session_id="session-1",
-            provider="fake",
+            provider="codex",
             model="offline",
             retained_tail=8,
             tokens_used_this_session=123,
@@ -354,7 +354,7 @@ async def test_inline_dollar_skill_request_is_sent_and_persisted(tmp_path: Path)
     store = ConversationStore(tmp_path / "sessions", cwd=project)
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=catalog),
-        provider="fake",
+        provider="codex",
         model="offline",
         zeta_home=tmp_path / "home",
         console=Console(file=StringIO(), force_terminal=False),
@@ -952,7 +952,7 @@ def test_compaction_history_counts_folded_messages_only(tmp_path: Path) -> None:
 
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
 
@@ -1039,7 +1039,7 @@ def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
     store.append_fork(str(checkpoint.seq))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
 
@@ -1146,7 +1146,7 @@ async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> N
     output = StringIO()
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -1170,7 +1170,7 @@ async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> N
         await run_task
 
     assert "session_id:" in output.getvalue()
-    assert "provider: fake" in output.getvalue()
+    assert "provider: codex" in output.getvalue()
     assert backend.calls == []
 
 
@@ -1189,7 +1189,7 @@ async def test_slash_webhook_commands(
         }
         return parse_job(name, {
             "prompt": "test", "trigger": trigger, "servers": [], "allow": [],
-            "deliver": "slack:U123", "provider": "fake", "model": "fake",
+            "deliver": "slack:U123", "provider": "codex", "model": "fake",
         "cwd": str(tmp_path),
         })
 

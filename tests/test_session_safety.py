@@ -26,7 +26,7 @@ from zeta.protocol.types import (
 
 def closed_session(tmp_path):
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     opened.store.close()
     return manager, opened.metadata.session_id
 
@@ -322,7 +322,7 @@ async def test_server_rename_and_cli_delete_serialize_across_processes(tmp_path,
 import asyncio, sys
 from zeta.server import ZetaServer
 async def main():
-    server = ZetaServer(home=sys.argv[1], port=0, provider='fake')
+    server = ZetaServer(home=sys.argv[1], port=0, provider='codex')
     manager = server.runtime.manager
     method = '_write_unlocked' if sys.argv[2] == 'rename-first' else 'record_name'
     original = getattr(manager, method)
@@ -408,7 +408,7 @@ def test_storage_operations_never_pass_full_session_paths_to_os(tmp_path, monkey
         for name in ("open", "replace", "rename", "unlink", "stat", "lstat", "mkdir", "rmdir", "scandir", "listdir"):
             patch.setattr(os, name, checked(getattr(os, name)))
         patch.setattr(io, "open", checked(io.open))
-        opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+        opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
         sid = opened.metadata.session_id
         store = opened.store
         store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("saved")]), MessageOrigin.USER))
@@ -455,7 +455,7 @@ def test_safe_open_rejects_hardlink_before_truncation(tmp_path):
 async def test_background_shutdown_stays_in_pinned_directory(tmp_path, replacement):
     from zeta.server.runtime import ServerRuntime
 
-    runtime = ServerRuntime(tmp_path / "home", cwd=tmp_path, provider="fake")
+    runtime = ServerRuntime(tmp_path / "home", cwd=tmp_path, provider="codex")
     await runtime.create_session()
     store = runtime.opened.store
     tasks = runtime.loop.tool_registry.background_tasks
@@ -542,7 +542,7 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
     sys.addaudithook(audit)
     runtime = None
     try:
-        runtime = ServerRuntime(home, cwd=tmp_path, provider="fake")
+        runtime = ServerRuntime(home, cwd=tmp_path, provider="codex")
         await runtime.create_session()
         store = runtime.opened.store
         sid = store.session_id
@@ -614,7 +614,7 @@ async def test_background_descriptor_keeps_lease_until_registry_close(tmp_path):
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     store = opened.store
     tasks = BackgroundTaskRegistry(session_dir=store.session_dir, directory_fd=store.directory_fd)
     store.close()

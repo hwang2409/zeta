@@ -51,7 +51,7 @@ def _job(tmp_path: Path, name: str = "hook", *, github: bool = True):
             "servers": [],
             "allow": ["read(/safe/*)"],
             "deliver": "slack:U123",
-            "provider": "fake",
+            "provider": "codex",
             "model": "fake",
             "cwd": str(tmp_path),
         },
@@ -411,7 +411,7 @@ def test_payload_is_delimited_bounded_and_cannot_change_job_grants(tmp_path: Pat
     assert len(prompt.encode()) < 67_000
     assert job.allow == ("read(/safe/*)",)
     assert job.deliver == "slack:U123"
-    assert job.provider == "fake" and job.cwd == str(tmp_path)
+    assert job.provider == "codex" and job.cwd == str(tmp_path)
 
 
 def test_default_port_non_loopback_gate_and_responsive_shutdown(tmp_path: Path) -> None:
