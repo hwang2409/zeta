@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from zeta.core.path_identity import same_physical_path
+from zeta.path_identity import same_physical_path
 
 
 def test_same_physical_path_resolves_existing_symlink(tmp_path: Path) -> None:

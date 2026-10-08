@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
+from ..path_identity import same_physical_path
 from ..protocol.types import (
     ASSISTANT_RESPONSE_SYNTHETIC,
     Message,
@@ -21,7 +22,6 @@ from ..protocol.types import (
     ToolUseContent,
 )
 from .abort import AbortSignal
-from .path_identity import same_physical_path
 from .store import ConversationStore
 
 
