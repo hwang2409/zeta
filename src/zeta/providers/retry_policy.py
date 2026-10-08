@@ -216,6 +216,9 @@ def retry_wait_seconds(
 
 
 def retry_reason(error: BaseException | object) -> str:
+    explicit_reason = getattr(error, "retry_reason", None)
+    if isinstance(explicit_reason, str) and explicit_reason:
+        return explicit_reason
     code = getattr(error, "code", None)
     if isinstance(code, str) and code:
         return code
