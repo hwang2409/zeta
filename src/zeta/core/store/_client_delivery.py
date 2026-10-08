@@ -77,8 +77,10 @@ class ClientDeliveryMixin:
 
         status: DeliveryStatus = accepted.data["status"]
         if status == "queued":
-            for entry in self._entries:
-                if entry.seq <= accepted.seq or entry.type != "message":
+            for entry in reversed(self._entries):
+                if entry.seq <= accepted.seq:
+                    break
+                if entry.type != "message":
                     continue
                 metadata = entry.data["message"].get("metadata", {})
                 if metadata.get(CLIENT_DELIVERY_METADATA) == delivery_id:
