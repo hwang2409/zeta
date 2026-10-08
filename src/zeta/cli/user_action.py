@@ -24,18 +24,37 @@ def confirm_memory_accept(
     if not stdin.isatty() or not stdout.isatty():
         raise ProjectRegistryError("memory accept requires an interactive terminal")
     preview = ""
-    loader = getattr(registry, "load_memory_for_context", None)
-    if loader is not None:
-        for entry in loader(project_id):
-            if getattr(entry, "name", None) == name:
-                preview = getattr(entry, "content", "")[:240]
-                break
-    print(f"Automatic memory file: {name}", file=stdout)
+    memory_format = getattr(registry, "memory_format", lambda _project_id: 1)(project_id)
+    if memory_format == 2:
+        value = registry.entry_memory_view(project_id)
+        preview = next(
+            (
+                str(entry.get("text", ""))[:240]
+                for entry in value.get("entries", [])
+                if entry.get("id") == name
+            ),
+            "",
+        )
+        noun = "entry"
+    else:
+        loader = getattr(registry, "load_memory_for_context", None)
+        if loader is not None:
+            for entry in loader(project_id):
+                if getattr(entry, "name", None) == name:
+                    preview = getattr(entry, "content", "")[:240]
+                    break
+        noun = "file"
+    print(f"Automatic memory {noun}: {name}", file=stdout)
     print(f"Preview: {preview or '(empty)'}", file=stdout)
-    print(f"Type '{name}' or 'accept' to accept this file: ", end="", file=stdout, flush=True)
+    print(
+        f"Type '{name}' or 'accept' to accept this {noun}: ",
+        end="",
+        file=stdout,
+        flush=True,
+    )
     answer = stdin.readline().strip()
     if answer not in {name, "accept"}:
-        raise ProjectRegistryError("memory accept cancelled; file was not changed")
+        raise ProjectRegistryError(f"memory accept cancelled; {noun} was not changed")
 
 
 __all__ = ["confirm_memory_accept"]

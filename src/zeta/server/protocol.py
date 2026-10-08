@@ -18,6 +18,7 @@ FEATURES = (
     "assistant_reset",
     "model_input_ids",
     "projects",
+    "projects-memory-v2",
     "abort_scope",
     "turn_context",
     "delivery_id",

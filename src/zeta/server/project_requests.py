@@ -16,6 +16,7 @@ from ..project_errors import (
 from ..project_inbox import LOCAL_ORIGIN, InboxError, ProjectInbox
 from ..project_memory_history import PROJECT_MEMORY_FILES
 from ..project_registry import Project, ProjectRegistry
+from .entry_project_views import EntryProjectViews
 from .protocol import FrameCodec
 
 if TYPE_CHECKING:
@@ -88,6 +89,12 @@ class ProjectRequests:
         self.inbox = ProjectInbox(self.registry, sessions_root=home / "sessions")
         self.runtime = runtime
         self.codec = codec
+        self.entry_views = EntryProjectViews(
+            registry=self.registry,
+            runtime=runtime,
+            codec=codec,
+            invalid=RequestValidationError,
+        )
 
     def project_sessions(self, project_id: object) -> list[Any]:
         """Read provider-compatible sessions for one validated project."""
@@ -105,16 +112,27 @@ class ProjectRequests:
         request_id: str | int,
         method: str,
         params: dict[str, Any],
+        *,
+        features: frozenset[str] = frozenset(),
     ) -> dict[str, object]:
         if method == "list_projects":
             return self._list_projects(request_id, params)
         project_id = self._project_id(params)
         project = self.require_project(project_id)
+        entry_response = "projects-memory-v2" in features
         if method == "project_show":
             self._only(params, {"project_id"})
-            return self._show(request_id, project)
+            return (
+                self.entry_views.show(request_id, project)
+                if entry_response
+                else self._show(request_id, project)
+            )
         if method == "project_memory_log":
-            return self._memory_log(request_id, project, params)
+            return (
+                self.entry_views.memory_log(request_id, project, params)
+                if entry_response
+                else self._memory_log(request_id, project, params)
+            )
         if method == "project_inbox":
             return self._inbox(request_id, project, params)
         raise AssertionError(f"unknown project request: {method}")

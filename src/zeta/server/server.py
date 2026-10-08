@@ -375,7 +375,9 @@ class _Client:
                 raise ProtocolError(
                     -32601, f"{method} requires the negotiated projects feature"
                 )
-            return self.projects.dispatch(request_id, method, params)
+            return self.projects.dispatch(
+                request_id, method, params, features=self.features
+            )
         if method == "list_sessions":
             return self._list_sessions(request_id, params)
         if method == "new_session":

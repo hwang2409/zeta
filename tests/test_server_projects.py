@@ -232,8 +232,11 @@ async def test_projects_feature_is_negotiated_and_optional(tmp_path: Path) -> No
     server = _server(tmp_path / "enabled")
     reader, writer = await _connect(server)
     try:
-        hello = await _hello(reader, writer, ["projects"])
-        assert hello["capabilities"]["features"] == ["projects"]
+        hello = await _hello(reader, writer, ["projects", "projects-memory-v2"])
+        assert hello["capabilities"]["features"] == [
+            "projects",
+            "projects-memory-v2",
+        ]
         assert {
             "list_projects",
             "project_show",

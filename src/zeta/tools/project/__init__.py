@@ -47,9 +47,12 @@ async def _inspect_project(
                     "sessions": links,
                 },
             )
-        memory = {
-            name: content for name, content in projects.load_memory(project.project_id)
-        }
+        if projects.memory_format(project.project_id) == 2:
+            memory = projects.entry_memory_view(project.project_id)
+        else:
+            memory = {
+                name: content for name, content in projects.load_memory(project.project_id)
+            }
         return _success_result(
             text_block(f"read bounded memory for project {project.name}"),
             structured_content={
