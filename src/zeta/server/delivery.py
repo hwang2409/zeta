@@ -171,11 +171,18 @@ class DeliveryRequests:
         runtime = client.server.runtime
         if runtime.opened is None:
             raise ProtocolError(-32003, "no active session")
-        delivery = runtime.opened.store.client_delivery(delivery_id)
-        return {
-            "delivery_id": delivery_id,
-            "status": delivery.status if delivery is not None else "unknown",
-        }
+        store = runtime.opened.store
+        delivery = store.client_delivery(delivery_id)
+        if delivery is not None:
+            return {"delivery_id": delivery_id, "status": delivery.status}
+        outcome = store.client_delivery_outcome(delivery_id)
+        if outcome is not None:
+            return {
+                "delivery_id": delivery_id,
+                "status": "evicted",
+                "outcome": outcome,
+            }
+        return {"delivery_id": delivery_id, "status": "unknown"}
 
     def _delivery_id(self, params: dict[str, Any]) -> str | None:
         if "delivery_id" not in params:
@@ -187,12 +194,20 @@ class DeliveryRequests:
         runtime = self._client.server.runtime
         if delivery_id is None or runtime.opened is None:
             return None
-        delivery = runtime.opened.store.client_delivery(delivery_id)
-        if delivery is None:
-            return None
-        if delivery.status == "dropped":
-            return {"accepted": False, "duplicate": True, "status": "dropped"}
-        return {**delivery.outcome, "duplicate": True}
+        store = runtime.opened.store
+        delivery = store.client_delivery(delivery_id)
+        if delivery is not None:
+            if delivery.status == "dropped":
+                return {"accepted": False, "duplicate": True, "status": "dropped"}
+            return {**delivery.outcome, "duplicate": True}
+        outcome = store.client_delivery_outcome(delivery_id)
+        if outcome is not None:
+            raise ProtocolError(
+                -32010,
+                "delivery id already used",
+                {"outcome": outcome},
+            )
+        return None
 
 
 def _required_string(params: dict[str, Any], name: str) -> str:
