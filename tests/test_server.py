@@ -41,6 +41,8 @@ from zeta.server.approval_lifecycle import ApprovalLifecycle
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
 from zeta.server.server import _approval_display_fields, _Client
 from zeta.server.slash_commands import ServerSlashSession
+from zeta.skills import SkillCatalog
+from zeta.skills.agent_catalog import AgentCatalog
 
 TIMEOUT = 3
 
@@ -4353,6 +4355,56 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         # Text that does not start with `/` is a shape error, not a passthrough.
         error = (await run("hello"))["error"]
         assert error["code"] == -32602
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_resume_slash_list_shows_skill_parse_notice(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = manager.create(
+        provider="codex",
+        model="offline",
+        cwd=tmp_path,
+        system_prompt="preserved prompt",
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+        prompt_recipe=None,
+        auto_project=False,
+    )
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    malformed = home / "skills" / "broken" / "SKILL.md"
+    malformed.parent.mkdir(parents=True)
+    malformed.write_text("not frontmatter", encoding="utf-8")
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.0", "client_version": "1.1"},
+        )
+        await _request(reader, writer, 2, "resume", {"session_id": session_id})
+        result = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "slash_list",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]
+
+        assert any(
+            str(malformed) in notice and "missing YAML frontmatter" in notice
+            for notice in result["notices"]
+        )
     finally:
         await _close(server, writer)
 

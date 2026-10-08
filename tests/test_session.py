@@ -42,6 +42,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.skills import SkillCatalog
+from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tools.agent import ChildApprovalPolicy
 from zeta.tui.app import TUIApp, create_app
 from zeta.tui.layout import CONTENT_MARGIN, content_width
@@ -623,6 +624,41 @@ async def test_resume_rebuilds_current_skill_catalog_for_prompt_and_tool(
     assert loaded["content"][0]["text"] == "first body"
     assert newly_loaded["isError"] is False
     assert newly_loaded["content"][0]["text"] == "second body"
+
+
+def test_tui_resume_shows_skill_parse_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    manager = SessionManager(home)
+    opened = manager.create(
+        provider="codex",
+        model="offline",
+        cwd=tmp_path,
+        system_prompt="preserved prompt",
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+        prompt_recipe=None,
+        auto_project=False,
+    )
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    malformed = home / "skills" / "broken" / "SKILL.md"
+    malformed.parent.mkdir(parents=True)
+    malformed.write_text("not frontmatter", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
+    )
+    try:
+        assert any(
+            str(malformed) in notice and "missing YAML frontmatter" in notice
+            for notice in resumed._slash_commands.notices
+        )
+    finally:
+        resumed.loop.store.close()
 
 
 def test_second_resume_after_override_sees_overridden_snapshot(

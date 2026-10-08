@@ -60,7 +60,7 @@ def compose_runtime(
     max_turns: int | None = None,
     background_event_sink: BackgroundEventSink | None = None,
     skill_catalog: SkillCatalog,
-    agent_catalog: AgentCatalog | None = None,
+    agent_catalog: AgentCatalog,
     auto_project: bool = True,
     project_id: str | None = None,
     project_discovery: ProjectDiscovery | None = None,
@@ -164,12 +164,6 @@ def compose_runtime(
                 tool_deny=effective_policy.deny,
                 tool_allow_layers=effective_policy.allow_layers,
             )
-        if metadata.skill_catalog is None:
-            raise ValueError("session has no persisted skill catalog")
-        skill_catalog = SkillCatalog.from_snapshot(metadata.skill_catalog)
-        if metadata.agent_catalog is None:
-            raise ValueError("session has no persisted agent catalog")
-        agent_catalog = AgentCatalog.from_snapshot(metadata.agent_catalog)
         completion_callback = on_completion_success or (lambda: manager.touch(metadata))
         policy = ApprovalPolicy(
             store=opened.store,
