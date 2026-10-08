@@ -8,9 +8,13 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.support.fake_backend import FakeBackend
 from zeta.core.approval import ApprovalPolicy
+from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import ToolCall, flatten_tool_content
+from zeta.core.tool_dispatch import dispatch_tool_calls
+from zeta.protocol.types import StreamEventType, ToolCall, flatten_tool_content
+from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, websearch
 from zeta.tools import fetch as fetch_tool
@@ -356,7 +360,7 @@ async def test_fetch_returns_partial_when_decompressed_body_exceeds_cap(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_stream", [False, True])
-async def test_parallel_fetches_cancel_on_registry_abort(
+async def test_parallel_fetches_cancel_on_production_dispatch_abort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     with_stream: bool,
@@ -381,6 +385,7 @@ async def test_parallel_fetches_cancel_on_registry_abort(
         ToolCall("fetch-b", "fetch", {"url": "example.com/b"}),
     ]
     if with_stream:
+
         async def run_streaming() -> list[object]:
             return await asyncio.gather(
                 *(
@@ -391,16 +396,39 @@ async def test_parallel_fetches_cancel_on_registry_abort(
 
         task = asyncio.create_task(run_streaming())
     else:
-        task = asyncio.create_task(registry.execute_many(calls))
+        loop = AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path),
+            registry=registry,
+            skill_catalog=SkillCatalog.empty(),
+        )
+
+        async def run_dispatch():
+            return [
+                event
+                async for event in dispatch_tool_calls(
+                    loop, calls, _validated_tool_result
+                )
+            ]
+
+        task = asyncio.create_task(run_dispatch())
 
     await asyncio.wait_for(started.wait(), timeout=1)
     registry.abort()
     results = await asyncio.wait_for(task, timeout=1)
 
-    assert [result["content"][0]["text"] for result in results] == [
-        "tool execution canceled",
-        "tool execution canceled",
-    ]
+    if with_stream:
+        assert [result["content"][0]["text"] for result in results] == [
+            "tool execution canceled",
+            "tool execution canceled",
+        ]
+    else:
+        assert [
+            event.tool_result.content
+            for event in results
+            if event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_result is not None
+        ] == ["tool execution canceled", "tool execution canceled"]
 
 
 @pytest.mark.asyncio

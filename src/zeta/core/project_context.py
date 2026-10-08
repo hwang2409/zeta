@@ -325,17 +325,6 @@ def same_git_repository(left: str | Path, right: str | Path) -> bool:
     return common_dirs[0] == common_dirs[1]
 
 
-def find_or_create_git_project(registry: ProjectRegistry, root: Path) -> Project:
-    """Converge linked checkouts on an existing project before creating one."""
-
-    project = registry.find_for_directory(root)
-    if project is not None:
-        return project
-    for candidate in registry.list_projects():
-        candidate_root = candidate.canonical_integration_root
-        if candidate_root is not None and same_git_repository(root, candidate_root):
-            return candidate
-    return registry.find_or_create_for_directory(root)
 
 
 def discover_or_find_project(

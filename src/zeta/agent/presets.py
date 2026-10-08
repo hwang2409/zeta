@@ -113,20 +113,8 @@ def get_agent_preset(agent_type: object) -> AgentPreset | None:
     )
 
 
-def agent_type_names() -> list[str]:
-    """Return the current names from the preset registry."""
-
-    return [preset.name for preset in AGENT_PRESETS.values()]
 
 
-def agent_type_description() -> str:
-    """Describe each registered preset for the agent tool schema."""
-
-    choices = "; ".join(
-        f"{preset.name}: {preset.selection_guidance}"
-        for preset in AGENT_PRESETS.values()
-    )
-    return f"Choose one of: {choices}."
 
 
 def compose_system_prompt(

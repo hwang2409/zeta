@@ -134,26 +134,6 @@ def _persisted_fields(composition: PromptComposition) -> tuple[object, ...]:
 class PromptCompositionMixin:
     """Own prompt composition persistence and concurrent resume coordination."""
 
-    def persist_context_snapshot(
-        self,
-        metadata: Any,
-        *,
-        system_prompt: str,
-        context_files: list[str] | tuple[str, ...],
-        overwrite: bool = False,
-    ) -> Any:
-        """Persist a legacy prompt snapshot, first-write-wins by default."""
-
-        def update(item: Any) -> Any:
-            if item.system_prompt and not overwrite:
-                return item
-            item.system_prompt = system_prompt
-            item.context_files = list(context_files)
-            return self._touch(item) if overwrite else item
-
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)
-        return current
 
     def resume_prompt_composition(
         self,
