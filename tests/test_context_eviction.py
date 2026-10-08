@@ -7,11 +7,13 @@ import time
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from itertools import pairwise
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 import zeta.context_eviction as eviction_module
+from zeta.context_accounting import message_token_count
 from zeta.context_eviction import (
     EvictionResult,
     estimated_tokens,
@@ -69,6 +71,207 @@ def tool_pair(
         tool_result=ToolResult(call_id, output, is_error=error),
     )
     return call, result
+
+
+def persisted_tool_result(
+    call_id: str, body: str, *, structured: bool = True
+) -> Message:
+    """Return the duplicate display/provider shape written by real sessions."""
+
+    block = {
+        "type": "text",
+        "text": body,
+        "truncated": False,
+        "full_size": len(body.encode()),
+    }
+    return Message.from_dict(
+        {
+            "role": "tool_result",
+            "content": [{"type": "text", "text": body}],
+            "tool_result": {
+                "tool_call_id": call_id,
+                "content": body,
+                "is_error": False,
+                "content_blocks": [block],
+                "structured_content": ({"status": "completed"} if structured else None),
+            },
+            "metadata": {"display_only": body},
+        }
+    )
+
+
+def test_tool_result_accounting_counts_every_provider_bound_field() -> None:
+    def count(
+        *,
+        call_id: str = "call",
+        content: str = "xxx",
+        is_error: bool = False,
+        content_blocks: list[Any] | None = None,
+        display_content: str | None = None,
+        structured_content: dict[str, Any] | None = None,
+        is_canceled: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        return message_token_count(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [TextContent(display_content)] if display_content is not None else [],
+                tool_result=ToolResult(
+                    call_id,
+                    content,
+                    is_error=is_error,
+                    content_blocks=content_blocks,
+                    structured_content=structured_content,
+                    is_canceled=is_canceled,
+                ),
+                metadata=metadata or {},
+            )
+        )
+
+    baseline = count()
+    provider_bound_counts = {
+        "tool_call_id": count(call_id="different-call-id" * 20),
+        "content": count(content="different provider content " * 20),
+        "is_error": count(is_error=True),
+        "text content block": count(
+            content_blocks=[
+                {
+                    "type": "text",
+                    "text": "provider text block " * 20,
+                    "truncated": False,
+                    "full_size": 400,
+                }
+            ]
+        ),
+        "image content block": count(
+            content_blocks=[
+                {
+                    "type": "image",
+                    "data": "iVBORw0KGgo=",
+                    "mimeType": "image/png",
+                }
+            ]
+        ),
+    }
+    assert {
+        field for field, changed in provider_bound_counts.items() if changed == baseline
+    } == set()
+
+    ignored = "provider-ignored value " * 200
+    provider_ignored_counts = {
+        "Message.content": count(display_content=ignored),
+        "structured_content": count(structured_content={"ignored": ignored}),
+        "is_canceled": count(is_canceled=True),
+        "metadata": count(metadata={"ignored": ignored}),
+    }
+    assert set(provider_ignored_counts.values()) == {baseline}
+
+
+def test_digest_receipt_drops_stale_display_content() -> None:
+    call, _ = tool_pair("read", "read-1", "unused")
+    result = persisted_tool_result("read-1", "large read result " * 1_000)
+
+    evicted = evict_messages([(1, call), (2, result)], fixed_tokens=0, target_tokens=1)
+
+    receipt = evicted.messages[1]
+    assert receipt.content == []
+    assert receipt.tool_result is not None
+    assert receipt.tool_result.content_blocks is None
+    assert receipt.tool_result.structured_content is None
+
+
+def test_orchestration_receipt_drops_stale_display_content() -> None:
+    call, _ = tool_pair(
+        "agent", "agent-1", "unused", arguments={"prompt": "review"}
+    )
+    result = persisted_tool_result("agent-1", "large agent result " * 1_000)
+
+    evicted = evict_messages([(1, call), (2, result)], fixed_tokens=0, target_tokens=1)
+
+    receipt = evicted.messages[1]
+    assert receipt.content == []
+    assert receipt.tool_result is not None
+    assert receipt.tool_result.content_blocks is None
+    assert receipt.tool_result.structured_content is None
+
+
+def _provider_message_bytes(provider: str, messages: list[Message]) -> bytes:
+    if provider == "anthropic":
+        payload = build_messages_payload(
+            messages, [], model="claude-test", max_tokens=2048, thinking_budget=1024
+        )["messages"]
+    elif provider == "codex":
+        payload = build_responses_payload(messages, [], model="gpt-test")["input"]
+    else:
+        payload = build_ollama_messages(messages)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "codex", "ollama"])
+def test_legacy_normalization_keeps_provider_payload_bytes(provider: str) -> None:
+    receipt_text = "[semantic read digest · seq 2] bounded receipt"
+    stale_body = "legacy duplicate output " * 200
+    image: Any = {
+        "type": "image",
+        "data": (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
+            "+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+        ),
+        "mimeType": "image/png",
+        "caption": "legacy image",
+    }
+    call, _ = tool_pair("read", "read-1", "unused")
+    legacy = Message(
+        MessageRole.TOOL_RESULT,
+        [TextContent(stale_body)],
+        tool_result=ToolResult(
+            "read-1",
+            receipt_text,
+            is_error=True,
+            content_blocks=[image],
+            structured_content={"display_only": stale_body},
+            is_canceled=True,
+        ),
+        metadata={
+            "context_evicted": True,
+            "source_seq": 2,
+            "eviction_content_digest": "abc123",
+            "display_only": stale_body,
+        },
+    )
+    before = _provider_message_bytes(provider, [call, legacy])
+
+    replayed = ContextAssembler._eviction_view_messages(
+        [{"seq": 2, "message": legacy.to_dict()}]
+    )[0]
+
+    assert replayed.content == []
+    assert replayed.tool_result is not None
+    assert replayed.tool_result.structured_content is None
+    assert message_token_count(replayed) == message_token_count(
+        Message(MessageRole.TOOL_RESULT, tool_result=replayed.tool_result)
+    )
+    assert _provider_message_bytes(provider, [call, replayed]) == before
+
+def test_provider_payload_unchanged_by_accounting_fix() -> None:
+    call, _ = tool_pair("read", "read-1", "unused")
+    result = persisted_tool_result("read-1", "provider output")
+    messages = [call, result]
+    anthropic_before = build_messages_payload(
+        messages, [], model="claude-test", max_tokens=2048, thinking_budget=1024
+    )["messages"]
+    codex_before = build_responses_payload(messages, [], model="gpt-test")["input"]
+    ollama_before = build_ollama_messages(messages)
+
+    assert message_token_count(result) == message_token_count(
+        Message(MessageRole.TOOL_RESULT, tool_result=result.tool_result)
+    )
+
+    assert build_messages_payload(
+        messages, [], model="claude-test", max_tokens=2048, thinking_budget=1024
+    )["messages"] == anthropic_before
+    assert build_responses_payload(messages, [], model="gpt-test")["input"] == codex_before
+    assert build_ollama_messages(messages) == ollama_before
 
 
 def rendered_text(messages: list[Message]) -> str:

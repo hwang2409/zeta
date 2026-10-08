@@ -22,6 +22,7 @@ from ..context_eviction import (
     TARGET_RATIO,
     evict_messages,
     eviction_view,
+    normalize_evicted_tool_result,
 )
 from ..compaction import (
     CompactionPolicy,
@@ -1078,11 +1079,13 @@ class ContextAssembler:
     @staticmethod
     def _eviction_view_message(item: Mapping[str, Any]) -> Message:
         message = Message.from_dict(item["message"])
-        return Message(
-            message.role,
-            list(message.content),
-            tool_result=message.tool_result,
-            metadata={"source_seq": item["seq"], **message.metadata},
+        return normalize_evicted_tool_result(
+            Message(
+                message.role,
+                list(message.content),
+                tool_result=message.tool_result,
+                metadata={"source_seq": item["seq"], **message.metadata},
+            )
         )
 
     @staticmethod
