@@ -7,7 +7,7 @@ import json
 import re
 from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil
 
 from ..context_accounting import message_token_count
@@ -23,6 +23,7 @@ from ..protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from .range_receipts import range_receipt_candidate
 
 EVICTION_KIND = "evict"
 TARGET_RATIO = 0.55
@@ -65,6 +66,7 @@ class EvictionResult:
     tokens_before: int
     tokens_after: int
     reached_target: bool
+    source_seqs: tuple[int, ...] = field(default=(), compare=False)
 
 
 def estimated_text_tokens(text: str) -> int:
@@ -129,24 +131,54 @@ def evict_messages(
 
     messages = [message for _, message in records]
     before = fixed_tokens + sum(token_counter(message) for message in messages)
+    eligibility = _eviction_eligibility(records, unconsumed_source_seqs)
+    changed: set[int] = set()
+    range_candidate = range_receipt_candidate(records, allows=eligibility.allows)
+    if range_candidate.coalesced_source_seqs and _strictly_smaller(
+        token_counter,
+        messages,
+        [message for _, message in range_candidate.records],
+    ):
+        records = range_candidate.records
+        messages = [message for _, message in records]
+        changed.update(range_candidate.coalesced_source_seqs)
+        eligibility = _eviction_eligibility(records, unconsumed_source_seqs)
+
     calls = _tool_calls(messages)
     call_indexes = _call_indexes(messages)
     results = _tool_results(messages)
-    eligibility = _eviction_eligibility(records, unconsumed_source_seqs)
-    changed: set[int] = set()
-    read_counts = _collapse_repeated_reads(
-        records, messages, calls, call_indexes, changed, eligibility
-    )
     message_tokens = [token_counter(message) for message in messages]
     running_total = fixed_tokens + sum(message_tokens)
 
-    def replace(index: int, replacement: Message) -> None:
+    def replace_many(replacements: Sequence[tuple[int, Message]]) -> bool:
         nonlocal running_total
-        replacement_tokens = token_counter(replacement)
-        running_total += replacement_tokens - message_tokens[index]
-        message_tokens[index] = replacement_tokens
-        messages[index] = replacement
-        changed.add(index)
+        indexes = [index for index, _ in replacements]
+        candidates = [replacement for _, replacement in replacements]
+        replacement_tokens = [token_counter(message) for message in candidates]
+        original_tokens = sum(message_tokens[index] for index in indexes)
+        if sum(replacement_tokens) >= original_tokens:
+            return False
+        running_total += sum(replacement_tokens) - original_tokens
+        for index, replacement, replacement_count in zip(
+            indexes, candidates, replacement_tokens, strict=True
+        ):
+            message_tokens[index] = replacement_count
+            messages[index] = replacement
+            changed.add(records[index][0])
+        return True
+
+    def replace(index: int, replacement: Message) -> bool:
+        return replace_many(((index, replacement),))
+
+    read_counts = _collapse_repeated_reads(
+        records,
+        messages,
+        calls,
+        call_indexes,
+        changed,
+        eligibility,
+        replace_many,
+    )
 
     def digest_results(*, failed: bool) -> EvictionResult | None:
         for index, (seq, _) in enumerate(records):
@@ -166,7 +198,7 @@ def evict_messages(
             count = read_counts.get((path, _content_digest(result.content)), 1)
             replace(index, _digest_result(message, call, seq, read_count=count))
             if running_total <= target_tokens:
-                return _result(messages, changed, before, running_total, True)
+                return _result(records, messages, changed, before, running_total, True)
         return None
 
     reached = digest_results(failed=False)
@@ -200,7 +232,7 @@ def evict_messages(
             ),
         )
         if running_total <= target_tokens:
-            return _result(messages, changed, before, running_total, True)
+            return _result(records, messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -221,7 +253,7 @@ def evict_messages(
             ),
         )
         if running_total <= target_tokens:
-            return _result(messages, changed, before, running_total, True)
+            return _result(records, messages, changed, before, running_total, True)
 
     reached = digest_results(failed=True)
     if reached is not None:
@@ -233,7 +265,7 @@ def evict_messages(
             continue
         replace(index, _notification_receipt(message, seq))
         if running_total <= target_tokens:
-            return _result(messages, changed, before, running_total, True)
+            return _result(records, messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -244,7 +276,7 @@ def evict_messages(
             continue
         replace(index, replacement)
         if running_total <= target_tokens:
-            return _result(messages, changed, before, running_total, True)
+            return _result(records, messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -260,7 +292,7 @@ def evict_messages(
             continue
         replace(index, _orchestration_result_receipt(message, call, seq))
         if running_total <= target_tokens:
-            return _result(messages, changed, before, running_total, True)
+            return _result(records, messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -275,11 +307,9 @@ def evict_messages(
         ):
             continue
         replacement = _workflow_result_receipt(message, call, seq)
-        if token_counter(replacement) >= message_tokens[index]:
-            continue
         replace(index, replacement)
         if running_total <= target_tokens:
-            return _result(messages, changed, before, running_total, True)
+            return _result(records, messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -290,7 +320,7 @@ def evict_messages(
             continue
         replace(index, replacement)
         if running_total <= target_tokens:
-            return _result(messages, changed, before, running_total, True)
+            return _result(records, messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -301,9 +331,10 @@ def evict_messages(
             continue
         replace(index, replacement)
         if running_total <= target_tokens:
-            return _result(messages, changed, before, running_total, True)
+            return _result(records, messages, changed, before, running_total, True)
 
     return _result(
+        records,
         messages,
         changed,
         before,
@@ -317,9 +348,10 @@ def eviction_view(
 ) -> list[dict[str, object]]:
     """Serialize an eviction result for durable replay."""
 
+    source_seqs = result.source_seqs or tuple(seq for seq, _ in records)
     return [
         {"seq": seq, "message": message.to_dict()}
-        for (seq, _), message in zip(records, result.messages, strict=True)
+        for seq, message in zip(source_seqs, result.messages, strict=True)
     ]
 
 
@@ -444,6 +476,7 @@ def _collapse_repeated_reads(
     call_indexes: Mapping[str, int],
     changed: set[int],
     eligibility: _EvictionEligibility,
+    replace_many: Callable[[Sequence[tuple[int, Message]]], bool] | None = None,
 ) -> dict[tuple[str | None, str], int]:
     groups: dict[tuple[str, str], list[tuple[int, str, int]]] = defaultdict(list)
     for result_index, (seq, message) in enumerate(records):
@@ -476,25 +509,38 @@ def _collapse_repeated_reads(
                 or len(_tool_uses(messages[call_index])) != 1
             ):
                 continue
-            messages[call_index] = Message(
-                MessageRole.ASSISTANT,
-                [TextContent(f"[older duplicate read collapsed into seq {newest[2]}]")],
-                metadata={
-                    "context_evicted": True,
-                    "source_seq": records[call_index][0],
-                    "collapsed_into_seq": newest[2],
-                },
+            replacements = (
+                (
+                    call_index,
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"[older duplicate read collapsed into seq {newest[2]}]")],
+                        metadata={
+                            "context_evicted": True,
+                            "source_seq": records[call_index][0],
+                            "collapsed_into_seq": newest[2],
+                        },
+                    ),
+                ),
+                (
+                    result_index,
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"[duplicate result collapsed into seq {newest[2]}]")],
+                        metadata={
+                            "context_evicted": True,
+                            "source_seq": seq,
+                            "collapsed_into_seq": newest[2],
+                        },
+                    ),
+                ),
             )
-            messages[result_index] = Message(
-                MessageRole.ASSISTANT,
-                [TextContent(f"[duplicate result collapsed into seq {newest[2]}]")],
-                metadata={
-                    "context_evicted": True,
-                    "source_seq": seq,
-                    "collapsed_into_seq": newest[2],
-                },
-            )
-            changed.update((call_index, result_index))
+            if replace_many is not None:
+                replace_many(replacements)
+            else:
+                for replacement_index, replacement in replacements:
+                    messages[replacement_index] = replacement
+                    changed.add(replacement_index)
     return counts
 
 
@@ -993,14 +1039,30 @@ def _selected_lines(lines: Sequence[str]) -> list[str]:
     return _unique([*important, *edges])
 
 
+def _strictly_smaller(
+    token_counter: Callable[[Message], int],
+    originals: Sequence[Message],
+    candidates: Sequence[Message],
+) -> bool:
+    return sum(map(token_counter, candidates)) < sum(map(token_counter, originals))
+
+
 def _result(
+    records: Sequence[tuple[int, Message]],
     messages: list[Message],
     changed: set[int],
     before: int,
     after: int,
     reached: bool,
 ) -> EvictionResult:
-    return EvictionResult(messages, len(changed), before, after, reached)
+    return EvictionResult(
+        messages,
+        len(changed),
+        before,
+        after,
+        reached,
+        tuple(seq for seq, _ in records),
+    )
 
 
 def _tool_calls(messages: Sequence[Message]) -> dict[str, ToolCall]:

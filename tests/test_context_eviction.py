@@ -2867,7 +2867,8 @@ async def test_manual_eviction_bypasses_hysteresis_without_summary_fallback(
 
     assert policy.calls == 0
     assert first.compacted is True
-    assert refreshed.compacted is True
+    # The remaining deterministic candidates are not smaller, even when forced.
+    assert refreshed.compacted is False
     assert "next request" in rendered_text(refreshed.messages)
     assert all(
         entry.data.get("kind") == "evict"
