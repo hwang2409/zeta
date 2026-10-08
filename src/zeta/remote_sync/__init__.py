@@ -24,6 +24,7 @@ from typing import Protocol
 
 from ..core.session import SessionManager
 from ..core.session_files import SessionError, SessionInUseError, session_directory
+from ..core.store.runtime_lease import RUNTIME_LEASE_NAME
 from .errors import RemoteSyncError
 from .memory import (
     MemoryTransferResult,
@@ -36,7 +37,7 @@ from .memory import (
 
 _SCHEMA = "zeta.session-transfer.v1"
 _MAX_CONVERSATION_HEADER_BYTES = 1024 * 1024
-_EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
+_EXCLUDED_NAMES = frozenset({".lock", ".spill.lock", RUNTIME_LEASE_NAME})
 _CREDENTIAL_NAMES = frozenset(
     {"oauth.json", "credentials.json", "tokens.json", "auth.json"}
 )
@@ -535,6 +536,8 @@ def _validate_snapshot(snapshot: Path, session_id: str) -> None:
     for path in snapshot.rglob("*"):
         if path.is_symlink():
             raise RemoteSyncError("remote session contains a symlink")
+        if path.name in _EXCLUDED_NAMES:
+            raise RemoteSyncError("remote session contains a runtime-only file")
 
 
 def _read_manifest(snapshot: Path) -> dict[str, object]:

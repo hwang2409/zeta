@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
+import sys
 import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -13,12 +15,6 @@ from zeta.core.session import SessionManager
 from zeta.runtime.prompt_resume import ResumedPrompt, resume_prompt
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
-
-
-@dataclass(frozen=True)
-class _Owner:
-    pid: int
-    started: str
 
 
 def _manager_with_prompt(
@@ -55,15 +51,28 @@ def _resume(
     home: Path,
     cwd: Path,
     context_loader: Callable[..., ProjectContext],
+    *,
+    live_stores: list[object] | None = None,
 ) -> ResumedPrompt:
-    return resume_prompt(
-        manager.read_metadata(session_id),
-        manager=manager,
-        home=home,
-        repo_root=cwd,
-        inbox_enabled=False,
-        context_loader=context_loader,
-    )
+    opened = manager.open(session_id)
+    try:
+        result = resume_prompt(
+            opened.metadata,
+            manager=manager,
+            store=opened.store,
+            home=home,
+            repo_root=cwd,
+            inbox_enabled=False,
+            context_loader=context_loader,
+        )
+    except BaseException:
+        opened.store.close()
+        raise
+    if live_stores is None:
+        opened.store.close()
+    else:
+        live_stores.append(opened.store)
+    return result
 
 
 def _staggered_resumes(
@@ -90,27 +99,21 @@ def _staggered_resumes(
     monkeypatch.setattr(
         "zeta.runtime.prompt_resume._adopted_context", pause_after_persist
     )
-    monkeypatch.setattr(
-        "zeta.core.store.prompt_composition.current_process_identity",
-        lambda: _Owner(
-            101 if threading.current_thread().name == "first-resumer" else 202,
-            "first-start" if threading.current_thread().name == "first-resumer" else "second-start",
-        ),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "zeta.core.store.prompt_composition.process_is_live",
-        lambda owner: owner.pid == 101 and owner.started == "first-start",
-        raising=False,
-    )
-
     results: list[ResumedPrompt] = []
+    live_stores: list[object] = []
     errors: list[BaseException] = []
 
     def run() -> None:
         try:
             results.append(
-                _resume(manager, session_id, home, cwd, context_loader)
+                _resume(
+                    manager,
+                    session_id,
+                    home,
+                    cwd,
+                    context_loader,
+                    live_stores=live_stores,
+                )
             )
         except BaseException as exc:  # noqa: BLE001 - report thread failures
             errors.append(exc)
@@ -128,6 +131,8 @@ def _staggered_resumes(
     assert not second.is_alive()
     assert errors == []
     assert len(results) == 2
+    for store in live_stores:
+        store.close()
     return results
 
 
@@ -156,11 +161,11 @@ def _assert_one_persisted_prompt(
         saved.system_prompt,
         saved.system_prompt,
     ]
-    assert saved.prompt_composition_epoch == 1
-    assert saved.prompt_composition_owner_pid == 101
+    assert "prompt_composition_epoch" not in saved.to_storage_dict()
+    assert "prompt_composition_owner_pid" not in saved.to_storage_dict()
 
 
-def test_staggered_recorded_default_resumes_adopt_live_owner(
+def test_staggered_recorded_default_resumes_adopt_live_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager, session_id = _manager_with_prompt(
@@ -181,7 +186,7 @@ def test_staggered_recorded_default_resumes_adopt_live_owner(
     assert calls == [1]
 
 
-def test_staggered_recipe_less_empty_resumes_adopt_live_owner(
+def test_staggered_recipe_less_empty_resumes_adopt_live_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager, session_id = _manager_with_prompt(
@@ -203,7 +208,7 @@ def test_staggered_recipe_less_empty_resumes_adopt_live_owner(
     assert manager.read_metadata(session_id).prompt_recipe == "default"
 
 
-def test_staggered_memory_span_resumes_adopt_live_owner(
+def test_staggered_memory_span_resumes_adopt_live_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prefix = "prefix "
@@ -242,31 +247,161 @@ def test_staggered_memory_span_resumes_adopt_live_owner(
     assert calls == [1]
 
 
-def test_dead_prompt_composition_owner_allows_rebuild(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_closed_runtime_allows_next_resume_to_rebuild(tmp_path: Path) -> None:
     manager, session_id = _manager_with_prompt(
         tmp_path / "home", tmp_path, system_prompt="recorded", prompt_recipe="default"
     )
     loader, calls = _numbered_default_contexts(tmp_path)
-    owners = iter(
-        [_Owner(101, "first-start"), _Owner(202, "second-start")]
-    )
-    monkeypatch.setattr(
-        "zeta.core.store.prompt_composition.current_process_identity",
-        lambda: next(owners),
-    )
-    monkeypatch.setattr(
-        "zeta.core.store.prompt_composition.process_is_live", lambda owner: False
-    )
 
     first = _resume(manager, session_id, tmp_path / "home", tmp_path, loader)
     second = _resume(manager, session_id, tmp_path / "home", tmp_path, loader)
 
     assert first.context.system_prompt == "default fallback 1"
     assert second.context.system_prompt == "default fallback 2"
-    saved = manager.read_metadata(session_id)
-    assert saved.system_prompt == "default fallback 2"
-    assert saved.prompt_composition_epoch == 2
-    assert saved.prompt_composition_owner_pid == 202
+    assert manager.read_metadata(session_id).system_prompt == "default fallback 2"
     assert calls == [1, 2]
+
+
+def _start_resume_process(
+    *,
+    home: Path,
+    cwd: Path,
+    session_id: str,
+    ready: Path,
+    release: Path,
+    close_before_ready: bool,
+) -> subprocess.Popen[bytes]:
+    close = "opened.store.close()" if close_before_ready else ""
+    script = f'''from pathlib import Path
+import os
+import time
+from zeta.core.project_context import ProjectContext
+from zeta.core.session import SessionManager
+from zeta.runtime.prompt_resume import resume_prompt
+home = Path({str(home)!r})
+cwd = Path({str(cwd)!r})
+manager = SessionManager(home)
+opened = manager.open({session_id!r})
+resume_prompt(opened.metadata, manager=manager, store=opened.store, home=home, repo_root=cwd, inbox_enabled=False, context_loader=lambda **kwargs: ProjectContext("child runtime", (), prompt_recipe="default"))
+{close}
+Path({str(ready)!r}).write_text("ready")
+while not Path({str(release)!r}).exists():
+    time.sleep(0.01)
+'''
+    return subprocess.Popen([sys.executable, "-c", script], cwd=cwd)
+
+
+def _wait_for(path: Path) -> None:
+    deadline = time.monotonic() + 10
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists()
+
+
+def test_serve_style_switch_releases_runtime_lease_while_process_lives(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    manager, session_id = _manager_with_prompt(
+        home, tmp_path, system_prompt="recorded", prompt_recipe="default"
+    )
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    child = _start_resume_process(
+        home=home,
+        cwd=tmp_path,
+        session_id=session_id,
+        ready=ready,
+        release=release,
+        close_before_ready=True,
+    )
+    try:
+        _wait_for(ready)
+        loader, calls = _numbered_default_contexts(tmp_path)
+        resumed = _resume(manager, session_id, home, tmp_path, loader)
+        assert child.poll() is None
+        assert resumed.context.system_prompt == "default fallback 1"
+        assert calls == [1]
+    finally:
+        release.write_text("release")
+        child.wait(timeout=10)
+
+
+def test_process_exit_releases_runtime_lease(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    manager, session_id = _manager_with_prompt(
+        home, tmp_path, system_prompt="recorded", prompt_recipe="default"
+    )
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    child = _start_resume_process(
+        home=home,
+        cwd=tmp_path,
+        session_id=session_id,
+        ready=ready,
+        release=release,
+        close_before_ready=False,
+    )
+    try:
+        _wait_for(ready)
+        loader, calls = _numbered_default_contexts(tmp_path)
+        adopted = _resume(manager, session_id, home, tmp_path, loader)
+        assert adopted.context.system_prompt == "child runtime"
+        assert calls == []
+        child.kill()
+        child.wait(timeout=10)
+        rebuilt = _resume(manager, session_id, home, tmp_path, loader)
+        assert rebuilt.context.system_prompt == "default fallback 1"
+        assert calls == [1]
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
+def test_transfer_excludes_runtime_lease_and_destination_rebuilds(
+    tmp_path: Path,
+) -> None:
+    from zeta.remote_sync import LocalTransport, pull_session, push_session
+
+    source = tmp_path / "source"
+    remote = tmp_path / "remote"
+    destination = tmp_path / "destination"
+    manager, session_id = _manager_with_prompt(
+        source, tmp_path, system_prompt="recorded", prompt_recipe="default"
+    )
+    source_stores: list[object] = []
+    source_loader, _ = _numbered_default_contexts(tmp_path)
+    _resume(
+        manager,
+        session_id,
+        source,
+        tmp_path,
+        source_loader,
+        live_stores=source_stores,
+    )
+    try:
+        push_session(source, LocalTransport(remote), session_id=session_id)
+        assert not (remote / "sessions" / session_id / "runtime.lease").exists()
+        pull_session(destination, LocalTransport(remote), session_id=session_id)
+        assert not (destination / "sessions" / session_id / "runtime.lease").exists()
+
+        calls: list[int] = []
+        resumed = _resume(
+            SessionManager(destination),
+            session_id,
+            destination,
+            tmp_path,
+            lambda **kwargs: (
+                calls.append(1),
+                ProjectContext("destination rebuild", (), prompt_recipe="default"),
+            )[1],
+        )
+        assert resumed.context.system_prompt == "destination rebuild"
+        assert calls == [1]
+        stored = (destination / "sessions" / session_id / "meta.json").read_text()
+        assert "prompt_composition_owner" not in stored
+        assert "prompt_composition_epoch" not in stored
+    finally:
+        for store in source_stores:
+            store.close()

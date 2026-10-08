@@ -13,6 +13,7 @@ from ..core.project_context import (
     refresh_project_memory,
 )
 from ..core.session import SessionManager, SessionMetadata
+from ..core.store import ConversationStore
 from ..core.store.prompt_composition import PromptComposition
 from ..skills import SkillCatalog, discover_session_skills
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
@@ -122,6 +123,7 @@ def resume_prompt(
     metadata: SessionMetadata,
     *,
     manager: SessionManager,
+    store: ConversationStore,
     home: Path,
     repo_root: Path,
     inbox_enabled: bool,
@@ -176,7 +178,7 @@ def resume_prompt(
             notices=context.notices,
         )
 
-    composition = manager.resume_prompt_composition(metadata, compose)
+    composition = manager.resume_prompt_composition(metadata, store, compose)
     return ResumedPrompt(
         _adopted_context(metadata, composition.notices),
         composition.skill_catalog,
