@@ -137,6 +137,7 @@ class AgentLoop(
         if self.agent_depth > 0:
             return
         self._background_owner.notify_wake()
+        self._schedule_transcript_index()
 
     def __init__(
         self,
@@ -181,6 +182,7 @@ class AgentLoop(
             root_session_dir if root_session_dir is not None else store.session_dir
         )
         self.project_registry = project_registry
+        self._configure_transcript_index()
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
@@ -1100,6 +1102,7 @@ class AgentLoop(
                     continue
                 if should_nudge:
                     continue
+                self._schedule_transcript_index()
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             dispatch = dispatch_tool_calls(

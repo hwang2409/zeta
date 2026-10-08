@@ -15,6 +15,7 @@ import json
 import os
 import time
 import warnings
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ...agent.receipt import encode_json
@@ -30,12 +31,73 @@ from ._validation import TASK_EXITED_NOTIFICATION_KIND
 if TYPE_CHECKING:
     from ._store import ConversationStore
 
+
+@dataclass(frozen=True, slots=True)
+class PersistedAppend:
+    """Proof of one byte range durably appended by this store process."""
+
+    start_offset: int
+    end_offset: int
+    digest: str
+    source_device: int
+    source_inode: int
+    before_mtime_ns: int
+    before_ctime_ns: int
+    after_mtime_ns: int
+    after_ctime_ns: int
+
+
 SCHEMA = "zeta.conversation.v1"
 PREFIX_FINGERPRINT_BYTES = 64 * 1024
+MAX_PENDING_APPEND_RECEIPTS = 256
 
 
 class ConversationLogMixin:
     """Load a log once, then synchronize only bytes appended by other writers."""
+
+    def enable_persisted_append_tracking(self: ConversationStore) -> None:
+        """Collect bounded append proofs for incremental transcript indexing."""
+        self._collect_persisted_appends = True
+
+    def disable_persisted_append_tracking(self: ConversationStore) -> None:
+        """Stop collecting append proofs and discard pending tracking state."""
+        self._collect_persisted_appends = False
+        self._persisted_appends.clear()
+        self._persisted_appends_unverified = False
+
+    def _record_persisted_append(
+        self: ConversationStore, receipt: PersistedAppend
+    ) -> None:
+        if not self._collect_persisted_appends or self._persisted_appends_unverified:
+            return
+        if len(self._persisted_appends) >= MAX_PENDING_APPEND_RECEIPTS:
+            self._persisted_appends.clear()
+            self._persisted_appends_unverified = True
+            return
+        self._persisted_appends.append(receipt)
+
+    def _accept_persisted_appends(
+        self: ConversationStore, receipts: tuple[PersistedAppend, ...] | None
+    ) -> None:
+        if not self._collect_persisted_appends:
+            return
+        if receipts is None:
+            self._persisted_appends.clear()
+            self._persisted_appends_unverified = True
+            return
+        for receipt in receipts:
+            self._record_persisted_append(receipt)
+
+    def take_persisted_appends(
+        self: ConversationStore,
+    ) -> tuple[PersistedAppend, ...] | None:
+        """Transfer append proofs, or report that the pending range is unverified."""
+        if self._persisted_appends_unverified:
+            self._persisted_appends_unverified = False
+            return None
+        receipts = tuple(self._persisted_appends)
+        self._persisted_appends.clear()
+        return receipts
 
     def _log_metadata_matches(self: ConversationStore) -> bool:
         """Return whether the durable log still matches the resident indexes."""
@@ -354,10 +416,30 @@ class ConversationLogMixin:
             ),
             "ab",
         ) as handle:
+            before = (
+                os.fstat(handle.fileno())
+                if self._collect_persisted_appends
+                else None
+            )
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-            self._set_log_stat(os.fstat(handle.fileno()))
+            after = os.fstat(handle.fileno())
+            self._set_log_stat(after)
+            if before is not None:
+                self._record_persisted_append(
+                    PersistedAppend(
+                        start_offset=before.st_size,
+                        end_offset=after.st_size,
+                        digest=hashlib.sha256(data).hexdigest(),
+                        source_device=after.st_dev,
+                        source_inode=after.st_ino,
+                        before_mtime_ns=before.st_mtime_ns,
+                        before_ctime_ns=before.st_ctime_ns,
+                        after_mtime_ns=after.st_mtime_ns,
+                        after_ctime_ns=after.st_ctime_ns,
+                    )
+                )
 
     @staticmethod
     def _prefix_fingerprint(fd: int, offset: int) -> bytes:

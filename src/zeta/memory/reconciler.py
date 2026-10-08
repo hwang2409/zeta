@@ -16,6 +16,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from zeta.memory.safety import contains_secret
 from zeta.project_memory_history import PROJECT_MEMORY_FILES
 from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 from zeta.protocol.types import (
@@ -27,15 +28,6 @@ from zeta.protocol.types import (
 MEMORY_FILES = PROJECT_MEMORY_FILES
 _USER_DISPLAY_TEXT_METADATA = "zeta.user_display_text"
 
-_SECRET_PATTERNS = (
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.IGNORECASE),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{16,}\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:password|passwd|api[_ -]?key|access[_ -]?token|secret)\s*[:=]\s*\S+",
-        re.IGNORECASE,
-    ),
-)
 _INJECTION_PATTERNS = (
     re.compile(
         r"\bignore (?:all |any )?(?:previous|prior|system) instructions?\b",
@@ -221,7 +213,7 @@ def _is_agent_directed_action(content: str) -> bool:
 
 
 def _unsafe_reason(content: str) -> str | None:
-    if any(pattern.search(content) for pattern in _SECRET_PATTERNS):
+    if contains_secret(content):
         return "secret"
     if _is_agent_directed_action(content) or any(
         pattern.search(content) for pattern in _INJECTION_PATTERNS

@@ -30,6 +30,7 @@ from ..checkpoints import (
     CheckpointForkMixin,
     ConversationEntry,
     ConversationIntegrityError,
+    active_branch,
     load_session_json,
 )
 from ..session_files import (
@@ -48,7 +49,7 @@ from ._approval_display import (
 )
 from ._async_writes import AsyncDurableWritesMixin
 from ._incremental_validation import IncrementalValidationMixin
-from ._log import ConversationLogMixin
+from ._log import ConversationLogMixin, PersistedAppend
 from ._notifications import NotificationStateMixin
 from ._pending_prompts import (
     MAX_PENDING_PROMPT_TEXT,
@@ -82,6 +83,7 @@ class ConversationStore(
         _lock_deadline: float | None = None,
         _read_only: bool = False,
         _must_exist: bool = False,
+        _collect_persisted_appends: bool = False,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -128,6 +130,9 @@ class ConversationStore(
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
+        self._collect_persisted_appends = _collect_persisted_appends
+        self._persisted_appends: list[PersistedAppend] = []
+        self._persisted_appends_unverified = False
         # Task-exit task ids for O(1) append_task_notification dedupe (task ids
         # are unique and exit once, so this mirrors the active-branch scan).
         self._task_notification_ids: set[str] = set()
@@ -166,6 +171,7 @@ class ConversationStore(
         with nullcontext() if self._read_only else self._append_lock():
             self._load()
             self._load_session_state()
+
     def __enter__(self) -> Self:
         return self
     def __exit__(self, *_exc: object) -> None:
@@ -1148,21 +1154,7 @@ class ConversationStore(
     def _active_branch(self) -> tuple[ConversationEntry, ...]:
         """Return resident active-branch entries for store-internal queries."""
 
-        if not self._entries:
-            return ()
-        by_id = {entry.id: entry for entry in self._entries}
-        current = self._entries[-1]
-        branch: list[ConversationEntry] = []
-        seen: set[str] = set()
-        while current is not None:
-            if current.id in seen:
-                raise ConversationIntegrityError(
-                    f"conversation parent cycle at {current.id}"
-                )
-            seen.add(current.id)
-            branch.append(current)
-            current = by_id.get(current.parent_id) if current.parent_id else None
-        return tuple(reversed(branch))
+        return active_branch(self._entries)
 
     def replay(self) -> list[ConversationEntry]:
         return self._snapshot_branch(self._active_branch())

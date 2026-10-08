@@ -75,6 +75,24 @@ def test_secret_and_injection_changes_are_dropped(unsafe: str) -> None:
     assert proposal.rejected_files == ("decisions.md",)
 
 
+def test_request_omits_complete_private_key_before_provider() -> None:
+    private_key = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "TOP_SECRET_KEY_MATERIAL\n"
+        "-----END PRIVATE KEY-----"
+    )
+    transcript = Transcript(
+        SESSION,
+        ({"seq": 7, "type": "message", "data": {"text": private_key}},),
+    )
+
+    request = prepare_request(transcript, {}, as_of=TODAY)
+
+    assert "TOP_SECRET_KEY_MATERIAL" not in request.prompt
+    assert "END PRIVATE KEY" not in request.prompt
+    assert "[unsafe content omitted]" in request.prompt
+
+
 def test_request_omits_unsafe_input_before_provider() -> None:
     secret = "API_KEY=sk_this_is_a_fake_secret_123456789"
     transcript = Transcript(
