@@ -1134,3 +1134,118 @@ async def test_resume_catches_up_from_durable_cursor(
     assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
         "range 1-4\n"
     )
+
+@pytest.mark.parametrize("failing_retry_seq", [None, 2], ids=["all-succeed", "one-fails"])
+@pytest.mark.asyncio
+async def test_repartitioned_retry_replaces_original_failure(
+    tmp_path: Path, failing_retry_seq: int | None
+) -> None:
+    retry_now = [1_000.0]
+    calls: list[tuple[int, int]] = []
+
+    async def invoke(prompt: str) -> str:
+        rows = json.loads(prompt.split("Completed transcript rows:", 1)[1].strip())
+        seq_range = (rows[0]["seq"], rows[-1]["seq"])
+        calls.append(seq_range)
+        if seq_range == (failing_retry_seq, failing_retry_seq):
+            raise RuntimeError("retry failed")
+        return _proposal(prompt)
+
+    runner, registry, project_id, _ = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=3,
+        minimum_interval=0,
+        retry_backoff_seconds=10,
+        retry_clock=lambda: retry_now[0],
+    )
+    rows = [
+        {
+            "seq": seq,
+            "type": "message",
+            "data": {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "x" * 20_000}],
+                    "metadata": {"zeta.origin": "user"},
+                }
+            },
+        }
+        for seq in (1, 2)
+    ]
+    rows.append({"seq": 3, "type": "message", "data": {"text": "later fact"}})
+    (runner.session_dir / "conversation.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    runner.state.record_failure(
+        seq_start=1,
+        seq_end=2,
+        validation_summary="initial failure",
+        reason="eviction",
+        usage={},
+        retry_backoff_seconds=10,
+        now=retry_now[0],
+        occurred_at="2026-10-08T00:00:00+00:00",
+    )
+    runner.state.record_success(
+        seq_start=3,
+        seq_end=3,
+        reason="eviction",
+        end_offset=0,
+        end_tokens=0,
+    )
+    registry.update_memory(project_id, {"brief.md": "# Brief\n\n" + "m" * 30_000})
+
+    retry_now[0] = 1_010
+    await asyncio.wait_for(runner.drain(), timeout=2)
+
+    assert calls == [(1, 1), (2, 2)]
+    state = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    expected = [] if failing_retry_seq is None else [(2, 2)]
+    assert [
+        (item["seq_start"], item["seq_end"])
+        for item in state["pending_failures"]
+    ] == expected
+    if failing_retry_seq is not None:
+        failure = state["pending_failures"][0]
+        assert failure["attempt_count"] == 2
+        assert failure["retry_after"] == 1_030
+    await runner.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_bounds_attempts_when_retry_key_stays_due(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    async def invoke(prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return _proposal(prompt)
+
+    runner, _, _, _ = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=0,
+        retry_clock=lambda: 1_000,
+    )
+    runner.state.record_failure(
+        seq_start=1,
+        seq_end=1,
+        validation_summary="initial failure",
+        reason="eviction",
+        usage={},
+        retry_backoff_seconds=0,
+        now=1_000,
+        occurred_at="2026-10-08T00:00:00+00:00",
+    )
+    monkeypatch.setattr(runner.state, "record_retry_outcomes", lambda *args, **kwargs: ())
+
+    await asyncio.wait_for(runner.drain(), timeout=2)
+
+    assert calls == 3
+    assert len(runner.state.ready_retries(1_000)) == 1
+    await runner.close()

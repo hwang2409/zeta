@@ -25,8 +25,11 @@ from .reconciler import (
     project_transcript_row,
 )
 from .reconciliation_state import (
+    MAX_SCHEDULED_ATTEMPTS,
     ReconciliationFailure,
+    ReconciliationOutcome,
     ReconciliationState,
+    ReconciliationWork,
     TerminalReceipt,
 )
 
@@ -135,6 +138,7 @@ class AutoMemoryReconciler:
         self._last_request_finished = 0.0
         self._conflict_retries = 0
         self._resume_catch_up = False
+        self._retry_attempts_in_cycle: dict[str, int] = {}
 
     @property
     def last_reconciled_seq(self) -> int:
@@ -160,6 +164,7 @@ class AutoMemoryReconciler:
         """Re-queue one terminal receipt for this session."""
         queued = self.state.retry_terminal(key, now=self._retry_clock())
         if queued and not self._closing:
+            self._begin_work_cycle()
             self._wake.set()
             self._drained.clear()
             self._ensure_worker()
@@ -174,6 +179,7 @@ class AutoMemoryReconciler:
         del seq  # The worker reads the authoritative durable sequence itself.
         if not self.config.enabled or self._closing:
             return
+        self._begin_work_cycle()
         self._activity_generation += 1
         self._idle_deadline = self._clock() + self.config.idle_seconds
         self._ensure_worker()
@@ -184,6 +190,7 @@ class AutoMemoryReconciler:
         """Queue every sequence in the exact range that will leave context."""
         if not self.config.enabled or self._closing or seq_end < seq_start:
             return
+        self._begin_work_cycle()
         self._add_pending(seq_start, seq_end, "eviction")
         self._ensure_worker()
         self._drained.clear()
@@ -193,18 +200,18 @@ class AutoMemoryReconciler:
         """Wait until all work currently caused by activity has settled."""
         if not self.config.enabled:
             return
+        self._begin_work_cycle()
         self._ensure_worker()
         self._wake.set()
         while (
             self._busy
             or self._pending
             or self._resume_catch_up
-            or bool(self.state.ready_retries(self._retry_clock()))
+            or bool(self._ready_retries())
             or self._seen_activity_generation < self._activity_generation
         ):
+            self._drained.clear()
             await self._drained.wait()
-            if self._busy or self._pending:
-                self._drained.clear()
 
     async def close(self) -> None:
         """Stop without starting provider work and bound any in-flight request."""
@@ -227,9 +234,22 @@ class AutoMemoryReconciler:
         """Queue durable transcript content left behind by an earlier shutdown."""
         if not self.config.enabled or self._closing:
             return
+        self._begin_work_cycle()
         self._resume_catch_up = True
         self._drained.clear()
         self._wake.set()
+
+    def _begin_work_cycle(self) -> None:
+        if self._drained.is_set() and not self._busy and not self._pending:
+            self._retry_attempts_in_cycle.clear()
+
+    def _ready_retries(self) -> tuple[ReconciliationWork, ...]:
+        return tuple(
+            work
+            for work in self.state.ready_retries(self._retry_clock())
+            if self._retry_attempts_in_cycle.get(work.key, 0)
+            < MAX_SCHEDULED_ATTEMPTS
+        )
 
     def _ensure_worker(self) -> None:
         if self._worker_task is None:
@@ -253,7 +273,7 @@ class AutoMemoryReconciler:
 
     def _queue_ready_retries(self) -> None:
         queued = {item.key for item in self._pending if item.key is not None}
-        for work in self.state.ready_retries(self._retry_clock()):
+        for work in self._ready_retries():
             if work.key in queued:
                 continue
             self._pending.append(
@@ -290,6 +310,10 @@ class AutoMemoryReconciler:
                     self._add_pending(self.last_reconciled_seq + 1, latest_seq, "tokens")
             if self._pending:
                 item = self._pending.pop(0)
+                if item.key is not None:
+                    self._retry_attempts_in_cycle[item.key] = (
+                        self._retry_attempts_in_cycle.get(item.key, 0) + 1
+                    )
                 delay = self.config.minimum_interval - (
                     self._clock() - self._last_request_finished
                 )
@@ -306,7 +330,11 @@ class AutoMemoryReconciler:
                 except _ConcurrentMemoryUpdate:
                     self._conflict_retries += 1
                     if not self._closing:
-                        self._add_pending(item.start, item.end, *item.reasons)
+                        if item.key is None:
+                            self._add_pending(item.start, item.end, *item.reasons)
+                        else:
+                            self._pending.append(item)
+                            self._pending.sort(key=lambda pending: pending.start)
                         await asyncio.sleep(
                             min(0.05 * (2 ** (self._conflict_retries - 1)), 1.0)
                         )
@@ -342,7 +370,12 @@ class AutoMemoryReconciler:
             timeout = None
             if self._idle_deadline is not None:
                 timeout = max(0.0, self._idle_deadline - self._clock())
-            retry_after = self.state.next_retry_after()
+            exhausted_retry_keys = frozenset(
+                key
+                for key, attempts in self._retry_attempts_in_cycle.items()
+                if attempts >= MAX_SCHEDULED_ATTEMPTS
+            )
+            retry_after = self.state.next_retry_after(exclude=exhausted_retry_keys)
             if retry_after is not None:
                 retry_timeout = max(0.0, retry_after - self._retry_clock())
                 timeout = retry_timeout if timeout is None else min(timeout, retry_timeout)
@@ -358,6 +391,7 @@ class AutoMemoryReconciler:
     async def _reconcile_range(self, item: _PendingRange) -> None:
         cursor = item.start
         reason = "+".join(sorted(item.reasons))
+        retry_outcomes: list[ReconciliationOutcome] = []
         while cursor <= item.end:
             if self._closing:
                 return
@@ -464,35 +498,74 @@ class AutoMemoryReconciler:
                     if isinstance(failure, ReconciliationError)
                     else type(failure).__name__
                 )
-                recorded = await asyncio.to_thread(
-                    self.state.record_failure,
-                    seq_start=selected_start,
-                    seq_end=selected_end,
-                    validation_summary=summary,
-                    reason=reason,
-                    usage=usage,
-                    retry_backoff_seconds=self.config.retry_backoff_seconds,
-                    now=self._retry_clock(),
-                    occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
-                    end_offset=end_offset,
-                    end_tokens=end_tokens,
-                    terminal=terminal_failure,
-                )
-                await asyncio.to_thread(self._append_failure_log, recorded)
-                self._publish_failure_notice()
+                if item.key is not None:
+                    retry_outcomes.append(
+                        ReconciliationOutcome(
+                            seq_start=selected_start,
+                            seq_end=selected_end,
+                            end_offset=end_offset,
+                            end_tokens=end_tokens,
+                            usage=usage,
+                            validation_summary=summary,
+                            terminal=terminal_failure,
+                        )
+                    )
+                else:
+                    recorded = await asyncio.to_thread(
+                        self.state.record_failure,
+                        seq_start=selected_start,
+                        seq_end=selected_end,
+                        validation_summary=summary,
+                        reason=reason,
+                        usage=usage,
+                        retry_backoff_seconds=self.config.retry_backoff_seconds,
+                        now=self._retry_clock(),
+                        occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                        end_offset=end_offset,
+                        end_tokens=end_tokens,
+                        terminal=terminal_failure,
+                    )
+                    await asyncio.to_thread(self._append_failure_log, recorded)
+                    self._publish_failure_notice()
             else:
-                await asyncio.to_thread(
-                    self.state.record_success,
-                    seq_start=selected_start,
-                    seq_end=selected_end,
-                    reason=reason,
-                    end_offset=end_offset,
-                    end_tokens=end_tokens,
-                )
+                if item.key is not None:
+                    retry_outcomes.append(
+                        ReconciliationOutcome(
+                            seq_start=selected_start,
+                            seq_end=selected_end,
+                            end_offset=end_offset,
+                            end_tokens=end_tokens,
+                            usage=usage,
+                        )
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self.state.record_success,
+                        seq_start=selected_start,
+                        seq_end=selected_end,
+                        reason=reason,
+                        end_offset=end_offset,
+                        end_tokens=end_tokens,
+                    )
                 if changed and self.notice is not None:
                     details = ", ".join(f"{name} (+1)" for name in changed)
                     self.notice(f"memory updated: {details}")
             cursor = selected_end + 1
+
+        if item.key is not None and retry_outcomes:
+            failures = await asyncio.to_thread(
+                self.state.record_retry_outcomes,
+                item.key,
+                tuple(retry_outcomes),
+                reason=reason,
+                retry_backoff_seconds=self.config.retry_backoff_seconds,
+                now=self._retry_clock(),
+                occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            )
+            for failure in failures:
+                await asyncio.to_thread(self._append_failure_log, failure)
+            if failures:
+                self._publish_failure_notice()
 
     async def _invoke_request(
         self, prompt: str, budget: ProviderRetryBudget

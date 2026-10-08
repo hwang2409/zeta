@@ -66,6 +66,19 @@ class TerminalReceipt:
     occurred_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class ReconciliationOutcome:
+    """The durable result of one request unit within a keyed retry."""
+
+    seq_start: int
+    seq_end: int
+    end_offset: int
+    end_tokens: int
+    usage: Mapping[str, int]
+    validation_summary: str | None = None
+    terminal: bool = False
+
+
 class ReconciliationState:
     """Own one session's atomic reconciliation ledger."""
 
@@ -121,9 +134,11 @@ class ReconciliationState:
             if float(item["retry_after"]) <= current
         )
 
-    def next_retry_after(self) -> float | None:
+    def next_retry_after(self, *, exclude: frozenset[str] = frozenset()) -> float | None:
         values = [
-            float(item["retry_after"]) for item in self._value["pending_failures"]
+            float(item["retry_after"])
+            for item in self._value["pending_failures"]
+            if item["key"] not in exclude
         ]
         return min(values) if values else None
 
@@ -249,6 +264,111 @@ class ReconciliationState:
             }
         )
         self._publish(reason)
+
+    def record_retry_outcomes(
+        self,
+        key: str,
+        outcomes: tuple[ReconciliationOutcome, ...],
+        *,
+        reason: str,
+        retry_backoff_seconds: float,
+        now: float,
+        occurred_at: str,
+    ) -> tuple[ReconciliationFailure, ...]:
+        """Atomically complete or replace one durable keyed retry."""
+        pending = self._value["pending_failures"]
+        original = next((item for item in pending if item["key"] == key), None)
+        if original is None:
+            return ()
+        original_start = int(original["seq_start"])
+        original_end = int(original["seq_end"])
+        cursor = original_start
+        for outcome in outcomes:
+            if outcome.seq_start != cursor or outcome.seq_end < outcome.seq_start:
+                raise ValueError("retry outcomes do not exactly cover the durable range")
+            cursor = outcome.seq_end + 1
+        if cursor != original_end + 1:
+            raise ValueError("retry outcomes do not exactly cover the durable range")
+        original_attempts = int(original["attempt_count"])
+        original_usage = self._valid_usage(original.get("usage", {}))
+        pending.remove(original)
+        self._value["terminal_receipts"] = [
+            item for item in self._value["terminal_receipts"] if item["key"] != key
+        ]
+        self._remove_archived_receipt(key)
+
+        failures: list[ReconciliationFailure] = []
+        diagnostics: list[tuple[ReconciliationFailure, str, int, dict[str, int]]] = []
+        for outcome in outcomes:
+            if outcome.validation_summary is None:
+                self._complete_unit(
+                    {
+                        "seq_start": outcome.seq_start,
+                        "seq_end": outcome.seq_end,
+                        "end_offset": outcome.end_offset,
+                        "end_tokens": outcome.end_tokens,
+                    }
+                )
+                continue
+
+            outcome_key = (
+                key
+                if (outcome.seq_start, outcome.seq_end)
+                == (original_start, original_end)
+                else self.reconciliation_key(outcome.seq_start, outcome.seq_end)
+            )
+            attempt_count = original_attempts + 1
+            usage = self._valid_usage(outcome.usage)
+            for usage_key, value in original_usage.items():
+                usage[usage_key] = usage.get(usage_key, 0) + value
+            record = {
+                "key": outcome_key,
+                "seq_start": outcome.seq_start,
+                "seq_end": outcome.seq_end,
+                "attempt_count": attempt_count,
+                "validation_summary": self._sanitize_summary(
+                    outcome.validation_summary
+                ),
+                "retry_after": now
+                + retry_backoff_seconds * (2 ** (attempt_count - 1)),
+                "reason": reason,
+                "usage": usage,
+                "end_offset": outcome.end_offset,
+                "end_tokens": outcome.end_tokens,
+            }
+            terminal = outcome.terminal or attempt_count >= MAX_SCHEDULED_ATTEMPTS
+            if terminal:
+                terminal_record = {
+                    **record,
+                    "retry_after": None,
+                    "occurred_at": occurred_at,
+                }
+                self._value["terminal_receipts"] = [
+                    item
+                    for item in self._value["terminal_receipts"]
+                    if item["key"] != outcome_key
+                ]
+                self._value["terminal_receipts"].append(terminal_record)
+                self._complete_unit(record)
+            else:
+                pending.append(record)
+            failure = ReconciliationFailure(
+                occurred_at=occurred_at,
+                message=str(record["validation_summary"]),
+                seq_start=outcome.seq_start,
+                seq_end=outcome.seq_end,
+                terminal=terminal,
+            )
+            failures.append(failure)
+            diagnostics.append((failure, outcome_key, attempt_count, usage))
+
+        if failures:
+            self._value["last_failure"] = self._failure_dict(failures[-1])
+        self._archive_old_receipts()
+        self._publish(reason)
+        for failure, outcome_key, attempt_count, usage in diagnostics:
+            self._write_diagnostic(failure, outcome_key, attempt_count, usage)
+        return tuple(failures)
 
     def retry_terminal(self, key: str, *, now: float | None = None) -> bool:
         """Re-queue one terminal receipt without deleting it before success."""
