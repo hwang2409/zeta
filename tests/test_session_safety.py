@@ -670,7 +670,7 @@ def test_composer_persistence_survives_directory_swap(tmp_path, monkeypatch):
 
 def test_child_transcript_reads_use_parent_descriptor(tmp_path):
     from zeta.tools.agent import _read_child_file
-    from zeta.tui.agent_card import AgentCard
+    from zeta.tui.cards.agent_sync import AgentTranscriptSource
 
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     store.allocate_agent_index()
@@ -684,7 +684,8 @@ def test_child_transcript_reads_use_parent_descriptor(tmp_path):
     store.session_dir.symlink_to(outside, target_is_directory=True)
     try:
         assert b"pinned child" in _read_child_file(store, child.session_dir, "conversation.jsonl")
-        assert AgentCard._tail_lines(str(child.session_dir), 5) == []
+        with pytest.raises((OSError, SessionError, ValueError)):
+            AgentTranscriptSource(child.session_dir).refresh(recursive=True)
         assert list(outside.iterdir()) == []
     finally:
         store.close()

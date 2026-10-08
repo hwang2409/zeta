@@ -12,6 +12,7 @@ from rich.text import Text
 
 from ...protocol.types import StreamEvent, StreamEventType
 from .. import theme
+from ..cards.agent_sync import refresh_agent_cards
 from ..layout import CONTENT_MARGIN
 from ..render import render_event
 from .transcript import (
@@ -387,6 +388,19 @@ class TranscriptPresenter:
                 unit.refresh()
             self._tool_region.update(self._tool_region_renderable())
 
+    async def refresh_active_agent_transcripts(self) -> None:
+        """Refresh expanded child transcript tails outside the UI loop."""
+
+        await self.transcript.refresh_agent_transcripts()
+        if self._tool_region is not None:
+            units = list(self._tool_region_units.values())
+            refreshed = await refresh_agent_cards(unit.card for unit in units)
+            for unit, changed in zip(units, refreshed):
+                if changed:
+                    unit.refresh()
+            if any(refreshed):
+                self._tool_region.update(self._tool_region_renderable())
+
     def handle_tool_event(
         self,
         event: StreamEvent,
@@ -461,7 +475,14 @@ class TranscriptPresenter:
             lifecycle_key = _event_tool_lifecycle_key(event)
             unit = self._tool_region_units.get(lifecycle_key)
             if unit is not None and rendered is not None:
-                unit.finish(rendered, event, compact=False)
+                unit.finish(
+                    rendered,
+                    event,
+                    compact=False,
+                    on_final_tail=lambda: self._tool_region.update(
+                        self._tool_region_renderable()
+                    ) if self._tool_region is not None else None,
+                )
                 rendered = unit.renderable
         if rendered is not None:
             if self._full_screen_active() and event.tool_call is not None:

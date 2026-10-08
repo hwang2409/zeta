@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import platform
 import shutil
@@ -65,7 +66,9 @@ from .render import is_retryable_error, render_event
 from .user import displayed_user_text, user_message
 
 SPINNER_INTERVAL = 0.2
+AGENT_TRANSCRIPT_REFRESH_INTERVAL = 1.0
 CLIPBOARD_TIMEOUT = 5.0
+_LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "ComposerCompleter",
@@ -120,6 +123,7 @@ class TurnConsumerMixin:
         self._invalidate_prompt()
 
     async def _pulse_spinner(self) -> None:
+        last_agent_refresh = 0.0
         while True:
             try:
                 await asyncio.wait_for(
@@ -128,8 +132,19 @@ class TurnConsumerMixin:
             except TimeoutError:
                 if self._spinner_active:
                     self._spinner_frame += 1
-                    if self._presenter.has_active_agent:
-                        self._presenter.refresh_active_agents()
+                    now = asyncio.get_running_loop().time()
+                    if (
+                        self._presenter.has_active_agent
+                        and now - last_agent_refresh
+                        >= AGENT_TRANSCRIPT_REFRESH_INTERVAL
+                    ):
+                        try:
+                            await self._presenter.refresh_active_agent_transcripts()
+                        except Exception:
+                            if not getattr(self, "_agent_refresh_error_logged", False):
+                                _LOGGER.exception("active agent transcript refresh failed")
+                                self._agent_refresh_error_logged = True
+                        last_agent_refresh = now
                     self._invalidate_prompt()
             else:
                 self._spinner_reset.clear()
