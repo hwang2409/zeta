@@ -297,7 +297,10 @@ async def test_attention_fork_composition_cannot_write_project_memory(
         assert composition.loop.context_assembler.on_before_eviction is None
         assert "inbox" not in composition.loop.tool_registry.registered_names
         composition.opened.store.append_message(
-            Message(MessageRole.USER, [TextContent("fork-only discussion")])
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("fork-only discussion")]),
+                MessageOrigin.USER,
+            )
         )
         await asyncio.sleep(0)
         after = {
