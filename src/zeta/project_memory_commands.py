@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from .memory.reconciliation_state import TerminalReceipt
+from .memory.user_authorization import MemoryMutationAuthorization
 from .project_registry import ProjectRegistryError
 
 
@@ -36,6 +37,7 @@ def run_memory_command(
     project_id: str,
     args: str,
     reconciler: MemoryReconciler | None = None,
+    authorization: MemoryMutationAuthorization | None = None,
 ) -> str:
     """Run ``/memory`` actions shared by TUI and serve clients."""
     action = args.strip()
@@ -69,6 +71,7 @@ def run_memory_command(
             ]
             if len(matches) != 1:
                 return "memory retry: receipt not found or prefix is ambiguous"
+            _authorize(authorization, "retry", matches[0])
             if not reconciler.retry_terminal(matches[0]):
                 return "memory retry: receipt not found"
             return f"memory retry queued: {matches[0]}"
@@ -78,11 +81,13 @@ def run_memory_command(
                 if len(parts) > 2:
                     return usage
                 target = parts[1] if len(parts) == 2 else None
+                _authorize(authorization, "undo", target or "latest")
                 result = registry._undo_entry_transaction(project_id, target)
                 ids = ", ".join(result.receipts[0].target_ids)
                 return f"memory undo complete: {ids}" if ids else "memory undo complete"
             if action != "undo":
                 return usage
+            _authorize(authorization, "undo", "latest")
             restored = registry.undo_memory(project_id)
             names = ", ".join(name for name, _ in restored)
             return f"memory undo complete: {names}" if names else "memory undo complete"
@@ -90,6 +95,7 @@ def run_memory_command(
             name = action.removeprefix("accept ").strip()
             if not name or " " in name:
                 return usage
+            _authorize(authorization, "accept", name)
             if memory_format == 2:
                 registry._accept_memory_entry(project_id, name)
             else:
@@ -134,6 +140,16 @@ def run_memory_command(
     except ProjectRegistryError as exc:
         return f"memory: {exc}"
     return usage
+
+
+def _authorize(
+    authorization: MemoryMutationAuthorization | None, action: str, target: str
+) -> None:
+    if authorization is None:
+        raise ProjectRegistryError(
+            f"memory {action} is unavailable without direct user authorization"
+        )
+    authorization.authorize(action=action, target=target)
 
 
 __all__ = ["run_memory_command"]

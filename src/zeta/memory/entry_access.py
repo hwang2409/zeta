@@ -59,8 +59,8 @@ class EntryMemoryViewMixin:
                 "could not refresh project memory mirror at %s: %s", mirror_path, exc
             )
 
-    def _repair_entry_memory_mirror(self, project_id: str) -> None:
-        """Repair a fixture-created format-2 mirror without changing authority."""
+    def _entry_memory_state_for_context(self, project_id: str) -> EntryMemorySnapshot:
+        """Load format-2 context and best-effort repair its derived mirrors."""
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
@@ -70,6 +70,7 @@ class EntryMemoryViewMixin:
                     snapshot.state,
                     mirror_path=self.root / project_id / "memory",
                 )
+                return snapshot
             finally:
                 os.close(directory_fd)
 
@@ -132,7 +133,8 @@ class EntryMemoryViewMixin:
         return value
 
     def _entry_memory_mirrors(self, project_id: str) -> dict[str, str]:
-        return render_all_kinds(self._entry_memory_state(project_id).state)
+        snapshot = self._entry_memory_state_for_context(project_id)
+        return render_all_kinds(snapshot.state)
 
     def _entry_memory_log(
         self,

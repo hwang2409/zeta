@@ -8,13 +8,16 @@ from types import SimpleNamespace
 import pytest
 
 from zeta.cli import project as project_cli
-from zeta.cli.user_action import confirm_memory_accept
 from zeta.memory.entry_store import (
     AddOperation,
     MemoryEntry,
     MemoryKind,
     MemorySchema,
     MemorySource,
+)
+from zeta.memory.user_authorization import (
+    MemoryMutationAuthorization,
+    memory_accept_preview,
 )
 from zeta.project_errors import ProjectRegistryError
 from zeta.project_memory_commands import run_memory_command
@@ -132,11 +135,16 @@ def test_entry_commands_parse_targets_and_render_receipts(tmp_path: Path) -> Non
     assert state_id in log
     assert "add" in log
     assert state_id in run_memory_command(registry, project_id, "log state")
-    assert run_memory_command(registry, project_id, f"accept {state_id}") == (
+    authorization = MemoryMutationAuthorization.direct_slash()
+    assert run_memory_command(
+        registry, project_id, f"accept {state_id}", authorization=authorization
+    ) == (
         f"memory accepted: {state_id}"
     )
     assert registry._entry_memory_state(project_id).state.entries[state_id].accepted_by == "user"  # type: ignore[union-attr]
-    assert run_memory_command(registry, project_id, f"undo {state_id}") == (
+    assert run_memory_command(
+        registry, project_id, f"undo {state_id}", authorization=authorization
+    ) == (
         f"memory undo complete: {state_id}"
     )
 
@@ -172,7 +180,8 @@ def test_cli_format_two_render_set_and_import_internals(
 
     replacement = args()
     replacement.set = [("state", "Manual replacement")]
-    assert project_cli.run(replacement, stdout=io.StringIO(), stderr=io.StringIO()) == 0
+    monkeypatch.setattr(project_cli.sys, "stdin", _TTY("state\n"))
+    assert project_cli.run(replacement, stdout=_TTY(), stderr=io.StringIO()) == 0
     state = registry._entry_memory_state(project_id).state
     old_entry = state.entries[state_id]
     assert isinstance(old_entry, MemoryEntry) and old_entry.status == "superseded"
@@ -187,7 +196,8 @@ def test_cli_format_two_render_set_and_import_internals(
     imported_path.write_text("Imported decision")
     imported = args()
     imported.from_file = [("decisions", str(imported_path))]
-    assert project_cli.run(imported, stdout=io.StringIO(), stderr=io.StringIO()) == 0
+    monkeypatch.setattr(project_cli.sys, "stdin", _TTY("decisions\n"))
+    assert project_cli.run(imported, stdout=_TTY(), stderr=io.StringIO()) == 0
     structured = args()
     structured.json = True
     output = io.StringIO()
@@ -201,13 +211,10 @@ def test_cli_format_two_render_set_and_import_internals(
 def test_entry_accept_confirmation_targets_entry_id(tmp_path: Path) -> None:
     _, registry, project_id, state_id, _ = _fixture(tmp_path)
     output = _TTY()
-    confirm_memory_accept(
-        registry,
-        project_id,
-        state_id,
-        stdin=_TTY(state_id + "\n"),
-        stdout=output,
-    )
+    noun, preview = memory_accept_preview(registry, project_id, state_id)
+    MemoryMutationAuthorization.terminal(
+        stdin=_TTY(state_id + "\n"), stdout=output
+    ).authorize(action="accept", target=state_id, preview=preview, noun=noun)
     assert f"Automatic memory entry: {state_id}" in output.getvalue()
     assert "Automatic state" in output.getvalue()
 
@@ -216,13 +223,10 @@ def test_entry_accept_confirmation_cancellation_does_not_mutate(tmp_path: Path) 
     _, registry, project_id, state_id, _ = _fixture(tmp_path)
     before = registry._entry_memory_state(project_id).digest
     with pytest.raises(ProjectRegistryError, match="entry was not changed"):
-        confirm_memory_accept(
-            registry,
-            project_id,
-            state_id,
-            stdin=_TTY("no\n"),
-            stdout=_TTY(),
-        )
+        noun, preview = memory_accept_preview(registry, project_id, state_id)
+        MemoryMutationAuthorization.terminal(
+            stdin=_TTY("no\n"), stdout=_TTY()
+        ).authorize(action="accept", target=state_id, preview=preview, noun=noun)
     assert registry._entry_memory_state(project_id).digest == before
 
 
@@ -282,7 +286,7 @@ def test_entry_mirrors_are_repaired_and_edits_never_change_state(tmp_path: Path)
     mirror.chmod(0o600)
     mirror.write_text(_MEMORY_MIRROR_HEADER + "user edit\n")
     before = registry._entry_memory_state(project_id)
-    registry._repair_entry_memory_mirror(project_id)
+    registry._entry_memory_mirrors(project_id)
     after = registry._entry_memory_state(project_id)
     assert "user edit" not in mirror.read_text()
     assert after.digest == before.digest

@@ -8,6 +8,7 @@ import pytest
 
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.reconciler import ReconciliationResponse
+from zeta.memory.user_authorization import MemoryMutationAuthorization
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_registry import ProjectRegistry
 
@@ -986,7 +987,13 @@ async def test_explicit_retry_requeues_terminal_receipt(tmp_path: Path) -> None:
     listing = run_memory_command(registry, project_id, "retry", runner)
     assert receipt.key in listing
     valid = True
-    queued = run_memory_command(registry, project_id, f"retry {receipt.key[:12]}", runner)
+    queued = run_memory_command(
+        registry,
+        project_id,
+        f"retry {receipt.key[:12]}",
+        runner,
+        MemoryMutationAuthorization.direct_slash(),
+    )
     assert queued == f"memory retry queued: {receipt.key}"
     await runner.drain()
 

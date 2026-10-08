@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import IO, Any
 
 from ..core.session import env_home
+from ..memory.user_authorization import (
+    MemoryMutationAuthorization,
+    memory_accept_preview,
+)
 from ..project_registry import ProjectRegistry, ProjectRegistryError
-from .user_action import confirm_memory_accept
 
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 
@@ -109,8 +112,11 @@ def run(
                 if project is None:
                     raise ProjectRegistryError("no project associated with the current directory")
                 project_id = project.project_id
-                confirm_memory_accept(
-                    registry, project_id, args.remote, stdin=sys.stdin, stdout=out
+                noun, preview = memory_accept_preview(registry, project_id, args.remote)
+                MemoryMutationAuthorization.terminal(
+                    stdin=sys.stdin, stdout=out
+                ).authorize(
+                    action="accept", target=args.remote, preview=preview, noun=noun
                 )
                 if registry.memory_format(project_id) == 2:
                     registry._accept_memory_entry(project_id, args.remote)
@@ -128,8 +134,11 @@ def run(
                     if _PROJECT_ID.fullmatch(args.project)
                     else registry.show_project(name=args.project).project_id
                 )
-                confirm_memory_accept(
-                    registry, project_id, args.action, stdin=sys.stdin, stdout=out
+                noun, preview = memory_accept_preview(registry, project_id, args.action)
+                MemoryMutationAuthorization.terminal(
+                    stdin=sys.stdin, stdout=out
+                ).authorize(
+                    action="accept", target=args.action, preview=preview, noun=noun
                 )
                 if registry.memory_format(project_id) == 2:
                     registry._accept_memory_entry(project_id, args.action)
@@ -185,6 +194,15 @@ def run(
                     value_or_path
                     if args.set
                     else Path(value_or_path).expanduser().read_text(encoding="utf-8")
+                )
+                action = "set" if args.set else "import"
+                MemoryMutationAuthorization.terminal(
+                    stdin=sys.stdin, stdout=out
+                ).authorize(
+                    action=action,
+                    target=name,
+                    preview=content,
+                    noun="kind" if memory_format == 2 else "file",
                 )
                 if memory_format == 2:
                     registry._replace_entry_kind(project_id, name, content)

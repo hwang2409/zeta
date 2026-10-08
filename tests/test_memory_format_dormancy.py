@@ -13,6 +13,7 @@ from zeta.cli import project as project_cli
 from zeta.core.project_context import refresh_project_memory
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_store import MemoryKind, MemorySchema
+from zeta.memory.user_authorization import MemoryMutationAuthorization
 from zeta.memory.version_store import UNSUPPORTED_FORMAT_2
 from zeta.project_errors import UnsupportedMemoryFormatError
 from zeta.project_memory_commands import run_memory_command
@@ -160,12 +161,13 @@ def test_format_two_views_are_dormant_while_activation_paths_reject(
     assert UNSUPPORTED_FORMAT_2 in stderr.getvalue()
 
     reconciler = SimpleNamespace(terminal_receipts=lambda: (), retry_terminal=lambda key: False)
+    authorization = MemoryMutationAuthorization.direct_slash()
     assert run_memory_command(registry, project_id, "log", reconciler) == "memory log: empty"
     assert "no retained memory" in run_memory_command(
-        registry, project_id, "undo", reconciler
+        registry, project_id, "undo", reconciler, authorization
     )
     assert "missing entry" in run_memory_command(
-        registry, project_id, "accept m_" + "1" * 32, reconciler
+        registry, project_id, "accept m_" + "1" * 32, reconciler, authorization
     )
     assert "no terminal receipts" in run_memory_command(
         registry, project_id, "retry", reconciler

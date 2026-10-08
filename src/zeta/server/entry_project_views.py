@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -14,6 +15,10 @@ from zeta.server.protocol import FrameCodec
 MAX_DIFF_BYTES = 64 * 1024
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 1_000
+DEFAULT_VERSION_ENTRY_LIMIT = 25
+MAX_VERSION_ENTRY_LIMIT = 100
+DEFAULT_VERSION_SOURCE_LIMIT = 8
+MAX_VERSION_SOURCE_LIMIT = 64
 
 
 class EntryProjectViews:
@@ -64,7 +69,15 @@ class EntryProjectViews:
     ) -> dict[str, object]:
         self._only(
             params,
-            {"project_id", "offset", "limit", "version_id", "entry_id"},
+            {
+                "project_id",
+                "offset",
+                "limit",
+                "source_offset",
+                "source_limit",
+                "version_id",
+                "entry_id",
+            },
         )
         version = params.get("version_id")
         entry_id = params.get("entry_id")
@@ -91,8 +104,22 @@ class EntryProjectViews:
     ) -> dict[str, object]:
         if not isinstance(version, str) or not version:
             raise self.invalid("version_id must be a non-empty string")
-        if "offset" in params or "limit" in params:
-            raise self.invalid("offset and limit cannot be used with version_id")
+        offset = self._integer(params, "offset", 0, minimum=0)
+        limit = self._integer(
+            params,
+            "limit",
+            DEFAULT_VERSION_ENTRY_LIMIT,
+            minimum=1,
+            maximum=MAX_VERSION_ENTRY_LIMIT,
+        )
+        source_offset = self._integer(params, "source_offset", 0, minimum=0)
+        source_limit = self._integer(
+            params,
+            "source_limit",
+            DEFAULT_VERSION_SOURCE_LIMIT,
+            minimum=1,
+            maximum=MAX_VERSION_SOURCE_LIMIT,
+        )
         record, before, after = self.registry._entry_memory_version(
             project.project_id, version
         )
@@ -108,8 +135,12 @@ class EntryProjectViews:
             raise self.invalid(f"memory version does not touch entry: {entry_id}")
         if isinstance(entry_id, str):
             touched = {entry_id}
-        before_entries = self._entries(before.entries, touched)
-        after_entries = self._entries(after.entries, touched)
+        before_entries, before_count, before_next = self._entries(
+            before.entries, touched, offset, limit, source_offset, source_limit
+        )
+        after_entries, after_count, after_next = self._entries(
+            after.entries, touched, offset, limit, source_offset, source_limit
+        )
         before_text = "\n".join(render_all_kinds(before).values())
         after_text = "\n".join(render_all_kinds(after).values())
         diff = "".join(
@@ -125,7 +156,13 @@ class EntryProjectViews:
             "version": {
                 **record,
                 "before_entries": before_entries,
+                "before_entries_count": before_count,
+                "before_entries_offset": offset,
+                "before_entries_next_offset": before_next,
                 "after_entries": after_entries,
+                "after_entries_count": after_count,
+                "after_entries_offset": offset,
+                "after_entries_next_offset": after_next,
                 "diff": diff,
                 "diff_truncated": truncated,
             }
@@ -134,12 +171,34 @@ class EntryProjectViews:
         return result
 
     @staticmethod
-    def _entries(entries: dict[str, object], touched: set[str]) -> list[dict[str, object]]:
-        return [
-            entry_value(entry)
+    def _entries(
+        entries: dict[str, object],
+        touched: set[str],
+        offset: int,
+        limit: int,
+        source_offset: int,
+        source_limit: int,
+    ) -> tuple[list[dict[str, object]], int, int | None]:
+        available = [
+            entry
             for key in sorted(touched)
             if isinstance((entry := entries.get(key)), MemoryEntry)
         ]
+        selected: list[dict[str, object]] = []
+        for entry in available[offset : offset + limit]:
+            value = entry_value(entry)
+            sources = value["sources"]
+            assert isinstance(sources, list)
+            value["sources_count"] = len(sources)
+            value["sources"] = sources[source_offset : source_offset + source_limit]
+            source_end = source_offset + len(value["sources"])
+            value["sources_offset"] = source_offset
+            value["sources_next_offset"] = (
+                source_end if source_end < len(sources) else None
+            )
+            selected.append(value)
+        end = offset + len(selected)
+        return selected, len(available), end if end < len(available) else None
 
     def _fit_version(self, request_id: str | int, result: dict[str, object]) -> None:
         detail = result["version"]
@@ -151,13 +210,41 @@ class EntryProjectViews:
                 detail["diff_truncated"] = True
                 continue
             entries = [*detail["before_entries"], *detail["after_entries"]]
+            with_sources = [entry for entry in entries if entry.get("sources")]
+            if with_sources:
+                largest = max(
+                    with_sources,
+                    key=lambda item: len(json.dumps(item["sources"]).encode()),
+                )
+                sources = largest["sources"]
+                assert isinstance(sources, list)
+                sources.pop()
+                largest["sources_next_offset"] = (
+                    int(largest["sources_offset"]) + len(sources)
+                )
+                continue
             texts = [entry for entry in entries if entry.get("text")]
-            if not texts:
+            if texts:
+                largest = max(texts, key=lambda item: len(str(item["text"]).encode()))
+                text = str(largest["text"])
+                largest["text"], _ = _truncate_utf8(
+                    text, len(text.encode()) // 2
+                )
+                largest["text_truncated"] = True
+                continue
+            removed = False
+            for key in ("after_entries", "before_entries"):
+                values = detail[key]
+                assert isinstance(values, list)
+                if values:
+                    values.pop()
+                    detail[f"{key}_next_offset"] = int(detail[f"{key}_offset"]) + len(
+                        values
+                    )
+                    removed = True
+                    break
+            if not removed:
                 raise RuntimeError("memory version metadata exceeds the frame limit")
-            largest = max(texts, key=lambda item: len(str(item["text"]).encode()))
-            text = str(largest["text"])
-            largest["text"], _ = _truncate_utf8(text, len(text.encode()) // 2)
-            largest["text_truncated"] = True
 
     def _page(
         self,

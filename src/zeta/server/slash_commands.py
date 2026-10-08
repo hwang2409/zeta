@@ -24,6 +24,7 @@ from ..core.slash import (
 )
 from ..core.todo import todo_count_tuple
 from ..mcp.prompt_commands import SlashPromptError
+from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
@@ -255,7 +256,13 @@ class ServerSlashSession:
         registry = runtime.manager.project_registry
         loop = getattr(runtime, "loop", None)
         reconciler = loop.memory_reconciler if loop is not None else None
-        return run_memory_command(registry, project_id, args, reconciler)
+        return run_memory_command(
+            registry,
+            project_id,
+            args,
+            reconciler,
+            MemoryMutationAuthorization.direct_slash(),
+        )
 
     def slash_tools(self, args: str) -> str:
         del args

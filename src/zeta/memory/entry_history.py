@@ -33,6 +33,7 @@ from zeta.memory.entry_store import (
 from zeta.memory.entry_store import (
     MemoryState as EntryMemoryState,
 )
+from zeta.memory.entry_undo import plan_entry_transaction_undo
 from zeta.memory.version_store import (
     PreparedVersion,
     PublicationContext,
@@ -412,8 +413,11 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                     directory_fd, create=False
                 )
                 try:
+                    history = list(pointer["history"])
                     target: dict[str, object] | None = None
-                    for version in reversed(pointer["history"]):
+                    target_index = -1
+                    for index in range(len(history) - 1, -1, -1):
+                        version = history[index]
                         record = self._manifest(versions_fd, version)
                         receipts = (
                             self._entry_receipts(record)
@@ -430,28 +434,39 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                             )
                         if matches:
                             target = record
+                            target_index = index
                             break
                     if target is None:
                         raise ProjectRegistryError(
                             "no retained memory transaction matches that target"
                         )
-                    restored, _ = self._entry_blob(
+                    before, _ = self._entry_blob(
                         blobs_fd, target.get("before_snapshot")
                     )
+                    after, _ = self._entry_blob(blobs_fd, target.get("snapshot"))
+                    later_receipts = tuple(
+                        receipt
+                        for version in history[target_index + 1 :]
+                        for record in (self._manifest(versions_fd, version),)
+                        if record.get("format") == 2
+                        for receipt in self._entry_receipts(record)
+                    )
+                    target_receipts = self._entry_receipts(target)
                 finally:
                     os.close(versions_fd)
                     os.close(blobs_fd)
                     os.close(root)
+                plan = plan_entry_transaction_undo(
+                    current=current.state,
+                    before=before,
+                    after=after,
+                    target_receipts=target_receipts,
+                    later_receipts=later_receipts,
+                )
                 ids = (
                     (target_id,)
                     if target_id is not None and target_id.startswith("m_")
-                    else tuple(
-                        dict.fromkeys(
-                            entry_id
-                            for item in self._entry_receipts(target)
-                            for entry_id in (*item.target_ids, *item.result_ids)
-                        )
-                    )
+                    else plan.target_ids
                 )
                 receipt = OperationReceipt(
                     new_operation_id(),
@@ -462,12 +477,9 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                     None,
                     False,
                 )
-                restored = dataclasses.replace(
-                    restored, generation=current.state.generation + 1
-                )
                 published = self._publish_entry_version(
                     directory_fd,
-                    state=restored,
+                    state=plan.state,
                     before=current.state,
                     kind="entry-undo",
                     receipts=(receipt,),
