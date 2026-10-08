@@ -41,6 +41,8 @@ _KIND_KEY = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 _ENTRY_ID = re.compile(r"m_[0-9a-f]{32}")
 _OPERATION_ID = re.compile(r"op_[0-9a-f]{32}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
+_VERSION_ID = re.compile(r"[0-9a-f]{32}")
+_PROJECT_ID = re.compile(r"p_[0-9a-f]{32}")
 _ALLOWED_ORIGINS = {origin.value for origin in MessageOrigin}
 
 
@@ -213,6 +215,10 @@ def _fail(message: str) -> None:
     raise ProjectRegistryError(message)
 
 
+def _matches(pattern: re.Pattern[str], value: object) -> bool:
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
 def _timestamp(value: str | None, *, optional: bool = False) -> None:
     if value is None and optional:
         return
@@ -244,7 +250,7 @@ def validate_schema(schema: MemorySchema) -> None:
         _fail("invalid memory schema kinds")
     seen: set[str] = set()
     for kind in schema.kinds:
-        if not _KIND_KEY.fullmatch(kind.key) or kind.key in seen:
+        if not _matches(_KIND_KEY, kind.key) or kind.key in seen:
             _fail("invalid memory kind key")
         seen.add(kind.key)
         _safe_text(kind.name, maximum=64, label="kind name")
@@ -278,14 +284,21 @@ def _validate_source(source: MemorySource) -> None:
 
 
 def _validate_entry(entry: MemoryEntry, state: MemoryState, kinds: set[str]) -> None:
-    if not _ENTRY_ID.fullmatch(entry.id) or entry.project_id != state.project_id:
+    if not _matches(_ENTRY_ID, entry.id) or entry.project_id != state.project_id:
         _fail("invalid memory entry identity")
-    if entry.kind not in kinds or entry.representation not in {"entry", "legacy_document"}:
+    if (
+        not isinstance(entry.kind, str)
+        or entry.kind not in kinds
+        or not isinstance(entry.representation, str)
+        or entry.representation not in {"entry", "legacy_document"}
+    ):
         _fail("invalid memory entry kind or representation")
     _safe_text(entry.text, maximum=MAX_ENTRY_TEXT_BYTES, label="entry text")
     if contains_secret(entry.text):
         _fail("memory entry text contains a secret")
-    if entry.status not in {"active", "superseded", "resolved", "expired"}:
+    if not isinstance(entry.status, str) or entry.status not in {
+        "active", "superseded", "resolved", "expired"
+    }:
         _fail("invalid memory entry status")
     for value in (entry.created_at, entry.updated_at, entry.seen_at, entry.valid_from):
         _timestamp(value)
@@ -295,33 +308,40 @@ def _validate_entry(entry: MemoryEntry, state: MemoryState, kinds: set[str]) -> 
         _fail("invalid memory entry provenance")
     if (entry.accepted_at is None) != (entry.accepted_by is None):
         _fail("invalid memory entry acceptance")
-    if entry.accepted_by not in {None, "user"}:
+    if entry.accepted_by is not None and entry.accepted_by != "user":
         _fail("invalid memory entry acceptance")
     if len(entry.sources) > MAX_SOURCES_PER_ENTRY:
         _fail("too many memory entry sources")
     for source in entry.sources:
         _validate_source(source)
+    if any(
+        not _matches(_ENTRY_ID, item)
+        for item in (*entry.supersedes, *entry.superseded_by)
+    ):
+        _fail("invalid memory entry link")
     if len(set(entry.supersedes)) != len(entry.supersedes) or len(
         set(entry.superseded_by)
     ) != len(entry.superseded_by):
         _fail("duplicate memory entry link")
     if entry.id in entry.supersedes or entry.id in entry.superseded_by:
         _fail("cyclic memory entry link")
-    if not _OPERATION_ID.fullmatch(entry.last_operation_id):
+    if not _matches(_OPERATION_ID, entry.last_operation_id):
         _fail("invalid memory operation identity")
 
 
 def validate_state(state: MemoryState) -> None:
-    if state.format != 2 or not re.fullmatch(r"p_[0-9a-f]{32}", state.project_id):
+    if state.format != 2 or not _matches(_PROJECT_ID, state.project_id):
         _fail("invalid format-2 memory state")
     if type(state.generation) is not int or state.generation < 0:
         _fail("invalid memory generation")
-    if state.compacted_through_version is not None and not re.fullmatch(
-        r"[0-9a-f]{32}", state.compacted_through_version
+    if state.compacted_through_version is not None and not _matches(
+        _VERSION_ID, state.compacted_through_version
     ):
         _fail("invalid memory compaction version")
+    if not isinstance(state.schema, MemorySchema):
+        _fail("invalid memory schema")
     validate_schema(state.schema)
-    if len(state.entries) > MAX_ENTRIES:
+    if not isinstance(state.entries, dict) or len(state.entries) > MAX_ENTRIES:
         _fail("too many memory entries")
     kinds = {kind.key for kind in state.schema.kinds}
     graph: dict[str, set[str]] = {}
@@ -329,7 +349,7 @@ def validate_state(state: MemoryState) -> None:
         if entry_id != entry.id:
             _fail("invalid memory entry map key")
         if isinstance(entry, MissingEntry):
-            if not _ENTRY_ID.fullmatch(entry.id):
+            if not _matches(_ENTRY_ID, entry.id):
                 _fail("invalid missing memory entry")
             continue
         if not isinstance(entry, MemoryEntry):
@@ -482,8 +502,12 @@ def state_from_bytes(payload: bytes) -> MemoryState:
             continue
         value = _exact_dict(item, entry_fields, "memory entry")
         sources_raw = value["sources"]
-        if not isinstance(sources_raw, list):
-            _fail("invalid memory entry sources")
+        if (
+            not isinstance(sources_raw, list)
+            or not isinstance(value["supersedes"], list)
+            or not isinstance(value["superseded_by"], list)
+        ):
+            _fail("invalid memory entry links or sources")
         sources = tuple(
             MemorySource(
                 **{
@@ -537,6 +561,10 @@ def receipt_from_dict(value: object) -> OperationReceipt:
         {"operation_id", "type", "target_ids", "result_ids", "reason", "reconciliation_key", "automatic"},
         "memory operation receipt",
     )
+    if not isinstance(raw["target_ids"], list) or not isinstance(
+        raw["result_ids"], list
+    ):
+        _fail("invalid memory operation receipt entries")
     receipt = OperationReceipt(
         operation_id=raw["operation_id"],
         type=raw["type"],
@@ -551,14 +579,16 @@ def receipt_from_dict(value: object) -> OperationReceipt:
 
 
 def validate_receipt(receipt: OperationReceipt) -> None:
-    if not _OPERATION_ID.fullmatch(receipt.operation_id) or receipt.type not in {
+    if not _matches(_OPERATION_ID, receipt.operation_id) or not isinstance(
+        receipt.type, str
+    ) or receipt.type not in {
         "add", "update", "supersede", "resolve", "expire", "accept", "undo"
     }:
         _fail("invalid memory operation receipt")
-    if any(not _ENTRY_ID.fullmatch(item) for item in (*receipt.target_ids, *receipt.result_ids)):
+    if any(not _matches(_ENTRY_ID, item) for item in (*receipt.target_ids, *receipt.result_ids)):
         _fail("invalid memory operation receipt entry")
     _safe_text(receipt.reason, maximum=MAX_REASON_BYTES, label="operation reason")
-    if receipt.reconciliation_key is not None and not _DIGEST.fullmatch(receipt.reconciliation_key):
+    if receipt.reconciliation_key is not None and not _matches(_DIGEST, receipt.reconciliation_key):
         _fail("invalid memory reconciliation key")
     if type(receipt.automatic) is not bool:
         _fail("invalid memory operation provenance")
@@ -665,7 +695,7 @@ def apply_operations(
     canonical_state_bytes(state)
     if not operations or len(operations) > MAX_OPERATIONS:
         _fail("invalid memory operation group")
-    if reconciliation_key is not None and not _DIGEST.fullmatch(reconciliation_key):
+    if reconciliation_key is not None and not _matches(_DIGEST, reconciliation_key):
         _fail("invalid memory reconciliation key")
     now = now or utc_now()
     _timestamp(now)
@@ -677,14 +707,14 @@ def apply_operations(
         if automatic and operation_sources == ():
             _fail("automatic memory operation requires durable sources")
         operation_id = operation_id_factory()
-        if not _OPERATION_ID.fullmatch(operation_id):
+        if not _matches(_OPERATION_ID, operation_id):
             _fail("invalid generated memory operation identity")
         targets: tuple[str, ...] = ()
         results: tuple[str, ...] = ()
         if isinstance(operation, AddOperation):
             _check_evidence(operation.sources, evidence)
             entry_id = entry_id_factory()
-            if entry_id in entries or not _ENTRY_ID.fullmatch(entry_id):
+            if entry_id in entries or not _matches(_ENTRY_ID, entry_id):
                 _fail("invalid generated memory entry identity")
             entry = _new_entry(
                 project_id=state.project_id, kind=operation.kind, text=operation.text,
@@ -741,7 +771,7 @@ def apply_operations(
             old_entries = tuple(_active(entries, entry_id) for entry_id in operation.entry_ids)
             _check_evidence(operation.sources, evidence)
             entry_id = entry_id_factory()
-            if entry_id in entries or not _ENTRY_ID.fullmatch(entry_id):
+            if entry_id in entries or not _matches(_ENTRY_ID, entry_id):
                 _fail("invalid generated memory entry identity")
             replacement = _new_entry(
                 project_id=state.project_id, kind=operation.kind, text=operation.text,

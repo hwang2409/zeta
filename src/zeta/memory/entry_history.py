@@ -224,7 +224,9 @@ class EntryMemoryHistoryMixin:
         evidence: tuple[str, int, int] | None = None,
     ) -> EntryCASResult:
         """Apply one dormant format-2 transaction."""
-        if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        if not isinstance(expected_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", expected_digest
+        ):
             raise ProjectRegistryError("invalid memory digest")
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
