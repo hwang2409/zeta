@@ -15,7 +15,7 @@ _zeta() {
     local -a commands session_verbs automation_verbs project_verbs project_index_verbs webhook_verbs mcp_verbs original_words
     typeset -A opt_args
     commands=(login serve session project inbox panel automation mcp stalls completion)
-    session_verbs=(list rename delete export stats push pull)
+    session_verbs=(list rename delete export push pull)
     automation_verbs=(list show approve disable import daemon webhook)
     project_verbs=(create init discover list show memory index)
     project_index_verbs=(status rebuild search)

@@ -14,7 +14,6 @@ from zeta.core.context import (
     CompactionPolicy,
     ContextAssembler,
     StaleBranchError,
-    SummaryInputTooLarge,
     SummaryCompletionError,
 )
 from zeta.context_accounting import (
@@ -1084,18 +1083,6 @@ async def test_stale_branch_discards_summary(context_root: Path) -> None:
     assert not any(entry.type == "compaction" for entry in store.entries)
 
 
-@pytest.mark.asyncio
-async def test_summary_source_bound_rejects_large_input(context_root: Path) -> None:
-    backend = FakeBackend([ScriptedTurn([TextContent("unused")])])
-    policy = CompactionPolicy(backend)
-
-    with pytest.raises(SummaryInputTooLarge):
-        await policy.summarize(
-            [text(MessageRole.USER, "x" * 200)],
-            max_source_tokens=10,
-        )
-
-    assert backend.calls == []
 
 
 @pytest.mark.asyncio
@@ -1216,7 +1203,7 @@ async def test_summary_aclose_error_propagates_after_success() -> None:
             return ClosingStream()
 
     with pytest.raises(RuntimeError, match="close failed"):
-        await CompactionPolicy(Backend()).summarize([text(MessageRole.USER, "source")])
+        await CompactionPolicy(Backend()).summarize_chunked([text(MessageRole.USER, "source")])
 
 
 @pytest.mark.asyncio
@@ -1246,7 +1233,7 @@ async def test_summary_aclose_cancellation_propagates_after_success() -> None:
             return ClosingStream()
 
     task = asyncio.create_task(
-        CompactionPolicy(Backend()).summarize([text(MessageRole.USER, "source")])
+        CompactionPolicy(Backend()).summarize_chunked([text(MessageRole.USER, "source")])
     )
     await close_started.wait()
     task.cancel()
@@ -1275,7 +1262,7 @@ async def test_summary_provider_error_stays_primary_when_aclose_fails() -> None:
             return ClosingStream()
 
     with pytest.raises(SummaryCompletionError, match="provider failed") as raised:
-        await CompactionPolicy(Backend()).summarize([text(MessageRole.USER, "source")])
+        await CompactionPolicy(Backend()).summarize_chunked([text(MessageRole.USER, "source")])
     assert raised.value.code == "provider_failed"
 
 
@@ -1469,7 +1456,7 @@ async def test_compaction_discards_partial_output_before_provider_retry() -> Non
             yield StreamEvent(StreamEventType.ASSISTANT_RESET)
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fresh")
 
-    summary = await CompactionPolicy(RetryBackend()).summarize(
+    summary = await CompactionPolicy(RetryBackend()).summarize_chunked(
         [text(MessageRole.USER, "source")]
     )
 

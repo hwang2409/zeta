@@ -96,7 +96,6 @@ def fallback_summary(source: str, *, max_chars: int) -> str:
 import asyncio
 import logging
 from collections.abc import Callable, Sequence
-from math import ceil
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -197,40 +196,6 @@ class CompactionPolicy:
     ) -> None:
         self.backend = backend
         self.summary_prompt = summary_prompt
-
-    async def summarize(
-        self,
-        messages: Sequence[Message],
-        *,
-        backend: CompletionBackend | None = None,
-        system_prompt: Message | None = None,
-        max_source_tokens: int | None = None,
-        on_success: Callable[[], None] | None = None,
-        on_usage: Callable[[Mapping[str, Any]], None] | None = None,
-    ) -> str:
-        completion_backend = backend or self.backend
-        if completion_backend is None:
-            raise SummaryCompletionError("compaction requires a completion backend")
-        sanitized_messages = [_strip_thinking(message) for message in messages]
-        source = json.dumps(
-            [_summary_message(message) for message in sanitized_messages],
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        source_tokens = max(1, ceil(len(source) / 4))
-        if max_source_tokens is not None and source_tokens > max_source_tokens:
-            raise SummaryInputTooLarge(
-                f"summary source is too large: {source_tokens} tokens "
-                f"exceeds {max_source_tokens}"
-            )
-        return await self._complete_source(
-            source,
-            max_chars=max_source_tokens * 4 if max_source_tokens is not None else 3_000,
-            backend=backend,
-            system_prompt=system_prompt,
-            on_success=on_success,
-            on_usage=on_usage,
-        )
 
     async def summarize_chunked(
         self,
