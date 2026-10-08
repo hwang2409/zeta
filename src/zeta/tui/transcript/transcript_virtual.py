@@ -443,7 +443,7 @@ class TranscriptVirtualMixin:
                 for match_line, first, last in occurrence.ranges:
                     if match_line != unit_line:
                         continue
-                    style = (
+                    style = theme.prompt_toolkit_style(
                         theme.SEARCH_CURRENT
                         if match_index == self._search_index
                         else theme.SEARCH_MATCH

@@ -209,6 +209,27 @@ def active_palette() -> Palette:
     return _ACTIVE
 
 
+def prompt_toolkit_style(style: str) -> str:
+    """Convert a shared Rich style to prompt-toolkit inline syntax.
+
+    Rich spells a background as ``on <color>``. Prompt-toolkit instead uses
+    ``bg:<color>`` and otherwise accepts the style tokens used by our themes.
+    """
+
+    tokens = style.split()
+    converted: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "on" and index + 1 < len(tokens):
+            converted.append(f"bg:{tokens[index + 1]}")
+            index += 2
+            continue
+        converted.append(token)
+        index += 1
+    return " ".join(converted)
+
+
 def set_active_palette(palette: Palette) -> None:
     """Rebuild every module-level style token from ``palette``.
 
