@@ -11,7 +11,6 @@ from pathlib import Path
 
 from prompt_toolkit.enums import EditingMode
 
-from ...computer.session import ComputerSession
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
 from ...core.session import SessionError, normalize_session_name
@@ -41,9 +40,6 @@ def _validate_model_name(provider: str, model: str) -> None:
 class SlashHandlerMixin:
     """Serve the session-state slash commands the registry dispatches."""
 
-    # Set by ``create_app`` for a computer session.
-    computer_session: ComputerSession | None = None
-    computer_requested = False
 
     async def slash_approve(self, args: str) -> str:
         """Approve the first pending request, or the request with this key."""
@@ -399,30 +395,6 @@ class SlashHandlerMixin:
             )
         self.request_new_session()
         return "starting a fresh session..."
-
-    def slash_computer(self, args: str) -> str:
-        """Reopen this session as a computer session, or show its links."""
-
-        if args.strip():
-            return "computer unchanged: /computer does not accept arguments"
-        if self.computer_session is not None:
-            return "\n".join(self.computer_session.notices)
-        if self.ephemeral_root is not None:
-            return (
-                "computer unchanged: an ephemeral session cannot be reopened; "
-                "start one with zeta --computer"
-            )
-        if self.active or self.pending_approvals:
-            return (
-                "computer unchanged: cannot start computer use while a turn or "
-                "approval is active"
-            )
-        self.computer_requested = True
-        self.request_exit()
-        return (
-            "reopening this session for computer use; host tools will be hidden "
-            "for the rest of the session"
-        )
 
     def slash_name(self, args: str) -> str:
         """Persist a session label shown in the resume picker."""

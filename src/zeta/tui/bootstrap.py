@@ -10,8 +10,6 @@ from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 
-from ..computer.session import ComputerSession
-from ..computer.session import prepare_args as prepare_computer_args
 from ..config.settings import ResolvedConfig, SettingsError
 from ..config.settings import resolve as resolve_settings
 from ..core.project_context import (
@@ -209,10 +207,6 @@ def _create_app_with_root(
         )
     except PromptArgumentError as exc:
         raise SessionError(str(exc)) from exc
-    try:
-        prepare_computer_args(args)
-    except ValueError as exc:
-        raise SessionError(str(exc)) from exc
     invocation_cwd = Path.cwd()
     continue_session = getattr(args, "continue_session", False)
     resume_id = getattr(args, "resume", None)
@@ -399,18 +393,6 @@ def _create_app_with_root(
     selected_model = composition.model
     external_tools = composition.external_tools
     budget_pinned = composition.budget_pinned
-    computer = None
-    if getattr(args, "computer", False):
-        try:
-            computer = ComputerSession.attach(
-                loop,
-                approval_policy,
-                home=home,
-                backend=getattr(args, "computer_backend", None),
-            )
-        except ValueError as exc:
-            raise SessionError(str(exc)) from exc
-        cleanup.callback(computer.stop_spectator)
     theme_notices = _apply_startup_theme(config.theme, home)
     _validate_keybindings(config.keybindings)
     startup_notices = (
@@ -418,7 +400,6 @@ def _create_app_with_root(
         + project_context.notices
         + external_tools.notices
         + theme_notices
-        + (computer.notices if computer is not None else ())
     )
     startup_warnings = tuple(loaded_settings.warnings) + external_tools.warnings
     if ephemeral:
@@ -465,7 +446,6 @@ def _create_app_with_root(
         project_eligible=discovery.eligible and discovery.primary_root is not None,
         resumed=resuming,
     )
-    app.computer_session = computer
     if composition.memory_reconciler is not None:
         composition.memory_reconciler.notice = app._print_system
     return app

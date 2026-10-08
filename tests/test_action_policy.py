@@ -253,8 +253,8 @@ def test_existing_tool_payloads_match_pre_action_policy_snapshots(
 def test_capability_selector_parser_normalizes_bare_action_and_mcp_names() -> None:
     assert str(parse_tool_selector("agent")) == "agent"
     assert str(parse_tool_selector("agent(status)")) == "agent(status)"
-    assert str(parse_tool_selector("computer__click")) == "computer__click"
-    assert str(parse_tool_selector("computer__*")) == "computer__*"
+    assert str(parse_tool_selector("remote__click")) == "remote__click"
+    assert str(parse_tool_selector("remote__*")) == "remote__*"
 
 
 @pytest.mark.parametrize("selector", ["agent()", "agent(status|output)", "agent(status *)"])
