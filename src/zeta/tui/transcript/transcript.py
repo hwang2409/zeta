@@ -199,7 +199,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._search_active = False
         self._search_query = ""
         self._search_index = 0
-        self._search_anchor_unit: _TranscriptUnit | None = None
+        self._search_anchor_key: int | None = None
         self._search_cache: OrderedDict[tuple[int, int, str], list[SearchMatch]] = (
             OrderedDict()
         )
@@ -605,15 +605,15 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._search_active = True
         self._search_query = ""
         self._search_index = 0
-        self._search_anchor_unit = None
+        self._search_anchor_key = None
         self._render_cache.clear()
         self._highlight_cache = None
 
-    def update_search(self, query: str, *, anchor_unit: _TranscriptUnit | None = None) -> None:
+    def update_search(self, query: str, *, anchor_key: int | None = None) -> None:
         self._search_active = True
         self._search_query = query
         self._search_index = 0
-        self._search_anchor_unit = anchor_unit
+        self._search_anchor_key = anchor_key
         self._parsed_cache.clear()
         self._search_cache.clear()
         self._highlight_cache = None
@@ -627,7 +627,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._search_active = False
         self._search_query = ""
         self._search_index = 0
-        self._search_anchor_unit = None
+        self._search_anchor_key = None
         self._render_cache.clear()
         self._parsed_cache.clear()
         self._highlight_cache = None
@@ -680,7 +680,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
 
     def _focus_search_match(self) -> None:
         matches = self._search_matches()
-        if not matches or self._search_anchor_unit is not None:
+        if not matches or self._search_anchor_key is not None:
             return
         if self._uses_virtual_history():
             self._focus_virtual_search_match()
@@ -712,18 +712,18 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
 
     def next_search_match(self) -> bool:
         matches = self._search_matches()
-        if not matches or self._search_anchor_unit is not None:
+        if not matches:
             return False
-        self._search_index = (self._search_index + 1) % len(matches)
+        self._search_index = self._search_navigation_index(matches, forward=True)
         self._refresh_search_render_cache()
         self._focus_search_match()
         return True
 
     def previous_search_match(self) -> bool:
         matches = self._search_matches()
-        if not matches or self._search_anchor_unit is not None:
+        if not matches:
             return False
-        self._search_index = (self._search_index - 1) % len(matches)
+        self._search_index = self._search_navigation_index(matches, forward=False)
         self._refresh_search_render_cache()
         self._focus_search_match()
         return True

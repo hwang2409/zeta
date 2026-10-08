@@ -384,6 +384,114 @@ async def test_virtual_accept_stays_on_target_while_search_index_builds() -> Non
     assert transcript._virtual_start[0] == transcript._units.index(later)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forward", [True, False])
+async def test_removed_virtual_search_anchor_keeps_navigation_working(
+    forward: bool,
+) -> None:
+    transcript = TranscriptWidget()
+    earlier = transcript.append(Text("an earlier zebra match"))
+    for index in range(199):
+        transcript.append(Text(f"filler {index}"))
+    target = transcript.append(Text("the selected zebra target"))
+    transcript.append(Text("nearest surviving message"))
+    for index in range(198):
+        transcript.append(Text(f"tail {index}"))
+    later = transcript.append(Text("a later zebra match"))
+    transcript.create_content(80, 1)
+
+    _open_finder(transcript)
+    _rank_finder(transcript, "zebra")
+    state = transcript.finder_state()
+    assert state is not None
+    selected = next(
+        index
+        for index, row in enumerate(state.rows)
+        if row.candidate.key == target.key
+    )
+    transcript.finder_move(selected)
+
+    assert transcript.finder_accept()
+    transcript.remove(target)
+    viewport = transcript._virtual_start
+    transcript.create_content(80, 1)
+    deadline = asyncio.get_running_loop().time() + 5
+    while not transcript._virtual_search_complete:
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.001)
+
+    assert transcript._virtual_start == viewport
+    navigate = (
+        transcript.next_search_match if forward else transcript.previous_search_match
+    )
+    assert navigate()
+    assert transcript._virtual_start is not None
+    expected = later if forward else earlier
+    assert transcript._virtual_start[0] == transcript._units.index(expected)
+
+
+@pytest.mark.parametrize("forward", [True, False])
+def test_removed_eager_search_anchor_keeps_navigation_working(
+    forward: bool,
+) -> None:
+    transcript = TranscriptWidget()
+    earlier = transcript.append(Text("an earlier zebra match"))
+    target = transcript.append(Text("the selected zebra target"))
+    following = transcript.append(Text("nearest surviving message"))
+    later = transcript.append(Text("a later zebra match"))
+    for index in range(5):
+        transcript.append(Text(f"tail {index}"))
+    transcript.create_content(80, 1)
+
+    _open_finder(transcript)
+    _rank_finder(transcript, "zebra")
+    state = transcript.finder_state()
+    assert state is not None
+    selected = next(
+        index
+        for index, row in enumerate(state.rows)
+        if row.candidate.key == target.key
+    )
+    transcript.finder_move(selected)
+
+    assert transcript.finder_accept()
+    transcript.remove(target)
+    viewport_unit = transcript._locations(80)[transcript.scroll_offset][0]
+    assert viewport_unit is following
+    navigate = (
+        transcript.next_search_match if forward else transcript.previous_search_match
+    )
+    assert navigate()
+    expected = later if forward else earlier
+    assert transcript._locations(80)[transcript.scroll_offset][0] is expected
+
+
+def test_removed_search_anchor_resolves_when_indexing_has_not_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("an earlier zebra match"))
+    target = transcript.append(Text("the selected zebra target"))
+    following = transcript.append(Text("nearest surviving message"))
+    later = transcript.append(Text("a later zebra match"))
+    for index in range(5):
+        transcript.append(Text(f"tail {index}"))
+    transcript.create_content(80, 1)
+    transcript.jump_to_index(transcript._units.index(target))
+
+    original_focus = transcript._focus_search_match
+    monkeypatch.setattr(transcript, "_focus_search_match", lambda: None)
+    transcript.begin_search()
+    transcript.update_search("zebra", anchor_key=target.key)
+    transcript.remove(target)
+    monkeypatch.setattr(transcript, "_focus_search_match", original_focus)
+
+    viewport_unit = transcript._locations(80)[transcript.scroll_offset][0]
+    assert viewport_unit is following
+    assert transcript.next_search_match()
+    assert transcript._locations(80)[transcript.scroll_offset][0] is later
+
+
 def test_candidate_worker_request_contains_only_immutable_plain_data() -> None:
     transcript = TranscriptWidget()
     transcript.append(Text("plain candidate"))

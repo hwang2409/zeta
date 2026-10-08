@@ -179,7 +179,7 @@ class TranscriptFinderMixin:
         query = self._finder.query
         if row is None:
             return False
-        unit_index = self._resolve_finder_unit(row.candidate)
+        unit_index = self._resolve_unit_key(row.candidate.key)
         if unit_index is None:
             return False
         self._finder = None
@@ -188,7 +188,7 @@ class TranscriptFinderMixin:
         literal = highlight_literal(query, row.candidate.text) if query else None
         if literal and self._unit_contains_literal(unit_index, literal):
             self.begin_search()
-            self.update_search(literal, anchor_unit=self._units[unit_index])
+            self.update_search(literal, anchor_key=self._units[unit_index].key)
             self._focus_search_on_unit(unit_index)
         return True
 
@@ -288,20 +288,6 @@ class TranscriptFinderMixin:
             )
         return candidates
 
-    def _resolve_finder_unit(self, candidate: Candidate) -> int | None:
-        """Resolve a stable key, or choose its next logical surviving neighbour."""
-
-        previous: int | None = None
-        for index, unit in enumerate(self._units):
-            if unit is None or unit.value is None:
-                continue
-            if unit.key == candidate.key:
-                return index
-            if unit.key > candidate.key:
-                return index
-            previous = index
-        return previous
-
     def _unit_contains_literal(self, unit_index: int, literal: str) -> bool:
         """Return whether the resolved live unit contains the finder literal."""
 
@@ -326,8 +312,6 @@ class TranscriptFinderMixin:
             for index, occurrence in enumerate(self._virtual_search_occurrences):
                 if occurrence.unit is unit:
                     self._search_index = index
-                    self._search_anchor_unit = None
-                    self._focus_search_match()
                     break
             return
         locations = self._locations(self._content_width)
@@ -335,9 +319,7 @@ class TranscriptFinderMixin:
             line = match.first_line
             if 0 <= line < len(locations) and locations[line][0] is unit:
                 self._search_index = index
-                self._search_anchor_unit = None
                 self._refresh_search_render_cache()
-                self._focus_search_match()
                 break
 
     def jump_to_index(self, unit_index: int) -> bool:
