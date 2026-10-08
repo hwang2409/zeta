@@ -670,7 +670,6 @@ class _Client:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await self._notify("turn_aborted", session_id)
-        self._schedule_background_wake(session_id)
         return {"aborted": True}
 
     def _session_snapshot(self) -> dict[str, object] | None:

@@ -189,6 +189,24 @@ class DisconnectThenSucceedBackend:
         )
 
 
+class AbortTwiceThenSucceedBackend:
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+        self.started = [asyncio.Event(), asyncio.Event()]
+
+    async def complete(self, messages, tool_schemas):
+        del tool_schemas
+        self.calls.append(messages)
+        call_index = len(self.calls) - 1
+        if call_index < len(self.started):
+            self.started[call_index].set()
+            await asyncio.Event().wait()
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("retried")]),
+        )
+
+
 class BlockingThenCaptureBackend:
     def __init__(self) -> None:
         self.calls: list[list[Message]] = []
@@ -4590,7 +4608,7 @@ async def test_failed_wake_turn_keeps_durable_notification_input(tmp_path: Path)
 async def test_foreground_abort_retries_interrupted_notification_turn(
     tmp_path: Path,
 ) -> None:
-    backend = DisconnectThenSucceedBackend()
+    backend = BlockingThenCaptureBackend()
     server = ZetaServer(
         home=tmp_path,
         port=0,
@@ -4622,11 +4640,188 @@ async def test_foreground_abort_retries_interrupted_notification_turn(
         await _frames_until_event(reader, "agent_end")
         while store.agent_notifications():
             await asyncio.sleep(0)
-        assert backend.calls == 2
+        assert len(backend.calls) == 2
         assert store.agent_notifications() == []
         assert sum(
             message.metadata.get("zeta_event") == "agent_notifications"
             for message in store.messages()
+        ) == 1
+        assert sum(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in backend.calls[1]
+        ) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_foreground_abort_before_notification_persistence_delivers_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("delivered")])])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    original_append = store.append_message_async
+    append_started = asyncio.Event()
+    append_calls = 0
+
+    async def block_first_append(message, *, on_persisted=None):
+        nonlocal append_calls
+        append_calls += 1
+        if append_calls == 1:
+            append_started.set()
+            await asyncio.Event().wait()
+        await original_append(message, on_persisted=on_persisted)
+
+    monkeypatch.setattr(store, "append_message_async", block_first_append)
+    store.append_agent_notification(
+        "child",
+        child_session_path="/tmp/child",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(
+            reader,
+            writer,
+            4,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
+        await asyncio.wait_for(append_started.wait(), TIMEOUT)
+        frames = await _request(
+            reader, writer, 5, "abort", {"scope": "foreground"}
+        )
+        assert frames[-1]["result"]["aborted"] is True
+        await _frames_until_event(reader, "agent_end")
+        assert len(backend.calls) == 1
+        assert append_calls == 2
+        assert store.agent_notifications() == []
+        assert sum(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in store.messages()
+        ) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", [None, "session"])
+async def test_session_abort_does_not_retry_notification_turn(
+    tmp_path: Path,
+    scope: str | None,
+) -> None:
+    backend = DisconnectThenSucceedBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_agent_notification(
+        "child",
+        child_session_path="/tmp/child",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        features = ["abort_scope"] if scope is not None else []
+        await _request(
+            reader,
+            writer,
+            4,
+            "hello",
+            {"protocol_version": "1.1", "features": features},
+        )
+        await asyncio.wait_for(backend.started.wait(), TIMEOUT)
+        params = {} if scope is None else {"scope": scope}
+        frames = await _request(reader, writer, 5, "abort", params)
+        assert frames[-1]["result"]["aborted"] is True
+        await asyncio.sleep(0.05)
+        assert backend.calls == 1
+        assert store.agent_notifications() == []
+        assert sum(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in store.messages()
+        ) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_repeated_foreground_notification_aborts_schedule_one_retry_each(
+    tmp_path: Path,
+) -> None:
+    backend = AbortTwiceThenSucceedBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_agent_notification(
+        "child",
+        child_session_path="/tmp/child",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(
+            reader,
+            writer,
+            4,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
+        await asyncio.wait_for(backend.started[0].wait(), TIMEOUT)
+        first = await _request(
+            reader, writer, 5, "abort", {"scope": "foreground"}
+        )
+        assert first[-1]["result"]["aborted"] is True
+        await asyncio.wait_for(backend.started[1].wait(), TIMEOUT)
+        await asyncio.sleep(0.05)
+        assert len(backend.calls) == 2
+
+        second = await _request(
+            reader, writer, 6, "abort", {"scope": "foreground"}
+        )
+        assert second[-1]["result"]["aborted"] is True
+        await _frames_until_event(reader, "agent_end")
+        assert len(backend.calls) == 3
+        assert store.agent_notifications() == []
+        assert sum(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in store.messages()
+        ) == 1
+        assert sum(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in backend.calls[2]
         ) == 1
     finally:
         await _close(server, writer)

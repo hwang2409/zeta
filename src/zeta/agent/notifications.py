@@ -105,6 +105,11 @@ class NotificationWake:
         self._claimed_ids: list[str] = []
         self._persisted_ids: set[str] = set()
         self._scheduled_message: Message | None = None
+        self._scheduled_plain_retry = False
+        self._running_notification_turn = False
+        self._running_plain_retry = False
+        self._foreground_retry_requested = False
+        self._plain_retry_pending = False
 
     def pending_message(self) -> Message | None:
         entries = [
@@ -115,14 +120,20 @@ class NotificationWake:
         return _notification_message(entries) if entries else None
 
     def schedule(self) -> bool:
-        """Synchronously reserve an idle notification turn."""
+        """Synchronously reserve an idle notification or plain retry turn."""
 
         if self.state != "idle":
             return False
-        message = self._claim_pending()
-        if message is None:
-            return False
-        self._scheduled_message = message
+        if self._plain_retry_pending:
+            self._plain_retry_pending = False
+            self._scheduled_message = None
+            self._scheduled_plain_retry = True
+        else:
+            message = self._claim_pending()
+            if message is None:
+                return False
+            self._scheduled_message = message
+            self._scheduled_plain_retry = False
         self.state = "scheduled"
         return True
 
@@ -136,12 +147,29 @@ class NotificationWake:
                 raise RuntimeError("notification turn is not scheduled")
             message = self._scheduled_message
             self._scheduled_message = None
+            self._running_notification_turn = True
+            self._running_plain_retry = self._scheduled_plain_retry
+            self._scheduled_plain_retry = False
         else:
             if self.state != "idle":
                 raise RuntimeError("a turn is already running")
             message = None
+            self._running_notification_turn = False
+            self._running_plain_retry = False
         self.state = "running"
         return message
+
+    def retry_after_foreground_abort(self) -> bool:
+        """Request one retry for the active or scheduled notification turn."""
+
+        notification_turn = self._running_notification_turn or (
+            self.state == "scheduled"
+            and (self._scheduled_message is not None or self._scheduled_plain_retry)
+        )
+        if not notification_turn:
+            return False
+        self._foreground_retry_requested = True
+        return True
 
     def claim_pending(self) -> Message | None:
         """Extend the running turn's claim with notifications that arrived later."""
@@ -184,9 +212,15 @@ class NotificationWake:
             raise RuntimeError("notification message contains unclaimed entries")
         self._persisted_ids.update(ids)
 
-    async def finish(self, *, success: bool) -> None:
-        """Consume persisted claims and release any claim not written durably."""
+    async def finish(self, *, success: bool) -> bool:
+        """Finish the claim and report whether foreground abort needs one wake."""
 
+        retry_requested = self._foreground_retry_requested
+        retry_from_history = (
+            self._running_plain_retry
+            or self._scheduled_plain_retry
+            or bool(self._persisted_ids)
+        )
         try:
             committed_ids = [
                 notification_id
@@ -201,7 +235,13 @@ class NotificationWake:
             self._claimed_ids.clear()
             self._persisted_ids.clear()
             self._scheduled_message = None
+            self._scheduled_plain_retry = False
+            self._running_notification_turn = False
+            self._running_plain_retry = False
+            self._foreground_retry_requested = False
+            self._plain_retry_pending = retry_requested and retry_from_history
             self.state = "idle"
+        return retry_requested
 
     def _claim_pending(self) -> Message | None:
         entries = [
@@ -270,6 +310,7 @@ class AgentNotificationMixin:
             abort_signal=abort_signal,
             system_message=system_message,
             on_persisted=system_message_persisted,
+            notification_turn=notification_turn,
         )
         success = True
         try:
@@ -282,9 +323,11 @@ class AgentNotificationMixin:
             raise
         finally:
             await close_completion(stream)
-            await self.notification_wake.finish(success=success)
+            retry_after_abort = await self.notification_wake.finish(success=success)
             self._turn_active = False
-            if success and self.notification_wake.pending_message() is not None:
+            if retry_after_abort or (
+                success and self.notification_wake.pending_message() is not None
+            ):
                 self.notify_background_persisted()
 
     def set_background_wake_callback(self, callback: Callable[[], None] | None) -> None:

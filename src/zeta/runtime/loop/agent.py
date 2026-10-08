@@ -340,7 +340,9 @@ class AgentLoop(
     def abort(self, *, foreground_only: bool = False) -> None:
         """Signal active tools; optionally preserve background work and steering."""
         self.tool_registry.abort()
-        if not foreground_only:
+        if foreground_only:
+            self.notification_wake.retry_after_foreground_abort()
+        else:
             self._background_owner.cancel_all()
             self._steering_queue.clear()
 
@@ -787,15 +789,15 @@ class AgentLoop(
         abort_signal: ToolAbortSignal | None = None,
         system_message: Message | None = None,
         on_persisted: Callable[[], None] | None = None,
+        notification_turn: bool = False,
     ) -> AsyncIterator[StreamEvent]:
-        notification_turn = system_message is not None
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
-        if self.hooks is not None and system_message is None:
+        if self.hooks is not None and system_message is None and not notification_turn:
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None:
             await self._append_turn_message(system_message, on_persisted=on_persisted)
-        else:
+        elif not notification_turn:
             reuse_persisted = not persist_user_message
             if reuse_persisted and user_message not in self.store.messages():
                 raise ValueError("cannot reuse a user message that is not persisted")

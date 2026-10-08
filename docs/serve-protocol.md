@@ -380,10 +380,12 @@ current boundary; the loop applies it to the next turn. A client that does not
 want that work can call `clear_steering` after the foreground abort.
 Session-scope abort clears pending steering as part of aborting an active turn.
 
-If foreground abort interrupts a notification turn, the server releases its
-durable claim and schedules the notification turn again. This retries the same
-notification batch instead of skipping it, so interrupted and later
-notifications are delivered without another user action.
+If foreground abort interrupts a notification turn, its notification lifecycle
+schedules one follow-up turn. A claim that was not persisted is released and
+delivered normally. A notification input that was already persisted stays in
+history, and the follow-up uses that input without appending it again. Each
+foreground abort schedules at most one follow-up. Session-scope abort does not
+schedule one.
 
 The result contains `aborted` (`true` when a turn was canceled). Abort persists
 the loop's partial state. When `aborted` is `true`, the server emits one
