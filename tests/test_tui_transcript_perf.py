@@ -870,14 +870,24 @@ def test_scroll_up_while_streaming_leaves_follow_mode_and_moves_up() -> None:
 
 
 def test_scroll_anchor_stable_when_heights_above_are_corrected() -> None:
-    transcript = _wrapped_tail_transcript()
+    transcript = TranscriptWidget()
+    call = ToolCall("child-refresh", "agent", {"prompt": "inspect"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    transcript.start_tool(call.id, call, Text("child running"), start)
+    transcript._virtual_unit_lines(0, 40)
+    for index in range(126):
+        transcript.append(Text(f"history {index}"))
+    transcript.append(Text("\n".join(f"tail row {index}" for index in range(40))))
     _top_virtual_location(transcript)
     transcript.page_up()
     anchor = _top_virtual_location(transcript)
-    anchor_index = transcript._units.index(anchor[0])
 
-    for index in range(anchor_index):
-        transcript._remember_unit_height(40, index, 7)
+    child = next(iter(transcript._card_units.values()))
+    child.card.refresh = Mock(
+        return_value=Text("\n".join(f"child row {index}" for index in range(20)))
+    )
+    transcript.refresh_active_agents()
+    transcript._virtual_unit_lines(0, 40)
     corrected = _top_virtual_location(transcript)
 
     assert corrected == anchor
