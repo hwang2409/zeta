@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import gzip
 import zlib
 from pathlib import Path
@@ -8,8 +9,12 @@ import httpx
 import pytest
 
 from zeta.core.approval import ApprovalPolicy
+from zeta.core.fake import FakeBackend
+from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import ToolCall, flatten_tool_content
+from zeta.core.tool_dispatch import dispatch_tool_calls
+from zeta.protocol.types import StreamEventType, ToolCall, flatten_tool_content
+from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, websearch
 from zeta.tools import fetch as fetch_tool
@@ -353,6 +358,79 @@ async def test_fetch_returns_partial_when_decompressed_body_exceeds_cap(
     assert Path(result["content"][0]["spill_path"]).read_text() == "x" * 32
 
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_stream", [False, True])
+async def test_parallel_fetches_cancel_on_production_dispatch_abort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_stream: bool,
+) -> None:
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+    started_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal started_count
+        del request
+        started_count += 1
+        if started_count == 2:
+            started.set()
+        await blocked.wait()
+        raise AssertionError("blocked transport was not canceled")
+
+    _mock_client(monkeypatch, handler)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    calls = [
+        ToolCall("fetch-a", "fetch", {"url": "example.com/a"}),
+        ToolCall("fetch-b", "fetch", {"url": "example.com/b"}),
+    ]
+    if with_stream:
+
+        async def run_streaming() -> list[object]:
+            return await asyncio.gather(
+                *(
+                    registry.execute(call, _stream_sink=lambda event: None)
+                    for call in calls
+                )
+            )
+
+        task = asyncio.create_task(run_streaming())
+    else:
+        loop = AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path),
+            registry=registry,
+            skill_catalog=SkillCatalog.empty(),
+        )
+
+        async def run_dispatch():
+            return [
+                event
+                async for event in dispatch_tool_calls(
+                    loop, calls, _validated_tool_result
+                )
+            ]
+
+        task = asyncio.create_task(run_dispatch())
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    registry.abort()
+    results = await asyncio.wait_for(task, timeout=1)
+
+    if with_stream:
+        assert [result["content"][0]["text"] for result in results] == [
+            "tool execution canceled",
+            "tool execution canceled",
+        ]
+    else:
+        assert [
+            event.tool_result.content
+            for event in results
+            if event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_result is not None
+        ] == ["tool execution canceled", "tool execution canceled"]
 
 
 @pytest.mark.asyncio

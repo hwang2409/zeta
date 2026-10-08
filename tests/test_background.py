@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta.agent.notifications import NotificationWake
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
@@ -326,6 +327,53 @@ def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
 
 
 
+
+
+def test_tui_presented_notification_remains_available_to_notification_wake(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    notification = store.append_agent_notification(
+        "macro:shutdown",
+        child_session_path="/tmp/macro.log",
+        description="/matrix",
+        status="canceled",
+        text="background macro canceled on session shutdown",
+        background_metadata=("background_macro", "session_shutdown"),
+    )
+    store.mark_agent_notification_presented_to_tui(notification.id)
+
+    message = NotificationWake(store).pending_message()
+
+    assert message is not None
+    assert message.metadata["notifications"] == [
+        {
+            "notification_id": notification.id,
+            **notification.data,
+            "kind": "agent_completion",
+        }
+    ]
+
+
+def test_legacy_notification_without_kind_is_agent_completion_in_wake_payload(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="legacy")
+    store._append_row(
+        "notification",
+        {
+            "child_instance_id": "child-legacy",
+            "child_session_path": "agents/1",
+            "description": "background child",
+            "status": "completed",
+            "text": "done",
+        },
+    )
+
+    message = NotificationWake(store).pending_message()
+
+    assert message is not None
+    assert message.metadata["notifications"][0]["kind"] == "agent_completion"
 
 
 def test_store_replay_accepts_task_and_unknown_notification_kinds(

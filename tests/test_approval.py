@@ -18,6 +18,7 @@ from zeta.core.approval import (
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationIntegrityError, ConversationStore
+from zeta.core.tool_dispatch import dispatch_tool_calls
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -30,6 +31,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
@@ -632,6 +634,124 @@ skill_catalog=SkillCatalog.empty(),
 
 
 
+
+
+@pytest.mark.asyncio
+async def test_parallel_pre_aborted_approved_calls_share_one_abort_generation(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="parallel-pre-aborted")
+    calls = [
+        ToolCall("parallel-approved-a", "echo", {"call_id": "parallel-approved-a"}),
+        ToolCall("parallel-approved-b", "echo", {"call_id": "parallel-approved-b"}),
+    ]
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [*(ToolUseContent(call) for call in calls)]),
+        [(call.id, call) for call in calls],
+    )
+    policy = ApprovalPolicy(default="ask", store=store)
+    assert all(policy.approve(call.id) for call in calls)
+    signal = ToolAbortSignal()
+    signal.abort()
+    registry = ToolRegistry(
+        approval_root,
+        approval_policy=policy,
+        approval_store=store,
+        abort_signal=signal,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    started = asyncio.Event()
+    started_count = 0
+    canceled: set[str] = set()
+
+    async def echo(
+        arguments: dict[str, object],
+        abort_signal: ToolAbortSignal,
+    ) -> str:
+        nonlocal started_count
+        call_id = str(arguments["call_id"])
+        started_count += 1
+        if started_count == len(calls):
+            started.set()
+        await abort_signal.wait()
+        canceled.add(call_id)
+        return "canceled"
+
+    registry.register("echo", echo, parallel_safe=True)
+    loop = AgentLoop(
+        FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty()
+    )
+    task = asyncio.create_task(
+        collect(dispatch_tool_calls(loop, calls, _validated_tool_result))
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    registry.abort()
+
+    events = await asyncio.wait_for(task, timeout=1)
+    results = [
+        event.tool_result
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    ]
+    assert [result.content for result in results if result is not None] == [
+        "canceled",
+        "canceled",
+    ]
+    assert all(result is not None and not result.is_error for result in results)
+    assert canceled == {call.id for call in calls}
+
+
+@pytest.mark.asyncio
+async def test_parallel_pending_approval_abort_wakes_every_waiter(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="parallel-pending-abort")
+    calls = [
+        ToolCall("pending-parallel-a", "echo", {}),
+        ToolCall("pending-parallel-b", "echo", {}),
+    ]
+    policy = ApprovalPolicy(default="ask", store=store)
+    registry = ToolRegistry(
+        approval_root,
+        approval_policy=policy,
+        approval_store=store,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register("echo", lambda arguments: "must not run", parallel_safe=True)
+    loop = AgentLoop(
+        FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty()
+    )
+
+    task = asyncio.create_task(
+        collect(dispatch_tool_calls(loop, calls, _validated_tool_result))
+    )
+    for _ in range(100):
+        if {request.request_id for request in policy.pending_requests()} == {
+            call.id for call in calls
+        }:
+            break
+        await asyncio.sleep(0.01)
+    assert {request.request_id for request in policy.pending_requests()} == {
+        call.id for call in calls
+    }
+
+    registry.abort()
+
+    events = await asyncio.wait_for(task, timeout=1)
+    results = [
+        event.tool_result
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    ]
+    assert [result.content for result in results if result is not None] == [
+        "tool execution canceled",
+        "tool execution canceled",
+    ]
+    assert all(result is not None and result.is_error for result in results)
+    assert policy.pending_requests() == []
 
 
 @pytest.mark.asyncio
