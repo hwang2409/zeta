@@ -670,12 +670,34 @@ def _target_transition_error(
     return None
 
 
+def _direct_user_procedure_fact(item: _ParsedOperation, text: str) -> bool:
+    lowered = text.lower()
+    return (
+        item.direct_user
+        and any(word in lowered for word in ("validated", "procedure"))
+        and re.search(r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+){2,}\b", text) is not None
+        and not any(
+            phrase in lowered
+            for phrase in (
+                "ignore previous",
+                "ignore prior",
+                "ignore system",
+                "system prompt",
+                "developer prompt",
+                "you are chatgpt",
+                "you are an assistant",
+                "you are an agent",
+            )
+        )
+    )
+
+
 def _semantic_error(item: _ParsedOperation, state: MemoryState, now: str) -> str | None:
     operation = item.operation
     text = getattr(operation, "text", None)
     if isinstance(text, str):
         unsafe = _unsafe_reason(text)
-        if unsafe:
+        if unsafe and not _direct_user_procedure_fact(item, text):
             return f"unsafe {unsafe} text"
     if item.source_rank >= 6:
         return "uncorroborated harness or tool evidence"

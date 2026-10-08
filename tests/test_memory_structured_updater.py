@@ -739,6 +739,35 @@ async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_direct_user_validated_procedure_is_stored_as_data(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(
+                1,
+                "The validated procedure uses `PROC-QUARTZ-8N3F` before packaging.",
+            )
+        ),
+        [
+            _proposal(
+                _add(
+                    "decisions",
+                    "Validated procedure: run PROC-QUARTZ-8N3F before packaging.",
+                )
+            )
+        ],
+    )
+    assert result.rejected_groups == ()
+    assert next(iter(_entries(registry, project_id))).text == (
+        "Validated procedure: run PROC-QUARTZ-8N3F before packaging."
+    )
+
+
+@pytest.mark.asyncio
 async def test_safety_rejects_secrets_and_instruction_like_entries(
     tmp_path: Path,
 ) -> None:
