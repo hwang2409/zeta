@@ -356,6 +356,42 @@ def status_card_float(
     return Float(content, width=card_width, height=card_height, z_index=10)
 
 
+def finder_float(
+    finder_window: AnyContainer, finder_active: Callable[[], bool]
+) -> Float:
+    """Create a top-anchored, content-sized overlay for the message finder.
+
+    The finder sits near the top of the screen (the way fzf sits above its
+    source) so the ranked list and preview grow downward without covering the
+    composer. Width and height track the control's own content, bounded by the
+    terminal so a tall result list never overflows the screen.
+    """
+
+    content = ConditionalContainer(finder_window, Condition(finder_active))
+
+    def finder_width() -> int:
+        terminal_width = get_app().output.get_size().columns
+        natural_width = finder_window.preferred_width(terminal_width).preferred
+        return max(
+            1, min(natural_width, max(1, terminal_width - STATUS_CARD_MARGIN * 2))
+        )
+
+    def finder_height() -> int:
+        size = get_app().output.get_size()
+        natural_height = finder_window.preferred_height(
+            finder_width(), size.rows
+        ).preferred
+        return max(1, min(natural_height, max(1, size.rows - STATUS_CARD_MARGIN * 2)))
+
+    return Float(
+        content,
+        top=STATUS_CARD_MARGIN,
+        width=finder_width,
+        height=finder_height,
+        z_index=20,
+    )
+
+
 def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[str, str]]:
     """Build the status footer and pad it to the composer's content width."""
     terminal_width = terminal_width or get_app().output.get_size().columns
@@ -424,6 +460,8 @@ def full_screen_content(
     status_active: Callable[[], bool] | None = None,
     tasks_window: AnyContainer | None = None,
     tasks_active: Callable[[], bool] | None = None,
+    finder_window: AnyContainer | None = None,
+    finder_active: Callable[[], bool] | None = None,
 ) -> FloatContainer:
     """Transcript over composer chrome, with the command menu floating above it."""
 
@@ -498,4 +536,6 @@ def full_screen_content(
         floats.append(status_card_float(status_window, status_active))
     if tasks_window is not None and tasks_active is not None:
         floats.append(status_card_float(tasks_window, tasks_active))
+    if finder_window is not None and finder_active is not None:
+        floats.append(finder_float(finder_window, finder_active))
     return FloatContainer(content, floats=floats)

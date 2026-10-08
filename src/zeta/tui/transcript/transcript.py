@@ -7,7 +7,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Callable
 from io import StringIO
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
@@ -32,6 +32,7 @@ from ..cards.agent_sync import refresh_agent_cards
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
 from .streaming_text import StreamingText
+from .transcript_finder import TranscriptFinderMixin
 from .transcript_virtual import TranscriptVirtualMixin
 from .transcript_search import (
     AnchoredSelection,
@@ -41,6 +42,10 @@ from .transcript_search import (
     find_matches,
     highlight_fragments,
 )
+
+if TYPE_CHECKING:
+    from .message_finder import MessageFinder
+    from .transcript_finder import _FinderRestore
 
 
 MAX_TOOL_TAIL_CHARS = 4_096
@@ -188,7 +193,7 @@ class _TranscriptUnit:
         self.value = value
 
 
-class TranscriptWidget(TranscriptVirtualMixin, UIControl):
+class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl):
     """Render logical transcript units at the current width and stay at the bottom."""
 
     def __init__(
@@ -220,6 +225,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._search_active = False
         self._search_query = ""
         self._search_index = 0
+        self._search_anchor_key: int | None = None
         self._search_cache: OrderedDict[tuple[int, int, str], list[SearchMatch]] = (
             OrderedDict()
         )
@@ -261,6 +267,12 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._virtual_search_cursor = 0
         self._virtual_search_complete = True
         self._virtual_search_scheduled = False
+        # Fuzzy message finder overlay. Built once when opened; the saved view
+        # restores the pre-open scroll when the overlay is cancelled.
+        self._finder: MessageFinder | None = None
+        self._finder_generation = 0
+        self._finder_preview = True
+        self._finder_restore: _FinderRestore | None = None
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -654,13 +666,15 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._search_active = True
         self._search_query = ""
         self._search_index = 0
+        self._search_anchor_key = None
         self._render_cache.clear()
         self._highlight_cache = None
 
-    def update_search(self, query: str) -> None:
+    def update_search(self, query: str, *, anchor_key: int | None = None) -> None:
         self._search_active = True
         self._search_query = query
         self._search_index = 0
+        self._search_anchor_key = anchor_key
         self._parsed_cache.clear()
         self._search_cache.clear()
         self._highlight_cache = None
@@ -674,6 +688,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._search_active = False
         self._search_query = ""
         self._search_index = 0
+        self._search_anchor_key = None
         self._render_cache.clear()
         self._parsed_cache.clear()
         self._highlight_cache = None
@@ -726,7 +741,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
 
     def _focus_search_match(self) -> None:
         matches = self._search_matches()
-        if not matches:
+        if not matches or self._search_anchor_key is not None:
             return
         if self._uses_virtual_history():
             self._focus_virtual_search_match()
@@ -760,7 +775,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         matches = self._search_matches()
         if not matches:
             return False
-        self._search_index = (self._search_index + 1) % len(matches)
+        self._search_index = self._search_navigation_index(matches, forward=True)
         self._refresh_search_render_cache()
         self._focus_search_match()
         return True
@@ -769,7 +784,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         matches = self._search_matches()
         if not matches:
             return False
-        self._search_index = (self._search_index - 1) % len(matches)
+        self._search_index = self._search_navigation_index(matches, forward=False)
         self._refresh_search_render_cache()
         self._focus_search_match()
         return True
