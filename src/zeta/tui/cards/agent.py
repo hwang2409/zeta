@@ -609,8 +609,16 @@ class AgentCard:
         path = structured.get("child_session_path") if structured else None
         if isinstance(path, str):
             self.set_child_session_path(path)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            can_refresh_final_tail = False
+        else:
+            can_refresh_final_tail = True
         self._final_tail_pending = bool(
-            self._expanded and self._transcript_source is not None
+            can_refresh_final_tail
+            and self._expanded
+            and self._transcript_source is not None
         )
         if not self._final_tail_pending:
             self.release_transcript_source()
