@@ -538,6 +538,27 @@ def _run_attempt(
         reconciler_codex_home = _stage_codex_auth(reconciler_home)
         reconciler_env = _environment(reconciler_home, reconciler_codex_home)
 
+    def benchmark_user_origin(rows: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
+        normalized: list[dict[str, Any]] = []
+        marked = False
+        for row in rows:
+            copied = row
+            data = row.get("data")
+            message = data.get("message") if isinstance(data, dict) else None
+            if not marked and isinstance(message, dict) and message.get("role") == "user":
+                copied = dict(row)
+                copied_data = dict(data)
+                copied_message = dict(message)
+                metadata = copied_message.get("metadata")
+                copied_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+                copied_metadata["zeta.origin"] = "user"
+                copied_message["metadata"] = copied_metadata
+                copied_data["message"] = copied_message
+                copied["data"] = copied_data
+                marked = True
+            normalized.append(copied)
+        return tuple(normalized)
+
     def reconcile_latest(
         phase: str,
         transcript: tuple[Path, str] | None = None,
@@ -581,12 +602,14 @@ def _run_attempt(
                 raw_transcript = read_transcript(transcript_path, session_id)
                 durable = Transcript(
                     session_id,
-                    tuple(
-                        projected
-                        for row in raw_transcript.rows
-                        if type(row.get("seq")) is int
-                        for projected in (project_transcript_row(row),)
-                        if projected is not None
+                    benchmark_user_origin(
+                        tuple(
+                            projected
+                            for row in raw_transcript.rows
+                            if type(row.get("seq")) is int
+                            for projected in (project_transcript_row(row),)
+                            if projected is not None
+                        )
                     ),
                 )
                 result = asyncio.run(
