@@ -274,7 +274,10 @@ def evict_messages(
             or call.name not in {"inbox", "project", "recall_history", "run_background"}
         ):
             continue
-        replace(index, _workflow_result_receipt(message, call, seq))
+        replacement = _workflow_result_receipt(message, call, seq)
+        if replacement is message:
+            continue
+        replace(index, replacement)
         if running_total <= target_tokens:
             return _result(messages, changed, before, running_total, True)
 
@@ -731,7 +734,7 @@ def _workflow_result_receipt(message: Message, call: ToolCall, seq: int) -> Mess
     else:
         payload = _background_receipt_payload(call, structured, result)
     receipt = _structured_receipt("workflow result receipt", payload, seq, "result")
-    return Message(
+    replacement = Message(
         message.role,
         tool_result=ToolResult(
             result.tool_call_id,
@@ -746,6 +749,11 @@ def _workflow_result_receipt(message: Message, call: ToolCall, seq: int) -> Mess
             "eviction_content_digest": _content_digest(result.content),
         },
     )
+    return (
+        replacement
+        if message_token_count(replacement) < message_token_count(message)
+        else message
+    )
 
 
 def _inbox_receipt_payload(
@@ -759,6 +767,24 @@ def _inbox_receipt_payload(
         if message_id := _one_line(structured.get("id")):
             payload["id"] = message_id
         return payload
+    if action == "projects":
+        raw_projects = structured.get("projects")
+        projects = (
+            [item for item in raw_projects if isinstance(item, Mapping)]
+            if isinstance(raw_projects, list)
+            else []
+        )
+        payload["projects"] = [
+            {
+                key: compact
+                for key in ("id", "name", "scope")
+                if (compact := _one_line(project.get(key)))
+            }
+            for project in projects[:WORKFLOW_MESSAGE_LIMIT]
+        ]
+        if len(projects) > WORKFLOW_MESSAGE_LIMIT:
+            payload["omitted_projects"] = len(projects) - WORKFLOW_MESSAGE_LIMIT
+        return payload
 
     raw_message = structured.get("message")
     raw_messages = structured.get("messages")
@@ -768,6 +794,12 @@ def _inbox_receipt_payload(
         messages = [item for item in raw_messages if isinstance(item, Mapping)]
     else:
         messages = []
+    if (
+        not messages
+        and action in {"claim", "done"}
+        and (message_id := _one_line(call.arguments.get("id")))
+    ):
+        messages = [{"id": message_id}]
     summaries: list[dict[str, object]] = []
     default_status = _one_line(structured.get("status"))
     for raw in messages[:WORKFLOW_MESSAGE_LIMIT]:
@@ -854,7 +886,11 @@ def _background_receipt_payload(
         "command": _one_line(call.arguments.get("command"), limit=120),
         "status": status,
     }
-    if task_id := _one_line(structured.get("task_id")):
+    task_id = _one_line(structured.get("task_id"))
+    if not task_id:
+        match = re.search(r"\bstarted background task ([^\s()]+)", result.content)
+        task_id = _one_line(match.group(1)) if match is not None else ""
+    if task_id:
         payload["task_id"] = task_id
     return payload
 
