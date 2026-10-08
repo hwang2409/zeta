@@ -1230,6 +1230,18 @@ def test_interrupted_sync_leaves_no_orphan_artifacts(tmp_path: Path) -> None:
         assert not list(projects.glob(f".{project_id}.install-*"))
         assert not list(projects.glob(f".{project_id}.backup-*"))
         assert not list(projects.glob(f".{project_id}.replace-*"))
+        project = projects / project_id
+        pointer = json.loads((project / "memory-current.json").read_text())
+        referenced: set[str] = set()
+        for version in pointer["history"]:
+            manifest = json.loads(
+                (project / "memory-versions" / "versions" / f"{version}.json").read_text()
+            )
+            for field in ("snapshot", "before_snapshot"):
+                value = manifest[field]
+                referenced.update(value.values() if isinstance(value, dict) else (value,))
+        blobs = {path.name for path in (project / "memory-versions" / "blobs").iterdir()}
+        assert blobs <= referenced
 
 def test_sync_state_size_bounded_over_add_sync_compact_cycles(tmp_path: Path) -> None:
     first, second = tmp_path / "first", tmp_path / "second"
