@@ -243,10 +243,12 @@ fake-mode servers; real sessions can resume across real providers.
 
 Params: exactly one of `text` or `input_id`. `text` is a non-empty direct user
 message. `input_id` is available only with `model_input_ids` and refers to a
-server-owned `model_input` returned by `slash_run`. The result acknowledges
-scheduling with `accepted` (`true`) and `session_id`. Streaming starts as
-notifications. Only one turn can run at a time. With the `user_message_event`
-feature, a `user_message` event with `mode: "send"` precedes the acknowledgement.
+server-owned `model_input` returned by `slash_run`. With the negotiated
+`delivery_id` feature, params can also contain `delivery_id` as described below.
+The result acknowledges scheduling with `accepted` (`true`) and `session_id`.
+Streaming starts as notifications. Only one turn can run at a time. With the
+`user_message_event` feature, a `user_message` event with `mode: "send"`
+precedes the acknowledgement.
 
 ```json
 {"jsonrpc":"2.0","id":5,"method":"send","params":{"text":"hello"}}
@@ -258,10 +260,11 @@ feature, a `user_message` event with `mode: "send"` precedes the acknowledgement
 
 ### `steer`
 
-Params: required `text`, a non-empty string. The server queues this user
-message at the next safe provider boundary. A turn must be running. With the
-`user_message_event` feature, a `user_message` event with `mode: "steer"`
-precedes the acknowledgement.
+Params: required `text`, a non-empty string. With the negotiated `delivery_id`
+feature, params can also contain `delivery_id` as described below. The server
+queues this user message at the next safe provider boundary. A turn must be
+running. With the `user_message_event` feature, a `user_message` event with
+`mode: "steer"` precedes the acknowledgement.
 
 ```json
 {"jsonrpc":"2.0","id":6,"method":"steer","params":{"text":"also check the tests"}}
@@ -269,6 +272,44 @@ precedes the acknowledgement.
 
 ```json
 {"jsonrpc":"2.0","id":6,"result":{"accepted":true}}
+```
+
+### client delivery IDs (`delivery_id` feature)
+
+A negotiated client can add `delivery_id` to `send` or `steer`. The value is
+1–128 ASCII characters, starts with a letter or digit, and otherwise contains
+only letters, digits, `.`, `_`, `:`, or `-`. A client should derive a stable ID
+from the inbound item that caused the request and reuse it after an uncertain
+transport outcome.
+
+The server retains the 1,000 most recent accepted IDs for each session in the
+append-only session log. The oldest ID becomes unknown when a later acceptance
+moves it outside that bound. The acceptance record is durably appended in the
+same store transaction as a `send` user message. For `steer`, the durable
+acceptance is appended before the synchronous post-persistence callback adds
+the item to the running loop's queue. A failed durable append therefore does
+not start a turn or add steering, and cancellation cannot separate a completed
+append from its callback.
+
+Repeating a retained ID returns the original result with `duplicate: true`. It
+does not validate changed text against the first request, enqueue steering, or
+start another turn. The lookup happens before the normal running-turn checks,
+so a retry remains successful after the original operation advances. Without
+the negotiated feature, sending `delivery_id` returns `-32602` and legacy
+clients have unchanged behavior.
+
+`delivery_status` requires the feature and an active session. Params contain
+only `delivery_id`. Its result is `{"delivery_id":"batch-42","status":"queued"}`,
+where status is:
+
+- `queued`: an accepted `steer` has not reached a safe provider boundary;
+- `delivered`: steering was durably appended as a user message at that boundary,
+  or a `send` user message was durably appended and its turn was scheduled;
+- `unknown`: the ID was never accepted in this session or was evicted from the
+  recent-ID bound.
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"delivery_status","params":{"delivery_id":"batch-42"}}
 ```
 
 ### `set_turn_context` (`turn_context` feature)
@@ -914,6 +955,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `projects` | adds `list_projects`, `project_show`, `project_memory_log`, and `project_inbox`; `list_sessions` accepts `project_id` |
 | `abort_scope` | `abort` accepts `scope: "session" \| "foreground"`; adds `clear_steering` |
 | `turn_context` | adds `set_turn_context` for one-shot context on the next server-started turn |
+| `delivery_id` | `send` and `steer` accept durable idempotency IDs; adds `delivery_status` |
 
 Features keep the protocol version at `1.1`. A version bump would make a new
 client that sends `client_version: "1.2"` negotiate `1.0` with a 1.1 server and
