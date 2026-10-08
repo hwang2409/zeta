@@ -11,11 +11,13 @@ import pytest
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     TextContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
+    with_message_origin,
 )
 
 
@@ -169,8 +171,8 @@ def test_fast_path_detects_same_size_rewrite_with_restored_mtime(
 def test_tool_result_query_uses_incremental_state_without_replay(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     result = ToolResult("call-1", "done")
-    store.append_message(Message(MessageRole.USER, [TextContent("history")]))
-    store.append_message(Message(MessageRole.USER, [], tool_result=result))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("history")]), MessageOrigin.USER))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [], tool_result=result), MessageOrigin.USER))
     store.replay = _unexpected_history_scan  # type: ignore[method-assign]
 
     assert store.tool_result("call-1") == result
@@ -181,7 +183,7 @@ def test_notification_queries_use_incremental_state_without_branch_scan(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("history")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("history")]), MessageOrigin.USER))
     notification = store.append_agent_notification(
         "child-1",
         child_session_path="/tmp/child-1",
@@ -268,7 +270,7 @@ def test_index_parity_with_replay(tmp_path: Path) -> None:
     apply(
         "linear user append",
         lambda: store.append_message(
-            Message(MessageRole.USER, [TextContent("start")])
+            with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER)
         ),
     )
     apply(

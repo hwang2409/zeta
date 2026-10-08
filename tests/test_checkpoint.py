@@ -14,6 +14,7 @@ from zeta.core.session import SessionManager
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -22,6 +23,7 @@ from zeta.protocol.types import (
     ToolCall,
     ToolResult,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -174,14 +176,14 @@ def test_checkpoint_method_type_hints_resolve_conversation_entry() -> None:
 
 def test_fork_points_exclude_empty_turn_nudge(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    visible = store.append_message(message(MessageRole.USER, "visible prompt"))
+    visible = store.append_message(with_message_origin(message(MessageRole.USER, "visible prompt"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "thinking only"))
     store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [TextContent("hidden recovery prompt")],
             metadata={"zeta_event": "empty_turn_nudge"},
-        )
+        ), MessageOrigin.USER)
     )
     store.append_message(message(MessageRole.ASSISTANT, "visible answer"))
 
@@ -194,10 +196,10 @@ def test_fork_points_exclude_empty_turn_nudge(tmp_path: Path) -> None:
 
 def test_checkpoint_and_fork_switch_the_active_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="fork")
-    first = store.append_message(message(MessageRole.USER, "first"))
+    first = store.append_message(with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "reply"))
     checkpoint = store.append_checkpoint("saved")
-    abandoned = store.append_message(message(MessageRole.USER, "abandoned"))
+    abandoned = store.append_message(with_message_origin(message(MessageRole.USER, "abandoned"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "later"))
 
     listed = store.list_checkpoints()
@@ -225,10 +227,10 @@ def test_numeric_checkpoint_labels_are_reserved_for_sequence_selectors(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "first"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "reply"))
     store.append_checkpoint("safe")
-    store.append_message(message(MessageRole.USER, "second"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "reply"))
     target = store.append_checkpoint("target")
 
@@ -241,7 +243,7 @@ def test_numeric_checkpoint_labels_are_reserved_for_sequence_selectors(
 
 def test_checkpoint_and_fork_require_a_turn_boundary(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "in flight"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "in flight"), MessageOrigin.USER))
 
     with pytest.raises(ConversationIntegrityError, match="turn is in flight"):
         store.append_checkpoint("blocked")
@@ -252,10 +254,10 @@ async def test_fork_drops_a_compaction_marker_and_restores_originals(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "original user"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "original user"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "original answer"))
     checkpoint = store.append_checkpoint("before compaction")
-    store.append_message(message(MessageRole.USER, "new user"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "new user"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "new answer"))
     store.append_compaction_marker("stale summary", 1, 2)
     store.append_fork(str(checkpoint.seq))
@@ -275,7 +277,7 @@ async def test_fork_drops_a_compaction_marker_and_restores_originals(
 
 def test_fork_drops_pending_approval_from_the_abandoned_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "start"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "start"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "ready"))
     checkpoint = store.append_checkpoint("safe")
     call = ToolCall("pending", "danger", {})
@@ -296,7 +298,7 @@ def test_naive_checkpoint_timestamp_is_normalized_at_jsonl_boundary(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "first"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "reply"))
     store.append_checkpoint("saved")
 
@@ -328,7 +330,7 @@ def test_naive_checkpoint_timestamp_is_normalized_at_jsonl_boundary(
 def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     call = ToolCall("read-1", "read", {"path": "README.md"})
-    store.append_message(message(MessageRole.USER, "inspect the readme"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "inspect the readme"), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
         Message(
@@ -338,7 +340,7 @@ def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
         )
     )
     store.append_checkpoint("saved")
-    store.append_message(message(MessageRole.USER, "abandoned"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "abandoned"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "later"))
 
     app = TUIApp(
@@ -526,7 +528,7 @@ def test_fork_rejects_running_background_agents_then_allows_completion(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "start"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "start"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "reply"))
     store.append_checkpoint("saved")
     app = TUIApp(

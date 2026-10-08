@@ -20,6 +20,7 @@ from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -27,6 +28,7 @@ from zeta.protocol.types import (
     ToolCall,
     ToolResult,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
@@ -232,7 +234,7 @@ async def test_deny_returns_error_and_loop_continues(tmp_path: Path) -> None:
             registry=registry,
             approval_policy=ApprovalPolicy(always_deny={"danger"}),
 skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = store.messages()[2].tool_result
@@ -261,7 +263,7 @@ async def test_abort_pending_request_cancels_and_closes_tool_call_history(
                 registry=registry,
                 approval_policy=policy,
 skill_catalog=SkillCatalog.empty(),
-            ).run_turn("start")
+            ).run_turn("start", origin=MessageOrigin.USER)
         )
     )
 
@@ -343,7 +345,7 @@ async def test_torn_request_write_does_not_leave_a_tool_call_or_start_event(
             registry=registry,
             approval_policy=policy,
 skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start"):
+        ).run_turn("start", origin=MessageOrigin.USER):
             events.append(event)
 
     restarted = ConversationStore(approval_root, session_id=store.session_id)
@@ -359,7 +361,7 @@ def test_resolution_rejects_a_parent_outside_the_request_ancestry(
     approval_root: Path,
 ) -> None:
     store = ConversationStore(approval_root, session_id="invalid-resolution-parent")
-    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    root = store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_approval_request(
         "call-1",
         ToolCall("call-1", "echo", {}),
@@ -384,7 +386,7 @@ def test_two_stores_do_not_abort_a_request_before_atomic_anchor_append(
 ) -> None:
     store_a = ConversationStore(approval_root, session_id="cross-store-race")
     store_b = ConversationStore(approval_root, session_id="cross-store-race")
-    root = store_a.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    root = store_a.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     call = ToolCall("cross-store-call", "echo", {})
     original_append = store_a.append_message_with_approval_requests
     started = Event()
@@ -417,7 +419,7 @@ def test_two_stores_dedupe_concurrent_duplicate_request_append(
 ) -> None:
     session_id = "cross-store-duplicate"
     store_a = ConversationStore(approval_root, session_id=session_id)
-    root = store_a.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    root = store_a.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store_b = ConversationStore(approval_root, session_id=session_id)
     call = ToolCall("duplicate-call", "echo", {})
 
@@ -767,7 +769,7 @@ def test_abandoned_branch_approval_does_not_leak_into_active_branch(
 ) -> None:
     call = ToolCall("dead-call", "echo", {})
     store = ConversationStore(approval_root)
-    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    root = store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_approval_request(call.id, call, parent_id=root.id)
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("active")]), parent_id=root.id)
 
@@ -780,7 +782,7 @@ def test_append_superset_preserves_all_approval_requests(
     approval_root: Path,
 ) -> None:
     store = ConversationStore(approval_root, session_id="approval-superset")
-    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    root = store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     call_a = ToolCall("superset-a", "echo", {})
     call_b = ToolCall("superset-b", "echo", {})
     first = store.append_message_with_approval_requests(
@@ -803,7 +805,7 @@ def test_same_parent_superset_keeps_the_prior_request(
     approval_root: Path,
 ) -> None:
     store = ConversationStore(approval_root, session_id="approval-same-parent")
-    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    root = store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     call_a = ToolCall("same-parent-a", "echo", {})
     call_b = ToolCall("same-parent-b", "echo", {})
     store.append_message_with_approval_requests(
@@ -826,7 +828,7 @@ def test_append_uses_the_target_parent_branch(
     approval_root: Path,
 ) -> None:
     store = ConversationStore(approval_root, session_id="approval-target-branch")
-    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    root = store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     call_a = ToolCall("target-a", "echo", {})
     call_b = ToolCall("target-b", "echo", {})
     target = store.append_approval_request(call_a.id, call_a, parent_id=root.id)
@@ -849,7 +851,7 @@ def test_append_target_parent_ignores_active_child_requests(
     approval_root: Path,
 ) -> None:
     store = ConversationStore(approval_root, session_id="approval-active-ancestor")
-    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    root = store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     call = ToolCall("active-ancestor-call", "echo", {})
     target = store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("target")]),
@@ -879,7 +881,7 @@ def test_abandoned_exact_sibling_is_not_deduped(
     approval_root: Path,
 ) -> None:
     store = ConversationStore(approval_root, session_id="approval-exact-sibling")
-    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    root = store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     call = ToolCall("exact-sibling-call", "echo", {})
     abandoned = store.append_approval_request(call.id, call, parent_id=root.id)
     store.append_message(
@@ -898,7 +900,7 @@ def test_off_branch_duplicate_request_is_not_reused(
     approval_root: Path,
 ) -> None:
     store = ConversationStore(approval_root, session_id="approval-off-branch")
-    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    root = store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     call = ToolCall("off-branch-call", "echo", {})
     abandoned = store.append_approval_request(call.id, call, parent_id=root.id)
     active = store.append_message(
@@ -917,7 +919,7 @@ def test_rewound_resolution_reopens_with_active_branch_scope(
     approval_root: Path,
 ) -> None:
     store = ConversationStore(approval_root, session_id="approval-rewind")
-    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    root = store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     call = ToolCall("rewound-call", "echo", {})
     request = store.append_approval_request(call.id, call, parent_id=root.id)
     store.append_approval_resolution(call.id, "allow", parent_id=request.id)

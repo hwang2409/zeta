@@ -23,7 +23,14 @@ from ..core.session_files import (
 )
 from ..core.store import ConversationStore
 from ..media.images import image_signature_matches
-from ..protocol.types import ImageContent, Message, MessageRole, TextContent
+from ..protocol.types import (
+    ImageContent,
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
 
 ATTACHMENT_MAX_TEXT_BYTES = 200 * 1024
 ATTACHMENT_TOKEN_RE = re.compile(r'(?<!\S)@(?:"([^"\n]+)"|([^\s]+))')
@@ -180,7 +187,9 @@ def build_user_message(
             paths.append(resolved)
     blocks = [TextContent(value)]
     blocks.extend(_read_attachment(path, session_store) for path in paths)
-    return Message(MessageRole.USER, blocks)
+    return with_message_origin(
+        Message(MessageRole.USER, blocks), MessageOrigin.USER
+    )
 
 
 def paste_image(session_dir: str | Path, *, directory_fd: int | None = None) -> Path:

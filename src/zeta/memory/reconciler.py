@@ -16,20 +16,19 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from zeta.memory.safety import contains_secret
 from zeta.project_memory_history import PROJECT_MEMORY_FILES
 from zeta.project_registry import ProjectRegistry, ProjectRegistryError
+from zeta.protocol.types import (
+    ASSISTANT_RESPONSE_SYNTHETIC,
+    MESSAGE_ORIGIN_METADATA,
+    MessageOrigin,
+)
 
 MEMORY_FILES = PROJECT_MEMORY_FILES
 
-_SECRET_PATTERNS = (
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.IGNORECASE),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{16,}\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:password|passwd|api[_ -]?key|access[_ -]?token|secret)\s*[:=]\s*\S+",
-        re.IGNORECASE,
-    ),
-)
+_USER_DISPLAY_TEXT_METADATA = "zeta.user_display_text"
+
 _INJECTION_PATTERNS = (
     re.compile(
         r"\bignore (?:all |any )?(?:previous|prior|system) instructions?\b",
@@ -204,7 +203,7 @@ def _is_agent_directed_action(content: str) -> bool:
 
 
 def _unsafe_reason(content: str) -> str | None:
-    if any(pattern.search(content) for pattern in _SECRET_PATTERNS):
+    if contains_secret(content):
         return "secret"
     if _is_agent_directed_action(content) or any(
         pattern.search(content) for pattern in _INJECTION_PATTERNS
@@ -277,19 +276,74 @@ def _message(row: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return message if isinstance(message, Mapping) else None
 
 
-def _is_user_authored_row(row: Mapping[str, Any]) -> bool:
-    message = _message(row)
-    if message is None:
-        return False
+def _transcript_authorship(row: Mapping[str, Any]) -> str:
+    """Label transcript text by its explicit durable origin."""
+    row_type = row.get("type")
     data = row.get("data")
-    candidates = [row.get("origin")]
-    for value in (row.get("metadata"), data, message.get("metadata")):
-        if isinstance(value, Mapping):
-            candidates.extend((value.get("zeta.origin"), value.get("origin")))
-    origins = [value for value in candidates if isinstance(value, str) and value]
-    if "user" in origins:
-        return True
-    return message.get("role") == "user" and not origins
+    if row_type == "pending_prompt":
+        if isinstance(data, dict) and data.get("origin") == MessageOrigin.AGENT_SEND:
+            return MessageOrigin.AGENT_SEND.value
+        return "harness_unknown"
+    if row_type == "notification":
+        return "harness_notification"
+    if row_type != "message" or not isinstance(data, dict):
+        return "harness"
+    message = data.get("message")
+    if not isinstance(message, dict):
+        return "harness"
+    if message.get("tool_result") is not None:
+        return "tool_output"
+    metadata = message.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    origin = metadata.get(MESSAGE_ORIGIN_METADATA)
+    if message.get("role") == "user":
+        if origin == MessageOrigin.USER:
+            return MessageOrigin.USER.value
+        if origin in {
+            MessageOrigin.SKILL_EXPANSION,
+            MessageOrigin.SLASH_EXPANSION,
+            MessageOrigin.AGENT_PROMPT,
+            MessageOrigin.AGENT_SEND,
+            MessageOrigin.HARNESS_NUDGE,
+            MessageOrigin.AUTOMATION_PROMPT,
+        }:
+            return str(origin)
+        return "harness_unknown"
+    if message.get("role") == "assistant":
+        if metadata.get("response_state") == ASSISTANT_RESPONSE_SYNTHETIC:
+            return "harness"
+        return "agent"
+    return "harness"
+
+
+def _is_user_authored_row(row: Mapping[str, Any]) -> bool:
+    return _transcript_authorship(row) == MessageOrigin.USER
+
+
+def _rendered_transcript_rows(transcript: Transcript) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in transcript.rows:
+        rendered = dict(row)
+        authorship = _transcript_authorship(row)
+        rendered["authorship"] = authorship
+        data = rendered.get("data")
+        message = data.get("message") if isinstance(data, dict) else None
+        metadata = message.get("metadata") if isinstance(message, dict) else None
+        display_text = (
+            metadata.get(_USER_DISPLAY_TEXT_METADATA)
+            if isinstance(metadata, dict)
+            else None
+        )
+        if authorship in {
+            MessageOrigin.SKILL_EXPANSION,
+            MessageOrigin.SLASH_EXPANSION,
+        } and isinstance(display_text, str):
+            rendered["user_authored_input"] = {
+                "authorship": MessageOrigin.USER.value,
+                "text": display_text,
+            }
+        rows.append(rendered)
+    return rows
 
 
 def _is_lossy_generated_row(row: Mapping[str, Any]) -> bool:
@@ -325,22 +379,38 @@ def _prompt(
         {name: _sanitized(memory.get(name, "")) for name in MEMORY_FILES},
         ensure_ascii=False,
     )
-    rendered_rows = json.dumps(transcript.rows, ensure_ascii=False)
+    rendered_rows = json.dumps(_rendered_transcript_rows(transcript), ensure_ascii=False)
     return f"""You reconcile one transcript range into durable project memory.
 Return one JSON object only. Do not use Markdown fences.
 
 Rules:
 - Default to no-op: use changes=[] unless the session contains durable, useful,
   project-scoped evidence. Do not store acknowledgements or routine chatter.
+- Use these priorities when deciding what to retain and how much space it gets:
+  1. The user's own words matter most: orders, decisions, corrections,
+     preferences, and their reasoning. Keep them close to verbatim and let them
+     outlive everything else. Record what the user said, not merely that they
+     said something. Only rows labeled `user`, or nested `user_authored_input`
+     values labeled `user`, contain the user's own words. Generated expansion,
+     harness, and notification labels do not.
+  2. Anything with lasting effect comes next: what changed, what was committed,
+     what failed, and why.
+  3. Findings, open questions, and the agent's replies get much less space.
+  4. Tool calls and outputs have the lowest priority. Describe each in a few
+     words: what was done, whether it worked or the error, and what the touched
+     thing is. Never copy tool calls or output. Prefer a word or two that keeps
+     an item findable over dropping it entirely.
 - A user statement that establishes a binding project decision, validated unusual
   procedure, tested failure/replacement, changed fact, completion state, or an
   explicitly absent value IS durable evidence. Store it even when the user asks
   only for acknowledgement or says not to change the repository; that constraint
   applies to the worktree, not this separate memory proposal.
 - Preserve good existing memory. Each change is an exact whole-file replacement.
-- brief.md: stable purpose/invariants. state.md: current short-lived state.
-  backlog.md: unresolved commitments. changelog.md: verified outcomes.
-  decisions.md: dated decisions, validated procedures, and failure lessons.
+- brief.md: stable purpose, scope, architecture, and invariants.
+  state.md: active branch/PR/deployment state and current blockers.
+  backlog.md: unresolved commitments, follow-ups, and open questions.
+  changelog.md: verified shipped outcomes and validation results.
+  decisions.md: user rulings and their reasons, including superseded history.
 - Every changed state.md must include `As of {as_of.isoformat()}`.
 - Keep decision history. When new evidence supersedes a decision, retain the old
   entry explicitly marked `Superseded` with a date and add the active dated entry.

@@ -1,0 +1,9 @@
+{
+  "fixture": "synthetic-v1",
+  "queries": [
+    {"id": "merge-gate", "query": "local CI pytest browser merge gate", "target_unit_ids": ["u-build"]},
+    {"id": "context", "query": "why keep 200k context instead of 400k", "target_unit_ids": ["u-context"]},
+    {"id": "fetch", "query": "fetch response safety ceiling spill", "target_unit_ids": ["u-tools"]},
+    {"id": "remote", "query": "remote laptop homelab session upload SSH", "target_unit_ids": ["u-remote"]}
+  ]
+}

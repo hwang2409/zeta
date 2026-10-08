@@ -15,7 +15,13 @@ import pytest
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.project_registry import ProjectRegistry
-from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
 from zeta.remote_sync import (
     LocalTransport,
     RemoteSyncError,
@@ -74,7 +80,7 @@ def _session(home: Path, repo: Path):
     opened = SessionManager(home).create(
         provider="fake", model="fake", cwd=repo, project_id=project.project_id
     )
-    opened.store.append_message(Message(MessageRole.USER, [TextContent("root transcript")]))
+    opened.store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("root transcript")]), MessageOrigin.USER))
     child = ConversationStore(
         opened.store.session_dir / "agents", session_id="1", cwd=repo
     )
@@ -176,7 +182,7 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
     result = push_session(
         local, LocalTransport(remote), session_id=opened.metadata.session_id
     )
-    opened.store.append_message(Message(MessageRole.USER, [TextContent("written after snapshot")]))
+    opened.store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("written after snapshot")]), MessageOrigin.USER))
     opened.store.close()
 
     destination = remote / "sessions" / result.session_id
@@ -260,7 +266,7 @@ def test_push_refuses_newer_remote_without_force(tmp_path: Path) -> None:
     push_session(local, transport, session_id=session_id)
 
     remote_opened = SessionManager(remote).open(session_id)
-    remote_opened.store.append_message(Message(MessageRole.USER, [TextContent("newer remote entry")]))
+    remote_opened.store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("newer remote entry")]), MessageOrigin.USER))
     remote_opened.store.close()
 
     with pytest.raises(RemoteSyncError, match="newer remote"):
@@ -285,7 +291,7 @@ def test_push_refuses_to_replace_an_open_remote_session_even_with_force(
     with pytest.raises(RemoteSyncError, match="active|open|in use"):
         push_session(source, transport, session_id=session_id, force=True)
     live.store.append_message(
-        Message(MessageRole.USER, [TextContent("still writable after refused push")])
+        with_message_origin(Message(MessageRole.USER, [TextContent("still writable after refused push")]), MessageOrigin.USER)
     )
     live.store.close()
 
@@ -318,7 +324,7 @@ def test_pull_refuses_to_replace_an_open_session_even_with_force(
             force=True,
         )
     live.store.append_message(
-        Message(MessageRole.USER, [TextContent("still writable after refused pull")])
+        with_message_origin(Message(MessageRole.USER, [TextContent("still writable after refused pull")]), MessageOrigin.USER)
     )
     live.store.close()
 
@@ -471,7 +477,7 @@ def test_ssh_remote_install_rejects_byte_bomb_and_cleans_staging(
     _git_repo(repo)
     opened = SessionManager(local).create(provider="fake", model="fake", cwd=repo)
     opened.store.append_message(
-        Message(MessageRole.USER, [TextContent("content larger than one byte")])
+        with_message_origin(Message(MessageRole.USER, [TextContent("content larger than one byte")]), MessageOrigin.USER)
     )
     session_id = opened.metadata.session_id
     opened.store.close()

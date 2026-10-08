@@ -12,11 +12,13 @@ from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     TextContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -40,9 +42,9 @@ def _msg(role: MessageRole, text: str) -> Message:
 
 def test_list_user_message_forkpoints_covers_active_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    first = store.append_message(_msg(MessageRole.USER, "first user"))
+    first = store.append_message(with_message_origin(_msg(MessageRole.USER, "first user"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply 1"))
-    second = store.append_message(_msg(MessageRole.USER, "second user"))
+    second = store.append_message(with_message_origin(_msg(MessageRole.USER, "second user"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply 2"))
 
     forkpoints = store.list_user_message_forkpoints()
@@ -56,9 +58,9 @@ def test_append_message_fork_reanchors_at_target_user_message(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    first = store.append_message(_msg(MessageRole.USER, "first user"))
+    first = store.append_message(with_message_origin(_msg(MessageRole.USER, "first user"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply 1"))
-    store.append_message(_msg(MessageRole.USER, "abandoned"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "abandoned"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "abandoned reply"))
 
     fork = store.append_message_fork(first.id)
@@ -82,7 +84,7 @@ def test_append_message_fork_reanchors_at_target_user_message(
 
 def test_append_message_fork_rejects_non_user_targets(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(_msg(MessageRole.USER, "first"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER))
     assistant = store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
     checkpoint = store.append_checkpoint("saved")
 
@@ -96,7 +98,7 @@ def test_append_message_fork_rejects_non_user_targets(tmp_path: Path) -> None:
 
 def test_message_fork_never_splits_tool_call_result_pair(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    user_message = store.append_message(_msg(MessageRole.USER, "read the file"))
+    user_message = store.append_message(with_message_origin(_msg(MessageRole.USER, "read the file"), MessageOrigin.USER))
     call = ToolCall("call-1", "read", {"path": "README.md"})
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
 
@@ -124,9 +126,9 @@ def test_message_fork_never_splits_tool_call_result_pair(tmp_path: Path) -> None
 
 def test_message_fork_persists_and_reopens(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="s1")
-    first = store.append_message(_msg(MessageRole.USER, "first user"))
+    first = store.append_message(with_message_origin(_msg(MessageRole.USER, "first user"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
-    store.append_message(_msg(MessageRole.USER, "second"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "second"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "later"))
     fork = store.append_message_fork(first.id)
 
@@ -137,9 +139,9 @@ def test_message_fork_persists_and_reopens(tmp_path: Path) -> None:
 
 def test_slash_fork_picker_lists_prior_user_messages(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(_msg(MessageRole.USER, "prompt one"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "prompt one"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply one"))
-    store.append_message(_msg(MessageRole.USER, "prompt two"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "prompt two"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply two"))
     app = _make_tui(store)
 
@@ -159,9 +161,9 @@ def test_slash_fork_picker_when_no_user_messages(tmp_path: Path) -> None:
 
 def test_slash_fork_by_index_returns_dim_notice(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(_msg(MessageRole.USER, "prompt one"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "prompt one"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply one"))
-    store.append_message(_msg(MessageRole.USER, "prompt two"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "prompt two"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply two"))
     app = _make_tui(store)
 
@@ -172,7 +174,7 @@ def test_slash_fork_by_index_returns_dim_notice(tmp_path: Path) -> None:
 
 def test_slash_fork_by_index_out_of_range(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(_msg(MessageRole.USER, "only one"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "only one"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
     app = _make_tui(store)
 
@@ -186,7 +188,7 @@ def test_slash_fork_by_index_out_of_range(tmp_path: Path) -> None:
 
 def test_slash_tree_renders_single_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(_msg(MessageRole.USER, "first"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
     app = _make_tui(store)
 
@@ -199,9 +201,9 @@ def test_slash_tree_renders_single_branch(tmp_path: Path) -> None:
 
 def test_slash_tree_shows_branch_points_and_current(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    first = store.append_message(_msg(MessageRole.USER, "first"))
+    first = store.append_message(with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply 1"))
-    store.append_message(_msg(MessageRole.USER, "second"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "second"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply 2"))
     store.append_message_fork(first.id)
     app = _make_tui(store)
@@ -217,9 +219,9 @@ def test_slash_tree_shows_branch_points_and_current(tmp_path: Path) -> None:
 
 def test_slash_tree_switches_branches_and_reanchors(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    first = store.append_message(_msg(MessageRole.USER, "first"))
+    first = store.append_message(with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply 1"))
-    store.append_message(_msg(MessageRole.USER, "second"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "second"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply 2"))
     store.append_message_fork(first.id)
     app = _make_tui(store)
@@ -237,7 +239,7 @@ def test_slash_tree_switches_branches_and_reanchors(tmp_path: Path) -> None:
 
 def test_slash_tree_usage_and_range_errors(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(_msg(MessageRole.USER, "first"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
     app = _make_tui(store)
 
@@ -250,7 +252,7 @@ def test_slash_tree_refuses_pending_tool_call_only_on_switch(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(_msg(MessageRole.USER, "read"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "read"), MessageOrigin.USER))
     call = ToolCall("call-1", "read", {"path": "README.md"})
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     app = _make_tui(store)
@@ -266,9 +268,9 @@ def test_slash_tree_refuses_background_children_on_switch(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    first = store.append_message(_msg(MessageRole.USER, "first"))
+    first = store.append_message(with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
-    store.append_message(_msg(MessageRole.USER, "second"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "second"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply again"))
     store.append_message_fork(first.id)
     app = _make_tui(store)
@@ -287,9 +289,9 @@ def test_resume_after_message_fork_replays_active_branch_only(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="resume")
-    first = store.append_message(_msg(MessageRole.USER, "first user"))
+    first = store.append_message(with_message_origin(_msg(MessageRole.USER, "first user"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "assistant reply"))
-    store.append_message(_msg(MessageRole.USER, "abandoned prompt"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "abandoned prompt"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "abandoned reply"))
     store.append_message_fork(first.id)
 
@@ -308,9 +310,9 @@ def test_resume_after_message_fork_replays_active_branch_only(
 
 def test_switch_between_branches_round_trips_replay(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    first = store.append_message(_msg(MessageRole.USER, "first"))
+    first = store.append_message(with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply 1"))
-    store.append_message(_msg(MessageRole.USER, "second"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "second"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply 2"))
     store.append_message_fork(first.id)
 
@@ -330,7 +332,7 @@ def test_switch_between_branches_round_trips_replay(tmp_path: Path) -> None:
 
 def test_switch_to_branch_rejects_non_leaf(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    first = store.append_message(_msg(MessageRole.USER, "first"))
+    first = store.append_message(with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
 
     with pytest.raises(ValueError, match="branch head not found"):
@@ -341,7 +343,7 @@ def test_switch_to_branch_rejects_non_leaf(tmp_path: Path) -> None:
 
 def test_switch_to_branch_rejects_current_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(_msg(MessageRole.USER, "first"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER))
     tail = store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
     with pytest.raises(ValueError, match="already on that branch"):
         store.switch_to_branch(tail.id)
@@ -349,7 +351,7 @@ def test_switch_to_branch_rejects_current_branch(tmp_path: Path) -> None:
 
 def test_message_fork_rejects_empty_id(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(_msg(MessageRole.USER, "first"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
     with pytest.raises(ValueError, match="requires a user message entry id"):
         store.append_message_fork("")
@@ -363,7 +365,7 @@ def test_switch_to_branch_rejects_empty_id(tmp_path: Path) -> None:
 
 def test_slash_fork_refuses_pending_tool_call(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(_msg(MessageRole.USER, "run tool"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "run tool"), MessageOrigin.USER))
     call = ToolCall("call-1", "read", {"path": "x"})
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     app = _make_tui(store)
@@ -375,7 +377,7 @@ def test_fork_entry_reopens_without_checkpoint_source(tmp_path: Path) -> None:
     """The relaxed fork validator accepts non-checkpoint sources on reload."""
 
     store = ConversationStore(tmp_path, session_id="s1")
-    first = store.append_message(_msg(MessageRole.USER, "hi"))
+    first = store.append_message(with_message_origin(_msg(MessageRole.USER, "hi"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
     store.append_message_fork(first.id)
 
@@ -396,20 +398,20 @@ def test_list_branches_empty_store(tmp_path: Path) -> None:
 def test_fork_entries_record_source_type_for_each_flavor(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "checkpoint"
     store = ConversationStore(checkpoint_dir)
-    store.append_message(_msg(MessageRole.USER, "one"))
+    store.append_message(with_message_origin(_msg(MessageRole.USER, "one"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply one"))
     store.append_checkpoint("saved")
     assert store.append_fork("saved").data["source_type"] == "checkpoint"
 
     message_dir = tmp_path / "message"
     store = ConversationStore(message_dir)
-    user = store.append_message(_msg(MessageRole.USER, "hello"))
+    user = store.append_message(with_message_origin(_msg(MessageRole.USER, "hello"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "hi"))
     assert store.append_message_fork(user.id).data["source_type"] == "message"
 
     branch_dir = tmp_path / "branch"
     store = ConversationStore(branch_dir, session_id="branchsession")
-    root = store.append_message(_msg(MessageRole.USER, "root"))
+    root = store.append_message(with_message_origin(_msg(MessageRole.USER, "root"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
     # Create a second branch to switch to.
     store.append_message_fork(root.id)
@@ -490,7 +492,7 @@ def test_slash_tree_soft_caps_long_branch_lists(tmp_path: Path) -> None:
     from zeta.tui.checkpoints import TREE_SOFT_CAP
 
     store = ConversationStore(tmp_path)
-    root = store.append_message(_msg(MessageRole.USER, "root"))
+    root = store.append_message(with_message_origin(_msg(MessageRole.USER, "root"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
     extra_forks = 5
     for _ in range(TREE_SOFT_CAP + extra_forks):

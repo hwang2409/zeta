@@ -8,6 +8,8 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from ..model_input import ModelInputEnvelope
+from ..protocol.types import MessageOrigin
 from .config import (
     MCPConfigError,
     MCPServerConfig,
@@ -19,7 +21,6 @@ from .config import (
 from .mount import MCPMount, NoticeSink
 from .oauth import MCPOAuthError, authorize
 from .oauth_store import load_token, token_state
-from .prompt_commands import SlashModelInput
 from .resources import (
     MCPResourceError,
     fetch_resource,
@@ -263,7 +264,7 @@ async def run_mcp_resources_list(mount: MCPMount, server: str) -> str:
 
 async def run_mcp_resource_attach(
     mount: MCPMount, server: str, uri: str
-) -> str | SlashModelInput:
+) -> str | ModelInputEnvelope:
     """Fetch one resource and hand it back for the next user turn."""
 
     client = mount.client_for(server)
@@ -281,7 +282,9 @@ async def run_mcp_resource_attach(
         )
     except MCPResourceError as exc:
         return f"mcp error: {exc}"
-    return SlashModelInput(attachment.labeled_text)
+    return ModelInputEnvelope(
+        attachment.labeled_text, "", MessageOrigin.SLASH_EXPANSION
+    )
 
 
 __all__ = [

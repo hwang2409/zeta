@@ -428,13 +428,20 @@ async def test_oversized_user_row_gets_terminal_receipt_without_publication(
             "message": {
                 "role": "user",
                 "content": [{"type": "text", "text": "x" * 100_000}],
+                "metadata": {"zeta.origin": "user"},
             }
         },
     }
     later = {
         "seq": 2,
         "type": "message",
-        "data": {"message": {"role": "user", "content": "later fact"}},
+        "data": {
+            "message": {
+                "role": "user",
+                "content": "later fact",
+                "metadata": {"zeta.origin": "user"},
+            }
+        },
     }
     (runner.session_dir / "conversation.jsonl").write_text(
         json.dumps(oversized) + "\n" + json.dumps(later) + "\n",

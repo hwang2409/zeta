@@ -17,6 +17,7 @@ from zeta.core.slash import SlashStatus, _format_status
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEventType,
     TextContent,
@@ -1304,7 +1305,7 @@ async def test_midstream_disconnect_without_tool_call_discards_partial_and_retri
     )
     conversation = ConversationStore(tmp_path / "sessions")
     loop = AgentLoop(backend, conversation, skill_catalog=SkillCatalog.empty())
-    events = [item async for item in loop.run_turn("hello")]
+    events = [item async for item in loop.run_turn("hello", origin=MessageOrigin.USER)]
 
     retry = next(item for item in events if item.type is StreamEventType.RETRY)
     assert len(requests) == 2
@@ -3515,7 +3516,7 @@ async def test_codex_stop_reason_persisted_on_assistant_message(
 
     async for _ in AgentLoop(
         backend, store, skill_catalog=SkillCatalog.empty()
-    ).run_turn("hi"):
+    ).run_turn("hi", origin=MessageOrigin.USER):
         pass
 
     assistant = store.messages()[-1]
