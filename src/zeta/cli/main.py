@@ -39,6 +39,11 @@ class _ArgumentParser(argparse.ArgumentParser):
         namespace: argparse.Namespace | None = None,
     ) -> argparse.Namespace:
         argv = list(sys.argv[1:] if args is None else args)
+        if any(
+            token == "--compaction" or token.startswith("--compaction=")
+            for token in argv
+        ):
+            self.error("summary compaction mode was removed; eviction is always used")
         server_command: list[str] | None = None
         option_actions = {
             option: action
@@ -148,15 +153,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="override the compaction/context token budget for this run",
-    )
-    parser.add_argument(
-        "--compaction",
-        choices=("summary", "evict"),
-        default=None,
-        help=(
-            "compaction mode (default: evict; summary keeps model-written "
-            "compaction); with --resume/--continue it switches the stored mode"
-        ),
     )
     parser.add_argument(
         "--tools",
@@ -542,7 +538,6 @@ def main(argv: list[str] | None = None) -> int:
                 port=args.port,
                 provider=args.serve_provider or args.provider,
                 model=args.serve_model or args.model,
-                compaction=args.compaction,
                 tools=args.serve_tools if args.serve_tools is not None else args.tools,
                 disallowed_tools=(
                     args.serve_disallowed_tools

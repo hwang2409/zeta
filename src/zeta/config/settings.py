@@ -16,7 +16,7 @@ one table entry (``[approval]\\nallow = [...]``) without restating unrelated
 tables, but replacing a list is one atomic swap.
 
 Trust boundary: the project layer may only contribute safe keys — provider,
-model, token_budget, compaction, workspace_snapshot_cap, tools, and
+model, token_budget, workspace_snapshot_cap, tools, and
 disallowed_tools. Project tool policy is cumulative: allowlists intersect and
 denylists are combined. ``yolo``, ``allow_hooks``, ``allow_external_tools``,
 ``[approval]``, ``theme``, and ``[keybindings]`` from the project file are
@@ -27,6 +27,8 @@ checkout cannot silently grant itself tool approvals, remap ``ctrl-c`` to
 exfiltrate the composer, or hide the abort key.
 
 Precedence: CLI flags override settings; settings override built-in defaults.
+The removed `compaction` key is accepted only to emit a migration notice; Zeta
+always uses eviction.
 The ``yolo`` flag is tri-state — an explicit ``--yolo`` or ``--no-yolo`` wins
 either way, while an omitted flag inherits the settings value.
 
@@ -48,7 +50,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from ..compaction import COMPACTION_MODES, DEFAULT_SESSION_COMPACTION
 from ..core.approval import parse_approval_rule
 from .tool_policy import parse_tool_patterns, validate_tool_patterns
 
@@ -111,7 +112,6 @@ class Settings:
     model: str | None = None
     yolo: bool | None = None
     token_budget: int | None = None
-    compaction: str | None = None
     theme: str | None = None
     approval_allow: tuple[str, ...] = ()
     approval_deny: tuple[str, ...] = ()
@@ -147,8 +147,6 @@ class ResolvedConfig:
     approval_deny: tuple[str, ...]
     approval_ask: tuple[str, ...]
     keybindings: Mapping[str, Any]
-    compaction: str = DEFAULT_SESSION_COMPACTION
-    compaction_pinned: bool = False
     stream_stall_seconds: int | None = None
     stream_stall_retries: int | None = None
     workspace_snapshot_cap: int | None = None
@@ -225,7 +223,6 @@ def resolve(
     cli_model: str | None,
     cli_yolo: bool | None,
     cli_token_budget: int | None,
-    cli_compaction: str | None = None,
     cli_tools: str | None = None,
     cli_disallowed_tools: str | None = None,
     cli_allow_hooks: bool | None = None,
@@ -253,8 +250,6 @@ def resolve(
         model=cli_model or settings.model,
         yolo=yolo,
         token_budget=token_budget,
-        compaction=cli_compaction or settings.compaction or DEFAULT_SESSION_COMPACTION,
-        compaction_pinned=cli_compaction is not None or settings.compaction is not None,
         theme=settings.theme,
         approval_allow=settings.approval_allow,
         approval_deny=settings.approval_deny,
@@ -458,9 +453,8 @@ def _validate(
     theme = _validated_string(data, "theme", notices)
     yolo = _validated_bool(data, "yolo", notices)
     token_budget = _validated_positive_int(data, "token_budget", notices)
-    compaction = _validated_choice(
-        data, "compaction", COMPACTION_MODES, notices
-    )
+    if "compaction" in data:
+        notices.append("settings · 'compaction' was removed; using eviction")
     stream_stall_seconds = _validated_positive_int(
         data, "stream_stall_seconds", notices
     )
@@ -498,7 +492,6 @@ def _validate(
         model=model,
         yolo=yolo,
         token_budget=token_budget,
-        compaction=compaction,
         theme=theme,
         approval_allow=allow,
         approval_deny=deny,

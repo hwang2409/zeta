@@ -184,8 +184,6 @@ def test_resolve_falls_back_to_defaults_when_nothing_configured(tmp_path: Path) 
     assert config.model is None
     assert config.yolo is False
     assert config.token_budget is None
-    assert config.compaction == "evict"
-    assert config.compaction_pinned is False
     assert config.approval_allow == ()
 
 
@@ -624,34 +622,23 @@ def test_scoped_rules_reach_the_live_policy_through_create_app(
     assert "todo(*)" in policy.notices[0]
 
 
-def test_compaction_setting_is_project_safe_and_cli_wins(tmp_path: Path) -> None:
+def test_removed_compaction_setting_uses_eviction_with_notice(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
     _write(home, 'compaction = "summary"\n')
-    _write(project, 'compaction = "evict"\n')
+    _write(project, 'compaction = "summary"\n')
 
     loaded = load_settings(home=home, project_dir=project)
-    configured = resolve(
+    config = resolve(
         loaded.settings,
         cli_provider=None,
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
     )
-    overridden = resolve(
-        loaded.settings,
-        cli_provider=None,
-        cli_model=None,
-        cli_yolo=None,
-        cli_token_budget=None,
-        cli_compaction="summary",
-    )
 
-    assert configured.compaction == "evict"
-    assert configured.compaction_pinned is True
-    assert overridden.compaction == "summary"
-    assert overridden.compaction_pinned is True
-
+    assert "settings · 'compaction' was removed; using eviction" in loaded.notices
+    assert not hasattr(config, "compaction")
 
 def test_inbox_feature_switch_defaults_on_and_can_be_disabled(tmp_path: Path) -> None:
     home = tmp_path / "home"

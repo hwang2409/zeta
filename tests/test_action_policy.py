@@ -236,10 +236,10 @@ def test_existing_tool_payloads_match_pre_action_policy_snapshots(
         "ollama": ollama_tools(existing_schemas),
     }
     expected = {
-        "schemas": "424464b3f6cb3c604c18f629a52c5679a541d171868dd9d66f3f9dd443ba7885",
-        "anthropic": "8e295ad1975e0e2b6da3a2f5d0c53c61f2d586f461a8971494688a2054e59c19",
-        "codex": "9bcbe9462dabc868b3b039b1f7bc1c917c396dc004790b69b511c113d74dab02",
-        "ollama": "3e41107071848090fdcebd6e4aeaa85e5d6686d107840e7a32731f35afd10c37",
+        "schemas": "f1e5f3e3c8e87a51a1b9570b89f729639c52a8219249fd9da1004f27bc002d16",
+        "anthropic": "e929642ad8e79ae60f09b42f175dfe347d3495a5f816b59c2186034210bb36f3",
+        "codex": "e769aa54af581e1e8c31c983aa379c0ec60d2678f8e35fb287bd4ef19a50c71d",
+        "ollama": "e7bf0a9f492eae89b57ce2425ff63431bb1ac71d70e501310bcf2a62366228ff",
     }
 
     assert {

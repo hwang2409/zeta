@@ -17,11 +17,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Mapping
 
-from ..compaction import (
-    COMPACTION_MODES,
-    DEFAULT_SESSION_COMPACTION,
-    LEGACY_SESSION_COMPACTION,
-)
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
@@ -102,8 +97,6 @@ class SessionMetadata:
     cwd: str
     retained_tail: int
     compaction_budget: int
-    compaction: str = DEFAULT_SESSION_COMPACTION
-    compaction_pinned: bool = False
     override_audit: list[dict[str, Any]] = field(default_factory=list)
     system_prompt: str = ""
     context_files: list[str] = field(default_factory=list)
@@ -141,8 +134,6 @@ class SessionMetadata:
         cwd: str,
         retained_tail: int,
         compaction_budget: int,
-        compaction: str = DEFAULT_SESSION_COMPACTION,
-        compaction_pinned: bool = False,
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),
         skill_catalog: SkillCatalog | None = None,
@@ -174,8 +165,6 @@ class SessionMetadata:
             cwd=cwd,
             retained_tail=retained_tail,
             compaction_budget=compaction_budget,
-            compaction=compaction,
-            compaction_pinned=compaction_pinned,
             system_prompt=system_prompt,
             context_files=list(context_files),
             skill_catalog=skill_catalog.to_snapshot()
@@ -225,17 +214,15 @@ class SessionMetadata:
             raise SessionError(f"session metadata is incomplete: {path}")
         retained_tail = value.get("retained_tail")
         compaction_budget = value.get("compaction_budget")
-        # Sessions created before compaction modes were persisted must keep
-        # their original summary behavior when they resume.
-        compaction = value.get("compaction", LEGACY_SESSION_COMPACTION)
-        compaction_pinned = value.get("compaction_pinned", False)
+        if value.get("compaction") == "summary":
+            logger.warning(
+                "session requested removed summary compaction; using eviction"
+            )
         if (
             type(retained_tail) is not int
             or retained_tail < 1
             or type(compaction_budget) is not int
             or compaction_budget < 1
-            or compaction not in COMPACTION_MODES
-            or type(compaction_pinned) is not bool
         ):
             raise SessionError(f"session metadata budgets are invalid: {path}")
         audit = value.get("override_audit", [])
@@ -367,8 +354,6 @@ class SessionMetadata:
             cwd=value["cwd"],
             retained_tail=retained_tail,
             compaction_budget=compaction_budget,
-            compaction=compaction,
-            compaction_pinned=compaction_pinned,
             override_audit=[dict(item) for item in audit],
             system_prompt=system_prompt,
             context_files=list(context_files),
@@ -408,8 +393,6 @@ class SessionMetadata:
             "cwd": self.cwd,
             "retained_tail": self.retained_tail,
             "compaction_budget": self.compaction_budget,
-            "compaction": self.compaction,
-            "compaction_pinned": self.compaction_pinned,
             "override_audit": self.override_audit,
             "system_prompt": self.system_prompt,
             "context_files": self.context_files,
@@ -471,8 +454,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         cwd: str | Path | None = None,
         retained_tail: int = 8,
         compaction_budget: int = 200_000,
-        compaction: str = DEFAULT_SESSION_COMPACTION,
-        compaction_pinned: bool = False,
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),
         skill_catalog: SkillCatalog | None = None,
@@ -516,8 +497,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 cwd=resolved_cwd,
                 retained_tail=retained_tail,
                 compaction_budget=compaction_budget,
-                compaction=compaction,
-                compaction_pinned=compaction_pinned,
                 system_prompt=system_prompt,
                 context_files=context_files,
                 skill_catalog=skill_catalog,

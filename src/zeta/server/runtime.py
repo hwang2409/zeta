@@ -117,7 +117,6 @@ class ServerRuntime:
         cwd: str | Path | None = None,
         provider: str | None = None,
         model: str | None = None,
-        compaction: str | None = None,
         tools: str | None = None,
         disallowed_tools: str | None = None,
         require_tools: bool = False,
@@ -130,7 +129,6 @@ class ServerRuntime:
         self.cwd = Path(cwd or Path.cwd()).expanduser().resolve()
         self._server_provider = provider
         self._server_model = model
-        self._server_compaction = compaction
         self._server_tools = tools
         self._server_disallowed_tools = disallowed_tools
         self._require_tools = require_tools
@@ -451,7 +449,6 @@ class ServerRuntime:
             cli_model=model if model is not None else self._server_model,
             cli_yolo=self._cli_yolo,
             cli_token_budget=None,
-            cli_compaction=self._server_compaction,
             cli_tools=self._server_tools,
             cli_disallowed_tools=self._server_disallowed_tools,
             cli_allow_hooks=self._allow_hooks,

@@ -28,7 +28,6 @@ from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import MessageOrigin
-from ...runtime.compaction_mode import run_compaction_command
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -109,7 +108,6 @@ class SlashHandlerMixin:
             compaction_history=compaction_history_data,
             model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
             mcp_summary=self.loop.mcp_summary,
-            compaction=context_assembler.compaction,
             automatic_memory_failure=(
                 self.loop.memory_reconciler.last_failure.status_line()
                 if self.loop.memory_reconciler is not None
@@ -244,16 +242,6 @@ class SlashHandlerMixin:
         if notes:
             return f"model: {model} ({'; '.join(notes)})"
         return f"model: {model}"
-
-    def slash_compaction(self, args: str) -> str:
-        """Show the compaction mode, or switch it for the next request."""
-
-        busy = (
-            "cannot change compaction while a turn or approval is active"
-            if self.active or self.pending_approvals
-            else None
-        )
-        return run_compaction_command(self.loop, args, busy=busy)
 
     def slash_plan(self, args: str) -> str | ModelInputEnvelope:
         """Toggle plan mode or submit a prompt while entering it."""

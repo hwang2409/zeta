@@ -22,7 +22,6 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
-from ..runtime.compaction_mode import switch_compaction
 from . import abort_scope, ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
 from .delivery import DeliveryRequests, TurnOutcome
@@ -60,7 +59,6 @@ class ZetaServer:
         port: int | None = None,
         provider: str | None = None,
         model: str | None = None,
-        compaction: str | None = None,
         tools: str | None = None,
         disallowed_tools: str | None = None,
         require_tools: bool = False,
@@ -85,7 +83,6 @@ class ZetaServer:
             cwd=cwd,
             provider=provider,
             model=model,
-            compaction=compaction,
             tools=tools,
             disallowed_tools=disallowed_tools,
             require_tools=require_tools,
@@ -565,9 +562,11 @@ class _Client:
             model_selection.apply(runtime, model, mode)
             return ergonomics.settings(runtime)
         if method == "set_compaction":
-            return switch_compaction(
-                runtime.loop, _required_string(params, "mode")
-            ).to_dict()
+            _required_string(params, "mode")
+            raise ProtocolError(
+                -32602,
+                "compaction mode selection was removed; eviction is always used",
+            )
         if method == "fork_message":
             store.append_message_fork(_required_string(params, "message_id"))
         elif method == "switch_branch":

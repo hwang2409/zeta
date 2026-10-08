@@ -90,14 +90,6 @@ def compose_runtime(
                 budget_model,
                 config.token_budget,
             )
-        if opened is None:
-            compaction = config.compaction
-            compaction_pinned = config.compaction_pinned
-        else:
-            # A session's persisted mode is part of its request shape. Resume
-            # must not change it because ambient settings changed later.
-            compaction = opened.metadata.compaction
-            compaction_pinned = opened.metadata.compaction_pinned
         backend_kwargs: dict[str, object] = {
             "home": home,
             "stall_seconds": config.stream_stall_seconds,
@@ -113,8 +105,6 @@ def compose_runtime(
                 model=selected_model,
                 cwd=cwd,
                 compaction_budget=effective_budget,
-                compaction=compaction,
-                compaction_pinned=compaction_pinned,
                 system_prompt=project_context.system_prompt,
                 context_files=[str(path) for path in project_context.files],
                 skill_catalog=skill_catalog,
@@ -201,7 +191,6 @@ def compose_runtime(
             ),
             "token_budget": effective_budget,
             "retained_tail": metadata.retained_tail,
-            "compaction": metadata.compaction,
             "on_completion_success": completion_callback,
             "on_plan_mode_change": on_plan_mode_change,
             "system_prompt": project_context.system_prompt,
@@ -215,7 +204,6 @@ def compose_runtime(
             project_id=metadata.project_id,
             project_registry=manager.project_registry,
             inbox_enabled=config.inbox_enabled,
-            compaction=metadata.compaction,
             tool_allow=tool_policy.allow,
             tool_deny=tool_policy.deny,
             tool_allow_layers=tool_policy.allow_layers,

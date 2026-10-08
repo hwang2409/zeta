@@ -5072,7 +5072,7 @@ async def test_context_retry_of_notification_consumption_is_never_nudged(
         message.metadata.get("zeta_event") == "empty_turn_nudge"
         for message in store.messages()
     )
-    assert len(backend.calls) == 4
+    assert len(backend.calls) == 3
     await loop.close()
 
 

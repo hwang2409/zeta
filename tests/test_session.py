@@ -966,7 +966,9 @@ async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Pat
     assert output is not None
     assert output.startswith("compacted entries ")
     assert store.compaction_marker_count() == 1
-    assert backend.calls[0][0][0].content[0].text == "stable identity"
+    assert backend.calls == []
+    marker = next(entry for entry in store.replay() if entry.type == "compaction")
+    assert marker.data["kind"] == "evict"
 
 
 def test_session_previews_are_ordered_and_ansi_safe(tmp_path: Path) -> None:
@@ -2392,7 +2394,7 @@ def test_session_delete_does_not_read_corrupt_data(tmp_path, corruption):
     assert manager.list_sessions() == []
 
 
-def test_new_session_defaults_to_evict(
+def test_new_sessions_use_eviction_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -2400,69 +2402,56 @@ def test_new_session_defaults_to_evict(
 
     app = create_app(build_parser().parse_args(["--provider", "fake"]))
 
-    assert app.loop.context_assembler.compaction == "evict"
     assert "recall_history" in app.loop.tool_registry.registered_names
     metadata = json.loads(
         (home / "sessions" / app.loop.store.session_id / "meta.json").read_text()
     )
-    assert metadata["compaction"] == "evict"
-    assert metadata["compaction_pinned"] is False
+    assert "compaction" not in metadata
+    assert "compaction_pinned" not in metadata
 
 
-def test_new_session_can_select_summary(
+def test_removed_summary_cli_mode_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["--provider", "fake", "--compaction", "summary"])
+
+    assert exc_info.value.code == 2
+    assert "summary compaction mode was removed; eviction is always used" in capsys.readouterr().err
+
+
+async def test_legacy_summary_marker_fixture_loads_and_resumes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-
-    app = create_app(
-        build_parser().parse_args(
-            ["--provider", "fake", "--compaction", "summary"]
-        )
-    )
-
-    assert app.loop.context_assembler.compaction == "summary"
-    assert "recall_history" not in app.loop.tool_registry.registered_names
-    metadata = json.loads(
-        (home / "sessions" / app.loop.store.session_id / "meta.json").read_text()
-    )
-    assert metadata["compaction"] == "summary"
-    assert metadata["compaction_pinned"] is True
-
-
-def test_compaction_mode_persists_and_survives_resume(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "zeta-home"
-    monkeypatch.setenv("ZETA_HOME", str(home))
-    first = create_app(
-        build_parser().parse_args(["--provider", "fake", "--compaction", "evict"])
-    )
+    first = create_app(build_parser().parse_args(["--provider", "fake"]))
     session_id = first.loop.store.session_id
-    assert first.loop.context_assembler.compaction == "evict"
-    assert "recall_history" in first.loop.tool_registry.registered_names
-    metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
-    assert metadata["compaction"] == "evict"
-    assert metadata["compaction_pinned"] is True
+    session_dir = home / "sessions" / session_id
+    await first.close()
+
+    fixture = Path("tests/fixtures/legacy-summary-conversation.jsonl").read_text()
+    metadata = json.loads((session_dir / "meta.json").read_text())
+    transcript = fixture.replace("__SESSION_ID__", session_id).replace(
+        "__CWD__", metadata["cwd"]
+    )
+    (session_dir / "conversation.jsonl").write_text(transcript, encoding="utf-8")
 
     resumed = create_app(build_parser().parse_args(["--resume", session_id]))
-    assert resumed.loop.context_assembler.compaction == "evict"
-    assert "recall_history" in resumed.loop.tool_registry.registered_names
-
-    # An explicit flag on resume switches the persisted mode.
-    switched = create_app(
-        build_parser().parse_args(
-            ["--resume", session_id, "--compaction", "summary"]
-        )
+    messages = await resumed.loop.context_assembler.assemble()
+    rendered = "\n".join(
+        block.text
+        for message in messages
+        for block in message.content
+        if isinstance(block, TextContent)
     )
-    assert switched.loop.context_assembler.compaction == "summary"
-    assert "recall_history" not in switched.loop.tool_registry.registered_names
-    metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
-    assert metadata["compaction"] == "summary"
+    assert "legacy summary preserves the prior decision" in rendered
+    assert "current question" in rendered
+    assert "legacy question" not in rendered
+    assert "legacy answer" not in rendered
+    await resumed.close()
 
 
-def test_legacy_session_without_compaction_resumes_as_summary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_legacy_summary_session_setting_resumes_with_eviction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
@@ -2470,11 +2459,11 @@ def test_legacy_session_without_compaction_resumes_as_summary(
     session_id = first.loop.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text())
-    metadata.pop("compaction")
-    metadata.pop("compaction_pinned")
+    metadata["compaction"] = "summary"
+    metadata["compaction_pinned"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
     resumed = create_app(build_parser().parse_args(["--resume", session_id]))
 
-    assert resumed.loop.context_assembler.compaction == "summary"
-    assert "recall_history" not in resumed.loop.tool_registry.registered_names
+    assert "recall_history" in resumed.loop.tool_registry.registered_names
+    assert "session requested removed summary compaction; using eviction" in caplog.text
