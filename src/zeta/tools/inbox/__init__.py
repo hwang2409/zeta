@@ -190,6 +190,7 @@ async def _inbox(
         if action == "sent":
             page = inbox.sent(
                 project_id,
+                session_id=session_id,
                 offset=arguments.get("offset", 0),
                 limit=arguments.get("limit", 50),
             )

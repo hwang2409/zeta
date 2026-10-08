@@ -703,6 +703,18 @@ class Message:
         )
 
 
+def is_passive_harness_message(message: Message | Mapping[str, Any]) -> bool:
+    """True for provider-visible harness input hidden from human transcript views."""
+
+    metadata = (
+        message.metadata if isinstance(message, Message) else message.get("metadata")
+    )
+    return (
+        isinstance(metadata, Mapping)
+        and metadata.get(MESSAGE_ORIGIN_METADATA) == MessageOrigin.HARNESS_NUDGE.value
+    )
+
+
 def require_new_message_origin(message: Message) -> Message:
     """Return a new message after validating its durable user origin."""
 

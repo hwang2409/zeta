@@ -22,7 +22,7 @@ from rich.text import Text
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..core.store import ConversationStore
-from ..protocol.types import Message, ToolCall
+from ..protocol.types import Message, ToolCall, is_passive_harness_message
 from . import theme
 from .cards.agent import (
     AgentCard,
@@ -468,11 +468,7 @@ def _read_bounded_messages(
                 data = row.get("data")
                 message = data.get("message") if isinstance(data, dict) else None
                 if isinstance(message, dict):
-                    metadata = message.get("metadata")
-                    if (
-                        isinstance(metadata, dict)
-                        and metadata.get("zeta_event") == "empty_turn_nudge"
-                    ):
+                    if is_passive_harness_message(message):
                         continue
                     append_message(message)
                     content = message.get("content")

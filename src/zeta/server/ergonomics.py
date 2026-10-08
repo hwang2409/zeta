@@ -22,6 +22,7 @@ from ..protocol.types import (
     MessageOrigin,
     MessageRole,
     TextContent,
+    is_passive_harness_message,
     with_message_origin,
 )
 from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
@@ -131,8 +132,7 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
         if entry.type in {"message", "notification"}
         and not (
             entry.type == "message"
-            and entry.data["message"].get("metadata", {}).get("zeta_event")
-            == "empty_turn_nudge"
+            and is_passive_harness_message(entry.data["message"])
         )
     ]
     rows = []

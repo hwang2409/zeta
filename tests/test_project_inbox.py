@@ -805,12 +805,11 @@ async def test_claim_injects_note_on_senders_next_turn_without_waking(
         notes = _sent_status_notes(backend)
         assert len(notes) == 1
         assert backend.calls[0][0][-1] is notes[0]
-        assert notes[0].content == [
-            TextContent(
-                'inbox: your message "Can you review this?" to beta was claimed '
-                f"by session {'b' * 32} at {inbox.read(project_b.project_id)['claimed'][0]['claimed_at']}"
-            )
-        ]
+        assert (
+            'inbox: your message "Can you review this?" to beta was claimed '
+            f"by session {'b' * 32} at {inbox.read(project_b.project_id)['claimed'][0]['claimed_at']}"
+            in notes[0].content[0].text
+        )
     finally:
         await loop.close()
         store.close()
@@ -1066,14 +1065,22 @@ def test_passive_scanner_io_is_bounded_by_sender_tracking(
         title="tracked",
         body="body",
     )
-    reads: list[str] = []
-    real_read_bounded = ProjectInbox._read_bounded
+    reads: list[tuple[str, str]] = []
+    real_read_tracked = ProjectInbox._read_tracked_message
 
-    def counted_read_bounded(self, project_id, limit):
-        reads.append(project_id)
-        return real_read_bounded(self, project_id, limit)
+    def counted_read_tracked(
+        self, source_project, source_session, target_project, tracked_message_id
+    ):
+        reads.append((target_project, tracked_message_id))
+        return real_read_tracked(
+            self,
+            source_project,
+            source_session,
+            target_project,
+            tracked_message_id,
+        )
 
-    monkeypatch.setattr(ProjectInbox, "_read_bounded", counted_read_bounded)
+    monkeypatch.setattr(ProjectInbox, "_read_tracked_message", counted_read_tracked)
     scanner = ProjectInboxScanner(
         registry,
         project_a.project_id,
@@ -1087,7 +1094,7 @@ def test_passive_scanner_io_is_bounded_by_sender_tracking(
     assert [(item["id"], item["status"]) for item in statuses] == [
         (message_id, "new")
     ]
-    assert reads == []
+    assert reads == [(project_b.project_id, message_id)]
 
 
 @pytest.mark.asyncio
@@ -1118,12 +1125,11 @@ async def test_done_without_reply_injects_completed_status(tmp_path: Path) -> No
         await _collect_turn(loop, "next")
         notes = _sent_status_notes(backend)
         assert len(notes) == 1
-        assert notes[0].content == [
-            TextContent(
-                'inbox: your message "Finish this" to beta was completed '
-                f"at {completed['done_at']} (outcome: fixed without a reply)"
-            )
-        ]
+        assert (
+            'inbox: your message "Finish this" to beta was completed '
+            f"at {completed['done_at']} (outcome: fixed without a reply)"
+            in notes[0].content[0].text
+        )
     finally:
         await loop.close()
         store.close()

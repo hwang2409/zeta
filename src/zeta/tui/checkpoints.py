@@ -37,8 +37,8 @@ from ..protocol.types import (
     ToolCall,
     ToolUseContent,
     assistant_text,
+    is_passive_harness_message,
 )
-from ..runtime.loop.empty_turn import is_nudge_message
 from .cards.base import strip_terminal_controls
 from .render import (
     is_retryable_error,
@@ -647,7 +647,7 @@ class CheckpointTranscriptMixin:
             message = entry.message
             if message is None:
                 raise RuntimeError("TUI message projection is missing its message")
-            if is_nudge_message(message):
+            if is_passive_harness_message(message):
                 yield
                 continue
             if message.role is MessageRole.USER:
