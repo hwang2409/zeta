@@ -646,6 +646,7 @@ SessionMetadata = {
     project_memory_offset: integer or null,
     project_memory_length: integer or null,
     project_memory_digest: string or null,
+    prompt_recipe: string or null, prompt_components: object,
     tool_allow: array[string] or null, tool_deny: array[string]
   },
   optional: {

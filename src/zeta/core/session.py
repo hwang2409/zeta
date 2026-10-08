@@ -27,6 +27,7 @@ from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
 from .store import ConversationStore
+from .store.prompt_composition import PromptCompositionMixin
 from .session_files import (
     SessionError,
     SessionInUseError,
@@ -55,9 +56,7 @@ from .session_links import (
     valid_pending_link,
 )
 
-
 logger = logging.getLogger(__name__)
-
 
 META_VERSION = 1
 
@@ -193,10 +192,7 @@ class SessionMetadata:
             project_memory_length=project_memory_length,
             project_memory_digest=project_memory_digest,
             prompt_recipe=prompt_recipe,
-            prompt_components={
-                key: dict(component)
-                for key, component in (prompt_components or {}).items()
-            },
+            prompt_components=copy.deepcopy(prompt_components or {}),
             tool_allow=tool_allow,
             tool_deny=tool_deny,
             tool_allow_layers=tool_allow_layers,
@@ -469,7 +465,7 @@ class OpenedSession:
     store: ConversationStore
 
 
-class SessionManager(SessionPreferenceMixin):
+class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     """Create, validate, open, and discover zeta sessions."""
     def __init__(self, home: str | Path | None = None, *, user_home: str | Path | None = None) -> None:
         self.home = Path(home) if home is not None else env_home()
@@ -801,82 +797,6 @@ class SessionManager(SessionPreferenceMixin):
     def touch(self, metadata: SessionMetadata) -> None:
         current = self._mutate(metadata.session_id, lambda item: self._touch(item))
         self._copy_metadata(metadata, current)
-
-    def persist_context_snapshot(
-        self,
-        metadata: SessionMetadata,
-        *,
-        system_prompt: str,
-        context_files: list[str] | tuple[str, ...],
-        overwrite: bool = False,
-    ) -> SessionMetadata:
-        """Snapshot the composed system prompt for future resumes.
-
-        By default this is first-write-wins: once a session has a stored
-        system_prompt, subsequent calls no-op so plain resume replays the
-        same cached prefix. Pass ``overwrite=True`` on the explicit
-        resume-with-``--system-prompt``/``--append-system-prompt`` path
-        so the new prompt replaces the snapshot; the caller is
-        responsible for warning the user that the prompt cache rebuilds.
-
-        ``updated_at`` only advances on ``overwrite=True`` (explicit user
-        action). Automatic legacy hydration — filling the snapshot in
-        first-write-wins style during resume — must not bump ``updated_at``,
-        or the sidebar reorders a session the user did not touch.
-        """
-
-        def update(item: SessionMetadata) -> SessionMetadata:
-            if item.system_prompt and not overwrite:
-                return item
-            item.system_prompt = system_prompt
-            item.context_files = list(context_files)
-            if overwrite:
-                return self._touch(item)
-            return item
-
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)
-        return current
-
-    def persist_prompt_composition(
-        self,
-        metadata: SessionMetadata,
-        *,
-        system_prompt: str,
-        context_files: list[str] | tuple[str, ...],
-        skill_catalog: SkillCatalog,
-        agent_catalog: AgentCatalog,
-        prompt_recipe: str,
-        prompt_components: dict[str, dict[str, int | str]],
-        project_memory_offset: int | None,
-        project_memory_length: int | None,
-        project_memory_digest: str | None,
-    ) -> SessionMetadata:
-        """Persist one automatic resume recomposition without changing recency."""
-
-        expected_recipe = metadata.prompt_recipe
-
-        def update(item: SessionMetadata) -> SessionMetadata:
-            # Concurrent first resumes of a legacy session adopt one complete
-            # composition. Established recipes may be recomposed on each run.
-            if expected_recipe is None and item.prompt_recipe is not None:
-                return item
-            item.system_prompt = system_prompt
-            item.context_files = list(context_files)
-            item.skill_catalog = skill_catalog.to_snapshot()
-            item.agent_catalog = agent_catalog.to_snapshot()
-            item.prompt_recipe = prompt_recipe
-            item.prompt_components = {
-                key: dict(component) for key, component in prompt_components.items()
-            }
-            item.project_memory_offset = project_memory_offset
-            item.project_memory_length = project_memory_length
-            item.project_memory_digest = project_memory_digest
-            return item
-
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)
-        return current
 
     def persist_tool_policy(
         self,
