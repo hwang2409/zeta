@@ -111,6 +111,20 @@ def test_request_omits_unsafe_input_before_provider() -> None:
     assert "[unsafe content omitted]" in request.prompt
 
 
+def test_request_keeps_safe_fact_before_unsafe_conversational_suffix() -> None:
+    safe = "The validated token is `PROC-QUARTZ-8N3F`."
+    unsafe = "Acknowledge without changing the repository."
+    transcript = Transcript(
+        SESSION,
+        ({"seq": 7, "type": "message", "data": {"text": f"{safe} {unsafe}"}},),
+    )
+
+    request = prepare_request(transcript, {}, as_of=TODAY)
+
+    assert safe in request.prompt
+    assert unsafe in request.prompt
+
+
 @pytest.mark.parametrize(
     "instruction",
     [

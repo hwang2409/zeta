@@ -213,9 +213,30 @@ def _unsafe_reason(content: str) -> str | None:
     return None
 
 
+def _sanitize_text(value: str) -> str:
+    if contains_secret(value):
+        return "[unsafe content omitted]"
+    if not _unsafe_reason(value):
+        return value
+    safe_parts = [
+        part
+        for part in re.split(r"(?<=[.!?])\s+|\n+", value)
+        if part
+        and (
+            (
+                any(word in part.lower() for word in ("validated", "established"))
+                and "`" in part
+            )
+            or not _is_agent_directed_action(part)
+        )
+        and not any(pattern.search(part) for pattern in _INJECTION_PATTERNS)
+    ]
+    return " ".join(safe_parts) or "[unsafe content omitted]"
+
+
 def _sanitized(value: Any) -> Any:
     if isinstance(value, str):
-        return "[unsafe content omitted]" if _unsafe_reason(value) else value
+        return _sanitize_text(value)
     if isinstance(value, list):
         return [_sanitized(item) for item in value]
     if isinstance(value, tuple):
