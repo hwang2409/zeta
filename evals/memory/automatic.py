@@ -15,14 +15,16 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 
-from evals.memory.reconciler import (
+from zeta.memory.reconciler import (
+    Proposal,
+    ReconciliationError,
     Transcript,
-    apply_proposal,
     build_prompt,
     memory_digest,
     parse_proposal,
     read_transcript,
 )
+from zeta.project_errors import ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
 
 
@@ -36,6 +38,43 @@ class AutoReconcileReceipt:
     rejected_files: tuple[str, ...]
     before_digest: str
     after_digest: str
+
+
+def reconcile_session(
+    transcript_path: Path,
+    session_id: str,
+    memory: Mapping[str, str],
+    invoke: Callable[[str], str],
+    *,
+    as_of: date,
+) -> Proposal:
+    """Produce one filtered legacy benchmark proposal."""
+
+    transcript = read_transcript(transcript_path, session_id)
+    raw = invoke(build_prompt(transcript, memory, as_of=as_of))
+    return parse_proposal(
+        raw,
+        expected_digest=memory_digest(memory),
+        transcript=transcript,
+        as_of=as_of,
+    )
+
+
+def apply_proposal(
+    registry: ProjectRegistry, project_id: str, proposal: Proposal
+) -> list[tuple[str, str]]:
+    """Apply a legacy benchmark proposal with the product registry CAS."""
+
+    updates = {item.name: item.content for item in proposal.replacements}
+    if not updates:
+        return registry.load_memory(project_id)
+    try:
+        result = registry.compare_and_swap_memory(
+            project_id, expected_digest=proposal.base_digest, updates=updates
+        )
+        return result.contents
+    except ProjectRegistryError as exc:
+        raise ReconciliationError("project memory changed before approval") from exc
 
 
 class AutomaticReconciler:

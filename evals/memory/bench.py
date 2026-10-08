@@ -26,18 +26,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from evals.memory.automatic import AutomaticReconciler
-from evals.memory.grading import MEMORY_ROOT, grade_workspace
-from evals.memory.reconciler import (
-    ReconciliationError,
+from evals.memory.automatic import (
+    AutomaticReconciler,
     apply_proposal,
     reconcile_session,
 )
+from evals.memory.grading import MEMORY_ROOT, grade_workspace
 from zeta.memory.entry_reconciler import reconcile_entry_range
 from zeta.memory.entry_store import MemoryEntry
 from zeta.memory.entry_views import render_all_kinds
 from zeta.memory.profiles import memory_profile
-from zeta.memory.reconciler import Transcript, project_transcript_row, read_transcript
+from zeta.memory.reconciler import (
+    ReconciliationError,
+    Transcript,
+    project_transcript_row,
+    read_transcript,
+)
 from zeta.project_registry import MAX_RECORD_SIZE, ProjectRegistry
 
 STRATEGIES = (
