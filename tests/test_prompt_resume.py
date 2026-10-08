@@ -264,19 +264,28 @@ def test_conservative_resume_discovers_new_agent_profile(tmp_path: Path) -> None
     )
 
 
-def test_resume_surfaces_skill_parse_notice(tmp_path: Path) -> None:
+@pytest.mark.parametrize("prompt_recipe", [None, "default"])
+def test_resume_surfaces_skill_parse_notice(
+    tmp_path: Path, prompt_recipe: str | None
+) -> None:
     home = tmp_path / "home"
     manager, session_id = _manager_with_prompt(
         home,
         tmp_path,
         system_prompt="unknown recipe prompt bytes",
-        prompt_recipe=None,
+        prompt_recipe=prompt_recipe,
     )
     malformed = home / "skills" / "broken" / "SKILL.md"
     malformed.parent.mkdir(parents=True)
     malformed.write_text("not frontmatter", encoding="utf-8")
 
-    resumed = _resume(manager, session_id, home, tmp_path, lambda **kwargs: None)
+    resumed = _resume(
+        manager,
+        session_id,
+        home,
+        tmp_path,
+        lambda **kwargs: ProjectContext("rebuilt", (), prompt_recipe="default"),
+    )
     slash_registry = create_slash_registry(skill_catalog=resumed.skill_catalog)
 
     assert any(
