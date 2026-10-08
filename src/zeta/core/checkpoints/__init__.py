@@ -117,6 +117,29 @@ class ConversationEntry:
         )
 
 
+def active_branch(
+    entries: Iterable[ConversationEntry],
+) -> tuple[ConversationEntry, ...]:
+    """Return the parent-linked branch ending at the newest entry."""
+
+    ordered = tuple(entries)
+    if not ordered:
+        return ()
+    by_id = {entry.id: entry for entry in ordered}
+    current: ConversationEntry | None = ordered[-1]
+    branch: list[ConversationEntry] = []
+    seen: set[str] = set()
+    while current is not None:
+        if current.id in seen:
+            raise ConversationIntegrityError(
+                f"conversation parent cycle at {current.id}"
+            )
+        seen.add(current.id)
+        branch.append(current)
+        current = by_id.get(current.parent_id) if current.parent_id else None
+    return tuple(reversed(branch))
+
+
 @dataclass(frozen=True, slots=True)
 class BranchInfo:
     """One leaf of the parent-linked conversation tree."""
