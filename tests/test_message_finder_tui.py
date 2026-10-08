@@ -159,15 +159,27 @@ def test_finder_jump_works_on_virtual_history() -> None:
 
 
 @pytest.mark.asyncio
-async def test_open_does_not_stall_long_session() -> None:
+async def test_open_does_not_stall_long_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     transcript = TranscriptWidget()
     long_tail = " x" * 2_000
-    for index in range(20_000):
+    for index in range(5000):
         unit = transcript.append(
             Text(f"message {index} mentioning pytest and fixtures{long_tail}")
         )
         transcript.mark_user(unit)
     transcript.create_content(100, 40)
+    extract_parts = transcript._finder_source_parts
+
+    def slow_extract_parts(unit: Any) -> tuple[str, ...]:
+        parts = extract_parts(unit)
+        deadline = time.thread_time() + 0.00002
+        while time.thread_time() < deadline:
+            pass
+        return parts
+
+    monkeypatch.setattr(transcript, "_finder_source_parts", slow_extract_parts)
     app = _app_for_finder(transcript)
     ticks = [(time.perf_counter(), time.thread_time())]
     running = True
@@ -193,9 +205,9 @@ async def test_open_does_not_stall_long_session() -> None:
         for (earlier_wall, earlier_cpu), (later_wall, later_cpu) in pairwise(ticks)
     ]
     # Thread CPU time excludes runner descheduling but includes all work done by
-    # the UI loop between 1 ms ticks. The old synchronous 20k scan exceeds 25 ms
-    # on the slow-runner conditions that caused this regression.
-    assert gaps and max(cpu_gap for _wall_gap, cpu_gap in gaps) < 0.025, max(gaps)
+    # the UI loop between 1 ms ticks. The small per-candidate delay models a slow
+    # runner and makes the old synchronous scan exceed the 40 ms bound.
+    assert gaps and max(cpu_gap for _wall_gap, cpu_gap in gaps) < 0.04, max(gaps)
 
 
 @pytest.mark.asyncio
