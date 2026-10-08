@@ -132,6 +132,7 @@ class ConversationStore(
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
+        self._initialize_client_delivery_lifecycle()
         self._collect_persisted_appends = _collect_persisted_appends
         self._persisted_appends: list[PersistedAppend] = []
         self._persisted_appends_unverified = False
@@ -664,6 +665,7 @@ class ConversationStore(
                 task_id = entry.data.get("task_id")
                 if type(task_id) is str and task_id:
                     self._task_notification_ids.add(task_id)
+        self._record_client_delivery_entries(entries)
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entries[-1].seq)
         return entries

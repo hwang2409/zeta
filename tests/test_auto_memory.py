@@ -1249,3 +1249,29 @@ async def test_drain_bounds_attempts_when_retry_key_stays_due(
     assert calls == 3
     assert len(runner.state.ready_retries(1_000)) == 1
     await runner.close()
+
+
+def test_transcript_chunk_skips_delivery_rows_but_advances_offset(tmp_path: Path) -> None:
+    runner, _registry, _project_id, _ = _runner(tmp_path, transcript_count=1)
+    path = runner.session_dir / "conversation.jsonl"
+    rows = [
+        {
+            "seq": 1,
+            "type": "client_delivery",
+            "data": {
+                "delivery_id": "private-id",
+                "method": "steer",
+                "status": "queued",
+                "outcome": {"accepted": True},
+            },
+        },
+        {"seq": 2, "type": "message", "data": {"text": "visible"}},
+    ]
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    projected, end_offset, _tokens = runner._transcript_chunk(1, 2)
+
+    assert [row["seq"] for row in projected] == [2]
+    assert end_offset == path.stat().st_size

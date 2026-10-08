@@ -691,6 +691,10 @@ class AutoMemoryReconciler:
                     if seq > end:
                         break
                     projected = project_transcript_row(value)
+                    if projected is None:
+                        end_offset = offset
+                        end_tokens = tokens
+                        continue
                     projected_size = len(
                         json.dumps(projected, ensure_ascii=False).encode("utf-8")
                     )

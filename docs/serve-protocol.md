@@ -291,12 +291,14 @@ the item to the running loop's queue. A failed durable append therefore does
 not start a turn or add steering, and cancellation cannot separate a completed
 append from its callback.
 
-Repeating a retained ID returns the original result with `duplicate: true`. It
-does not validate changed text against the first request, enqueue steering, or
-start another turn. The lookup happens before the normal running-turn checks,
-so a retry remains successful after the original operation advances. Without
-the negotiated feature, sending `delivery_id` returns `-32602` and legacy
-clients have unchanged behavior.
+Repeating a retained queued or delivered ID returns the original result with
+`duplicate: true`. It does not validate changed text against the first request,
+enqueue steering, or start another turn. A dropped ID instead returns
+`{"accepted":false,"duplicate":true,"status":"dropped"}`. The client must
+resend that work with a new ID if it is still wanted. The lookup happens before
+the normal running-turn checks, so a retry remains deterministic after the
+original operation advances. Without the negotiated feature, sending
+`delivery_id` returns `-32602` and legacy clients have unchanged behavior.
 
 `delivery_status` requires the feature and an active session. Params contain
 only `delivery_id`. Its result is `{"delivery_id":"batch-42","status":"queued"}`,
@@ -305,6 +307,9 @@ where status is:
 - `queued`: an accepted `steer` has not reached a safe provider boundary;
 - `delivered`: steering was durably appended as a user message at that boundary,
   or a `send` user message was durably appended and its turn was scheduled;
+- `dropped`: accepted steering left the live queue without delivery because of
+  restart, session abort, explicit clearing, disconnect, or turn end. It is not
+  restored after restart; resend still-wanted work with a new ID;
 - `unknown`: the ID was never accepted in this session or was evicted from the
   recent-ID bound.
 

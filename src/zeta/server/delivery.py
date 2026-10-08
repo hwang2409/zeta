@@ -146,6 +146,8 @@ class DeliveryRequests:
         delivery = runtime.opened.store.client_delivery(delivery_id)
         if delivery is None:
             return None
+        if delivery.status == "dropped":
+            return {"accepted": False, "duplicate": True, "status": "dropped"}
         return {**delivery.outcome, "duplicate": True}
 
 

@@ -6,11 +6,10 @@ import asyncio
 import os
 import shlex
 import warnings
-from collections import deque
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from ...agent.background import (
     BackgroundAgentOwner,
@@ -83,7 +82,6 @@ from ...protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
-    require_new_message_origin,
     user_message_for_turn,
 )
 from ...providers.retry_policy import ProviderRetryBudget, apply_retry_budget
@@ -173,6 +171,7 @@ class AgentLoop(
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
         self.backend = backend
         self.store = store
+        self.store.recover_client_deliveries()
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
@@ -274,7 +273,6 @@ class AgentLoop(
         self._plan_mode = False
         self._plan_mode_policy = PLAN_MODE_POLICY
         self._plan_mode_prior_prompt: Message | None = None
-        self._steering_queue: deque[Message] = deque()
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
     @property
@@ -339,14 +337,19 @@ class AgentLoop(
         if isinstance(self.backend, ContextWindowBackend):
             self.backend.set_token_budget(token_budget)
 
-    def abort(self, *, foreground_only: bool = False) -> None:
+    def abort(
+        self,
+        *,
+        foreground_only: bool = False,
+        steering_drop_reason: Literal["abort", "disconnect"] = "abort",
+    ) -> None:
         """Signal active tools; optionally preserve background work and steering."""
         self.tool_registry.abort()
         if foreground_only:
             self.notification_wake.retry_after_foreground_abort()
         else:
             self._background_owner.cancel_all()
-            self._steering_queue.clear()
+            self.store.drop_client_steering(steering_drop_reason)
 
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
@@ -354,19 +357,16 @@ class AgentLoop(
         call, so the message never lands between a tool_call and its
         tool_result. Callers must pass a durable USER-role message.
         """
-        if message.role is not MessageRole.USER:
-            raise ValueError("steering message must have the user role")
-        self._steering_queue.append(require_new_message_origin(message))
+        self.store.queue_client_steering(message)
 
     @property
     def has_pending_steering(self) -> bool:
-        return bool(self._steering_queue)
-
-    def clear_pending_steering(self) -> int:
-        cleared = len(self._steering_queue)
-        self._steering_queue.clear()
-        return cleared
-
+        return self.store.has_pending_client_steering
+    def clear_pending_steering(
+        self,
+        reason: Literal["clear", "turn_end"] = "clear",
+    ) -> int:
+        return self.store.drop_client_steering(reason)
     def set_background_event_sink(
         self, sink: Callable[[StreamEvent], None] | None
     ) -> None:
@@ -858,9 +858,10 @@ class AgentLoop(
                 nudge_turn_pending = False
                 self._turn_stop_reason = None
                 self._turn_output_tokens = None
-                while self._steering_queue:
-                    steering = self._steering_queue.popleft()
-                    await self._append_turn_message(steering)
+                while self.store.has_pending_client_steering:
+                    await self.store.deliver_next_client_steering(
+                        self._append_turn_message
+                    )
                 async for event in self.drain_notification_batch():
                     yield event
                 self.tool_registry.start_batch()

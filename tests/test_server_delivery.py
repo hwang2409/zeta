@@ -414,3 +414,207 @@ def test_delivery_record_accepts_tagged_user_message_atomically(tmp_path: Path) 
     assert store.client_delivery("send-atomic").status == "delivered"
     assert [item.content[0].text for item in store.messages()] == ["hello"]
     store.close()
+
+
+async def _queued_steer_server(tmp_path: Path, suffix: str):
+    backend = BlockingBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path, suffix),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    await _request(
+        reader,
+        writer,
+        1,
+        "hello",
+        {
+            "protocol_version": "1.1",
+            "features": ["delivery_id", "abort_scope"],
+        },
+    )
+    await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+    await _request(reader, writer, 3, "send", {"text": "wait"})
+    await asyncio.wait_for(backend.started.wait(), TIMEOUT)
+    accepted = await _request(
+        reader,
+        writer,
+        4,
+        "steer",
+        {"text": "later", "delivery_id": "drop-me"},
+    )
+    assert accepted[-1]["result"] == {"accepted": True}
+    return server, backend, reader, writer
+
+
+@pytest.mark.asyncio
+async def test_session_abort_marks_accepted_steering_dropped(tmp_path: Path) -> None:
+    server, _backend, reader, writer = await _queued_steer_server(tmp_path, "-abort")
+    try:
+        await _request(reader, writer, 5, "abort", {"scope": "session"})
+        status = await _request(
+            reader, writer, 6, "delivery_status", {"delivery_id": "drop-me"}
+        )
+        assert status[-1]["result"]["status"] == "dropped"
+        assert server.runtime.opened.store.client_delivery("drop-me").reason == "abort"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_clear_steering_marks_delivery_dropped_and_duplicate_rejected(
+    tmp_path: Path,
+) -> None:
+    server, backend, reader, writer = await _queued_steer_server(tmp_path, "-clear")
+    try:
+        cleared = await _request(reader, writer, 5, "clear_steering")
+        duplicate = await _request(
+            reader,
+            writer,
+            6,
+            "steer",
+            {"text": "later", "delivery_id": "drop-me"},
+        )
+        assert cleared[-1]["result"] == {"cleared": 1}
+        assert duplicate[-1]["result"] == {
+            "accepted": False,
+            "duplicate": True,
+            "status": "dropped",
+        }
+        assert server.runtime.opened.store.client_delivery("drop-me").reason == "clear"
+        backend.release.set()
+        await _event(reader, "agent_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_disconnect_marks_accepted_steering_dropped(tmp_path: Path) -> None:
+    server, _backend, _reader, writer = await _queued_steer_server(tmp_path, "-disconnect")
+    writer.close()
+    await writer.wait_closed()
+    for _ in range(100):
+        if not server._client_active:
+            break
+        await asyncio.sleep(0.01)
+    assert not server._client_active
+
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        await _request(
+            reader,
+            writer,
+            7,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        status = await _request(
+            reader, writer, 8, "delivery_status", {"delivery_id": "drop-me"}
+        )
+        assert status[-1]["result"]["status"] == "dropped"
+        assert server.runtime.opened.store.client_delivery("drop-me").reason == "disconnect"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_tool_less_turn_end_marks_late_steering_dropped(tmp_path: Path) -> None:
+    server, backend, reader, writer = await _queued_steer_server(tmp_path, "-turn-end")
+    try:
+        backend.release.set()
+        await _event(reader, "agent_end")
+        status = await _request(
+            reader, writer, 5, "delivery_status", {"delivery_id": "drop-me"}
+        )
+        assert status[-1]["result"]["status"] == "dropped"
+        assert server.runtime.opened.store.client_delivery("drop-me").reason == "turn_end"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
+    first = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-restart-1"))
+    reader, writer = await _connect(first)
+    await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+    created = await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+    session_id = created[-1]["result"]["session"]["session_id"]
+    await _close(first, writer)
+
+    store = ConversationStore(tmp_path / "sessions", session_id=session_id)
+    store.append_client_delivery(
+        "restart-steer", "steer", "queued", {"accepted": True}
+    )
+    store.close()
+
+    resumed = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-restart-2"))
+    reader, writer = await _connect(resumed)
+    try:
+        await _request(
+            reader,
+            writer,
+            3,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 4, "resume", {"session_id": session_id})
+        status = await _request(
+            reader,
+            writer,
+            5,
+            "delivery_status",
+            {"delivery_id": "restart-steer"},
+        )
+        assert status[-1]["result"]["status"] == "dropped"
+        delivery = resumed.runtime.opened.store.client_delivery("restart-steer")
+        assert delivery.reason == "restart"
+    finally:
+        await _close(resumed, writer)
+
+
+@pytest.mark.asyncio
+async def test_orphan_steer_is_rejected_without_acceptance(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-orphan"))
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        rejected = await _request(
+            reader,
+            writer,
+            3,
+            "steer",
+            {"text": "orphan", "delivery_id": "orphan-steer"},
+        )
+        status = await _request(
+            reader, writer, 4, "delivery_status", {"delivery_id": "orphan-steer"}
+        )
+        assert rejected[-1]["error"]["code"] == -32005
+        assert status[-1]["result"]["status"] == "unknown"
+    finally:
+        await _close(server, writer)
+
+
+def test_delivery_lookup_does_not_read_log_after_load(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_client_delivery(
+        "indexed", "steer", "queued", {"accepted": True}
+    )
+
+    class UnreadableEntries(list):
+        def __iter__(self):
+            raise AssertionError("delivery lookup read the conversation log")
+
+        def __reversed__(self):
+            raise AssertionError("delivery lookup read the conversation log")
+
+    store._entries = UnreadableEntries(store._entries)
+    assert store.client_delivery("indexed").status == "queued"
+    store.close()

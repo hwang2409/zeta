@@ -333,7 +333,7 @@ class _Client:
             if self._turn_task is not None and not self._turn_task.done():
                 loop = self.server.runtime.loop
                 if loop is not None:
-                    loop.abort()
+                    loop.abort(steering_drop_reason="disconnect")
                 self._turn_task.cancel()
                 await asyncio.gather(self._turn_task, return_exceptions=True)
             self._turn_task = None
@@ -713,6 +713,8 @@ class _Client:
                 data={},
             )
         finally:
+            if success and loop.has_pending_steering:
+                loop.clear_pending_steering("turn_end")
             self._finalize_turn(
                 session_id, state, success=success, schedule_wake=agent_end is None
             )

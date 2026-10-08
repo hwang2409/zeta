@@ -1890,3 +1890,24 @@ async def test_bounded_fallback_keeps_small_compacted_context_in_budget(
 
     assert compacted.token_count <= 20
     assert store.compaction_marker_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_model_context_strips_client_delivery_marker(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    message = with_message_origin(
+        Message(MessageRole.USER, [TextContent("hello")]), MessageOrigin.USER
+    )
+    store.append_client_delivery(
+        "private-context-id",
+        "send",
+        "delivered",
+        {"accepted": True, "session_id": store.session_id},
+        message=message,
+    )
+
+    assembled = await ContextAssembler(store).assemble()
+
+    assert len(assembled) == 1
+    assert "zeta_client_delivery_id" not in assembled[0].metadata
+    store.close()
