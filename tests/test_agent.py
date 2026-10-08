@@ -762,7 +762,7 @@ async def test_background_agent_returns_handle_and_parent_continues(
     assert result.structured_content is not None
     assert result.structured_content["status"] == "running"
     assert result.structured_content["description"] == "background research"
-    assert backend.child_started.is_set()
+    await asyncio.wait_for(backend.child_started.wait(), timeout=5)
 
     parent_events = await _collect(loop.run_turn("follow up", origin=MessageOrigin.USER))
     assert any(event.type is StreamEventType.TURN_END for event in parent_events)
