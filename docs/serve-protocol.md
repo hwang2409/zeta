@@ -634,7 +634,6 @@ SessionMetadata = {
     version: integer, session_id: string, created_at: string,
     updated_at: string, provider: string, model: string, cwd: string,
     retained_tail: integer, compaction_budget: integer,
-    compaction: string, compaction_pinned: boolean,
     override_audit: array[object], system_prompt: string,
     context_files: array[string], skill_catalog: array[object] or null,
     agent_catalog: array[object] or null, vim_mode: boolean,
@@ -680,8 +679,8 @@ Usage = object with provider-defined JSON values
 ```
 
 `SessionMetadata` is the session serializer output; a test keeps this block
-equal to it. `compaction` is the persisted compaction mode. `skill_catalog` and
-`agent_catalog` are the session's snapshotted catalogs. `project_*` fields
+equal to it. `skill_catalog` and `agent_catalog` are the session's snapshotted
+catalogs. `project_*` fields
 describe the project association and the owned project-memory block in
 `system_prompt`. `parent_session_id` names the parent of a child session.
 `tool_allow` is `null` when no allowlist applies. `tool_allow_layers` appears
@@ -871,16 +870,10 @@ error code and message. Provider status and origin remain internal.
   Running turns reject changes with `-32004`. Missing target-provider logins
   return `-32000` with a login message; failed swaps retain the previous settings.
   The response contains the applied settings.
-- `set_compaction`: takes `mode` (`evict` or `summary`) and switches the
-  compaction mode of the active session. The mode persists in session metadata
-  and applies from the next completion; durable compaction markers of either
-  mode stay valid. `recall_history` is advertised only in `evict` mode and only
-  when the session tool policy allows it. The response contains `compaction`
-  (the applied mode), `previous`, and `recall_history` (whether the tool is
-  advertised). Setting the current mode is a no-op. Unknown modes, and a switch
-  to `summary` when the tool policy requires `recall_history`, return `-32602`.
-  Busy sessions return `-32004`. The `/compaction` slash command over
-  `slash_run` shows or switches the mode through the same path.
+- `set_compaction` is retained only to give old clients a clear migration
+  error. All modes, including `summary`, return `-32602` with
+  `compaction mode selection was removed; eviction is always used`. New clients
+  must not advertise or send this request.
 - `send_images`: takes `text` (possibly empty) and `images`, a list of one to four
   objects with `name`, `mime_type`, and base64 `data`. Supported types are
   `image/png`, `image/jpeg`, `image/gif`, and `image/webp`. The combined decoded
@@ -925,7 +918,7 @@ implementation for the frontend client. Two RPCs cover the surface.
   - `error`: the shared dispatcher reported a bounded failure `text`.
 
 The scope floor served over `slash_run` is `/status`, `/compact`,
-`/compaction`, `/model`, `/init`, `/help`, and user prompt macros (`.zeta/commands/*.md` with
+`/model`, `/init`, `/help`, and user prompt macros (`.zeta/commands/*.md` with
 `kind: prompt`) plus skills. `/model` splits by argument shape: argless
 `/model` returns `client_only` so the frontend client can open Settings for the
 picker surface, while `/model <name>` dispatches server-side through the

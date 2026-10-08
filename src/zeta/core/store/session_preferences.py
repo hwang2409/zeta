@@ -34,29 +34,3 @@ class SessionPreferenceMixin:
 
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
-
-    def record_compaction(
-        self,
-        metadata: Any,
-        *,
-        compaction: str,
-        pinned: bool,
-        touch: bool = True,
-    ) -> None:
-        """Persist the selected compaction mode without losing concurrent updates."""
-
-        from ..session import SessionError
-
-        if compaction not in {"summary", "evict"}:
-            raise ValueError("unknown compaction mode")
-        expected = (metadata.compaction, metadata.compaction_pinned)
-
-        def update(item: Any) -> Any:
-            if (item.compaction, item.compaction_pinned) != expected:
-                raise SessionError("session compaction mode changed before commit")
-            item.compaction = compaction
-            item.compaction_pinned = pinned
-            return self._touch(item) if touch else item
-
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)

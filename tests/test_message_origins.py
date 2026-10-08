@@ -678,7 +678,7 @@ def test_headless_entry_persists_user_origin(
     monkeypatch.setattr(sys, "stderr", StringIO())
 
     code = run_headless(
-        SimpleNamespace(format="text", require_tools=False, compaction=None),
+        SimpleNamespace(format="text", require_tools=False),
         "headless input",
     )
 

@@ -152,8 +152,6 @@ def _create_fork_session(
         cwd=metadata.cwd,
         retained_tail=metadata.retained_tail,
         compaction_budget=metadata.compaction_budget,
-        compaction=metadata.compaction,
-        compaction_pinned=metadata.compaction_pinned,
         **clone_prompt_composition(metadata),
         vim_mode=metadata.vim_mode,
         budget_pinned=metadata.budget_pinned,
