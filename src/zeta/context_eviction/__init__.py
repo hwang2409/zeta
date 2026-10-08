@@ -275,7 +275,7 @@ def evict_messages(
         ):
             continue
         replacement = _workflow_result_receipt(message, call, seq)
-        if replacement is message:
+        if token_counter(replacement) >= message_tokens[index]:
             continue
         replace(index, replacement)
         if running_total <= target_tokens:
@@ -734,7 +734,7 @@ def _workflow_result_receipt(message: Message, call: ToolCall, seq: int) -> Mess
     else:
         payload = _background_receipt_payload(call, structured, result)
     receipt = _structured_receipt("workflow result receipt", payload, seq, "result")
-    replacement = Message(
+    return Message(
         message.role,
         tool_result=ToolResult(
             result.tool_call_id,
@@ -748,11 +748,6 @@ def _workflow_result_receipt(message: Message, call: ToolCall, seq: int) -> Mess
             "source_seq": seq,
             "eviction_content_digest": _content_digest(result.content),
         },
-    )
-    return (
-        replacement
-        if message_token_count(replacement) < message_token_count(message)
-        else message
     )
 
 

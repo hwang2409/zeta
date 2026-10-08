@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 import zeta.context_eviction as eviction_module
+from zeta.agent.tool_results import validated_tool_result
 from zeta.context_accounting import message_token_count
 from zeta.context_eviction import (
     EvictionResult,
@@ -23,6 +24,8 @@ from zeta.context_eviction import (
 )
 from zeta.core.context import CompactionPolicy, ContextAssembler
 from zeta.core.store import ConversationStore
+from zeta.project_inbox import ProjectInbox
+from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
@@ -483,6 +486,122 @@ def test_project_recall_and_background_results_get_receipts() -> None:
     assert receipts[2]["status"] == "running"
     assert str(receipts[2]["command"]).startswith("python -m pytest")
     assert len(str(receipts[2]["command"])) <= 120
+
+
+@pytest.mark.asyncio
+async def test_real_workflow_tool_results_get_eviction_receipts(tmp_path: Path) -> None:
+    home = tmp_path / ".zeta"
+    projects = ProjectRegistry(home / "projects")
+    project = projects.create_project("zeta", "test project")
+    sender = projects.create_project("sender", "test sender")
+    projects.update_memory(project.project_id, {"state.md": "private state " * 500})
+    store = ConversationStore(
+        home / "sessions", session_id="a" * 32, cwd=tmp_path
+    )
+    hidden = store.append_message(text(MessageRole.USER, "hidden history " * 500))
+    store.append_compaction_marker("evicted", hidden.seq, hidden.seq)
+    ProjectInbox(projects, sessions_root=home / "sessions").send(
+        from_project=sender.project_id,
+        from_session="b" * 32,
+        to_project=project.project_id,
+        kind="question",
+        title="receipt coverage",
+        body="private inbox body " * 500,
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        project_id=project.project_id,
+        project_registry=projects,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    calls = [
+        ToolCall("real-inbox", "inbox", {"action": "list"}),
+        ToolCall("real-project", "project", {"action": "inspect"}),
+        ToolCall(
+            "real-recall",
+            "recall_history",
+            {"seq_start": hidden.seq, "seq_end": hidden.seq},
+        ),
+        ToolCall("real-background", "run_background", {"command": "sleep 30"}),
+    ]
+    try:
+        results = [
+            validated_tool_result(await registry.execute(call), call.id)
+            for call in calls
+        ]
+        records: list[tuple[int, Message]] = []
+        for index, (call, result) in enumerate(zip(calls, results, strict=True)):
+            records.extend(
+                (
+                    (
+                        index * 2 + 1,
+                        Message(
+                            MessageRole.ASSISTANT,
+                            [ToolUseContent(call)],
+                        ),
+                    ),
+                    (
+                        index * 2 + 2,
+                        Message(MessageRole.TOOL_RESULT, tool_result=result),
+                    ),
+                )
+            )
+
+        evicted = evict_messages(
+            records,
+            fixed_tokens=0,
+            target_tokens=0,
+            token_counter=lambda message: (
+                1 if message.metadata.get("context_evicted") else 100
+            ),
+        )
+
+        receipts = {
+            call.name: receipt_payload(result.content, "workflow result receipt")
+            for call, message in zip(calls, evicted.messages[1::2], strict=True)
+            if (result := message.tool_result) is not None
+        }
+        assert set(receipts) == {
+            "inbox",
+            "project",
+            "recall_history",
+            "run_background",
+        }
+        assert receipts["inbox"]["messages"][0]["title"] == "receipt coverage"
+        assert receipts["project"]["project_id"] == project.project_id
+        assert receipts["recall_history"]["seq_start"] == hidden.seq
+        assert receipts["run_background"]["task_id"] == results[-1].structured_content[
+            "task_id"
+        ]
+    finally:
+        await registry.close()
+        store.close()
+
+
+def test_workflow_receipt_size_policy_uses_supplied_token_counter() -> None:
+    call, _ = tool_pair(
+        "project", "project-size", "unused", arguments={"action": "inspect"}
+    )
+    result = _structured_result(
+        "project-size",
+        "large under the default counter " * 100,
+        {"project": {"project_id": "p_123", "name": "zeta"}, "memory": {}},
+    )
+
+    def supplied_counter(message: Message) -> int:
+        return 99_999 if message.metadata.get("context_evicted") else 1
+
+    evicted = evict_messages(
+        [(1, call), (2, result)],
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=supplied_counter,
+    )
+
+    assert evicted.messages == [call, result]
+    assert evicted.tokens_before == 2
+    assert evicted.tokens_after == 2
 
 
 def test_receipt_replaces_only_when_smaller() -> None:
