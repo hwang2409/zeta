@@ -200,6 +200,13 @@ def compose_runtime(
             metadata.tool_deny,
             allow_layers=metadata.tool_allow_layers,
         )
+        from ..attention_forks import ATTENTION_FORK_POLICY, read_attention_fork
+
+        attention_fork = read_attention_fork(
+            opened.store.session_dir, directory_fd=opened.store.directory_fd
+        )
+        if attention_fork is not None:
+            tool_policy = tool_policy.narrowed_by(ATTENTION_FORK_POLICY)
         hooks_restricted = tool_policy.restricted
         loop_kwargs: dict[str, Any] = {
             "approval_policy": policy,
@@ -225,9 +232,9 @@ def compose_runtime(
             project_registry=manager.project_registry,
             inbox_enabled=config.inbox_enabled,
             compaction=metadata.compaction,
-            tool_allow=metadata.tool_allow,
-            tool_deny=metadata.tool_deny,
-            tool_allow_layers=metadata.tool_allow_layers,
+            tool_allow=tool_policy.allow,
+            tool_deny=tool_policy.deny,
+            tool_allow_layers=tool_policy.allow_layers,
             image_policy=image_policy_for_provider(provider),
             required_tool_names=tuple(
                 dict.fromkeys(
@@ -238,6 +245,11 @@ def compose_runtime(
                 )
             ),
         )
+        if attention_fork is not None:
+            from ..tools.resolve_attention import register_fork
+
+            registry.unregister("request_attention")
+            register_fork(registry)
         cleanup.callback(registry.background_tasks.release_directory)
         loop = AgentLoop(
             backend,
@@ -245,6 +257,7 @@ def compose_runtime(
             registry=registry,
             skill_catalog=skill_catalog,
             root_project_id=metadata.project_id,
+            parent_session_id=metadata.parent_session_id,
             project_registry=manager.project_registry,
             **loop_kwargs,
         )
@@ -252,7 +265,11 @@ def compose_runtime(
         loop.manager = manager
         loop.session_metadata = metadata
         memory_reconciler = None
-        if config.memory_auto and metadata.project_id is not None:
+        if (
+            attention_fork is None
+            and config.memory_auto
+            and metadata.project_id is not None
+        ):
             memory_backend: CompletionBackend | None = None
 
             async def invoke_memory(prompt: str) -> ReconciliationResponse:
@@ -284,7 +301,9 @@ def compose_runtime(
             )
             loop.memory_reconciler = memory_reconciler
             opened.store.on_persisted_activity = memory_reconciler.activity
-            loop.context_assembler.on_before_eviction = memory_reconciler.before_eviction
+            loop.context_assembler.on_before_eviction = (
+                memory_reconciler.before_eviction
+            )
             if resuming:
                 memory_reconciler.catch_up()
         if metadata.plan_mode:

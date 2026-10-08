@@ -1103,6 +1103,8 @@ class BackgroundTaskRegistry:
                 "pid": record.pid,
                 "running": record.running,
                 "exit_code": record.exit_code,
+                "started_at": record.started_at,
+                "ended_at": record.ended_at,
             }
             for record in self._records.values()
         ]

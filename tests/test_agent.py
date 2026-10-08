@@ -1999,7 +1999,9 @@ async def test_agent_returns_child_text_and_persists_child_session(
     ] == [MessageRole.USER, MessageRole.ASSISTANT]
     assert "agent" in {schema["name"] for schema in backend.calls[1][1]}
     assert {schema["name"] for schema in backend.calls[1][1]} == {
-        schema["name"] for schema in backend.calls[0][1]
+        schema["name"]
+        for schema in backend.calls[0][1]
+        if schema["name"] != "request_attention"
     }
 
 

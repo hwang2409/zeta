@@ -30,9 +30,14 @@ class ProjectInboxNotificationMixin:
         projects = self.tool_registry.project_registry
         project_id = self.tool_registry.project_id
         if projects is None or project_id is None:
-            raise InboxError("inbox is unavailable outside a registered project session")
+            raise InboxError(
+                "inbox is unavailable outside a registered project session"
+            )
         return ProjectInboxScanner(
-            projects, project_id, sessions_root=projects.root.parent / "sessions"
+            projects,
+            project_id,
+            sessions_root=projects.root.parent / "sessions",
+            session_id=self.store.session_id,
         )
 
     async def _watch_project_inbox(self) -> None:

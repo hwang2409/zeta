@@ -151,7 +151,7 @@ async def _inbox(
             return _result("send", project_id, {"id": message_id})
         if action == "list":
             status = arguments.get("status", "new")
-            state = inbox.list(project_id)
+            state = inbox.list(project_id, session_id=session_id)
             messages = state[status]
             invalid = [item for item in state["invalid"] if item["status"] == status]
             return _result(

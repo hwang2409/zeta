@@ -462,7 +462,7 @@ def test_unknown_optional_fields_survive_claim_and_done(tmp_path: Path) -> None:
     assert [item["id"] for item in state["new"]] == [message_id]
     assert state["invalid"] == []
 
-    session_id = "c" * 32
+    session_id = "f" * 32
     claimed = inbox.claim(project_b.project_id, message_id, session_id)
     assert claimed is not None
     assert claimed["future_optional"] == {"needed": True}
