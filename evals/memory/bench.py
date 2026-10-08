@@ -891,7 +891,7 @@ def _run_attempt(
         errors.extend(f"final: {error}" for error in parse_errors)
         if process.returncode:
             errors.append(f"final: zeta exited {process.returncode}")
-        if spec.strategy in {"S2", "S2-entry"} and not process.returncode and not parse_errors:
+        if spec.strategy == "S2" and not process.returncode and not parse_errors:
             reconcile_latest("final")
         _discard_raw_sessions(home)
         final_grade = grade_workspace(
