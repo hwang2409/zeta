@@ -237,7 +237,9 @@ class ReconciliationState:
         self._value["terminal_receipts"] = [
             item for item in self._value["terminal_receipts"] if not matches(item)
         ]
-        self._remove_archived_receipt(key)
+        self._remove_archived_receipt(
+            key, seq_start=seq_start, seq_end=seq_end
+        )
         self._complete_unit(
             {
                 "seq_start": seq_start,
@@ -347,9 +349,25 @@ class ReconciliationState:
         self._append_receipt_archive(overflow)
         del receipts[:-_MAX_RECENT_TERMINAL_RECEIPTS]
 
-    def _remove_archived_receipt(self, key: str) -> None:
+    def _remove_archived_receipt(
+        self,
+        key: str,
+        *,
+        seq_start: int | None = None,
+        seq_end: int | None = None,
+    ) -> None:
         records = self._read_receipt_archive()
-        retained = tuple(item for item in records if item.get("key") != key)
+        retained = tuple(
+            item
+            for item in records
+            if item.get("key") != key
+            and not (
+                seq_start is not None
+                and seq_end is not None
+                and item.get("seq_start") == seq_start
+                and item.get("seq_end") == seq_end
+            )
+        )
         if len(retained) != len(records):
             self._write_receipt_archive(retained)
 

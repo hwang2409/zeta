@@ -949,6 +949,9 @@ def test_terminal_receipts_move_to_bounded_archive(tmp_path: Path) -> None:
     assert len(receipts) == 1_000
     assert receipts[0].key in listing
     assert receipts[-1].key in listing
+    assert runner.state.retry_terminal(receipts[0].key, now=1_001)
+    state = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert state["pending_failures"][0]["key"] == receipts[0].key
 
 
 @pytest.mark.asyncio
