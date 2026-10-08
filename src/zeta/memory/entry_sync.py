@@ -57,12 +57,33 @@ class EntryConflict:
 
 
 @dataclass(frozen=True, slots=True)
+class ResolutionCandidate:
+    kind: Literal["entries", "schema"]
+    entry_ids: tuple[str, ...]
+    local_digest: str
+    remote_digest: str
+    prepared_digest: str
+
+    def to_dict(self) -> dict[str, object]:
+        value: dict[str, object] = {
+            "kind": self.kind,
+            "local": self.local_digest,
+            "remote": self.remote_digest,
+            "prepared": self.prepared_digest,
+        }
+        if self.kind == "entries":
+            value["entry_ids"] = list(self.entry_ids)
+        return value
+
+
+@dataclass(frozen=True, slots=True)
 class EntryMergeResult:
     local: MemoryState
     remote: MemoryState
     entry_baseline: dict[str, str]
     schema_baseline: str
     conflicts: dict[str, EntryConflict]
+    resolved_candidates: dict[str, ResolutionCandidate]
     local_changed: tuple[str, ...]
     remote_changed: tuple[str, ...]
     schema_changed_local: bool = False
@@ -135,6 +156,7 @@ def merge_entry_states(
         raise ProjectRegistryError("entry sync resolution choice is invalid")
 
     next_conflicts: dict[str, EntryConflict] = {}
+    resolved_candidates: dict[str, ResolutionCandidate] = {}
     local_schema = local.schema
     remote_schema = remote.schema
     local_schema_changed = False
@@ -151,6 +173,13 @@ def merge_entry_states(
         next_schema_digest = schema_baseline or local_schema_hash
     elif existing_schema is not None:
         chosen_schema = local.schema if schema_choice == "local" else remote.schema
+        resolved_candidates["schema"] = ResolutionCandidate(
+            "schema",
+            (),
+            local_schema_hash,
+            remote_schema_hash,
+            schema_digest(chosen_schema),
+        )
         local_schema_changed = local.schema != chosen_schema
         remote_schema_changed = remote.schema != chosen_schema
         local_schema = remote_schema = chosen_schema
@@ -235,6 +264,16 @@ def merge_entry_states(
             continue
         if choice is not None:
             chosen = local_entries if choice == "local" else remote_entries
+            ordered_component = tuple(sorted(component))
+            candidate = ResolutionCandidate(
+                "entries",
+                ordered_component,
+                _entry_set_digest(ordered_component, local_entries),
+                _entry_set_digest(ordered_component, remote_entries),
+                _entry_set_digest(ordered_component, chosen),
+            )
+            for key in conflict_keys:
+                resolved_candidates[key] = candidate
             _propagate_component(
                 component,
                 chosen,
@@ -319,11 +358,40 @@ def merge_entry_states(
         entry_baseline=baseline,
         schema_baseline=next_schema_digest,
         conflicts=next_conflicts,
+        resolved_candidates=resolved_candidates,
         local_changed=tuple(sorted(local_changed)),
         remote_changed=tuple(sorted(remote_changed)),
         schema_changed_local=local_schema_changed,
         schema_changed_remote=remote_schema_changed,
     )
+
+
+def recoverable_resolutions(
+    local: MemoryState,
+    remote: MemoryState,
+    *,
+    candidates: Mapping[str, ResolutionCandidate],
+    resolutions: Mapping[str, ConflictChoice],
+) -> dict[str, ConflictChoice]:
+    """Return stored choices whose exact candidates still exist on both peers."""
+
+    recovered: dict[str, ConflictChoice] = {}
+    for key, choice in resolutions.items():
+        candidate = candidates.get(key)
+        if candidate is None:
+            continue
+        if candidate.kind == "schema":
+            local_digest = schema_digest(local.schema)
+            remote_digest = schema_digest(remote.schema)
+        else:
+            local_digest = _entry_set_digest(candidate.entry_ids, local.entries)
+            remote_digest = _entry_set_digest(candidate.entry_ids, remote.entries)
+        if (
+            local_digest in {candidate.local_digest, candidate.prepared_digest}
+            and remote_digest in {candidate.remote_digest, candidate.prepared_digest}
+        ):
+            recovered[key] = choice
+    return recovered
 
 
 def _entries_valid_for_schema(
@@ -534,8 +602,10 @@ __all__ = [
     "EntryConflict",
     "EntryMemoryExport",
     "EntryMergeResult",
+    "ResolutionCandidate",
     "entry_digest",
     "merge_entry_states",
     "merge_version_receipts",
+    "recoverable_resolutions",
     "schema_digest",
 ]

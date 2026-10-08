@@ -26,8 +26,10 @@ from typing import Literal, Protocol
 from ..memory.entry_store import state_digest
 from ..memory.entry_sync import (
     EntryMemoryExport,
+    ResolutionCandidate,
     merge_entry_states,
     merge_version_receipts,
+    recoverable_resolutions,
 )
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
@@ -55,6 +57,7 @@ class _SharedSyncState:
     previous_digest: str
     transition_id: str | None = None
     resolutions: dict[str, Literal["local", "remote"]] | None = None
+    candidates: dict[str, ResolutionCandidate] | None = None
 
 
 class _Digest(Protocol):
@@ -89,6 +92,7 @@ def sync_project_memory(
     state_key = _state_key(local_id, peer)
     local_project = home / "projects" / project_id
     with _registry_lock(home / "projects"):
+        _recover_interrupted_replacement(local_project)
         local_expected = project_digest(local_project)
         if local_expected == _MISSING and direction == "push":
             raise RemoteSyncError(f"project {project_id} was not found")
@@ -137,20 +141,29 @@ def sync_project_memory(
             if isinstance(local_export, EntryMemoryExport) and isinstance(
                 remote_export, EntryMemoryExport
             ):
+                recovery_resolutions = _stored_recovery_resolutions(
+                    local_export, remote_export, shared
+                )
                 (
                     result,
                     local_merged,
                     remote_merged,
                     local_changed,
                     remote_changed,
+                    transition_candidates,
                 ) = _merge_entries(
                     local_export,
                     remote_export,
                     state=state,
                     project_id=project_id,
-                    resolutions=shared.resolutions,
+                    resolutions=recovery_resolutions,
                 )
-                _finish_entry_transition(state, shared, shared.resolutions or {})
+                _finish_entry_transition(
+                    state,
+                    shared,
+                    recovery_resolutions,
+                    transition_candidates,
+                )
                 merged = remote_merged
                 source_merged = local_merged
                 source = local
@@ -212,6 +225,7 @@ def resolve_project_memory(
     state_key = _state_key(local_id, peer)
     local_project = home / "projects" / project_id
     with _registry_lock(home / "projects"):
+        _recover_interrupted_replacement(local_project)
         if not local_project.is_dir():
             raise RemoteSyncError(f"project {project_id} was not found")
         local_expected = project_digest(local_project)
@@ -247,25 +261,28 @@ def resolve_project_memory(
             if isinstance(local_export, EntryMemoryExport) and isinstance(
                 remote_export, EntryMemoryExport
             ):
+                resolution_choices = _resolution_choices(
+                    local_export, remote_export, shared, conflicts, accept
+                )
                 (
                     merged_result,
                     local_merged,
                     remote_merged,
                     local_changed,
                     remote_changed,
+                    transition_candidates,
                 ) = _merge_entries(
                     local_export,
                     remote_export,
                     state=state,
                     project_id=project_id,
-                    resolutions=(
-                        shared.resolutions or {key: accept for key in conflicts}
-                    ),
+                    resolutions=resolution_choices,
                 )
                 _finish_entry_transition(
                     state,
                     shared,
-                    shared.resolutions or {key: accept for key in conflicts},
+                    resolution_choices,
+                    transition_candidates,
                 )
                 _write_state(local, state_key, state)
                 _write_state(remote, state_key, state)
@@ -338,6 +355,7 @@ def fetch_local_project(
 
     project = home / "projects" / project_id
     with _registry_lock(home / "projects", blocking=False, peer=peer):
+        _recover_interrupted_replacement(project)
         if not project.is_dir():
             return _MISSING
         for name in MEMORY_FILES:
@@ -361,6 +379,7 @@ def publish_local_project(
     _validate_project_snapshot(snapshot, project_id)
     project = home / "projects" / project_id
     with _registry_lock(home / "projects"):
+        _recover_interrupted_replacement(project)
         if project_digest(project) != expected_digest:
             raise RemoteSyncError("remote changed during transfer; retry after inspection")
         project.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -580,6 +599,7 @@ def _merge_entries(
     EntryMemoryExport,
     tuple[str, ...],
     tuple[str, ...],
+    dict[str, ResolutionCandidate],
 ]:
     baseline = state.get("entries")
     schema_baseline = state.get("schema_digest")
@@ -626,6 +646,7 @@ def _merge_entries(
         remote_export,
         result.local_changed,
         result.remote_changed,
+        result.resolved_candidates,
     )
 
 
@@ -703,13 +724,19 @@ def _recover_partial_entry_transition(
             continue
         transition_id = transition.get("id")
         resolutions = transition.get("resolutions")
-        if not isinstance(transition_id, str) or not isinstance(resolutions, dict):
+        candidates = _parse_transition_candidates(transition.get("candidates"))
+        if (
+            not isinstance(transition_id, str)
+            or not isinstance(resolutions, dict)
+            or candidates is None
+        ):
             continue
         return _SharedSyncState(
             copy.deepcopy(older),
             _sync_state_digest(older),
             transition_id=transition_id,
             resolutions=dict(resolutions),  # validated by _read_state
+            candidates=candidates,
         )
     return None
 
@@ -733,20 +760,61 @@ def _recover_missing_entry_predecessor(
         return None
     transition_id = transition.get("id")
     resolutions = transition.get("resolutions")
-    if not isinstance(transition_id, str) or not isinstance(resolutions, dict):
+    candidates = _parse_transition_candidates(transition.get("candidates"))
+    if (
+        not isinstance(transition_id, str)
+        or not isinstance(resolutions, dict)
+        or candidates is None
+    ):
         return None
     return _SharedSyncState(
         predecessor,
         previous_digest,
         transition_id=transition_id,
         resolutions=dict(resolutions),  # validated by _read_state
+        candidates=candidates,
     )
+
+
+def _stored_recovery_resolutions(
+    local: EntryMemoryExport,
+    remote: EntryMemoryExport,
+    shared: _SharedSyncState,
+) -> dict[str, Literal["local", "remote"]]:
+    if shared.resolutions is None or shared.candidates is None:
+        return {}
+    return recoverable_resolutions(
+        local.state,
+        remote.state,
+        candidates=shared.candidates,
+        resolutions=shared.resolutions,
+    )
+
+
+def _resolution_choices(
+    local: EntryMemoryExport,
+    remote: EntryMemoryExport,
+    shared: _SharedSyncState,
+    conflicts: object,
+    accept: Literal["local", "remote"],
+) -> dict[str, Literal["local", "remote"]]:
+    if not isinstance(conflicts, dict):
+        raise RemoteSyncError("memory synchronization state is invalid")
+    explicit = {key: accept for key in conflicts}
+    if shared.resolutions and any(
+        choice != accept for choice in shared.resolutions.values()
+    ):
+        return explicit
+    if shared.resolutions:
+        return _stored_recovery_resolutions(local, remote, shared)
+    return explicit
 
 
 def _finish_entry_transition(
     state: dict[str, object],
     shared: _SharedSyncState,
     resolutions: dict[str, Literal["local", "remote"]],
+    candidates: dict[str, ResolutionCandidate],
 ) -> None:
     if state.get("schema") != 3:
         return
@@ -754,6 +822,9 @@ def _finish_entry_transition(
         "id": shared.transition_id or uuid.uuid4().hex,
         "previous_state": shared.previous_digest,
         "resolutions": dict(sorted(resolutions.items())),
+        "candidates": {
+            key: candidate.to_dict() for key, candidate in sorted(candidates.items())
+        },
     }
 
 
@@ -899,21 +970,68 @@ def _valid_entry_sync_state(value: dict[str, object], project_id: str) -> bool:
 
 
 
+def _parse_transition_candidates(
+    value: object,
+) -> dict[str, ResolutionCandidate] | None:
+    if not isinstance(value, dict):
+        return None
+    parsed: dict[str, ResolutionCandidate] = {}
+    for key, raw in value.items():
+        if not isinstance(key, str) or not isinstance(raw, dict):
+            return None
+        kind = raw.get("kind")
+        expected = {"kind", "local", "remote", "prepared"}
+        entry_ids: tuple[str, ...] = ()
+        if kind == "entries":
+            expected.add("entry_ids")
+            raw_ids = raw.get("entry_ids")
+            if (
+                not isinstance(raw_ids, list)
+                or not raw_ids
+                or raw_ids != sorted(set(raw_ids))
+                or any(
+                    not isinstance(entry_id, str) or not entry_id.startswith("m_")
+                    for entry_id in raw_ids
+                )
+            ):
+                return None
+            entry_ids = tuple(raw_ids)
+        elif kind != "schema":
+            return None
+        if set(raw) != expected or any(
+            not _valid_digest(raw.get(name))
+            for name in ("local", "remote", "prepared")
+        ):
+            return None
+        parsed[key] = ResolutionCandidate(
+            kind,
+            entry_ids,
+            str(raw["local"]),
+            str(raw["remote"]),
+            str(raw["prepared"]),
+        )
+    return parsed
+
+
 def _valid_entry_transition(value: object) -> bool:
     if not isinstance(value, dict) or set(value) != {
         "id",
         "previous_state",
         "resolutions",
+        "candidates",
     }:
         return False
     transition_id = value.get("id")
     resolutions = value.get("resolutions")
+    candidates = _parse_transition_candidates(value.get("candidates"))
     return (
         isinstance(transition_id, str)
         and len(transition_id) == 32
         and all(character in "0123456789abcdef" for character in transition_id)
         and _valid_digest(value.get("previous_state"))
         and isinstance(resolutions, dict)
+        and candidates is not None
+        and set(candidates) == set(resolutions)
         and all(
             isinstance(key, str)
             and (key == "schema" or key.startswith("m_"))
@@ -990,19 +1108,105 @@ def _registry_lock(
 
 
 def _atomic_replace_directory(staging: Path, destination: Path) -> None:
-    backup = destination.parent / f".{destination.name}.replaced-{os.getpid()}"
-    if backup.exists():
-        shutil.rmtree(backup)
-    if destination.exists():
-        destination.rename(backup)
+    token = uuid.uuid4().hex
+    parent = destination.parent
+    install = parent / f".{destination.name}.install-{token}"
+    backup = parent / f".{destination.name}.backup-{token}"
+    journal = parent / f".{destination.name}.replace-{token}.json"
+    os.replace(staging, install)
+    _fsync_directory(parent)
+    _atomic_write_file(
+        json.dumps(
+            {"project_id": destination.name, "install": install.name, "backup": backup.name},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode(),
+        journal,
+    )
+    _fsync_directory(parent)
     try:
-        staging.rename(destination)
+        if destination.exists():
+            os.replace(destination, backup)
+            _fsync_directory(parent)
+        os.replace(install, destination)
+        _fsync_directory(parent)
     except BaseException:
-        if backup.exists() and not destination.exists():
-            backup.rename(destination)
+        _recover_interrupted_replacement(destination)
         raise
-    if backup.exists():
-        shutil.rmtree(backup)
+    _finish_directory_replacement(destination, install, backup, journal)
+
+
+def _recover_interrupted_replacement(destination: Path) -> None:
+    parent = destination.parent
+    for journal in sorted(parent.glob(f".{destination.name}.replace-*.json")):
+        try:
+            value = json.loads(journal.read_bytes())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RemoteSyncError("project replacement journal is invalid") from exc
+        token = journal.name.removeprefix(f".{destination.name}.replace-").removesuffix(
+            ".json"
+        )
+        expected = {
+            "project_id": destination.name,
+            "install": f".{destination.name}.install-{token}",
+            "backup": f".{destination.name}.backup-{token}",
+        }
+        if value != expected or len(token) != 32 or any(
+            character not in "0123456789abcdef" for character in token
+        ):
+            raise RemoteSyncError("project replacement journal is invalid")
+        install = parent / expected["install"]
+        backup = parent / expected["backup"]
+        if destination.exists():
+            try:
+                _validate_recovery_snapshot(destination, destination.name)
+            except RemoteSyncError:
+                if not backup.is_dir():
+                    raise
+                shutil.rmtree(destination)
+                os.replace(backup, destination)
+                _fsync_directory(parent)
+            _finish_directory_replacement(destination, install, backup, journal)
+            continue
+        candidate = install if install.is_dir() else backup
+        if not candidate.is_dir():
+            raise RemoteSyncError("project replacement journal has no recoverable snapshot")
+        try:
+            _validate_recovery_snapshot(candidate, destination.name)
+        except RemoteSyncError:
+            if candidate == backup or not backup.is_dir():
+                raise
+            candidate = backup
+            _validate_recovery_snapshot(candidate, destination.name)
+        os.replace(candidate, destination)
+        _fsync_directory(parent)
+        _finish_directory_replacement(destination, install, backup, journal)
+
+
+def _validate_recovery_snapshot(candidate: Path, project_id: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="zeta-memory-recovery-") as temporary:
+        copy = Path(temporary) / project_id
+        copy_project_snapshot(candidate, copy)
+        _validate_project_snapshot(copy, project_id)
+
+
+def _finish_directory_replacement(
+    destination: Path, install: Path, backup: Path, journal: Path
+) -> None:
+    for path in (install, backup):
+        if path.exists():
+            shutil.rmtree(path)
+    _fsync_directory(destination.parent)
+    journal.unlink(missing_ok=True)
+    _fsync_directory(destination.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _atomic_write_file(payload: bytes, destination: Path) -> None:

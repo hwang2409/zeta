@@ -6,6 +6,9 @@ import hashlib
 import io
 import json
 import os
+import subprocess
+import sys
+import textwrap
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -1030,6 +1033,66 @@ def test_resolution_recovers_after_failure_between_remote_and_local_publish(
     assert entry_id in local._entry_memory_state(project_id).state.entries
 
 
+def test_recovery_does_not_reapply_stale_resolution_over_newer_edit(
+    tmp_path: Path,
+) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, remote, project_id, entry_id = _create_entry_conflict(first, second)
+    with pytest.raises(RemoteSyncError, match="after remote publish"):
+        resolve_project_memory(
+            first,
+            _FailingPublishTransport(second, after_publish=True),
+            project_id=project_id,
+            accept="local",
+        )
+    before = remote._entry_memory_state(project_id)
+    remote._compare_and_swap_entries(
+        project_id,
+        expected_digest=before.digest,
+        operations=(
+            UpdateOperation(entry_id, _source(4), text="remote post-publish choice"),
+        ),
+        reconciliation_key=None,
+    )
+
+    result = push_project_memory(first, LocalTransport(second), project_id=project_id)
+
+    assert result.conflicts == (entry_id,)
+    assert _active_texts(local, project_id) == {"local edit"}
+    assert _active_texts(remote, project_id) == {"remote post-publish choice"}
+
+
+def test_new_explicit_resolution_supersedes_pending_choice_or_fails_clearly(
+    tmp_path: Path,
+) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, remote, project_id, entry_id = _create_entry_conflict(first, second)
+    with pytest.raises(RemoteSyncError, match="after remote publish"):
+        resolve_project_memory(
+            first,
+            _FailingPublishTransport(second, after_publish=True),
+            project_id=project_id,
+            accept="local",
+        )
+    before = remote._entry_memory_state(project_id)
+    remote._compare_and_swap_entries(
+        project_id,
+        expected_digest=before.digest,
+        operations=(
+            UpdateOperation(entry_id, _source(4), text="remote post-publish choice"),
+        ),
+        reconciliation_key=None,
+    )
+
+    result = resolve_project_memory(
+        first, LocalTransport(second), project_id=project_id, accept="remote"
+    )
+
+    assert result.conflicts == ()
+    assert _active_texts(local, project_id) == {"remote post-publish choice"}
+    assert _active_texts(remote, project_id) == {"remote post-publish choice"}
+
+
 def test_sync_failure_before_remote_publish_is_no_op(tmp_path: Path) -> None:
     first, second = tmp_path / "first", tmp_path / "second"
     local, project_id = _fixture(first, tmp_path / "workspace")
@@ -1047,6 +1110,100 @@ def test_sync_failure_before_remote_publish_is_no_op(tmp_path: Path) -> None:
 
     assert project_digest(first / "projects" / project_id) == before_local
     assert project_digest(second / "projects" / project_id) == before_remote
+
+
+def _run_killed_publication(
+    first: Path, second: Path, project_id: str, boundary: str
+) -> subprocess.CompletedProcess[str]:
+    script = textwrap.dedent(
+        """
+        import os
+        import sys
+        from pathlib import Path
+
+        from zeta.remote_sync import LocalTransport, push_project_memory
+        import zeta.remote_sync.memory as memory
+
+        first, second, project_id, boundary = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+        destination = second / "projects" / project_id
+        real_replace = memory.os.replace
+
+        def killing_replace(source, target, *args, **kwargs):
+            if args or kwargs:
+                return real_replace(source, target, *args, **kwargs)
+            source_path, target_path = Path(source), Path(target)
+            if boundary == "before_backup" and target_path.name.startswith(f".{project_id}.replace-"):
+                real_replace(source, target)
+                os._exit(91)
+            if target_path.name.startswith(f".{project_id}.backup-"):
+                real_replace(source, target)
+                if boundary == "between":
+                    os._exit(92)
+                return
+            real_replace(source, target)
+            if target_path == destination and source_path.name.startswith(f".{project_id}.install-") and boundary == "after_install":
+                os._exit(93)
+
+        memory.os.replace = killing_replace
+        push_project_memory(first, LocalTransport(second), project_id=project_id)
+        """
+    )
+    killed = subprocess.run(
+        [sys.executable, "-c", script, str(first), str(second), project_id, boundary],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert killed.returncode in {91, 92, 93}, killed.stderr
+    return killed
+
+
+def _retry_sync_in_fresh_process(first: Path, second: Path, project_id: str) -> None:
+    script = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        from zeta.remote_sync import LocalTransport, push_project_memory
+
+        result = push_project_memory(Path(sys.argv[1]), LocalTransport(Path(sys.argv[2])), project_id=sys.argv[3])
+        assert not result.conflicts
+        """
+    )
+    subprocess.run(
+        [sys.executable, "-c", script, str(first), str(second), project_id],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
+def _assert_killed_publication_recovers(tmp_path: Path, boundary: str) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    local, project_id = _fixture(first, tmp_path / "workspace")
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    entry_id = _add(local, project_id, "pending publication", 1)
+
+    _run_killed_publication(first, second, project_id, boundary)
+    _retry_sync_in_fresh_process(first, second, project_id)
+
+    for home in (first, second):
+        project = home / "projects" / project_id
+        assert project.is_dir()
+        assert entry_id in ProjectRegistry(home / "projects")._entry_memory_state(
+            project_id
+        ).state.entries
+
+
+def test_kill_between_backup_and_install_recovers(tmp_path: Path) -> None:
+    _assert_killed_publication_recovers(tmp_path, "between")
+
+
+def test_kill_after_install_before_cleanup_recovers(tmp_path: Path) -> None:
+    _assert_killed_publication_recovers(tmp_path, "after_install")
+
+
+def test_kill_before_backup_is_noop(tmp_path: Path) -> None:
+    _assert_killed_publication_recovers(tmp_path, "before_backup")
 
 
 def test_sync_state_size_bounded_over_add_sync_compact_cycles(tmp_path: Path) -> None:
