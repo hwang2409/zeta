@@ -2402,6 +2402,78 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_serve_resume_renders_legacy_browser_tool_messages(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    session_id = opened.metadata.session_id
+    transcript_path = opened.store.path
+    opened.store.close()
+    fixture = Path(__file__).parent / "fixtures" / "legacy_browser_transcript.jsonl"
+    with transcript_path.open("ab") as transcript:
+        transcript.write(fixture.read_bytes())
+
+    server = ZetaServer(
+        home=tmp_path,
+        provider="codex",
+        port=0,
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    await server.runtime.resume_session(session_id)
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        history = (
+            await _request(
+                reader,
+                writer,
+                2,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        browser_call = next(
+            block["tool_call"]
+            for message in history
+            for block in message["content"]
+            if block["type"] == "tool_use"
+        )
+        browser_result = next(
+            message["tool_result"]
+            for message in history
+            if message["tool_result"] is not None
+        )
+        assert browser_call == {
+            "id": "browser-call-1",
+            "name": "browser",
+            "arguments": {},
+        }
+        assert browser_result["tool_call_id"] == "browser-call-1"
+        assert browser_result["content"] == "Example Domain"
+
+        provider_context = await server.runtime.loop.context_assembler.assemble()
+        provider_browser_call = next(
+            block.tool_call
+            for message in provider_context
+            for block in message.content
+            if isinstance(block, ToolUseContent)
+        )
+        provider_browser_result = next(
+            message.tool_result
+            for message in provider_context
+            if message.tool_result is not None
+        )
+        assert provider_browser_call.name == "browser"
+        assert provider_browser_call.id == "browser-call-1"
+        assert provider_browser_result.tool_call_id == "browser-call-1"
+        assert provider_browser_result.content == "Example Domain"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)

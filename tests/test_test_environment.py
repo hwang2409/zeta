@@ -532,7 +532,6 @@ def test_environment_was_sanitized():
         "WIKI_AGENT_RUNTIME_DIR",
     ):
         assert name not in os.environ
-    assert os.environ["ZETA_REQUIRE_BROWSER"] == "1"
     assert Path(os.environ["ZETA_HOME"]) != Path.home() / ".zeta"
     assert Path(os.environ["ZETA_HOME"]).is_dir()
     assert os.environ.get("HOME")
@@ -549,7 +548,6 @@ def test_environment_was_sanitized():
             "CLAUDE_CONFIG_DIR": "/hostile/claude",
             "CODEX_HOME": "/hostile/codex",
             "WIKI_AGENT_RUNTIME_DIR": "/hostile/wiki",
-            "ZETA_REQUIRE_BROWSER": "1",
         }
     )
     repo_root = Path(__file__).resolve().parents[1]

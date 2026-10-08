@@ -535,17 +535,19 @@ class TranscriptVirtualMixin:
             if trimming_blanks and (unit is None or unit.value is None):
                 continue
             trimming_blanks = False
-            lines, _ = self._virtual_unit_lines(
+            streaming = isinstance(getattr(unit, "value", None), StreamingText)
+            lines, locations = self._virtual_unit_lines(
                 index,
                 width,
-                streaming_tail=(
-                    remaining
-                    if isinstance(getattr(unit, "value", None), StreamingText)
-                    else None
-                ),
+                streaming_tail=remaining if streaming else None,
             )
             if len(lines) >= remaining:
-                return index, max(0, len(lines) - remaining)
+                local_offset = max(0, len(lines) - remaining)
+                return (
+                    (index, locations[local_offset][1])
+                    if streaming
+                    else (index, local_offset)
+                )
             remaining -= len(lines)
         return 0, 0
 
@@ -652,19 +654,22 @@ class TranscriptVirtualMixin:
         index, offset = start
         while index < len(self._units) and len(lines) < wanted:
             unit = self._units[index]
+            streaming_tail = self._follow_tail and isinstance(
+                getattr(unit, "value", None), StreamingText
+            )
             unit_lines, unit_locations = self._virtual_unit_lines(
                 index,
                 width,
-                streaming_tail=(
-                    wanted
-                    if self._follow_tail
-                    and isinstance(getattr(unit, "value", None), StreamingText)
-                    else None
-                ),
+                streaming_tail=wanted if streaming_tail else None,
             )
-            lines.extend(unit_lines[offset:])
-            locations.extend(unit_locations[offset:])
-            unit_line_numbers.extend(range(offset, len(unit_lines)))
+            local_offset = offset
+            if streaming_tail and unit_locations:
+                local_offset = max(0, offset - unit_locations[0][1])
+            lines.extend(unit_lines[local_offset:])
+            locations.extend(unit_locations[local_offset:])
+            unit_line_numbers.extend(
+                range(offset, offset + len(unit_lines) - local_offset)
+            )
             index += 1
             offset = 0
         lines = lines[:wanted] or [[]]
