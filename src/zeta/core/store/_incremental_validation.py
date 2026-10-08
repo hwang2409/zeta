@@ -94,6 +94,7 @@ class IncrementalValidationMixin:
         self._task_notification_ids = staged._task_notification_ids
         # Publish entries last so readers never see rows without matching indexes.
         self._entries = staged._entries
+        self._record_client_delivery_entries(entries)
         return True
 
     def _before_incremental_state_install(self) -> None:

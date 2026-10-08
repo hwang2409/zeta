@@ -5,12 +5,11 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
-import warnings
-from collections import deque
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from ...agent.background import (
     BackgroundAgentOwner,
@@ -83,7 +82,6 @@ from ...protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
-    require_new_message_origin,
     user_message_for_turn,
 )
 from ...providers.retry_policy import ProviderRetryBudget, apply_retry_budget
@@ -103,6 +101,7 @@ from ._completion import (
     assistant_reset_event,
     can_retry_context,
     close_completion,
+    provider_events,
     provider_retry_notice,
     start_provider_attempt,
     task_is_cancelling,
@@ -173,6 +172,7 @@ class AgentLoop(
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
         self.backend = backend
         self.store = store
+        self.store.recover_client_deliveries()
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
@@ -274,7 +274,6 @@ class AgentLoop(
         self._plan_mode = False
         self._plan_mode_policy = PLAN_MODE_POLICY
         self._plan_mode_prior_prompt: Message | None = None
-        self._steering_queue: deque[Message] = deque()
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
     @property
@@ -339,34 +338,42 @@ class AgentLoop(
         if isinstance(self.backend, ContextWindowBackend):
             self.backend.set_token_budget(token_budget)
 
-    def abort(self, *, foreground_only: bool = False) -> None:
+    def abort(
+        self,
+        *,
+        foreground_only: bool = False,
+        steering_drop_reason: Literal["abort", "disconnect"] | None = "abort",
+    ) -> None:
         """Signal active tools; optionally preserve background work and steering."""
         self.tool_registry.abort()
         if foreground_only:
             self.notification_wake.retry_after_foreground_abort()
         else:
             self._background_owner.cancel_all()
-            self._steering_queue.clear()
-
+            if steering_drop_reason is not None:
+                self.store.drop_client_steering(steering_drop_reason)
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
         The running ``_run_turn`` drains this queue before the next provider
         call, so the message never lands between a tool_call and its
         tool_result. Callers must pass a durable USER-role message.
         """
-        if message.role is not MessageRole.USER:
-            raise ValueError("steering message must have the user role")
-        self._steering_queue.append(require_new_message_origin(message))
+        self.store.queue_client_steering(message)
 
     @property
     def has_pending_steering(self) -> bool:
-        return bool(self._steering_queue)
+        return self.store.has_pending_client_steering
+    def clear_pending_steering(
+        self,
+        reason: Literal["clear", "turn_end"] = "clear",
+    ) -> int:
+        return self.store.drop_client_steering(reason)
 
-    def clear_pending_steering(self) -> int:
-        cleared = len(self._steering_queue)
-        self._steering_queue.clear()
-        return cleared
-
+    def drop_pending_steering(
+        self,
+        reason: Literal["abort", "disconnect", "turn_end", "failed"],
+    ) -> int:
+        return self.store.drop_client_steering(reason)
     def set_background_event_sink(
         self, sink: Callable[[StreamEvent], None] | None
     ) -> None:
@@ -858,9 +865,6 @@ class AgentLoop(
                 nudge_turn_pending = False
                 self._turn_stop_reason = None
                 self._turn_output_tokens = None
-                while self._steering_queue:
-                    steering = self._steering_queue.popleft()
-                    await self._append_turn_message(steering)
                 async for event in self.drain_notification_batch():
                     yield event
                 self.tool_registry.start_batch()
@@ -911,13 +915,19 @@ class AgentLoop(
                     if self._cache_trace is not None
                     else None
                 )
+                steering = self.store.pending_client_steering()
+                if steering is not None:
+                    context_messages.extend(steering.messages)
                 provider_retry_budget = start_provider_attempt(provider_retry_budget)
                 self._turn_provider_retry_records = provider_retry_budget.records
                 completion = apply_retry_budget(
                     self.backend.complete(context_messages, active_tools),
                     provider_retry_budget,
                 )
-                async for event in completion:
+                provider_stream = completion if steering is None else provider_events(
+                    completion, partial(self.store.deliver_client_steering, steering)
+                )
+                async for event in provider_stream:
                     attempt_state.observe(event)
                     self.context_assembler.observe_event(event)
                     if cache_trace is not None:
@@ -1210,25 +1220,6 @@ class AgentLoop(
             metadata=metadata,
         )
         self.store.append_message(durable_message(assistant_message))
-
-    def _persist_partial_for_control(
-        self,
-        partial_blocks: list[ContentBlock],
-        assistant_message: Message | None,
-    ) -> None:
-        try:
-            self._persist_partial_with_cancelled_tools(
-                partial_blocks, assistant_message
-            )
-        except Exception as exc:  # noqa: BLE001 - warn when persistence fails
-            try:
-                warnings.warn(
-                    f"failed to persist partial state: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            except BaseException:  # noqa: BLE001, S110 - warning failure is ignored
-                pass
 
     def _persist_partial_with_cancelled_tools(
         self,

@@ -359,16 +359,31 @@ def _is_lossy_generated_row(row: Mapping[str, Any]) -> bool:
     return message is not None and message.get("role") == "tool_result"
 
 
-def project_transcript_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Remove replay-only transcript copies from a durable compaction row."""
-    if row.get("type") != "compaction":
-        return row
+def project_transcript_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Remove private protocol bookkeeping and replay-only transcript copies."""
+    if row.get("type") == "client_delivery":
+        return None
+    projected = row
     data = row.get("data")
-    if not isinstance(data, dict) or not isinstance(data.get("view"), list):
-        return row
-    projected = dict(row)
+    if row.get("type") == "compaction" and isinstance(data, dict) and isinstance(data.get("view"), list):
+        projected = dict(row)
+        projected_data = dict(data)
+        projected_data["view"] = [{"omitted_compaction_entries": len(data["view"])}]
+        projected["data"] = projected_data
+        data = projected_data
+    if not isinstance(data, dict):
+        return projected
+    message = data.get("message")
+    metadata = message.get("metadata") if isinstance(message, dict) else None
+    if not isinstance(metadata, dict) or "zeta_client_delivery_id" not in metadata:
+        return projected
+    projected = dict(projected)
     projected_data = dict(data)
-    projected_data["view"] = [{"omitted_compaction_entries": len(data["view"])}]
+    projected_message = dict(message)
+    projected_metadata = dict(metadata)
+    del projected_metadata["zeta_client_delivery_id"]
+    projected_message["metadata"] = projected_metadata
+    projected_data["message"] = projected_message
     projected["data"] = projected_data
     return projected
 
@@ -475,7 +490,10 @@ def prepare_request(
 
     rows: list[dict[str, Any]] = []
     for raw_row in transcript.rows:
-        safe_row = _sanitized(project_transcript_row(raw_row))
+        projected_row = project_transcript_row(raw_row)
+        if projected_row is None:
+            continue
+        safe_row = _sanitized(projected_row)
         if not isinstance(safe_row, dict):
             continue
         candidate = Transcript(transcript.session_id, (*rows, safe_row))

@@ -15,10 +15,17 @@ from typing import Any
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
-from ..protocol.types import MessageOrigin, StreamEvent, StreamEventType, TextContent
+from ..protocol.types import (
+    Message,
+    MessageOrigin,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+)
 from ..runtime.compaction_mode import switch_compaction
 from . import abort_scope, ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
+from .delivery import DeliveryRequests, TurnOutcome
 from .model_inputs import PendingModelInputs
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
@@ -34,7 +41,7 @@ from .protocol import (
     ProtocolError,
     bounded,
 )
-from .runtime import BackendFactory, ServerRuntime, SessionState
+from .runtime import BackendFactory, ServerRuntime
 from .turn_context import PendingTurnContexts
 
 # Echoed user text stays well inside the 1 MiB frame after JSON escaping.
@@ -222,10 +229,12 @@ class _Client:
         self._close_lock = asyncio.Lock()
         self._closed = False
         self._turn_task: asyncio.Task[None] | None = None
+        self._turn_cancel_outcome: TurnOutcome | None = None
         self._read_buffer = bytearray()
         self._model_inputs = PendingModelInputs()
         self.codec = FrameCodec()
         self.projects = ProjectRequests(home=server.home, runtime=server.runtime, codec=self.codec)
+        self.deliveries = DeliveryRequests(self)
         self._approvals = ApprovalLifecycle()
 
     async def run(self) -> None:
@@ -325,7 +334,8 @@ class _Client:
             if self._turn_task is not None and not self._turn_task.done():
                 loop = self.server.runtime.loop
                 if loop is not None:
-                    loop.abort()
+                    loop.abort(steering_drop_reason=None)
+                self._turn_cancel_outcome = TurnOutcome.DISCONNECTED
                 self._turn_task.cancel()
                 await asyncio.gather(self._turn_task, return_exceptions=True)
             self._turn_task = None
@@ -399,9 +409,11 @@ class _Client:
             await self._attach_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "send":
-            return await self._send(params)
+            return await self.deliveries.send(params)
         if method == "steer":
-            return await self._steer(_required_string(params, "text"))
+            return await self.deliveries.steer(params)
+        if method == "delivery_status":
+            return self.deliveries.status(params)
         if method == "clear_steering":
             return abort_scope.clear_pending_steering(self.features, self.server.runtime.loop)
         if method in {"approve", "deny"}:
@@ -465,6 +477,8 @@ class _Client:
                 requests += PROJECT_REQUESTS
             if "abort_scope" in self.features:
                 requests.append("clear_steering")
+            if "delivery_id" in self.features:
+                requests.append("delivery_status")
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],
@@ -558,40 +572,6 @@ class _Client:
             if not current or current[-1].id != head:
                 store.switch_to_branch(head)
         return ergonomics.tree(runtime)
-    async def _send(self, params: dict[str, Any]) -> dict[str, object]:
-        runtime = self.server.runtime
-        if runtime.loop is None:
-            raise ProtocolError(-32003, "no active session")
-        if self._turn_busy():
-            raise ProtocolError(-32004, "a turn is already running")
-        value = self._model_inputs.resolve(runtime.session_id, params, enabled="model_input_ids" in self.features)
-        await self._user_message(value.display_text, "send")
-        self._turn_task = asyncio.create_task(self._run_turn(
-            value.text, origin=value.origin, user_message=value.message
-        ))
-        return {"accepted": True, "session_id": runtime.session_id}
-
-    async def _steer(self, text: str) -> dict[str, object]:
-        loop = self.server.runtime.loop
-        if loop is None:
-            raise ProtocolError(-32003, "no active session")
-        if not self._turn_busy():
-            raise ProtocolError(-32005, "no turn is running")
-        from ..protocol.types import (
-            Message,
-            MessageOrigin,
-            MessageRole,
-            with_message_origin,
-        )
-
-        loop.steer(
-            with_message_origin(
-                Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
-            )
-        )
-        await self._user_message(text, "steer")
-        return {"accepted": True}
-
     async def _approval(
         self, method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
@@ -651,11 +631,23 @@ class _Client:
 
     async def _abort(self, scope: abort_scope.AbortScope = "session") -> dict[str, object]:
         session_id = self.server.runtime.session_id
+        outcome = (
+            TurnOutcome.FOREGROUND_CANCELED
+            if scope == "foreground"
+            else TurnOutcome.SESSION_CANCELED
+        )
+        turn_task = self._turn_task
+
+        def mark_canceled() -> None:
+            if turn_task is not None and not turn_task.done():
+                self._turn_cancel_outcome = outcome
+
         aborted = await abort_scope.abort_active_turn(
-            self._turn_task,
+            turn_task,
             scope=scope,
             loop=self.server.runtime.loop,
             terminate_approvals=self._terminate_pending_approvals,
+            before_cancel=mark_canceled,
         )
         if aborted:
             await self._notify("turn_aborted", session_id)
@@ -694,30 +686,40 @@ class _Client:
             ),
         }
 
-    async def _run_turn(self, text: str, user_message=None, *, origin: MessageOrigin = MessageOrigin.USER) -> None:
+    async def _run_turn(
+        self,
+        text: str,
+        user_message: Message | None = None,
+        *,
+        origin: MessageOrigin = MessageOrigin.USER,
+        persist_user_message: bool = True,
+    ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
         if loop is None or state is None:
             return
         session_id = state.session_id
         state.turn_started()
-        success = True
+        outcome = TurnOutcome.COMPLETED
         agent_end: StreamEvent | None = None
         try:
             async for event in loop.run_turn(
-                text, origin=origin, user_message=user_message
+                text,
+                origin=origin,
+                user_message=user_message,
+                persist_user_message=persist_user_message,
             ):
                 if event.type is StreamEventType.ERROR:
-                    success = False
+                    outcome = TurnOutcome.FAILED
                 if event.type is StreamEventType.AGENT_END:
                     agent_end = event
                 else:
                     await self._event(event, session_id=session_id)
         except asyncio.CancelledError:
-            success = False
+            outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
             raise
         except Exception as exc:  # noqa: BLE001 - serialize all turn failures
-            success = False
+            outcome = TurnOutcome.FAILED
             await self._notify(
                 "error",
                 session_id,
@@ -725,34 +727,13 @@ class _Client:
                 data={},
             )
         finally:
-            self._finalize_turn(
-                session_id, state, success=success, schedule_wake=agent_end is None
+            self.deliveries.finalize_turn(
+                session_id, state, outcome, schedule_wake=agent_end is None
             )
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id)
-            if success:
+            if outcome is TurnOutcome.COMPLETED:
                 self._schedule_background_wake(session_id)
-
-    def _finalize_turn(
-        self,
-        session_id: str,
-        state: SessionState,
-        *,
-        success: bool = True,
-        schedule_wake: bool = True,
-    ) -> None:
-        self._approvals.prune_ended()
-        if self.server.runtime.state is state:
-            state.turn_finished()
-        if self._turn_task is asyncio.current_task():
-            self._turn_task = None
-        if (
-            schedule_wake
-            and success
-            and self.server.runtime.state is state
-            and state.loop.notification_system_message() is not None
-        ):
-            self._schedule_background_wake(session_id)
 
     def _schedule_background_wake(self, session_id: str) -> None:
         if self._closed:
@@ -772,7 +753,7 @@ class _Client:
         state = self.server.runtime.state
         if loop is None or state is None or state.session_id != session_id:
             return
-        success = False
+        outcome = TurnOutcome.FAILED
         started = False
         agent_end: StreamEvent | None = None
         try:
@@ -782,11 +763,12 @@ class _Client:
             success, agent_end = await self.server.turn_contexts.run_notification_turn(
                 session_id, loop, self._event
             )
+            outcome = TurnOutcome.COMPLETED if success else TurnOutcome.FAILED
         except asyncio.CancelledError:
-            success = False
+            outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
             raise
         except Exception as exc:  # noqa: BLE001 - serialize all turn failures
-            success = False
+            outcome = TurnOutcome.FAILED
             await self._notify(
                 "error",
                 session_id,
@@ -796,12 +778,12 @@ class _Client:
         finally:
             if not started and loop.notification_turn_state == "scheduled":
                 await loop.finish_notification_turn(success=False)
-            self._finalize_turn(
-                session_id, state, success=success, schedule_wake=agent_end is None
+            self.deliveries.finalize_turn(
+                session_id, state, outcome, schedule_wake=agent_end is None
             )
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id)
-            if success:
+            if outcome is TurnOutcome.COMPLETED:
                 self._schedule_background_wake(session_id)
 
     async def _attach_pending_notifications(self) -> None:
@@ -830,16 +812,25 @@ class _Client:
                     asyncio.create_task(self._event(event, session_id=session_id))
                 )
 
+        outcome = TurnOutcome.COMPLETED
         try:
             await loop.resume_pending_tool(
                 request_id,
                 prepared=True,
                 event_sink=emit,
             )
+        except asyncio.CancelledError:
+            outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
+            raise
+        except BaseException:
+            outcome = TurnOutcome.FAILED
+            raise
         finally:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
-            self._finalize_turn(session_id, state, schedule_wake=agent_end is None)
+            self.deliveries.finalize_turn(
+                session_id, state, outcome, schedule_wake=agent_end is None
+            )
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id)
             self._schedule_background_wake(session_id)

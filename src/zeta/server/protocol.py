@@ -20,6 +20,7 @@ FEATURES = (
     "projects",
     "abort_scope",
     "turn_context",
+    "delivery_id",
 )
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
