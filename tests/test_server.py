@@ -53,6 +53,29 @@ def test_removed_fake_provider_has_clear_serve_error(tmp_path: Path) -> None:
         ZetaServer(home=tmp_path, cwd=tmp_path, provider="fake", port=0)
 
 
+@pytest.mark.asyncio
+async def test_removed_fake_provider_has_clear_new_session_error(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, cwd=tmp_path, provider="codex", port=0)
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        response = (
+            await _request(
+                reader,
+                writer,
+                2,
+                "new_session",
+                {"provider": "fake"},
+            )
+        )[-1]
+        assert response["error"] == {
+            "code": -32602,
+            "message": "the fake provider was removed; choose claude, codex or ollama",
+        }
+    finally:
+        await _close(server, writer)
+
+
 @pytest.fixture(autouse=True)
 def _controlled_terminal_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TERM", raising=False)
