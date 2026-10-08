@@ -747,6 +747,14 @@ async def _wait_for_notification(store: ConversationStore, status: str) -> objec
     raise AssertionError(f"missing {status} background notification")
 
 
+async def _wait_for_no_agent_children(store: ConversationStore) -> None:
+    for _ in range(100):
+        if not store.agent_children():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("background child cleanup did not finish")
+
+
 @pytest.mark.asyncio
 async def test_background_agent_returns_handle_and_parent_continues(
     tmp_path: Path,
@@ -1459,7 +1467,7 @@ async def test_parent_abort_cancels_background_grandchild(
         "tool_call_id": "grandchild",
         "content": "tool execution canceled",
     }
-    assert not store.agent_children()
+    await _wait_for_no_agent_children(store)
     await loop.close()
 
 
