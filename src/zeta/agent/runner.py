@@ -989,7 +989,9 @@ def _child_base_system_prompt(
 ) -> str | Message:
     """Compose project context from an explicit cwd that differs from the parent."""
 
-    if cwd_override is None or cwd_override == os.path.abspath(loop.store.cwd):
+    if cwd_override is None or os.path.abspath(cwd_override) == os.path.abspath(
+        loop.store.cwd
+    ):
         return loop.context_assembler.system_prompt
     if child_registry is not None:
         child_registry.verify_cwd_identity()
