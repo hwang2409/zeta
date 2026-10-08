@@ -65,8 +65,10 @@ class StreamingText:
     def _wrapped(console: Console, value: str, width: int, style: str) -> list[Text]:
         return list(Text(value, style=style).wrap(console, width))
 
-    def tail(self, console: Console, width: int, height: int) -> list[Text]:
-        """Return the visible wrapped tail, processing each appended chunk once."""
+    def tail_with_offset(
+        self, console: Console, width: int, height: int
+    ) -> tuple[int, list[Text]]:
+        """Return the wrapped tail and its line offset in the complete value."""
 
         consumed, stable, pending = self._wraps.get(width, (0, [], ""))
         pending += "".join(self._chunks[consumed:])
@@ -80,9 +82,13 @@ class StreamingText:
             cut = offsets[-retained]
             stable.extend(wrapped[:-retained])
             pending = pending[cut:]
+            wrapped = self._wrapped(console, pending, width, self.style)
         self._wraps[width] = (len(self._chunks), stable, pending)
-        visible = [
-            *stable[-height:],
-            *self._wrapped(console, pending, width, self.style),
-        ]
-        return visible[-height:] or [Text("", style=self.style)]
+        combined = [*stable[-height:], *wrapped]
+        visible = combined[-height:] or [Text("", style=self.style)]
+        return max(0, len(stable) + len(wrapped) - len(visible)), visible
+
+    def tail(self, console: Console, width: int, height: int) -> list[Text]:
+        """Return the visible wrapped tail, processing each appended chunk once."""
+
+        return self.tail_with_offset(console, width, height)[1]

@@ -11,6 +11,8 @@ from typing import Any
 
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.data_structures import Point
+from prompt_toolkit.formatted_text import ANSI, to_formatted_text
+from prompt_toolkit.formatted_text.utils import split_lines
 from prompt_toolkit.layout.controls import UIContent
 from rich.console import Console
 from rich.text import Text
@@ -31,6 +33,41 @@ from .transcript_search import (
 
 _LAZY_TAIL_MIN_UNITS = 128
 _VIRTUAL_MARGIN_SCREENS = 1
+
+
+class _HeightIndex:
+    """Fenwick index for O(log n) transcript height updates and prefixes."""
+
+    def __init__(self, size: int) -> None:
+        self.values = [1] * size
+        self.tree = [0, *(index & -index for index in range(1, size + 1))]
+
+    def ensure(self, size: int) -> None:
+        while len(self.values) < size:
+            old_size = len(self.values)
+            index = old_size + 1
+            low = index & -index
+            prior = self.prefix(old_size) - self.prefix(index - low)
+            self.values.append(1)
+            self.tree.append(prior + 1)
+
+    def set(self, index: int, value: int) -> None:
+        delta = value - self.values[index]
+        if not delta:
+            return
+        self.values[index] = value
+        cursor = index + 1
+        while cursor < len(self.tree):
+            self.tree[cursor] += delta
+            cursor += cursor & -cursor
+
+    def prefix(self, count: int) -> int:
+        total = 0
+        cursor = min(count, len(self.values))
+        while cursor:
+            total += self.tree[cursor]
+            cursor -= cursor & -cursor
+        return total
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,12 +461,30 @@ class TranscriptVirtualMixin:
         return int(getattr(value, "revision", 0))
 
     def _virtual_unit_lines(
-        self, index: int, width: int
+        self, index: int, width: int, *, streaming_tail: int | None = None
     ) -> tuple[list[list[tuple[str, str]]], list[tuple[Any | None, int]]]:
         unit = self._units[index]
         if unit is None or unit.value is None:
             return [[]], [(unit, 0)]
         revision = self._unit_revision(unit)
+        if isinstance(unit.value, StreamingText) and streaming_tail is not None:
+            cached = self._virtual_stream_lines.get(unit.key)
+            if cached is not None and cached[:3] == (width, revision, streaming_tail):
+                lines, base_offset = cached[3], cached[4]
+            else:
+                base_offset, lines = self._streaming_tail_lines(
+                    unit.value, width, max(1, streaming_tail)
+                )
+                self._virtual_stream_lines[unit.key] = (
+                    width,
+                    revision,
+                    streaming_tail,
+                    lines,
+                    base_offset,
+                )
+            return lines, [
+                (unit, base_offset + offset) for offset in range(len(lines))
+            ]
         rendered_entry = self._render_cache.get(unit.key)
         line_entry = self._unit_lines_cache.get(unit.key)
         location_entry = self._unit_locations_cache.get(unit.key)
@@ -443,25 +498,31 @@ class TranscriptVirtualMixin:
         ):
             lines = line_entry[1]
             self._unit_heights[(width, unit.key, revision)] = len(lines)
+            self._remember_unit_height(width, index, len(lines))
             return lines, [(unit, offset) for offset in location_entry[2]]
         lines = self._unit_parsed_lines(unit, width)
         self._unit_heights[(width, unit.key, revision)] = len(lines)
+        self._remember_unit_height(width, index, len(lines))
         # ``_unit_parsed_lines`` populated the render cache. Avoid even a
         # cached _render_unit call so count-based work remains viewport-bound.
         rendered = self._render_cache[unit.key][2]
         _plain, offsets = self._unit_locations(unit, width, rendered)
         return lines, [(unit, offset) for offset in offsets]
 
+    def _height_index(self, width: int) -> _HeightIndex:
+        index = self._height_indexes.get(width)
+        if index is None:
+            index = _HeightIndex(len(self._units))
+            self._height_indexes[width] = index
+        else:
+            index.ensure(len(self._units))
+        return index
+
+    def _remember_unit_height(self, width: int, unit_index: int, height: int) -> None:
+        self._height_index(width).set(unit_index, height)
+
     def _estimated_prefix(self, width: int, unit_index: int, line_offset: int) -> int:
-        total = 0
-        for unit in self._units[:unit_index]:
-            if unit is None:
-                total += 1
-            else:
-                total += self._unit_heights.get(
-                    (width, unit.key, self._unit_revision(unit)), 1
-                )
-        return total + line_offset
+        return self._height_index(width).prefix(unit_index) + line_offset
 
     def _estimated_total(self, width: int) -> int:
         return self._estimated_prefix(width, len(self._units), 0)
@@ -474,7 +535,15 @@ class TranscriptVirtualMixin:
             if trimming_blanks and (unit is None or unit.value is None):
                 continue
             trimming_blanks = False
-            lines, _ = self._virtual_unit_lines(index, width)
+            lines, _ = self._virtual_unit_lines(
+                index,
+                width,
+                streaming_tail=(
+                    remaining
+                    if isinstance(getattr(unit, "value", None), StreamingText)
+                    else None
+                ),
+            )
             if len(lines) >= remaining:
                 return index, max(0, len(lines) - remaining)
             remaining -= len(lines)
@@ -582,7 +651,17 @@ class TranscriptVirtualMixin:
         unit_line_numbers: list[int] = []
         index, offset = start
         while index < len(self._units) and len(lines) < wanted:
-            unit_lines, unit_locations = self._virtual_unit_lines(index, width)
+            unit = self._units[index]
+            unit_lines, unit_locations = self._virtual_unit_lines(
+                index,
+                width,
+                streaming_tail=(
+                    wanted
+                    if self._follow_tail
+                    and isinstance(getattr(unit, "value", None), StreamingText)
+                    else None
+                ),
+            )
             lines.extend(unit_lines[offset:])
             locations.extend(unit_locations[offset:])
             unit_line_numbers.extend(range(offset, len(unit_lines)))
@@ -632,6 +711,59 @@ class TranscriptVirtualMixin:
             cursor_position=Point(x=0, y=0),
             show_cursor=False,
         )
+
+    def _streaming_tail_lines(
+        self, value: StreamingText, width: int, height: int
+    ) -> tuple[int, list[list[tuple[str, str]]]]:
+        output = StringIO()
+        console = Console(
+            file=output,
+            force_terminal=True,
+            color_system="truecolor",
+            no_color=False,
+            width=width,
+            theme=RICH_THEME,
+        )
+        base_offset, wrapped = value.tail_with_offset(console, width, height)
+        rendered = Text("", style=value.style)
+        for index, line in enumerate(wrapped):
+            if index:
+                rendered.append("\n")
+            rendered.append_text(line)
+        console.print(rendered, soft_wrap=True)
+        ansi = "\n".join(line.rstrip(" ") for line in output.getvalue().splitlines())
+        lines = list(split_lines(to_formatted_text(ANSI(ansi)))) if ansi else [[]]
+        return base_offset, lines
+
+    def _tail_lines(self, width: int, height: int) -> list[list[tuple[str, str]]]:
+        """Render only enough newest units to fill a follow-tail viewport."""
+
+        lines: list[list[tuple[str, str]]] = []
+        trimming_trailing_blanks = True
+        reached_start = True
+        for unit in reversed(self._units):
+            if unit is None:
+                unit_lines = [[]]
+            elif isinstance(unit.value, StreamingText):
+                _base_offset, unit_lines = self._streaming_tail_lines(
+                    unit.value, width, height
+                )
+            else:
+                unit_lines = self._unit_parsed_lines(unit, width)
+            if trimming_trailing_blanks:
+                unit_lines = list(unit_lines)
+                while unit_lines and not unit_lines[-1]:
+                    unit_lines.pop()
+                trimming_trailing_blanks = not unit_lines
+            if unit_lines:
+                lines[:0] = unit_lines
+            if len(lines) >= height and not trimming_trailing_blanks:
+                reached_start = False
+                break
+        if reached_start:
+            while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
+                lines.pop(0)
+        return lines[-height:] or [[]]
 
     def _keyed_locations(self) -> list[tuple[int | None, int]]:
         """Return paint-local locations, or the cached eager location map."""
