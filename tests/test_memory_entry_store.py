@@ -9,6 +9,7 @@ import pytest
 
 from zeta.memory.entry_store import (
     AddOperation,
+    ExpireOperation,
     MemoryEntry,
     MemoryKind,
     MemorySchema,
@@ -231,6 +232,37 @@ def test_memory_accept_and_undo_target_entry_ids(tmp_path: Path) -> None:
     assert restored.accepted_at is None
     assert restored.accepted_by is None
     assert undone.receipts[0].target_ids == (entry_id,)
+
+
+def test_resolve_and_expire_transition_active_entries(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    initial = registry._create_entry_memory_for_test(project_id, _schema())
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=initial.digest,
+        operations=(
+            AddOperation("state", "Open work", _source()),
+            AddOperation("state", "Temporary state", _source()),
+        ),
+        reconciliation_key=_key("two-active-entries"),
+    )
+    first_id, second_id = added.state.entries
+
+    transitioned = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=added.digest,
+        operations=(
+            ResolveOperation(first_id, _source(2)),
+            ExpireOperation(second_id, "validity window ended"),
+        ),
+        reconciliation_key=_key("two-transitions"),
+    )
+
+    first = transitioned.state.entries[first_id]
+    second = transitioned.state.entries[second_id]
+    assert isinstance(first, MemoryEntry) and first.status == "resolved"
+    assert isinstance(second, MemoryEntry) and second.status == "expired"
+    assert [receipt.type for receipt in transitioned.receipts] == ["resolve", "expire"]
 
 
 def test_reconciliation_key_deduplicates_entry_transaction(tmp_path: Path) -> None:
