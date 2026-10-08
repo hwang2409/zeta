@@ -101,7 +101,7 @@ class BlockingBackend:
 @pytest.mark.asyncio
 async def test_duplicate_send_starts_one_turn(tmp_path: Path) -> None:
     backend = BlockingBackend()
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -157,7 +157,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -225,7 +225,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
 @pytest.mark.asyncio
 async def test_server_restart_keeps_delivery_deduplication(tmp_path: Path) -> None:
     first_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
-    first_server = ZetaServer(
+    first_server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path, "-1"),
         backend_factory=lambda provider, model, home: (
@@ -254,7 +254,7 @@ async def test_server_restart_keeps_delivery_deduplication(tmp_path: Path) -> No
     await _close(first_server, writer)
 
     second_backend = FakeBackend([])
-    second_server = ZetaServer(
+    second_server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path, "-2"),
         backend_factory=lambda provider, model, home: (
@@ -291,7 +291,7 @@ async def test_server_restart_keeps_delivery_deduplication(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 async def test_delivery_status_unknown_and_feature_gate(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path))
+    server = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path))
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
@@ -307,7 +307,7 @@ async def test_delivery_status_unknown_and_feature_gate(tmp_path: Path) -> None:
     finally:
         await _close(server, writer)
 
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-status"))
+    server = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-status"))
     reader, writer = await _connect(server)
     try:
         await _request(
@@ -451,7 +451,7 @@ async def test_evicted_delivery_status_and_send_reuse_are_distinct(
     tmp_path: Path,
 ) -> None:
     backend = BlockingBackend()
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -505,7 +505,7 @@ async def test_evicted_delivery_status_and_send_reuse_are_distinct(
 async def test_evicted_dropped_steer_status_and_reuse_are_distinct(
     tmp_path: Path,
 ) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path))
+    server = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path))
     reader, writer = await _connect(server)
     try:
         await _request(
@@ -551,7 +551,7 @@ async def test_evicted_dropped_steer_status_and_reuse_are_distinct(
 
 @pytest.mark.asyncio
 async def test_restart_rebuilds_evicted_delivery_outcome(tmp_path: Path) -> None:
-    first = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-first"))
+    first = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-first"))
     reader, writer = await _connect(first)
     await _request(
         reader,
@@ -565,7 +565,7 @@ async def test_restart_rebuilds_evicted_delivery_outcome(tmp_path: Path) -> None
     _evict_delivery(first.runtime.opened.store, "restart-old")
     await _close(first, writer)
 
-    resumed = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-resumed"))
+    resumed = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-resumed"))
     reader, writer = await _connect(resumed)
     try:
         await _request(
@@ -607,7 +607,7 @@ def test_delivery_record_accepts_tagged_user_message_atomically(tmp_path: Path) 
 
 async def _queued_steer_server(tmp_path: Path, suffix: str):
     backend = BlockingBackend()
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path, suffix),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -724,7 +724,7 @@ async def test_tool_less_turn_end_marks_late_steering_dropped(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
-    first = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-restart-1"))
+    first = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-restart-1"))
     reader, writer = await _connect(first)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
     created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
@@ -737,7 +737,7 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
     )
     store.close()
 
-    resumed = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-restart-2"))
+    resumed = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-restart-2"))
     reader, writer = await _connect(resumed)
     try:
         await _request(
@@ -764,7 +764,7 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_orphan_steer_is_rejected_without_acceptance(tmp_path: Path) -> None:
-    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-orphan"))
+    server = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-orphan"))
     reader, writer = await _connect(server)
     try:
         await _request(
@@ -835,7 +835,7 @@ class _FailingActiveTurnBackend:
 @pytest.mark.asyncio
 async def test_failed_turn_drops_queued_steering_before_next_turn(tmp_path: Path) -> None:
     backend = _FailingActiveTurnBackend()
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path, "-failed"),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -885,7 +885,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path, "-dispatch"),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -941,7 +941,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
         release.set()
         await _close(server, writer)
 
-    resumed = ZetaServer(
+    resumed = ZetaServer(provider="codex", 
         home=crash_home,
         socket_path=_socket_path(tmp_path, "-restarted"),
         backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),

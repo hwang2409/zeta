@@ -414,7 +414,7 @@ async def test_server_streams_display_safe_thinking_body_without_metadata(
 async def test_unexpected_turn_error_matches_event_schema(tmp_path: Path) -> None:
     duplicate = ToolCall("duplicate-id", "read", {})
     backend = FakeBackend([ScriptedTurn(tool_calls=[duplicate, duplicate])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -442,7 +442,7 @@ async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
     target.write_text("approved")
     call = ToolCall("call-1", "read", {"path": str(target)})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -468,7 +468,7 @@ async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
 async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -492,7 +492,7 @@ async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> N
 async def test_client_close_emits_approval_end_once(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -516,7 +516,7 @@ async def test_client_close_emits_approval_end_once(tmp_path: Path) -> None:
 async def test_server_shutdown_emits_approval_end_once(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -554,7 +554,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -598,7 +598,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[agent]), ScriptedTurn(tool_calls=[child_call])]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -633,7 +633,7 @@ async def test_status_pending_delegated_identity_matches_event(tmp_path: Path) -
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[agent]), ScriptedTurn(tool_calls=[child_call])]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -658,7 +658,7 @@ async def test_status_pending_foreground_has_delegated_false_and_no_child_id(
 ) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -681,7 +681,7 @@ async def test_status_pending_foreground_has_delegated_false_and_no_child_id(
 async def test_decision_then_loop_end_emits_single_approval_end(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -721,7 +721,7 @@ async def test_lifecycle_prunes_ended_approvals(tmp_path: Path) -> None:
             )
         ]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -755,7 +755,7 @@ async def test_approval_and_steer_continue_the_same_turn(tmp_path: Path) -> None
     target.write_text("approved")
     call = ToolCall("call-1", "read", {"path": str(target)})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -800,7 +800,7 @@ async def test_approval_scope_always_tool_records_session_policy_and_skips_next_
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -849,7 +849,7 @@ async def test_approval_without_scope_keeps_legacy_shape(tmp_path: Path) -> None
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -882,7 +882,7 @@ async def test_approval_scope_rejects_invalid_values(tmp_path: Path) -> None:
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -966,7 +966,7 @@ async def test_resumed_approval_finishes_idle_after_terminal_event(tmp_path: Pat
 @pytest.mark.asyncio
 async def test_abort_mid_stream(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("first"), TextContent("second")], delay=0.2)])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -990,7 +990,7 @@ async def test_abort_captures_turn_before_approval_end_write(
 ) -> None:
     call = ToolCall("approval-race", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1043,7 +1043,7 @@ async def test_foreground_abort_only_ends_foreground_approval(
 ) -> None:
     call = ToolCall("foreground-approval", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1110,7 +1110,7 @@ async def test_foreground_abort_mid_stream_keeps_pending_steering(
     tmp_path: Path,
 ) -> None:
     backend = BlockingThenCaptureBackend()
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1155,7 +1155,7 @@ async def test_foreground_abort_mid_stream_keeps_pending_steering(
 @pytest.mark.asyncio
 async def test_clear_steering_returns_cleared_count(tmp_path: Path) -> None:
     backend = BlockingThenCaptureBackend()
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1213,7 +1213,7 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
         f"pathlib.Path({str(marker)!r}).write_text('done')\""
     )
     backend = BackgroundChildAndForegroundToolBackend(command)
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         cwd=tmp_path,
         socket_path=_socket_path(tmp_path),
@@ -1624,7 +1624,7 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
 ) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1644,7 +1644,7 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
 async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1675,7 +1675,7 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
 @pytest.mark.asyncio
 async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("first"), TextContent("second")], delay=0.2)])
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -1951,7 +1951,7 @@ async def test_parameterless_new_session_uses_server_defaults_after_override(
         )
         result = await _request(reader, writer, 4, "new_session")
         assert result[-1]["result"]["session"]["model"] == "server-default"
-        assert calls[-1] == ("fake", "server-default")
+        assert calls[-1] == ("codex", "server-default")
     finally:
         await _close(server, writer)
 
@@ -1973,7 +1973,7 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
             ScriptedTurn([TextContent("parent done")]),
         ]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -2065,7 +2065,7 @@ async def test_delegated_approval_stream_carries_captured_execution_facts(
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path / "home",
         cwd=repository,
         socket_path=_socket_path(tmp_path),
@@ -2117,7 +2117,7 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
             ScriptedTurn([TextContent("done")]),
         ]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
@@ -2246,6 +2246,7 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
 
     monkeypatch.setattr(tui_app, "build_backend", tui_backend)
     monkeypatch.setattr(server_runtime, "default_backend", serve_backend)
+    monkeypatch.delenv("ZETA_TEST_SCRIPTED_PROVIDER")
     tui = tui_app.create_app(build_parser().parse_args(["--provider", "codex"]))
     server = ZetaServer(home=home, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _connect(server)
@@ -2705,14 +2706,20 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
     async def rpc(method, **params):
         return (await _request(reader, writer, method, method, {"session_id": sid, **params}))[-1]
     try:
-        assert (await rpc("model_catalog"))["result"] == {"models": ["faster", "offline"]}
-        assert (await rpc("session_settings"))["result"] == {"model": "offline", "approval_mode": "ask"}
-        for model, mode in (("invalid", "ask"), ("offline", "invalid")):
+        catalog = (await rpc("model_catalog"))["result"]
+        assert catalog["providers"]["gpt-5.6-luna"] == "codex"
+        assert (await rpc("session_settings"))["result"] == {
+            "model": "gpt-5.6-luna",
+            "approval_mode": "ask",
+        }
+        for model, mode in (("invalid", "ask"), ("gpt-5.6-luna", "invalid")):
             assert (await rpc("set_settings", model=model, approval_mode=mode))["error"]["code"] == -32602
-        settings = {"model": "faster", "approval_mode": "deny"}
+        settings = {"model": "gpt-5.6-sol", "approval_mode": "deny"}
         assert (await rpc("set_settings", **settings))["result"] == settings
-        assert server.runtime.metadata.model_fallback is None
-        assert server.runtime.loop.backend.model == "faster"
+        assert server.runtime.metadata.model_fallback == (
+            "codex", "gpt-5.6-luna", 1_050_000
+        )
+        assert server.runtime.loop.backend.model == "gpt-5.6-sol"
         assert server.runtime.policy.default.value == "deny"
         await _request(reader, writer, "new", "new_session", {"provider": "codex"})
         assert (await rpc("set_settings", **settings))["error"]["code"] == -32003
@@ -2778,7 +2785,7 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
     from zeta.protocol.types import ImageContent
     from zeta.server.ergonomics import MAX_IMAGE_BYTES
     backend = FakeBackend([ScriptedTurn(content=[TextContent("seen")])])
-    server = ZetaServer(home=tmp_path, port=0, backend_factory=lambda provider, model, home: (backend, model or "offline"))
+    server = ZetaServer(provider="codex", home=tmp_path, port=0, backend_factory=lambda provider, model, home: (backend, model or "offline"))
     reader, writer, sid = await _ready_extensions(server)
     png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
     image = {"name": "test.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
@@ -2811,7 +2818,11 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
 async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, failure):
     from zeta.core.slash import MODEL_CONTEXT_WINDOWS
 
-    monkeypatch.setitem(MODEL_CONTEXT_WINDOWS, "fake", {"offline": 1_050_000, "faster": 400_000})
+    monkeypatch.setitem(
+        MODEL_CONTEXT_WINDOWS,
+        "codex",
+        {"gpt-5.6-luna": 1_050_000, "gpt-5.6-sol": 400_000},
+    )
     if pinned:
         (tmp_path / "settings.toml").write_text("token_budget = 123456\n")
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
@@ -2827,7 +2838,7 @@ async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, 
 
                 def fail_model(model):
                     original(model)
-                    if model == "faster":
+                    if model == "gpt-5.6-sol":
                         raise OSError("partial backend change")
 
                 patch.setattr(runtime.loop, "set_model", fail_model)
@@ -2842,17 +2853,17 @@ async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, 
 
                 patch.setattr(session_module.os, "replace", fail_metadata)
             response = (await _request(reader, writer, "settings", "set_settings", {
-                "session_id": sid, "model": "faster", "approval_mode": "deny",
+                "session_id": sid, "model": "gpt-5.6-sol", "approval_mode": "deny",
             }))[-1]
         if failure:
             assert response["error"]["code"] == -32000
             assert runtime.metadata.to_dict() == metadata_before
-            assert runtime.loop.backend.model == "offline"
+            assert runtime.loop.backend.model == "gpt-5.6-luna"
             assert runtime.loop.context_assembler.token_budget == old_budget
             assert runtime.policy.default.value == "ask"
             assert SessionManager(tmp_path).open(sid).metadata.to_dict() == metadata_before
         else:
-            assert response["result"] == {"model": "faster", "approval_mode": "deny"}
+            assert response["result"] == {"model": "gpt-5.6-sol", "approval_mode": "deny"}
             expected_budget = 123456 if pinned else 400_000
             assert runtime.loop.context_assembler.token_budget == expected_budget
             assert runtime.metadata.compaction_budget == expected_budget
@@ -3106,6 +3117,7 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, mo
     from zeta.providers.codex import CodexCredentialStore
 
     monkeypatch.delenv("ZETA_ALLOW_API_KEY", raising=False)
+    monkeypatch.delenv("ZETA_TEST_SCRIPTED_PROVIDER")
     monkeypatch.setattr(AnthropicCredentialStore, "bootstrap", lambda self: None)
     monkeypatch.setattr(CodexCredentialStore, "bootstrap", lambda self: None)
     source, source_model, model = ("claude", "claude-sonnet-4-6", "gpt-5.4") if target == "codex" else ("codex", "gpt-5.4", "claude-sonnet-4-6")
@@ -3140,48 +3152,38 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "server_provider, session_provider",
-    [
-        ("claude", "fake"),
-        ("codex", "fake"),
-        (None, "claude"),
-        ("fake", "claude"),
-        ("fake", "codex"),
-    ],
-)
-async def test_cross_mode_resume_rejected_without_session_mutation(
-    tmp_path, server_provider, session_provider
-):
+@pytest.mark.parametrize("server_provider", ["claude", "codex"])
+async def test_removed_provider_resume_is_rejected_without_session_mutation(
+    tmp_path: Path, server_provider: str
+) -> None:
     opened = SessionManager(tmp_path).create(
-        provider=session_provider,
-        model={"fake": "offline", "claude": "claude-sonnet-4-6", "codex": "gpt-5.4"}[
-            session_provider
-        ],
-        cwd=tmp_path,
+        provider="fake", model="offline", cwd=tmp_path
     )
-    # Rejection must not repair even a recoverable torn conversation tail.
     with opened.store.path.open("ab") as stream:
         stream.write(b'{"type":')
     before_files = {
-        p: p.read_bytes() for p in opened.store.session_dir.rglob("*") if p.is_file()
+        path: path.read_bytes()
+        for path in opened.store.session_dir.rglob("*")
+        if path.is_file()
     }
-    builds = []
+    builds: list[str] = []
 
-    def build(provider, model, home):
+    def build(provider: str, model: str | None, _home: Path):
         builds.append(provider)
-        return FakeBackend(
-            [ScriptedTurn([TextContent("still here")])]
-        ), model or "default"
+        return FakeBackend([ScriptedTurn([TextContent("still here")])]), (
+            model or "gpt-5.6-luna"
+        )
 
     server = ZetaServer(
-        home=tmp_path, port=0, provider=server_provider, backend_factory=build
+        home=tmp_path,
+        port=0,
+        provider=server_provider,
+        backend_factory=build,
     )
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
-        # Reject both before and after an active session exists.
-        for request_id in [2, 4]:
+        for request_id in (2, 4):
             state = server.runtime.state
             before_builds = list(builds)
             response = (
@@ -3195,13 +3197,13 @@ async def test_cross_mode_resume_rejected_without_session_mutation(
             )[-1]
             assert response["error"] == {
                 "code": -32602,
-                "message": "session uses the offline test provider; open it with --provider codex"
-                if session_provider == "codex"
-                else f"session uses a real provider; open it with --provider {session_provider}",
+                "message": "the fake provider was removed; choose claude, codex or ollama",
             }
             assert server.runtime.state is state
             assert builds == before_builds
-            assert {p: p.read_bytes() for p in before_files} == before_files
+            assert {
+                path: path.read_bytes() for path in before_files
+            } == before_files
             if state is None:
                 await _request(reader, writer, 3, "new_session")
         assert (await _request(reader, writer, 5, "send", {"text": "still here"}))[-1][
@@ -3213,109 +3215,120 @@ async def test_cross_mode_resume_rejected_without_session_mutation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("server_provider", ["claude", "codex", None, "fake"])
-async def test_session_listing_isolates_fake_provider(tmp_path, server_provider):
+@pytest.mark.parametrize("server_provider", ["claude", "codex"])
+async def test_session_listing_includes_real_and_removed_provider_sessions(
+    tmp_path: Path, server_provider: str
+) -> None:
     manager = SessionManager(tmp_path)
     sessions = {
-        p: manager.create(provider=p, model=m, cwd=tmp_path).metadata.session_id
-        for p, m in [
+        provider: manager.create(provider=provider, model=model, cwd=tmp_path).metadata.session_id
+        for provider, model in (
             ("fake", "offline"),
             ("claude", "claude-sonnet-4-6"),
             ("codex", "gpt-5.4"),
-        ]
+        )
     }
     server = ZetaServer(
         home=tmp_path,
         port=0,
         provider=server_provider,
-        backend_factory=lambda p, m, h: (FakeBackend([]), m),
+        backend_factory=lambda _provider, model, _home: (
+            FakeBackend([]),
+            model or "gpt-5.6-luna",
+        ),
     )
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         response = (await _request(reader, writer, 2, "list_sessions"))[-1]["result"]
-        expected = {
-            sid
-            for provider, sid in sessions.items()
-            if (provider == "codex") == (server_provider in (None, "fake"))
-        }
-        assert {s["session_id"] for s in response["sessions"]} == expected
-        for sid in expected:
-            response = (
-                await _request(reader, writer, 3, "resume", {"session_id": sid})
+        assert {row["session_id"] for row in response["sessions"]} == set(
+            sessions.values()
+        )
+        rejected = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "resume",
+                {"session_id": sessions["fake"]},
+            )
+        )[-1]
+        assert rejected["error"]["message"] == (
+            "the fake provider was removed; choose claude, codex or ollama"
+        )
+        for request_id, provider in enumerate(("claude", "codex"), start=4):
+            resumed = (
+                await _request(
+                    reader,
+                    writer,
+                    request_id,
+                    "resume",
+                    {"session_id": sessions[provider]},
+                )
             )[-1]
-            assert response["result"]["session"]["session_id"] == sid
+            assert resumed["result"]["session"]["session_id"] == sessions[provider]
     finally:
         await _close(server, writer)
 
 
-@pytest.mark.parametrize("settings_provider", [None, "claude"])
-def test_plain_serve_uses_effective_provider_mode(
-    tmp_path, monkeypatch, settings_provider
-):
+@pytest.mark.parametrize(
+    ("settings_text", "expected_provider"),
+    [
+        ('model = "gpt-5.6-luna"\n', "codex"),
+        ('provider = "claude"\n', "claude"),
+    ],
+)
+def test_plain_serve_resolves_provider_from_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings_text: str,
+    expected_provider: str,
+) -> None:
     from zeta import server as server_module
     from zeta.cli.main import main as cli_main
     from zeta.models.catalog import PROVIDER_MODELS, known_model_names
 
     home = tmp_path / "home"
     home.mkdir()
+    (home / "settings.toml").write_text(settings_text)
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    if settings_provider is not None:
-        (home / "settings.toml").write_text(f'provider = "{settings_provider}"\n')
-    expected_provider = settings_provider or "fake"
-    foreign_provider = "claude" if expected_provider == "codex" else "fake"
-    foreign = (
-        SessionManager(home)
-        .create(
-            provider=foreign_provider,
-            model="claude-sonnet-4-6" if foreign_provider == "claude" else "offline",
-            cwd=tmp_path,
-        )
-        .metadata.session_id
-    )
+    legacy = SessionManager(home).create(
+        provider="fake", model="offline", cwd=tmp_path
+    ).metadata.session_id
 
-    async def check_server(server):
-        # Exercise the CLI-created server over a real socket, with no provider flag.
+    async def check_server(server: ZetaServer) -> None:
         server.socket_path = _socket_path(tmp_path)
-        if settings_provider is not None:
-            server.runtime.backend_factory = lambda p, m, h: (
-                FakeBackend([]),
-                m or "claude-sonnet-4-6",
-            )
+        server.runtime.backend_factory = lambda _provider, model, _home: (
+            FakeBackend([]),
+            model or "claude-sonnet-4-6",
+        )
         reader, writer = await _connect(server)
         try:
-            launch_provider = server.runtime.provider
             await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
-            created = (await _request(reader, writer, 2, "new_session"))[-1]["result"][
-                "session"
-            ]
+            created = (await _request(reader, writer, 2, "new_session"))[-1]["result"]["session"]
             assert created["provider"] == expected_provider
             sid = created["session_id"]
             catalog = (
                 await _request(reader, writer, 3, "model_catalog", {"session_id": sid})
             )[-1]["result"]
-            if expected_provider == "codex":
-                assert catalog == {"models": ["faster", "offline"]}
-            else:
-                assert catalog == {
-                    "models": known_model_names(),
-                    "providers": {
-                        m: p for p, models in PROVIDER_MODELS.items() for m in models
-                    },
-                }
+            assert catalog == {
+                "models": known_model_names(),
+                "providers": {
+                    model: provider
+                    for provider, models in PROVIDER_MODELS.items()
+                    for model in models
+                },
+            }
             listed = (await _request(reader, writer, 4, "list_sessions"))[-1]["result"]
-            assert {s["session_id"] for s in listed["sessions"]} == {sid}
+            assert {row["session_id"] for row in listed["sessions"]} == {sid, legacy}
             rejected = (
-                await _request(reader, writer, 5, "resume", {"session_id": foreign})
+                await _request(reader, writer, 5, "resume", {"session_id": legacy})
             )[-1]
-            assert rejected["error"]["code"] == -32602
+            assert rejected["error"]["message"] == (
+                "the fake provider was removed; choose claude, codex or ollama"
+            )
             assert server.runtime.session_id == sid
-            resumed = (
-                await _request(reader, writer, 6, "resume", {"session_id": sid})
-            )[-1]
-            assert resumed["result"]["session"]["session_id"] == sid
-            assert launch_provider == expected_provider
         finally:
             await _close(server, writer)
 
@@ -4195,9 +4208,9 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         assert result == {"kind": "client_only", "name": "model"}
 
         # /model switching applies through the shared settings path.
-        result = (await run("/model faster"))["result"]
-        assert result == {"kind": "output", "text": "model: faster"}
-        assert server.runtime.model == "faster"
+        result = (await run("/model gpt-5.6-sol"))["result"]
+        assert result == {"kind": "output", "text": "model: gpt-5.6-sol"}
+        assert server.runtime.model == "gpt-5.6-sol"
 
         result = (await run("/vim off"))["result"]
         assert result == {"kind": "output", "text": "vim mode: off"}
@@ -4325,7 +4338,7 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
         # `/compact` mutates the context store — must reject.
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
-        assert (await run(5, "/model faster"))["error"]["code"] == -32004
+        assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
         # `/model` with no args is read-only — must still hand off to the
         # client's picker (never the mutation guard).
         assert (await run(6, "/model"))["result"] == {
@@ -4399,7 +4412,7 @@ async def test_server_approval_carries_trusted_project_display(tmp_path: Path) -
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
     )
-    server = ZetaServer(
+    server = ZetaServer(provider="codex", 
         home=home,
         cwd=repository,
         socket_path=_socket_path(tmp_path),
@@ -4573,7 +4586,7 @@ def test_serve_yolo_sets_allow_default(tmp_path: Path, monkeypatch) -> None:
         assert server.runtime._config(None, None).yolo is True
 
     monkeypatch.setattr(server_module, "run_server", check_server)
-    assert cli_main(["--yolo", "serve"]) == 0
+    assert cli_main(["--provider", "codex", "--yolo", "serve"]) == 0
 
 
 def test_serve_no_yolo_overrides_settings(tmp_path: Path, monkeypatch) -> None:
@@ -4587,7 +4600,7 @@ def test_serve_no_yolo_overrides_settings(tmp_path: Path, monkeypatch) -> None:
         assert server.runtime._config(None, None).yolo is False
 
     monkeypatch.setattr(server_module, "run_server", check_server)
-    assert cli_main(["--no-yolo", "serve"]) == 0
+    assert cli_main(["--provider", "codex", "--no-yolo", "serve"]) == 0
 
 
 @pytest.mark.asyncio

@@ -65,8 +65,8 @@ async def connect(tmp_path, provider="claude", version="1.1"):
     return server, reader, writer, hello["result"]
 
 
-@pytest.mark.parametrize("server_provider,version", [("fake", "1.1"), ("claude", "1.0")])
-async def test_login_is_hidden_and_rejected_for_fake_and_legacy(tmp_path, server_provider, version):
+@pytest.mark.parametrize("server_provider,version", [("claude", "1.0")])
+async def test_login_is_hidden_and_rejected_for_legacy_protocol(tmp_path, server_provider, version):
     server, reader, writer, hello = await connect(tmp_path, server_provider, version)
     try:
         assert not set(REQUESTS) & set(hello["capabilities"]["requests"])
