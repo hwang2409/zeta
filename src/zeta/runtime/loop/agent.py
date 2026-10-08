@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
-import warnings
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -101,6 +101,7 @@ from ._completion import (
     assistant_reset_event,
     can_retry_context,
     close_completion,
+    provider_events,
     provider_retry_notice,
     start_provider_attempt,
     task_is_cancelling,
@@ -341,7 +342,7 @@ class AgentLoop(
         self,
         *,
         foreground_only: bool = False,
-        steering_drop_reason: Literal["abort", "disconnect"] = "abort",
+        steering_drop_reason: Literal["abort", "disconnect"] | None = "abort",
     ) -> None:
         """Signal active tools; optionally preserve background work and steering."""
         self.tool_registry.abort()
@@ -349,8 +350,8 @@ class AgentLoop(
             self.notification_wake.retry_after_foreground_abort()
         else:
             self._background_owner.cancel_all()
-            self.store.drop_client_steering(steering_drop_reason)
-
+            if steering_drop_reason is not None:
+                self.store.drop_client_steering(steering_drop_reason)
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
         The running ``_run_turn`` drains this queue before the next provider
@@ -365,6 +366,12 @@ class AgentLoop(
     def clear_pending_steering(
         self,
         reason: Literal["clear", "turn_end"] = "clear",
+    ) -> int:
+        return self.store.drop_client_steering(reason)
+
+    def drop_pending_steering(
+        self,
+        reason: Literal["abort", "disconnect", "turn_end", "failed"],
     ) -> int:
         return self.store.drop_client_steering(reason)
     def set_background_event_sink(
@@ -858,10 +865,6 @@ class AgentLoop(
                 nudge_turn_pending = False
                 self._turn_stop_reason = None
                 self._turn_output_tokens = None
-                while self.store.has_pending_client_steering:
-                    await self.store.deliver_next_client_steering(
-                        self._append_turn_message
-                    )
                 async for event in self.drain_notification_batch():
                     yield event
                 self.tool_registry.start_batch()
@@ -879,6 +882,7 @@ class AgentLoop(
             provider_error_data: dict[str, Any] = {}
             provider_retry_usage: dict[str, Any] | None = None
             attempt_state = ProviderAttemptState()
+            provider_reset_pending = False
             try:
                 if retrying_context or self.context_assembler.needs_compaction():
                     yield StreamEvent(
@@ -912,13 +916,19 @@ class AgentLoop(
                     if self._cache_trace is not None
                     else None
                 )
+                steering = self.store.pending_client_steering()
+                if steering is not None:
+                    context_messages.extend(steering.messages)
                 provider_retry_budget = start_provider_attempt(provider_retry_budget)
                 self._turn_provider_retry_records = provider_retry_budget.records
                 completion = apply_retry_budget(
                     self.backend.complete(context_messages, active_tools),
                     provider_retry_budget,
                 )
-                async for event in completion:
+                on_started = None if steering is None else partial(
+                    self.store.deliver_client_steering, steering
+                )
+                async for event in provider_events(completion, on_started):
                     attempt_state.observe(event)
                     self.context_assembler.observe_event(event)
                     if cache_trace is not None:
@@ -936,12 +946,15 @@ class AgentLoop(
                         provider_error_source = event.error or provider_error
                         provider_error_data = dict(event.data)
                         break
+                    if event.type is StreamEventType.RETRY:
+                        provider_reset_pending = True
                     if (
                         event.type is StreamEventType.ASSISTANT_RESET
                         and not completion_succeeded
                     ):
                         partial_blocks = []
                         assistant_message = None
+                        provider_reset_pending = False
                     if event.type is StreamEventType.MESSAGE_UPDATE:
                         if event.content is not None:
                             partial_blocks.append(event.content)
@@ -973,11 +986,17 @@ class AgentLoop(
                     )
             except asyncio.CancelledError:
                 await close_completion(completion)
-                self._persist_partial_for_control(partial_blocks, assistant_message)
+                self._persist_partial_for_control(
+                    [] if provider_reset_pending else partial_blocks,
+                    None if provider_reset_pending else assistant_message,
+                )
                 raise
             except GeneratorExit:
                 await close_completion(completion)
-                self._persist_partial_for_control(partial_blocks, assistant_message)
+                self._persist_partial_for_control(
+                    [] if provider_reset_pending else partial_blocks,
+                    None if provider_reset_pending else assistant_message,
+                )
                 raise
             except Exception as exc:
                 await close_completion(completion)
@@ -1211,25 +1230,6 @@ class AgentLoop(
             metadata=metadata,
         )
         self.store.append_message(durable_message(assistant_message))
-
-    def _persist_partial_for_control(
-        self,
-        partial_blocks: list[ContentBlock],
-        assistant_message: Message | None,
-    ) -> None:
-        try:
-            self._persist_partial_with_cancelled_tools(
-                partial_blocks, assistant_message
-            )
-        except Exception as exc:  # noqa: BLE001 - warn when persistence fails
-            try:
-                warnings.warn(
-                    f"failed to persist partial state: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            except BaseException:  # noqa: BLE001, S110 - warning failure is ignored
-                pass
 
     def _persist_partial_with_cancelled_tools(
         self,

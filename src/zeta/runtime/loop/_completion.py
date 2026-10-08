@@ -8,7 +8,7 @@ state or dispatched a tool.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,6 +30,51 @@ from ...providers.retry_policy import (
 )
 
 MAX_ERROR_MESSAGE = 400
+
+
+async def provider_events(
+    completion: AsyncIterator[StreamEvent],
+    on_started: Callable[[], Awaitable[None]] | None = None,
+) -> AsyncIterator[StreamEvent]:
+    """Preserve stream ordering while exposing the provider-start seam."""
+
+    finished = object()
+    events: asyncio.Queue[StreamEvent | object] = asyncio.Queue(maxsize=1)
+    consumed = asyncio.Event()
+    started = asyncio.Event()
+
+    async def produce() -> None:
+        started.set()
+        try:
+            async for event in completion:
+                await events.put(event)
+                await consumed.wait()
+                consumed.clear()
+        finally:
+            task = asyncio.current_task()
+            if task is None or not task.cancelling():
+                await events.put(finished)
+
+    producer = asyncio.create_task(produce())
+    try:
+        await started.wait()
+        if producer.done() and not producer.cancelled():
+            error = producer.exception()
+            if error is not None:
+                raise error
+        if on_started is not None:
+            await on_started()
+        while (event := await events.get()) is not finished:
+            assert isinstance(event, StreamEvent)
+            try:
+                yield event
+            finally:
+                consumed.set()
+        await producer
+    finally:
+        if not producer.done():
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
 
 
 def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:

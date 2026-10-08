@@ -1271,7 +1271,55 @@ def test_transcript_chunk_skips_delivery_rows_but_advances_offset(tmp_path: Path
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
     )
 
-    projected, end_offset, _tokens = runner._transcript_chunk(1, 2)
+    projected, end_offset, _tokens, scanned_end = runner._transcript_chunk(1, 2)
 
     assert [row["seq"] for row in projected] == [2]
     assert end_offset == path.stat().st_size
+    assert scanned_end == 2
+
+
+@pytest.mark.asyncio
+async def test_delivery_only_range_advances_cursor_without_provider(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(prompt)
+
+    runner, registry, project_id, _ = _runner(tmp_path, invoke, transcript_count=0)
+    path = runner.session_dir / "conversation.jsonl"
+    row = {
+        "seq": 1,
+        "type": "client_delivery",
+        "data": {
+            "delivery_id": "private-id",
+            "method": "steer",
+            "status": "queued",
+            "outcome": {"accepted": True},
+        },
+    }
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    position = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert calls == 0
+    assert position["seq"] == 1
+    assert position["transcript_bytes"] == path.stat().st_size
+    assert position["transcript_tokens"] > 0
+
+    replacement = AutoMemoryReconciler(
+        registry=registry,
+        project_id=project_id,
+        session_id=SESSION,
+        session_dir=runner.session_dir,
+        invoke=invoke,
+        config=runner.config,
+    )
+    assert replacement.last_reconciled_seq == 1
+    replacement.activity(1)
+    await replacement.drain()
+    assert calls == 0
+    await runner.close()
+    await replacement.close()

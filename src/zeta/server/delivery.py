@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from ..core.store._client_delivery import (
@@ -20,7 +21,17 @@ from ..protocol.types import (
 from .protocol import ProtocolError
 
 if TYPE_CHECKING:
+    from .runtime import SessionState
     from .server import _Client
+
+
+class TurnOutcome(StrEnum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+    FOREGROUND_CANCELED = "foreground-canceled"
+    SESSION_CANCELED = "session-canceled"
+    DISCONNECTED = "disconnected"
+
 
 class DeliveryRequests:
     """Own feature gating, persistence, deduplication, and status queries."""
@@ -119,6 +130,39 @@ class DeliveryRequests:
             on_persisted=lambda: loop.steer(tagged),
         )
         return outcome
+
+    def finalize_turn(
+        self,
+        session_id: str,
+        state: SessionState,
+        outcome: TurnOutcome,
+        *,
+        schedule_wake: bool,
+    ) -> None:
+        """Apply all lifecycle effects for one explicit terminal outcome."""
+
+        client = self._client
+        reason = {
+            TurnOutcome.COMPLETED: "turn_end",
+            TurnOutcome.FAILED: "failed",
+            TurnOutcome.SESSION_CANCELED: "abort",
+            TurnOutcome.DISCONNECTED: "disconnect",
+        }.get(outcome)
+        if reason is not None:
+            state.loop.drop_pending_steering(reason)
+        client._approvals.prune_ended()
+        if client.server.runtime.state is state:
+            state.turn_finished()
+        if client._turn_task is asyncio.current_task():
+            client._turn_task = None
+            client._turn_cancel_outcome = None
+        if (
+            schedule_wake
+            and outcome is TurnOutcome.COMPLETED
+            and client.server.runtime.state is state
+            and state.loop.notification_system_message() is not None
+        ):
+            client._schedule_background_wake(session_id)
 
     def status(self, params: dict[str, Any]) -> dict[str, object]:
         client = self._client

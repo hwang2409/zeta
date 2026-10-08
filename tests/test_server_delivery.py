@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ import pytest
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
+    ErrorInfo,
     Message,
     MessageOrigin,
     MessageRole,
@@ -618,3 +620,166 @@ def test_delivery_lookup_does_not_read_log_after_load(tmp_path: Path) -> None:
     store._entries = UnreadableEntries(store._entries)
     assert store.client_delivery("indexed").status == "queued"
     store.close()
+
+
+class _FailingActiveTurnBackend:
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def complete(self, messages, tool_schemas):
+        del tool_schemas
+        self.calls.append(list(messages))
+        if len(self.calls) == 1:
+            self.started.set()
+            await self.release.wait()
+            yield StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo("backend_error", "failed"),
+            )
+            return
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_drops_queued_steering_before_next_turn(tmp_path: Path) -> None:
+    backend = _FailingActiveTurnBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path, "-failed"),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader, writer, 1, "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await asyncio.wait_for(backend.started.wait(), TIMEOUT)
+        await _request(
+            reader, writer, 4, "steer",
+            {"text": "stale", "delivery_id": "failed-steer"},
+        )
+        backend.release.set()
+        await _event(reader, "agent_end")
+        delivery = server.runtime.opened.store.client_delivery("failed-steer")
+        assert delivery.status == "dropped"
+        assert delivery.reason == "failed"
+        assert not server.runtime.loop.has_pending_steering
+
+        await _request(reader, writer, 5, "send", {"text": "next"})
+        await _event(reader, "agent_end")
+        assert not any(
+            isinstance(block, TextContent) and block.text == "stale"
+            for message in backend.calls[-1]
+            for block in message.content
+        )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("read-1", "read", {"path": str(target)})]
+            ),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path, "-dispatch"),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    release = asyncio.Event()
+    crash_home = tmp_path.parent / f"{tmp_path.name}-crash"
+    session_id = ""
+    try:
+        await _request(
+            reader, writer, 1, "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        created = await _request(
+            reader, writer, 2, "new_session", {"provider": "fake"}
+        )
+        session_id = created[-1]["result"]["session"]["session_id"]
+        original = server.runtime.loop.context_assembler.assemble
+        entered = asyncio.Event()
+        calls = 0
+
+        async def blocked_assemble(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                entered.set()
+                await release.wait()
+            return await original(*args, **kwargs)
+
+        server.runtime.loop.context_assembler.assemble = blocked_assemble
+        await _request(reader, writer, 3, "send", {"text": "read"})
+        await _event(reader, "approval_request")
+        await _request(
+            reader, writer, 4, "steer",
+            {"text": "later", "delivery_id": "dispatch-steer"},
+        )
+        await _request(reader, writer, 5, "deny", {"request_id": "read-1"})
+        await asyncio.wait_for(entered.wait(), TIMEOUT)
+
+        delivery = server.runtime.opened.store.client_delivery("dispatch-steer")
+        assert delivery.status == "queued"
+        assert len(backend.calls) == 1
+        shutil.copytree(tmp_path, crash_home)
+
+        release.set()
+        for _ in range(100):
+            delivery = server.runtime.opened.store.client_delivery("dispatch-steer")
+            if len(backend.calls) == 2 and delivery.status == "delivered":
+                break
+            await asyncio.sleep(0)
+        assert len(backend.calls) == 2
+        assert delivery.status == "delivered"
+    finally:
+        release.set()
+        await _close(server, writer)
+
+    resumed = ZetaServer(
+        home=crash_home,
+        socket_path=_socket_path(tmp_path, "-restarted"),
+        backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
+    )
+    reader, writer = await _connect(resumed)
+    try:
+        await _request(
+            reader, writer, 6, "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 7, "resume", {"session_id": session_id})
+        status = await _request(
+            reader, writer, 8, "delivery_status",
+            {"delivery_id": "dispatch-steer"},
+        )
+        assert status[-1]["result"]["status"] == "dropped"
+        delivery = resumed.runtime.opened.store.client_delivery("dispatch-steer")
+        assert delivery.reason == "restart"
+        assert all(
+            not any(
+                isinstance(block, TextContent) and block.text == "later"
+                for block in message.content
+            )
+            for message in resumed.runtime.opened.store.messages()
+        )
+    finally:
+        await _close(resumed, writer)

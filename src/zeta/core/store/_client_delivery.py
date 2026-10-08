@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import OrderedDict, deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, TypeGuard
 
@@ -20,7 +20,7 @@ DELIVERY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 DeliveryMethod = Literal["send", "steer"]
 DeliveryStatus = Literal["queued", "delivered", "dropped"]
-DeliveryDropReason = Literal["restart", "abort", "clear", "disconnect", "turn_end"]
+DeliveryDropReason = Literal["restart", "abort", "clear", "disconnect", "turn_end", "failed"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +36,19 @@ class ClientDelivery:
 class _QueuedSteering:
     message: Message
     delivery_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ClientSteeringBatch:
+    """One immutable provider-request snapshot of queued steering."""
+
+    _queued: tuple[_QueuedSteering, ...]
+
+    @property
+    def messages(self) -> tuple[Message, ...]:
+        return tuple(
+            without_client_delivery_marker(item.message) for item in self._queued
+        )
 
 
 def valid_client_delivery_id(value: object) -> TypeGuard[str]:
@@ -75,7 +88,7 @@ def validate_client_delivery_data(
             (status == "delivered" and reason is None and set(data) == {"delivery_id", "method", "status"})
             or (
                 status == "dropped"
-                and reason in {"restart", "abort", "clear", "disconnect", "turn_end"}
+                and reason in {"restart", "abort", "clear", "disconnect", "turn_end", "failed"}
                 and set(data) == {"delivery_id", "method", "status", "reason"}
             )
         )
@@ -232,35 +245,52 @@ class ClientDeliveryMixin:
     def has_pending_client_steering(self: ConversationStore) -> bool:
         return bool(self._client_steering)
 
-    async def deliver_next_client_steering(
-        self: ConversationStore,
-        append_message: Callable[[Message], Awaitable[object]],
+    def pending_client_steering(self: ConversationStore) -> ClientSteeringBatch | None:
+        """Snapshot steering to include in one provider request."""
+
+        if not self._client_steering:
+            return None
+        return ClientSteeringBatch(tuple(self._client_steering))
+
+    async def deliver_client_steering(
+        self: ConversationStore, batch: ClientSteeringBatch
     ) -> None:
-        queued = self._client_steering[0]
-        if queued.delivery_id is None:
-            await append_message(queued.message)
-        else:
-            await self._to_thread_durable(
-                self._deliver_client_steering,
-                queued.delivery_id,
-                queued.message,
-            )
-        self._client_steering.popleft()
+        """Publish a dispatched steering batch as one durable append."""
+
+        await self._to_thread_durable(self._deliver_client_steering, batch)
+        for expected in batch._queued:
+            if not self._client_steering or self._client_steering[0] != expected:
+                raise RuntimeError("client steering queue changed during delivery")
+            self._client_steering.popleft()
 
     def _deliver_client_steering(
-        self: ConversationStore, delivery_id: str, message: Message
+        self: ConversationStore, batch: ClientSteeringBatch
     ) -> None:
         with self._append_lock():
             self._load()
-            delivery = self.client_delivery(delivery_id)
-            if delivery is None or delivery.status != "queued":
-                raise ValueError(f"client delivery is not queued: {delivery_id}")
-            self._append_many_unlocked(
-                [
-                    ("message", {"message": tag_client_delivery(message, delivery_id).to_dict()}),
-                    _transition_row(delivery_id, "delivered"),
-                ]
-            )
+            rows: list[tuple[str, dict[str, object]]] = []
+            for queued in batch._queued:
+                delivery_id = queued.delivery_id
+                if delivery_id is not None:
+                    delivery = self.client_delivery(delivery_id)
+                    if delivery is None or delivery.status != "queued":
+                        raise ValueError(f"client delivery is not queued: {delivery_id}")
+                rows.append(
+                    (
+                        "message",
+                        {
+                            "message": (
+                                tag_client_delivery(queued.message, delivery_id)
+                                if delivery_id is not None
+                                else queued.message
+                            ).to_dict()
+                        },
+                    )
+                )
+                if delivery_id is not None:
+                    rows.append(_transition_row(delivery_id, "delivered"))
+            if rows:
+                self._append_many_unlocked(rows)
 
     def drop_client_steering(self: ConversationStore, reason: DeliveryDropReason) -> int:
         """Durably drop every queued delivery before releasing queue ownership."""
