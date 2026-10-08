@@ -130,6 +130,11 @@ class ClientDeliveryMixin:
     def recover_client_deliveries(self: ConversationStore) -> int:
         """Mark accepted steering with no live owner as dropped after restart."""
 
+        if not any(
+            delivery.method == "steer" and delivery.status == "queued"
+            for delivery in self._client_deliveries.values()
+        ):
+            return 0
         with self._append_lock():
             self._load()
             ids = [
