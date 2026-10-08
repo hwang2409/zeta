@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..context_eviction import estimated_text_tokens
+from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import ProjectRegistry, ProjectRegistryError
 from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
 from .reconciler import (
@@ -48,6 +49,12 @@ _MAX_TRANSCRIPT_CHUNK_BYTES = 96 * 1024
 _MAX_REQUEST_BYTES = 64 * 1024
 _REPAIR_PROMPT_BYTES = 1024
 _MAX_FAILURE_LOG_BYTES = 64 * 1024
+
+
+def _failure_summary(error: Exception) -> str:
+    if isinstance(error, (ReconciliationError, UnsupportedMemoryFormatError)):
+        return str(error)
+    return type(error).__name__
 
 
 class _ConcurrentMemoryUpdate(Exception):
@@ -343,11 +350,7 @@ class AutoMemoryReconciler:
                         self.state.record_failure,
                         seq_start=item.start,
                         seq_end=item.end,
-                        validation_summary=(
-                            str(exc)
-                            if isinstance(exc, ReconciliationError)
-                            else type(exc).__name__
-                        ),
+                        validation_summary=_failure_summary(exc),
                         reason="+".join(sorted(item.reasons)),
                         usage={},
                         retry_backoff_seconds=self.config.retry_backoff_seconds,
@@ -493,11 +496,7 @@ class AutoMemoryReconciler:
                 raise _ConcurrentMemoryUpdate
 
             if failure is not None:
-                summary = (
-                    str(failure)
-                    if isinstance(failure, ReconciliationError)
-                    else type(failure).__name__
-                )
+                summary = _failure_summary(failure)
                 if item.key is not None:
                     retry_outcomes.append(
                         ReconciliationOutcome(
