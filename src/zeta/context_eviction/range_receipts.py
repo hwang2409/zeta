@@ -31,11 +31,13 @@ def range_receipt_candidate(
     records: Sequence[tuple[int, Message]],
     *,
     allows: Callable[[int], bool],
+    is_smaller: Callable[[Sequence[Message], Sequence[Message]], bool],
 ) -> RangeCandidate:
-    """Coalesce maximal runs, while existing ranges permanently break later runs.
+    """Coalesce smaller maximal runs; existing ranges permanently break runs.
 
     A provider tool call and all its receipted results are one unit. This removes
     the complete exchange or leaves it intact, so no provider sees an orphan.
+    Each run is accepted separately through the caller's shared size policy.
     """
 
     output: list[tuple[int, Message]] = []
@@ -44,14 +46,17 @@ def range_receipt_candidate(
     index = 0
 
     def flush() -> None:
-        if len(run) < 2:
-            for unit in run:
-                output.extend(unit.records)
-        else:
-            flattened = [record for unit in run for record in unit.records]
+        flattened = [record for unit in run for record in unit.records]
+        if len(run) >= 2:
             start, end = flattened[0][0], flattened[-1][0]
-            output.append((start, _range_receipt(start, end, run)))
-            coalesced.update(seq for seq, _ in flattened)
+            receipt = _range_receipt(start, end, run)
+            if is_smaller([message for _, message in flattened], [receipt]):
+                output.append((start, receipt))
+                coalesced.update(seq for seq, _ in flattened)
+            else:
+                output.extend(flattened)
+        else:
+            output.extend(flattened)
         run.clear()
 
     while index < len(records):

@@ -121,11 +121,29 @@ def test_range_receipt_keeps_provider_payload_valid() -> None:
         *_tool_receipt_pair(1, "read", "read-1"),
         *_tool_receipt_pair(3, "read", "read-2"),
         *_tool_receipt_pair(5, "search", "search-1"),
+        *_tool_receipt_pair(7, "search", "protected-1"),
     ]
 
-    messages = evict_messages(records, fixed_tokens=0, target_tokens=1).messages
+    messages = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        unconsumed_source_seqs={8},
+    ).messages
 
-    assert len(messages) == 1
+    assert len(messages) == 3
+    call_ids = {
+        block.tool_call.id
+        for message in messages
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    }
+    result_ids = {
+        message.tool_result.tool_call_id
+        for message in messages
+        if message.tool_result is not None
+    }
+    assert call_ids == result_ids == {"protected-1"}
     assert build_messages_payload(
         messages, [], model="claude-test", max_tokens=2048, thinking_budget=1024
     )["messages"]
@@ -232,3 +250,33 @@ def test_all_eviction_candidates_use_supplied_counter() -> None:
     ]
     assert evicted.tokens_before == evicted.tokens_after == 4
     assert evicted.items_evicted == 0
+
+    user = Message(MessageRole.USER, [TextContent("break the receipt runs")])
+    receipted_records = [
+        (1, _assistant_receipt(1)),
+        (2, _assistant_receipt(2)),
+        (3, user),
+        (4, _assistant_receipt(4)),
+        (5, _assistant_receipt(5)),
+    ]
+
+    def range_adversarial_counter(message: Message) -> int:
+        if message.metadata.get("eviction_range"):
+            return 1 if message.metadata["source_seq"] == 1 else 100
+        return 100 if message.metadata.get("source_seq", 99) <= 2 else 2
+
+    range_evicted = evict_messages(
+        receipted_records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=range_adversarial_counter,
+    )
+
+    assert len(range_evicted.messages) == 4
+    assert range_evicted.messages[0].metadata.get("eviction_range") is True
+    assert [message.to_dict() for message in range_evicted.messages[-2:]] == [
+        message.to_dict() for _, message in receipted_records[-2:]
+    ]
+    assert range_evicted.tokens_before == 206
+    assert range_evicted.tokens_after == 7
+    assert range_evicted.items_evicted == 2

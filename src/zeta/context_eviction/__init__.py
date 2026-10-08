@@ -133,12 +133,14 @@ def evict_messages(
     before = fixed_tokens + sum(token_counter(message) for message in messages)
     eligibility = _eviction_eligibility(records, unconsumed_source_seqs)
     changed: set[int] = set()
-    range_candidate = range_receipt_candidate(records, allows=eligibility.allows)
-    if range_candidate.coalesced_source_seqs and _strictly_smaller(
-        token_counter,
-        messages,
-        [message for _, message in range_candidate.records],
-    ):
+    range_candidate = range_receipt_candidate(
+        records,
+        allows=eligibility.allows,
+        is_smaller=lambda originals, candidates: _strictly_smaller(
+            sum(map(token_counter, originals)), sum(map(token_counter, candidates))
+        ),
+    )
+    if range_candidate.coalesced_source_seqs:
         records = range_candidate.records
         messages = [message for _, message in records]
         changed.update(range_candidate.coalesced_source_seqs)
@@ -156,7 +158,7 @@ def evict_messages(
         candidates = [replacement for _, replacement in replacements]
         replacement_tokens = [token_counter(message) for message in candidates]
         original_tokens = sum(message_tokens[index] for index in indexes)
-        if sum(replacement_tokens) >= original_tokens:
+        if not _strictly_smaller(original_tokens, sum(replacement_tokens)):
             return False
         running_total += sum(replacement_tokens) - original_tokens
         for index, replacement, replacement_count in zip(
@@ -500,7 +502,7 @@ def _collapse_repeated_reads(
     counts: dict[tuple[str | None, str], int] = {}
     for (path, digest), occurrences in groups.items():
         newest = occurrences[-1]
-        counts[(path, digest)] = len(occurrences)
+        collapsed_count = 1
         for result_index, call_id, seq in occurrences[:-1]:
             call_index = call_indexes.get(call_id)
             if (
@@ -536,11 +538,13 @@ def _collapse_repeated_reads(
                 ),
             )
             if replace_many is not None:
-                replace_many(replacements)
+                collapsed_count += int(replace_many(replacements))
             else:
                 for replacement_index, replacement in replacements:
                     messages[replacement_index] = replacement
                     changed.add(replacement_index)
+                collapsed_count += 1
+        counts[(path, digest)] = collapsed_count
     return counts
 
 
@@ -1039,12 +1043,8 @@ def _selected_lines(lines: Sequence[str]) -> list[str]:
     return _unique([*important, *edges])
 
 
-def _strictly_smaller(
-    token_counter: Callable[[Message], int],
-    originals: Sequence[Message],
-    candidates: Sequence[Message],
-) -> bool:
-    return sum(map(token_counter, candidates)) < sum(map(token_counter, originals))
+def _strictly_smaller(original_tokens: int, candidate_tokens: int) -> bool:
+    return candidate_tokens < original_tokens
 
 
 def _result(
