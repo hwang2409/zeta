@@ -679,8 +679,8 @@ Usage = object with provider-defined JSON values
 ```
 
 `SessionMetadata` is the session serializer output; a test keeps this block
-equal to it. `compaction` is the persisted compaction mode. `skill_catalog` and
-`agent_catalog` are the session's snapshotted catalogs. `project_*` fields
+equal to it. `skill_catalog` and `agent_catalog` are the session's snapshotted
+catalogs. `project_*` fields
 describe the project association and the owned project-memory block in
 `system_prompt`. `parent_session_id` names the parent of a child session.
 `tool_allow` is `null` when no allowlist applies. `tool_allow_layers` appears

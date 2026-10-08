@@ -27,6 +27,18 @@ def _tool_patterns_arg(value: str) -> str:
     return value
 
 
+class _RemovedCompactionAction(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | None,
+        option_string: str | None = None,
+    ) -> None:
+        del namespace, values, option_string
+        parser.error("summary compaction mode was removed; eviction is always used")
+
+
 class _ArgumentParser(argparse.ArgumentParser):
     """Parse the ``mcp add --`` command tail independently of argparse internals."""
 
@@ -36,11 +48,6 @@ class _ArgumentParser(argparse.ArgumentParser):
         namespace: argparse.Namespace | None = None,
     ) -> argparse.Namespace:
         argv = list(sys.argv[1:] if args is None else args)
-        if any(
-            token == "--compaction" or token.startswith("--compaction=")
-            for token in argv
-        ):
-            self.error("summary compaction mode was removed; eviction is always used")
         server_command: list[str] | None = None
         option_actions = {
             option: action
@@ -163,6 +170,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="override the compaction/context token budget for this run",
+    )
+    parser.add_argument(
+        "--compaction",
+        nargs="?",
+        action=_RemovedCompactionAction,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--tools",

@@ -41,6 +41,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
 from zeta.tools.agent import ChildApprovalPolicy
 from zeta.tui.app import TUIApp, create_app
@@ -2452,7 +2453,9 @@ def test_new_sessions_use_eviction_only(
     assert "compaction_pinned" not in metadata
 
 
-def test_removed_summary_cli_mode_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
+def test_removed_compaction_flag_reports_migration_message(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     with pytest.raises(SystemExit) as exc_info:
         build_parser().parse_args(["--provider", "codex", "--compaction", "summary"])
 
@@ -2460,9 +2463,17 @@ def test_removed_summary_cli_mode_is_rejected(capsys: pytest.CaptureFixture[str]
     assert "summary compaction mode was removed; eviction is always used" in capsys.readouterr().err
 
 
-async def test_legacy_summary_marker_fixture_loads_and_resumes(
+def test_double_dash_compaction_positional_is_not_intercepted() -> None:
+    args = build_parser().parse_args(
+        ["session", "rename", "session-id", "--", "--compaction"]
+    )
+
+    assert args.name == "--compaction"
+
+
+async def _install_legacy_summary_fixture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> tuple[Path, str]:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     first = create_app(build_parser().parse_args(["--provider", "codex"]))
@@ -2476,20 +2487,82 @@ async def test_legacy_summary_marker_fixture_loads_and_resumes(
         "__CWD__", metadata["cwd"]
     )
     (session_dir / "conversation.jsonl").write_text(transcript, encoding="utf-8")
+    return home, session_id
 
+
+async def test_legacy_summary_marker_fixture_loads_and_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, session_id = await _install_legacy_summary_fixture(tmp_path, monkeypatch)
     resumed = create_app(build_parser().parse_args(["--resume", session_id]))
-    messages = await resumed.loop.context_assembler.assemble()
-    rendered = "\n".join(
-        block.text
-        for message in messages
-        for block in message.content
-        if isinstance(block, TextContent)
+    try:
+        messages = await resumed.loop.context_assembler.assemble()
+        rendered = "\n".join(
+            block.text
+            for message in messages
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        assert "legacy summary preserves the prior decision" in rendered
+        assert "current question" in rendered
+        assert "legacy question" not in rendered
+        assert "legacy answer" not in rendered
+    finally:
+        await resumed.close()
+
+
+async def test_tui_resume_renders_legacy_summary_marker_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, session_id = await _install_legacy_summary_fixture(tmp_path, monkeypatch)
+    resumed = create_app(build_parser().parse_args(["--resume", session_id]))
+    resumed._active_session = resumed._make_session()
+    try:
+        await resumed._rebuild_transcript_async()
+        rendered = Text.from_ansi(resumed._transcript.render(120)).plain
+        assert "[compaction marker: entries 1–2]" in rendered
+        assert "current question" in rendered
+    finally:
+        await resumed.close()
+
+
+async def test_server_runtime_resumes_legacy_summary_history_and_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, session_id = await _install_legacy_summary_fixture(tmp_path, monkeypatch)
+    runtime = ServerRuntime(
+        home,
+        cwd=tmp_path,
+        provider="codex",
+        backend_factory=lambda provider, model, root: (
+            FakeBackend([]),
+            model or "offline",
+        ),
     )
-    assert "legacy summary preserves the prior decision" in rendered
-    assert "current question" in rendered
-    assert "legacy question" not in rendered
-    assert "legacy answer" not in rendered
-    await resumed.close()
+    try:
+        await runtime.resume_session(session_id)
+        assert runtime.opened is not None
+        summary_entries = [
+            entry
+            for entry in runtime.opened.store.replay()
+            if entry.type == "compaction"
+        ]
+        assert [entry.data["summary"] for entry in summary_entries] == [
+            "legacy summary preserves the prior decision"
+        ]
+
+        assert runtime.loop is not None
+        messages = await runtime.loop.context_assembler.assemble()
+        provider_context = "\n".join(
+            block.text
+            for message in messages
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        assert "legacy summary preserves the prior decision" in provider_context
+        assert "current question" in provider_context
+    finally:
+        await runtime.close()
 
 
 def test_legacy_summary_session_setting_resumes_with_eviction(
