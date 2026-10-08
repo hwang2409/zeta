@@ -197,7 +197,7 @@ def test_malformed_toml_is_a_startup_error(tmp_path: Path, scope: str) -> None:
     _write(project, 'provider = "codex"\n')
     target = home if scope == "global" else project
     (target / SETTINGS_FILENAME).write_text(
-        'tools = ["computer__*"\n', encoding="utf-8"
+        'tools = ["remote__*"\n', encoding="utf-8"
     )
 
     with pytest.raises(SettingsError, match=r"could not parse .*settings\.toml"):
