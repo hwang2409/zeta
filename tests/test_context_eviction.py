@@ -7,12 +7,13 @@ import time
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from itertools import pairwise
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 import zeta.context_eviction as eviction_module
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.context_accounting import message_token_count
 from zeta.context_eviction import (
     EvictionResult,
     estimated_tokens,
@@ -70,6 +71,207 @@ def tool_pair(
         tool_result=ToolResult(call_id, output, is_error=error),
     )
     return call, result
+
+
+def persisted_tool_result(
+    call_id: str, body: str, *, structured: bool = True
+) -> Message:
+    """Return the duplicate display/provider shape written by real sessions."""
+
+    block = {
+        "type": "text",
+        "text": body,
+        "truncated": False,
+        "full_size": len(body.encode()),
+    }
+    return Message.from_dict(
+        {
+            "role": "tool_result",
+            "content": [{"type": "text", "text": body}],
+            "tool_result": {
+                "tool_call_id": call_id,
+                "content": body,
+                "is_error": False,
+                "content_blocks": [block],
+                "structured_content": ({"status": "completed"} if structured else None),
+            },
+            "metadata": {"display_only": body},
+        }
+    )
+
+
+def test_tool_result_accounting_counts_every_provider_bound_field() -> None:
+    def count(
+        *,
+        call_id: str = "call",
+        content: str = "xxx",
+        is_error: bool = False,
+        content_blocks: list[Any] | None = None,
+        display_content: str | None = None,
+        structured_content: dict[str, Any] | None = None,
+        is_canceled: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        return message_token_count(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [TextContent(display_content)] if display_content is not None else [],
+                tool_result=ToolResult(
+                    call_id,
+                    content,
+                    is_error=is_error,
+                    content_blocks=content_blocks,
+                    structured_content=structured_content,
+                    is_canceled=is_canceled,
+                ),
+                metadata=metadata or {},
+            )
+        )
+
+    baseline = count()
+    provider_bound_counts = {
+        "tool_call_id": count(call_id="different-call-id" * 20),
+        "content": count(content="different provider content " * 20),
+        "is_error": count(is_error=True),
+        "text content block": count(
+            content_blocks=[
+                {
+                    "type": "text",
+                    "text": "provider text block " * 20,
+                    "truncated": False,
+                    "full_size": 400,
+                }
+            ]
+        ),
+        "image content block": count(
+            content_blocks=[
+                {
+                    "type": "image",
+                    "data": "iVBORw0KGgo=",
+                    "mimeType": "image/png",
+                }
+            ]
+        ),
+    }
+    assert {
+        field for field, changed in provider_bound_counts.items() if changed == baseline
+    } == set()
+
+    ignored = "provider-ignored value " * 200
+    provider_ignored_counts = {
+        "Message.content": count(display_content=ignored),
+        "structured_content": count(structured_content={"ignored": ignored}),
+        "is_canceled": count(is_canceled=True),
+        "metadata": count(metadata={"ignored": ignored}),
+    }
+    assert set(provider_ignored_counts.values()) == {baseline}
+
+
+def test_digest_receipt_drops_stale_display_content() -> None:
+    call, _ = tool_pair("read", "read-1", "unused")
+    result = persisted_tool_result("read-1", "large read result " * 1_000)
+
+    evicted = evict_messages([(1, call), (2, result)], fixed_tokens=0, target_tokens=1)
+
+    receipt = evicted.messages[1]
+    assert receipt.content == []
+    assert receipt.tool_result is not None
+    assert receipt.tool_result.content_blocks is None
+    assert receipt.tool_result.structured_content is None
+
+
+def test_orchestration_receipt_drops_stale_display_content() -> None:
+    call, _ = tool_pair(
+        "agent", "agent-1", "unused", arguments={"prompt": "review"}
+    )
+    result = persisted_tool_result("agent-1", "large agent result " * 1_000)
+
+    evicted = evict_messages([(1, call), (2, result)], fixed_tokens=0, target_tokens=1)
+
+    receipt = evicted.messages[1]
+    assert receipt.content == []
+    assert receipt.tool_result is not None
+    assert receipt.tool_result.content_blocks is None
+    assert receipt.tool_result.structured_content is None
+
+
+def _provider_message_bytes(provider: str, messages: list[Message]) -> bytes:
+    if provider == "anthropic":
+        payload = build_messages_payload(
+            messages, [], model="claude-test", max_tokens=2048, thinking_budget=1024
+        )["messages"]
+    elif provider == "codex":
+        payload = build_responses_payload(messages, [], model="gpt-test")["input"]
+    else:
+        payload = build_ollama_messages(messages)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "codex", "ollama"])
+def test_legacy_normalization_keeps_provider_payload_bytes(provider: str) -> None:
+    receipt_text = "[semantic read digest · seq 2] bounded receipt"
+    stale_body = "legacy duplicate output " * 200
+    image: Any = {
+        "type": "image",
+        "data": (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
+            "+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+        ),
+        "mimeType": "image/png",
+        "caption": "legacy image",
+    }
+    call, _ = tool_pair("read", "read-1", "unused")
+    legacy = Message(
+        MessageRole.TOOL_RESULT,
+        [TextContent(stale_body)],
+        tool_result=ToolResult(
+            "read-1",
+            receipt_text,
+            is_error=True,
+            content_blocks=[image],
+            structured_content={"display_only": stale_body},
+            is_canceled=True,
+        ),
+        metadata={
+            "context_evicted": True,
+            "source_seq": 2,
+            "eviction_content_digest": "abc123",
+            "display_only": stale_body,
+        },
+    )
+    before = _provider_message_bytes(provider, [call, legacy])
+
+    replayed = ContextAssembler._eviction_view_messages(
+        [{"seq": 2, "message": legacy.to_dict()}]
+    )[0]
+
+    assert replayed.content == []
+    assert replayed.tool_result is not None
+    assert replayed.tool_result.structured_content is None
+    assert message_token_count(replayed) == message_token_count(
+        Message(MessageRole.TOOL_RESULT, tool_result=replayed.tool_result)
+    )
+    assert _provider_message_bytes(provider, [call, replayed]) == before
+
+def test_provider_payload_unchanged_by_accounting_fix() -> None:
+    call, _ = tool_pair("read", "read-1", "unused")
+    result = persisted_tool_result("read-1", "provider output")
+    messages = [call, result]
+    anthropic_before = build_messages_payload(
+        messages, [], model="claude-test", max_tokens=2048, thinking_budget=1024
+    )["messages"]
+    codex_before = build_responses_payload(messages, [], model="gpt-test")["input"]
+    ollama_before = build_ollama_messages(messages)
+
+    assert message_token_count(result) == message_token_count(
+        Message(MessageRole.TOOL_RESULT, tool_result=result.tool_result)
+    )
+
+    assert build_messages_payload(
+        messages, [], model="claude-test", max_tokens=2048, thinking_budget=1024
+    )["messages"] == anthropic_before
+    assert build_responses_payload(messages, [], model="gpt-test")["input"] == codex_before
+    assert build_ollama_messages(messages) == ollama_before
 
 
 def rendered_text(messages: list[Message]) -> str:
@@ -774,7 +976,7 @@ async def test_eviction_does_not_block_event_loop(tmp_path: Path) -> None:
         store.append_message(result)
     store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     assembler = ContextAssembler(
-        store, token_budget=600, retained_tail=1, compaction="evict"
+        store, token_budget=600, retained_tail=1
     )
     real_evict = evict_messages
 
@@ -822,7 +1024,6 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
         store,
         token_budget=700,
         retained_tail=1,
-        compaction="evict",
         telemetry_sink=telemetry.append,
     )
     assembler._provider_token_total = 4321
@@ -904,7 +1105,6 @@ async def test_branch_change_during_reuse_or_fallback_plan_replans(
         store,
         token_budget=700,
         retained_tail=1,
-        compaction="evict",
         compaction_policy=policy,
     )
     if outcome == "reuse":
@@ -955,7 +1155,7 @@ async def test_revalidation_does_not_replay_unchanged_branch(tmp_path: Path) -> 
     store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
     store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     assembler = ContextAssembler(
-        store, token_budget=700, retained_tail=1, compaction="evict"
+        store, token_budget=700, retained_tail=1
     )
     planning_finished = False
     replay_calls_after_planning = 0
@@ -993,7 +1193,7 @@ async def test_repeated_stale_plans_never_plan_on_event_loop(tmp_path: Path) -> 
     store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
     store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     assembler = ContextAssembler(
-        store, token_budget=700, retained_tail=1, compaction="evict"
+        store, token_budget=700, retained_tail=1
     )
     owner_thread = threading.get_ident()
     planner_threads: list[int] = []
@@ -1055,7 +1255,6 @@ async def test_stale_reuse_and_fallback_outcomes_always_revalidated(
         store,
         token_budget=1200,
         retained_tail=1,
-        compaction="evict",
         compaction_policy=policy,
     )
     if outcome == "reuse":
@@ -1096,7 +1295,7 @@ async def test_branch_change_during_offloop_plan_replans(tmp_path: Path) -> None
     store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
     store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     assembler = ContextAssembler(
-        store, token_budget=700, retained_tail=1, compaction="evict"
+        store, token_budget=700, retained_tail=1
     )
     planning_started = threading.Event()
     branch_changed = threading.Event()
@@ -1271,7 +1470,6 @@ async def test_long_single_user_turn_evicts_consumed_results_without_summary(
         store,
         token_budget=20_000,
         retained_tail=1,
-        compaction="evict",
         compaction_policy=policy,
     ).assemble_context()
 
@@ -1300,7 +1498,7 @@ async def test_current_turn_agent_result_not_evicted(tmp_path: Path) -> None:
     store.append_message(current_result)
 
     context = await ContextAssembler(
-        store, token_budget=30_000, retained_tail=1, compaction="evict"
+        store, token_budget=30_000, retained_tail=1
     ).assemble_context()
 
     output = rendered_text(context.messages)
@@ -1367,7 +1565,7 @@ async def _cancel_partial_after_fresh_agent_result(
         await task
 
     context = await ContextAssembler(
-        store, token_budget=10_000, retained_tail=1, compaction="evict"
+        store, token_budget=10_000, retained_tail=1
     ).assemble_context()
     return store, rendered_text(context.messages)
 
@@ -1430,7 +1628,7 @@ async def test_fresh_notification_not_evicted_before_model_sees_it(
     )
 
     context = await ContextAssembler(
-        store, token_budget=35_000, retained_tail=1, compaction="evict"
+        store, token_budget=35_000, retained_tail=1
     ).assemble_context()
 
     output = rendered_text(context.messages)
@@ -1457,7 +1655,7 @@ async def test_incomplete_agent_call_prompt_not_evicted(tmp_path: Path) -> None:
     store.append_message(incomplete_call)
 
     context = await ContextAssembler(
-        store, token_budget=30_000, retained_tail=1, compaction="evict"
+        store, token_budget=30_000, retained_tail=1
     ).assemble_context()
 
     calls = {call.id: call for call in _tool_calls_for_test(context.messages)}
@@ -1484,7 +1682,7 @@ async def test_old_turn_content_still_evicted(tmp_path: Path) -> None:
     store.append_message(with_message_origin(text(MessageRole.USER, "new turn"), MessageOrigin.USER))
 
     context = await ContextAssembler(
-        store, token_budget=10_000, retained_tail=1, compaction="evict"
+        store, token_budget=10_000, retained_tail=1
     ).assemble_context()
 
     output = rendered_text(context.messages)
@@ -1541,7 +1739,7 @@ async def test_evict_digests_old_completion_notifications_and_recall_restores(
     store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
 
     context = await ContextAssembler(
-        store, token_budget=800, retained_tail=1, compaction="evict"
+        store, token_budget=800, retained_tail=1
     ).assemble_context()
 
     receipt = rendered_text(context.messages)
@@ -1891,55 +2089,6 @@ def test_evict_bash_args_keeps_recent_tail(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.asyncio
-async def test_explicit_summary_keeps_previous_default_request_bytes(
-    tmp_path: Path,
-) -> None:
-    default_store = ConversationStore(tmp_path / "default")
-    explicit_store = ConversationStore(tmp_path / "explicit")
-    for store in (default_store, explicit_store):
-        store.append_message(with_message_origin(text(MessageRole.USER, "hello"), MessageOrigin.USER))
-        store.append_message(text(MessageRole.ASSISTANT, "world"))
-
-    default = await ContextAssembler(default_store, system_prompt="system").assemble_context()
-    explicit = await ContextAssembler(
-        explicit_store, system_prompt="system", compaction="summary"
-    ).assemble_context()
-
-    assert default.digest == explicit.digest
-    assert [message.to_dict() for message in default.messages] == [
-        message.to_dict() for message in explicit.messages
-    ]
-
-    default_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
-    summary_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
-    default_loop = AgentLoop(
-        default_backend,
-        ConversationStore(tmp_path / "default-request"),
-        skill_catalog=SkillCatalog.empty(),
-        max_turns=1,
-    )
-    summary_store = ConversationStore(tmp_path / "summary-request")
-    summary_registry = ToolRegistry(
-        tmp_path,
-        session_store=summary_store,
-        skill_catalog=SkillCatalog.empty(),
-        compaction="summary",
-    )
-    summary_loop = AgentLoop(
-        summary_backend,
-        summary_store,
-        registry=summary_registry,
-        skill_catalog=SkillCatalog.empty(),
-        compaction="summary",
-        max_turns=1,
-    )
-
-    _ = [event async for event in default_loop.run_turn("same request", origin=MessageOrigin.USER)]
-    _ = [event async for event in summary_loop.run_turn("same request", origin=MessageOrigin.USER)]
-
-    assert default_backend.request_bytes == summary_backend.request_bytes
-    assert "recall_history" not in summary_registry.registered_names
 
 
 @pytest.mark.asyncio
@@ -1958,7 +2107,6 @@ async def test_latest_user_message_never_evicted(tmp_path: Path) -> None:
         store,
         token_budget=1000,
         retained_tail=8,
-        compaction="evict",
     ).assemble_context()
 
     assert "latest request verbatim" in rendered_text(context.messages)
@@ -2034,7 +2182,7 @@ async def test_eviction_replay_deterministic_with_new_rules(tmp_path: Path) -> N
             store.append_message(message)
     store.append_message(with_message_origin(text(MessageRole.USER, "latest request verbatim"), MessageOrigin.USER))
     assembler = ContextAssembler(
-        store, token_budget=5_000, retained_tail=1, compaction="evict"
+        store, token_budget=5_000, retained_tail=1
     )
 
     first = await assembler.assemble_context()
@@ -2043,7 +2191,6 @@ async def test_eviction_replay_deterministic_with_new_rules(tmp_path: Path) -> N
         ConversationStore(sessions, session_id="evict"),
         token_budget=5_000,
         retained_tail=1,
-        compaction="evict",
     ).assemble_context()
 
     assert first.digest == repeated.digest == reopened.digest
@@ -2100,7 +2247,7 @@ async def test_hysteresis_replay_identity_pinned_user_and_reopen(tmp_path: Path)
     store.append_message(text(MessageRole.ASSISTANT, "old reasoning " * 20))
     store.append_message(with_message_origin(text(MessageRole.USER, "latest request verbatim"), MessageOrigin.USER))
     assembler = ContextAssembler(
-        store, token_budget=700, retained_tail=1, compaction="evict"
+        store, token_budget=700, retained_tail=1
     )
 
     assembled = [await assembler.assemble_context() for _ in range(4)]
@@ -2114,7 +2261,7 @@ async def test_hysteresis_replay_identity_pinned_user_and_reopen(tmp_path: Path)
 
     reopened = ConversationStore(sessions, session_id="evict")
     replayed = await ContextAssembler(
-        reopened, token_budget=700, retained_tail=1, compaction="evict"
+        reopened, token_budget=700, retained_tail=1
     ).assemble_context()
     assert replayed.digest == assembled[0].digest
     assert [message.to_dict() for message in replayed.messages] == [
@@ -2149,7 +2296,6 @@ async def test_forced_retry_reuses_existing_eviction_inside_hysteresis(
         store,
         token_budget=700,
         retained_tail=1,
-        compaction="evict",
         compaction_policy=policy,
     )
     first = await assembler.assemble_context()
@@ -2182,7 +2328,6 @@ async def test_manual_eviction_bypasses_hysteresis_without_summary_fallback(
         store,
         token_budget=700,
         retained_tail=1,
-        compaction="evict",
         compaction_policy=policy,
     )
     first = await assembler.assemble_context()
@@ -2217,7 +2362,6 @@ async def test_eviction_can_replace_a_prior_summary(tmp_path: Path) -> None:
         store,
         token_budget=1000,
         retained_tail=1,
-        compaction="evict",
         compaction_policy=policy,
     ).assemble_context()
 
@@ -2242,7 +2386,6 @@ async def test_forced_eviction_uses_evict_mode(tmp_path: Path) -> None:
         store,
         token_budget=700,
         retained_tail=1,
-        compaction="evict",
         compaction_policy=policy,
     ).assemble_context(force=True)
 
@@ -2268,7 +2411,6 @@ async def test_eviction_that_fits_budget_does_not_require_target_or_summary(
         store,
         token_budget=1000,
         retained_tail=1,
-        compaction="evict",
         compaction_policy=policy,
     )
     fitted_result = Message(
@@ -2310,7 +2452,6 @@ async def test_eviction_validates_replay_view_before_persisting(tmp_path: Path) 
         store,
         token_budget=525,
         retained_tail=1,
-        compaction="evict",
     )
 
     first = await assembler.assemble_context()
@@ -2328,7 +2469,6 @@ async def test_eviction_validates_replay_view_before_persisting(tmp_path: Path) 
         reopened,
         token_budget=525,
         retained_tail=1,
-        compaction="evict",
     ).assemble_context()
     assert [message.to_dict() for message in first.messages] == [
         message.to_dict() for message in replayed.messages
@@ -2352,7 +2492,6 @@ async def test_rejected_eviction_view_leaves_store_unchanged(tmp_path: Path) -> 
         store,
         token_budget=100,
         retained_tail=1,
-        compaction="evict",
     )
 
     with (
@@ -2376,7 +2515,6 @@ async def test_eviction_falls_back_to_existing_summary(tmp_path: Path) -> None:
         store,
         token_budget=300,
         retained_tail=1,
-        compaction="evict",
         compaction_policy=policy,
     ).assemble_context()
 
@@ -2385,24 +2523,17 @@ async def test_eviction_falls_back_to_existing_summary(tmp_path: Path) -> None:
     assert [entry.data.get("kind", "summary") for entry in store.replay() if entry.type == "compaction"] == ["summary"]
 
 
-def test_recall_tool_only_changes_the_evict_tool_surface_and_children_inherit(
-    tmp_path: Path,
-) -> None:
+def test_recall_tool_is_registered_and_children_inherit(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    summary = ToolRegistry(
-        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
-    )
-    evict = ToolRegistry(
+    registry = ToolRegistry(
         tmp_path,
         session_store=store,
         skill_catalog=SkillCatalog.empty(),
-        compaction="evict",
     )
     child_store = ConversationStore(tmp_path / "sessions")
-    child = evict.clone_for_session(child_store)
+    child = registry.clone_for_session(child_store)
 
-    assert "recall_history" not in summary.registered_names
-    assert "recall_history" in evict.registered_names
+    assert "recall_history" in registry.registered_names
     assert "recall_history" in child.registered_names
 
 
@@ -2510,32 +2641,3 @@ def test_recall_query_matches_non_ascii_text(tmp_path: Path, needle: str) -> Non
 
     assert "No matching compacted messages" not in found
     assert f"seq {entry.seq}:" in found
-
-
-def test_evict_loop_builds_matching_registry_and_rejects_mismatch(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "evict-loop")
-    loop = AgentLoop(
-        FakeBackend([]),
-        store,
-        skill_catalog=SkillCatalog.empty(),
-        compaction="evict",
-        max_turns=1,
-    )
-    assert "recall_history" in loop.tool_registry.registered_names
-
-    summary_store = ConversationStore(tmp_path / "mismatch")
-    summary_registry = ToolRegistry(
-        tmp_path,
-        session_store=summary_store,
-        skill_catalog=SkillCatalog.empty(),
-        compaction="summary",
-    )
-    with pytest.raises(ValueError, match="compaction mode must match"):
-        AgentLoop(
-            FakeBackend([]),
-            summary_store,
-            registry=summary_registry,
-            skill_catalog=SkillCatalog.empty(),
-            compaction="evict",
-            max_turns=1,
-        )

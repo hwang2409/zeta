@@ -41,7 +41,9 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
+from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tools.agent import ChildApprovalPolicy
 from zeta.tui.app import TUIApp, create_app
 from zeta.tui.layout import CONTENT_MARGIN, content_width
@@ -625,6 +627,41 @@ async def test_resume_rebuilds_current_skill_catalog_for_prompt_and_tool(
     assert newly_loaded["content"][0]["text"] == "second body"
 
 
+def test_tui_resume_shows_skill_parse_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    manager = SessionManager(home)
+    opened = manager.create(
+        provider="codex",
+        model="offline",
+        cwd=tmp_path,
+        system_prompt="preserved prompt",
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+        prompt_recipe=None,
+        auto_project=False,
+    )
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    malformed = home / "skills" / "broken" / "SKILL.md"
+    malformed.parent.mkdir(parents=True)
+    malformed.write_text("not frontmatter", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
+    )
+    try:
+        assert any(
+            str(malformed) in notice and "missing YAML frontmatter" in notice
+            for notice in resumed._slash_commands.notices
+        )
+    finally:
+        resumed.loop.store.close()
+
+
 def test_second_resume_after_override_sees_overridden_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1054,7 +1091,9 @@ async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Pat
     assert output is not None
     assert output.startswith("compacted entries ")
     assert store.compaction_marker_count() == 1
-    assert backend.calls[0][0][0].content[0].text == "stable identity"
+    assert backend.calls == []
+    marker = next(entry for entry in store.replay() if entry.type == "compaction")
+    assert marker.data["kind"] == "evict"
 
 
 def test_session_previews_are_ordered_and_ansi_safe(tmp_path: Path) -> None:
@@ -2478,7 +2517,7 @@ def test_session_delete_does_not_read_corrupt_data(tmp_path, corruption):
     assert manager.list_sessions() == []
 
 
-def test_new_session_defaults_to_evict(
+def test_new_sessions_use_eviction_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -2486,69 +2525,128 @@ def test_new_session_defaults_to_evict(
 
     app = create_app(build_parser().parse_args(["--provider", "codex"]))
 
-    assert app.loop.context_assembler.compaction == "evict"
     assert "recall_history" in app.loop.tool_registry.registered_names
     metadata = json.loads(
         (home / "sessions" / app.loop.store.session_id / "meta.json").read_text()
     )
-    assert metadata["compaction"] == "evict"
-    assert metadata["compaction_pinned"] is False
+    assert "compaction" not in metadata
+    assert "compaction_pinned" not in metadata
 
 
-def test_new_session_can_select_summary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_removed_compaction_flag_reports_migration_message(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["--provider", "codex", "--compaction", "summary"])
+
+    assert exc_info.value.code == 2
+    assert "summary compaction mode was removed; eviction is always used" in capsys.readouterr().err
+
+
+def test_double_dash_compaction_positional_is_not_intercepted() -> None:
+    args = build_parser().parse_args(
+        ["session", "rename", "session-id", "--", "--compaction"]
+    )
+
+    assert args.name == "--compaction"
+
+
+async def _install_legacy_summary_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, str]:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-
-    app = create_app(
-        build_parser().parse_args(
-            ["--provider", "codex", "--compaction", "summary"]
-        )
-    )
-
-    assert app.loop.context_assembler.compaction == "summary"
-    assert "recall_history" not in app.loop.tool_registry.registered_names
-    metadata = json.loads(
-        (home / "sessions" / app.loop.store.session_id / "meta.json").read_text()
-    )
-    assert metadata["compaction"] == "summary"
-    assert metadata["compaction_pinned"] is True
-
-
-def test_compaction_mode_persists_and_survives_resume(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "zeta-home"
-    monkeypatch.setenv("ZETA_HOME", str(home))
-    first = create_app(
-        build_parser().parse_args(["--provider", "codex", "--compaction", "evict"])
-    )
+    first = create_app(build_parser().parse_args(["--provider", "codex"]))
     session_id = first.loop.store.session_id
-    assert first.loop.context_assembler.compaction == "evict"
-    assert "recall_history" in first.loop.tool_registry.registered_names
-    metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
-    assert metadata["compaction"] == "evict"
-    assert metadata["compaction_pinned"] is True
+    session_dir = home / "sessions" / session_id
+    await first.close()
 
-    resumed = create_app(build_parser().parse_args(["--resume", session_id]))
-    assert resumed.loop.context_assembler.compaction == "evict"
-    assert "recall_history" in resumed.loop.tool_registry.registered_names
-
-    # An explicit flag on resume switches the persisted mode.
-    switched = create_app(
-        build_parser().parse_args(
-            ["--resume", session_id, "--compaction", "summary"]
-        )
+    fixture = Path("tests/fixtures/legacy-summary-conversation.jsonl").read_text()
+    metadata = json.loads((session_dir / "meta.json").read_text())
+    transcript = fixture.replace("__SESSION_ID__", session_id).replace(
+        "__CWD__", metadata["cwd"]
     )
-    assert switched.loop.context_assembler.compaction == "summary"
-    assert "recall_history" not in switched.loop.tool_registry.registered_names
-    metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
-    assert metadata["compaction"] == "summary"
+    (session_dir / "conversation.jsonl").write_text(transcript, encoding="utf-8")
+    return home, session_id
 
 
-def test_legacy_session_without_compaction_resumes_as_summary(
+async def test_legacy_summary_marker_fixture_loads_and_resumes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, session_id = await _install_legacy_summary_fixture(tmp_path, monkeypatch)
+    resumed = create_app(build_parser().parse_args(["--resume", session_id]))
+    try:
+        messages = await resumed.loop.context_assembler.assemble()
+        rendered = "\n".join(
+            block.text
+            for message in messages
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        assert "legacy summary preserves the prior decision" in rendered
+        assert "current question" in rendered
+        assert "legacy question" not in rendered
+        assert "legacy answer" not in rendered
+    finally:
+        await resumed.close()
+
+
+async def test_tui_resume_renders_legacy_summary_marker_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, session_id = await _install_legacy_summary_fixture(tmp_path, monkeypatch)
+    resumed = create_app(build_parser().parse_args(["--resume", session_id]))
+    resumed._active_session = resumed._make_session()
+    try:
+        await resumed._rebuild_transcript_async()
+        rendered = Text.from_ansi(resumed._transcript.render(120)).plain
+        assert "[compaction marker: entries 1–2]" in rendered
+        assert "current question" in rendered
+    finally:
+        await resumed.close()
+
+
+async def test_server_runtime_resumes_legacy_summary_history_and_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, session_id = await _install_legacy_summary_fixture(tmp_path, monkeypatch)
+    runtime = ServerRuntime(
+        home,
+        cwd=tmp_path,
+        provider="codex",
+        backend_factory=lambda provider, model, root: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    try:
+        await runtime.resume_session(session_id)
+        assert runtime.opened is not None
+        summary_entries = [
+            entry
+            for entry in runtime.opened.store.replay()
+            if entry.type == "compaction"
+        ]
+        assert [entry.data["summary"] for entry in summary_entries] == [
+            "legacy summary preserves the prior decision"
+        ]
+
+        assert runtime.loop is not None
+        messages = await runtime.loop.context_assembler.assemble()
+        provider_context = "\n".join(
+            block.text
+            for message in messages
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        assert "legacy summary preserves the prior decision" in provider_context
+        assert "current question" in provider_context
+    finally:
+        await runtime.close()
+
+
+def test_legacy_summary_session_setting_resumes_with_eviction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
@@ -2556,11 +2654,11 @@ def test_legacy_session_without_compaction_resumes_as_summary(
     session_id = first.loop.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text())
-    metadata.pop("compaction")
-    metadata.pop("compaction_pinned")
+    metadata["compaction"] = "summary"
+    metadata["compaction_pinned"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
     resumed = create_app(build_parser().parse_args(["--resume", session_id]))
 
-    assert resumed.loop.context_assembler.compaction == "summary"
-    assert "recall_history" not in resumed.loop.tool_registry.registered_names
+    assert "recall_history" in resumed.loop.tool_registry.registered_names
+    assert "session requested removed summary compaction; using eviction" in caplog.text

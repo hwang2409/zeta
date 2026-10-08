@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterator, Sequence
 from math import ceil
 from typing import Any
 
-from ..protocol.types import Message
+from ..protocol.types import Message, MessageRole
 
 IMAGE_TOKEN_ESTIMATE = 1024
 _JSON_STRING_CHUNK = 65_536
@@ -72,7 +72,8 @@ def message_token_count(message: Message) -> int:
     """Estimate text tokens and charge a small fixed amount per image.
 
     Base64 is transport data, not text. Without image dimensions, use a fixed
-    estimate that keeps images near the 4 MiB transport cap usable.
+    estimate that keeps images near the 4 MiB transport cap usable. Tool results
+    count the union of fields sent by Anthropic, Codex, and Ollama.
     """
 
     calls = getattr(_token_count_state, "calls", 0) + 1
@@ -81,6 +82,21 @@ def message_token_count(message: Message) -> int:
         cooperative_pause()
 
     value = message.to_dict()
+    if message.role is MessageRole.TOOL_RESULT and message.tool_result is not None:
+        result = message.tool_result
+        value = {
+            "role": message.role.value,
+            "tool_result": {
+                "tool_call_id": result.tool_call_id,
+                "content": result.content,
+                "is_error": result.is_error,
+                **(
+                    {"content_blocks": result.content_blocks}
+                    if result.content_blocks is not None
+                    else {}
+                ),
+            },
+        }
     image_count = 0
     content = value.get("content")
     if isinstance(content, list):
