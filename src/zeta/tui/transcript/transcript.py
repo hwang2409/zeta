@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import OrderedDict
 from collections.abc import Callable
@@ -27,6 +28,7 @@ from ...protocol.types import (
 )
 from .. import theme
 from ..agent_card import AgentCard
+from ..cards.agent_sync import refresh_agent_cards
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
 from .streaming_text import StreamingText
@@ -140,6 +142,7 @@ class _ToolUnit:
         event: StreamEvent | None = None,
         *,
         compact: bool = True,
+        on_final_tail: Callable[[], None] | None = None,
     ) -> None:
         self.finished = True
         self.search_renderable = rendered
@@ -147,6 +150,21 @@ class _ToolUnit:
             self.card.finish(event, rendered) if compact else self.card.finish(event)
         ) or rendered
         self.revision += 1
+        if self.card.final_tail_pending:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            async def publish_final_tail() -> None:
+                terminal = await self.card.finish_tail()
+                if terminal is None:
+                    return
+                self.search_renderable = terminal
+                self.renderable = terminal
+                self.revision += 1
+                if on_final_tail is not None:
+                    on_final_tail()
+            loop.create_task(publish_final_tail())
 
     def toggle(self) -> bool:
         rendered = self.card.toggle()
@@ -230,6 +248,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._virtual_unit_count = 0
         self._virtual_start_needs_clamp = False
         self._unit_heights: dict[tuple[int, int, int], int] = {}
+        self._height_indexes: dict[int, object] = {}
+        self._virtual_stream_lines = {}
         self._pending_virtual_scroll = 0
         self._virtual_search_key: tuple[int, int, str] | None = None
         self._virtual_search_occurrences = []
@@ -321,14 +341,17 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._unit_lines_cache.pop(unit.key, None)
         self._unit_locations_cache.pop(unit.key, None)
         self._unit_search_cache.pop(unit.key, None)
+        self._height_indexes.clear()
         self._bump_revision()
 
     def append_blank(self) -> None:
         self._append_unit(None)
 
     def clear(self) -> None:
-        """Remove all rendered transcript units."""
+        """Remove all rendered transcript units and release child sources."""
 
+        for unit in self._card_units.values():
+            unit.card.release_transcript_source()
         self._units.clear()
         self._tools.clear()
         self._background_tools.clear()
@@ -339,6 +362,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._unit_locations_cache.clear()
         self._unit_search_cache.clear()
         self._unit_search_widths.clear()
+        self._height_indexes.clear()
         self._keyed_cache = None
         self._line_locations.clear()
         self._locations_cache.clear()
@@ -422,6 +446,16 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         if refreshed:
             self._bump_revision()
 
+    async def refresh_agent_transcripts(self) -> None:
+        """Read active expanded child tails off-loop, then invalidate once."""
+        units = list(self._tools.values())
+        refreshed = await refresh_agent_cards(unit.card for unit in units)
+        for unit, changed in zip(units, refreshed):
+            if changed:
+                unit.refresh()
+        if any(refreshed):
+            self._bump_revision()
+
     def finish_tool(
         self,
         call_id: str | ToolLifecycleKey,
@@ -431,7 +465,13 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         lifecycle_key = _tool_lifecycle_key(call_id, event)
         unit = self._tools.pop(lifecycle_key, None)
         if unit is not None:
-            unit.finish(rendered, event)
+            unit.finish(
+                rendered,
+                event,
+                on_final_tail=lambda: (
+                    self._bump_revision(), self._prime_search_value(unit)
+                ),
+            )
             self._bump_revision()
             self._prime_search_value(unit)
         else:
@@ -464,6 +504,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             if call_id not in self._background_tools
         }
         active_ids = {id(unit) for unit in active}
+        for unit in active:
+            unit.card.release_transcript_source()
         removed_keys = {
             unit.key
             for unit in self._units
@@ -483,6 +525,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             )
         ]
         self._user_units[:] = [unit for unit in self._user_units if unit in self._units]
+        self._height_indexes.clear()
         if self._anchor is not None and self._anchor[0] not in self._units:
             self._anchor = None
         for key in removed_keys:
@@ -542,6 +585,13 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         if self._follow_tail and amount >= 0:
             return
         if self._uses_virtual_history():
+            if self._follow_tail and amount < 0 and self._anchor is not None:
+                anchor_unit, anchor_offset = self._anchor
+                if anchor_unit in self._units:
+                    self._virtual_start = (
+                        self._units.index(anchor_unit),
+                        anchor_offset,
+                    )
             self._pending_virtual_scroll += amount
             if amount < 0:
                 self._follow_tail = False
@@ -898,56 +948,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             else:
                 lines.extend(self._unit_parsed_lines(unit, width))
         return self._finish_assembled_lines(lines)
-
-    def _streaming_tail_lines(
-        self, value: _StreamingText, width: int, height: int
-    ) -> list[list[tuple[str, str]]]:
-        output = StringIO()
-        console = Console(
-            file=output,
-            force_terminal=True,
-            color_system="truecolor",
-            no_color=False,
-            width=width,
-            theme=RICH_THEME,
-        )
-        wrapped = value.tail(console, width, height)
-        rendered = Text("", style=value.style)
-        for index, line in enumerate(wrapped):
-            if index:
-                rendered.append("\n")
-            rendered.append_text(line)
-        console.print(rendered, soft_wrap=True)
-        ansi = "\n".join(line.rstrip(" ") for line in output.getvalue().splitlines())
-        return list(split_lines(to_formatted_text(ANSI(ansi)))) if ansi else [[]]
-
-    def _tail_lines(self, width: int, height: int) -> list[list[tuple[str, str]]]:
-        """Render only enough newest units to fill a follow-tail viewport."""
-
-        lines: list[list[tuple[str, str]]] = []
-        trimming_trailing_blanks = True
-        reached_start = True
-        for unit in reversed(self._units):
-            if unit is None:
-                unit_lines = [[]]
-            elif isinstance(unit.value, _StreamingText):
-                unit_lines = self._streaming_tail_lines(unit.value, width, height)
-            else:
-                unit_lines = self._unit_parsed_lines(unit, width)
-            if trimming_trailing_blanks:
-                unit_lines = list(unit_lines)
-                while unit_lines and not unit_lines[-1]:
-                    unit_lines.pop()
-                trimming_trailing_blanks = not unit_lines
-            if unit_lines:
-                lines[:0] = unit_lines
-            if len(lines) >= height and not trimming_trailing_blanks:
-                reached_start = False
-                break
-        if reached_start:
-            while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
-                lines.pop(0)
-        return lines[-height:] or [[]]
 
     def _parsed_lines(self, width: int) -> list[list[tuple[str, str]]]:
         cached = self._parsed_cache.get(width)

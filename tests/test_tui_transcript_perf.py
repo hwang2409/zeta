@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import shutil
 import threading
 import time
 from collections import OrderedDict
@@ -11,7 +13,9 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
-from rich.console import Group
+from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.output import DummyOutput
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
@@ -22,9 +26,11 @@ from zeta.protocol.types import (
     MessageRole,
     StreamEvent,
     StreamEventType,
+    TextContent,
     ThinkingContent,
     ToolCall,
     ToolResult,
+    ToolUseContent,
 )
 from zeta.tui import agent_card as agent_card_module
 from zeta.tui import checkpoints as checkpoints_module
@@ -33,7 +39,9 @@ from zeta.tui import render as render_module
 from zeta.tui import theme
 from zeta.tui.agent_card import AgentNavigation, AgentTranscriptControl
 from zeta.tui.app import TUIApp
+from zeta.tui.cards import agent_sync as agent_sync_module
 from zeta.tui.composer import TurnConsumerMixin
+from zeta.tui.key_bindings import FullScreenPromptSession
 from zeta.tui.render import render_markdown, render_thought_live
 from zeta.tui.transcript import AnchoredSelection, TranscriptPresenter, TranscriptWidget
 from zeta.tui.transcript.streaming_text import StreamingText
@@ -107,6 +115,32 @@ def _transcript(messages: int) -> TranscriptWidget:
     return transcript
 
 
+@pytest.mark.asyncio
+async def test_keystroke_invalidation_is_not_delayed_by_output_frame_cap() -> None:
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), multiline=True
+        )
+        assert session.app.min_redraw_interval is None
+        rendered = asyncio.Event()
+
+        def record_frame(_app: object) -> None:
+            if session.default_buffer.text == "x":
+                rendered.set()
+
+        session.app.before_render += record_frame
+        running = asyncio.create_task(session.app.run_async())
+        await asyncio.sleep(0.02)
+        started = time.perf_counter()
+        pipe.send_text("x")
+        await asyncio.wait_for(rendered.wait(), timeout=0.1)
+        latency = time.perf_counter() - started
+        session.app.exit(result="")
+        await running
+
+    assert latency < 0.01
+
+
 def test_stream_invalidation_does_not_add_an_idle_trailing_paint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -147,6 +181,210 @@ def test_repaints_do_not_rescan_terminal_agent_sessions(
     assert metadata.call_count == 0
 
 
+@pytest.mark.asyncio
+async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reads: list[int] = []
+    original = agent_sync_module.AgentTranscriptSource._refresh_path
+
+    def recording_refresh(*args: object, **kwargs: object) -> object:
+        reads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        agent_sync_module.AgentTranscriptSource, "_refresh_path", recording_refresh
+    )
+    transcript = TranscriptWidget()
+    for index in range(8):
+        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("child output" * 1_000)])
+        )
+        call = ToolCall(
+            f"agent-{index}",
+            "agent",
+            {"prompt": "inspect", "description": f"agent {index}"},
+        )
+        start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        transcript.start_tool(call.id, call, render_module.render_event(start), start)
+        update = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            tool_call=call,
+            data={"child_session_path": str(child.session_dir)},
+        )
+        transcript.update_tool(call.id, Text("turn 1"), update)
+        child.close()
+
+    loop_thread = threading.get_ident()
+    for _ in range(5):
+        transcript.refresh_active_agents()
+    assert reads == []
+
+    await transcript.refresh_agent_transcripts()
+    assert reads
+    assert set(reads) == {reads[0]}
+    assert loop_thread not in reads
+
+
+@pytest.mark.asyncio
+async def test_production_agent_refresh_keeps_event_loop_responsive(
+    tmp_path: Path,
+) -> None:
+    template = ConversationStore(tmp_path / "template", session_id="0")
+    template.append_many(
+        (
+            "message",
+            {
+                "message": Message(
+                    MessageRole.ASSISTANT,
+                    [TextContent("child output line")],
+                ).to_dict()
+            },
+        )
+        for _ in range(22_000)
+    )
+    template.close()
+    fixture_size = template.path.stat().st_size
+    assert 4_000_000 < fixture_size < 6_000_000
+
+    transcript = TranscriptWidget()
+    for index in range(8):
+        child_path = tmp_path / "agents" / str(index) / "0"
+        shutil.copytree(template.session_dir, child_path)
+        call = ToolCall(
+            f"agent-{index}",
+            "agent",
+            {"prompt": "inspect", "description": f"agent {index}"},
+        )
+        start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        transcript.start_tool(call.id, call, render_module.render_event(start), start)
+        transcript.update_tool(
+            call.id,
+            Text("turn 1"),
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_UPDATE,
+                tool_call=call,
+                data={"child_session_path": str(child_path)},
+            ),
+        )
+
+    gaps: list[float] = []
+    done = False
+
+    async def ticker() -> None:
+        expected = time.perf_counter() + 0.005
+        while not done:
+            await asyncio.sleep(max(0, expected - time.perf_counter()))
+            now = time.perf_counter()
+            gaps.append(max(0, now - expected))
+            expected = now + 0.005
+
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0.01)
+    await transcript.refresh_agent_transcripts()
+    done = True
+    await ticker_task
+
+    assert gaps
+    assert max(gaps) < 0.05
+
+
+def test_bounded_agent_source_reads_only_active_branch_tail(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "agents", session_id="child")
+    first = store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("first")])
+    )
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("abandoned")])
+    )
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("new branch")]),
+        parent_id=first.id,
+    )
+    store.close()
+
+    source = agent_sync_module.AgentTranscriptSource(
+        store.session_dir, message_limit=2
+    )
+    snapshot = source.refresh().transcript(store.session_dir)
+
+    assert snapshot is not None
+    assert [message["content"][0]["text"] for _, message in snapshot.messages] == [
+        "first",
+        "new branch",
+    ]
+    assert source._stores == {}
+    source.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        source.refresh()
+
+
+@pytest.mark.asyncio
+async def test_finished_agent_cards_release_transcript_sources(
+    tmp_path: Path,
+) -> None:
+    await asyncio.to_thread(lambda: None)
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    baseline = len(os.listdir(fd_root))
+    transcript = TranscriptWidget()
+
+    for index in range(100):
+        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"answer {index}")])
+        )
+        child.close()
+        call = ToolCall(
+            f"agent-{index}",
+            "agent",
+            {"prompt": "inspect", "description": f"agent {index}"},
+        )
+        start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        transcript.start_tool(call.id, call, render_module.render_event(start), start)
+        transcript.update_tool(
+            call.id,
+            Text("turn 1"),
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_UPDATE,
+                tool_call=call,
+                data={"child_session_path": str(child.session_dir)},
+            ),
+        )
+        end = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "done",
+                structured_content={"child_session_path": str(child.session_dir)},
+            ),
+        )
+        transcript.finish_tool(call.id, render_module.render_event(end), end)
+
+    final_card = transcript._card_units[(None, "agent-99")].card
+    for _ in range(200):
+        sources_closed = all(
+            unit.card.transcript_source is None
+            for unit in transcript._card_units.values()
+        )
+        final_tail_published = final_card._tail == ("assistant: answer 99",)
+        if (
+            sources_closed
+            and final_tail_published
+            and len(os.listdir(fd_root)) == baseline
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    assert len(os.listdir(fd_root)) == baseline
+    assert all(
+        unit.card.transcript_source is None
+        for unit in transcript._card_units.values()
+    )
+    assert final_card._tail == ("assistant: answer 99",)
+
+
 def test_follow_tail_redraw_does_not_rebuild_location_map() -> None:
     counts: list[int] = []
     for size in (100, 2_000):
@@ -158,6 +396,27 @@ def test_follow_tail_redraw_does_not_rebuild_location_map() -> None:
         transcript.create_content(100, 30)
         counts.append(locations.call_count)
     assert counts == [0, 0]
+
+
+def test_virtual_streaming_tail_cost_is_bounded_by_viewport() -> None:
+    transcript = _transcript(2_000)
+    stream = StreamingText(theme.BODY, palette_role="body")
+    unit = transcript.append(stream)
+    stream.append("x" * 50_000)
+    transcript.touch(unit)
+    transcript.create_content(100, 30)
+    render = Mock(wraps=transcript._render_unit)
+    transcript._render_unit = render
+
+    started = time.perf_counter()
+    for _ in range(20):
+        stream.append(" next")
+        transcript.touch(unit)
+        transcript.create_content(100, 30)
+    elapsed = time.perf_counter() - started
+
+    render.assert_not_called()
+    assert elapsed < 0.2
 
 
 def test_follow_tail_rendered_output_remains_available() -> None:
@@ -707,6 +966,23 @@ def test_virtual_threshold_transition_preserves_active_search() -> None:
     assert transcript.search_status() == (1, 1)
 
 
+def test_scrolled_paint_cost_is_independent_of_unit_count() -> None:
+    durations: list[float] = []
+    for size in (2_000, 20_000):
+        transcript = _transcript(size)
+        transcript.create_content(100, 30)
+        for _ in range(10):
+            transcript.page_up()
+            transcript.create_content(100, 30)
+        started = time.perf_counter()
+        for _ in range(100):
+            transcript.create_content(100, 30)
+        durations.append(time.perf_counter() - started)
+
+    assert durations[1] < 0.1
+    assert durations[1] < durations[0] * 3
+
+
 def test_virtual_position_indicator_uses_consistent_line_estimates() -> None:
     transcript = TranscriptWidget()
     for index in range(128):
@@ -1056,3 +1332,218 @@ def test_lazy_tail_disabled_when_max_lines_set() -> None:
     assert actual == ([[]] * (10 - len(expected))) + expected
     assert marker in "".join(text for _, text in expected[0])
     assert content.line_count == 10
+
+
+def test_long_stream_page_up_visits_every_stream_line() -> None:
+    transcript = _transcript(128)
+    stream = StreamingText(theme.BODY, palette_role="body")
+    unit = transcript.append(stream)
+    stream.append("\n".join(f"stream-{index}" for index in range(30)))
+    transcript.touch(unit)
+    transcript.create_content(80, 5)
+
+    visible: set[str] = set()
+    for _ in range(8):
+        text = _content_text(transcript, 80, 5)
+        visible.update(re.findall(r"stream-\d+", text))
+        transcript.page_up()
+
+    assert visible == {f"stream-{index}" for index in range(30)}
+
+
+@pytest.mark.asyncio
+async def test_agent_completion_before_first_refresh_publishes_final_tail(
+    tmp_path: Path,
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("final child answer")])
+    )
+    transcript = TranscriptWidget()
+    call = ToolCall("agent-1", "agent", {"prompt": "inspect", "description": "short"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    transcript.start_tool(call.id, call, render_module.render_event(start), start)
+    transcript.update_tool(
+        call.id,
+        Text("turn 1"),
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            tool_call=call,
+            data={"child_session_path": str(child.session_dir)},
+        ),
+    )
+    end = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done",
+            structured_content={"child_session_path": str(child.session_dir)},
+        ),
+    )
+    transcript.finish_tool(call.id, render_module.render_event(end), end)
+    await asyncio.sleep(0.05)
+
+    assert "final child answer" in Text.from_ansi(transcript.render(100)).plain
+    assert "child transcript unavailable" not in Text.from_ansi(
+        transcript.render(100)
+    ).plain
+
+
+@pytest.mark.asyncio
+async def test_grandchild_append_updates_parent_agent_card(tmp_path: Path) -> None:
+    parent = ConversationStore(tmp_path / "agents", session_id="1")
+    grandchild = ConversationStore(parent.session_dir / "agents", session_id="1")
+    nested = ToolCall("nested", "agent", {"prompt": "nested"})
+    parent.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(nested)])
+    )
+    parent.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(
+                nested.id,
+                "running",
+                structured_content={"child_session_path": str(grandchild.session_dir)},
+            ),
+        )
+    )
+    grandchild.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("nested first")])
+    )
+    transcript = TranscriptWidget()
+    call = ToolCall("agent-1", "agent", {"prompt": "inspect"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    transcript.start_tool(call.id, call, render_module.render_event(start), start)
+    transcript.update_tool(
+        call.id,
+        Text("turn 1"),
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            tool_call=call,
+            data={"child_session_path": str(parent.session_dir)},
+        ),
+    )
+    await transcript.refresh_agent_transcripts()
+    grandchild.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("nested appended")])
+    )
+
+    await transcript.refresh_agent_transcripts()
+
+    assert "nested appended" in Text.from_ansi(transcript.render(100)).plain
+
+
+@pytest.mark.asyncio
+async def test_oversized_far_branch_clears_existing_agent_tail(tmp_path: Path) -> None:
+    from zeta.tui.cards.agent import AgentCard
+
+    store = ConversationStore(tmp_path / "agents", session_id="oversized")
+    first = store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("first")])
+    )
+    payload = "x" * 13_000
+    for index in range(1_500):
+        store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"old-{index}-{payload}")])
+        )
+    assert store.path.stat().st_size > 16 * 1024 * 1024
+
+    card = AgentCard(ToolCall("agent-oversized", "agent", {"prompt": "inspect"}))
+    card.set_child_session_path(str(store.session_dir))
+    assert await card.refresh_tail()
+    assert any("old-1499" in line for line in card._tail)
+
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("NEW-BRANCH")]),
+        parent_id=first.id,
+    )
+    assert await card.refresh_tail()
+
+    assert card._tail == (
+        "child transcript unavailable: history exceeds bounded scan",
+    )
+    console = Console(record=True, width=100)
+    console.print(card.current())
+    rendered = console.export_text()
+    assert "old-1499" not in rendered
+    assert "history exceeds bounded scan" in rendered
+    card.release_transcript_source()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_failing_agent_source_does_not_stop_batch_or_spinner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from zeta.tui.cards.agent import AgentCard
+
+    cards = []
+    for index in range(3):
+        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"child-{index}")])
+        )
+        child.close()
+        card = AgentCard(ToolCall(f"agent-{index}", "agent", {"prompt": "inspect"}))
+        card.set_child_session_path(str(child.session_dir))
+        cards.append(card)
+
+    failing_path = cards[1].transcript_source.path
+    original_refresh = agent_sync_module.AgentTranscriptSource.refresh
+
+    def fail_one_source(self, *, recursive: bool = False):
+        if self.path == failing_path:
+            raise OSError("broken child")
+        return original_refresh(self, recursive=recursive)
+
+    monkeypatch.setattr(
+        agent_sync_module.AgentTranscriptSource,
+        "refresh",
+        fail_one_source,
+    )
+
+    class Presenter:
+        has_active_agent = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def refresh_active_agent_transcripts(self) -> None:
+            self.calls += 1
+            await agent_sync_module.refresh_agent_cards(cards)
+
+    class Spinner(TurnConsumerMixin):
+        pass
+
+    monkeypatch.setattr(composer_module, "SPINNER_INTERVAL", 0.001)
+    monkeypatch.setattr(composer_module, "AGENT_TRANSCRIPT_REFRESH_INTERVAL", 0.0)
+    caplog.set_level("WARNING", logger=agent_sync_module.__name__)
+    spinner = Spinner()
+    spinner._presenter = Presenter()
+    spinner._spinner_reset = asyncio.Event()
+    spinner._spinner_active = True
+    spinner._spinner_frame = 0
+    spinner._invalidate_prompt = lambda: None
+    task = asyncio.create_task(spinner._pulse_spinner())
+    try:
+        for _ in range(100):
+            if spinner._spinner_frame >= 3:
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert spinner._spinner_frame >= 3
+    assert spinner._presenter.calls >= 3
+    assert cards[0]._tail == ("assistant: child-0",)
+    assert cards[1]._tail == ("child transcript unavailable: refresh failed",)
+    assert cards[2]._tail == ("assistant: child-2",)
+    errors = [record for record in caplog.records if "broken child" in record.message]
+    assert len(errors) == 1
+    for card in cards:
+        card.release_transcript_source()

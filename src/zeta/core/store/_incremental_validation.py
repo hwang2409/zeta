@@ -31,14 +31,20 @@ class IncrementalValidationMixin:
     def _rebuild_incremental_validation_state(self) -> None:
         """Build O(1) integrity indexes after a complete validation pass."""
         self._reset_incremental_validation_state()
-        self._entry_ids = {entry.id for entry in self._entries}
-        by_id = {entry.id: entry for entry in self._entries}
+        by_id: dict[str, ConversationEntry] = {}
+        for index, entry in enumerate(self._entries):
+            if index and index % 64 == 0:
+                time.sleep(0.0001)
+            self._entry_ids.add(entry.id)
+            by_id[entry.id] = entry
         branch: list[ConversationEntry] = []
         current = self._entries[-1] if self._entries else None
         while current is not None:
             branch.append(current)
             current = by_id.get(current.parent_id) if current.parent_id else None
-        for entry in reversed(branch):
+        for index, entry in enumerate(reversed(branch)):
+            if index and index % 64 == 0:
+                time.sleep(0.0001)
             self._record_active_entry(entry)
 
     def _accept_incremental_entries(
