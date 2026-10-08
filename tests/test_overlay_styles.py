@@ -28,19 +28,19 @@ def _restore_palette():
 
 
 def _task(task_id: str, **kwargs) -> BackgroundTaskInfo:
-    base = dict(
-        command="python -m http.server 8000",
-        pid=4242,
-        owner="run_background",
-        running=True,
-        exit_code=None,
-        note=None,
-        terminal_phase=None,
-        started_at=0.0,
-        ended_at=None,
-        output_bytes=0,
-        output_lines=0,
-    )
+    base = {
+        "command": "python -m http.server 8000",
+        "pid": 4242,
+        "owner": "run_background",
+        "running": True,
+        "exit_code": None,
+        "note": None,
+        "terminal_phase": None,
+        "started_at": 0.0,
+        "ended_at": None,
+        "output_bytes": 0,
+        "output_lines": 0,
+    }
     base.update(kwargs)
     return BackgroundTaskInfo(task_id=task_id, **base)
 
