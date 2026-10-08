@@ -37,6 +37,7 @@ from ..core.session import (
 from ..core.slash import (
     SlashCommand,
     SlashCommandRegistry,
+    SlashStatus,
     UsageTracker,
     _format_status,
     create_slash_registry,
@@ -106,6 +107,18 @@ from .transcript import (
     stream_key,
 )
 from .transcript.finder_runtime import FinderRuntimeMixin
+
+
+def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
+    return [
+        overlay.title("Status"),
+        overlay.rule(),
+        *([overlay.value(line)] for line in _format_status(status).splitlines()),
+        overlay.rule(),
+        overlay.hint(
+            "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"
+        ),
+    ]
 
 
 def _register_tui_slash_commands(registry: SlashCommandRegistry) -> None:
@@ -665,20 +678,7 @@ class TUIApp(
         else:
             self._status_restore_text = ""
             self._status_restore_cursor = 0
-        self._status_card.set_lines(
-            [
-                overlay.title("Status"),
-                overlay.rule(),
-                *(
-                    [overlay.value(line)]
-                    for line in _format_status(self.slash_status()).splitlines()
-                ),
-                overlay.rule(),
-                overlay.hint(
-                    "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"
-                ),
-            ]
-        )
+        self._status_card.set_lines(_status_card_lines(self.slash_status()))
         self._status_card_open = True
         session.layout.focus(self._status_card_window)
         self._invalidate_prompt()

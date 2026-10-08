@@ -13,9 +13,11 @@ from __future__ import annotations
 import pytest
 from prompt_toolkit.styles import Style
 
+from zeta.core.slash import SlashStatus
 from zeta.mcp.management import MCPManagementService
 from zeta.tools._shared.process import BackgroundTaskInfo
 from zeta.tui import overlay, theme
+from zeta.tui.app import _status_card_lines
 from zeta.tui.cards.mcp_manager import MCPManager
 from zeta.tui.cards.tasks_panel import BackgroundTasksPanel
 
@@ -78,13 +80,18 @@ def _mcp_lines(tmp_path) -> list[overlay.FragmentLine]:
 
 
 def _status_lines() -> list[overlay.FragmentLine]:
-    return [
-        overlay.title("Status"),
-        overlay.rule(),
-        *([overlay.value(line)] for line in ("session abc123", "tokens 1,234", "")),
-        overlay.rule(),
-        overlay.hint("↑/↓ scroll · esc close"),
-    ]
+    return _status_card_lines(
+        SlashStatus(
+            session_id="abc123",
+            provider="test",
+            model="test",
+            retained_tail=0,
+            tokens_used_this_session=1234,
+            tokens_in_current_context=1234,
+            compaction_marker_count=0,
+            pending_approvals=(),
+        )
+    )
 
 
 def _all_popup_lines(tmp_path) -> dict[str, list[overlay.FragmentLine]]:
