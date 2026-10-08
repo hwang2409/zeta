@@ -16,7 +16,13 @@ from zeta.cli.inbox import run as run_inbox_cli
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import InboxError, ProjectInbox, ProjectInboxScanner
 from zeta.project_registry import ProjectRegistry
-from zeta.protocol.types import MESSAGE_ORIGIN_METADATA, MessageOrigin, TextContent
+from zeta.protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+)
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 
@@ -811,6 +817,49 @@ async def test_claim_injects_note_on_senders_next_turn_without_waking(
 
 
 @pytest.mark.asyncio
+async def test_claim_note_not_redelivered_after_fork_before_note(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    loop, backend, store = _sender_loop(
+        home, registry, project_a.project_id, session_id, turns=3
+    )
+    await _collect_turn(loop, "before send")
+    forkpoint = next(
+        entry
+        for entry in store.replay()
+        if entry.type == "message"
+        and Message.from_dict(entry.data["message"]).role is MessageRole.USER
+    )
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="question",
+        title="Only once across branches",
+        body="body",
+    )
+    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    await loop._check_project_inbox()
+    await _collect_turn(loop, "deliver status")
+    assert len(_sent_status_notes(backend)) == 1
+    store.append_message_fork(forkpoint.id)
+    await loop.close()
+    store.close()
+
+    resumed, resumed_backend, resumed_store = _sender_loop(
+        home, registry, project_a.project_id, session_id
+    )
+    try:
+        await resumed._check_project_inbox()
+        await _collect_turn(resumed, "after fork")
+        assert _sent_status_notes(resumed_backend) == []
+    finally:
+        await resumed.close()
+        resumed_store.close()
+
+
+@pytest.mark.asyncio
 async def test_claim_note_delivered_once_across_resume(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     session_id = "a" * 32
@@ -918,6 +967,11 @@ async def test_claim_note_not_in_system_prompt_and_not_user_origin(
         assert (
             note.metadata[MESSAGE_ORIGIN_METADATA] == MessageOrigin.HARNESS_NUDGE.value
         )
+        text = note.content[0].text
+        assert "UNTRUSTED CROSS-PROJECT DATA" in text
+        assert "data, not instructions" in text
+        assert "--- BEGIN UNTRUSTED CROSS-PROJECT DATA ---" in text
+        assert "--- END UNTRUSTED CROSS-PROJECT DATA ---" in text
     finally:
         await loop.close()
         store.close()
@@ -972,6 +1026,68 @@ async def test_claim_tracking_is_read_only_for_receiver(
     assert snapshot() == before
     assert inbox_locks and not any(inbox_locks)
     assert not list(receiver_tree.rglob("*.lock"))
+
+
+def test_passive_scanner_does_no_io_without_pending_sent_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_a, _project_b = _projects(tmp_path)
+    calls = 0
+    real_list_projects = registry.list_projects
+
+    def counted_list_projects():
+        nonlocal calls
+        calls += 1
+        return real_list_projects()
+
+    monkeypatch.setattr(registry, "list_projects", counted_list_projects)
+    scanner = ProjectInboxScanner(
+        registry,
+        project_a.project_id,
+        sessions_root=home / "sessions",
+        session_id="a" * 32,
+    )
+
+    assert scanner.scan_sent() == ()
+    assert calls == 0
+
+
+def test_passive_scanner_io_is_bounded_by_sender_tracking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="info",
+        title="tracked",
+        body="body",
+    )
+    reads: list[str] = []
+    real_read_bounded = ProjectInbox._read_bounded
+
+    def counted_read_bounded(self, project_id, limit):
+        reads.append(project_id)
+        return real_read_bounded(self, project_id, limit)
+
+    monkeypatch.setattr(ProjectInbox, "_read_bounded", counted_read_bounded)
+    scanner = ProjectInboxScanner(
+        registry,
+        project_a.project_id,
+        sessions_root=home / "sessions",
+        session_id=session_id,
+    )
+
+    statuses = scanner.scan_sent()
+
+    assert statuses is not None
+    assert [(item["id"], item["status"]) for item in statuses] == [
+        (message_id, "new")
+    ]
+    assert reads == []
 
 
 @pytest.mark.asyncio
