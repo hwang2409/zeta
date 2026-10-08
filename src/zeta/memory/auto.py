@@ -136,9 +136,7 @@ class AutoMemoryReconciler:
             self.position_path,
             project_id=project_id,
             session_id=session_id,
-            diagnostics_path=registry.root.parent
-            / "logs"
-            / "memory-reconciliation.jsonl",
+            diagnostics_path=registry.root.parent / "logs" / "memory-reconciliation.jsonl",
         )
         self._pending: list[_PendingRange] = []
         self._wake = asyncio.Event()
@@ -236,7 +234,9 @@ class AutoMemoryReconciler:
         task = self._worker_task
         if task is None:
             return
-        done, _ = await asyncio.wait({task}, timeout=self.config.shutdown_grace_seconds)
+        done, _ = await asyncio.wait(
+            {task}, timeout=self.config.shutdown_grace_seconds
+        )
         if done:
             await asyncio.gather(task, return_exceptions=True)
             return
@@ -260,7 +260,8 @@ class AutoMemoryReconciler:
         return tuple(
             work
             for work in self.state.ready_retries(self._retry_clock())
-            if self._retry_attempts_in_cycle.get(work.key, 0) < MAX_SCHEDULED_ATTEMPTS
+            if self._retry_attempts_in_cycle.get(work.key, 0)
+            < MAX_SCHEDULED_ATTEMPTS
         )
 
     def _ensure_worker(self) -> None:
@@ -313,17 +314,13 @@ class AutoMemoryReconciler:
                     )
             generation = self._activity_generation
             if generation != self._seen_activity_generation:
-                (
-                    latest_seq,
-                    _transcript_bytes,
-                    transcript_tokens,
-                ) = await asyncio.to_thread(self._transcript_state)
+                latest_seq, _transcript_bytes, transcript_tokens = await asyncio.to_thread(
+                    self._transcript_state
+                )
                 self._seen_activity_generation = generation
                 growth = max(0, transcript_tokens - self._last_reconciled_tokens)
                 if growth >= self.config.token_threshold:
-                    self._add_pending(
-                        self.last_reconciled_seq + 1, latest_seq, "tokens"
-                    )
+                    self._add_pending(self.last_reconciled_seq + 1, latest_seq, "tokens")
                 early_range = await asyncio.to_thread(
                     self._completed_direct_user_turn, latest_seq
                 )
@@ -399,9 +396,7 @@ class AutoMemoryReconciler:
             retry_after = self.state.next_retry_after(exclude=exhausted_retry_keys)
             if retry_after is not None:
                 retry_timeout = max(0.0, retry_after - self._retry_clock())
-                timeout = (
-                    retry_timeout if timeout is None else min(timeout, retry_timeout)
-                )
+                timeout = retry_timeout if timeout is None else min(timeout, retry_timeout)
             try:
                 await self._idle_wait(self._wake, timeout)
             except TimeoutError:
@@ -447,9 +442,9 @@ class AutoMemoryReconciler:
                             invoke=self.invoke,
                             cas_retries=self.config.cas_retries,
                             as_of=today,
-                            now=datetime.now(UTC)
-                            .isoformat(timespec="microseconds")
-                            .replace("+00:00", "Z"),
+                            now=datetime.now(UTC).isoformat(timespec="microseconds").replace(
+                                "+00:00", "Z"
+                            ),
                         )
                         selected_start = entry_result.seq_start
                         selected_end = entry_result.seq_end
@@ -619,7 +614,9 @@ class AutoMemoryReconciler:
         return raw, {}
 
     @staticmethod
-    def _sum_usage(total: dict[str, int], addition: dict[str, int]) -> dict[str, int]:
+    def _sum_usage(
+        total: dict[str, int], addition: dict[str, int]
+    ) -> dict[str, int]:
         result = dict(total)
         for key, value in addition.items():
             if type(value) is int and value >= 0:
@@ -645,19 +642,16 @@ class AutoMemoryReconciler:
 
     def _append_failure_log(self, failure: ReconciliationFailure) -> None:
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        line = (
-            json.dumps(
-                {
-                    "occurred_at": failure.occurred_at,
-                    "message": failure.message,
-                    "seq_start": failure.seq_start,
-                    "seq_end": failure.seq_end,
-                    "terminal": failure.terminal,
-                },
-                sort_keys=True,
-            ).encode()
-            + b"\n"
-        )
+        line = json.dumps(
+            {
+                "occurred_at": failure.occurred_at,
+                "message": failure.message,
+                "seq_start": failure.seq_start,
+                "seq_end": failure.seq_end,
+                "terminal": failure.terminal,
+            },
+            sort_keys=True,
+        ).encode() + b"\n"
         try:
             previous = self.failure_log_path.read_bytes()
         except FileNotFoundError:
