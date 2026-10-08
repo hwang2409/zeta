@@ -405,18 +405,6 @@ def _evict_delivery(
             },
         )
     ]
-    if status == "dropped":
-        rows.append(
-            (
-                "client_delivery",
-                {
-                    "delivery_id": delivery_id,
-                    "method": "steer",
-                    "status": "dropped",
-                    "reason": "clear",
-                },
-            )
-        )
     rows.extend(
         (
             "client_delivery",
@@ -429,6 +417,18 @@ def _evict_delivery(
         )
         for index in range(1_000)
     )
+    if status == "dropped":
+        rows.append(
+            (
+                "client_delivery",
+                {
+                    "delivery_id": delivery_id,
+                    "method": "steer",
+                    "status": "dropped",
+                    "reason": "clear",
+                },
+            )
+        )
     store.append_many(rows)
 
 
