@@ -585,13 +585,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         if self._follow_tail and amount >= 0:
             return
         if self._uses_virtual_history():
-            if self._follow_tail and amount < 0 and self._anchor is not None:
-                anchor_unit, anchor_offset = self._anchor
-                if anchor_unit in self._units:
-                    self._virtual_start = (
-                        self._units.index(anchor_unit),
-                        anchor_offset,
-                    )
             self._pending_virtual_scroll += amount
             if amount < 0:
                 self._follow_tail = False
