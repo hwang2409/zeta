@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 import zeta
 from zeta.attention_forks import (
     ATTENTION_FORK_POLICY,
     create_discussion_fork,
     read_attention_fork,
+    validate_attention_fork,
 )
 from zeta.attention_panel import panel_snapshot
 from zeta.attention_records import AttentionStore
@@ -259,4 +264,84 @@ def test_fork_copies_active_branch_through_anchor_without_modifying_source(
         "resolve_attention",
     )
     fork.store.close()
+    opened.store.close()
+
+
+def test_concurrent_fork_creators_reuse_one_usable_session(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "Alpha")
+    opened = _session(tmp_path, project_id=project.project_id)
+    anchor = opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("Choose")])
+    )
+    attention = AttentionStore(opened.store.session_dir).request(
+        session_id=opened.store.session_id,
+        project_id=project.project_id,
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+        title="Question",
+        why="Need a choice.",
+    )
+    sessions_before = {path.name for path in manager.sessions_dir.iterdir()}
+    original_create = SessionManager.create
+
+    def delayed_create(self, *args, **kwargs):
+        time.sleep(0.1)
+        return original_create(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionManager, "create", delayed_create)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fork_ids = tuple(
+            pool.map(
+                lambda _: create_discussion_fork(
+                    tmp_path, opened.store.session_id, attention.id
+                ),
+                range(2),
+            )
+        )
+
+    assert fork_ids[0] == fork_ids[1]
+    assert {path.name for path in manager.sessions_dir.iterdir()} == sessions_before | {
+        fork_ids[0]
+    }
+    fork = manager.open(fork_ids[0], _read_only=True)
+    validated = validate_attention_fork(
+        home=tmp_path,
+        current_session_id=fork_ids[0],
+        current_project_id=project.project_id,
+        directory_fd=fork.store.directory_fd,
+    )
+    assert validated.record.fork_session_id == fork_ids[0]
+    fork.store.close()
+    opened.store.close()
+
+
+def test_failed_fork_binding_removes_created_session(
+    tmp_path: Path, monkeypatch
+) -> None:
+    opened = _session(tmp_path)
+    anchor = opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("Choose")])
+    )
+    attention = AttentionStore(opened.store.session_dir).request(
+        session_id=opened.store.session_id,
+        project_id=None,
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+        title="Question",
+        why="Need a choice.",
+    )
+    manager = SessionManager(tmp_path)
+    sessions_before = {path.name for path in manager.sessions_dir.iterdir()}
+
+    def fail_replace(self, record, *, create_directory=False):
+        raise OSError("binding publication failed")
+
+    monkeypatch.setattr(AttentionStore, "replace", fail_replace)
+    with pytest.raises(OSError, match="binding publication failed"):
+        create_discussion_fork(tmp_path, opened.store.session_id, attention.id)
+
+    assert {path.name for path in manager.sessions_dir.iterdir()} == sessions_before
     opened.store.close()

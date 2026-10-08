@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,8 +17,14 @@ from .attention_records import (
     read_bounded_session_json,
 )
 from .config.tool_policy import ToolPolicy
-from .core.session import SessionManager
-from .core.session_files import session_directory, write_session_file
+from .core.checkpoints import ConversationEntry
+from .core.session import OpenedSession, SessionManager
+from .core.session_files import (
+    child_directory,
+    open_session_file,
+    session_directory,
+    write_session_file,
+)
 from .protocol.types import Message, MessageRole, TextContent
 from .skills import SkillCatalog
 from .skills.agent_catalog import AgentCatalog
@@ -106,6 +115,126 @@ def attention_decision_message_id(attention_id: str) -> str:
     ]
 
 
+@contextmanager
+def _fork_allocation_lock(
+    attention_store: AttentionStore, attention_id: str
+) -> Iterator[None]:
+    if len(attention_id) != 32 or any(
+        character not in "0123456789abcdef" for character in attention_id
+    ):
+        raise ValueError("invalid attention id")
+    with (
+        session_directory(
+            attention_store.session_dir.parent, attention_store.session_dir.name
+        ) as (_, session_fd),
+        child_directory(session_fd, "attention") as attention_fd,
+    ):
+        lock_fd = open_session_file(
+            attention_fd, f".{attention_id}.lock", os.O_RDWR | os.O_CREAT
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+
+def _create_fork_session(
+    *,
+    manager: SessionManager,
+    source: OpenedSession,
+    record: AttentionRecord,
+    branch: list[ConversationEntry],
+    anchor: int,
+) -> str:
+    metadata = source.metadata
+    fork = manager.create(
+        provider=metadata.provider,
+        model=metadata.model,
+        cwd=metadata.cwd,
+        retained_tail=metadata.retained_tail,
+        compaction_budget=metadata.compaction_budget,
+        compaction=metadata.compaction,
+        compaction_pinned=metadata.compaction_pinned,
+        system_prompt=metadata.system_prompt,
+        context_files=metadata.context_files,
+        skill_catalog=(
+            SkillCatalog.from_snapshot(metadata.skill_catalog)
+            if metadata.skill_catalog is not None
+            else None
+        ),
+        agent_catalog=(
+            AgentCatalog.from_snapshot(metadata.agent_catalog)
+            if metadata.agent_catalog is not None
+            else None
+        ),
+        vim_mode=metadata.vim_mode,
+        budget_pinned=metadata.budget_pinned,
+        name=f"Discussion: {record.title}",
+        project_id=metadata.project_id,
+        project_role="session",
+        parent_session_id=record.session_id,
+        tool_allow=ATTENTION_FORK_POLICY.allow,
+        auto_project=False,
+    )
+    fork_id = fork.store.session_id
+    try:
+        try:
+            with session_directory(manager.sessions_dir, fork_id) as (_, fork_fd):
+                write_session_file(
+                    fork_fd,
+                    "attention_fork.json",
+                    (
+                        json.dumps(
+                            {
+                                "forked_from_session": record.session_id,
+                                "forked_at_entry": record.entry_id,
+                                "attention_id": record.id,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode(),
+                )
+        finally:
+            fork.store.close()
+        log_path = fork.store.session_dir / "conversation.jsonl"
+        header = log_path.read_bytes().splitlines(keepends=True)[0]
+        log_path.write_bytes(
+            header
+            + b"".join(
+                (
+                    json.dumps(entry.to_dict(), sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                ).encode()
+                for entry in branch[: anchor + 1]
+            )
+        )
+        reopened = manager.open(fork_id)
+        try:
+            note = (
+                f"You are a discussion fork for attention item {record.id}: "
+                f"{record.title}. The original session keeps running. Read, search, "
+                "and discuss only. When the user reaches a decision, send it with "
+                "resolve_attention."
+            )
+            reopened.store.append_message(
+                Message(
+                    MessageRole.SYSTEM,
+                    [TextContent(note)],
+                    metadata={"origin": "harness", "kind": "attention_fork"},
+                )
+            )
+        finally:
+            reopened.store.close()
+    except BaseException:
+        manager.delete(fork_id)
+        raise
+    return fork_id
+
+
 def create_discussion_fork(
     home: Path, source_session_id: str, attention_id: str
 ) -> str:
@@ -114,103 +243,48 @@ def create_discussion_fork(
     source = manager.open(source_session_id, _read_only=True)
     try:
         attention_store = AttentionStore(source.store.session_dir)
-        record = attention_store.get(attention_id)
-        if record.session_id != source_session_id:
-            raise ValueError("attention record does not belong to the source session")
-        if record.project_id != source.metadata.project_id:
-            raise ValueError("attention record does not belong to the source project")
-        if record.fork_session_id:
-            return record.fork_session_id
-        branch = source.store.replay()
-        anchor_index = next(
-            (
-                index
-                for index, entry in enumerate(branch)
-                if entry.id == record.entry_id
-            ),
-            None,
-        )
-        if anchor_index is None:
-            raise ValueError("attention anchor is not on the active branch")
-        metadata = source.metadata
-        fork = manager.create(
-            provider=metadata.provider,
-            model=metadata.model,
-            cwd=metadata.cwd,
-            retained_tail=metadata.retained_tail,
-            compaction_budget=metadata.compaction_budget,
-            compaction=metadata.compaction,
-            compaction_pinned=metadata.compaction_pinned,
-            system_prompt=metadata.system_prompt,
-            context_files=metadata.context_files,
-            skill_catalog=(
-                SkillCatalog.from_snapshot(metadata.skill_catalog)
-                if metadata.skill_catalog is not None
-                else None
-            ),
-            agent_catalog=(
-                AgentCatalog.from_snapshot(metadata.agent_catalog)
-                if metadata.agent_catalog is not None
-                else None
-            ),
-            vim_mode=metadata.vim_mode,
-            budget_pinned=metadata.budget_pinned,
-            name=f"Discussion: {record.title}",
-            project_id=metadata.project_id,
-            project_role="session",
-            parent_session_id=source_session_id,
-            tool_allow=ATTENTION_FORK_POLICY.allow,
-            auto_project=False,
-        )
-        fork_id = fork.store.session_id
-        with session_directory(manager.sessions_dir, fork_id) as (_, fork_fd):
-            write_session_file(
-                fork_fd,
-                "attention_fork.json",
+        with _fork_allocation_lock(attention_store, attention_id):
+            record = attention_store.get(attention_id)
+            if record.session_id != source_session_id:
+                raise ValueError("attention record does not belong to the source session")
+            if record.project_id != source.metadata.project_id:
+                raise ValueError("attention record does not belong to the source project")
+            if record.fork_session_id:
+                return record.fork_session_id
+            branch = source.store.replay()
+            anchor_index = next(
                 (
-                    json.dumps(
-                        {
-                            "forked_from_session": source_session_id,
-                            "forked_at_entry": record.entry_id,
-                            "attention_id": record.id,
-                        },
-                        sort_keys=True,
-                        separators=(",", ":"),
+                    index
+                    for index, entry in enumerate(branch)
+                    if entry.id == record.entry_id
+                ),
+                None,
+            )
+            if anchor_index is None:
+                raise ValueError("attention anchor is not on the active branch")
+            fork_id = _create_fork_session(
+                manager=manager,
+                source=source,
+                record=record,
+                branch=branch,
+                anchor=anchor_index,
+            )
+            bound_record = AttentionRecord.from_dict(
+                {**record.to_dict(), "fork_session_id": fork_id}
+            )
+            try:
+                attention_store.replace(bound_record)
+            except BaseException:
+                try:
+                    publication_succeeded = (
+                        attention_store.get(attention_id).fork_session_id == fork_id
                     )
-                    + "\n"
-                ).encode(),
-            )
-        fork.store.close()
-        log_path = fork.store.session_dir / "conversation.jsonl"
-        header = log_path.read_bytes().splitlines(keepends=True)[0]
-        selected = branch[: anchor_index + 1]
-        log_path.write_bytes(
-            header
-            + b"".join(
-                (
-                    json.dumps(entry.to_dict(), sort_keys=True, separators=(",", ":"))
-                    + "\n"
-                ).encode()
-                for entry in selected
-            )
-        )
-        reopened = manager.open(fork_id)
-        note = (
-            f"You are a discussion fork for attention item {record.id}: {record.title}. "
-            "The original session keeps running. Read, search, and discuss only. "
-            "When the user reaches a decision, send it with resolve_attention."
-        )
-        reopened.store.append_message(
-            Message(
-                MessageRole.SYSTEM,
-                [TextContent(note)],
-                metadata={"origin": "harness", "kind": "attention_fork"},
-            )
-        )
-        reopened.store.close()
-        attention_store.replace(
-            AttentionRecord.from_dict({**record.to_dict(), "fork_session_id": fork_id})
-        )
-        return fork_id
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    publication_succeeded = False
+                if publication_succeeded:
+                    return fork_id
+                manager.delete(fork_id)
+                raise
+            return fork_id
     finally:
         source.store.close()
