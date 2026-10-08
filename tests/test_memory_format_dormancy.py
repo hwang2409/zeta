@@ -190,7 +190,7 @@ def test_cli_tui_serve_sync_refresh_and_index_reject_format_two(
 
 
 @pytest.mark.asyncio
-async def test_auto_reconciler_rejects_format_two_before_provider_call(
+async def test_private_format_two_fixture_reaches_dormant_updater(
     tmp_path: Path,
 ) -> None:
     home, registry, project_id, _ = _format_two_project(tmp_path)
@@ -218,7 +218,7 @@ async def test_auto_reconciler_rejects_format_two_before_provider_call(
     async def invoke(_prompt: str) -> str:
         nonlocal invoked
         invoked = True
-        return "{}"
+        return '{"operations":[]}'
 
     notices: list[str] = []
     runner = AutoMemoryReconciler(
@@ -233,10 +233,37 @@ async def test_auto_reconciler_rejects_format_two_before_provider_call(
     runner.before_eviction(1, 1)
     await runner.drain()
     await runner.close()
-    assert invoked is False
-    assert runner.last_failure is not None
-    assert UNSUPPORTED_FORMAT_2 in runner.last_failure.message
-    assert any(UNSUPPORTED_FORMAT_2 in notice for notice in notices)
+    assert invoked is True
+    assert runner.last_failure is None
+    assert runner.last_reconciled_seq == 1
+    assert notices == []
+
+
+def test_no_public_path_can_apply_a_profile_to_a_real_project(tmp_path: Path) -> None:
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    project_cli.add_subcommand(commands)
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "project",
+                "create",
+                "demo",
+                "--scope",
+                "scope",
+                "--memory-profile",
+                "messaging",
+            ]
+        )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope", workspace)
+    registry.initialize_memory(project.project_id)
+    assert registry.memory_snapshot(project.project_id).contents
+    with pytest.raises(UnsupportedMemoryFormatError, match="uses format 1"):
+        registry._entry_memory_state(project.project_id)
 
 
 def test_format_one_manifest_and_pointer_remain_byte_identical(tmp_path: Path) -> None:

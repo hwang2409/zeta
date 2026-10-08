@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from ..protocol.types import (
     CompletionBackend,
@@ -20,6 +22,24 @@ from ..providers.retry_policy import (
 )
 from .reconciler import ReconciliationResponse
 
+_RESPONSE_BYTE_LIMIT: ContextVar[int | None] = ContextVar(
+    "memory_response_byte_limit", default=None
+)
+
+
+@contextmanager
+def use_response_byte_limit(limit: int) -> Iterator[None]:
+    """Stop a reconciliation stream after this many response bytes."""
+    token = _RESPONSE_BYTE_LIMIT.set(limit)
+    try:
+        yield
+    finally:
+        _RESPONSE_BYTE_LIMIT.reset(token)
+
+
+def _bounded_response(parts: list[str], limit: int) -> str:
+    return "".join(parts).encode()[:limit].decode("utf-8", errors="ignore")
+
 
 async def complete_reconciliation(
     backend: CompletionBackend, prompt: str
@@ -35,6 +55,9 @@ async def complete_reconciliation(
     while budget.start_attempt("memory"):
         final: Message | None = None
         usage: dict[str, int] = {}
+        response_parts: list[str] = []
+        response_bytes = 0
+        response_limit = _RESPONSE_BYTE_LIMIT.get()
         failure: BaseException | object | None = None
         event_data: dict[str, object] = {}
         try:
@@ -44,6 +67,15 @@ async def complete_reconciliation(
                         failure = event.error
                         event_data = dict(event.data)
                         break
+                    if event.type is StreamEventType.MESSAGE_UPDATE and event.delta:
+                        response_parts.append(event.delta)
+                        response_bytes += len(event.delta.encode())
+                        if response_limit is not None and response_bytes > response_limit:
+                            return ReconciliationResponse(
+                                _bounded_response(response_parts, response_limit),
+                                usage,
+                                truncated=True,
+                            )
                     if (
                         event.type is StreamEventType.MESSAGE_END
                         and event.message is not None
@@ -61,14 +93,16 @@ async def complete_reconciliation(
         except BaseException as exc:  # noqa: BLE001 - classified by shared policy
             failure = exc
         if final is not None:
-            return ReconciliationResponse(
-                "".join(
-                    block.text
-                    for block in final.content
-                    if isinstance(block, TextContent)
-                ),
-                usage,
+            text = "".join(
+                block.text
+                for block in final.content
+                if isinstance(block, TextContent)
             )
+            if response_limit is not None and len(text.encode()) > response_limit:
+                return ReconciliationResponse(
+                    _bounded_response([text], response_limit), usage, truncated=True
+                )
+            return ReconciliationResponse(text, usage)
         failure = failure or RuntimeError("memory reconciler returned no final message")
         plan = budget.plan(failure, owner="memory", event_data=event_data)
         if plan is None:

@@ -51,6 +51,7 @@ class _FormatTwoPayloadAdapter:
     receipts: tuple[OperationReceipt, ...]
     reconciliation_key: str | None
     target_version: str | None
+    rejected_groups: tuple[str, ...] = ()
 
     def prepare(self, context: PublicationContext) -> PreparedVersion[EntryMemoryState]:
         retained_operation_ids = {receipt.operation_id for receipt in self.receipts}
@@ -88,6 +89,8 @@ class _FormatTwoPayloadAdapter:
             fields["reconciliation_key"] = self.reconciliation_key
         if self.target_version is not None:
             fields["entry_target_version"] = self.target_version
+        if self.rejected_groups:
+            fields["rejected_groups"] = list(self.rejected_groups)
         return PreparedVersion(
             {"state": canonical_state_bytes(state)},
             {"state": canonical_state_bytes(before)},
@@ -161,6 +164,7 @@ class EntryMemoryHistoryMixin:
         reconciliation_key: str | None = None,
         target_version: str | None = None,
         reset_history: bool = False,
+        rejected_groups: tuple[str, ...] = (),
     ) -> EntryMemorySnapshot:
         adapter = _FormatTwoPayloadAdapter(
             state=state,
@@ -169,6 +173,7 @@ class EntryMemoryHistoryMixin:
             receipts=receipts,
             reconciliation_key=reconciliation_key,
             target_version=target_version,
+            rejected_groups=rejected_groups,
         )
         published = publish_version(
             directory_fd,
@@ -226,12 +231,21 @@ class EntryMemoryHistoryMixin:
         reconciliation_key: str | None,
         automatic: bool = True,
         evidence: tuple[str, int, int] | None = None,
+        rejected_groups: tuple[str, ...] = (),
+        now: str | None = None,
     ) -> EntryCASResult:
         """Apply one dormant format-2 transaction."""
         if not isinstance(expected_digest, str) or not re.fullmatch(
             r"[0-9a-f]{64}", expected_digest
         ):
             raise ProjectRegistryError("invalid memory digest")
+        if len(rejected_groups) > 64 or any(
+            not isinstance(reason, str)
+            or not reason
+            or len(reason.encode("utf-8")) > 512
+            for reason in rejected_groups
+        ):
+            raise ProjectRegistryError("invalid rejected memory operation groups")
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
@@ -272,13 +286,19 @@ class EntryMemoryHistoryMixin:
                 current = self._entry_snapshot_locked(directory_fd)
                 if current.digest != expected_digest:
                     raise ProjectRegistryError("project memory digest mismatch")
-                state, receipts = apply_operations(
-                    current.state,
-                    operations,
-                    reconciliation_key=reconciliation_key,
-                    automatic=automatic,
-                    evidence=evidence,
-                )
+                if operations:
+                    state, receipts = apply_operations(
+                        current.state,
+                        operations,
+                        reconciliation_key=reconciliation_key,
+                        automatic=automatic,
+                        evidence=evidence,
+                        now=now,
+                    )
+                elif rejected_groups:
+                    state, receipts = current.state, ()
+                else:
+                    raise ProjectRegistryError("empty format-2 memory transaction")
                 published = self._publish_entry_version(
                     directory_fd,
                     state=state,
@@ -286,6 +306,7 @@ class EntryMemoryHistoryMixin:
                     kind="entry-update",
                     receipts=receipts,
                     reconciliation_key=reconciliation_key,
+                    rejected_groups=rejected_groups,
                 )
                 return EntryCASResult(
                     published.state,

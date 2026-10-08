@@ -105,6 +105,7 @@ class ReconciliationResponse:
 
     text: str
     usage: Mapping[str, int]
+    truncated: bool = False
 
 
 class ReconciliationError(ValueError):

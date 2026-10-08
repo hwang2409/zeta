@@ -1289,23 +1289,39 @@ async def test_delivery_only_range_advances_cursor_without_provider(tmp_path: Pa
 
     runner, registry, project_id, _ = _runner(tmp_path, invoke, transcript_count=0)
     path = runner.session_dir / "conversation.jsonl"
-    row = {
-        "seq": 1,
-        "type": "client_delivery",
-        "data": {
-            "delivery_id": "private-id",
-            "method": "steer",
-            "status": "queued",
-            "outcome": {"accepted": True},
+    rows = [
+        {"seq": 1, "type": "message", "data": {"text": "user turn"}},
+        {"seq": 2, "type": "message", "data": {"text": "assistant turn"}},
+        {
+            "seq": 3,
+            "type": "client_delivery",
+            "data": {
+                "delivery_id": "private-id",
+                "method": "steer",
+                "status": "queued",
+                "outcome": {"accepted": True},
+            },
         },
-    }
-    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
-    runner.before_eviction(1, 1)
+    ]
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    runner.state.record_success(
+        seq_start=1,
+        seq_end=2,
+        reason="test-setup",
+        end_offset=0,
+        end_tokens=0,
+    )
+    assert runner.state.consume_early_trigger(2)
+
+    runner.before_eviction(3, 3)
     await runner.drain()
 
     position = json.loads(runner.position_path.read_text(encoding="utf-8"))
     assert calls == 0
-    assert position["seq"] == 1
+    assert position["seq"] == 3
+    assert position["early_trigger_seq"] == 2
     assert position["transcript_bytes"] == path.stat().st_size
     assert position["transcript_tokens"] > 0
 
@@ -1317,8 +1333,9 @@ async def test_delivery_only_range_advances_cursor_without_provider(tmp_path: Pa
         invoke=invoke,
         config=runner.config,
     )
-    assert replacement.last_reconciled_seq == 1
-    replacement.activity(1)
+    assert replacement.last_reconciled_seq == 3
+    assert replacement.state.early_trigger_seq == 2
+    replacement.activity(3)
     await replacement.drain()
     assert calls == 0
     await runner.close()

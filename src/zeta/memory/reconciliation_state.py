@@ -111,6 +111,11 @@ class ReconciliationState:
         return int(self._value["transcript_tokens"])
 
     @property
+    def early_trigger_seq(self) -> int:
+        """Highest completed assistant turn consumed by the early trigger."""
+        return int(self._value["early_trigger_seq"])
+
+    @property
     def last_failure(self) -> ReconciliationFailure | None:
         return self._parse_failure(self._value.get("last_failure"))
 
@@ -398,6 +403,14 @@ class ReconciliationState:
         self._publish("explicit-retry")
         return True
 
+    def consume_early_trigger(self, seq: int) -> bool:
+        """Durably consume one completed turn for early-update scheduling."""
+        if seq <= self.early_trigger_seq:
+            return False
+        self._value["early_trigger_seq"] = seq
+        self._publish("early-trigger-consumed")
+        return True
+
     def uncovered_ranges(self, start: int, end: int) -> tuple[tuple[int, int], ...]:
         """Return ranges not already pending, completed out of order, or terminal."""
         covered: list[tuple[int, int]] = []
@@ -617,6 +630,7 @@ class ReconciliationState:
             "seq": 0,
             "transcript_bytes": 0,
             "transcript_tokens": 0,
+            "early_trigger_seq": 0,
             "pending_failures": [],
             "completed_ranges": [],
             "terminal_receipts": [],
@@ -632,6 +646,7 @@ class ReconciliationState:
             "seq",
             "transcript_bytes",
             "transcript_tokens",
+            "early_trigger_seq",
         ):
             candidate = value.get(name, 0)
             if type(candidate) is not int or candidate < 0:

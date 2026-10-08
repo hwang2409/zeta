@@ -61,6 +61,7 @@ def _source(seq: int = 1) -> tuple[MemorySource, ...]:
             seq_end=seq,
             origins=("user",),
             observed_at="2026-10-08T12:00:00Z",
+            evidence_rank=2,
         ),
     )
 
@@ -398,3 +399,30 @@ def test_entry_store_crash_publication_is_atomic(
     visible = registry._entry_memory_state(project_id).state
     entries = [entry for entry in visible.entries.values() if isinstance(entry, MemoryEntry)]
     assert [entry.text for entry in entries] == (["Published"] if step == "publish" else [])
+
+@pytest.mark.parametrize("invalid_rank", [0, 7, True])
+def test_memory_source_evidence_rank_is_canonical_and_bounded(
+    tmp_path: Path, invalid_rank: object
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    initial = registry._create_entry_memory_for_test(project_id, _schema())
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=initial.digest,
+        operations=(AddOperation("decisions", "Use Postgres.", _source()),),
+        reconciliation_key=_key("ranked-source"),
+    )
+    entry = next(
+        value for value in added.state.entries.values() if isinstance(value, MemoryEntry)
+    )
+    encoded = canonical_state_bytes(added.state)
+    assert json.loads(encoded)["entries"][entry.id]["sources"][0]["evidence_rank"] == 2
+    assert state_from_bytes(encoded) == added.state
+
+    invalid_source = dataclasses.replace(entry.sources[0], evidence_rank=invalid_rank)
+    invalid_entry = dataclasses.replace(entry, sources=(invalid_source,))
+    invalid_state = dataclasses.replace(
+        added.state, entries={entry.id: invalid_entry}
+    )
+    with pytest.raises(ProjectRegistryError, match="entry source"):
+        canonical_state_bytes(invalid_state)
