@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import json
 import os
 import re
 import stat
-import uuid
 from collections.abc import Mapping
 
-from zeta.core.session_files import atomic_publish_file
 from zeta.memory.entry_store import (
     EntryCASResult,
     EntryMemorySnapshot,
@@ -32,10 +29,72 @@ from zeta.memory.entry_store import (
 from zeta.memory.entry_store import (
     MemoryState as EntryMemoryState,
 )
+from zeta.memory.version_store import (
+    PreparedVersion,
+    PublicationContext,
+    publish_version,
+    require_memory_format,
+)
 from zeta.project_errors import ProjectRegistryError
 
 _CURRENT = "memory-current.json"
 _MAX_STATE_BYTES = 8 * 1024 * 1024
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _FormatTwoPayloadAdapter:
+    """Prepare one canonical entry-state payload for the shared publisher."""
+
+    state: EntryMemoryState
+    before: EntryMemoryState
+    kind: str
+    receipts: tuple[OperationReceipt, ...]
+    reconciliation_key: str | None
+    target_version: str | None
+
+    def prepare(self, context: PublicationContext) -> PreparedVersion[EntryMemoryState]:
+        retained_operation_ids = {receipt.operation_id for receipt in self.receipts}
+        retained_versions = set(context.retained_history)
+        for version, record in zip(
+            context.old_history, context.old_manifests, strict=True
+        ):
+            if version in retained_versions and record.get("format") == 2:
+                retained_operation_ids.update(
+                    receipt.operation_id
+                    for receipt in EntryMemoryHistoryMixin._entry_receipts(record)
+                )
+        compacted_through = (
+            context.dropped_history[-1]
+            if context.dropped_history
+            else self.state.compacted_through_version
+        )
+        state = compact_inactive_entries(
+            self.state,
+            retained_operation_ids=retained_operation_ids,
+            compacted_through_version=compacted_through,
+        )
+        before = compact_inactive_entries(
+            self.before,
+            retained_operation_ids=retained_operation_ids,
+            compacted_through_version=compacted_through,
+        )
+        fields: dict[str, object] = {
+            "format": 2,
+            "kind": self.kind,
+            "created_at": utc_now(),
+            "operations": [receipt_to_dict(receipt) for receipt in self.receipts],
+        }
+        if self.reconciliation_key is not None:
+            fields["reconciliation_key"] = self.reconciliation_key
+        if self.target_version is not None:
+            fields["entry_target_version"] = self.target_version
+        return PreparedVersion(
+            {"state": canonical_state_bytes(state)},
+            {"state": canonical_state_bytes(before)},
+            fields,
+            state,
+            scalar_payload=True,
+        )
 
 
 class EntryMemoryHistoryMixin:
@@ -63,6 +122,13 @@ class EntryMemoryHistoryMixin:
             os.close(fd)
 
     def _entry_snapshot_locked(self, directory_fd: int) -> EntryMemorySnapshot:
+        require_memory_format(
+            directory_fd,
+            2,
+            pointer_reader=self._pointer,
+            version_handles=lambda fd, create: self._version_handles(fd, create=create),
+            manifest_reader=self._manifest,
+        )
         pointer = self._pointer(directory_fd)
         if pointer is None:
             raise ProjectRegistryError("format-2 memory is not initialized")
@@ -70,8 +136,6 @@ class EntryMemoryHistoryMixin:
         try:
             version = str(pointer["current"])
             manifest = self._manifest(versions_fd, version)
-            if manifest.get("format") != 2:
-                raise ProjectRegistryError("project memory is not format 2")
             state, digest = self._entry_blob(blobs_fd, manifest.get("snapshot"))
             return EntryMemorySnapshot(state, digest, version)
         finally:
@@ -98,90 +162,30 @@ class EntryMemoryHistoryMixin:
         target_version: str | None = None,
         reset_history: bool = False,
     ) -> EntryMemorySnapshot:
-        root, blobs_fd, versions_fd = self._version_handles(directory_fd, create=True)
-        try:
-            pointer = self._pointer(directory_fd)
-            old_history = (
-                [] if reset_history or pointer is None else list(pointer["history"])
-            )
-            version = uuid.uuid4().hex
-            prospective_history = [*old_history, version][-self._entry_retention_limit():]
-            dropped = old_history[: max(0, len(old_history) + 1 - self._entry_retention_limit())]
-            retained_operation_ids = {receipt.operation_id for receipt in receipts}
-            for retained_version in prospective_history:
-                if retained_version == version:
-                    continue
-                record = self._manifest(versions_fd, retained_version)
-                if record.get("format") == 2:
-                    retained_operation_ids.update(
-                        receipt.operation_id for receipt in self._entry_receipts(record)
-                    )
-            compacted_through = (
-                dropped[-1] if dropped else state.compacted_through_version
-            )
-            state = compact_inactive_entries(
-                state,
-                retained_operation_ids=retained_operation_ids,
-                compacted_through_version=compacted_through,
-            )
-            before = compact_inactive_entries(
-                before,
-                retained_operation_ids=retained_operation_ids,
-                compacted_through_version=compacted_through,
-            )
-
-            def publish_blob(value: EntryMemoryState) -> str:
-                payload = canonical_state_bytes(value)
-                digest = hashlib.sha256(payload).hexdigest()
-                try:
-                    os.stat(digest, dir_fd=blobs_fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    atomic_publish_file(blobs_fd, digest, payload)
-                return digest
-
-            snapshot_digest = publish_blob(state)
-            before_digest = publish_blob(before)
-            os.fsync(blobs_fd)
-            self._memory_transaction_step("snapshot")
-            manifest: dict[str, object] = {
-                "version": version,
-                "format": 2,
-                "kind": kind,
-                "created_at": utc_now(),
-                "snapshot": snapshot_digest,
-                "before_snapshot": before_digest,
-                "operations": [receipt_to_dict(receipt) for receipt in receipts],
-            }
-            if reconciliation_key is not None:
-                manifest["reconciliation_key"] = reconciliation_key
-            if target_version is not None:
-                # Use a format-specific name so bounded format-2 history does not
-                # inherit format 1's indefinitely followed undo target.
-                manifest["entry_target_version"] = target_version
-            atomic_publish_file(
-                versions_fd,
-                f"{version}.json",
-                json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode(),
-            )
-            os.fsync(versions_fd)
-            self._memory_transaction_step("manifest")
-            atomic_publish_file(
-                directory_fd,
-                _CURRENT,
-                json.dumps(
-                    {"current": version, "history": prospective_history},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode(),
-                sync_directory=True,
-            )
-            self._memory_transaction_step("publish")
-            self._prune_versions(blobs_fd, versions_fd, set(prospective_history))
-            return EntryMemorySnapshot(state, snapshot_digest, version)
-        finally:
-            os.close(versions_fd)
-            os.close(blobs_fd)
-            os.close(root)
+        adapter = _FormatTwoPayloadAdapter(
+            state=state,
+            before=before,
+            kind=kind,
+            receipts=receipts,
+            reconciliation_key=reconciliation_key,
+            target_version=target_version,
+        )
+        published = publish_version(
+            directory_fd,
+            adapter=adapter,
+            retention_limit=self._entry_retention_limit(),
+            reset_history=reset_history,
+            pointer_reader=self._pointer,
+            version_handles=lambda fd, create: self._version_handles(fd, create=create),
+            manifest_reader=self._manifest,
+            transaction_step=self._memory_transaction_step,
+            prune_versions=self._prune_versions,
+        )
+        if not isinstance(published.snapshot, str):
+            raise TypeError("format-2 publication returned a non-scalar snapshot")
+        return EntryMemorySnapshot(
+            published.value, published.snapshot, published.version
+        )
 
     def _create_entry_memory_for_test(
         self, project_id: str, schema: MemorySchema

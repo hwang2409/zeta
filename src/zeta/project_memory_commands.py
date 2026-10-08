@@ -14,6 +14,7 @@ class MemoryReconciler(Protocol):
 
 
 class MemoryRegistry(Protocol):
+    def ensure_memory_supported(self, project_id: str) -> None: ...
     def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]: ...
     def undo_memory(self, project_id: str) -> list[tuple[str, str]]: ...
     def accept_memory(self, project_id: str, name: str) -> list[tuple[str, str]]: ...
@@ -29,6 +30,7 @@ def run_memory_command(
     action = args.strip()
     usage = "usage: /memory [log|retry [receipt]|undo|accept <file>]"
     try:
+        registry.ensure_memory_supported(project_id)
         if action == "retry":
             if reconciler is None:
                 return "memory retry: unavailable for this session"
