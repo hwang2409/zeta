@@ -40,15 +40,19 @@ _CURRENT_PROCESS = ProcessIdentity(
 
 
 def current_process_identity() -> ProcessIdentity:
-    """Return this process's stable identity."""
+    """Return this process's stable identity, including after a fork."""
 
+    global _CURRENT_PROCESS
+    pid = os.getpid()
+    if _CURRENT_PROCESS.pid != pid:
+        _CURRENT_PROCESS = ProcessIdentity(pid, _process_started(pid) or "unavailable")
     return _CURRENT_PROCESS
 
 
 def process_is_live(identity: ProcessIdentity) -> bool:
     """Return whether the exact process, excluding PID reuse, is alive."""
 
-    if identity == _CURRENT_PROCESS:
+    if identity == current_process_identity():
         return True
     return bool(identity.started) and _process_started(identity.pid) == identity.started
 
