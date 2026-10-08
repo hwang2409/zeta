@@ -5,13 +5,13 @@ import threading
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import (
     _close,
     _connect,
     _frames_until_event,
     _request,
 )
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.server import ZetaServer
 from zeta.server.turn_context import PendingTurnContexts
@@ -29,7 +29,7 @@ async def _ready(
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="fake",
+        provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _connect(server)

@@ -18,8 +18,8 @@ import zeta.tools._shared.sandbox as sandbox_module
 import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.receipt import build_agent_receipt, receipt_message_size
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
 from zeta.core.store import ConversationStore

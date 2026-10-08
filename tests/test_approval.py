@@ -6,6 +6,7 @@ from threading import Event
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import (
     ApprovalDecision,
@@ -15,7 +16,6 @@ from zeta.core.approval import (
     ApprovalRule,
     parse_approval_rule,
 )
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.core.tool_dispatch import dispatch_tool_calls

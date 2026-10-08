@@ -230,8 +230,6 @@ def settings(runtime: ServerRuntime) -> dict:
 
 
 def catalog(runtime: ServerRuntime) -> dict:
-    if runtime.fake_catalog:
-        return {"models": ["faster", "offline"]}
     return {
         "models": known_model_names(),
         "providers": {

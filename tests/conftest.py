@@ -371,6 +371,7 @@ def isolate_zeta_home(
             monkeypatch.delenv(name, raising=False)
 
         monkeypatch.setenv("ZETA_HOME", str(isolated_home))
+        monkeypatch.setenv("ZETA_TEST_SCRIPTED_PROVIDER", "1")
         monkeypatch.setenv("ZETA_TEST_AUDIT_LEDGER", str(live_home_write_guard._ledger))
         monkeypatch.setenv(
             "ZETA_TEST_LIVE_HOME", str(live_home_write_guard.live_home)
@@ -433,3 +434,22 @@ def block_real_http_connections(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", blocked_sync)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", blocked_async)
+
+@pytest.fixture(autouse=True)
+def _inject_scripted_completion_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep provider-backed tests offline through the production backend seam."""
+    try:
+        from tests.support.tui_backend import FakeInteractiveBackend
+    except ModuleNotFoundError:
+        return
+    from zeta.tui import app as tui_app
+
+    def build_backend(provider: str, model: str | None, **_kwargs: object):
+        selected = model or {
+            "claude": "claude-sonnet-4-6",
+            "codex": "gpt-5.6-luna",
+            "ollama": "qwen3:4b",
+        }[provider]
+        return FakeInteractiveBackend(delay=0, model=selected), selected
+
+    monkeypatch.setattr(tui_app, "build_backend", build_backend)

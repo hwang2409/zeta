@@ -22,8 +22,8 @@ import zeta.providers.anthropic as anthropic_module
 import zeta.providers.auth as auth_module
 import zeta.providers.codex as codex_module
 import zeta.providers.transport as transport_module
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.config.settings import Settings, load_settings, resolve
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     FAILED_TURN_MARKER,
@@ -985,6 +985,7 @@ def test_resolve_carries_stream_stall_settings_into_resolved_config() -> None:
         cli_model=None,
         cli_yolo=None,
         cli_token_budget=None,
+    default_provider="codex",
     )
     assert resolved.stream_stall_seconds == 45
     assert resolved.stream_stall_retries == 4

@@ -19,9 +19,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.notifications import NotificationWake
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -196,7 +196,7 @@ async def test_task_exit_recovered_after_restart_exactly_once(tmp_path: Path) ->
     # S5: a previously-running row with no existing task_exited notification
     # yields exactly one recovery notification on the normal production path,
     # and repeated resumes never duplicate it.
-    from zeta.core.fake import FakeBackend
+    from tests.support.fake_backend import FakeBackend
     from zeta.runtime.loop import AgentLoop
     from zeta.tools._shared.process import _BackgroundRecord
 
@@ -1368,7 +1368,7 @@ asyncio.run(main(Path(sys.argv[1])))
 async def test_archive_private_and_session_scoped(tmp_path: Path) -> None:
     home = tmp_path / "home"
     manager = SessionManager(home)
-    opened = manager.create(provider="fake", model="fake", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="fake", cwd=tmp_path)
     store = opened.store
     tasks = BackgroundTaskRegistry(
         session_dir=store.session_dir,

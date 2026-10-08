@@ -37,7 +37,6 @@ def resolve_job(
         or {
             "claude": DEFAULT_CLAUDE_MODEL,
             "codex": DEFAULT_CODEX_MODEL,
-            "fake": "fake",
         }.get(selected_provider, ""),
     )
     value.setdefault("cwd", str(Path(cwd).expanduser().resolve()))

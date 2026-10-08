@@ -43,10 +43,10 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -70,7 +70,6 @@ from zeta.tui.agent_card import (
     read_agent_transcript,
 )
 from zeta.tui.app import (
-    FakeInteractiveBackend,
     FullScreenPromptSession,
     TUIApp,
     background_notice,
@@ -157,6 +156,9 @@ def _fixed_terminal_env(home: Path) -> dict[str, str]:
         ZETA_HOME=str(home),
         TERM="xterm-256color",
         COLORTERM="truecolor",
+        PYTHONPATH=os.pathsep.join(
+            filter(None, (str(Path(__file__).parents[1]), env.get("PYTHONPATH")))
+        ),
     )
     return env
 
@@ -212,7 +214,7 @@ def _agent_list_session(
         store.set_todo_items(todo_items)
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
     )
@@ -299,7 +301,6 @@ def _capture_until(
 
 
 def test_app_reexports_backend_helpers() -> None:
-    assert FakeInteractiveBackend.__module__ == "zeta.tui.fake_backend"
     assert callable(build_backend)
     assert callable(background_notice)
 
@@ -359,7 +360,7 @@ async def _background_event_transcript_count(
             store,
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False, width=160),
     )
@@ -482,7 +483,7 @@ async def _background_event_transcript_count(
                     reopened,
                     skill_catalog=SkillCatalog.empty(),
                 ),
-                provider="fake",
+                provider="codex",
                 model="offline",
                 console=Console(
                     file=resumed_output, force_terminal=False, width=160
@@ -650,7 +651,7 @@ def test_other_background_notices_remain_visible() -> None:
 def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     rendered: list[Text] = []
@@ -2769,7 +2770,7 @@ async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> No
             ConversationStore(tmp_path),
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -2835,7 +2836,7 @@ async def test_tui_overflow_final_render_is_authoritative(tmp_path: Path) -> Non
             max_turns=1,
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -2899,7 +2900,7 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
             max_turns=1,
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -3581,7 +3582,7 @@ async def test_provider_failure_card_is_visible_in_both_modes(
 ) -> None:
     app = TUIApp(
         AgentLoop(ErrorBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -3622,7 +3623,7 @@ async def test_transport_failure_shapes_render_error_cards(
             ConversationStore(tmp_path / "sessions"),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -3644,7 +3645,7 @@ async def test_retry_reuses_user_message_and_keeps_partial_output(
     backend = ErrorThenSuccessBackend()
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -3681,7 +3682,7 @@ async def test_retry_failure_renders_a_fresh_error_card(tmp_path: Path) -> None:
             ConversationStore(tmp_path / "sessions"),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -3731,7 +3732,7 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
     )
     app = TUIApp(
         AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -3796,7 +3797,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
     )
     app = TUIApp(
         AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -3863,7 +3864,7 @@ async def test_manual_compact_error_event_aborts_and_preserves_source(
     )
     app = TUIApp(
         AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -3920,7 +3921,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     backend = ErrorThenSuccessBackend()
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -3969,7 +3970,7 @@ def test_resumed_failure_followed_by_success_is_not_retryable(
     )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -3996,7 +3997,7 @@ def test_resumed_failure_followed_by_new_user_is_not_retryable(
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("second")]), MessageOrigin.USER))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -4011,7 +4012,7 @@ async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
     backend = WaitingFailureBackend()
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -4037,7 +4038,7 @@ async def test_submitted_revision_does_not_clear_a_rapid_new_draft(
     draft_path = tmp_path / "draft"
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         draft_path=draft_path,
     )
@@ -4064,7 +4065,7 @@ async def test_rapid_buffer_sends_keep_the_newest_persisted_draft(
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         draft_path=tmp_path / "draft",
     )
@@ -4102,7 +4103,7 @@ async def test_rapid_buffer_sends_keep_each_staged_image_owned(
     second_image.write_bytes(PNG)
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     session = app._make_session()
@@ -4572,7 +4573,7 @@ def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> 
             ),
         )
     )
-    app = TUIApp(AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()), provider="fake", model="offline")
+    app = TUIApp(AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
     app._active_session = app._make_session()
 
     app._rebuild_transcript()
@@ -5621,7 +5622,7 @@ async def test_discard_retry_drops_inline_partial_from_scrollback(
             tool_schemas=[],
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=_test_console(output),
     )
@@ -5658,7 +5659,7 @@ async def test_truncated_response_notice_is_printed_once(tmp_path: Path) -> None
             tool_schemas=[],
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -5672,7 +5673,7 @@ skill_catalog=SkillCatalog.empty(),
 def test_stream_kind_switch_keeps_partial_assistant_transient(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -5706,7 +5707,7 @@ def test_stream_kind_switch_keeps_partial_assistant_transient(tmp_path: Path) ->
 def test_thought_stream_is_visible_before_completion(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -5741,7 +5742,7 @@ def test_thought_stream_is_visible_before_completion(tmp_path: Path) -> None:
 def test_adjacent_signed_thought_blocks_keep_separate_units(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -5765,7 +5766,7 @@ def test_thought_commit_keeps_logical_lines_for_resize(tmp_path: Path) -> None:
     source = "logical-line-that-reflows"
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -5794,7 +5795,7 @@ def test_thought_updates_keep_active_unit_after_interleaved_output(
 ) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -5819,7 +5820,7 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
     output = StringIO()
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -5840,7 +5841,7 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
 def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
 
@@ -5869,7 +5870,7 @@ def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
 async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(ErrorBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -5901,7 +5902,7 @@ async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
 async def test_verbose_error_flushes_before_raw_error(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(ErrorBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         verbose=True,
         console=Console(file=StringIO(), force_terminal=False),
@@ -5970,7 +5971,7 @@ async def test_verbose_transition_flushes_before_raw_event(
 ) -> None:
     app = TUIApp(
         AgentLoop(EventBackend(event), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         verbose=True,
         console=Console(file=StringIO(), force_terminal=False),
@@ -6009,7 +6010,7 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
     output = StringIO()
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -6034,8 +6035,10 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     process = subprocess.Popen(
         [
             sys.executable,
-            "-c",
-            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'fake']))",
+            "-m",
+            "tests.support.scripted_tui",
+            "--provider",
+            "codex",
         ],
         stdin=slave_fd,
         stdout=slave_fd,
@@ -6081,8 +6084,10 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
     process = subprocess.Popen(
         [
             sys.executable,
-            "-c",
-            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'fake']))",
+            "-m",
+            "tests.support.scripted_tui",
+            "--provider",
+            "codex",
         ],
         stdin=slave_fd,
         stdout=slave_fd,
@@ -6137,8 +6142,10 @@ def test_main_pty_normal_command_then_queued_enter_submits(
     process = subprocess.Popen(
         [
             sys.executable,
-            "-c",
-            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'fake']))",
+            "-m",
+            "tests.support.scripted_tui",
+            "--provider",
+            "codex",
         ],
         stdin=slave_fd,
         stdout=slave_fd,
@@ -6281,7 +6288,7 @@ def test_completed_message_replaces_streaming_unit_once(
 ) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -6319,7 +6326,7 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
     call = ToolCall("mixed-1", "read", {"path": "README.md"})
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -6426,7 +6433,7 @@ def test_large_markdown_table_falls_back_within_render_budget() -> None:
 def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -6452,7 +6459,7 @@ def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:
 def test_markdown_stream_preserves_model_line_structure(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -6493,7 +6500,7 @@ def test_completed_message_renders_final_message_text(
     partial = source[: source.index("`fallback`") + 1]
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -6525,7 +6532,7 @@ def test_completed_message_rerenders_text_split_by_thinking(
     monkeypatch.setenv("COLORTERM", "truecolor")
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -6575,7 +6582,7 @@ def test_completed_message_rerenders_text_split_by_tool(
     call = ToolCall("split-1", "read", {"path": "README.md"})
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -6626,7 +6633,7 @@ async def test_startup_replay_rejects_actions_and_defers_runtime_events(
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -6681,7 +6688,7 @@ async def test_ctrl_v_paste_waits_for_startup_replay(
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     replay_started = asyncio.Event()
@@ -6728,7 +6735,7 @@ def test_startup_replay_discards_child_streaming_events(tmp_path: Path) -> None:
             ConversationStore(tmp_path / "sessions"),
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._begin_startup_replay()
@@ -6755,7 +6762,7 @@ def test_startup_replay_coalesces_tool_updates_without_reordering_boundaries(
             ConversationStore(tmp_path / "sessions"),
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     call = ToolCall("call-1", "bash", {"command": "echo hello"})
@@ -6798,7 +6805,7 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
         store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent(str(index))]), MessageOrigin.USER))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         resumed=True,
     )
@@ -6836,7 +6843,7 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("remembered")]), MessageOrigin.USER))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         resumed=True,
     )
@@ -6902,7 +6909,7 @@ async def test_async_rebuild_freezes_once_per_process_only_for_resume(
             )
         return TUIApp(
             AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-            provider="fake",
+            provider="codex",
             model="offline",
             resumed=resumed,
         )
@@ -6959,7 +6966,7 @@ async def test_rebuild_transcript_matches_character_stream(
             ConversationStore(tmp_path / "sessions"),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -6997,7 +7004,7 @@ async def test_run_replays_resumed_transcript_before_prompt(
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=True, color_system="truecolor"),
     )
@@ -7043,7 +7050,7 @@ async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
             skip_mcp_mount=True,
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
 
@@ -7079,7 +7086,7 @@ def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
     store.append_compaction_marker("provider summary", 1, 2)
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -7099,7 +7106,7 @@ async def test_run_keeps_empty_resumed_transcript_blank(
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=True, color_system="truecolor"),
     )
@@ -7224,7 +7231,7 @@ def _rendered_display(app: TUIApp, output: StringIO, full_screen: bool) -> str:
 def _test_tui_app(store: ConversationStore, output: StringIO) -> TUIApp:
     return TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(
             file=output,
@@ -7310,7 +7317,7 @@ async def test_aborted_turn_does_not_reorder_the_next_reply(
     backend = AbortThenSuccessBackend()
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -7347,7 +7354,7 @@ async def test_failed_turn_does_not_reorder_the_next_reply(
             ConversationStore(tmp_path / "sessions"),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -7374,7 +7381,7 @@ def test_empty_final_message_removes_streamed_assistant_text(
     monkeypatch.setenv("COLORTERM", "truecolor")
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -7418,7 +7425,7 @@ def test_inline_message_commits_canonical_text_once(
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -7457,7 +7464,7 @@ def test_rebuild_user_attachment_hides_file_content(
     )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -7475,7 +7482,7 @@ def test_markdown_stream_keeps_model_blank_lines_without_inserting_more(
 ) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -7520,7 +7527,7 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
         from pathlib import Path
         from tempfile import TemporaryDirectory
 
-        from zeta.core.fake import FakeBackend
+        from tests.support.fake_backend import FakeBackend
         from zeta.core.loop import AgentLoop
         from zeta.core.store import ConversationStore
         from zeta.skills import SkillCatalog
@@ -7534,7 +7541,7 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
                     ConversationStore(Path(directory)),
                     skill_catalog=SkillCatalog.empty(),
                 ),
-                provider="fake",
+                provider="codex",
                 model="offline",
             )
             app._active_session = app._make_session()
@@ -7789,7 +7796,7 @@ async def test_composer_screen_fill_is_scoped_to_multiline_input(
                 ConversationStore(tmp_path / "sessions"),
                 skill_catalog=SkillCatalog.empty(),
             ),
-            provider="fake",
+            provider="codex",
             model="offline",
         )
         session = app._make_session()
@@ -7873,7 +7880,7 @@ def test_composer_meta_line_includes_model_approval_and_home_cwd(
             ConversationStore(tmp_path / "sessions", cwd=cwd),
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=ApprovalPolicy(default="ask"),
     )
@@ -7883,7 +7890,7 @@ def test_composer_meta_line_includes_model_approval_and_home_cwd(
 
     meta = "".join(value for _, value in app._status_toolbar())
 
-    assert "fake/offline" in meta
+    assert "codex/offline" in meta
     assert "ask" in meta
     assert "~" in meta
     assert "INSERT" in meta
@@ -7957,7 +7964,7 @@ def test_status_toolbar_preserves_live_state_at_production_widths(
 def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -7997,7 +8004,7 @@ def test_full_screen_layout_keeps_transcript_inset_through_agent_view(
             ConversationStore(tmp_path / "sessions"),
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     session = app._make_session()
@@ -8189,7 +8196,7 @@ async def test_pruned_agent_list_returns_focus_to_composer(
     )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
     )
@@ -8222,7 +8229,7 @@ async def test_full_screen_steady_state_paint_does_not_clear_screen(
 ) -> None:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         history_path=tmp_path / "history",
     )
@@ -8274,7 +8281,7 @@ def test_full_screen_footer_fits_content_column(
             ),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     output = SimpleNamespace(
@@ -8331,7 +8338,6 @@ def test_full_screen_pty_keeps_padded_margins_clean(
     session = f"zeta-pty-{uuid.uuid4().hex[:10]}"
     socket_dir = Path(tempfile.mkdtemp(prefix="zeta-tmux-", dir="/tmp"))
     socket = socket_dir / "sock"
-    zeta = Path(sys.executable).with_name("zeta")
     env = _fixed_terminal_env(tmp_path / "zeta-home")
     def cleanup() -> None:
         subprocess.run(
@@ -8357,13 +8363,13 @@ def test_full_screen_pty_keeps_padded_margins_clean(
                 (
                     "exec env -u NO_COLOR -u FORCE_COLOR -u CLICOLOR "
                     '-u CLICOLOR_FORCE -u PY_COLORS ZETA_HOME="$1" TERM="$2" '
-                    'COLORTERM="$3" "$4" --provider fake'
+                    'COLORTERM="$3" "$4" -m tests.support.scripted_tui --provider codex'
                 ),
                 "zeta-pane",
                 str(tmp_path / "zeta-home"),
                 "xterm-256color",
                 "truecolor",
-                str(zeta),
+                sys.executable,
             ],
             cwd=Path(__file__).parents[1],
             env=env,
@@ -8485,7 +8491,7 @@ def test_full_screen_transcript_preserves_markdown_list_line(
 ) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=_test_console(),
     )
@@ -8504,7 +8510,7 @@ def test_full_screen_transcript_reflows_logical_text_at_narrow_widths(
 ) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._active_session = app._make_session()
@@ -8530,7 +8536,7 @@ def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
             ConversationStore(tmp_path / "sessions"),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._update_usage(
@@ -8543,7 +8549,7 @@ skill_catalog=SkillCatalog.empty(),
     toolbar = app._status_toolbar()
     plain = "".join(value for _, value in toolbar)
     assert "5 (0%)" in plain
-    assert "fake/offline" in plain
+    assert "codex/offline" in plain
     assert app.loop.store.session_id[:8] in plain
     assert "\n" not in plain
 
@@ -8553,7 +8559,7 @@ def test_status_toolbar_preserves_vim_state_style(
 ) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     output = SimpleNamespace(get_size=lambda: Size(rows=24, columns=80))
@@ -8577,7 +8583,7 @@ def test_status_toolbar_preserves_vim_state_style(
 def test_status_toolbar_does_not_advance_spinner_frame(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._spinner_frame = 0
@@ -8594,7 +8600,7 @@ def test_status_toolbar_does_not_advance_spinner_frame(tmp_path: Path) -> None:
 async def test_spinner_pulses_on_timer(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._streaming = True
@@ -8629,7 +8635,7 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
             tools={"read": slow_tool},
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
 
@@ -8668,7 +8674,7 @@ async def test_app_abort_enters_interrupted_state(tmp_path: Path) -> None:
     backend = GateBackend()
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -8700,7 +8706,7 @@ async def test_app_surfaces_compacting_state_before_provider_output(tmp_path: Pa
             ConversationStore(tmp_path / "sessions"),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -8733,7 +8739,7 @@ async def test_empty_completion_prints_neutral_fallback(tmp_path: Path) -> None:
             ConversationStore(tmp_path / "sessions"),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -8757,7 +8763,7 @@ async def test_empty_completion_removes_preview_region_before_fallback(
             ConversationStore(tmp_path / "sessions"),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -8781,7 +8787,7 @@ async def test_full_screen_separates_user_and_assistant_units(tmp_path: Path) ->
             ConversationStore(tmp_path / "sessions"),
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -8812,7 +8818,7 @@ async def test_full_session_preserves_assistant_tool_user_order(tmp_path: Path) 
             tools={"read": lambda _: "tool result"},
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -8866,7 +8872,7 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
             },
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False, width=72),
     )
@@ -8944,7 +8950,7 @@ async def test_run_delivers_queued_follow_up_after_current_turn(tmp_path: Path) 
     with create_pipe_input() as pipe:
         app = TUIApp(
             AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-            provider="fake",
+            provider="codex",
             model="offline",
             console=Console(file=StringIO(), force_terminal=False),
         )
@@ -8992,7 +8998,7 @@ async def test_control_command_does_not_reject_rapid_follow_up(
     output = StringIO()
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -9019,7 +9025,7 @@ async def test_plain_approve_word_is_sent_to_model_from_composer(
     output = StringIO()
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -9050,7 +9056,7 @@ async def test_plain_approve_word_is_sent_to_model_from_prompt_session(
     output = StringIO()
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -9091,7 +9097,7 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
             approval_policy=policy,
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
@@ -9119,7 +9125,7 @@ async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> N
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -9149,7 +9155,7 @@ async def test_submission_undo_cancels_only_the_exact_rapid_enter(tmp_path: Path
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -9180,7 +9186,7 @@ async def test_undo_restores_double_slash_source_text(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -9225,7 +9231,7 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
     with create_pipe_input() as pipe:
         app = TUIApp(
             loop,
-            provider="fake",
+            provider="codex",
             model="offline",
             console=Console(file=StringIO(), force_terminal=False),
         )
@@ -9257,7 +9263,7 @@ async def test_run_abort_during_streamed_tool_call_pairs_result(tmp_path: Path) 
     with create_pipe_input() as pipe:
         app = TUIApp(
             loop,
-            provider="fake",
+            provider="codex",
             model="offline",
             console=Console(file=StringIO(), force_terminal=False),
         )
@@ -9602,7 +9608,7 @@ def test_vim_slash_command_toggles_both_directions(tmp_path: Path) -> None:
     session = PromptSession()
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         session=session,
         vim_mode=True,
@@ -9633,7 +9639,7 @@ async def test_vi_composer_can_show_approval_prompt_while_in_normal_mode(
             approval_policy=policy,
 skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
@@ -10119,7 +10125,7 @@ async def test_history_and_draft_store_attachment_refs_without_payloads(
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         history_path=history_path,
         draft_path=draft_path,
@@ -10150,7 +10156,7 @@ async def test_mcp_prompt_result_does_not_activate_attachment_syntax(
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     app._slash_commands.set_mcp_prompts(
@@ -10185,7 +10191,7 @@ async def test_mcp_prompt_error_restores_draft_and_attachments(
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     session = app._make_session()
@@ -10267,7 +10273,7 @@ async def test_app_draft_round_trip_and_send_clear(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     first = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         history_path=tmp_path / "history",
     )
@@ -10280,7 +10286,7 @@ async def test_app_draft_round_trip_and_send_clear(tmp_path: Path) -> None:
     )
     second = TUIApp(
         AgentLoop(FakeBackend([]), reopened_store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         history_path=tmp_path / "history",
     )
@@ -10295,7 +10301,7 @@ async def test_app_draft_round_trip_and_send_clear(tmp_path: Path) -> None:
 async def test_undo_restores_submission_before_turn_creation(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -10317,7 +10323,7 @@ async def test_undo_restores_submission_before_turn_creation(tmp_path: Path) -> 
 async def test_pending_undo_keeps_a_new_buffer_draft(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
     session = app._make_session()
@@ -10342,7 +10348,7 @@ async def test_undo_restores_text_and_aborts_streaming_turn(tmp_path: Path) -> N
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -10369,7 +10375,7 @@ async def test_undo_keeps_a_draft_typed_during_streaming(tmp_path: Path) -> None
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -10399,7 +10405,7 @@ async def test_undo_restores_staged_image_for_resubmission(tmp_path: Path) -> No
     staged.write_bytes(PNG)
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -10442,7 +10448,7 @@ async def test_undo_restores_next_image_token_after_deleted_token(
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -10484,7 +10490,7 @@ async def test_tui_setup_handles_corrupt_and_legacy_drafts(
     path.write_bytes(payload)
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         history_path=tmp_path / "history",
     )
@@ -10538,7 +10544,7 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
     )
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
     )
 
@@ -10575,7 +10581,7 @@ def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -10606,7 +10612,7 @@ async def test_notification_turn_empty_reply_is_silent(tmp_path: Path) -> None:
             store,
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
@@ -10626,7 +10632,7 @@ async def test_user_turn_still_shows_no_response_after_failed_nudge(
     output = StringIO()
     app = TUIApp(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
     )

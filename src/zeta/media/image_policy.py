@@ -92,7 +92,6 @@ _PROVIDER_POLICIES = {
     "anthropic": ANTHROPIC_IMAGE_POLICY,
     "claude": ANTHROPIC_IMAGE_POLICY,
     "codex": CODEX_IMAGE_POLICY,
-    "fake": ANTHROPIC_IMAGE_POLICY,
     "openai": CODEX_IMAGE_POLICY,
     "ollama": OLLAMA_IMAGE_POLICY,
 }

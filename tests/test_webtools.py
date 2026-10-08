@@ -8,8 +8,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.support.fake_backend import FakeBackend
 from zeta.core.approval import ApprovalPolicy
-from zeta.core.fake import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.core.tool_dispatch import dispatch_tool_calls
