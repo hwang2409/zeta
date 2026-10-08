@@ -286,14 +286,19 @@ class EntryMemoryHistoryMixin:
                 current = self._entry_snapshot_locked(directory_fd)
                 if current.digest != expected_digest:
                     raise ProjectRegistryError("project memory digest mismatch")
-                state, receipts = apply_operations(
-                    current.state,
-                    operations,
-                    reconciliation_key=reconciliation_key,
-                    automatic=automatic,
-                    evidence=evidence,
-                    now=now,
-                )
+                if operations:
+                    state, receipts = apply_operations(
+                        current.state,
+                        operations,
+                        reconciliation_key=reconciliation_key,
+                        automatic=automatic,
+                        evidence=evidence,
+                        now=now,
+                    )
+                elif rejected_groups:
+                    state, receipts = current.state, ()
+                else:
+                    raise ProjectRegistryError("empty format-2 memory transaction")
                 published = self._publish_entry_version(
                     directory_fd,
                     state=state,

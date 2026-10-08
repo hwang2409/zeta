@@ -229,6 +229,19 @@ async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -
     assert any(entry.text == "The architecture note is durable." for entry in entries)
     assert next(entry for entry in entries if entry.id == target).status == "active"
     assert result.rejected_groups
+    pointer = json.loads(
+        (registry.root / project_id / "memory-current.json").read_text()
+    )
+    manifest = json.loads(
+        (
+            registry.root
+            / project_id
+            / "memory-versions"
+            / "versions"
+            / f"{pointer['current']}.json"
+        ).read_text()
+    )
+    assert manifest["rejected_groups"] == list(result.rejected_groups)
 
 
 @pytest.mark.asyncio
@@ -263,6 +276,7 @@ async def test_accepted_entry_requires_direct_user_evidence_to_supersede(
         ),
         reconciliation_key=None,
         automatic=False,
+        now="2026-10-08T11:00:00.000000Z",
     )
     target = next(iter(accepted.state.entries))
     operation = {

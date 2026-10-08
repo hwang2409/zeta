@@ -13,7 +13,7 @@ import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from zeta.project_errors import ProjectRegistryError
 from zeta.providers.retry_policy import ProviderRetryBudget, use_retry_budget
@@ -47,6 +47,10 @@ from .reconciler import (
     project_transcript_row,
 )
 
+if TYPE_CHECKING:
+    from zeta.project_registry import ProjectRegistry
+
+
 EntryInvokeResult = str | ReconciliationResponse
 EntryInvoke = Callable[[str], EntryInvokeResult | Awaitable[EntryInvokeResult]]
 ReconciliationKey = str | Callable[[int, int], str]
@@ -57,7 +61,16 @@ _MAX_PRIMARY_REQUEST_BYTES = 28 * 1024
 _MAX_OPERATIONS = 64
 _MAX_PROPOSED_TEXT_BYTES = 24 * 1024
 _MAX_REASON_BYTES = 1024
-_CORRECTION_WORDS = ("correction", "actually", "instead", "no longer", "changed to")
+_HIGHEST_PRIORITY_WORDS = (
+    "correction",
+    "actually",
+    "instead",
+    "no longer",
+    "changed to",
+    "i decide",
+    "we decide",
+    "decision:",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +89,6 @@ class EntryReconciliationResult:
 class _ParsedOperation:
     operation: MemoryOperation
     targets: frozenset[str]
-    reason: str
     source_rank: int
     direct_user: bool
     observed_at: str
@@ -245,7 +257,9 @@ def _source_rank(rows: Sequence[Mapping[str, Any]]) -> tuple[int, bool]:
     direct = "user" in authorships
     if direct:
         text = " ".join(_message_text(row).lower() for row in rows)
-        return (1 if any(word in text for word in _CORRECTION_WORDS) else 2), True
+        return (
+            1 if any(word in text for word in _HIGHEST_PRIORITY_WORDS) else 2
+        ), True
     if any(value in {"skill_expansion", "slash_expansion"} for value in authorships):
         return 3, False
     if "agent" in authorships and "tool_output" in authorships:
@@ -253,6 +267,24 @@ def _source_rank(rows: Sequence[Mapping[str, Any]]) -> tuple[int, bool]:
     if "agent" in authorships:
         return 5, False
     return 6, False
+
+
+def _observed_at(rows: Sequence[Mapping[str, Any]], fallback: str) -> str:
+    values: list[str] = []
+    for row in rows:
+        data = row.get("data")
+        value = data.get("created_at") if isinstance(data, Mapping) else None
+        if not isinstance(value, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            continue
+        if parsed.tzinfo is not None:
+            values.append(
+                parsed.isoformat(timespec="microseconds").replace("+00:00", "Z")
+            )
+    return max(values, default=fallback)
 
 
 def _sources(
@@ -284,10 +316,13 @@ def _sources(
                 )
             )
         origins = tuple(dict.fromkeys(_transcript_authorship(row) for row in rows))
-        parsed.append(MemorySource(transcript.session_id, start, end, origins, now))
+        observed_at = _observed_at(rows, now)
+        parsed.append(
+            MemorySource(transcript.session_id, start, end, origins, observed_at)
+        )
         all_rows.extend(rows)
     rank, direct = _source_rank(all_rows)
-    return tuple(parsed), rank, direct, now
+    return tuple(parsed), rank, direct, _observed_at(all_rows, now)
 
 
 def _text(value: object, label: str, index: int) -> str:
@@ -459,7 +494,7 @@ def _parse_operation(
         target = _text(raw["target"], "target", index)
         operation = ResolveOperation(target, sources)
         targets = frozenset((target,))
-    return _ParsedOperation(operation, targets, reason, rank, direct, observed)
+    return _ParsedOperation(operation, targets, rank, direct, observed)
 
 
 def _target_kind(state: MemoryState, target: str) -> str:
@@ -538,17 +573,20 @@ def _semantic_error(item: _ParsedOperation, state: MemoryState) -> str | None:
         entry = state.entries.get(target)
         if not isinstance(entry, MemoryEntry) or entry.status != "active":
             return "target is missing or inactive"
-        if entry.accepted_at is not None and not item.direct_user:
-            return "accepted entry requires direct user evidence"
+        if entry.accepted_at is not None:
+            if not item.direct_user:
+                return "accepted entry requires direct user evidence"
+            if item.observed_at <= entry.seen_at:
+                return "accepted entry requires newer direct user evidence"
         old_rank = _stored_rank(entry)
         if isinstance(operation, SupersedeOperation) and item.source_rank > old_rank:
             return "weaker evidence cannot supersede stronger evidence"
         if (
             isinstance(operation, SupersedeOperation)
             and item.source_rank == old_rank
-            and item.observed_at < entry.seen_at
+            and item.observed_at <= entry.seen_at
         ):
-            return "older evidence cannot supersede newer evidence"
+            return "non-newer evidence cannot supersede existing evidence"
     return None
 
 
@@ -654,7 +692,7 @@ def _sum_usage(total: dict[str, int], addition: Mapping[str, int]) -> dict[str, 
 
 async def reconcile_entry_range(
     *,
-    registry: object,
+    registry: ProjectRegistry,
     project_id: str,
     transcript: Transcript,
     reconciliation_key: ReconciliationKey,
@@ -667,7 +705,7 @@ async def reconcile_entry_range(
     usage: dict[str, int] = {}
     budget = ProviderRetryBudget()
     for attempt in range(cas_retries):
-        snapshot = await asyncio.to_thread(registry._entry_memory_state, project_id)  # type: ignore[attr-defined]
+        snapshot = await asyncio.to_thread(registry._entry_memory_state, project_id)
         request = _prepare_request(transcript, snapshot.state, as_of=as_of)
         selected_start = min(int(row["seq"]) for row in request.transcript.rows)
         selected_end = max(int(row["seq"]) for row in request.transcript.rows)
@@ -688,9 +726,9 @@ async def reconcile_entry_range(
             parsed = _parse(repaired, snapshot.state, request.transcript, now)
         operations, rejected = _select_groups(parsed, snapshot.state, key, now)
         operations = (*_expired_operations(snapshot.state, now), *operations)
-        if not operations:
+        if not operations and not rejected:
             return EntryReconciliationResult(
-                (), rejected, usage, selected_start, selected_end, key
+                (), (), usage, selected_start, selected_end, key
             )
         evidence = (
             transcript.session_id,
@@ -699,7 +737,7 @@ async def reconcile_entry_range(
         )
         try:
             result = await asyncio.to_thread(
-                registry._compare_and_swap_entries,  # type: ignore[attr-defined]
+                registry._compare_and_swap_entries,
                 project_id,
                 expected_digest=snapshot.digest,
                 operations=tuple(operations),
