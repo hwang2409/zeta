@@ -738,6 +738,9 @@ def test_explicit_resume_discovers_only_the_stored_session_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.core import project_context
+    from zeta.core.project_context import load_project_context
+    from zeta.skills import discover_session_skills
+    from zeta.skills.agent_catalog import discover_session_agents
     from zeta.tui.app import create_app
 
     session_repo = tmp_path / "session-repo"
@@ -772,7 +775,28 @@ def test_explicit_resume_discovers_only_the_stored_session_cwd(
     user_home = tmp_path / "user-home"
     user_home.mkdir()
     manager = SessionManager(home, user_home=user_home)
-    opened = manager.create(provider="fake", model="test", cwd=session_repo)
+    skills = discover_session_skills(home=home, project_dir=session_repo)
+    agents = discover_session_agents(home=home, project_dir=session_repo)
+    context = load_project_context(
+        cwd=session_repo,
+        repo_root=session_repo,
+        zeta_home=home,
+        catalog=skills,
+    )
+    opened = manager.create(
+        provider="fake",
+        model="test",
+        cwd=session_repo,
+        system_prompt=context.system_prompt,
+        context_files=[str(path) for path in context.files],
+        skill_catalog=skills,
+        agent_catalog=agents,
+        project_memory_offset=context.memory_offset,
+        project_memory_length=context.memory_length,
+        project_memory_digest=context.memory_digest,
+        prompt_recipe=context.prompt_recipe,
+        prompt_components=context.prompt_components,
+    )
     session_id = opened.metadata.session_id
     project_id = opened.metadata.project_id
     opened.store.close()
