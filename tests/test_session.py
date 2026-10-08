@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -135,7 +136,7 @@ def test_fresh_session_injects_context_and_lists_files(
     assert str((tmp_path / "AGENTS.md").resolve()) in app.slash_status().context_files
 
 
-def test_resume_restores_context_snapshot_across_directories(
+def test_resume_rebuilds_default_context_from_stored_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -159,13 +160,13 @@ def test_resume_restores_context_snapshot_across_directories(
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
-    assert "original rules" in prompt
-    assert "changed rules" not in prompt
+    assert "original rules" not in prompt
+    assert "changed rules" in prompt
     assert "new directory rules" not in prompt
     assert resumed.slash_status().context_files == (str(original_context.resolve()),)
 
 
-def test_legacy_resume_persists_context_snapshot(
+def test_legacy_empty_prompt_resume_builds_default_from_stored_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -185,20 +186,21 @@ def test_legacy_resume_persists_context_snapshot(
     )
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
 
-    assert saved["system_prompt"] == resumed.loop.context_assembler.system_prompt.content[0].text
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+    assert "legacy rules" in prompt
+    assert saved["system_prompt"] == prompt
+    assert saved["prompt_recipe"] == "default"
     assert saved["context_files"] == [str(context_file.resolve())]
 
 
 def test_legacy_resume_hydrates_without_bumping_updated_at(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Automatic snapshot fill-in must not reorder the sidebar.
+    """Conservative legacy adoption must not reorder the sidebar.
 
-    A legacy resume (system_prompt missing) writes the snapshot on the
-    first resume, but the row's updated_at must stay pinned — the user
-    did not touch this session, so it must not jump above sessions that
-    actually saw activity later. An explicit --system-prompt override is
-    the counterpoint: it IS user activity, so updated_at bumps.
+    A recipe-less empty prompt adopts the default recipe without user activity.
+    An explicit --system-prompt override is user activity, so it replaces that
+    snapshot and bumps updated_at.
     """
 
     home = tmp_path / "zeta-home"
@@ -217,7 +219,8 @@ def test_legacy_resume_hydrates_without_bumping_updated_at(
 
     create_app(build_parser().parse_args(["--resume", session_id, "--provider", "fake"]))
     hydrated = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert hydrated["system_prompt"], "legacy hydration should still fill the snapshot"
+    assert "legacy rules" in hydrated["system_prompt"]
+    assert hydrated["prompt_recipe"] == "default"
     assert hydrated["updated_at"] == pinned, (
         "automatic legacy hydration must not bump updated_at"
     )
@@ -289,7 +292,7 @@ def test_first_legacy_resume_with_explicit_prompt_bumps_updated_at(
     )
 
 
-def test_legacy_resume_migrates_prompt_index_with_skill_catalog(
+def test_legacy_resume_does_not_marker_scan_skill_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -317,13 +320,13 @@ def test_legacy_resume_migrates_prompt_index_with_skill_catalog(
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
-    assert "legacy prompt" in prompt
-    assert "legacy: legacy skill" in prompt
-    assert "- old: old skill" not in prompt
-    assert "legacy tail" in prompt
+    assert prompt == legacy_prompt
+    assert SessionManager(home).read_metadata(
+        opened.store.session_id
+    ).skill_catalog is not None
 
 
-def test_legacy_resume_rejects_unterminated_skill_index_without_mutation(
+def test_legacy_resume_preserves_unterminated_skill_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -335,17 +338,15 @@ def test_legacy_resume_rejects_unterminated_skill_index_without_mutation(
         cwd=tmp_path,
         system_prompt="legacy\n<zeta-skills>\nAvailable skills:\n- old: old",
     )
-    metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
-    original = metadata_path.read_bytes()
-
-    with pytest.raises(ValueError, match="unterminated skill index"):
-        create_app(
-            build_parser().parse_args(
-                ["--resume", opened.store.session_id, "--provider", "fake"]
-            )
+    resumed = create_app(
+        build_parser().parse_args(
+            ["--resume", opened.store.session_id, "--provider", "fake"]
         )
+    )
 
-    assert metadata_path.read_bytes() == original
+    assert resumed.loop.context_assembler.system_prompt.content[0].text == (
+        "legacy\n<zeta-skills>\nAvailable skills:\n- old: old"
+    )
 
 
 def test_catalog_boundaries_require_explicit_catalog() -> None:
@@ -366,7 +367,7 @@ def test_catalog_boundaries_require_explicit_catalog() -> None:
         assert inspect.signature(callable_).parameters[parameter].default is inspect.Parameter.empty
 
 
-def test_legacy_resume_uses_persisted_snapshot_on_second_resume(
+def test_legacy_empty_prompt_adopts_live_default_recipe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -391,11 +392,15 @@ def test_legacy_resume_uses_persisted_snapshot_on_second_resume(
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
-    assert "first rules" in prompt
-    assert "second rules" not in prompt
+    assert "first rules" not in prompt
+    assert "second rules" in prompt
+    assert (
+        SessionManager(home).read_metadata(opened.store.session_id).prompt_recipe
+        == "default"
+    )
 
 
-def test_partial_context_metadata_is_replaced_with_fallback_snapshot(
+def test_partial_context_metadata_preserves_recorded_prompt_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -417,8 +422,10 @@ def test_partial_context_metadata_is_replaced_with_fallback_snapshot(
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
-    assert "replacement rules" in prompt
-    assert saved["context_files"] == [str(context_file.resolve())]
+    assert "first rules" in prompt
+    assert "replacement rules" not in prompt
+    assert saved["context_files"] == []
+    assert saved["prompt_recipe"] is None
 
 
 def test_resume_system_prompt_flag_wins_over_snapshot(
@@ -493,7 +500,7 @@ def test_resume_append_flag_composes_over_snapshot_base(
     )
 
 
-def test_resume_without_flags_leaves_snapshot_untouched(
+def test_resume_without_flags_recomposes_default_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -506,7 +513,7 @@ def test_resume_without_flags_leaves_snapshot_untouched(
     metadata_path = home / "sessions" / session_id / "meta.json"
     original = json.loads(metadata_path.read_text(encoding="utf-8"))
 
-    # Mutate the AGENTS.md on disk; snapshot resume must ignore the edit.
+    # A new run rebuilds the default recipe from the session's stored CWD.
     (tmp_path / "AGENTS.md").write_text("mutated rules", encoding="utf-8")
 
     resumed = create_app(
@@ -515,14 +522,15 @@ def test_resume_without_flags_leaves_snapshot_untouched(
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
 
-    assert prompt == original["system_prompt"]
-    assert saved["system_prompt"] == original["system_prompt"]
+    assert prompt != original["system_prompt"]
+    assert "mutated rules" in prompt
+    assert saved["system_prompt"] == prompt
     assert saved["context_files"] == original["context_files"]
     assert resumed._startup_alerts == ()
 
 
 @pytest.mark.asyncio
-async def test_resume_reuses_one_persisted_skill_catalog_for_prompt_and_tool(
+async def test_resume_rebuilds_current_skill_catalog_for_prompt_and_tool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -549,17 +557,17 @@ async def test_resume_reuses_one_persisted_skill_catalog_for_prompt_and_tool(
     loaded = await resumed.loop.tool_registry.execute(
         ToolCall("skill", "skill", {"name": "first"}), _skip_approval=True
     )
-    missing = await resumed.loop.tool_registry.execute(
+    newly_loaded = await resumed.loop.tool_registry.execute(
         ToolCall("skill-missing", "skill", {"name": "second"}),
         _skip_approval=True,
     )
 
     assert "first: first skill" in prompt
-    assert "second: second skill" not in prompt
+    assert "second: second skill" in prompt
     assert loaded["isError"] is False
     assert loaded["content"][0]["text"] == "first body"
-    assert missing["isError"] is True
-    assert "available skills: first" in missing["content"][0]["text"]
+    assert newly_loaded["isError"] is False
+    assert newly_loaded["content"][0]["text"] == "second body"
 
 
 def test_second_resume_after_override_sees_overridden_snapshot(
@@ -595,7 +603,7 @@ def test_second_resume_after_override_sees_overridden_snapshot(
     assert resumed._startup_alerts == ()
 
 
-def test_concurrent_legacy_resumes_adopt_the_persisted_snapshot(
+def test_concurrent_legacy_empty_prompt_resumes_adopt_one_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -609,18 +617,17 @@ def test_concurrent_legacy_resumes_adopt_the_persisted_snapshot(
     metadata.pop("context_files")
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-    barrier = threading.Barrier(2)
     load_count = 0
-    load_count_lock = threading.Lock()
 
     def load_context(**kwargs: object) -> ProjectContext:
         del kwargs
         nonlocal load_count
-        with load_count_lock:
-            index = load_count
-            load_count += 1
-        barrier.wait()
-        return ProjectContext(f"fallback {index}", (tmp_path / f"context-{index}.md",))
+        load_count += 1
+        return ProjectContext(
+            f"default fallback {load_count}",
+            (tmp_path / "context.md",),
+            prompt_recipe="default",
+        )
 
     monkeypatch.setattr("zeta.tui.app.load_project_context", load_context)
     apps: list[TUIApp] = []
@@ -650,9 +657,12 @@ def test_concurrent_legacy_resumes_adopt_the_persisted_snapshot(
     saved = SessionManager(home).open(session_id).metadata
     prompts = [app.loop.context_assembler.system_prompt.content[0].text for app in apps]
     context_files = [app.slash_status().context_files for app in apps]
-    assert saved.system_prompt in {"fallback 0", "fallback 1"}
+    assert saved.prompt_recipe == "default"
     assert prompts == [saved.system_prompt, saved.system_prompt]
-    assert context_files == [tuple(saved.context_files), tuple(saved.context_files)]
+    assert context_files == [
+        (str(tmp_path / "context.md"),),
+        (str(tmp_path / "context.md"),),
+    ]
 
 
 def test_session_bash_cwd_round_trips_through_store_state(
@@ -2304,6 +2314,55 @@ def test_model_fallback_persists_and_clears_with_settings(tmp_path):
     with pytest.raises(SessionError, match="changed before commit"):
         manager.record_session_settings(stale, model=stale.model, provider=stale.provider,
                                         approval_mode="ask", budget=stale.compaction_budget)
+
+
+def test_copy_metadata_adopts_every_dataclass_field(tmp_path: Path) -> None:
+    from zeta.core.session import SessionMetadata
+
+    target = SessionMetadata.new(
+        session_id="a" * 32,
+        provider="fake",
+        model="offline",
+        cwd=str(tmp_path),
+        retained_tail=8,
+        compaction_budget=1000,
+    )
+    source = dataclasses.replace(target)
+    for metadata_field in dataclasses.fields(SessionMetadata):
+        setattr(source, metadata_field.name, {"copied": [metadata_field.name]})
+
+    SessionManager._copy_metadata(target, source)
+
+    for metadata_field in dataclasses.fields(SessionMetadata):
+        copied = getattr(target, metadata_field.name)
+        original = getattr(source, metadata_field.name)
+        assert copied == original
+        assert copied is not original
+
+
+def test_prompt_component_digest_must_match_owned_span(tmp_path: Path) -> None:
+    from zeta.core.session import SessionMetadata
+
+    metadata = SessionMetadata.new(
+        session_id="a" * 32,
+        provider="fake",
+        model="offline",
+        cwd=str(tmp_path),
+        retained_tail=8,
+        compaction_budget=1000,
+        system_prompt="prefix-owned-suffix",
+        prompt_recipe="custom",
+        prompt_components={
+            "project_memory": {
+                "offset": 7,
+                "length": 5,
+                "digest": hashlib.sha256(b"wrong").hexdigest(),
+            }
+        },
+    )
+
+    with pytest.raises(SessionError, match="prompt components are invalid"):
+        SessionMetadata.from_dict(metadata.to_dict(), path=tmp_path / "meta.json")
 
 
 @pytest.mark.parametrize("fallback", ["bad", [], [[], "model", 5], ["fake", "model", 5],

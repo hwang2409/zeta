@@ -11,7 +11,7 @@ import re
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,6 +27,7 @@ from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
 from .store import ConversationStore
+from .store.prompt_composition import PromptCompositionMixin, parse_prompt_recipe
 from .session_files import (
     SessionError,
     SessionInUseError,
@@ -55,9 +56,7 @@ from .session_links import (
     valid_pending_link,
 )
 
-
 logger = logging.getLogger(__name__)
-
 
 META_VERSION = 1
 
@@ -123,6 +122,8 @@ class SessionMetadata:
     project_memory_offset: int | None = None
     project_memory_length: int | None = None
     project_memory_digest: str | None = None
+    prompt_recipe: str | None = None
+    prompt_components: dict[str, dict[str, int | str]] = field(default_factory=dict)
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
@@ -153,6 +154,8 @@ class SessionMetadata:
         project_memory_offset: int | None = None,
         project_memory_length: int | None = None,
         project_memory_digest: str | None = None,
+        prompt_recipe: str | None = None,
+        prompt_components: dict[str, dict[str, int | str]] | None = None,
         tool_allow: tuple[str, ...] | None = None,
         tool_deny: tuple[str, ...] = (),
         tool_allow_layers: tuple[tuple[str, ...], ...] = (),
@@ -188,6 +191,8 @@ class SessionMetadata:
             project_memory_offset=project_memory_offset,
             project_memory_length=project_memory_length,
             project_memory_digest=project_memory_digest,
+            prompt_recipe=prompt_recipe,
+            prompt_components=copy.deepcopy(prompt_components or {}),
             tool_allow=tool_allow,
             tool_deny=tool_deny,
             tool_allow_layers=tool_allow_layers,
@@ -245,9 +250,14 @@ class SessionMetadata:
             or fallback[2] <= 0
         ):
             raise SessionError(f"session model fallback is invalid: {path}")
-        has_context_snapshot = "system_prompt" in value and "context_files" in value
-        system_prompt = value.get("system_prompt", "") if has_context_snapshot else ""
-        context_files = value.get("context_files", []) if has_context_snapshot else []
+        has_system_prompt = "system_prompt" in value
+        has_context_files = "context_files" in value
+        has_context_snapshot = has_system_prompt and has_context_files
+        # Preserve whichever legacy bytes exist even when the old snapshot is
+        # incomplete. An incomplete snapshot has no recorded recipe ownership,
+        # so resume treats it conservatively instead of rebuilding it.
+        system_prompt = value.get("system_prompt", "") if has_system_prompt else ""
+        context_files = value.get("context_files", []) if has_context_files else []
         skill_catalog = value.get("skill_catalog")
         agent_catalog = value.get("agent_catalog")
         vim_mode = value.get("vim_mode", True)
@@ -299,6 +309,12 @@ class SessionMetadata:
             ):
                 raise SessionError(f"session project memory span is invalid: {path}")
             memory_offset, memory_length, memory_digest = raw_offset, raw_length, raw_digest
+        prompt_recipe, prompt_components = parse_prompt_recipe(
+            value,
+            system_prompt=system_prompt,
+            has_context_snapshot=has_context_snapshot,
+            path=path,
+        )
         if (
             type(system_prompt) is not str
             or type(context_files) is not list
@@ -371,6 +387,8 @@ class SessionMetadata:
             project_memory_offset=memory_offset,
             project_memory_length=memory_length,
             project_memory_digest=memory_digest,
+            prompt_recipe=prompt_recipe,
+            prompt_components=prompt_components,
             tool_allow=tool_allow,
             tool_deny=tool_deny,
             tool_allow_layers=tool_allow_layers,
@@ -405,6 +423,8 @@ class SessionMetadata:
             "project_memory_offset": self.project_memory_offset,
             "project_memory_length": self.project_memory_length,
             "project_memory_digest": self.project_memory_digest,
+            "prompt_recipe": self.prompt_recipe,
+            "prompt_components": self.prompt_components,
             "tool_allow": list(self.tool_allow) if self.tool_allow is not None else None,
             "tool_deny": list(self.tool_deny),
             **(
@@ -433,7 +453,7 @@ class OpenedSession:
     store: ConversationStore
 
 
-class SessionManager(SessionPreferenceMixin):
+class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     """Create, validate, open, and discover zeta sessions."""
     def __init__(self, home: str | Path | None = None, *, user_home: str | Path | None = None) -> None:
         self.home = Path(home) if home is not None else env_home()
@@ -463,6 +483,8 @@ class SessionManager(SessionPreferenceMixin):
         project_memory_offset: int | None = None,
         project_memory_length: int | None = None,
         project_memory_digest: str | None = None,
+        prompt_recipe: str | None = None,
+        prompt_components: dict[str, dict[str, int | str]] | None = None,
         tool_allow: tuple[str, ...] | None = None,
         tool_deny: tuple[str, ...] = (),
         tool_allow_layers: tuple[tuple[str, ...], ...] = (),
@@ -506,6 +528,8 @@ class SessionManager(SessionPreferenceMixin):
                 project_memory_offset=project_memory_offset,
                 project_memory_length=project_memory_length,
                 project_memory_digest=project_memory_digest,
+                prompt_recipe=prompt_recipe,
+                prompt_components=prompt_components,
                 tool_allow=tool_allow,
                 tool_deny=tool_deny,
                 tool_allow_layers=tool_allow_layers,
@@ -761,42 +785,6 @@ class SessionManager(SessionPreferenceMixin):
     def touch(self, metadata: SessionMetadata) -> None:
         current = self._mutate(metadata.session_id, lambda item: self._touch(item))
         self._copy_metadata(metadata, current)
-
-    def persist_context_snapshot(
-        self,
-        metadata: SessionMetadata,
-        *,
-        system_prompt: str,
-        context_files: list[str] | tuple[str, ...],
-        overwrite: bool = False,
-    ) -> SessionMetadata:
-        """Snapshot the composed system prompt for future resumes.
-
-        By default this is first-write-wins: once a session has a stored
-        system_prompt, subsequent calls no-op so plain resume replays the
-        same cached prefix. Pass ``overwrite=True`` on the explicit
-        resume-with-``--system-prompt``/``--append-system-prompt`` path
-        so the new prompt replaces the snapshot; the caller is
-        responsible for warning the user that the prompt cache rebuilds.
-
-        ``updated_at`` only advances on ``overwrite=True`` (explicit user
-        action). Automatic legacy hydration — filling the snapshot in
-        first-write-wins style during resume — must not bump ``updated_at``,
-        or the sidebar reorders a session the user did not touch.
-        """
-
-        def update(item: SessionMetadata) -> SessionMetadata:
-            if item.system_prompt and not overwrite:
-                return item
-            item.system_prompt = system_prompt
-            item.context_files = list(context_files)
-            if overwrite:
-                return self._touch(item)
-            return item
-
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)
-        return current
 
     def persist_tool_policy(
         self,
@@ -1126,39 +1114,14 @@ class SessionManager(SessionPreferenceMixin):
 
     @staticmethod
     def _copy_metadata(target: SessionMetadata, source: SessionMetadata) -> None:
-        target.version = source.version
-        target.session_id = source.session_id
-        target.created_at = source.created_at
-        target.updated_at = source.updated_at
-        target.provider = source.provider
-        target.model = source.model
-        target.cwd = source.cwd
-        target.retained_tail = source.retained_tail
-        target.compaction_budget = source.compaction_budget
-        target.compaction = source.compaction
-        target.compaction_pinned = source.compaction_pinned
-        target.override_audit = [dict(item) for item in source.override_audit]
-        target.system_prompt = source.system_prompt
-        target.context_files = list(source.context_files)
-        target.skill_catalog = (
-            [dict(item) for item in source.skill_catalog]
-            if source.skill_catalog is not None
-            else None
-        )
-        target.agent_catalog = (
-            [dict(item) for item in source.agent_catalog]
-            if source.agent_catalog is not None
-            else None
-        )
-        target.vim_mode = source.vim_mode
-        target.budget_pinned = source.budget_pinned
-        target.plan_mode = source.plan_mode
-        target.name = source.name
-        target.approval_mode = source.approval_mode
-        target.model_fallback = source.model_fallback
-        target.tool_allow = source.tool_allow
-        target.tool_deny = source.tool_deny
-        target.tool_allow_layers = source.tool_allow_layers
+        """Adopt every persisted field into the caller's live metadata object."""
+
+        for metadata_field in fields(SessionMetadata):
+            setattr(
+                target,
+                metadata_field.name,
+                copy.deepcopy(getattr(source, metadata_field.name)),
+            )
 
     def _read(
         self, session_id: str, *, directory_fd: int | None = None

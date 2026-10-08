@@ -18,6 +18,7 @@ from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
 from ..models.catalog import provider_for_model
+from ..path_identity import same_physical_path
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
@@ -989,7 +990,7 @@ def _child_base_system_prompt(
 ) -> str | Message:
     """Compose project context from an explicit cwd that differs from the parent."""
 
-    if cwd_override is None or cwd_override == os.path.abspath(loop.store.cwd):
+    if cwd_override is None or same_physical_path(cwd_override, loop.store.cwd):
         return loop.context_assembler.system_prompt
     if child_registry is not None:
         child_registry.verify_cwd_identity()

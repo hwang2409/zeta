@@ -176,15 +176,16 @@ def test_cli_tui_serve_sync_refresh_and_index_reject_format_two(
 
     prompt = "prefix<zeta-project-memory></zeta-project-memory>suffix"
     block = "<zeta-project-memory></zeta-project-memory>"
-    with pytest.raises(UnsupportedMemoryFormatError, match=UNSUPPORTED_FORMAT_2):
-        refresh_project_memory(
-            prompt,
-            home=home,
-            project_id=project_id,
-            memory_offset=len("prefix"),
-            memory_length=len(block),
-            memory_digest=__import__("hashlib").sha256(block.encode()).hexdigest(),
-        )
+    refreshed = refresh_project_memory(
+        prompt,
+        home=home,
+        project_id=project_id,
+        memory_offset=len("prefix"),
+        memory_length=len(block),
+        memory_digest=__import__("hashlib").sha256(block.encode()).hexdigest(),
+    )
+    assert refreshed.startswith("prefix<zeta-project-memory>")
+    assert refreshed.endswith("</zeta-project-memory>suffix")
 
     assert _snapshot(project_root) == before
 

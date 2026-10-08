@@ -12,11 +12,7 @@ from ..config.settings import ResolvedConfig
 from ..config.tool_policy import ToolPolicy
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.hooks import load_hooks_for_provider
-from ..core.project_context import (
-    ProjectContext,
-    ProjectDiscovery,
-    refresh_project_memory,
-)
+from ..core.project_context import ProjectContext, ProjectDiscovery
 from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
 from ..media.image_policy import image_policy_for_provider
@@ -127,6 +123,8 @@ def compose_runtime(
                 project_memory_offset=project_context.memory_offset,
                 project_memory_length=project_context.memory_length,
                 project_memory_digest=project_context.memory_digest,
+                prompt_recipe=project_context.prompt_recipe,
+                prompt_components=project_context.prompt_components,
                 auto_project=(
                     config.auto_project and auto_project and project_discovery is None
                 ),
@@ -165,20 +163,6 @@ def compose_runtime(
                 tool_allow=effective_policy.allow,
                 tool_deny=effective_policy.deny,
                 tool_allow_layers=effective_policy.allow_layers,
-            )
-        if opened is not None:
-            project_context = ProjectContext(
-                refresh_project_memory(
-                    metadata.system_prompt,
-                    home=home,
-                    cwd=cwd,
-                    project_id=metadata.project_id,
-                    memory_offset=metadata.project_memory_offset,
-                    memory_length=metadata.project_memory_length,
-                    memory_digest=metadata.project_memory_digest,
-                ),
-                project_context.files,
-                project_context.notices,
             )
         if metadata.skill_catalog is None:
             raise ValueError("session has no persisted skill catalog")

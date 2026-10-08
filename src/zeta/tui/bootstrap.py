@@ -15,7 +15,6 @@ from ..computer.session import prepare_args as prepare_computer_args
 from ..config.settings import ResolvedConfig, SettingsError
 from ..config.settings import resolve as resolve_settings
 from ..core.project_context import (
-    ProjectContext,
     PromptArgumentError,
     associate_project_discovery,
     discover_project,
@@ -24,7 +23,6 @@ from ..core.project_context import (
 from ..core.session import (
     SessionError,
     SessionManager,
-    SessionMetadata,
     SessionPreview,
     env_home,
     format_relative_age,
@@ -34,12 +32,11 @@ from ..providers.factory import build_backend as build_network_backend
 from ..providers.scripted_fake import ScriptedFakeBackend, fake_script_from_env
 from ..runtime import compose_runtime
 from ..runtime.compaction_mode import apply_compaction, persist_compaction
+from ..runtime.prompt_resume import resume_prompt
 from ..skills import (
-    SkillCatalog,
     discover_session_skills,
-    replace_skill_index,
 )
-from ..skills.agent_catalog import AgentCatalog, discover_session_agents
+from ..skills.agent_catalog import discover_session_agents
 from ..tools._shared.process import (
     BackgroundTaskNotice,
     BackgroundTaskShutdownNotice,
@@ -280,8 +277,6 @@ def _create_app_with_root(
         discovery = associate_project_discovery(discovery, manager.project_registry)
     override_on_resume = False
     if resuming:
-        skill_catalog = _session_skill_catalog(metadata, home, manager, repo_root)
-        agent_catalog = _session_agent_catalog(metadata, home, manager, repo_root)
         cli_provider = getattr(args, "provider", None)
         cli_model = getattr(args, "model", None)
         provider_override = cli_provider or loaded_settings.settings.provider
@@ -310,39 +305,21 @@ def _create_app_with_root(
         override_on_resume = (
             system_prompt_override is not None or system_prompt_append is not None
         )
-        # Project memory is human-editable and must be refreshed on resume;
-        # ordinary context remains snapshot-first for prompt stability.
-        if (
-            metadata.system_prompt
-            and not override_on_resume
-            and metadata.project_id is None
-        ):
-            project_context = ProjectContext(
-                metadata.system_prompt,
-                tuple(Path(path) for path in metadata.context_files),
-            )
-        else:
-            project_context = _app.load_project_context(
-                cwd=Path(metadata.cwd),
-                repo_root=repo_root,
-                zeta_home=home,
-                system_override=system_prompt_override,
-                system_append=system_prompt_append,
-                catalog=skill_catalog,
-                project_id=metadata.project_id,
-                inbox_enabled=config.inbox_enabled,
-            )
-            persisted = manager.persist_context_snapshot(
-                metadata,
-                system_prompt=project_context.system_prompt,
-                context_files=[str(path) for path in project_context.files],
-                overwrite=override_on_resume,
-            )
-            project_context = ProjectContext(
-                persisted.system_prompt,
-                tuple(Path(path) for path in persisted.context_files),
-                project_context.notices,
-            )
+        resumed_prompt = resume_prompt(
+            metadata,
+            manager=manager,
+            home=home,
+            repo_root=repo_root,
+            inbox_enabled=config.inbox_enabled,
+            system_override=system_prompt_override,
+            system_append=system_prompt_append,
+            context_loader=_app.load_project_context,
+        )
+        project_context = resumed_prompt.context
+        skill_catalog = resumed_prompt.skill_catalog
+        agent_catalog = resumed_prompt.agent_catalog
+        if override_on_resume:
+            manager.touch(metadata)
     else:
         provider = config.provider
         model = config.model
@@ -508,46 +485,6 @@ def _create_app_with_root(
     if not getattr(args, "prompt", None) and resuming and resume_compaction is not None:
         persist_compaction(loop)
     return app
-
-
-def _session_skill_catalog(
-    metadata: SessionMetadata, home: Path, manager: SessionManager, repo_root: Path
-) -> SkillCatalog:
-    if metadata.skill_catalog is None:
-        catalog = discover_session_skills(home=home, project_dir=repo_root)
-        persisted = manager.persist_skill_catalog(
-            metadata,
-            catalog,
-            system_prompt=(
-                replace_skill_index(metadata.system_prompt, catalog)
-                if metadata.system_prompt
-                else None
-            ),
-        )
-        try:
-            return SkillCatalog.from_snapshot(persisted.skill_catalog)
-        except ValueError as exc:
-            raise SessionError("session skill catalog is invalid") from exc
-    try:
-        return SkillCatalog.from_snapshot(metadata.skill_catalog)
-    except ValueError as exc:
-        raise SessionError("session skill catalog is invalid") from exc
-
-
-def _session_agent_catalog(
-    metadata: SessionMetadata, home: Path, manager: SessionManager, repo_root: Path
-):
-    if metadata.agent_catalog is None:
-        catalog = discover_session_agents(home=home, project_dir=repo_root)
-        persisted = manager.persist_agent_catalog(metadata, catalog)
-        try:
-            return AgentCatalog.from_snapshot(persisted.agent_catalog)
-        except ValueError as exc:
-            raise SessionError("session agent catalog is invalid") from exc
-    try:
-        return AgentCatalog.from_snapshot(metadata.agent_catalog)
-    except ValueError as exc:
-        raise SessionError("session agent catalog is invalid") from exc
 
 
 def _apply_startup_theme(name: str | None, home: Path) -> tuple[str, ...]:

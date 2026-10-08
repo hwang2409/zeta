@@ -12,11 +12,7 @@ from typing import Any
 from ..config.settings import load_settings
 from ..config.settings import resolve as resolve_settings
 from ..core.approval import ApprovalPolicy
-from ..core.project_context import (
-    ProjectContext,
-    discover_repo_root,
-    load_project_context,
-)
+from ..core.project_context import discover_repo_root, load_project_context
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
 from ..core.slash import effective_budget_for_model, resolve_session_budget
 from ..project_registry import ProjectRegistryError
@@ -25,12 +21,9 @@ from ..providers.scripted_fake import ScriptedFakeBackend, fake_script_from_env
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
-from ..skills import (
-    SkillCatalog,
-    discover_session_skills,
-    replace_skill_index,
-)
-from ..skills.agent_catalog import AgentCatalog, discover_session_agents
+from ..runtime.prompt_resume import resume_prompt
+from ..skills import discover_session_skills
+from ..skills.agent_catalog import discover_session_agents
 from .fake_backend import ServerFakeBackend
 
 BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]]
@@ -323,41 +316,18 @@ class ServerRuntime:
             )
         opened = await asyncio.to_thread(self.manager.open, session_id)
         try:
-            if opened.metadata.skill_catalog is None:
-                skill_catalog = discover_session_skills(
-                    home=self.home,
-                    project_dir=discover_repo_root(Path(opened.metadata.cwd)),
-                )
-                self.manager.persist_skill_catalog(
-                    opened.metadata,
-                    skill_catalog,
-                    system_prompt=(
-                        replace_skill_index(
-                            opened.metadata.system_prompt, skill_catalog
-                        )
-                        if opened.metadata.system_prompt
-                        else None
-                    ),
-                )
-            else:
-                skill_catalog = SkillCatalog.from_snapshot(
-                    opened.metadata.skill_catalog
-                )
-            if opened.metadata.agent_catalog is None:
-                agent_catalog = discover_session_agents(
-                    home=self.home,
-                    project_dir=discover_repo_root(Path(opened.metadata.cwd)),
-                )
-                self.manager.persist_agent_catalog(opened.metadata, agent_catalog)
-            else:
-                agent_catalog = AgentCatalog.from_snapshot(
-                    opened.metadata.agent_catalog
-                )
-            context = ProjectContext(
-                opened.metadata.system_prompt,
-                tuple(Path(path) for path in opened.metadata.context_files),
-            )
+            repo_root = discover_repo_root(session_cwd)
             config = self._config(opened.metadata.provider, opened.metadata.model)
+            resumed_prompt = resume_prompt(
+                opened.metadata,
+                manager=self.manager,
+                home=self.home,
+                repo_root=repo_root,
+                inbox_enabled=config.inbox_enabled,
+            )
+            context = resumed_prompt.context
+            skill_catalog = resumed_prompt.skill_catalog
+            agent_catalog = resumed_prompt.agent_catalog
             composition = self._compose(
                 cwd=session_cwd,
                 config=config,
