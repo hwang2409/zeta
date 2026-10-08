@@ -7,7 +7,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 from ..core.session import env_home
 from ..project_registry import ProjectRegistry, ProjectRegistryError
@@ -32,6 +32,14 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
         "discover", help="find the project associated with a directory"
     )
     discover.add_argument("directory", nargs="?", default=".")
+    index = verbs.add_parser("index", help="inspect or rebuild transcript search")
+    index.add_argument("project", help="project ID or exact name")
+    index_actions = index.add_subparsers(dest="index_action", required=True)
+    index_actions.add_parser("status", help="show index generation and cursors")
+    index_actions.add_parser("rebuild", help="rebuild from linked parent sessions")
+    search = index_actions.add_parser("search", help="search sanitized transcript units")
+    search.add_argument("query", nargs="+")
+    search.add_argument("--limit", type=int, default=10)
     memory = verbs.add_parser(
         "memory", help="print, update, push, or pull bounded project memory"
     )
@@ -85,6 +93,8 @@ def run(
             if project is None:
                 raise ProjectRegistryError("no project associated with directory")
             value = project.to_dict()
+        elif args.project_verb == "index":
+            value = _run_index(args, registry)
         elif args.project_verb == "memory":
             if args.project == "accept":
                 if args.remote is None or args.action is not None:
@@ -165,11 +175,75 @@ def run(
         else:
             print(f"zeta: unknown project verb: {args.project_verb}", file=err)
             return 2
-    except (ProjectRegistryError, OSError, UnicodeError) as exc:
+    except (
+        ProjectRegistryError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ) as exc:
         print(f"zeta: {exc}", file=err)
         return 1
     print(json.dumps(value, indent=2, sort_keys=True), file=out)
     return 0
+
+
+def _run_index(args: argparse.Namespace, registry: ProjectRegistry) -> object:
+    from ..transcript_search.index import TranscriptIndex, TranscriptSource
+
+    project = (
+        registry.show_project(args.project)
+        if _PROJECT_ID.fullmatch(args.project)
+        else registry.show_project(name=args.project)
+    )
+    index = TranscriptIndex(registry.root / project.project_id, project.project_id)
+    if args.index_action == "rebuild":
+        sources = []
+        for link in registry.list_session_links(project.project_id, limit=10_000):
+            if link.get("parent_session_id") is not None:
+                continue
+            session_id = link.get("session_id")
+            transcript_path = link.get("transcript_path")
+            if isinstance(session_id, str) and isinstance(transcript_path, str):
+                sources.append(
+                    TranscriptSource(
+                        session_id, Path(transcript_path), project.project_id
+                    )
+                )
+        status = index.rebuild(sources)
+        return _status_value(status)
+    if args.index_action == "search":
+        return [
+            {
+                "unit_id": hit.unit_id,
+                "session_id": hit.unit.session_id,
+                "seq_start": hit.unit.seq_start,
+                "seq_end": hit.unit.seq_end,
+                "kind": hit.unit.kind,
+                "match": hit.match,
+                "score": hit.score,
+                "text": hit.unit.text,
+            }
+            for hit in index.search(" ".join(args.query), limit=args.limit)
+        ]
+    return _status_value(index.status())
+
+
+def _status_value(status: Any) -> dict[str, object]:
+    return {
+        "project_id": status.project_id,
+        "schema_version": status.schema_version,
+        "sanitizer_version": status.sanitizer_version,
+        "ready": status.ready,
+        "detail": status.detail,
+        "generation": status.generation,
+        "unit_count": status.unit_count,
+        "session_count": status.session_count,
+        "cursors": status.cursors,
+        "path": str(status.path),
+        "size_bytes": status.size_bytes,
+    }
 
 
 def _run_memory_sync(

@@ -12,12 +12,13 @@ def zsh_script() -> str:
 
 _zeta() {
     local context state line command_index command_name token
-    local -a commands session_verbs automation_verbs project_verbs webhook_verbs mcp_verbs original_words
+    local -a commands session_verbs automation_verbs project_verbs project_index_verbs webhook_verbs mcp_verbs original_words
     typeset -A opt_args
     commands=(login serve session project inbox panel automation mcp stalls computer completion)
     session_verbs=(list rename delete export stats push pull)
     automation_verbs=(list show approve disable import daemon webhook)
-    project_verbs=(create init discover list show memory)
+    project_verbs=(create init discover list show memory index)
+    project_index_verbs=(status rebuild search)
     webhook_verbs=(url show-secret rotate-secret rotate-url)
     mcp_verbs=(add list show remove enable disable test login logout trust untrust)
     original_words=("${words[@]}")
@@ -118,6 +119,7 @@ _zeta() {
                         init) _arguments '--name=[project name]:name:' '--scope=[project scope]:scope:' '1:directory:_directories' ;;
                         discover) _arguments '1:directory:_directories' ;;
                         memory) _arguments '--project=[project for sync]:project:' '--remote-home=[remote ZETA_HOME]:directory:' '--accept=[conflict side]:side:(local remote)' '1:project or push/pull/resolve:' '2:remote host:' '--set=[memory file]:file:' '2:content:' '--from-file=[memory file]:file:' '2:path:_files' ;;
+                        index) _arguments '1:project:' '2:action:(status rebuild search)' '--limit=[result limit]:count:' '*:query:' ;;
                         show) _arguments '1:project:' ;;
                         list) _message 'no arguments' ;;
                         *) _describe 'verb' project_verbs ;;
@@ -253,12 +255,13 @@ def bash_script() -> str:
             ;;
         project)
             if (( COMP_CWORD <= command_index + 1 )); then
-                COMPREPLY=( $(compgen -W "create init discover list show memory --canonical-integration-root --name --scope --set --from-file --project --remote-home --accept" -- "$cur") )
+                COMPREPLY=( $(compgen -W "create init discover list show memory index --canonical-integration-root --name --scope --set --from-file --project --remote-home --accept" -- "$cur") )
             else
                 case "$verb" in
                     create) COMPREPLY=( $(compgen -W "--scope --canonical-integration-root" -- "$cur") ) ;;
                     init) COMPREPLY=( $(compgen -W "--name --scope" -- "$cur") ) ;;
                     memory) COMPREPLY=( $(compgen -W "push pull resolve --set --from-file --project --remote-home --accept" -- "$cur") ) ;;
+                    index) COMPREPLY=( $(compgen -W "status rebuild search --limit" -- "$cur") ) ;;
                 esac
             fi
             ;;
