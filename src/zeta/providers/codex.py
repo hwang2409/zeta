@@ -31,7 +31,6 @@ import httpx
 from .codex_payload import (
     _cache_affinity_json,
     build_responses_payload,
-    codex_stop_reason,
 )
 from .stream_diagnostics import StreamDiagnostics
 from .stream_errors import decode_stream_error
@@ -106,6 +105,7 @@ class _ItemState:
     raw_text: str = ""
     encrypted_content: str | None = None
     completed_item: dict[str, Any] | None = None
+    completion_status: object = None
     blocks: set[BlockKey] = field(default_factory=set)
 
 
@@ -462,65 +462,22 @@ def _translate_event(
     _require_response_started(response_state, event_type)
     if response_state == "stopped":
         raise CodexStreamError("Codex event follows response completion")
-    if event_type == "response.failed":
-        response = payload.get("response")
-        detail = response.get("error") if isinstance(response, Mapping) else None
-        if not isinstance(detail, Mapping):
-            detail = {}
-        error = decode_stream_error(detail)
-        raise CodexStreamError(
-            error.message,
-            code=error.code,
-            status_code=error.status_code,
-            retryable=error.retry_reason is not None,
-            retry_reason=error.retry_reason,
-        )
-    if event_type == "response.incomplete":
-        raise CodexStreamError("Codex response was incomplete")
-    if event_type in {"response.completed", "response.done"}:
+    if event_type in {
+        "response.completed",
+        "response.done",
+        "response.incomplete",
+        "response.failed",
+    }:
         if response_state != "started":
             raise CodexStreamError("Codex response completion has no active response")
-        if any(item.state != "stopped" for item in items.values()):
-            raise _stream_inconsistent("Codex response completed with open items")
-        if any(block.state != "stopped" for block in blocks.values()):
-            raise _stream_inconsistent("Codex response completed with open blocks")
-        response = payload.get("response")
-        if response is not None and not isinstance(response, Mapping):
-            raise CodexStreamError("Codex response completion is invalid")
-        if isinstance(response, Mapping):
-            if "status" in response and response["status"] != "completed":
-                raise _stream_inconsistent(
-                    f"Codex response completion status {response['status']!r} is invalid"
-                )
-            response_data.update(
-                {key: response[key] for key in ("id", "status") if key in response}
-            )
-            response_usage = response.get("usage")
-            if response_usage is not None and not isinstance(response_usage, Mapping):
-                raise CodexStreamError("Codex response usage is invalid")
-            if isinstance(response_usage, Mapping):
-                usage.update(response_usage)
-        content: list[ContentBlock] = []
-        output_items: list[dict[str, Any]] = []
-        for index in sorted(items):
-            item = items[index]
-            content.extend(_complete_item(item))
-            if item.completed_item is None:
-                raise CodexStreamError("Codex output item has no completed item")
-            output_items.append(dict(item.completed_item))
         return (
-            StreamEvent(
-                StreamEventType.MESSAGE_END,
-                message=Message(
-                    MessageRole.ASSISTANT,
-                    content,
-                    metadata={"codex_output_items": output_items},
-                ),
-                data={
-                    "usage": normalize_usage(usage),
-                    **response_data,
-                    "stop_reason": codex_stop_reason(response_data),
-                },
+            _decode_terminal_response(
+                event_type,
+                payload,
+                items,
+                blocks,
+                usage,
+                response_data,
             ),
             "stopped",
         )
@@ -629,7 +586,9 @@ def _translate_event(
         for key in item.blocks:
             blocks[key].state = "stopped"
         item.state = "stopped"
-        if item.kind == "function_call":
+        if item.kind == "function_call" and (
+            item.completion_status is None or item.completion_status == "completed"
+        ):
             return (
                 StreamEvent(
                     StreamEventType.MESSAGE_UPDATE,
@@ -914,6 +873,124 @@ def _stream_inconsistent(message: str) -> CodexStreamError:
     )
 
 
+def _format_provider_status(status: object) -> str:
+    if type(status) is str:
+        bounded = status.encode("utf-8")[:32].decode("utf-8", errors="ignore")
+        return repr(bounded)
+    return f"<{type(status).__name__}>"
+
+
+def _decode_terminal_response(
+    event_type: str,
+    payload: Mapping[str, Any],
+    items: Mapping[int, _ItemState],
+    blocks: Mapping[BlockKey, _BlockState],
+    usage: dict[str, Any],
+    response_data: dict[str, Any],
+) -> StreamEvent:
+    response = payload.get("response")
+    if event_type == "response.failed":
+        detail = response.get("error") if isinstance(response, Mapping) else None
+        if not isinstance(detail, Mapping):
+            detail = {}
+        error = decode_stream_error(detail)
+        raise CodexStreamError(
+            error.message,
+            code=error.code,
+            status_code=error.status_code,
+            retryable=error.retry_reason is not None,
+            retry_reason=error.retry_reason,
+        )
+    if response is not None and not isinstance(response, Mapping):
+        raise CodexStreamError("Codex response completion is invalid")
+    if any(item.state != "stopped" for item in items.values()):
+        raise _stream_inconsistent("Codex response completed with open items")
+    if any(block.state != "stopped" for block in blocks.values()):
+        raise _stream_inconsistent("Codex response completed with open blocks")
+
+    response_status = response.get("status") if isinstance(response, Mapping) else None
+    incomplete = event_type == "response.incomplete"
+    if incomplete:
+        if response_status is not None and response_status != "incomplete":
+            raise CodexStreamError(
+                "Codex incomplete response status "
+                f"{_format_provider_status(response_status)} is invalid"
+            )
+        details = (
+            response.get("incomplete_details")
+            if isinstance(response, Mapping)
+            else None
+        )
+        reason = details.get("reason") if isinstance(details, Mapping) else None
+        if reason == "max_output_tokens":
+            stop_reason = "max_tokens"
+        elif reason == "content_filter":
+            stop_reason = "content_filter"
+        else:
+            raise CodexStreamError(
+                f"Codex response was incomplete: {_format_provider_status(reason)}"
+            )
+    else:
+        if response_status is not None and response_status != "completed":
+            raise _stream_inconsistent(
+                "Codex response completion status "
+                f"{_format_provider_status(response_status)} is invalid"
+            )
+        invalid_item = next(
+            (
+                item
+                for item in items.values()
+                if item.completion_status is not None
+                and item.completion_status != "completed"
+            ),
+            None,
+        )
+        if invalid_item is not None:
+            raise _stream_inconsistent(
+                f"Codex completed {invalid_item.kind} status "
+                f"{_format_provider_status(invalid_item.completion_status)} is invalid"
+            )
+        stop_reason = "end_turn"
+
+    if isinstance(response, Mapping):
+        response_data.update(
+            {key: response[key] for key in ("id", "status") if key in response}
+        )
+        response_usage = response.get("usage")
+        if response_usage is not None and not isinstance(response_usage, Mapping):
+            raise CodexStreamError("Codex response usage is invalid")
+        if isinstance(response_usage, Mapping):
+            usage.update(response_usage)
+
+    content: list[ContentBlock] = []
+    output_items: list[dict[str, Any]] = []
+    for index in sorted(items):
+        item = items[index]
+        if item.completed_item is None:
+            raise CodexStreamError("Codex output item has no completed item")
+        if (
+            incomplete
+            and item.kind == "function_call"
+            and item.completion_status != "completed"
+        ):
+            continue
+        content.extend(_complete_item(item))
+        output_items.append(dict(item.completed_item))
+    return StreamEvent(
+        StreamEventType.MESSAGE_END,
+        message=Message(
+            MessageRole.ASSISTANT,
+            content,
+            metadata={"codex_output_items": output_items},
+        ),
+        data={
+            "usage": normalize_usage(usage),
+            **response_data,
+            "stop_reason": stop_reason,
+        },
+    )
+
+
 def _finish_reasoning_summary_part(
     payload: Mapping[str, Any],
     items: Mapping[int, _ItemState],
@@ -957,10 +1034,7 @@ def _merge_completed_item(
         raise CodexStreamError("Codex completed item id does not match output item")
     if complete.get("type") != item.kind:
         raise CodexStreamError("Codex completed item type does not match output item")
-    if "status" in complete and complete["status"] != "completed":
-        raise _stream_inconsistent(
-            f"Codex completed {item.kind} status {complete['status']!r} is invalid"
-        )
+    item.completion_status = complete.get("status")
     if item.kind == "message":
         if complete.get("role") != "assistant":
             raise CodexStreamError("Codex completed message metadata is invalid")
@@ -1053,6 +1127,7 @@ def _merge_completed_item(
         )
         item.arguments = arguments
     item.completed_item = dict(complete)
+
 
 def _complete_item(item: _ItemState) -> list[ContentBlock]:
     if item.kind == "message":
