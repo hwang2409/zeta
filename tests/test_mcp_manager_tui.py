@@ -48,7 +48,7 @@ async def test_slash_mcp_opens_primary_tui_manager(tmp_path):
     app._submit_input("/mcp")
     assert app.status_card_active
     assert app._mcp_manager_open
-    assert app._status_card._lines[0] == "MCP servers"
+    assert app._status_card._lines[0][0][1] == "MCP servers"
     await loop.ensure_mcp_servers()
     await loop.close()
 
@@ -62,7 +62,9 @@ def test_manager_renders_every_status_glyph_and_redacts(tmp_path):
     manager.path("user").write_text(json.dumps(raw))
     view = MCPManager(manager)
 
-    rendered = view.render()
+    rendered = "\n".join(
+        "".join(text for _style, text in line) for line in view.render()
+    )
 
     assert "○ disabled" in rendered
     assert "◌ pending" in rendered

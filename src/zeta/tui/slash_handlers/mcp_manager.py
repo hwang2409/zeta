@@ -27,7 +27,7 @@ class MCPManagerMixin:
             self._status_restore_cursor = 0
         self._mcp_manager.service.mount = self.loop._mcp_mount
         self._mcp_manager_open = True
-        self._status_card.set_lines(self._mcp_manager.render().splitlines())
+        self._status_card.set_lines(self._mcp_manager.render())
         self._status_card_open = True
         session.layout.focus(self._status_card_window)
         asyncio.create_task(self._sync_mcp_manager())
@@ -43,7 +43,7 @@ class MCPManagerMixin:
         if not self._mcp_manager_open:
             return
         self._mcp_manager.service.mount = self.loop._mcp_mount
-        self._status_card.set_lines(self._mcp_manager.render().splitlines())
+        self._status_card.set_lines(self._mcp_manager.render())
         self._invalidate_prompt()
 
     def _status_move(self, amount: int) -> None:

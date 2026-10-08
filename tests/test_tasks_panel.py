@@ -16,8 +16,8 @@ from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.skills import SkillCatalog
 from zeta.tools._shared.process import BackgroundTaskInfo, BackgroundTaskRegistry
-from zeta.tui.app import TUIApp
 from zeta.tui import theme
+from zeta.tui.app import TUIApp
 from zeta.tui.cards.tasks_panel import (
     MAX_OUTPUT_LINES,
     BackgroundTasksPanel,
