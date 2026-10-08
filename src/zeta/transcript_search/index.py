@@ -375,6 +375,26 @@ _PROJECT_LOCKS: dict[tuple[Path, str], threading.RLock] = {}
 _PROJECT_LOCKS_GUARD = threading.Lock()
 
 
+def is_indexable_top_level_project_session(
+    *,
+    agent_depth: int,
+    project_id: str | None,
+    parent_session_id: str | None,
+    session_dir: Path,
+) -> bool:
+    """Return whether one session belongs in ordinary project transcript search."""
+
+    if agent_depth != 0 or project_id is None or parent_session_id is not None:
+        return False
+    try:
+        (Path(session_dir) / "attention_fork.json").lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 class TranscriptIndexError(RuntimeError):
     """A recoverable derived-index failure."""
 

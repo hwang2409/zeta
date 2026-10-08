@@ -481,6 +481,9 @@ async def test_background_shutdown_stays_in_pinned_directory(tmp_path, replaceme
     rows = load_session_json((pinned / "background_tasks.json").read_bytes())
     assert rows[0]["task_id"] == task_id
     assert rows[0]["running"] is False
+    assert type(rows[0]["started_at"]) is float
+    assert type(rows[0]["ended_at"]) is float
+    assert rows[0]["ended_at"] >= rows[0]["started_at"]
     assert tasks._directory_fd is None
 
 
