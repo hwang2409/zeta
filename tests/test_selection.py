@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ErrorInfo, StreamEvent, StreamEventType
 from zeta.runtime.loop import AgentLoop
@@ -270,7 +270,7 @@ def test_wheel_still_scrolls_and_other_buttons_pass_through() -> None:
 def _app(tmp_path: Path) -> TUIApp:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
         history_path=tmp_path / "history",

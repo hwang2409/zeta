@@ -40,7 +40,7 @@ from zeta.tools.registry import ToolDefinition, ToolRegistry
 def _session(home: Path, *, project_id: str | None = None):
     manager = SessionManager(home)
     return manager.create(
-        provider="fake",
+        provider="codex",
         model="fake",
         cwd=home,
         project_id=project_id,
@@ -326,7 +326,7 @@ async def test_attention_fork_preserves_prompt_composition_on_resume(
         )
     manager = SessionManager(home)
     source = manager.create(
-        provider="fake",
+        provider="codex",
         model="offline",
         cwd=workspace,
         system_prompt=context.system_prompt,
@@ -361,7 +361,7 @@ async def test_attention_fork_preserves_prompt_composition_on_resume(
         fork.store.close()
 
     (home / "AGENTS.md").write_text("identity after", encoding="utf-8")
-    runtime = ServerRuntime(home, cwd=tmp_path, provider="fake")
+    runtime = ServerRuntime(home, cwd=tmp_path, provider="codex")
     await runtime.resume_session(fork_id)
     resumed = runtime.loop.context_assembler.system_prompt.content[0].text
     await runtime.close()

@@ -1,4 +1,4 @@
-"""Small deterministic backend used by ``zeta serve --provider fake``."""
+"""Small deterministic backend used by ``zeta serve --provider codex``."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
-from ..protocol.types import (
+from zeta.protocol.types import (
     CompletionBackend,
     Message,
     MessageRole,

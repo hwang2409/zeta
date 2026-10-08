@@ -57,39 +57,8 @@ def _with_turn_context(message: Message, text: str) -> Message:
     )
 
 
-def build_notification_system_message(store: ConversationStore) -> Message | None:
-    """Build a system input from the currently pending notifications."""
-
-    notifications = store.agent_notifications()
-    return _notification_message(notifications) if notifications else None
 
 
-def notification_events(
-    store: ConversationStore,
-    notification_ids: Collection[str] | None = None,
-) -> Iterator[StreamEvent]:
-    """Render notifications outside a parent turn and acknowledge them."""
-
-    notifications = store.agent_notifications()
-    if notification_ids is not None:
-        notifications = [
-            notification
-            for notification in notifications
-            if notification.id in notification_ids
-        ]
-    for notification in notifications:
-        yield StreamEvent(
-            StreamEventType.AGENT_NOTIFICATION,
-            data={
-                "notification_id": notification.id,
-                **notification.data,
-                "kind": notification.data.get("kind", "agent_completion"),
-                "tui_presented": store.is_agent_notification_presented_to_tui(
-                    notification.id
-                ),
-            },
-        )
-        store.acknowledge_agent_notification(notification.id)
 
 
 class NotificationWake:

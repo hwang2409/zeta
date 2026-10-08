@@ -19,8 +19,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.agent.notifications import NotificationWake
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -195,7 +196,7 @@ async def test_task_exit_recovered_after_restart_exactly_once(tmp_path: Path) ->
     # S5: a previously-running row with no existing task_exited notification
     # yields exactly one recovery notification on the normal production path,
     # and repeated resumes never duplicate it.
-    from zeta.core.fake import FakeBackend
+    from tests.support.fake_backend import FakeBackend
     from zeta.runtime.loop import AgentLoop
     from zeta.tools._shared.process import _BackgroundRecord
 
@@ -324,11 +325,9 @@ def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
     assert active[0].data["exit_code"] == 1
 
 
-def test_tui_presented_cancellation_remains_available_to_headless_consumer(
+def test_tui_presented_notification_remains_available_to_notification_wake(
     tmp_path: Path,
 ) -> None:
-    from zeta.agent.notifications import build_notification_system_message
-
     store = ConversationStore(tmp_path)
     notification = store.append_agent_notification(
         "macro:shutdown",
@@ -340,7 +339,7 @@ def test_tui_presented_cancellation_remains_available_to_headless_consumer(
     )
     store.mark_agent_notification_presented_to_tui(notification.id)
 
-    message = build_notification_system_message(store)
+    message = NotificationWake(store).pending_message()
 
     assert message is not None
     assert message.metadata["notifications"] == [
@@ -352,14 +351,9 @@ def test_tui_presented_cancellation_remains_available_to_headless_consumer(
     ]
 
 
-def test_legacy_notification_without_kind_loads_as_agent_completion(tmp_path: Path) -> None:
-    # S7: a notification row persisted without a `kind` field is treated as an
-    # agent_completion by every durable-notification consumer.
-    from zeta.agent.notifications import (
-        build_notification_system_message,
-        notification_events,
-    )
-
+def test_legacy_notification_without_kind_is_agent_completion_in_wake_payload(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path, session_id="legacy")
     store._append_row(
         "notification",
@@ -371,12 +365,11 @@ def test_legacy_notification_without_kind_loads_as_agent_completion(tmp_path: Pa
             "text": "done",
         },
     )
-    message = build_notification_system_message(store)
+
+    message = NotificationWake(store).pending_message()
+
     assert message is not None
     assert message.metadata["notifications"][0]["kind"] == "agent_completion"
-    events = list(notification_events(store))
-    assert len(events) == 1
-    assert events[0].data["kind"] == "agent_completion"
 
 
 def test_store_replay_accepts_task_and_unknown_notification_kinds(
@@ -1371,7 +1364,7 @@ asyncio.run(main(Path(sys.argv[1])))
 async def test_archive_private_and_session_scoped(tmp_path: Path) -> None:
     home = tmp_path / "home"
     manager = SessionManager(home)
-    opened = manager.create(provider="fake", model="fake", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="fake", cwd=tmp_path)
     store = opened.store
     tasks = BackgroundTaskRegistry(
         session_dir=store.session_dir,

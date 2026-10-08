@@ -47,18 +47,12 @@ class _BoundedText:
         if len(value) > remaining:
             self.truncated = True
 
-    def append_captured(self, value: str, full_size: int) -> None:
-        self.append(value)
-        self._full_size += max(0, full_size - len(value.encode("utf-8")))
 
     def begin_line(self) -> None:
         if self._has_line:
             self.append("\n")
         self._has_line = True
 
-    def append_line(self, value: str) -> None:
-        self.begin_line()
-        self.append(value)
 
     def render(self, *, full_size: int | None = None) -> ToolTextBlock:
         return text_block(

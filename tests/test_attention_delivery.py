@@ -20,7 +20,7 @@ from zeta.tools.resolve_attention import register_fork
 
 def _project_session(home: Path, project_id: str):
     return SessionManager(home).create(
-        provider="fake",
+        provider="codex",
         model="fake",
         cwd=home,
         project_id=project_id,

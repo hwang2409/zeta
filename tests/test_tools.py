@@ -18,8 +18,8 @@ import zeta.tools._shared.sandbox as sandbox_module
 import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.receipt import build_agent_receipt, receipt_message_size
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
 from zeta.core.store import ConversationStore
@@ -1646,41 +1646,6 @@ async def test_numeric_validation_rejects_nonfinite_and_bool_enum_values(
     assert int_result["content"][0]["text"] == "enum"
 
 
-@pytest.mark.asyncio
-async def test_abort_cancels_calls_after_the_signal_is_set(tmp_path: Path) -> None:
-    abort_signal = ToolAbortSignal()
-    called: list[str] = []
-    registry = ToolRegistry(
-        tmp_path,
-        abort_signal=abort_signal,
-        register_builtin=False,
-skill_catalog=SkillCatalog.empty(),
-    )
-
-    async def handler(
-        arguments: dict[str, str],
-        signal: ToolAbortSignal,
-    ) -> str:
-        called.append(arguments["value"])
-        if arguments["value"] == "first":
-            signal.abort()
-        await asyncio.sleep(0)
-        return arguments["value"]
-
-    registry.register("step", handler)
-    results = await registry.execute_many(
-        [
-            ToolCall("call-1", "step", {"value": "first"}),
-            ToolCall("call-2", "step", {"value": "second"}),
-        ]
-    )
-
-    assert [result["content"][0]["text"] for result in results] == [
-        "first",
-        "tool execution canceled",
-    ]
-    assert called == ["first"]
-    assert results[1]["isError"] is True
 
 
 @pytest.mark.asyncio
@@ -1722,107 +1687,10 @@ async def test_abort_signal_stays_set_for_an_active_handler(tmp_path: Path) -> N
     assert observed == [True, True]
 
 
-@pytest.mark.asyncio
-async def test_parallel_safe_calls_overlap_and_keep_call_order(tmp_path: Path) -> None:
-    finished: list[str] = []
-    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
-
-    async def worker(arguments: dict[str, str]) -> str:
-        if arguments["value"] == "slow":
-            await asyncio.sleep(0.03)
-        finished.append(arguments["value"])
-        return arguments["value"]
-
-    registry.register(
-        "work",
-        worker,
-        parameters={
-            "type": "object",
-            "properties": {"value": {"type": "string"}},
-            "required": ["value"],
-        },
-        parallel_safe=True,
-    )
-    results = await registry.execute_many(
-        [
-            ToolCall("call-1", "work", {"value": "slow"}),
-            ToolCall("call-2", "work", {"value": "fast"}),
-        ]
-    )
-
-    assert finished == ["fast", "slow"]
-    assert [result["content"][0]["text"] for result in results] == ["slow", "fast"]
 
 
-@pytest.mark.asyncio
-async def test_execute_many_rejects_duplicate_ids_before_dispatch(tmp_path: Path) -> None:
-    called = False
-    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
-
-    async def handler(arguments: dict[str, object]) -> str:
-        nonlocal called
-        del arguments
-        called = True
-        return "ran"
-
-    registry.register("work", handler, parallel_safe=True)
-
-    with pytest.raises(ValueError, match="duplicate tool call id"):
-        await registry.execute_many(
-            [
-                ToolCall("same-id", "work", {}),
-                ToolCall("same-id", "work", {}),
-            ]
-        )
-
-    assert not called
 
 
-@pytest.mark.asyncio
-async def test_execute_many_abort_cancels_every_parallel_handler(
-    tmp_path: Path,
-) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
-    calls = [ToolCall("parallel-a", "wait", {}), ToolCall("parallel-b", "wait", {})]
-    started = asyncio.Event()
-    started_count = 0
-    generations: list[int] = []
-
-    async def handler(
-        arguments: dict[str, object],
-        abort_signal: ToolAbortSignal,
-    ) -> str:
-        nonlocal started_count
-        del arguments
-        started_count += 1
-        generations.append(abort_signal.generation)
-        if started_count == len(calls):
-            started.set()
-        await abort_signal.wait()
-        return "canceled"
-
-    registry.register("wait", handler, parallel_safe=True)
-    task = asyncio.create_task(registry.execute_many(calls))
-    await asyncio.wait_for(started.wait(), timeout=1)
-
-    registry.abort()
-
-    assert await asyncio.wait_for(task, timeout=1) == [
-        {
-            "content": [
-                {
-                    "type": "text",
-                    "text": "canceled",
-                    "truncated": False,
-                    "full_size": 8,
-                }
-            ],
-            "isError": False,
-            "structuredContent": None,
-        }
-        for _ in calls
-    ]
-    assert generations == [generations[0], generations[0]]
 
 
 @pytest.mark.asyncio

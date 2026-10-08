@@ -18,12 +18,12 @@ from rich.console import Console
 import zeta.runtime.execution as execution_module
 import zeta.runtime.loop.agent as agent_loop_module
 import zeta.tools.agent_send as agent_send_module
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.background import (
     BackgroundAgentOwner,
     adopt_agent_children,
     finish_background_child,
 )
-from zeta.agent.notifications import notification_events
 from zeta.agent.presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
@@ -32,7 +32,6 @@ from zeta.agent.runner import _child_base_system_prompt
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
     ConversationStore,
@@ -845,7 +844,7 @@ async def test_user_submission_waits_behind_notification_wake(
     )
     app = TUIApp(
         AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -915,35 +914,6 @@ async def test_notification_wake_waits_for_resumed_durable_tool(
         await loop.close()
 
 
-def test_notification_ack_follows_delivery(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    for index in (1, 2):
-        store.append_agent_notification(
-            f"child-{index}",
-            child_session_path=f"/tmp/child-{index}",
-            description=f"child {index}",
-            status="completed",
-            text=f"done {index}",
-        )
-
-    events = notification_events(store)
-    first = next(events)
-    assert first.data["child_instance_id"] == "child-1"
-    assert [
-        entry.data["child_instance_id"] for entry in store.agent_notifications()
-    ] == [
-        "child-1",
-        "child-2",
-    ]
-
-    second = next(events)
-    assert second.data["child_instance_id"] == "child-2"
-    assert [
-        entry.data["child_instance_id"] for entry in store.agent_notifications()
-    ] == [
-        "child-2",
-    ]
-    store.close()
 
 
 @pytest.mark.asyncio

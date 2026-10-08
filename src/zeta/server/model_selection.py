@@ -20,7 +20,7 @@ def apply(
         provider, model, budget = fallback
         fallback = None
     else:
-        provider = "fake" if runtime.fake_catalog else provider_for_model(model)
+        provider = provider_for_model(model)
         budget, _ = resolve_session_budget(
             runtime.metadata.compaction_budget,
             runtime.metadata.budget_pinned,
@@ -40,7 +40,6 @@ def apply(
     previous_budget = assembler.token_budget
     if (
         not reverting
-        and not runtime.fake_catalog
         and model != previous
         and fallback is None
     ):

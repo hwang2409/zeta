@@ -19,7 +19,7 @@ from prompt_toolkit.layout.screen import Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.console import Console
 
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -54,7 +54,7 @@ def _app(tmp_path: Path) -> tuple[TUIApp, FullScreenPromptSession]:
             ConversationStore(tmp_path / "sessions"),
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(
             file=StringIO(), force_terminal=True, color_system="truecolor"

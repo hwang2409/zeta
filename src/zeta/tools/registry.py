@@ -7,7 +7,6 @@ also include ``full_size_chars`` for their readable-text character length.
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import importlib
 import inspect
@@ -1159,54 +1158,6 @@ class ToolRegistry:
             self.abort_signal = self._abort_registry.new_generation()
         return self.abort_signal
 
-    async def execute_many(
-        self,
-        tool_calls: Sequence[ToolCall],
-        *,
-        abort_signal: ToolAbortSignal | None = None,
-    ) -> list[StructuredToolResult]:
-        """Execute calls with safe contiguous groups in parallel, preserving order."""
-
-        _validate_unique_tool_call_ids(tool_calls)
-        parent_signal = abort_signal or self.abort_signal
-        boundary_signal = parent_signal if _signal_is_set(parent_signal) else None
-        scope_signal = parent_signal
-        if abort_signal is None:
-            scope_signal = self._abort_registry.new_generation()
-            self.abort_signal = scope_signal
-        results: list[StructuredToolResult | None] = [None] * len(tool_calls)
-        index = 0
-        while index < len(tool_calls):
-            definition = self._tools.get(tool_calls[index].name)
-            if definition is None or not definition.parallel_safe:
-                results[index] = await self.execute(
-                    tool_calls[index],
-                    abort_signal=scope_signal,
-                    _scope_signal=scope_signal,
-                    _boundary_signal=boundary_signal,
-                )
-                index += 1
-                continue
-            end = index + 1
-            while end < len(tool_calls):
-                next_definition = self._tools.get(tool_calls[end].name)
-                if next_definition is None or not next_definition.parallel_safe:
-                    break
-                end += 1
-            group = await asyncio.gather(
-                *(
-                    self.execute(
-                        call,
-                        abort_signal=scope_signal,
-                        _scope_signal=scope_signal,
-                        _boundary_signal=boundary_signal,
-                    )
-                    for call in tool_calls[index:end]
-                )
-            )
-            results[index:end] = group
-            index = end
-        return [result for result in results if result is not None]
 
     def _path(self, raw_path: object) -> Path:
         return self.policy.resolve(raw_path).absolute
