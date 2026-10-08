@@ -21,7 +21,14 @@ from zeta.attention_records import AttentionStore
 from zeta.config.tool_policy import ToolPolicy
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
+from zeta.protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    ToolCall,
+)
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolDefinition, ToolRegistry
 
@@ -218,11 +225,23 @@ def test_fork_copies_active_branch_through_anchor_without_modifying_source(
     tmp_path: Path,
 ) -> None:
     opened = _session(tmp_path)
-    opened.store.append_message(Message(MessageRole.USER, [TextContent("one")]))
+    opened.store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("one")],
+            metadata={MESSAGE_ORIGIN_METADATA: MessageOrigin.USER.value},
+        )
+    )
     anchor = opened.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("two")])
     )
-    opened.store.append_message(Message(MessageRole.USER, [TextContent("three")]))
+    opened.store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("three")],
+            metadata={MESSAGE_ORIGIN_METADATA: MessageOrigin.USER.value},
+        )
+    )
     attention = AttentionStore(opened.store.session_dir).request(
         session_id=opened.store.session_id,
         project_id=None,
