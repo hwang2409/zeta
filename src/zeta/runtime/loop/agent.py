@@ -882,7 +882,6 @@ class AgentLoop(
             provider_error_data: dict[str, Any] = {}
             provider_retry_usage: dict[str, Any] | None = None
             attempt_state = ProviderAttemptState()
-            provider_reset_pending = False
             try:
                 if retrying_context or self.context_assembler.needs_compaction():
                     yield StreamEvent(
@@ -925,10 +924,10 @@ class AgentLoop(
                     self.backend.complete(context_messages, active_tools),
                     provider_retry_budget,
                 )
-                on_started = None if steering is None else partial(
-                    self.store.deliver_client_steering, steering
+                provider_stream = completion if steering is None else provider_events(
+                    completion, partial(self.store.deliver_client_steering, steering)
                 )
-                async for event in provider_events(completion, on_started):
+                async for event in provider_stream:
                     attempt_state.observe(event)
                     self.context_assembler.observe_event(event)
                     if cache_trace is not None:
@@ -946,15 +945,12 @@ class AgentLoop(
                         provider_error_source = event.error or provider_error
                         provider_error_data = dict(event.data)
                         break
-                    if event.type is StreamEventType.RETRY:
-                        provider_reset_pending = True
                     if (
                         event.type is StreamEventType.ASSISTANT_RESET
                         and not completion_succeeded
                     ):
                         partial_blocks = []
                         assistant_message = None
-                        provider_reset_pending = False
                     if event.type is StreamEventType.MESSAGE_UPDATE:
                         if event.content is not None:
                             partial_blocks.append(event.content)
@@ -986,17 +982,11 @@ class AgentLoop(
                     )
             except asyncio.CancelledError:
                 await close_completion(completion)
-                self._persist_partial_for_control(
-                    [] if provider_reset_pending else partial_blocks,
-                    None if provider_reset_pending else assistant_message,
-                )
+                self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except GeneratorExit:
                 await close_completion(completion)
-                self._persist_partial_for_control(
-                    [] if provider_reset_pending else partial_blocks,
-                    None if provider_reset_pending else assistant_message,
-                )
+                self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except Exception as exc:
                 await close_completion(completion)
