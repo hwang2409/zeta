@@ -42,16 +42,6 @@ class _FinderRestore:
 
 
 @dataclass(frozen=True, slots=True)
-class _FinderCandidateSource:
-    """Immutable plain data for one candidate extraction."""
-
-    key: int
-    index: int
-    marker: str
-    parts: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class FinderCandidateRequest:
     """Identity of one generation's incrementally prepared candidate snapshot."""
 
@@ -92,7 +82,13 @@ class TranscriptFinderMixin:
         """Build a stable-key snapshot in batches that keep the UI responsive."""
 
         units = tuple(self._units)
-        user_unit_ids = frozenset(id(unit) for unit in self._user_units)
+        user_units = tuple(self._user_units)
+        user_unit_ids: set[int] = set()
+        for batch_start in range(0, len(user_units), _FINDER_PREPARE_BATCH_SIZE):
+            batch = user_units[batch_start : batch_start + _FINDER_PREPARE_BATCH_SIZE]
+            user_unit_ids.update(id(unit) for unit in batch)
+            await asyncio.sleep(0)
+
         candidates: list[Candidate] = []
         turn = 0
         for batch_start in range(0, len(units), _FINDER_PREPARE_BATCH_SIZE):
@@ -103,20 +99,14 @@ class TranscriptFinderMixin:
                 role = self._finder_role(unit, user_unit_ids)
                 if role is Role.USER:
                     turn += 1
-                source = _FinderCandidateSource(
-                    key=unit.key,
-                    index=index,
-                    marker=f"#{turn}" if turn else "#0",
-                    parts=self._finder_source_parts(unit),
-                )
-                text, preview = self._finder_text(source)
+                text, preview = self._finder_text(self._finder_source_parts(unit))
                 if text:
                     candidates.append(
                         Candidate(
-                            key=source.key,
-                            index=source.index,
+                            key=unit.key,
+                            index=index,
                             role=role,
-                            marker=source.marker,
+                            marker=f"#{turn}" if turn else "#0",
                             text=text,
                             preview=preview,
                         )
@@ -214,7 +204,7 @@ class TranscriptFinderMixin:
             complete=self._finder.complete,
         )
 
-    def _finder_role(self, unit: Any, user_unit_ids: frozenset[int]) -> Role:
+    def _finder_role(self, unit: Any, user_unit_ids: set[int]) -> Role:
         if id(unit) in user_unit_ids:
             return Role.USER
         value = unit.value
@@ -258,12 +248,12 @@ class TranscriptFinderMixin:
         return (plain[:_FINDER_PREVIEW_TEXT_LIMIT],)
 
     @staticmethod
-    def _finder_text(source: _FinderCandidateSource) -> tuple[str, tuple[str, ...]]:
+    def _finder_text(parts: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
         """Return bounded matching text and preview lines from plain snapshot data."""
 
         chunks: list[str] = []
         remaining = _FINDER_PREVIEW_TEXT_LIMIT
-        for part in source.parts:
+        for part in parts:
             if remaining <= 0:
                 break
             chunks.append(part[:remaining])

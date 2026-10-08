@@ -162,20 +162,20 @@ def test_finder_jump_works_on_virtual_history() -> None:
 async def test_open_does_not_stall_long_session() -> None:
     transcript = TranscriptWidget()
     long_tail = " x" * 2_000
-    for index in range(5000):
+    for index in range(20_000):
         unit = transcript.append(
             Text(f"message {index} mentioning pytest and fixtures{long_tail}")
         )
         transcript.mark_user(unit)
     transcript.create_content(100, 40)
     app = _app_for_finder(transcript)
-    ticks = [time.perf_counter()]
+    ticks = [(time.perf_counter(), time.thread_time())]
     running = True
 
     async def ticker() -> None:
         while running:
-            await asyncio.sleep(0.01)
-            ticks.append(time.perf_counter())
+            await asyncio.sleep(0.001)
+            ticks.append((time.perf_counter(), time.thread_time()))
 
     ticker_task = asyncio.create_task(ticker())
     await asyncio.sleep(0)
@@ -188,8 +188,14 @@ async def test_open_does_not_stall_long_session() -> None:
 
     state = transcript.finder_state()
     assert state is not None and state.rows
-    gaps = [later - earlier for earlier, later in pairwise(ticks)]
-    assert gaps and max(gaps) < 0.04, max(gaps)
+    gaps = [
+        (later_wall - earlier_wall, later_cpu - earlier_cpu)
+        for (earlier_wall, earlier_cpu), (later_wall, later_cpu) in pairwise(ticks)
+    ]
+    # Thread CPU time excludes runner descheduling but includes all work done by
+    # the UI loop between 1 ms ticks. The old synchronous 20k scan exceeds 25 ms
+    # on the slow-runner conditions that caused this regression.
+    assert gaps and max(cpu_gap for _wall_gap, cpu_gap in gaps) < 0.025, max(gaps)
 
 
 @pytest.mark.asyncio
