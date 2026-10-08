@@ -282,23 +282,27 @@ only letters, digits, `.`, `_`, `:`, or `-`. A client should derive a stable ID
 from the inbound item that caused the request and reuse it after an uncertain
 transport outcome.
 
-The server retains the 1,000 most recent accepted IDs for each session in the
-append-only session log. The oldest ID becomes unknown when a later acceptance
-moves it outside that bound. The acceptance record is durably appended in the
-same store transaction as a `send` user message. For `steer`, the durable
-acceptance is appended before the synchronous post-persistence callback adds
-the item to the running loop's queue. A failed durable append therefore does
-not start a turn or add steering, and cancellation cannot separate a completed
-append from its callback.
+The append-only session log retains every accepted ID. In memory, the server
+retains full details for the 1,000 most recent accepted IDs and a compact
+16-byte digest plus one-byte outcome for every accepted ID during the session
+lifetime. The compact index is rebuilt from the session log when the session is
+loaded. The acceptance record is durably appended in the same store transaction
+as a `send` user message. For `steer`, the durable acceptance is appended before
+the synchronous post-persistence callback adds the item to the running loop's
+queue. A failed durable append therefore does not start a turn or add steering,
+and cancellation cannot separate a completed append from its callback.
 
 Repeating a retained queued or delivered ID returns the original result with
 `duplicate: true`. It does not validate changed text against the first request,
 enqueue steering, or start another turn. A dropped ID instead returns
 `{"accepted":false,"duplicate":true,"status":"dropped"}`. The client must
-resend that work with a new ID if it is still wanted. The lookup happens before
-the normal running-turn checks, so a retry remains deterministic after the
-original operation advances. Without the negotiated feature, sending
-`delivery_id` returns `-32602` and legacy clients have unchanged behavior.
+resend that work with a new ID if it is still wanted. Reusing an accepted ID
+whose details were evicted returns `-32010` with
+`data: {"outcome":"queued"|"delivered"|"dropped"}` and does not queue or start
+work. The lookup happens before the normal running-turn checks, so a retry
+remains deterministic after the original operation advances. Without the
+negotiated feature, sending `delivery_id` returns `-32602` and legacy clients
+have unchanged behavior.
 
 `delivery_status` requires the feature and an active session. Params contain
 only `delivery_id`. Its result is `{"delivery_id":"batch-42","status":"queued"}`,
@@ -310,8 +314,10 @@ where status is:
 - `dropped`: accepted steering left the live queue without delivery because of
   restart, session abort, explicit clearing, disconnect, or turn end. It is not
   restored after restart; resend still-wanted work with a new ID;
-- `unknown`: the ID was never accepted in this session or was evicted from the
-  recent-ID bound.
+- `evicted`: the ID was accepted but is outside the 1,000-entry detail bound;
+  the result also contains its retained `outcome`, which is `queued`,
+  `delivered`, or `dropped`;
+- `unknown`: the ID was never accepted in this session.
 
 ```json
 {"jsonrpc":"2.0","id":7,"method":"delivery_status","params":{"delivery_id":"batch-42"}}
@@ -613,6 +619,7 @@ Error responses use standard JSON-RPC codes where applicable:
 | `-32005` | no turn is running for steering |
 | `-32006` | approval request is missing or already resolved |
 | `-32007` | outbound frame exceeds the size limit |
+| `-32010` | delivery ID was accepted but its full details were evicted |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. A malformed frame never terminates the server process. The

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -320,7 +321,7 @@ class ServerRuntime:
             raise ValueError(
                 f"session working directory no longer exists: {metadata.cwd}"
             )
-        opened = self.manager.open(session_id)
+        opened = await asyncio.to_thread(self.manager.open, session_id)
         try:
             if opened.metadata.skill_catalog is None:
                 skill_catalog = discover_session_skills(

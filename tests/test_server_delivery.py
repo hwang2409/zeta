@@ -381,24 +381,211 @@ async def test_delivery_effect_callback_only_runs_after_durable_record(
     store.close()
 
 
-def test_delivery_lookup_evicts_ids_outside_recent_bound(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    store.append_many(
+def _evict_delivery(
+    store: ConversationStore,
+    delivery_id: str,
+    *,
+    method: str = "send",
+    status: str = "delivered",
+) -> None:
+    acceptance_status = "delivered" if method == "send" else "queued"
+    outcome = (
+        {"accepted": True, "session_id": store.session_id}
+        if method == "send"
+        else {"accepted": True}
+    )
+    rows: list[tuple[str, dict[str, object]]] = [
         (
             "client_delivery",
             {
-                "delivery_id": f"batch-{index}",
+                "delivery_id": delivery_id,
+                "method": method,
+                "status": acceptance_status,
+                "outcome": outcome,
+            },
+        )
+    ]
+    if status == "dropped":
+        rows.append(
+            (
+                "client_delivery",
+                {
+                    "delivery_id": delivery_id,
+                    "method": "steer",
+                    "status": "dropped",
+                    "reason": "clear",
+                },
+            )
+        )
+    rows.extend(
+        (
+            "client_delivery",
+            {
+                "delivery_id": f"filler-{index}",
                 "method": "steer",
                 "status": "queued",
                 "outcome": {"accepted": True},
             },
         )
-        for index in range(1_001)
+        for index in range(1_000)
     )
-    assert store.client_delivery("batch-0") is None
-    assert store.client_delivery("batch-1").status == "queued"
-    assert store.client_delivery("batch-1000").status == "queued"
+    store.append_many(rows)
+
+
+def test_delivery_lookup_retains_evicted_outcomes_without_ids(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    _evict_delivery(store, "old-delivered")
+    _evict_delivery(store, "old-dropped", method="steer", status="dropped")
+
+    assert store.client_delivery("old-delivered") is None
+    assert store.client_delivery_outcome("old-delivered") == "delivered"
+    assert store.client_delivery("old-dropped") is None
+    assert store.client_delivery_outcome("old-dropped") == "dropped"
+    assert store.client_delivery_outcome("never-seen") is None
+    assert store.client_delivery("filler-999").status == "queued"
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_evicted_delivery_status_and_send_reuse_are_distinct(
+    tmp_path: Path,
+) -> None:
+    backend = BlockingBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        _evict_delivery(server.runtime.opened.store, "old-send")
+
+        status = await _request(
+            reader, writer, 3, "delivery_status", {"delivery_id": "old-send"}
+        )
+        rejected = await _request(
+            reader,
+            writer,
+            4,
+            "send",
+            {"text": "must not run", "delivery_id": "old-send"},
+        )
+        unknown = await _request(
+            reader, writer, 5, "delivery_status", {"delivery_id": "never-seen"}
+        )
+
+        assert status[-1]["result"] == {
+            "delivery_id": "old-send",
+            "status": "evicted",
+            "outcome": "delivered",
+        }
+        assert rejected[-1]["error"] == {
+            "code": -32010,
+            "message": "delivery id already used",
+            "data": {"outcome": "delivered"},
+        }
+        assert unknown[-1]["result"] == {
+            "delivery_id": "never-seen",
+            "status": "unknown",
+        }
+        assert backend.calls == 0
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_evicted_dropped_steer_status_and_reuse_are_distinct(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        _evict_delivery(
+            server.runtime.opened.store,
+            "old-steer",
+            method="steer",
+            status="dropped",
+        )
+
+        status = await _request(
+            reader, writer, 3, "delivery_status", {"delivery_id": "old-steer"}
+        )
+        rejected = await _request(
+            reader,
+            writer,
+            4,
+            "steer",
+            {"text": "must not queue", "delivery_id": "old-steer"},
+        )
+
+        assert status[-1]["result"] == {
+            "delivery_id": "old-steer",
+            "status": "evicted",
+            "outcome": "dropped",
+        }
+        assert rejected[-1]["error"] == {
+            "code": -32010,
+            "message": "delivery id already used",
+            "data": {"outcome": "dropped"},
+        }
+        assert not server.runtime.loop.has_pending_steering
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_restart_rebuilds_evicted_delivery_outcome(tmp_path: Path) -> None:
+    first = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-first"))
+    reader, writer = await _connect(first)
+    await _request(
+        reader,
+        writer,
+        1,
+        "hello",
+        {"protocol_version": "1.1", "features": ["delivery_id"]},
+    )
+    created = await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+    session_id = created[-1]["result"]["session"]["session_id"]
+    _evict_delivery(first.runtime.opened.store, "restart-old")
+    await _close(first, writer)
+
+    resumed = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path, "-resumed"))
+    reader, writer = await _connect(resumed)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "resume", {"session_id": session_id})
+        status = await _request(
+            reader, writer, 3, "delivery_status", {"delivery_id": "restart-old"}
+        )
+        assert status[-1]["result"] == {
+            "delivery_id": "restart-old",
+            "status": "evicted",
+            "outcome": "delivered",
+        }
+    finally:
+        await _close(resumed, writer)
 
 
 def test_delivery_record_accepts_tagged_user_message_atomically(tmp_path: Path) -> None:
