@@ -15,6 +15,30 @@ from zeta.protocol.types import (
     TextContent,
     ToolSchema,
 )
+from zeta.providers.retry_policy import ProviderRetryBudget, use_retry_budget
+
+
+class _BudgetExhaustingBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(
+        self, messages: Sequence[Message], tools: Sequence[ToolSchema]
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tools
+        self.calls += 1
+        if self.calls < 5:
+            yield StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo("timeout", "safe timeout"),
+                data={"retry_after": 0},
+            )
+            return
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("not json")]),
+            data={"usage": {"input_tokens": 1}},
+        )
 
 
 class _PostStreamRetryBackend(CompletionBackend):
@@ -39,6 +63,21 @@ class _PostStreamRetryBackend(CompletionBackend):
             message=Message(MessageRole.ASSISTANT, [TextContent('{"changes":[]}')]),
             data={"usage": {"input_tokens": 3, "output_tokens": 2}},
         )
+
+
+@pytest.mark.asyncio
+async def test_original_and_repair_share_one_provider_attempt_budget() -> None:
+    backend = _BudgetExhaustingBackend()
+    budget = ProviderRetryBudget()
+
+    with use_retry_budget(budget):
+        response = await complete_reconciliation(backend, "original")
+        assert response.text == "not json"
+        with pytest.raises(RuntimeError, match="budget exhausted"):
+            await complete_reconciliation(backend, "repair")
+
+    assert backend.calls == 5
+    assert budget.attempts == 5
 
 
 @pytest.mark.asyncio
