@@ -11,8 +11,8 @@ from zeta.protocol.types import MessageOrigin, with_message_origin
 @pytest.mark.parametrize("damage", ["missing", "json", "encoding", "directory"])
 def test_listing_skips_unreadable_metadata(tmp_path: Path, damage: str) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="fake", model="offline")
-    bad = manager.create(provider="fake", model="offline")
+    good = manager.create(provider="codex", model="offline")
+    bad = manager.create(provider="codex", model="offline")
     path = bad.store.session_dir / "meta.json"
     path.unlink()
     if damage == "json":
@@ -28,8 +28,8 @@ def test_listing_skips_unreadable_metadata(tmp_path: Path, damage: str) -> None:
 @pytest.mark.parametrize("damage", ["metadata", "conversation", "corrupt_conversation"])
 def test_previews_skip_unreadable_sessions(tmp_path: Path, damage: str) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="fake", model="offline")
-    bad = manager.create(provider="fake", model="offline")
+    good = manager.create(provider="codex", model="offline")
+    bad = manager.create(provider="codex", model="offline")
     if damage == "metadata":
         (bad.store.session_dir / "meta.json").write_text("{")
     elif damage == "conversation":
@@ -61,10 +61,10 @@ def test_create_publishes_only_complete_sessions(
     monkeypatch.setattr(SessionManager, "_write", checked_write)
     if fail_write:
         with pytest.raises(OSError, match="interrupted write"):
-            manager.create(provider="fake", model="offline")
+            manager.create(provider="codex", model="offline")
         assert list(manager.sessions_dir.iterdir()) == []
     else:
-        opened = manager.create(provider="fake", model="offline")
+        opened = manager.create(provider="codex", model="offline")
         assert manager.open(opened.metadata.session_id).metadata == opened.metadata
         assert opened.store.root_dir == manager.sessions_dir
         assert opened.store.path.is_file()
@@ -82,8 +82,8 @@ def test_missing_metadata_error_distinguishes_absent_session(tmp_path: Path) -> 
 
 def test_listing_skips_deeply_nested_metadata(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="fake", model="offline")
-    bad = manager.create(provider="fake", model="offline")
+    good = manager.create(provider="codex", model="offline")
+    bad = manager.create(provider="codex", model="offline")
     (bad.store.session_dir / "meta.json").write_text("[" * 10_000 + "]" * 10_000)
 
     with pytest.raises(SessionError, match="session metadata could not be read"):
@@ -93,8 +93,8 @@ def test_listing_skips_deeply_nested_metadata(tmp_path: Path) -> None:
 
 def test_preview_limit_counts_healthy_sessions(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="fake", model="offline")
-    bad = manager.create(provider="fake", model="offline")
+    good = manager.create(provider="codex", model="offline")
+    bad = manager.create(provider="codex", model="offline")
     bad.metadata.updated_at = "2099-01-01T00:00:00+00:00"
     manager._write(bad.metadata)
     bad.store.path.write_text("broken\n")
@@ -107,8 +107,8 @@ def test_preview_limit_counts_healthy_sessions(tmp_path: Path) -> None:
 
 def test_listing_skips_missing_conversation(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="fake", model="offline")
-    bad = manager.create(provider="fake", model="offline")
+    good = manager.create(provider="codex", model="offline")
+    bad = manager.create(provider="codex", model="offline")
     bad.store.path.unlink()
 
     assert manager.list_sessions() == [good.metadata]
@@ -132,7 +132,7 @@ def test_create_preserves_empty_directory_created_during_staging(
             inode = collision.stat().st_ino
 
     monkeypatch.setattr(SessionManager, "_write", racing_write)
-    opened = manager.create(provider="fake", model="offline")
+    opened = manager.create(provider="codex", model="offline")
 
     assert collision is not None
     assert collision.stat().st_ino == inode
@@ -144,8 +144,8 @@ def test_create_preserves_empty_directory_created_during_staging(
 @pytest.mark.parametrize("filename", ["session_state.json", "agent_lifecycle.json"])
 def test_previews_skip_deeply_nested_state(tmp_path: Path, filename: str) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="fake", model="offline")
-    bad = manager.create(provider="fake", model="offline")
+    good = manager.create(provider="codex", model="offline")
+    bad = manager.create(provider="codex", model="offline")
     (bad.store.session_dir / filename).write_text("[" * 10_000 + "]" * 10_000)
 
     with pytest.raises(ConversationIntegrityError, match="could not be read"):
@@ -178,7 +178,7 @@ def test_create_preserves_directory_created_at_publication(
         return original_mkdir(path, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "mkdir", racing_mkdir)
-    opened = manager.create(provider="fake", model="offline")
+    opened = manager.create(provider="codex", model="offline")
 
     assert collision is not None
     assert collision.stat().st_ino == inode
@@ -209,7 +209,7 @@ def test_interrupted_publication_is_not_discoverable(
 
     monkeypatch.setattr(os, "replace", interrupted_replace)
     with pytest.raises(OSError, match="interrupted publication"):
-        manager.create(provider="fake", model="offline")
+        manager.create(provider="codex", model="offline")
 
     assert interrupted is not None
     assert interrupted.is_dir()
@@ -251,11 +251,11 @@ def test_listings_skip_decoder_surviving_depth(tmp_path: Path, filename: str) ->
     from zeta.protocol.types import Message, MessageRole, TextContent
 
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="fake", model="offline")
+    good = manager.create(provider="codex", model="offline")
     good.store.append_message(
         with_message_origin(Message(MessageRole.USER, [TextContent("healthy preview")]), MessageOrigin.USER)
     )
-    bad = manager.create(provider="fake", model="offline")
+    bad = manager.create(provider="codex", model="offline")
     deep = '{"nested":' * 500 + "0" + "}" * 500
     if filename == "session_state.json":
         payload = (
@@ -293,7 +293,7 @@ def test_listings_skip_decoder_surviving_depth(tmp_path: Path, filename: str) ->
 
 def test_mixed_store_listings_validate_without_mutating(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="fake", model="offline")
+    good = manager.create(provider="codex", model="offline")
     # Legacy sessions may lack optional state and lock files. Listing must not create them.
     good.store.state_path.unlink()
     good.store.lock_path.unlink()
@@ -307,12 +307,12 @@ def test_mixed_store_listings_validate_without_mutating(tmp_path: Path) -> None:
         ("agent_lifecycle.json", b"[]"),
         ("agent_lifecycle.json", b"\xff"),
     ):
-        bad = manager.create(provider="fake", model="offline")
+        bad = manager.create(provider="codex", model="offline")
         (bad.store.session_dir / filename).write_bytes(content)
-    torn = manager.create(provider="fake", model="offline")
+    torn = manager.create(provider="codex", model="offline")
     with torn.store.path.open("ab") as handle:
         handle.write(b'{"seq":')
-    no_state = manager.create(provider="fake", model="offline")
+    no_state = manager.create(provider="codex", model="offline")
     no_state.store.state_path.unlink()
     no_state.store.agent_lifecycle_path.write_text("[]")
     before = {p: p.read_bytes() for p in manager.sessions_dir.rglob("*") if p.is_file()}
@@ -330,8 +330,8 @@ def test_preview_boundary_includes_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="fake", model="offline")
-    bad = manager.create(provider="fake", model="offline")
+    good = manager.create(provider="codex", model="offline")
+    bad = manager.create(provider="codex", model="offline")
     replay = ConversationStore.replay
 
     def fail_replay(self):
@@ -364,7 +364,7 @@ def test_listing_boundaries_propagate_programming_faults(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault, surface: str
 ) -> None:
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="fake", model="offline")
+    opened = manager.create(provider="codex", model="offline")
 
     def fail(*args, **kwargs):
         raise fault("programming fault")
@@ -395,7 +395,7 @@ def test_export_rejects_corrupt_rows_cleanly(
 
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="fake", model="offline")
+    opened = manager.create(provider="codex", model="offline")
     with opened.store.path.open("ab") as handle:
         handle.write(row)
     before = opened.store.path.read_bytes()

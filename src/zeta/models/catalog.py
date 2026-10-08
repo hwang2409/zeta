@@ -8,8 +8,13 @@ models a child may run on.
 from __future__ import annotations
 
 
+PROVIDERS = frozenset({"claude", "codex", "ollama"})
+REMOVED_PROVIDER_ERROR = (
+    "the fake provider was removed; choose claude, codex or ollama"
+)
+
+
 DEFAULT_MODELS: dict[str, str] = {
-    "fake": "offline",
     "ollama": "qwen3:4b",
     "claude": "claude-sonnet-4-6",
     "codex": "gpt-5.6-luna",
@@ -50,6 +55,18 @@ PROVIDER_MODELS: dict[str, frozenset[str]] = {
 }
 
 
+def validate_provider(provider: str) -> str:
+    """Return a supported provider or raise a stable configuration error."""
+
+    if provider == "fake":
+        raise ValueError(REMOVED_PROVIDER_ERROR)
+    if provider not in PROVIDERS:
+        raise ValueError(
+            f"unknown provider {provider!r}; choose claude, codex or ollama"
+        )
+    return provider
+
+
 def default_model(provider: str) -> str | None:
     """Return the built-in default model for a provider, if it has one."""
 
@@ -79,8 +96,11 @@ def provider_for_model(model: str) -> str:
 
 __all__ = [
     "DEFAULT_MODELS",
+    "PROVIDERS",
     "PROVIDER_MODELS",
+    "REMOVED_PROVIDER_ERROR",
     "default_model",
     "known_model_names",
     "provider_for_model",
+    "validate_provider",
 ]

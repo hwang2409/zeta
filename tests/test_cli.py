@@ -16,6 +16,16 @@ from zeta.core.commands.completion import completion_script
 from zeta.project_registry import ProjectRegistry
 
 
+def test_removed_fake_provider_has_clear_cli_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        build_parser().parse_args(["--provider", "fake"])
+
+    assert (
+        "the fake provider was removed; choose claude, codex or ollama"
+        in capsys.readouterr().err
+    )
+
+
 class _TTYInput:
     def __init__(self, value: str) -> None:
         self.value = value
@@ -385,7 +395,7 @@ def _credential_job(tmp_path: Path, name: str, *, webhook: bool = True):
     }
     return parse_job(name, {
         "prompt": "test", "trigger": trigger, "servers": [], "allow": [],
-        "deliver": "slack:U123", "provider": "fake", "model": "fake",
+        "deliver": "slack:U123", "provider": "codex", "model": "fake",
         "cwd": str(tmp_path),
     })
 

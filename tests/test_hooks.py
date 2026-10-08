@@ -379,10 +379,10 @@ def test_status_lists_hooks_and_fake_default_is_off(tmp_path: Path, monkeypatch:
     hook = _python_command("pass")
     _write_config(home, f'[[hook]]\nevent = "stop"\ncommand = {json.dumps(hook)}\n')
     monkeypatch.setenv("ZETA_HOME", str(home))
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     assert "stop:" in "\n".join(app.slash_status().hooks)
 
     monkeypatch.delenv("ZETA_HOME")
     monkeypatch.setenv("HOME", str(tmp_path / "plain-home"))
-    plain_app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    plain_app = create_app(build_parser().parse_args(["--provider", "codex"]))
     assert plain_app.slash_status().hooks == ()

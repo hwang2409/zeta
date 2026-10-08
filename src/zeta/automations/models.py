@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..core.approval import parse_approval_rule
+from ..models.catalog import validate_provider
 from .trigger import Trigger, Webhook, parse_trigger
 
 
@@ -125,8 +126,7 @@ def parse_job(name: str, value: object) -> Job:
             raise ValueError(f"{field} must be a list of strings")
         if len(value[field]) != len(set(value[field])):
             raise ValueError(f"{field} must not contain duplicates")
-    if value["provider"] not in {"claude", "codex", "fake"}:
-        raise ValueError("unknown provider")
+    validate_provider(value["provider"])
     if not Path(value["cwd"]).is_absolute():
         raise ValueError("cwd must be an absolute path on the daemon host")
     if not value["deliver"].startswith("slack:") or not value["deliver"][6:].strip():

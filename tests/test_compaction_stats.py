@@ -14,12 +14,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.compaction_stats import compaction_report, render_report, scan_log
 from zeta.cli.main import main
 from zeta.compaction import fallback_summary
 from zeta.context_eviction import recall_history
 from zeta.core.context import ContextAssembler
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,

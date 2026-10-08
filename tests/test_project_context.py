@@ -779,7 +779,7 @@ def test_cli_flags_reach_context_assembler_system_prompt(
     args = build_parser().parse_args(
         [
             "--provider",
-            "fake",
+            "codex",
             "--system-prompt",
             "operator override",
             "--append-system-prompt",
@@ -803,7 +803,7 @@ def test_cli_append_only_extends_default_system_prompt(
     args = build_parser().parse_args(
         [
             "--provider",
-            "fake",
+            "codex",
             "--append-system-prompt",
             "TAIL EXTENSION",
         ]
@@ -828,7 +828,7 @@ def test_cli_at_file_form_loads_prompt_from_disk(
     args = build_parser().parse_args(
         [
             "--provider",
-            "fake",
+            "codex",
             "--system-prompt",
             f"@{prompt_file}",
         ]
@@ -851,7 +851,7 @@ def test_cli_missing_at_file_surfaces_session_error(
     args = build_parser().parse_args(
         [
             "--provider",
-            "fake",
+            "codex",
             "--system-prompt",
             f"@{tmp_path / 'missing.md'}",
         ]
@@ -864,7 +864,7 @@ def test_status_lists_loaded_context_files() -> None:
     output = _format_status(
         SlashStatus(
             session_id="session",
-            provider="fake",
+            provider="codex",
             model="offline",
             retained_tail=8,
             tokens_used_this_session=0,
@@ -1191,7 +1191,7 @@ def test_session_metadata_partial_memory_span_is_legacy(
     from zeta.core.session import SessionManager, SessionMetadata
 
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     data = opened.metadata.to_dict()
     opened.store.close()
     data["project_memory_offset"] = offset
@@ -1213,7 +1213,7 @@ def test_session_metadata_rejects_malformed_digest(tmp_path: Path, digest) -> No
     from zeta.core.session import SessionError, SessionManager, SessionMetadata
 
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     data = opened.metadata.to_dict()
     opened.store.close()
     # All three components present, so the span is authoritative; only the

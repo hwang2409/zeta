@@ -5,6 +5,7 @@ import logging
 import multiprocessing
 import os
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -12,9 +13,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser
 from zeta.config.settings import load_settings
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.project_context import associate_project_discovery, discover_project
 from zeta.core.session import SessionManager
 from zeta.project_registry import ProjectRegistry
@@ -52,7 +53,7 @@ def manager(tmp_path: Path) -> SessionManager:
 
 def test_new_session_auto_creates_and_links_project(tmp_path: Path) -> None:
     root = repo(tmp_path)
-    opened = manager(tmp_path).create(provider="fake", model="test", cwd=root)
+    opened = manager(tmp_path).create(provider="codex", model="test", cwd=root)
     project = ProjectRegistry(tmp_path / "zeta" / "projects").show_project(opened.metadata.project_id)
     assert opened.metadata.project_id == project.project_id
     assert project.name == root.name
@@ -68,7 +69,7 @@ def test_subdirectory_and_inside_outside_worktrees_share_one_project(tmp_path: P
     git(root, "worktree", "add", str(outside), "-b", "outside")
     (root / "sub").mkdir()
     m = manager(tmp_path)
-    ids = [m.create(provider="fake", model="test", cwd=where).metadata.project_id
+    ids = [m.create(provider="codex", model="test", cwd=where).metadata.project_id
            for where in (root / "sub", inside, outside)]
     assert len(set(ids)) == 1
     assert len(ProjectRegistry(tmp_path / "zeta" / "projects").list_projects()) == 1
@@ -82,14 +83,14 @@ def test_non_git_home_and_filesystem_root_are_unassociated(tmp_path: Path, monke
         cwd = tmp_path / "home"; cwd.mkdir(); monkeypatch.setenv("HOME", str(cwd))
     else:
         cwd = Path("/")
-    opened = manager(tmp_path).create(provider="fake", model="test", cwd=cwd)
+    opened = manager(tmp_path).create(provider="codex", model="test", cwd=cwd)
     assert opened.metadata.project_id is None
     assert not list((tmp_path / "zeta" / "projects").glob("p_*/project.json"))
 
 
 def test_auto_project_can_be_disabled(tmp_path: Path) -> None:
     root = repo(tmp_path)
-    opened = manager(tmp_path).create(provider="fake", model="test", cwd=root, auto_project=False)
+    opened = manager(tmp_path).create(provider="codex", model="test", cwd=root, auto_project=False)
     assert opened.metadata.project_id is None
 
 
@@ -97,7 +98,7 @@ def test_concurrent_session_creation_is_unique(tmp_path: Path) -> None:
     root = repo(tmp_path)
     m = manager(tmp_path)
     with ThreadPoolExecutor(max_workers=8) as pool:
-        sessions = list(pool.map(lambda _: m.create(provider="fake", model="test", cwd=root), range(8)))
+        sessions = list(pool.map(lambda _: m.create(provider="codex", model="test", cwd=root), range(8)))
     assert len({s.metadata.project_id for s in sessions}) == 1
     assert len(m.project_registry.list_projects()) == 1
 
@@ -109,16 +110,16 @@ def test_registry_failure_is_nonfatal_and_warns(tmp_path: Path, monkeypatch: pyt
         raise OSError("registry down")
     monkeypatch.setattr(m.project_registry, "find_for_directory", fail)
     with caplog.at_level(logging.WARNING):
-        opened = m.create(provider="fake", model="test", cwd=root)
+        opened = m.create(provider="codex", model="test", cwd=root)
     assert opened.metadata.project_id is None
     assert "continuing without project" in caplog.text
 
 
 def test_resumed_session_keeps_association_and_child_inherits(tmp_path: Path) -> None:
     root = repo(tmp_path); m = manager(tmp_path)
-    parent = m.create(provider="fake", model="test", cwd=root)
+    parent = m.create(provider="codex", model="test", cwd=root)
     resumed = m.open(parent.metadata.session_id)
-    child = m.create(provider="fake", model="test", cwd=tmp_path, project_id=parent.metadata.project_id, parent_session_id=parent.metadata.session_id, project_role="worker")
+    child = m.create(provider="codex", model="test", cwd=tmp_path, project_id=parent.metadata.project_id, parent_session_id=parent.metadata.session_id, project_role="worker")
     assert resumed.metadata.project_id == parent.metadata.project_id
     assert child.metadata.project_id == parent.metadata.project_id
     assert len(m.project_registry.list_projects()) == 1
@@ -126,13 +127,13 @@ def test_resumed_session_keeps_association_and_child_inherits(tmp_path: Path) ->
 
 def test_no_session_auto_project_flag_is_disabled(tmp_path: Path) -> None:
     root = repo(tmp_path)
-    opened = manager(tmp_path).create(provider="fake", model="test", cwd=root, auto_project=False)
+    opened = manager(tmp_path).create(provider="codex", model="test", cwd=root, auto_project=False)
     assert opened.metadata.project_id is None
 
 
 def test_project_tool_inspects_auto_associated_memory(tmp_path: Path) -> None:
     root = repo(tmp_path); m = manager(tmp_path)
-    opened = m.create(provider="fake", model="test", cwd=root)
+    opened = m.create(provider="codex", model="test", cwd=root)
     tools = ToolRegistry(cwd=str(root), project_id=opened.metadata.project_id, project_registry=m.project_registry, skill_catalog=SkillCatalog.empty())
     # Registration is the public capability boundary; invoke the async handler directly.
     from zeta.tools.project import _inspect_project
@@ -143,7 +144,7 @@ def test_project_tool_inspects_auto_associated_memory(tmp_path: Path) -> None:
 
 def test_project_slash_show_and_init(tmp_path: Path) -> None:
     root = repo(tmp_path); m = manager(tmp_path)
-    opened = m.create(provider="fake", model="test", cwd=root)
+    opened = m.create(provider="codex", model="test", cwd=root)
     class Loop:
         project_registry = m.project_registry
         manager = m
@@ -161,7 +162,7 @@ def test_project_slash_show_and_init(tmp_path: Path) -> None:
     output = handler.slash_project("")
     assert "project: repo" in output
     plain = tmp_path / "plain"; plain.mkdir()
-    opened2 = m.create(provider="fake", model="test", cwd=plain, auto_project=False)
+    opened2 = m.create(provider="codex", model="test", cwd=plain, auto_project=False)
     handler.loop.session_metadata = opened2.metadata; handler.loop.store.cwd = str(plain)
     assert "unassociated" in handler.slash_project("")
     assert "project: plain" in handler.slash_project("init")
@@ -176,7 +177,7 @@ def test_settings_auto_project_false(tmp_path: Path) -> None:
 
 def _create_session_process(home: str, root: str, queue: multiprocessing.Queue) -> None:
     """Spawn-safe worker for the cross-process registry race regression."""
-    opened = SessionManager(home).create(provider="fake", model="test", cwd=root)
+    opened = SessionManager(home).create(provider="codex", model="test", cwd=root)
     queue.put(opened.metadata.project_id)
     opened.store.close()
 
@@ -191,7 +192,7 @@ def test_registered_home_project_does_not_capture_nested_repo(
     registry = ProjectRegistry(tmp_path / "zeta" / "projects")
     home_project = registry.create_project("home", "manual", user_home)
 
-    opened = manager(tmp_path).create(provider="fake", model="test", cwd=nested)
+    opened = manager(tmp_path).create(provider="codex", model="test", cwd=nested)
 
     assert opened.metadata.project_id != home_project.project_id
     assert opened.metadata.project_id is not None
@@ -206,7 +207,7 @@ def test_registered_filesystem_root_project_does_not_capture_nested_repo(
     registry = ProjectRegistry(tmp_path / "zeta" / "projects")
     root_project = registry.create_project("filesystem", "manual", Path("/"))
 
-    opened = manager(tmp_path).create(provider="fake", model="test", cwd=nested)
+    opened = manager(tmp_path).create(provider="codex", model="test", cwd=nested)
 
     assert opened.metadata.project_id != root_project.project_id
     assert opened.metadata.project_id is not None
@@ -226,7 +227,7 @@ def test_linked_worktree_under_home_uses_nested_repo_project(
     nested_project = registry.create_project("nested", "git", nested)
     registry.create_project("home", "manual", user_home)
 
-    opened = manager(tmp_path).create(provider="fake", model="test", cwd=worktree)
+    opened = manager(tmp_path).create(provider="codex", model="test", cwd=worktree)
 
     assert opened.metadata.project_id == nested_project.project_id
     opened.store.close()
@@ -242,7 +243,7 @@ def test_git_repo_at_home_does_not_create_project_for_descendant(
     nested.mkdir()
     monkeypatch.setenv("HOME", str(user_home))
 
-    opened = manager(tmp_path).create(provider="fake", model="test", cwd=nested)
+    opened = manager(tmp_path).create(provider="codex", model="test", cwd=nested)
 
     assert opened.metadata.project_id is None
     assert ProjectRegistry(tmp_path / "zeta" / "projects").list_projects() == []
@@ -258,8 +259,8 @@ def test_same_basename_repositories_get_distinct_stable_projects(tmp_path: Path)
         roots.append(root)
 
     m = manager(tmp_path)
-    first = [m.create(provider="fake", model="test", cwd=root) for root in roots]
-    reopened = [m.create(provider="fake", model="test", cwd=root) for root in roots]
+    first = [m.create(provider="codex", model="test", cwd=root) for root in roots]
+    reopened = [m.create(provider="codex", model="test", cwd=root) for root in roots]
 
     first_ids = [opened.metadata.project_id for opened in first]
     assert len(set(first_ids)) == 2
@@ -283,7 +284,7 @@ def test_ambient_git_repository_selection_is_ignored(
     monkeypatch.setenv("GIT_WORK_TREE", str(shadow))
     monkeypatch.setenv("GIT_INDEX_FILE", str(shadow / ".git" / "index"))
 
-    opened = manager(tmp_path).create(provider="fake", model="test", cwd=plain)
+    opened = manager(tmp_path).create(provider="codex", model="test", cwd=plain)
 
     assert opened.metadata.project_id is None
     assert ProjectRegistry(tmp_path / "zeta" / "projects").list_projects() == []
@@ -306,7 +307,7 @@ def test_git_discovery_timeout_is_bounded_and_warns(
 
     started = time.monotonic()
     with caplog.at_level(logging.WARNING):
-        opened = manager(tmp_path).create(provider="fake", model="test", cwd=plain)
+        opened = manager(tmp_path).create(provider="codex", model="test", cwd=plain)
     elapsed = time.monotonic() - started
 
     assert elapsed < 5
@@ -334,7 +335,7 @@ def test_git_discovery_does_not_invoke_fsmonitor(
         return real_run(command, *args, **kwargs)
 
     monkeypatch.setattr(project_context.subprocess, "run", record_run)
-    opened = manager(tmp_path).create(provider="fake", model="test", cwd=root)
+    opened = manager(tmp_path).create(provider="codex", model="test", cwd=root)
 
     assert opened.metadata.project_id is not None
     assert discovery_commands
@@ -361,8 +362,8 @@ def test_separate_git_dir_and_linked_worktree_share_primary_project(tmp_path: Pa
     git(primary, "worktree", "add", "-b", "linked", str(linked))
 
     m = manager(tmp_path)
-    primary_session = m.create(provider="fake", model="test", cwd=primary)
-    linked_session = m.create(provider="fake", model="test", cwd=linked)
+    primary_session = m.create(provider="codex", model="test", cwd=primary)
+    linked_session = m.create(provider="codex", model="test", cwd=linked)
 
     assert linked_session.metadata.project_id == primary_session.metadata.project_id
     projects = m.project_registry.list_projects()
@@ -384,7 +385,7 @@ def test_linked_worktree_loads_primary_project_memory_on_open_and_resume(
     user_home = tmp_path / "user-home"
     user_home.mkdir()
     m = SessionManager(home, user_home=user_home)
-    primary_session = m.create(provider="fake", model="test", cwd=primary)
+    primary_session = m.create(provider="codex", model="test", cwd=primary)
     assert primary_session.metadata.project_id is not None
     m.project_registry.update_memory(
         primary_session.metadata.project_id, {"state.md": "memory from primary"}
@@ -394,7 +395,7 @@ def test_linked_worktree_loads_primary_project_memory_on_open_and_resume(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(linked)
 
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     session_id = app.loop.store.session_id
     try:
         assert "memory from primary" in app.loop.context_assembler.system_prompt.content[0].text
@@ -402,7 +403,7 @@ def test_linked_worktree_loads_primary_project_memory_on_open_and_resume(
         asyncio.run(app.close())
 
     resumed = create_app(
-        build_parser().parse_args(["--provider", "fake", "--resume", session_id])
+        build_parser().parse_args(["--provider", "codex", "--resume", session_id])
     )
     try:
         assert "memory from primary" in resumed.loop.context_assembler.system_prompt.content[0].text
@@ -431,7 +432,7 @@ def test_new_frontend_session_runs_one_git_discovery_sequence(
         return real_run(command, *args, **kwargs)
 
     monkeypatch.setattr(project_context.subprocess, "run", count_git)
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     try:
         assert len(commands) <= 3
     finally:
@@ -460,7 +461,7 @@ def test_hanging_git_frontend_startup_has_one_bounded_warning(
 
     started = time.monotonic()
     with caplog.at_level(logging.WARNING):
-        app = create_app(build_parser().parse_args(["--provider", "fake"]))
+        app = create_app(build_parser().parse_args(["--provider", "codex"]))
     elapsed = time.monotonic() - started
     try:
         assert elapsed < 4
@@ -493,7 +494,7 @@ def test_incomplete_git_discovery_is_ineligible_and_warns(
 
     monkeypatch.setattr(project_context.subprocess, "run", timeout_one)
     with caplog.at_level(logging.WARNING):
-        opened = m.create(provider="fake", model="test", cwd=root)
+        opened = m.create(provider="codex", model="test", cwd=root)
     try:
         assert opened.metadata.project_id is None
         assert m.project_registry.list_projects() == []
@@ -513,7 +514,7 @@ def test_registered_home_and_injected_filesystem_root_projects_do_not_auto_captu
     home_project = m.project_registry.find_or_create_for_directory(user_home)
     root_project = m.project_registry.find_or_create_for_directory(fake_root)
 
-    opened = m.create(provider="fake", model="test", cwd=nested)
+    opened = m.create(provider="codex", model="test", cwd=nested)
     try:
         assert opened.metadata.project_id is None
         assert opened.metadata.project_id != home_project.project_id
@@ -539,7 +540,7 @@ def test_registered_home_and_injected_filesystem_root_projects_do_not_auto_captu
     monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta"))
     monkeypatch.chdir(user_home)
-    explicit = create_app(build_parser().parse_args(["--provider", "fake"]))
+    explicit = create_app(build_parser().parse_args(["--provider", "codex"]))
     try:
         assert "project: user-home" in explicit.slash_project("init")
         assert explicit.loop.session_metadata.project_id == home_project.project_id
@@ -547,7 +548,7 @@ def test_registered_home_and_injected_filesystem_root_projects_do_not_auto_captu
         asyncio.run(explicit.close())
 
     monkeypatch.chdir(nested)
-    later = create_app(build_parser().parse_args(["--provider", "fake"]))
+    later = create_app(build_parser().parse_args(["--provider", "codex"]))
     try:
         assert later.loop.session_metadata.project_id is None
     finally:
@@ -567,7 +568,7 @@ def test_first_auto_created_session_refreshes_project_memory_on_resume(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(root)
 
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     session_id = app.loop.store.session_id
     project_id = app.loop.session_metadata.project_id
     assert project_id is not None
@@ -578,7 +579,7 @@ def test_first_auto_created_session_refreshes_project_memory_on_resume(
     asyncio.run(app.close())
 
     resumed = create_app(
-        build_parser().parse_args(["--provider", "fake", "--resume", session_id])
+        build_parser().parse_args(["--provider", "codex", "--resume", session_id])
     )
     try:
         prompt = resumed.loop.context_assembler.system_prompt.content[0].text
@@ -601,7 +602,7 @@ async def test_project_init_rebinds_runtime_child_and_approval(
     monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(plain)
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     try:
         assert app.loop.root_project_id is None
         assert "project: plain" in app.slash_project("init")
@@ -671,7 +672,7 @@ def test_project_init_uses_durable_pending_link_on_registry_failure(
     root = tmp_path / "plain"
     root.mkdir()
     m = manager(tmp_path)
-    opened = m.create(provider="fake", model="test", cwd=root, auto_project=False)
+    opened = m.create(provider="codex", model="test", cwd=root, auto_project=False)
     project = m.project_registry.find_or_create_for_directory(root)
 
     def fail(*args: object, **kwargs: object) -> None:
@@ -718,10 +719,28 @@ def test_real_cli_no_session_does_not_create_project(tmp_path: Path) -> None:
         "HOME": str(user_home),
         "ZETA_HOME": str(home),
         "ZETA_TESTING": "1",
+        "PYTHONPATH": os.pathsep.join(
+            filter(
+                None,
+                (
+                    str(Path(__file__).parents[1]),
+                    os.environ.get("PYTHONPATH"),
+                ),
+            )
+        ),
     }
 
     result = subprocess.run(
-        ["zeta", "--provider", "fake", "--no-session", "--print", "hello"],
+        [
+            sys.executable,
+            "-m",
+            "tests.support.scripted_cli",
+            "--provider",
+            "codex",
+            "--no-session",
+            "--print",
+            "hello",
+        ],
         cwd=root,
         env=env,
         capture_output=True,
@@ -784,7 +803,7 @@ def test_explicit_resume_discovers_only_the_stored_session_cwd(
         catalog=skills,
     )
     opened = manager.create(
-        provider="fake",
+        provider="codex",
         model="test",
         cwd=session_repo,
         system_prompt=context.system_prompt,
@@ -815,7 +834,7 @@ def test_explicit_resume_discovers_only_the_stored_session_cwd(
 
     monkeypatch.setattr(project_context.subprocess, "run", count_git)
     app = create_app(
-        build_parser().parse_args(["--provider", "fake", "--resume", session_id])
+        build_parser().parse_args(["--provider", "codex", "--resume", session_id])
     )
     try:
         prompt = app.loop.context_assembler.system_prompt.content[0].text

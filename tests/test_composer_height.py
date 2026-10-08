@@ -15,7 +15,7 @@ from prompt_toolkit.layout.screen import Screen, WritePosition
 from rich.console import Console
 from rich.text import Text
 
-from zeta.core.fake import FakeBackend
+from tests.support.fake_backend import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -37,7 +37,7 @@ def _app(
             ConversationStore(tmp_path / "sessions", cwd=cwd),
             skill_catalog=SkillCatalog.empty(),
         ),
-        provider="fake",
+        provider="codex",
         model="offline",
         console=Console(
             file=StringIO(),

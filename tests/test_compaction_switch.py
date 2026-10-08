@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser
 from zeta.core.context import CompactionPolicy, ContextAssembler
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -83,7 +83,7 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 async def test_tui_switch_persists_across_reopen(home: Path) -> None:
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     session_id = app.loop.store.session_id
     assert app.loop.context_assembler.compaction == "evict"
 
@@ -116,7 +116,7 @@ async def test_tui_switch_persists_across_reopen(home: Path) -> None:
 
 
 async def test_tui_compaction_reports_mode_budget_and_last_stats(home: Path) -> None:
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     try:
         shown = await _slash(app, "/compaction")
         assert "compaction: evict" in shown
@@ -313,7 +313,7 @@ async def test_tui_compaction_reports_policy_block_and_required_tool(
 ) -> None:
     blocked = create_app(
         build_parser().parse_args(
-            ["--provider", "fake", "--disallowed-tools", "recall_history"]
+            ["--provider", "codex", "--disallowed-tools", "recall_history"]
         )
     )
     try:
@@ -326,7 +326,7 @@ async def test_tui_compaction_reports_policy_block_and_required_tool(
 
     required = create_app(
         build_parser().parse_args(
-            ["--provider", "fake", "--tools", "read,recall_history"]
+            ["--provider", "codex", "--tools", "read,recall_history"]
         )
     )
     try:
@@ -342,7 +342,7 @@ async def test_tui_compaction_reports_policy_block_and_required_tool(
 
 
 async def test_tui_refuses_switch_while_turn_is_active(home: Path) -> None:
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     pending = asyncio.get_running_loop().create_future()
     try:
         app._active_task = pending  # type: ignore[assignment]
@@ -360,7 +360,7 @@ def test_headless_resume_flag_switches_persisted_mode(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     parser = build_parser()
-    first = parser.parse_args(["--provider", "fake", "-p", "first"])
+    first = parser.parse_args(["--provider", "codex", "-p", "first"])
     assert run_headless(first, first.prompt) == 0
     session_id = SessionManager(home).list_sessions()[0].session_id
     assert _meta(home, session_id)["compaction"] == "evict"
@@ -381,7 +381,7 @@ def test_headless_resume_flag_switches_persisted_mode(
 def test_settings_file_compaction_does_not_switch_resumed_session(
     home: Path,
 ) -> None:
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     session_id = app.loop.store.session_id
     asyncio.run(app.close())
     home.mkdir(exist_ok=True)
@@ -396,7 +396,7 @@ def test_settings_file_compaction_does_not_switch_resumed_session(
 
 
 def test_default_behaviour_unchanged_for_new_and_legacy_sessions(home: Path) -> None:
-    fresh = create_app(build_parser().parse_args(["--provider", "fake"]))
+    fresh = create_app(build_parser().parse_args(["--provider", "codex"]))
     session_id = fresh.loop.store.session_id
     assert fresh.loop.context_assembler.compaction == "evict"
     assert _meta(home, session_id)["compaction_pinned"] is False
@@ -421,7 +421,7 @@ def test_headless_resume_switch_refused_by_required_tool_leaves_metadata(
 ) -> None:
     parser = build_parser()
     first = parser.parse_args(
-        ["--provider", "fake", "--tools", "recall_history", "-p", "first"]
+        ["--provider", "codex", "--tools", "recall_history", "-p", "first"]
     )
     assert run_headless(first, first.prompt) == 0
     session_id = SessionManager(home).list_sessions()[0].session_id
@@ -450,7 +450,7 @@ def test_tui_resume_switch_refused_by_required_tool_leaves_metadata(
     home: Path,
 ) -> None:
     app = create_app(
-        build_parser().parse_args(["--provider", "fake", "--tools", "recall_history"])
+        build_parser().parse_args(["--provider", "codex", "--tools", "recall_history"])
     )
     session_id = app.loop.store.session_id
     asyncio.run(app.close())
@@ -473,7 +473,7 @@ def test_tui_resume_switch_refused_by_required_tool_leaves_metadata(
 
 
 def test_tui_resume_switch_persists_after_startup_validation(home: Path) -> None:
-    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
     session_id = app.loop.store.session_id
     asyncio.run(app.close())
 
