@@ -28,7 +28,6 @@ from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
-from ..skills import SkillCatalog
 from . import ergonomics
 from .model_selection import apply as apply_settings
 from .protocol import ProtocolError
@@ -329,10 +328,10 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
     opened = runtime.opened
     if opened is None:
         raise ProtocolError(-32003, "no active session")
-    if opened.metadata.skill_catalog is not None:
-        catalog = SkillCatalog.from_snapshot(opened.metadata.skill_catalog)
-    else:
-        catalog = SkillCatalog.empty()
+    loop = runtime.loop
+    if loop is None:
+        raise ProtocolError(-32003, "no active session")
+    catalog = loop.tool_registry.skill_catalog
     project_dir = discover_repo_root(Path(opened.metadata.cwd or runtime.cwd))
     return create_slash_registry(
         zeta_home=runtime.home,
