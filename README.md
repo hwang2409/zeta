@@ -73,7 +73,6 @@ directory.
 
 - [Attention panel](docs/attention-panel.md)
 - [Automations](docs/automations.md)
-- [Computer use](docs/computer-use.md)
 - [Design notes](docs/design.md)
 - [Fake provider](docs/fake-provider.md)
 - [MCP management](docs/mcp-management.md)
@@ -97,4 +96,4 @@ uv run --frozen ruff check .
 
 The package is under `src/zeta/`; tests are under `tests/`. Optional browser
 dependencies use the `browser` extra. See the relevant document above before
-running browser or computer-use workflows.
+running browser workflows.
