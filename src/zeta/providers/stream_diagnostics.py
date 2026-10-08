@@ -93,6 +93,20 @@ class StreamDiagnostics:
         self.written = True
 
     @staticmethod
+    def record_reassembly_mismatches(path: Path, *, count: int) -> None:
+        """Record mismatch frequency without logging provider content."""
+
+        write_stream_diagnostic(
+            path,
+            {
+                "timestamp": time.time(),
+                "cause": "codex_reassembly_mismatch",
+                "reassembly_mismatches": count,
+                **fd_diagnostics(),
+            },
+        )
+
+    @staticmethod
     def record_retry_exhausted(
         path: Path,
         error: BaseException,
