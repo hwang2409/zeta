@@ -93,7 +93,7 @@ def test_restricted_policy_does_not_import_user_tools_without_opt_in(
     registry = ToolRegistry(
         tmp_path / "cwd",
         skill_catalog=SkillCatalog.empty(),
-        tool_allow=("computer__*",),
+        tool_allow=("remote__*",),
     )
 
     discovery = apply_external_tools(registry, home=home, project_dir=None)
@@ -118,7 +118,7 @@ def test_restricted_policy_imports_user_tools_with_trusted_opt_in(
     registry = ToolRegistry(
         tmp_path / "cwd",
         skill_catalog=SkillCatalog.empty(),
-        tool_allow=("computer__*",),
+        tool_allow=("remote__*",),
     )
 
     apply_external_tools(
@@ -176,7 +176,7 @@ async def test_runtime_blocks_user_tool_import_in_restricted_session(
 
     app = create_app(
         build_parser().parse_args(
-            ["--provider", "codex", "--tools", "computer__*"]
+            ["--provider", "codex", "--tools", "remote__*"]
         )
     )
     try:

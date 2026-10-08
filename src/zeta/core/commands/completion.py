@@ -14,7 +14,7 @@ _zeta() {
     local context state line command_index command_name token
     local -a commands session_verbs automation_verbs project_verbs project_index_verbs webhook_verbs mcp_verbs original_words
     typeset -A opt_args
-    commands=(login serve session project inbox panel automation mcp stalls computer completion)
+    commands=(login serve session project inbox panel automation mcp stalls completion)
     session_verbs=(list rename delete export stats push pull)
     automation_verbs=(list show approve disable import daemon webhook)
     project_verbs=(create init discover list show memory index)
@@ -27,10 +27,10 @@ _zeta() {
     while (( command_index <= $#original_words )); do
         token=$original_words[command_index]
         case $token in
-            --provider|--model|--resume|--token-budget|--compaction|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|--computer-backend|-p|--print)
+            --provider|--model|--resume|--token-budget|--compaction|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|-p|--print)
                 (( command_index += 2 ))
                 ;;
-            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--computer-backend=*|-p*)
+            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|-p*)
                 (( command_index++ ))
                 ;;
             --)
@@ -75,8 +75,6 @@ _zeta() {
         '--format=[headless output format]:format:(text json)' \
         '--system-prompt=[replace the built-in system prompt]:text or @file:' \
         '--append-system-prompt=[append to the default system prompt]:text or @file:' \
-        '--computer[use a sandboxed desktop]' \
-        '--computer-backend=[desktop backend]:backend:(local)' \
         '1:command:->command' \
         '*::argument:->argument'
 
@@ -94,9 +92,6 @@ _zeta() {
                     ;;
                 stalls)
                     _arguments '--top=[top stacks]:count:' '--json[print JSON]'
-                    ;;
-                computer)
-                    _arguments '1:action:(setup status stop destroy watch)' '--live[watch live desktop]' '--yes[skip destroy confirmation]'
                     ;;
                 completion)
                     _arguments '1:shell:(zsh bash)'
@@ -181,14 +176,14 @@ def bash_script() -> str:
     while (( index < COMP_CWORD )); do
         token="${COMP_WORDS[index]}"
         case "$token" in
-            --provider|--model|--resume|--token-budget|--compaction|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|--computer-backend|--socket|--port|--cwd|-p|--print)
+            --provider|--model|--resume|--token-budget|--compaction|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
                 if [[ "${COMP_WORDS[index+1]:-}" == "=" ]]; then
                     (( index += 3 ))
                 else
                     (( index += 2 ))
                 fi
                 ;;
-            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--computer-backend=*|--socket=*|--port=*|--cwd=*|-p*)
+            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
                 (( index++ ))
                 ;;
             --)
@@ -212,8 +207,8 @@ def bash_script() -> str:
     if (( command_index > 0 && COMP_CWORD > command_index + 1 )); then
         verb="${COMP_WORDS[command_index+1]}"
     fi
-    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --auto-memory --no-auto-memory --token-budget --compaction --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt --computer --computer-backend"
-    local commands="login serve session project inbox panel automation mcp stalls computer completion"
+    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --auto-memory --no-auto-memory --token-budget --compaction --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt"
+    local commands="login serve session project inbox panel automation mcp stalls completion"
 
     if (( command_index == 0 )); then
         if [[ "$cur" == -* ]]; then
@@ -233,9 +228,6 @@ def bash_script() -> str:
             ;;
         stalls)
             COMPREPLY=( $(compgen -W "--top --json" -- "$cur") )
-            ;;
-        computer)
-            COMPREPLY=( $(compgen -W "setup status stop destroy watch --live --yes" -- "$cur") )
             ;;
         completion)
             COMPREPLY=( $(compgen -W "zsh bash" -- "$cur") )

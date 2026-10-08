@@ -28,8 +28,8 @@ def _registry(tmp_path: Path, **kwargs: object) -> ToolRegistry:
     )
     registry.register("read", lambda arguments: "read")
     registry.register("bash", lambda arguments: "bash")
-    registry.register("computer__click", lambda arguments: "clicked")
-    registry.register("computer__type", lambda arguments: "typed")
+    registry.register("remote__click", lambda arguments: "clicked")
+    registry.register("remote__type", lambda arguments: "typed")
     return registry
 
 
@@ -42,12 +42,12 @@ def test_disallowed_tool_schemas_are_omitted_from_all_provider_payloads(
 ) -> None:
     registry = _registry(
         tmp_path,
-        tool_allow=("computer__*",),
-        tool_deny=("computer__type",),
+        tool_allow=("remote__*",),
+        tool_deny=("remote__type",),
     )
 
     names = [schema["name"] for schema in registry.schemas]
-    assert names == ["computer__click"]
+    assert names == ["remote__click"]
 
     anthropic = build_request_payload(
         _messages(), registry.schemas, model="claude-test", max_tokens=2048, thinking_budget=1024
@@ -55,14 +55,14 @@ def test_disallowed_tool_schemas_are_omitted_from_all_provider_payloads(
     codex = build_responses_payload(_messages(), registry.schemas, model="codex-test")
     ollama = ollama_tools(registry.schemas)
 
-    assert [tool["name"] for tool in anthropic["tools"]] == ["computer__click"]
-    assert [tool["name"] for tool in codex["tools"]] == ["computer__click"]
-    assert [tool["function"]["name"] for tool in ollama] == ["computer__click"]
+    assert [tool["name"] for tool in anthropic["tools"]] == ["remote__click"]
+    assert [tool["name"] for tool in codex["tools"]] == ["remote__click"]
+    assert [tool["function"]["name"] for tool in ollama] == ["remote__click"]
 
 
 @pytest.mark.asyncio
 async def test_calling_disallowed_tool_returns_clear_policy_error(tmp_path: Path) -> None:
-    registry = _registry(tmp_path, tool_allow=("computer__*",))
+    registry = _registry(tmp_path, tool_allow=("remote__*",))
 
     result = await registry.execute(ToolCall("call-1", "bash", {}))
 
@@ -76,24 +76,24 @@ def test_glob_allow_and_deny_patterns_apply_to_builtins_and_mcp_names(
 ) -> None:
     registry = _registry(
         tmp_path,
-        tool_allow=("computer__*", "read"),
+        tool_allow=("remote__*", "read"),
         tool_deny=("*type",),
     )
 
-    assert registry.registered_names == frozenset({"read", "computer__click"})
+    assert registry.registered_names == frozenset({"read", "remote__click"})
 
 
 def test_child_registry_can_narrow_but_cannot_widen_tool_policy(tmp_path: Path) -> None:
     from zeta.core.store import ConversationStore
 
-    parent = _registry(tmp_path, tool_allow=("computer__*", "read"))
+    parent = _registry(tmp_path, tool_allow=("remote__*", "read"))
     child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
     try:
         child = parent.clone_for_session(
             child_store,
-            exclude_names={"computer__type"},
+            exclude_names={"remote__type"},
         )
-        assert child.registered_names == frozenset({"read", "computer__click"})
+        assert child.registered_names == frozenset({"read", "remote__click"})
         assert "bash" not in child.registered_names
     finally:
         child_store.close()
@@ -107,16 +107,16 @@ def test_tool_policy_round_trips_in_session_metadata(tmp_path: Path) -> None:
         cwd=str(tmp_path),
         retained_tail=8,
         compaction_budget=1000,
-        tool_allow=("computer__*",),
-        tool_deny=("computer__type",),
+        tool_allow=("remote__*",),
+        tool_deny=("remote__type",),
     )
 
     restored = SessionMetadata.from_dict(
         metadata.to_storage_dict(), path=tmp_path / "meta.json"
     )
 
-    assert restored.tool_allow == ("computer__*",)
-    assert restored.tool_deny == ("computer__type",)
+    assert restored.tool_allow == ("remote__*",)
+    assert restored.tool_deny == ("remote__type",)
 
 
 @pytest.mark.asyncio
@@ -141,20 +141,20 @@ async def test_resume_intersects_and_persists_invocation_tool_policy(
                 "--provider",
                 "codex",
                 "--tools",
-                "computer__*",
+                "remote__*",
                 "--disallowed-tools",
-                "computer__type",
+                "remote__type",
             ]
         )
     )
     try:
         assert "bash" not in narrowed.loop.tool_registry.registered_names
-        assert not narrowed.loop.tool_registry.tool_is_allowed("computer__type")
+        assert not narrowed.loop.tool_registry.tool_is_allowed("remote__type")
         from zeta.core.session import SessionManager
 
         persisted = SessionManager(home).read_metadata(session_id)
-        assert persisted.tool_allow_layers == (("computer__*",),)
-        assert persisted.tool_deny == ("computer__type",)
+        assert persisted.tool_allow_layers == (("remote__*",),)
+        assert persisted.tool_deny == ("remote__type",)
     finally:
         await narrowed.close()
 
@@ -163,8 +163,8 @@ async def test_resume_intersects_and_persists_invocation_tool_policy(
     )
     try:
         assert "bash" not in resumed.loop.tool_registry.registered_names
-        assert resumed.loop.tool_registry.tool_allow == ("computer__*",)
-        assert resumed.loop.tool_registry.tool_deny == ("computer__type",)
+        assert resumed.loop.tool_registry.tool_allow == ("remote__*",)
+        assert resumed.loop.tool_registry.tool_deny == ("remote__type",)
     finally:
         await resumed.close()
 
@@ -185,9 +185,9 @@ async def test_resume_intersects_persisted_policy_with_ambient_policy(
                 "--provider",
                 "codex",
                 "--tools",
-                "computer__*",
+                "remote__*",
                 "--disallowed-tools",
-                "computer__type",
+                "remote__type",
             ]
         )
     )
@@ -202,14 +202,14 @@ async def test_resume_intersects_persisted_policy_with_ambient_policy(
     )
     try:
         assert resumed.loop.tool_registry.tool_policy.allow_layers == (
-            ("computer__*",),
+            ("remote__*",),
             ("bash",),
         )
         assert resumed.loop.tool_registry.registered_names == frozenset()
-        assert resumed.loop.tool_registry.tool_deny == ("computer__type",)
+        assert resumed.loop.tool_registry.tool_deny == ("remote__type",)
         tools_status = resumed.slash_tools("")
-        assert "allow: computer__* AND bash" in tools_status
-        assert "deny: computer__type" in tools_status
+        assert "allow: remote__* AND bash" in tools_status
+        assert "deny: remote__type" in tools_status
     finally:
         await resumed.close()
 
@@ -227,14 +227,14 @@ async def test_server_resume_applies_server_policy_as_upper_bound(tmp_path: Path
         await first.close()
 
     restricted = ServerRuntime(
-        home, cwd=tmp_path, provider="codex", tools="computer__*"
+        home, cwd=tmp_path, provider="codex", tools="remote__*"
     )
     try:
         await restricted.resume_session(session_id)
         assert restricted.loop is not None
         assert "bash" not in restricted.loop.tool_registry.registered_names
         persisted = restricted.manager.read_metadata(session_id)
-        assert persisted.tool_allow_layers == (("computer__*",),)
+        assert persisted.tool_allow_layers == (("remote__*",),)
     finally:
         await restricted.close()
 
@@ -336,10 +336,10 @@ def test_mcp_server_must_satisfy_every_allow_layer() -> None:
     from zeta.config.tool_policy import ToolPolicy
 
     policy = ToolPolicy.create(
-        allow=("*",), allow_layers=(("computer__*",), ("*",))
+        allow=("*",), allow_layers=(("remote__*",), ("*",))
     )
 
-    assert policy.allows_mcp_server("computer")
+    assert policy.allows_mcp_server("remote")
     assert not policy.allows_mcp_server("unrelated")
 
 
@@ -422,7 +422,7 @@ def test_project_tool_policy_can_only_narrow_global_policy(tmp_path: Path) -> No
     home.mkdir()
     project.mkdir()
     (home / "settings.toml").write_text(
-        'tools = ["computer__*"]\ndisallowed_tools = ["bash"]\n',
+        'tools = ["remote__*"]\ndisallowed_tools = ["bash"]\n',
         encoding="utf-8",
     )
     (project / "settings.toml").write_text(
@@ -446,7 +446,7 @@ def test_project_tool_policy_can_only_narrow_global_policy(tmp_path: Path) -> No
     )
 
     assert registry.registered_names == frozenset(
-        {"computer__click", "computer__type"}
+        {"remote__click", "remote__type"}
     )
     assert config.tool_deny == ("bash",)
     assert any("cannot widen" in notice for notice in loaded.notices)
@@ -458,7 +458,7 @@ def test_empty_project_allowlist_allows_nothing(tmp_path: Path) -> None:
     home.mkdir()
     project.mkdir()
     (home / "settings.toml").write_text(
-        'tools = ["computer__*"]\n', encoding="utf-8"
+        'tools = ["remote__*"]\n', encoding="utf-8"
     )
     (project / "settings.toml").write_text('tools = []\n', encoding="utf-8")
 
@@ -484,7 +484,7 @@ def test_empty_project_allowlist_allows_nothing(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "body, field",
     [
-        ('tools = "computer__*"\n', "tools"),
+        ('tools = "remote__*"\n', "tools"),
         ('tools = [""]\n', "tools"),
         ('disallowed_tools = "bash"\n', "disallowed_tools"),
         ('disallowed_tools = [""]\n', "disallowed_tools"),
@@ -507,7 +507,7 @@ def test_cli_and_layered_settings_resolve_tool_patterns(tmp_path: Path) -> None:
     home.mkdir()
     project.mkdir()
     (home / "settings.toml").write_text(
-        'tools = ["read", "computer__*"]\ndisallowed_tools = ["computer__type"]\n',
+        'tools = ["read", "remote__*"]\ndisallowed_tools = ["remote__type"]\n',
         encoding="utf-8",
     )
     loaded = load_settings(home=home, project_dir=project)
@@ -521,9 +521,9 @@ def test_cli_and_layered_settings_resolve_tool_patterns(tmp_path: Path) -> None:
         cli_disallowed_tools=None,
     default_provider="codex",
     )
-    assert config.tool_allow == ("read", "computer__*")
-    assert config.tool_allow_layers == (("read", "computer__*"),)
-    assert config.tool_deny == ("computer__type",)
+    assert config.tool_allow == ("read", "remote__*")
+    assert config.tool_allow_layers == (("read", "remote__*"),)
+    assert config.tool_deny == ("remote__type",)
 
     overridden = resolve(
         loaded.settings,
@@ -539,10 +539,10 @@ def test_cli_and_layered_settings_resolve_tool_patterns(tmp_path: Path) -> None:
     assert overridden.tool_deny == ("read",)
 
     args = build_parser().parse_args(
-        ["--tools", "computer__*,read", "--disallowed-tools", "computer__type", "-p", "go"]
+        ["--tools", "remote__*,read", "--disallowed-tools", "remote__type", "-p", "go"]
     )
-    assert args.tools == "computer__*,read"
-    assert args.disallowed_tools == "computer__type"
+    assert args.tools == "remote__*,read"
+    assert args.disallowed_tools == "remote__type"
 
 
 def test_only_global_settings_can_enable_hooks(tmp_path: Path) -> None:
@@ -607,7 +607,7 @@ async def test_mcp_start_failure_with_allowlist_does_not_advertise_builtins(
         json.dumps(
             {
                 "servers": {
-                    "computer": {
+                    "remote": {
                         "transport": "stdio",
                         "command": "definitely-not-a-server",
                     }
@@ -617,7 +617,7 @@ async def test_mcp_start_failure_with_allowlist_does_not_advertise_builtins(
         encoding="utf-8",
     )
     args = build_parser().parse_args(
-        ["--provider", "codex", "--tools", "computer__*", "-p", "go"]
+        ["--provider", "codex", "--tools", "remote__*", "-p", "go"]
     )
     app = create_app(args)
     try:
@@ -642,7 +642,7 @@ def test_require_tools_exits_nonzero_when_exact_allowlisted_tool_is_missing(
             "--provider",
             "codex",
             "--tools",
-            "computer__click",
+            "remote__click",
             "--require-tools",
             "-p",
             "go",
@@ -650,7 +650,7 @@ def test_require_tools_exits_nonzero_when_exact_allowlisted_tool_is_missing(
     )
 
     assert run_headless(args, args.prompt) != 0
-    assert "computer__click" in capsys.readouterr().err
+    assert "remote__click" in capsys.readouterr().err
 
 
 def test_default_tool_policy_keeps_provider_request_bytes_identical(

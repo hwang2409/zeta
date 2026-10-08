@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 from rich.cells import cell_len
 from rich.console import Console
+from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser, main
@@ -133,6 +134,46 @@ def test_fresh_session_injects_context_and_lists_files(
     assert "You are zeta" in system_prompt
     assert "repo rules" in system_prompt
     assert str((tmp_path / "AGENTS.md").resolve()) in app.slash_status().context_files
+
+
+def test_resume_renders_legacy_computer_tool_messages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Removed tools remain readable through the generic transcript card."""
+
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    opened = create_app(_args())
+    call = ToolCall("legacy-computer-call", "computer__click", {"x": 12, "y": 34})
+    opened.loop.store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
+    )
+    opened.loop.store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(call.id, "legacy click completed"),
+        )
+    )
+    session_id = opened.loop.store.session_id
+    opened.loop.store.close()
+
+    resumed = create_app(_args("--resume", session_id))
+    capsys.readouterr()
+    resumed._rebuild_transcript()
+    rendered = Text.from_ansi(capsys.readouterr().out).plain
+
+    assert "computer__click" in rendered
+    assert "x=12" in rendered
+    assert "legacy click completed" in rendered
+    results = [
+        message.tool_result.content
+        for message in resumed.loop.store.messages()
+        if message.tool_result
+    ]
+    assert results == ["legacy click completed"]
 
 
 def test_resume_rebuilds_default_context_from_stored_directory(

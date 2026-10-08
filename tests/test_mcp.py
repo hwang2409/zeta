@@ -122,7 +122,7 @@ async def test_mount_skips_stdio_server_outside_tool_policy_before_spawn(
         tmp_path,
         register_builtin=False,
         skill_catalog=SkillCatalog.empty(),
-        tool_allow=("computer__*",),
+        tool_allow=("remote__*",),
     )
     notices: list[str] = []
 

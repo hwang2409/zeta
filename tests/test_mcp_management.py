@@ -527,7 +527,7 @@ async def test_login_skips_oauth_flow_blocked_by_session_policy(
         tmp_path,
         register_builtin=False,
         skill_catalog=SkillCatalog.empty(),
-        tool_allow=("computer__*",),
+        tool_allow=("remote__*",),
     )
     mount = MCPMount(registry, {})
     manager = service(tmp_path, mount=mount)
@@ -577,7 +577,7 @@ async def test_management_test_skips_server_blocked_by_session_policy(tmp_path):
         tmp_path,
         register_builtin=False,
         skill_catalog=SkillCatalog.empty(),
-        tool_allow=("computer__*",),
+        tool_allow=("remote__*",),
     )
     mount = MCPMount(registry, {})
     manager = service(tmp_path, mount=mount)
@@ -641,12 +641,12 @@ def test_untrusted_project_stdio_server_is_not_spawned_by_test(tmp_path):
     source = f"open({str(marker)!r}, 'w').close()"
     manager = service(tmp_path)
     manager.add(
-        "computer", scope="project", command=sys.executable, args=("-c", source),
+        "untrusted", scope="project", command=sys.executable, args=("-c", source),
         enabled=True,
     )
-    assert manager.show("computer", scope="project").trusted is False
+    assert manager.show("untrusted", scope="project").trusted is False
 
-    result = asyncio.run(manager.test("computer", scope="project"))
+    result = asyncio.run(manager.test("untrusted", scope="project"))
 
     assert result["status"] == "untrusted"
     assert result["tools"] == []

@@ -464,7 +464,7 @@ async def test_unattended_runtime_preserves_persisted_allow_layers(
         cwd=tmp_path,
         skill_catalog=discover_session_skills(home=tmp_path),
         tool_allow=("*",),
-        tool_allow_layers=(("computer__*",), ("*",)),
+        tool_allow_layers=(("remote__*",), ("*",)),
     )
     loop = build_unattended_loop(
         session, home=tmp_path, allow=("bash",), backend=FakeBackend([])

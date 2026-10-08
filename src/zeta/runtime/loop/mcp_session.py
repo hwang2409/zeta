@@ -15,7 +15,7 @@ from ...mcp import (
 
 class MCPSession:
     # An explicitly selected configuration replaces the user and project MCP
-    # files for this session (for example the computer-use server).
+    # files for this session.
     _mcp_selected_config: MCPConfig | None = None
 
     @property

@@ -84,8 +84,6 @@ _TOP_KEYS = frozenset(
         "allow_external_tools",
         # Parsed by zeta.remote_sync; global only.
         "remotes",
-        # Validated by zeta.computer.settings; global only.
-        "computer",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
