@@ -87,6 +87,7 @@ class MemorySource:
     seq_end: int
     origins: tuple[str, ...]
     observed_at: str
+    evidence_rank: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +286,8 @@ def _validate_source(source: MemorySource) -> None:
         or not source.origins
         or len(set(source.origins)) != len(source.origins)
         or any(origin not in _ALLOWED_ORIGINS for origin in source.origins)
+        or type(source.evidence_rank) is not int
+        or not 1 <= source.evidence_rank <= 6
     ):
         _fail("invalid memory entry source")
     _timestamp(source.observed_at)
@@ -405,6 +408,7 @@ def _source_dict(source: MemorySource) -> dict[str, object]:
         "seq_end": source.seq_end,
         "origins": list(source.origins),
         "observed_at": source.observed_at,
+        "evidence_rank": source.evidence_rank,
     }
 
 
@@ -501,7 +505,10 @@ def state_from_bytes(payload: bytes) -> MemoryState:
         "valid_until", "supersedes", "superseded_by", "sources", "automatic",
         "accepted_at", "accepted_by", "last_operation_id",
     }
-    source_fields = {"session_id", "seq_start", "seq_end", "origins", "observed_at"}
+    source_fields = {
+        "session_id", "seq_start", "seq_end", "origins", "observed_at",
+        "evidence_rank",
+    }
     for entry_id, item in root["entries"].items():
         if isinstance(item, dict) and item.get("missing") is True:
             marker = _exact_dict(item, {"id", "missing"}, "missing memory entry")

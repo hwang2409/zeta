@@ -310,7 +310,7 @@ def _sources(
     by_seq = {
         row.get("seq"): row for row in transcript.rows if type(row.get("seq")) is int
     }
-    parsed: list[MemorySource] = []
+    parsed_ranges: list[tuple[int, int, tuple[str, ...], str]] = []
     all_rows: list[Mapping[str, Any]] = []
     for source_index, item in enumerate(raw):
         source = _exact(item, {"seq_start", "seq_end"}, {"seq_start", "seq_end"}, index)
@@ -328,12 +328,14 @@ def _sources(
             )
         origins = tuple(dict.fromkeys(_transcript_authorship(row) for row in rows))
         observed_at = _observed_at(rows, now)
-        parsed.append(
-            MemorySource(transcript.session_id, start, end, origins, observed_at)
-        )
+        parsed_ranges.append((start, end, origins, observed_at))
         all_rows.extend(rows)
     rank, direct = _source_rank(all_rows)
-    return tuple(parsed), rank, direct, _observed_at(all_rows, now)
+    sources = tuple(
+        MemorySource(transcript.session_id, start, end, origins, observed_at, rank)
+        for start, end, origins, observed_at in parsed_ranges
+    )
+    return sources, rank, direct, _observed_at(all_rows, now)
 
 
 def _text(value: object, label: str, index: int) -> str:
@@ -555,20 +557,10 @@ def _parse(
 
 
 def _stored_rank(entry: MemoryEntry) -> int:
-    ranks = []
-    for source in entry.sources:
-        origins = set(source.origins)
-        if "user" in origins:
-            ranks.append(2)
-        elif origins & {"skill_expansion", "slash_expansion"}:
-            ranks.append(3)
-        elif "agent" in origins and "tool_output" in origins:
-            ranks.append(4)
-        elif "agent" in origins:
-            ranks.append(5)
-        else:
-            ranks.append(6)
-    return min(ranks, default=2 if entry.accepted_at else 6)
+    return min(
+        (source.evidence_rank for source in entry.sources),
+        default=2 if entry.accepted_at else 6,
+    )
 
 
 def _target_transition_error(

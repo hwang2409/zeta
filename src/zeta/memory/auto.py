@@ -23,7 +23,7 @@ from ..protocol.types import (
 )
 from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
 from .entry_reconciler import EntryReconciliationFailure, reconcile_entry_range
-from .profiles import early_update_debounce_seconds
+from .profiles import early_update_debounce_seconds, early_update_max_wait_seconds
 from .reconciler import (
     ReconciliationError,
     ReconciliationResponse,
@@ -81,6 +81,7 @@ class AutoMemoryConfig:
     shutdown_grace_seconds: float = 2.5
     retry_backoff_seconds: float = 60.0
     early_trigger_debounce_seconds: float | None = None
+    early_trigger_max_wait_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if self.token_threshold < 1:
@@ -100,6 +101,11 @@ class AutoMemoryConfig:
             and self.early_trigger_debounce_seconds < 0
         ):
             raise ValueError("memory early-trigger debounce cannot be negative")
+        if (
+            self.early_trigger_max_wait_seconds is not None
+            and self.early_trigger_max_wait_seconds <= 0
+        ):
+            raise ValueError("memory early-trigger maximum wait must be positive")
 
 
 @dataclass(slots=True)
@@ -156,6 +162,7 @@ class AutoMemoryReconciler:
         self._seen_activity_generation = 0
         self._idle_deadline: float | None = None
         self._early_deadline: float | None = None
+        self._early_window_started_at: float | None = None
         self._early_pending_end: int | None = None
         self._last_request_finished = 0.0
         self._conflict_retries = 0
@@ -327,6 +334,7 @@ class AutoMemoryReconciler:
                 )
                 self._early_pending_end = None
                 self._early_deadline = None
+                self._early_window_started_at = None
             if self._resume_catch_up:
                 self._resume_catch_up = False
                 latest_seq, _, _ = await asyncio.to_thread(self._transcript_state)
@@ -347,7 +355,7 @@ class AutoMemoryReconciler:
                     self._completed_direct_user_turn, latest_seq
                 )
                 if early_turn is not None:
-                    completion_seq, debounce_seconds = early_turn
+                    completion_seq, debounce_seconds, max_wait_seconds = early_turn
                     consumed = await asyncio.to_thread(
                         self.state.consume_early_trigger, completion_seq
                     )
@@ -355,7 +363,13 @@ class AutoMemoryReconciler:
                         self._early_pending_end = max(
                             self._early_pending_end or 0, completion_seq
                         )
-                        self._early_deadline = self._clock() + debounce_seconds
+                        now = self._clock()
+                        if self._early_window_started_at is None:
+                            self._early_window_started_at = now
+                        self._early_deadline = min(
+                            now + debounce_seconds,
+                            self._early_window_started_at + max_wait_seconds,
+                        )
             if self._pending:
                 item = self._pending.pop(0)
                 if item.key is not None:
@@ -717,15 +731,21 @@ class AutoMemoryReconciler:
             except FileNotFoundError:
                 pass
 
-    def _completed_direct_user_turn(self, latest_seq: int) -> tuple[int, float] | None:
-        """Return the newest unseen completed turn and its profile debounce."""
+    def _completed_direct_user_turn(
+        self, latest_seq: int
+    ) -> tuple[int, float, float] | None:
+        """Return the newest unseen completed turn and its profile delays."""
         try:
             snapshot = self.registry._entry_memory_state(self.project_id)
         except UnsupportedMemoryFormatError:
             return None
+        profile = snapshot.state.schema.profile
         debounce = self.config.early_trigger_debounce_seconds
         if debounce is None:
-            debounce = early_update_debounce_seconds(snapshot.state.schema.profile)
+            debounce = early_update_debounce_seconds(profile)
+        max_wait = self.config.early_trigger_max_wait_seconds
+        if max_wait is None:
+            max_wait = early_update_max_wait_seconds(profile)
         path = self.session_dir / "conversation.jsonl"
         try:
             with path.open("rb") as handle:
@@ -775,7 +795,7 @@ class AutoMemoryReconciler:
                 direct_user_pending = False
         if newest_completion <= self.state.early_trigger_seq:
             return None
-        return newest_completion, debounce
+        return newest_completion, debounce, max_wait
 
     def _transcript_state(self) -> tuple[int, int, int]:
         path = self.session_dir / "conversation.jsonl"

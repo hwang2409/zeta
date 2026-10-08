@@ -19,11 +19,14 @@ from zeta.memory.entry_store import (
     MemorySource,
     UpdateOperation,
     apply_operations,
+    canonical_state_bytes,
     empty_state,
+    state_from_bytes,
 )
 from zeta.memory.profiles import (
     BUILTIN_PROFILES,
     early_update_debounce_seconds,
+    early_update_max_wait_seconds,
     memory_profile,
 )
 from zeta.memory.reconciler import ReconciliationResponse, Transcript
@@ -152,7 +155,7 @@ def _seed_user_entry(
             AddOperation(
                 kind,
                 text,
-                (MemorySource(SESSION, 1, 1, ("user",), observed_at),),
+                (MemorySource(SESSION, 1, 1, ("user",), observed_at, 2),),
             ),
         ),
         reconciliation_key=_key(f"seed-{kind}-{text}"),
@@ -182,6 +185,8 @@ def test_zeta_and_messaging_profiles_apply_distinct_defaults() -> None:
     )
     assert early_update_debounce_seconds("zeta") == 60
     assert early_update_debounce_seconds("messaging") == 15
+    assert early_update_max_wait_seconds("zeta") == 300
+    assert early_update_max_wait_seconds("messaging") == 120
     assert (
         next(kind for kind in zeta.kinds if kind.key == "state").default_expiry_days
         == 30
@@ -196,7 +201,7 @@ def test_zeta_and_messaging_profiles_apply_distinct_defaults() -> None:
         BUILTIN_PROFILES["other"] = zeta  # type: ignore[index]
 
     project_id = "p_" + "1" * 32
-    source = (MemorySource(SESSION, 1, 1, ("user",), NOW),)
+    source = (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),)
     zeta_state, _ = apply_operations(
         empty_state(project_id, zeta),
         (AddOperation("state", "Current work.", source),),
@@ -229,6 +234,7 @@ def test_default_expiry_uses_seen_at_and_support_extends_only_default() -> None:
             1,
             ("user",),
             "2026-10-01T12:00:00.000000Z",
+            2,
         ),
     )
     state, _ = apply_operations(
@@ -258,6 +264,7 @@ def test_default_expiry_uses_seen_at_and_support_extends_only_default() -> None:
             2,
             ("user",),
             "2026-10-10T12:00:00.000000Z",
+            2,
         ),
     )
     updated, _ = apply_operations(
@@ -308,7 +315,7 @@ async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -
             AddOperation(
                 "state",
                 "Old status.",
-                (MemorySource(SESSION, 1, 1, ("user",), NOW),),
+                (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),),
             ),
         ),
         reconciliation_key=_key("seed"),
@@ -653,7 +660,7 @@ async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> N
         _transcript(
             _row(
                 3,
-                "PR 10 is done and post-merge checks passed.",
+                "Actually, PR 10 is done and post-merge checks passed.",
                 created_at="2026-10-08T13:00:00.000000Z",
             )
         ),
@@ -676,7 +683,7 @@ async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> N
             AddOperation(
                 "state",
                 "Temporary rollout state.",
-                (MemorySource(SESSION, 4, 4, ("user",), NOW),),
+                (MemorySource(SESSION, 4, 4, ("user",), NOW, 2),),
                 expires_at="2026-10-08T11:00:00.000000Z",
             ),
         ),
@@ -759,7 +766,7 @@ async def test_cas_retry_regenerates_against_new_entry_state(
                     AddOperation(
                         "brief",
                         "A concurrent fact survives.",
-                        (MemorySource(SESSION, 1, 1, ("user",), NOW),),
+                        (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),),
                     ),
                 ),
                 reconciliation_key=_key("concurrent"),
@@ -1047,3 +1054,143 @@ async def test_reconciliation_retry_is_idempotent_after_cursor_crash(
     assert len(_entries(registry, project_id)) == 1
     assert history_after_retry == history_after_commit
     assert replacement.last_reconciled_seq == 1
+
+@pytest.mark.asyncio
+async def test_stored_correction_rejects_newer_ordinary_user_statement(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    added, _ = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(
+                1,
+                "Actually, use Postgres.",
+                created_at="2026-10-08T11:00:00.000000Z",
+            )
+        ),
+        [_proposal(_add("decisions", "Use Postgres."))],
+        key="ranked-correction",
+        now="2026-10-08T11:00:00.000000Z",
+    )
+    target = added.changed_entry_ids[0]
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(_row(2, "Use SQLite.", created_at=NOW)),
+        [
+            _proposal(
+                {
+                    "op": "update",
+                    "target": target,
+                    "text": "Use SQLite.",
+                    "sources": [{"seq_start": 2, "seq_end": 2}],
+                    "reason": "ordinary statement",
+                }
+            )
+        ],
+        key="weaker-ordinary-statement",
+    )
+    assert not result.changed_entry_ids
+    assert result.rejected_groups
+    stored = next(
+        entry for entry in _entries(registry, project_id) if entry.id == target
+    )
+    assert stored.text == "Use Postgres."
+
+
+@pytest.mark.asyncio
+async def test_newer_correction_can_replace_older_correction(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    added, _ = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(
+                1,
+                "Actually, use Postgres.",
+                created_at="2026-10-08T11:00:00.000000Z",
+            )
+        ),
+        [_proposal(_add("decisions", "Use Postgres."))],
+        key="older-correction",
+        now="2026-10-08T11:00:00.000000Z",
+    )
+    target = added.changed_entry_ids[0]
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(_row(2, "Actually, use SQLite instead.", created_at=NOW)),
+        [
+            _proposal(
+                {
+                    "op": "update",
+                    "target": target,
+                    "text": "Use SQLite.",
+                    "sources": [{"seq_start": 2, "seq_end": 2}],
+                    "reason": "newer correction",
+                }
+            )
+        ],
+        key="newer-correction",
+    )
+    assert result.changed_entry_ids == (target,)
+    stored = next(
+        entry for entry in _entries(registry, project_id) if entry.id == target
+    )
+    assert stored.text == "Use SQLite."
+
+
+@pytest.mark.asyncio
+async def test_entry_state_round_trip_preserves_computed_evidence_rank(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    await _run(
+        registry,
+        project_id,
+        _transcript(_row(1, "Actually, use Postgres.", created_at=NOW)),
+        [_proposal(_add("decisions", "Use Postgres."))],
+        key="round-trip-rank",
+    )
+    state = registry._entry_memory_state(project_id).state
+    restored = state_from_bytes(canonical_state_bytes(state))
+    entry = next(
+        value for value in restored.entries.values() if isinstance(value, MemoryEntry)
+    )
+    assert entry.sources[0].evidence_rank == 1
+
+
+@pytest.mark.asyncio
+async def test_continuous_turns_fire_by_default_max_wait_and_repeat(
+    tmp_path: Path,
+) -> None:
+    fired_at: list[float] = []
+    clock = _MutableClock()
+
+    async def invoke(_prompt: str) -> str:
+        fired_at.append(clock.now)
+        return _proposal()
+
+    runner, _, _ = _auto_runner(
+        tmp_path, invoke, clock=clock, debounce_seconds=60
+    )
+    rows: list[dict[str, object]] = []
+    for turn in range(21):
+        seq = turn * 2 + 1
+        rows.extend((_row(seq, f"Fact {turn}."), _completed_assistant(seq + 1)))
+        _write_session(runner.session_dir, *rows)
+        runner.activity(seq + 1)
+        while runner.state.early_trigger_seq < seq + 1:
+            await asyncio.sleep(0)
+        while runner._seen_activity_generation < runner._activity_generation:
+            await asyncio.sleep(0)
+        await runner._drained.wait()
+        clock.now += 30
+    for _ in range(10):
+        await asyncio.sleep(0)
+    try:
+        assert fired_at == [300, 600]
+    finally:
+        await runner.close()

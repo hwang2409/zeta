@@ -65,12 +65,23 @@ BUILTIN_PROFILES: MappingProxyType[str, MemorySchema] = MappingProxyType(
 _EARLY_UPDATE_DEBOUNCE_SECONDS: MappingProxyType[str, float] = MappingProxyType(
     {"zeta": 60.0, "messaging": 15.0}
 )
+_EARLY_UPDATE_MAX_WAIT_SECONDS: MappingProxyType[str, float] = MappingProxyType(
+    {"zeta": 300.0, "messaging": 120.0}
+)
 
 
 def early_update_debounce_seconds(profile: str) -> float:
     """Return the completed-turn debounce selected by a memory profile."""
     try:
         return _EARLY_UPDATE_DEBOUNCE_SECONDS[profile]
+    except KeyError as exc:
+        raise ValueError(f"unknown memory profile: {profile}") from exc
+
+
+def early_update_max_wait_seconds(profile: str) -> float:
+    """Return the maximum completed-turn coalescing delay for a profile."""
+    try:
+        return _EARLY_UPDATE_MAX_WAIT_SECONDS[profile]
     except KeyError as exc:
         raise ValueError(f"unknown memory profile: {profile}") from exc
 
