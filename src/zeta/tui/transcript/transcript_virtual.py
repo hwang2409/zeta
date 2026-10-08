@@ -247,10 +247,16 @@ class TranscriptVirtualMixin:
                     self._virtual_search_by_unit.setdefault(unit, []).append(
                         (index, occurrence)
                     )
+                    if unit.key == self._search_anchor_key:
+                        self._search_index = index
             if bounded and time.perf_counter() - started >= 0.02:
                 break
         self._virtual_search_complete = self._virtual_search_cursor >= len(self._units)
-        if before == 0 and self._virtual_search_occurrences:
+        if (
+            before == 0
+            and self._virtual_search_occurrences
+            and self._search_anchor_key is None
+        ):
             self._focus_virtual_search_match()
         if self._virtual_search_complete:
             self._virtual_search_scheduled = False
@@ -267,6 +273,90 @@ class TranscriptVirtualMixin:
     def _scheduled_virtual_search_batch(self, key: tuple[int, int, str]) -> None:
         self._virtual_search_scheduled = False
         self._continue_virtual_search_index(key)
+
+    def _resolve_unit_key(self, key: int) -> int | None:
+        """Resolve a stable key to its nearest logical surviving unit."""
+
+        previous: int | None = None
+        for index, unit in enumerate(self._units):
+            if unit is None or unit.value is None:
+                continue
+            if unit.key == key:
+                return index
+            if unit.key > key:
+                return index
+            previous = index
+        return previous
+
+    def _viewport_unit_index(self) -> int | None:
+        if self._uses_virtual_history():
+            if self._virtual_start is not None:
+                return min(self._virtual_start[0], len(self._units) - 1)
+            return len(self._units) - 1 if self._units else None
+        locations = self._locations(self._content_width)
+        if not locations:
+            return None
+        unit = locations[min(self._scroll_offset, len(locations) - 1)][0]
+        return self._units.index(unit) if unit in self._units else None
+
+    def _search_match_unit_index(self, match_index: int) -> int | None:
+        if self._uses_virtual_history():
+            if match_index >= len(self._virtual_search_occurrences):
+                return None
+            unit = self._virtual_search_occurrences[match_index].unit
+        else:
+            matches = self._search_matches()
+            locations = self._locations(self._content_width)
+            line = matches[match_index].first_line
+            if line >= len(locations):
+                return None
+            unit = locations[line][0]
+        return self._units.index(unit) if unit in self._units else None
+
+    def _search_navigation_index(
+        self, matches: list[SearchMatch], *, forward: bool
+    ) -> int:
+        anchor_key = self._search_anchor_key
+        if anchor_key is None:
+            step = 1 if forward else -1
+            return (self._search_index + step) % len(matches)
+
+        self._search_anchor_key = None
+        anchor_index = self._resolve_unit_key(anchor_key)
+        exact = (
+            anchor_index is not None
+            and self._units[anchor_index] is not None
+            and self._units[anchor_index].key == anchor_key
+        )
+        if exact and self._search_match_unit_index(self._search_index) == anchor_index:
+            step = 1 if forward else -1
+            return (self._search_index + step) % len(matches)
+        if anchor_index is None:
+            anchor_index = self._viewport_unit_index()
+        if anchor_index is None:
+            return 0 if forward else len(matches) - 1
+
+        indexed = [
+            (index, self._search_match_unit_index(index))
+            for index in range(len(matches))
+        ]
+        if forward:
+            return next(
+                (
+                    index
+                    for index, unit_index in indexed
+                    if unit_index is not None and unit_index > anchor_index
+                ),
+                0,
+            )
+        return next(
+            (
+                index
+                for index, unit_index in reversed(indexed)
+                if unit_index is not None and unit_index < anchor_index
+            ),
+            len(matches) - 1,
+        )
 
     def _indexed_search_matches(self) -> list[SearchMatch]:
         if not self._search_query:
