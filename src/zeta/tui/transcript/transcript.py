@@ -136,12 +136,6 @@ class _ToolUnit:
             self.renderable = rendered
             self.revision += 1
 
-    async def refresh_tail(self) -> bool:
-        if not await self.card.refresh_tail():
-            return False
-        self.refresh()
-        return True
-
     def finish(
         self,
         rendered: RenderableType,
@@ -161,7 +155,6 @@ class _ToolUnit:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 return
-
             async def publish_final_tail() -> None:
                 terminal = await self.card.finish_tail()
                 if terminal is None:
@@ -171,7 +164,6 @@ class _ToolUnit:
                 self.revision += 1
                 if on_final_tail is not None:
                     on_final_tail()
-
             loop.create_task(publish_final_tail())
 
     def toggle(self) -> bool:
@@ -257,9 +249,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._virtual_start_needs_clamp = False
         self._unit_heights: dict[tuple[int, int, int], int] = {}
         self._height_indexes: dict[int, object] = {}
-        self._virtual_stream_lines: dict[
-            int, tuple[int, int, int, list[list[tuple[str, str]]], int]
-        ] = {}
+        self._virtual_stream_lines = {}
         self._pending_virtual_scroll = 0
         self._virtual_search_key: tuple[int, int, str] | None = None
         self._virtual_search_occurrences = []
@@ -458,7 +448,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
 
     async def refresh_agent_transcripts(self) -> None:
         """Read active expanded child tails off-loop, then invalidate once."""
-
         units = list(self._tools.values())
         refreshed = await refresh_agent_cards(unit.card for unit in units)
         for unit, changed in zip(units, refreshed):
