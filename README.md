@@ -95,6 +95,4 @@ uv run --frozen pytest -q
 uv run --frozen ruff check .
 ```
 
-The package is under `src/zeta/`; tests are under `tests/`. Optional browser
-dependencies use the `browser` extra. See the relevant document above before
-running browser or computer-use workflows.
+The package is under `src/zeta/`; tests are under `tests/`.

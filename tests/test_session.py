@@ -680,6 +680,50 @@ def test_resume_reopens_an_explicit_session(
     assert resumed.loop.store.session_id == session_id
 
 
+@pytest.mark.asyncio
+async def test_removed_browser_tool_session_loads_renders_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setenv("ZETA_BROWSER", "1")
+    monkeypatch.setenv("ZETA_STALL_TRACE", "1")
+    monkeypatch.setenv("ZETA_CACHE_TRACE", "1")
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    transcript_path = first.loop.store.path
+    first.loop.store.close()
+    fixture = Path(__file__).parent / "fixtures" / "legacy_browser_transcript.jsonl"
+    with transcript_path.open("ab") as transcript:
+        transcript.write(fixture.read_bytes())
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    try:
+        assert "browser" not in {
+            schema["name"] for schema in resumed.loop.tool_registry.schemas
+        }
+        messages = resumed.loop.store.messages()
+        browser_call = next(
+            block.tool_call
+            for message in messages
+            for block in message.content
+            if isinstance(block, ToolUseContent)
+        )
+        assert browser_call.name == "browser"
+
+        assert await resumed._rebuild_transcript_async()
+        rendered = capsys.readouterr().out
+        assert "browser" in rendered
+        assert "Example Domain" in rendered
+        assert "The page loaded." in rendered
+    finally:
+        await resumed.close()
+
+
 def test_model_swap_persists_and_restores_on_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

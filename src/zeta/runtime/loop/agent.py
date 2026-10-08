@@ -108,7 +108,6 @@ from ._completion import (
     wait_for_provider_retry,
 )
 from ._store_writes import StoreWriteMixin
-from .cache_trace import CacheTrace
 from .empty_turn import (
     annotate_turn_metadata,
     build_nudge_message,
@@ -129,6 +128,7 @@ class AgentLoop(
     MCPSession,
 ):
     post_stream_provider_retry = True
+
     def notify_background_persisted(self) -> None:
         """Wake the root loop after a durable background notification."""
         # Child-owned notifications stay in the child store and must not wake
@@ -205,9 +205,6 @@ class AgentLoop(
         self._turn_output_tokens: int | None = None
         self.memory_reconciler: AutoMemoryReconciler | None = None
         self._turn_provider_retry_records: list[dict[str, object]] = []
-        self._cache_trace = CacheTrace.from_environment(
-            agent_instance_id or store.session_id, agent_depth
-        )
         recover_agent_children(self)
         self.tool_registry = select_tool_registry(
             store,
@@ -903,18 +900,6 @@ class AgentLoop(
                         },
                     )
                 active_tools = self._active_tool_schemas()
-                cache_trace = (
-                    self._cache_trace.start(
-                        context_messages,
-                        active_tools,
-                        self.backend,
-                        turn_number,
-                        self.plan_mode,
-                        bool(context and context.compacted),
-                    )
-                    if self._cache_trace is not None
-                    else None
-                )
                 steering = self.store.pending_client_steering()
                 if steering is not None:
                     context_messages.extend(steering.messages)
@@ -930,9 +915,6 @@ class AgentLoop(
                 async for event in provider_stream:
                     attempt_state.observe(event)
                     self.context_assembler.observe_event(event)
-                    if cache_trace is not None:
-                        assert self._cache_trace is not None
-                        self._cache_trace.observe(cache_trace, event)
                     if event.type is StreamEventType.ERROR:
                         provider_error = (
                             replace(event.error, provider_error=True)

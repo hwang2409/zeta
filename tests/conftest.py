@@ -329,7 +329,7 @@ class LiveHomeWriteGuard:
 # These variables control the test harness itself and must survive environment
 # isolation.  Keep this list explicit so adding a ZETA_* setting cannot silently
 # change CI behavior.
-_TEST_HARNESS_ENV_ALLOWLIST = frozenset({"ZETA_REQUIRE_BROWSER"})
+_TEST_HARNESS_ENV_ALLOWLIST = frozenset()
 
 
 _HOME_GUARD = pytest.StashKey[LiveHomeWriteGuard]()
