@@ -865,16 +865,16 @@ class ToolRegistry:
         if self.approval_policy is None:
             return None
         if not self.tool_is_allowed(tool_call.name):
-            self._abort_approval(tool_call)
+            self.abort_approval(tool_call)
             return None
         definition = self._tools.get(tool_call.name)
         if definition is None:
-            self._abort_approval(tool_call)
+            self.abort_approval(tool_call)
             return None
         try:
             capability = self.resolve_call(tool_call.name, tool_call.arguments)
         except (KeyError, UnknownToolAction, InvalidActionArguments):
-            self._abort_approval(tool_call)
+            self.abort_approval(tool_call)
             return None
         if not capability.requires_approval and not self.enforce_approvals:
             return None
@@ -882,7 +882,7 @@ class ToolRegistry:
             try:
                 _validate_arguments(tool_call.arguments, definition.parameters)
             except (AttributeError, KeyError, TypeError, ValueError):
-                self._abort_approval(tool_call)
+                self.abort_approval(tool_call)
                 return None
         request = self.approval_policy.prepare(
             tool_call,
@@ -947,7 +947,7 @@ class ToolRegistry:
             if abort_result is not None:
                 return await finalize(abort_result)
         if not self.tool_is_allowed(tool_call.name):
-            self._abort_approval(tool_call)
+            self.abort_approval(tool_call)
             return await finalize(
                 _error_result(
                     f"tool not allowed by session tool policy: {tool_call.name}",
@@ -956,7 +956,7 @@ class ToolRegistry:
             )
         definition = self._tools.get(tool_call.name)
         if definition is None:
-            self._abort_approval(tool_call)
+            self.abort_approval(tool_call)
             return await finalize(
                 _error_result(
                     f"unknown tool: {tool_call.name}",
@@ -966,17 +966,17 @@ class ToolRegistry:
         try:
             capability = self.resolve_call(tool_call.name, tool_call.arguments)
         except UnknownToolAction as exc:
-            self._abort_approval(tool_call)
+            self.abort_approval(tool_call)
             return await finalize(
                 _error_result(str(exc), kind="invalid_tool_action")
             )
         except InvalidActionArguments as exc:
-            self._abort_approval(tool_call)
+            self.abort_approval(tool_call)
             return await finalize(
                 _error_result(str(exc), kind="invalid_arguments")
             )
         if not self.tool_policy.allows_call(capability):
-            self._abort_approval(tool_call)
+            self.abort_approval(tool_call)
             capability_name = (
                 tool_call.name
                 if capability.action is None
@@ -995,7 +995,7 @@ class ToolRegistry:
                 else _coerce_arguments(tool_call.arguments)
             )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            self._abort_approval(tool_call)
+            self.abort_approval(tool_call)
             return await finalize(
                 _error_result(
                     f"invalid arguments: {exc}",
@@ -1115,16 +1115,22 @@ class ToolRegistry:
 
     def abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
         """Abort an unresolved approval without replacing a concurrent decision."""
-
         if self.approval_policy is None:
             return None
         try:
-            return self.approval_policy.abort_or_winner(tool_call.id)
+            capability = self.resolve_call(tool_call.name, tool_call.arguments)
+        except (KeyError, UnknownToolAction, InvalidActionArguments, TypeError, ValueError):
+            try:
+                self.approval_policy.abort(tool_call.id)
+            except RuntimeError:
+                pass
+            return None
+        try:
+            return self.approval_policy.abort_or_winner(
+                tool_call.id, capability=capability
+            )
         except RuntimeError:
             return None
-
-    def _abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
-        return self.abort_approval(tool_call)
 
     def _arbitrate_abort(
         self,
@@ -1132,7 +1138,7 @@ class ToolRegistry:
         signal_state: ToolAbortSignal,
         scope_signal: ToolAbortSignal | None = None,
     ) -> tuple[ToolAbortSignal, StructuredToolResult | None]:
-        winner = self._abort_approval(tool_call)
+        winner = self.abort_approval(tool_call)
         if winner is ApprovalDecision.ALLOW:
             signal_state = self._next_abort_generation(signal_state, scope_signal)
             if _signal_is_set(signal_state):
