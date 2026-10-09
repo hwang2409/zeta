@@ -284,6 +284,31 @@ def test_resume_closes_question_for_child_that_no_longer_runs_once(
     assert loop is not second
 
 
+def test_resume_with_no_child_marker_withdraws_orphaned_question(
+    tmp_path: Path,
+) -> None:
+    parent, child, _registry, handle, owner = _setup_without_loop(tmp_path)
+    owner.conversation_channel.publish_question(
+        child_instance_id=handle,
+        question_id="orphan",
+        question="Anyone there?",
+        options=None,
+    )
+    parent.finish_agent_child(handle)
+    parent_path = parent.session_dir
+    parent.close()
+    child.close()
+
+    resumed = ConversationStore(
+        parent_path.parent, session_id=parent_path.name, cwd=tmp_path
+    )
+    AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    pending = resumed.agent_notifications()
+    assert len(pending) == 1
+    assert pending[0].data["kind"] == "child_question_withdrawn"
+    assert pending[0].data["text"] == "question withdrawn: child canceled"
+
+
 @pytest.mark.asyncio
 async def test_grandchild_question_wakes_direct_parent_then_routes_to_live_ancestor(
     tmp_path: Path,

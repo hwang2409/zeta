@@ -122,6 +122,20 @@ class ConversationChannel:
             closed += store.close_child_questions(child_instance_id, reason=reason)
         return closed
 
+    def recover_orphaned_questions(self, store: ConversationStore) -> int:
+        """Withdraw persisted questions whose child did not survive restart."""
+
+        child_ids = {
+            entry.data.get("child_instance_id")
+            for entry in store.agent_notifications()
+            if entry.data.get("kind") == "child_question"
+        }
+        return sum(
+            store.close_child_questions(child_id, reason="canceled")
+            for child_id in child_ids
+            if type(child_id) is str and not self._owner.owns_running(child_id)
+        )
+
     def _live_parent(
         self, child_instance_id: str
     ) -> tuple[ConversationStore, str | None]:
