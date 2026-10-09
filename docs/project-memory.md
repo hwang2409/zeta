@@ -60,10 +60,13 @@ operations:
 - after a coalesced completed user turn.
 
 Requests use the configured memory model. Zeta removes secrets and
-agent-directed instructions before provider assembly. Each automatic operation
-records its transcript evidence and origin. Contradictions supersede older
-entries; completed work resolves open entries; elapsed validity expires
-temporary entries. There is no model-facing forget operation.
+agent-directed instructions before provider assembly. If active memory exceeds
+the request budget, the request includes full text for the highest-priority,
+most recently updated entries and an ID, kind, date, and short-text index for
+every other active entry. Each automatic operation records its transcript
+evidence and origin. Contradictions supersede older entries; completed work
+resolves open entries; elapsed validity expires temporary entries. There is no
+model-facing forget operation.
 
 Configure `~/.zeta/settings.toml`:
 
@@ -93,10 +96,14 @@ confirmation interface.
 
 ## Migrate, roll back, and finalize
 
-Migration uses the deterministic migration engine. It does not call a model and
-preserves each complete format-1 document as one accepted legacy-document
-entry. Activation first checks that updater, prompt projection, commands/API,
-and synchronization all report format-2 support.
+Migration uses the deterministic migration engine. It does not call a model.
+Each top-level list item and non-list paragraph becomes one typed entry; `##`
+headings become stable section metadata. Oversized blocks split without
+truncation. Entries keep their source order and the migration source digest and
+version. A file's entries remain automatic only when that format-1 file was
+automatic; other migrated entries are accepted. The exact five source files
+remain protected for rollback. Activation first checks that updater, prompt
+projection, commands/API, and synchronization all report format-2 support.
 
 ```sh
 # Migrate one existing project. Its format-1 target remains protected.
