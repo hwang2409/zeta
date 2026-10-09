@@ -2,19 +2,37 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import uuid
 from pathlib import Path
 
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
+MAX_MEMORY_FILE_SIZE = 128 * 1024
+MAX_RECORD_SIZE = 10_000_000
+MAX_NAME_LENGTH = 128
+MAX_SCOPE_LENGTH = 4096
+SCHEMA_VERSION = 1
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
 _MAX_HISTORY = 128
+_MAX_FORMAT_TWO_STATE_SIZE = 8 * 1024 * 1024
+_PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
+_PROJECT_FIELDS = {
+    "schema_version",
+    "project_id",
+    "name",
+    "scope",
+    "created_at",
+    "updated_at",
+    "canonical_integration_root",
+}
 
 
 class ProjectPublicationError(Exception):
@@ -26,9 +44,7 @@ def publish_local_project(
 ) -> None:
     """Validate and CAS-publish a staged project without replacing an existing one."""
 
-    _validate_snapshot(
-        snapshot, project_id, require_version=expected_digest != _MISSING
-    )
+    _validate_snapshot(snapshot, project_id)
     projects = home / "projects"
     projects.mkdir(parents=True, exist_ok=True, mode=0o700)
     project = projects / project_id
@@ -158,38 +174,174 @@ def project_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_snapshot(
-    snapshot: Path, project_id: str, *, require_version: bool
-) -> None:
+def validate_project_record(
+    value: dict[str, object], expected_id: str | None = None
+) -> tuple[str, str, str, str, str, str | None]:
+    """Validate one complete registry record using only the standard library."""
+
+    if (
+        not _PROJECT_FIELDS.issubset(value)
+        or not set(value).issubset(_PROJECT_FIELDS | {"lanes"})
+        or value.get("schema_version") != SCHEMA_VERSION
+    ):
+        raise ValueError("unknown or invalid project schema")
+    project_id = _validated_id(value["project_id"])
+    if expected_id is not None and project_id != expected_id:
+        raise ValueError("project ID does not match its path")
+    name = _validated_text(value["name"], "name", MAX_NAME_LENGTH)
+    scope = _validated_text(value["scope"], "scope", MAX_SCOPE_LENGTH)
+    created = _validated_timestamp(value["created_at"], "created_at")
+    updated = _validated_timestamp(value["updated_at"], "updated_at")
+    root = _validated_root(value["canonical_integration_root"])
+    return project_id, name, scope, created, updated, root
+
+
+def decode_legacy_memory(payload: bytes, name: str) -> str:
+    """Apply the registry's size and UTF-8 rules to one legacy memory file."""
+
+    if len(payload) > MAX_MEMORY_FILE_SIZE:
+        raise ValueError(f"project memory file {name} is too large")
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"project memory file {name} is unreadable") from exc
+
+
+def _validate_snapshot(snapshot: Path, project_id: str) -> None:
     if snapshot.name != project_id or not snapshot.is_dir() or snapshot.is_symlink():
         raise ProjectPublicationError(
             "project snapshot path does not match its project ID"
         )
-    record = _read_json(snapshot / "project.json")
-    if record.get("project_id") != project_id:
-        raise ProjectPublicationError(
-            "project snapshot record does not match its project ID"
-        )
-    if require_version:
+    try:
+        validate_project_record(_read_record(snapshot / "project.json"), project_id)
+    except ValueError as exc:
+        raise ProjectPublicationError(str(exc)) from exc
+    pointer_path = snapshot / "memory-current.json"
+    if pointer_path.exists():
         pointer = _read_pointer(snapshot)
-        manifest = _read_manifest(snapshot, pointer["current"])
-        _manifest_payloads(snapshot, manifest, "snapshot")
-        _manifest_payloads(snapshot, manifest, "before_snapshot")
+        for version in pointer["history"]:
+            manifest = _read_manifest(snapshot, version)
+            _manifest_payloads(snapshot, manifest, "snapshot")
+            _manifest_payloads(snapshot, manifest, "before_snapshot")
+    else:
+        _validate_legacy_memory(snapshot)
     for path in snapshot.rglob("*"):
         if path.is_symlink():
             raise ProjectPublicationError("project snapshot contains a symlink")
 
 
+def _read_record(path: Path) -> dict[str, object]:
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) & 0o077
+            or info.st_size > MAX_RECORD_SIZE
+        ):
+            raise ProjectPublicationError("invalid project snapshot file: project.json")
+        payload = path.read_bytes()
+        if len(payload) > MAX_RECORD_SIZE:
+            raise ProjectPublicationError("invalid project snapshot file: project.json")
+        value = json.loads(payload, object_pairs_hook=_unique_object)
+    except ProjectPublicationError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ProjectPublicationError("invalid project snapshot file: project.json") from exc
+    if not isinstance(value, dict):
+        raise ProjectPublicationError("invalid project snapshot file: project.json")
+    return value
+
+
 def _read_json(path: Path) -> dict[str, object]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ProjectPublicationError(
             f"invalid project snapshot file: {path.name}"
         ) from exc
     if not isinstance(value, dict):
         raise ProjectPublicationError(f"invalid project snapshot file: {path.name}")
     return value
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ProjectPublicationError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _validated_id(value: object) -> str:
+    if not isinstance(value, str) or not _PROJECT_ID.fullmatch(value):
+        raise ValueError("invalid project_id")
+    return value
+
+
+def _validated_text(value: object, field: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise ValueError(
+            f"{field} must be a non-empty string of at most {maximum} characters"
+        )
+    if "\x00" in value or any(ord(character) < 32 for character in value):
+        raise ValueError(f"{field} contains a control character")
+    return value
+
+
+def _validated_timestamp(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError(f"invalid {field}")
+    try:
+        parsed = dt.datetime.strptime(
+            value, "%Y-%m-%dT%H:%M:%S.%fZ"
+        ).replace(tzinfo=dt.timezone.utc)  # noqa: UP017 - remote Python can be 3.9
+    except ValueError as exc:
+        raise ValueError(f"invalid {field}") from exc
+    if parsed.strftime("%Y-%m-%dT%H:%M:%S.%fZ") != value:
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _validated_root(value: object) -> str | None:
+    if value is None:
+        return None
+    root = _validated_text(value, "canonical_integration_root", 4096)
+    path = Path(root)
+    if not path.is_absolute() or ".." in path.parts or os.path.normpath(root) != root:
+        raise ValueError(
+            "canonical_integration_root must be an absolute normalized path"
+        )
+    return str(path.expanduser().resolve(strict=False))
+
+
+def _validate_legacy_memory(snapshot: Path) -> None:
+    memory = snapshot / "memory"
+    try:
+        info = memory.lstat()
+    except OSError as exc:
+        raise ProjectPublicationError("project memory directory is unavailable") from exc
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+        raise ProjectPublicationError("project memory directory is unsafe")
+    for name in MEMORY_FILES:
+        path = memory / name
+        try:
+            info = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) & 0o077
+            ):
+                raise ProjectPublicationError(
+                    f"project memory file {name} is unsafe"
+                )
+            payload = path.read_bytes()
+            decode_legacy_memory(payload, name)
+        except ProjectPublicationError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise ProjectPublicationError(str(exc)) from exc
 
 
 def _read_pointer(root: Path) -> dict[str, object]:
@@ -208,7 +360,11 @@ def _read_pointer(root: Path) -> dict[str, object]:
 
 
 def _read_manifest(root: Path, version: object) -> dict[str, object]:
-    if not isinstance(version, str) or len(version) != 32:
+    if (
+        not isinstance(version, str)
+        or len(version) != 32
+        or any(character not in "0123456789abcdef" for character in version)
+    ):
         raise ProjectPublicationError("invalid project memory version")
     manifest = _read_json(root / "memory-versions" / "versions" / f"{version}.json")
     if manifest.get("version") != version:
@@ -220,16 +376,19 @@ def _manifest_payloads(
     root: Path, manifest: dict[str, object], key: str
 ) -> tuple[dict[str, bytes], bool]:
     value = manifest.get(key)
-    if isinstance(value, str):
+    memory_format = manifest.get("format", 1)
+    if memory_format == 2 and isinstance(value, str):
         values = {"state": value}
         scalar = True
-    elif isinstance(value, dict) and all(
-        isinstance(name, str) and isinstance(digest, str)
-        for name, digest in value.items()
+    elif isinstance(value, dict) and (
+        (memory_format == 2 and set(value) == {"state"})
+        or (memory_format == 1 and set(value) == set(MEMORY_FILES))
     ):
         values = value
         scalar = False
     else:
+        raise ProjectPublicationError("invalid project memory manifest payload")
+    if not all(isinstance(digest, str) for digest in values.values()):
         raise ProjectPublicationError("invalid project memory manifest payload")
     payloads: dict[str, bytes] = {}
     for name, digest in values.items():
@@ -246,8 +405,38 @@ def _manifest_payloads(
             or hashlib.sha256(payload).hexdigest() != digest
         ):
             raise ProjectPublicationError("project memory blob is invalid")
+        if memory_format == 1:
+            try:
+                decode_legacy_memory(payload, name)
+            except ValueError as exc:
+                raise ProjectPublicationError(str(exc)) from exc
+        else:
+            _validate_format_two_payload(payload)
         payloads[name] = payload
     return payloads, scalar
+
+
+def _validate_format_two_payload(payload: bytes) -> None:
+    if len(payload) > _MAX_FORMAT_TWO_STATE_SIZE:
+        raise ProjectPublicationError("format-2 memory state is too large")
+    try:
+        value = json.loads(payload, object_pairs_hook=_unique_object)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ProjectPublicationError("format-2 memory state is malformed") from exc
+    fields = {
+        "format",
+        "project_id",
+        "generation",
+        "schema",
+        "entries",
+        "compacted_through_version",
+    }
+    if not isinstance(value, dict) or set(value) != fields or value.get("format") != 2:
+        raise ProjectPublicationError("invalid format-2 memory state")
+    if not isinstance(value.get("schema"), dict) or not isinstance(
+        value.get("entries"), dict
+    ):
+        raise ProjectPublicationError("invalid format-2 memory state")
 
 
 def _publish_payloads(blobs: Path, payloads: dict[str, bytes], scalar: bool) -> object:

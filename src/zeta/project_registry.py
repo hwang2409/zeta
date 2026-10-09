@@ -417,33 +417,14 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
 
     @staticmethod
     def _decode(value: dict[str, object], expected_id: str | None = None) -> Project:
-        required = {
-            "schema_version",
-            "project_id",
-            "name",
-            "scope",
-            "created_at",
-            "updated_at",
-            "canonical_integration_root",
-        }
-        # Earlier builds also persisted a ``lanes`` field.  Lanes moved to a
-        # separate change, so the field is tolerated (for legacy on-disk records)
-        # but otherwise ignored; no other unknown keys are accepted.
-        if (
-            not required.issubset(value)
-            or not set(value).issubset(required | {"lanes"})
-            or value.get("schema_version") != SCHEMA_VERSION
-        ):
-            raise ProjectRegistryError("unknown or invalid project schema")
-        project_id = _validate_id(value["project_id"], _PROJECT_ID, "project_id")
-        if expected_id is not None and project_id != expected_id:
-            raise ProjectRegistryError("project ID does not match its path")
-        name = _validate_text(value["name"], "name", MAX_NAME_LENGTH)
-        scope = _validate_text(value["scope"], "scope", MAX_SCOPE_LENGTH)
-        created = _validate_timestamp(value["created_at"], "created_at")
-        updated = _validate_timestamp(value["updated_at"], "updated_at")
-        root = _validate_root(value["canonical_integration_root"])
-        return Project(project_id, name, scope, created, updated, root)
+        # Imported lazily because remote_sync imports ProjectRegistry during startup.
+        from .remote_sync.project_publish import validate_project_record
+
+        try:
+            fields = validate_project_record(value, expected_id)
+        except ValueError as exc:
+            raise ProjectRegistryError(str(exc)) from exc
+        return Project(*fields)
 
     @staticmethod
     def _encode(project: Project) -> dict[str, object]:
@@ -690,10 +671,13 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                         f"project memory file {name} is too large"
                     )
                 chunks.append(chunk)
-            return b"".join(chunks).decode("utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            if isinstance(exc, ProjectRegistryError):
-                raise
+            from .remote_sync.project_publish import decode_legacy_memory
+
+            try:
+                return decode_legacy_memory(b"".join(chunks), name)
+            except ValueError as exc:
+                raise ProjectRegistryError(str(exc)) from exc
+        except OSError as exc:
             raise ProjectRegistryError(
                 f"project memory file {name} is unreadable"
             ) from exc

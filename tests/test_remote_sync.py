@@ -15,7 +15,7 @@ import pytest
 
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
-from zeta.project_registry import ProjectRegistry
+from zeta.project_registry import MAX_MEMORY_FILE_SIZE, ProjectRegistry
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -36,6 +36,10 @@ from zeta.remote_sync import (
 from zeta.remote_sync import memory as memory_module
 from zeta.remote_sync import ssh as ssh_module
 from zeta.remote_sync.memory import _machine_id
+from zeta.remote_sync.project_publish import ProjectPublicationError
+from zeta.remote_sync.project_publish import (
+    publish_local_project as publish_destination_project,
+)
 from zeta.remote_sync.ssh import SshTransport
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -804,6 +808,92 @@ def test_ssh_memory_sync_keeps_project_directory_and_side_files(
 
     assert destination.stat().st_ino == inode
     assert unrelated.read_text(encoding="utf-8") == '{"kept": true}\n'
+
+
+def _pointerless_project_snapshot(tmp_path: Path) -> tuple[Path, str]:
+    source = tmp_path / "source"
+    workspace = tmp_path / "pointerless-workspace"
+    workspace.mkdir()
+    project = ProjectRegistry(source / "projects").create_project(
+        "pointerless", "test", workspace
+    )
+    return source / "projects" / project.project_id, project.project_id
+
+
+def _publish_initial_project(
+    kind: str,
+    remote: Path,
+    snapshot: Path,
+    project_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if kind == "local":
+        publish_destination_project(
+            remote, project_id, snapshot, expected_digest="missing"
+        )
+        return
+    _install_ssh_shim(tmp_path, monkeypatch)
+    SshTransport("fake", str(remote), name="cloud").publish_project(
+        project_id, snapshot, expected_digest="missing"
+    )
+
+
+@pytest.mark.parametrize("kind", ("local", "ssh"))
+def test_initial_pointerless_project_snapshot_is_validated_and_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    snapshot, project_id = _pointerless_project_snapshot(tmp_path)
+    remote = tmp_path / "remote"
+    _publish_initial_project(
+        kind, remote, snapshot, project_id, tmp_path, monkeypatch
+    )
+
+    registry = ProjectRegistry(remote / "projects")
+    assert registry.show_project(project_id).project_id == project_id
+    assert set(dict(registry.load_memory(project_id))) == {
+        "brief.md",
+        "state.md",
+        "backlog.md",
+        "changelog.md",
+        "decisions.md",
+    }
+
+
+@pytest.mark.parametrize("kind", ("local", "ssh"))
+@pytest.mark.parametrize(
+    "corruption", ("project-metadata", "malformed-memory", "oversized-memory")
+)
+def test_initial_pointerless_project_rejects_invalid_snapshot_without_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    corruption: str,
+) -> None:
+    snapshot, project_id = _pointerless_project_snapshot(tmp_path)
+    remote = tmp_path / "remote"
+    if corruption == "project-metadata":
+        (snapshot / "project.json").write_text(
+            json.dumps({"project_id": project_id}), encoding="utf-8"
+        )
+    else:
+        payload = (
+            b"not utf-8: \xff"
+            if corruption == "malformed-memory"
+            else b"x" * (MAX_MEMORY_FILE_SIZE + 1)
+        )
+        (snapshot / "memory" / "brief.md").write_bytes(payload)
+
+    with pytest.raises((ProjectPublicationError, RemoteSyncError)):
+        _publish_initial_project(
+            kind, remote, snapshot, project_id, tmp_path, monkeypatch
+        )
+
+    projects = remote / "projects"
+    assert not (projects / project_id).exists()
+    assert not list(projects.glob(f".{project_id}.incoming-*"))
 
 
 def test_interrupted_initial_creation_leaves_no_incoming_artifacts_local(
