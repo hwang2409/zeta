@@ -975,6 +975,8 @@ class FinishGateBackend(CompletionBackend):
                 blocks = [
                     ToolUseContent(ToolCall(call_id, "agent_handoff", arguments))
                 ]
+            elif self.gate_action == "text_handoff":
+                blocks = [TextContent("HAND OFF: use the parent receipt")]
             elif self.gate_action == "poll":
                 blocks = [
                     ToolUseContent(
@@ -1909,6 +1911,28 @@ async def test_child_finish_gate_handoff_requires_reason_and_outputs(
     assert store.agent_children()
     backend.release_grandchild.set()
     await _wait_for_notification(store, "completed")
+    child_store.close()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_finish_gate_text_handoff_is_not_control_signal(
+    tmp_path: Path,
+) -> None:
+    backend = FinishGateBackend("text_handoff")
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    backend.release_grandchild.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    lifecycle = child_store.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["final_result"].startswith("merged result: evidence ready")
+    assert not store.agent_children()
     child_store.close()
     await loop.close()
 
