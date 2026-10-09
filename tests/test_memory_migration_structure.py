@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
-from zeta.memory.entry_store import MAX_ENTRY_TEXT_BYTES, MemoryEntry
+from zeta.memory.entry_store import (
+    MAX_ENTRY_TEXT_BYTES,
+    MemoryEntry,
+    canonical_state_bytes,
+    state_from_bytes,
+)
+from zeta.memory.entry_views import active_entries
 from zeta.memory.migration import LEGACY_FILES, migrate_format_one
 
 PROJECT_ID = "p_" + "1" * 32
@@ -73,6 +80,7 @@ Closing paragraph.
         ("Active", "- Second item"),
         ("Active", "Closing paragraph."),
     ]
+    assert [entry.migration_order for entry in entries] == list(range(len(entries)))
     assert all(entry.representation == "entry" for entry in entries)
     assert _normalized(plan.rendered_mirrors["state.md"]) == _normalized(state)
 
@@ -93,14 +101,29 @@ def test_migration_splits_overlong_blocks_at_paragraph_boundaries() -> None:
     assert _normalized(plan.rendered_mirrors["state.md"]) == _normalized(state)
 
 
-@pytest.mark.parametrize("project", ("zeta", "phoebe", "research"))
-def test_real_memory_fixture_round_trips_as_typed_entries(project: str) -> None:
+@pytest.mark.parametrize(
+    ("project", "expected_counts"),
+    (
+        ("zeta", {"brief": 20, "state": 21, "backlog": 15, "changelog": 12, "decisions": 10}),
+        ("phoebe", {"brief": 27, "state": 14, "backlog": 19, "changelog": 15, "decisions": 13}),
+        ("research", {"brief": 3, "state": 11, "backlog": 29, "changelog": 14, "decisions": 48}),
+    ),
+)
+def test_real_memory_fixture_round_trips_as_typed_entries(
+    project: str, expected_counts: dict[str, int]
+) -> None:
     root = FIXTURES / project
     contents = {name: (root / name).read_text(encoding="utf-8") for name in LEGACY_FILES}
     metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
 
     plan = _plan(contents, automatic_files=frozenset(metadata["automatic_files"]))
 
+    assert Counter(entry.kind for entry in plan.state.entries.values()) == expected_counts
+    restored = state_from_bytes(canonical_state_bytes(plan.state))
+    for kind, count in expected_counts.items():
+        assert [
+            entry.migration_order for entry in active_entries(restored, kind=kind)
+        ] == list(range(count))
     assert {
         name: _normalized(content) for name, content in plan.rendered_mirrors.items()
     } == {name: _normalized(content) for name, content in contents.items()}

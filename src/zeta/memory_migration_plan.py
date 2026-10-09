@@ -179,6 +179,7 @@ def build_migration_entries(
                 "accepted_by": None if automatic else "user",
                 "last_operation_id": operation_id,
                 "section": section,
+                "migration_order": position,
                 "migration_source": {
                     "source_digest": source_digest,
                     "source_version": source_version,

@@ -118,6 +118,7 @@ class MemoryEntry:
     accepted_by: str | None
     last_operation_id: str
     section: str | None = None
+    migration_order: int | None = None
     migration_source: MigrationSource | None = None
 
 
@@ -334,6 +335,14 @@ def _validate_entry(entry: MemoryEntry, state: MemoryState, kinds: set[str]) -> 
         _safe_text(entry.section, maximum=256, label="entry section")
         if "\n" in entry.section or entry.section.startswith("#"):
             _fail("invalid memory entry section")
+    if (entry.migration_order is None) != (entry.migration_source is None) or (
+        entry.migration_order is not None
+        and (
+            type(entry.migration_order) is not int
+            or not 0 <= entry.migration_order < MAX_ENTRIES
+        )
+    ):
+        _fail("invalid memory entry migration order")
     if entry.migration_source is not None and (
         not _matches(_DIGEST, entry.migration_source.source_digest)
         or (
@@ -464,6 +473,7 @@ def _entry_dict(entry: MemoryEntry | MissingEntry) -> dict[str, object]:
         "accepted_by": entry.accepted_by,
         "last_operation_id": entry.last_operation_id,
         "section": entry.section,
+        "migration_order": entry.migration_order,
         "migration_source": (
             None if entry.migration_source is None else dataclasses.asdict(entry.migration_source)
         ),
@@ -536,7 +546,7 @@ def state_from_bytes(payload: bytes) -> MemoryState:
         "created_at", "updated_at", "seen_at", "expires_at", "valid_from",
         "valid_until", "supersedes", "superseded_by", "sources", "automatic",
         "accepted_at", "accepted_by", "last_operation_id", "section",
-        "migration_source",
+        "migration_order", "migration_source",
     }
     source_fields = {
         "session_id", "seq_start", "seq_end", "origins", "observed_at",
