@@ -307,7 +307,8 @@ class TUIApp(
         self._mcp_manager_open = False
         self._init_background_tasks_panel()
         self._init_decisions_panel()
-        self._resume_target: str | None = None
+        self._suspended = False
+        self._startup_presented = False
         self._mcp_wizard_active = False
         self._mcp_wizard_dialog_active = False
         self._mcp_wizard_task: asyncio.Task[None] | None = None
@@ -357,24 +358,6 @@ class TUIApp(
     def request_new_session(self) -> None:
         self._new_session_requested = True
         self.request_exit()
-
-    @property
-    def resume_target(self) -> str | None:
-        return self._resume_target
-
-    def request_resume(self, session_id: str) -> None:
-        """Exit this TUI and resume ``session_id`` in its place.
-
-        Reuses the outer run loop's resume path (the same one ``/new`` uses) so
-        the terminal is restored cleanly instead of re-executing the process.
-        """
-
-        self._resume_target = session_id
-        self._exit_requested = True
-        session = self._active_session
-        if isinstance(session, FullScreenPromptSession) and session.app.is_running:
-            session.app.exit()
-        self.abort_active()
 
     @property
     def _transcript_lines(self) -> list[str]:
@@ -577,7 +560,10 @@ class TUIApp(
             )[-1],
             on_agent_list_open=lambda: app._agent_navigation.open_selected(),
             on_agent_list_back=lambda: app._agent_navigation.list_back(),
-            on_agent_navigation_exit=lambda: app._agent_navigation.exit_navigation(),
+            on_agent_navigation_exit=lambda: (
+                app.clear_fork_return_arm(),
+                app._agent_navigation.exit_navigation(),
+            )[-1],
             child_view_focused=lambda: app._agent_navigation.child_view_focused(),
             on_child_view_back=lambda: app._agent_navigation.back_to_parent(),
             on_child_view_down=lambda: app._agent_navigation.focus_child_list(),
@@ -892,8 +878,11 @@ class TUIApp(
         if isinstance(usage, dict):
             self._usage.update(usage)
 
-    @staticmethod
-    def _invalidate_prompt() -> None:
+    def _invalidate_prompt(self) -> None:
+        # Suspended behind a discussion fork: keep working but do not paint over
+        # the fork that owns the terminal (output rebuilds from the store later).
+        if self._suspended:
+            return
         get_app().invalidate()
 
     def _flush_stream_kind(self, *, preserve_inline: bool = False) -> None:
@@ -1109,7 +1098,14 @@ class TUIApp(
         self._bind_fork_navigation()
 
     async def run(self, session: PromptSession[str] | None = None) -> None:
-        """Run the alternate-screen app until Ctrl-D or an exit request."""
+        """Run the alternate-screen app until Ctrl-D or an exit request.
+
+        Re-entrant: the fork controller re-shows a suspended main runtime by
+        calling this again, presenting one-time startup output only once.
+        """
+        self._exit_requested = False
+        self._suspended = False
+        self._decisions_switching = False
         try:
             self._begin_startup_replay()
             await self.loop.activate()
@@ -1130,28 +1126,10 @@ class TUIApp(
                 if replay_completed is False or self._exit_requested:
                     return
                 await self.loop.ensure_mcp_servers()
-                for warning in self._startup_warnings:
-                    self._print_unit(Text(warning, style=theme.WARNING))
-                # After the MCP mount so argument-scoped rules dropped for a
-                # just-mounted subject-less tool are reported too (ZETA-86).
-                if self._approval_policy is not None:
-                    for notice in self._approval_policy.notices:
-                        self._print_unit(Text(notice, style=theme.WARNING))
-                for alert in self._startup_alerts:
-                    self._print_unit(Text(alert, style=theme.COMMAND))
-                for notice in self._startup_notices:
-                    self._print_unit(Text(notice, style=theme.DIM))
-                for notice in self._slash_commands.notices:
-                    style = (
-                        theme.COMMAND
-                        if notice in self._slash_commands.warning_notices
-                        else theme.DIM
-                    )
-                    self._print_unit(Text(f"command · {notice}", style=style))
+                if not self._startup_presented:
+                    self._present_startup_output()
+                    self._startup_presented = True
                 self._present_pending_approvals()
-                header = self.fork_header_notice
-                if header is not None:
-                    self._print_unit(Text(header, style=theme.DIM))
                 self.start_decisions_poll()
                 if isinstance(session, FullScreenPromptSession):
                     await self._run_full_screen(session, prompt_task)
@@ -1171,15 +1149,47 @@ class TUIApp(
                 if prompt_task is not None and not prompt_task.done():
                     prompt_task.cancel()
                     await asyncio.gather(prompt_task, return_exceptions=True)
-                if self._active_task is not None and not self._active_task.done():
-                    self._active_task.cancel()
-                    await asyncio.gather(self._active_task, return_exceptions=True)
-                if isinstance(session, FullScreenPromptSession):
-                    session.restore_terminal()
-                    self._active_session = None
-                    self._terminal_restored = True
+                # Suspending for a discussion fork keeps the runtime's work
+                # alive: do not cancel the turn or drop the session reference.
+                if self._suspending_for_fork:
+                    self._suspended = True
+                    self._session = None
+                    if isinstance(session, FullScreenPromptSession):
+                        session.restore_terminal()
+                        self._terminal_restored = True
+                else:
+                    if self._active_task is not None and not self._active_task.done():
+                        self._active_task.cancel()
+                        await asyncio.gather(self._active_task, return_exceptions=True)
+                    if isinstance(session, FullScreenPromptSession):
+                        session.restore_terminal()
+                        self._active_session = None
+                        self._terminal_restored = True
         finally:
-            await self.close()
+            if not self._suspending_for_fork:
+                await self.close()
+
+    def _present_startup_output(self) -> None:
+        for warning in self._startup_warnings:
+            self._print_unit(Text(warning, style=theme.WARNING))
+        # After the MCP mount so dropped argument-scoped rules report too (ZETA-86).
+        if self._approval_policy is not None:
+            for notice in self._approval_policy.notices:
+                self._print_unit(Text(notice, style=theme.WARNING))
+        for alert in self._startup_alerts:
+            self._print_unit(Text(alert, style=theme.COMMAND))
+        for notice in self._startup_notices:
+            self._print_unit(Text(notice, style=theme.DIM))
+        for notice in self._slash_commands.notices:
+            style = (
+                theme.COMMAND
+                if notice in self._slash_commands.warning_notices
+                else theme.DIM
+            )
+            self._print_unit(Text(f"command · {notice}", style=style))
+        header = self.fork_header_notice
+        if header is not None:
+            self._print_unit(Text(header, style=theme.DIM))
 
     async def close(self) -> None:
         self._closed = True

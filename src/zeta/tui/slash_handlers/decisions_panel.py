@@ -244,6 +244,9 @@ class DecisionsMixin:
             return
         self._decisions_switching = True
         source_id, attention_id = item.session_id, item.record.id
+        # Close the popup now so the main runtime re-shows a clean composer
+        # when the discussion returns.
+        self.close_decisions_panel()
 
         async def run() -> None:
             from ...attention_forks import create_discussion_fork
@@ -257,7 +260,7 @@ class DecisionsMixin:
                 self._print_system(f"could not open discussion: {exc}")
                 self._refresh_decisions_panel()
                 return
-            self.request_resume(fork_id)
+            self.request_open_fork(fork_id)
 
         asyncio.create_task(run())
 

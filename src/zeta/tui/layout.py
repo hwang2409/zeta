@@ -423,6 +423,7 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
         plan_state="PLAN" if app.loop.plan_mode else None,
         background_count=app.loop.tool_registry.background_tasks.running_count,
         decisions_count=app.decisions_count,
+        main_active=app.main_activity_pending,
         undo_available=(
             app._undo_candidate is not None
             and app.active

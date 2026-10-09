@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -391,8 +392,30 @@ def _print_exit_hint(app: object) -> None:
     print(f"resume with: zeta --resume {app.loop.store.session_id}", file=sys.stderr)
 
 
-async def _run_tui(app: object) -> None:
-    await app.run()
+async def _run_tui(app: object, args: argparse.Namespace) -> None:
+    """Run the main TUI, keeping it live while discussion forks are shown.
+
+    Opening an attention discussion suspends the main UI and runs a fork app on
+    top in the same process and event loop, so the main runtime's turn,
+    background children, tasks, notifications, and inbox keep running. Returning
+    closes the fork and re-shows the main UI; only a real exit closes the main
+    runtime.
+    """
+    from ..tui.bootstrap import create_app
+    from ..tui.fork_session import run_fork_stack
+
+    def _build_fork(fork_id: str) -> object:
+        fork_args = copy.copy(args)
+        fork_args.resume = fork_id
+        fork_args.continue_session = False
+        fork_args.prompt = None
+        fork_args.no_session = False
+        return create_app(fork_args)
+
+    async def build_fork(fork_id: str) -> object:
+        return await asyncio.to_thread(_build_fork, fork_id)
+
+    await run_fork_stack(app, build_fork)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -556,14 +579,10 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(exc))
         try:
             with patch_stdout(raw=True):
-                asyncio.run(_run_tui(app))
+                asyncio.run(_run_tui(app, args))
             if app.new_session_requested:
                 args.continue_session = False
                 args.resume = None
-                continue
-            if app.resume_target is not None:
-                args.continue_session = False
-                args.resume = app.resume_target
                 continue
             _print_exit_hint(app)
             return 0

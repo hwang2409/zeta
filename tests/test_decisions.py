@@ -58,6 +58,13 @@ def test_status_bar_shows_decisions_only_when_present() -> None:
     assert "decision" not in none
 
 
+def test_status_bar_shows_main_indicator_during_discussion() -> None:
+    shown = format_status("codex", "fake", "idle", main_active=True).plain
+    assert "◆ main" in shown
+    hidden = format_status("codex", "fake", "idle", main_active=False).plain
+    assert "◆ main" not in hidden
+
+
 # -- scan across live sessions ---------------------------------------------
 
 

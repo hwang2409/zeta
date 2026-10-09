@@ -63,6 +63,10 @@ DEFAULTS: Final[Mapping[str, tuple[str, ...]]] = {
     # handles terminal state around the round-trip. Works in both vi and
     # emacs editing modes; the vi ``v``-in-normal shortcut still applies.
     "open-editor": ("c-x", "c-e"),
+    # Opens the attention-decisions popup. The default c-t shadows the Emacs
+    # transpose-char editing chord; remap it (``open-decisions = "c-b"`` etc.)
+    # to keep transpose. ``/decisions`` opens the same popup regardless.
+    "open-decisions": ("c-t",),
 }
 
 ACTIONS: Final[frozenset[str]] = frozenset(DEFAULTS)
@@ -618,7 +622,7 @@ def build_key_bindings(
     if on_decisions_open is not None:
 
         @bindings.add(
-            "c-t",
+            *resolved_keys["open-decisions"],
             filter=full_screen_mode & ~panel_mode & interactions_enabled,
             eager=True,
         )

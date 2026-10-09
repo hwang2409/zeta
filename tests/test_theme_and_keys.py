@@ -71,6 +71,25 @@ def test_resolve_keybindings_round_trips_user_remaps() -> None:
     assert resolved["interrupt"] == DEFAULTS["interrupt"]
 
 
+def test_open_decisions_is_a_remappable_action() -> None:
+    # Default is Ctrl+T (shadows Emacs transpose-char; documented) and remaps
+    # cleanly so users who want transpose can move it.
+    assert "open-decisions" in ACTIONS
+    assert DEFAULTS["open-decisions"] == ("c-t",)
+    resolved = resolve_keybindings({"open-decisions": "c-b"})
+    assert resolved["open-decisions"] == ("c-b",)
+
+
+def test_open_decisions_binds_the_remapped_key() -> None:
+    bindings = build_key_bindings(
+        on_interrupt=lambda: None,
+        on_exit=lambda: None,
+        on_decisions_open=lambda: None,
+        key_remap={"open-decisions": "c-b"},
+    )
+    assert _binding_keys(bindings, "open_decisions") == {("c-b",)}
+
+
 def test_resolve_keybindings_rejects_unknown_action() -> None:
     with pytest.raises(KeybindingError, match="unknown action"):
         resolve_keybindings({"typo-action": "c-r"})
@@ -120,10 +139,10 @@ def test_build_key_bindings_applies_remap_over_defaults() -> None:
         on_exit=lambda: calls.append("exit"),
         on_retry=lambda: calls.append("retry"),
         on_toggle_agent=lambda: calls.append("toggle-agent"),
-        key_remap={"retry": "f5", "toggle-agent": "c-t"},
+        key_remap={"retry": "f5", "toggle-agent": "f6"},
     )
     assert _binding_keys(bindings, "retry") == {("f5",)}
-    assert _binding_keys(bindings, "toggle_agent") == {("c-t",)}
+    assert _binding_keys(bindings, "toggle_agent") == {("f6",)}
 
 
 def test_build_key_bindings_loud_fails_on_bad_remap() -> None:
