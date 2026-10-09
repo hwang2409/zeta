@@ -81,7 +81,13 @@ Closing paragraph.
         ("Active", "Closing paragraph."),
     ]
     assert [entry.migration_order for entry in entries] == list(range(len(entries)))
-    assert all(entry.representation == "entry" for entry in entries)
+    assert all(
+        entry.representation == "entry"
+        and not entry.automatic
+        and entry.accepted_at == MIGRATED_AT
+        and entry.accepted_by == "user"
+        for entry in entries
+    )
     assert _normalized(plan.rendered_mirrors["state.md"]) == _normalized(state)
 
 
