@@ -45,16 +45,24 @@ def render_kind(state: MemoryState, kind_key: str) -> str:
         isinstance(entry, MemoryEntry) and entry.representation == "legacy_document"
         for entry in state.entries.values()
     )
+    prefix: list[str] = []
+    heading_level = "##"
     if migrating_legacy_documents:
         legacy = [entry for entry in entries if entry.representation == "legacy_document"]
-        if len(legacy) > 1 or len(legacy) != len(entries):
-            raise ValueError("legacy migration kind contains mixed memory entries")
-        return legacy[0].text if legacy else ""
+        if len(legacy) > 1:
+            raise ValueError("legacy migration kind contains duplicate documents")
+        structured = [entry for entry in entries if entry.representation != "legacy_document"]
+        if not structured:
+            return legacy[0].text if legacy else ""
+        if legacy:
+            prefix = [legacy[0].text.rstrip(), "", "## Entry memory", ""]
+            heading_level = "###"
+        entries = structured
     accepted = [entry for entry in entries if _accepted(entry)]
     automatic = [entry for entry in entries if not _accepted(entry)]
-    lines = [f"# {kind.name}", ""]
+    lines = prefix or [f"# {kind.name}", ""]
     for heading, values in (("Accepted", accepted), ("Automatic", automatic)):
-        lines.extend((f"## {heading}", ""))
+        lines.extend((f"{heading_level} {heading}", ""))
         if not values:
             lines.extend(("_None._", ""))
             continue

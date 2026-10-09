@@ -80,6 +80,8 @@ _DURABLE_LITERAL_CUES = (
     "decision",
     "remember",
 )
+SUPPORTED_MEMORY_FORMATS = frozenset({1, 2})
+
 _HIGHEST_PRIORITY_WORDS = (
     "correction",
     "actually",

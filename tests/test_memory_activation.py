@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 
 from zeta.cli import project as project_cli
-from zeta.memory.entry_store import AddOperation, MemoryEntry, MemorySource
+from zeta.memory.entry_store import (
+    AddOperation,
+    MemoryEntry,
+    MemorySource,
+    UpdateOperation,
+)
 from zeta.memory.profiles import memory_profile
 from zeta.project_errors import ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
@@ -58,6 +63,80 @@ def test_profile_change_requires_mapping_for_removed_nonempty_kind(tmp_path: Pat
     assert entry.kind == "threads"
 
 
+def test_profile_change_undo_restores_schema_and_kind_mapping(tmp_path: Path) -> None:
+    registry, project_id = _entry_project(tmp_path)
+    before = registry._entry_memory_state(project_id)
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=before.digest,
+        operations=(AddOperation("state", "Mapped state.", _source()),),
+        reconciliation_key=None,
+        now="2026-10-09T00:00:00Z",
+    )
+    entry_id = added.receipts[0].result_ids[0]
+    changed = registry.set_memory_profile(
+        project_id, "messaging", kind_mappings={"state": "threads"}
+    )
+
+    undone = registry._undo_entry_transaction(project_id, changed.version)
+
+    assert undone.state.schema == added.state.schema
+    assert undone.state.entries == added.state.entries
+    entry = undone.state.entries[entry_id]
+    assert isinstance(entry, MemoryEntry)
+    assert entry.kind == "state"
+
+
+def test_profile_change_undo_restores_resolved_entries(tmp_path: Path) -> None:
+    registry, project_id = _entry_project(tmp_path)
+    before = registry._entry_memory_state(project_id)
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=before.digest,
+        operations=(AddOperation("state", "Resolved during profile change.", _source()),),
+        reconciliation_key=None,
+        now="2026-10-09T00:00:00Z",
+    )
+    entry_id = added.receipts[0].result_ids[0]
+    changed = registry.set_memory_profile(
+        project_id, "messaging", resolve_kinds=frozenset({"state"})
+    )
+    assert entry_id not in changed.state.entries
+
+    undone = registry._undo_entry_transaction(project_id, changed.version)
+
+    assert undone.state.schema == added.state.schema
+    assert undone.state.entries == added.state.entries
+
+
+def test_profile_change_undo_rejects_dependent_later_entry_change(tmp_path: Path) -> None:
+    registry, project_id = _entry_project(tmp_path)
+    initial = registry._entry_memory_state(project_id)
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=initial.digest,
+        operations=(AddOperation("state", "Mapped state.", _source()),),
+        reconciliation_key=None,
+        now="2026-10-09T00:00:00Z",
+    )
+    entry_id = added.receipts[0].result_ids[0]
+    changed = registry.set_memory_profile(
+        project_id, "messaging", kind_mappings={"state": "threads"}
+    )
+    later = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=changed.digest,
+        operations=(UpdateOperation(entry_id, _source(), text="Later edit."),),
+        reconciliation_key=None,
+        now="2026-10-09T00:01:00Z",
+    )
+
+    with pytest.raises(ProjectRegistryError, match="dependent later operations"):
+        registry._undo_entry_transaction(project_id, changed.version)
+
+    assert registry._entry_memory_state(project_id).digest == later.digest
+
+
 def test_profile_change_preserves_explicit_expiry(tmp_path: Path) -> None:
     registry, project_id = _entry_project(tmp_path)
     before = registry._entry_memory_state(project_id)
@@ -75,15 +154,24 @@ def test_profile_change_preserves_explicit_expiry(tmp_path: Path) -> None:
     assert entry.expires_at == "2027-01-01T00:00:00Z"
 
 
-def test_activation_refuses_missing_format_two_capability(tmp_path: Path) -> None:
+@pytest.mark.parametrize("operation", ("activate", "migrate"))
+def test_activation_refuses_consumer_without_format_two_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    from zeta import project_memory_commands
+
     registry = ProjectRegistry(tmp_path / "projects")
     project = registry.create_project("demo", "test", tmp_path / "workspace")
-    with pytest.raises(ProjectRegistryError, match="missing format-2 capabilities: sync"):
-        registry.activate_entry_memory(
-            project.project_id,
-            "zeta",
-            capabilities=frozenset({"updater", "prompt_projection", "commands_api"}),
-        )
+    monkeypatch.setattr(project_memory_commands, "SUPPORTED_MEMORY_FORMATS", frozenset({1}))
+
+    with pytest.raises(
+        ProjectRegistryError, match="missing format-2 capabilities: commands_api"
+    ):
+        if operation == "activate":
+            registry.activate_entry_memory(project.project_id, "zeta")
+        else:
+            registry.migrate_memory(project.project_id)
+
     assert registry.memory_format(project.project_id) == 1
 
 

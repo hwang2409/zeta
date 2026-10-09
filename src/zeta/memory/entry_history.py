@@ -56,6 +56,26 @@ FORMAT_TWO_CAPABILITIES = frozenset(
 )
 
 
+def _format_two_capabilities() -> frozenset[str]:
+    from zeta import project_memory_commands
+    from zeta.core import project_context
+    from zeta.remote_sync import memory as remote_memory
+
+    from . import entry_reconciler
+
+    consumers = {
+        "updater": entry_reconciler,
+        "prompt_projection": project_context,
+        "commands_api": project_memory_commands,
+        "sync": remote_memory,
+    }
+    return frozenset(
+        name
+        for name, consumer in consumers.items()
+        if 2 in consumer.SUPPORTED_MEMORY_FORMATS
+    )
+
+
 def _require_format_two_capabilities(capabilities: frozenset[str]) -> None:
     missing = sorted(FORMAT_TWO_CAPABILITIES - capabilities)
     if missing:
@@ -175,12 +195,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
     """Adapt the format-2 domain module to the existing version protocol."""
 
     @staticmethod
-    def _ensure_entry_memory_capabilities(
-        capabilities: frozenset[str] | None = None,
-    ) -> None:
-        _require_format_two_capabilities(
-            FORMAT_TWO_CAPABILITIES if capabilities is None else capabilities
-        )
+    def _ensure_entry_memory_capabilities() -> None:
+        _require_format_two_capabilities(_format_two_capabilities())
 
     @staticmethod
     def _entry_blob(blobs_fd: int, digest: object) -> tuple[EntryMemoryState, str]:
@@ -481,11 +497,9 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         self,
         project_id: str,
         profile: str = "zeta",
-        *,
-        capabilities: frozenset[str] | None = None,
     ) -> EntryMemorySnapshot:
         """Activate an empty real project when every format-2 consumer is ready."""
-        self._ensure_entry_memory_capabilities(capabilities)
+        self._ensure_entry_memory_capabilities()
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
@@ -583,10 +597,9 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         self,
         project_id: str,
         *,
-        capabilities: frozenset[str] | None = None,
         migrated_at: str | None = None,
     ) -> MigrationPlan:
-        self._ensure_entry_memory_capabilities(capabilities)
+        self._ensure_entry_memory_capabilities()
         return self._migrate_memory_for_test(
             project_id, migrated_at=migrated_at or utc_now()
         )

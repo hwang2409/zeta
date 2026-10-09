@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import dataclasses
 import hashlib
 import io
@@ -9,7 +10,6 @@ import os
 import subprocess
 import sys
 import textwrap
-from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,7 +19,6 @@ import pytest
 from zeta.cli import project as project_cli
 from zeta.core.project_context import load_project_context, refresh_project_memory
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
-from zeta.memory.entry_reconciler import reconcile_entry_range
 from zeta.memory.entry_store import (
     AddOperation,
     ExpireOperation,
@@ -31,9 +30,9 @@ from zeta.memory.entry_store import (
     apply_operations,
     empty_state,
 )
+from zeta.memory.entry_views import render_all_kinds
 from zeta.memory.migration import migrate_format_one, reverse_migration
 from zeta.memory.profiles import memory_profile
-from zeta.memory.reconciler import Transcript
 from zeta.memory.user_authorization import MemoryMutationAuthorization
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_memory_history import PROJECT_MEMORY_FILES
@@ -299,13 +298,11 @@ def test_entry_sync_propagates_status_and_conflicts_schema(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_real_project_activation_end_to_end_updater_resume_commands_serve_and_sync(
-    tmp_path: Path,
-) -> None:
-    first = tmp_path / "first"
+async def test_public_migration_end_to_end_with_real_content(tmp_path: Path) -> None:
+    first = tmp_path / "home"
     second = tmp_path / "second"
     workspace = tmp_path / "workspace"
-    registry, project_id = _fixture(first, workspace)
+    registry, project_id, original_contents = _legacy_fixture(tmp_path)
     starting_context = load_project_context(
         cwd=workspace,
         repo_root=workspace,
@@ -313,9 +310,24 @@ async def test_real_project_activation_end_to_end_updater_resume_commands_serve_
         catalog=SkillCatalog.empty(),
         project_id=project_id,
     )
-    transcript = Transcript(
-        "fixture-session",
-        (
+    monkey_home = os.environ.get("ZETA_HOME")
+    os.environ["ZETA_HOME"] = str(first)
+    try:
+        assert project_cli.run(
+            _cli_args(project_id, remote="migrate"),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+        ) == 0
+    finally:
+        if monkey_home is None:
+            os.environ.pop("ZETA_HOME", None)
+        else:
+            os.environ["ZETA_HOME"] = monkey_home
+
+    session_dir = first / "sessions" / ("a" * 32)
+    session_dir.mkdir(parents=True)
+    (session_dir / "conversation.jsonl").write_text(
+        json.dumps(
             {
                 "seq": 1,
                 "type": "message",
@@ -326,8 +338,8 @@ async def test_real_project_activation_end_to_end_updater_resume_commands_serve_
                         "metadata": {"zeta.origin": "user"},
                     }
                 },
-            },
-        ),
+            }
+        ) + "\n"
     )
 
     async def invoke(_prompt: str) -> str:
@@ -345,17 +357,22 @@ async def test_real_project_activation_end_to_end_updater_resume_commands_serve_
             }
         )
 
-    result = await reconcile_entry_range(
+    runner = AutoMemoryReconciler(
         registry=registry,
         project_id=project_id,
-        transcript=transcript,
-        reconciliation_key=hashlib.sha256(b"fixture-range").hexdigest(),
+        session_id="a" * 32,
+        session_dir=session_dir,
         invoke=invoke,
-        cas_retries=3,
-        as_of=date(2026, 10, 8),
-        now="2026-10-08T12:00:00.000000Z",
+        config=AutoMemoryConfig(minimum_interval=0),
     )
-    entry_id = result.changed_entry_ids[0]
+    runner.before_eviction(1, 1)
+    await runner.drain()
+    await runner.close()
+    entry_id = next(
+        entry.id
+        for entry in registry._entry_memory_state(project_id).state.entries.values()
+        if isinstance(entry, MemoryEntry) and entry.text == "PR 5 is ready."
+    )
     resumed = refresh_project_memory(
         starting_context.system_prompt,
         home=first,
@@ -366,49 +383,38 @@ async def test_real_project_activation_end_to_end_updater_resume_commands_serve_
     )
     assert "PR 5 is ready." in resumed
     assert entry_id in run_memory_command(registry, project_id, "log")
-    assert "undo complete" in run_memory_command(
-        registry,
-        project_id,
-        f"undo {entry_id}",
-        authorization=MemoryMutationAuthorization.direct_slash(),
-    )
-    result = await reconcile_entry_range(
-        registry=registry,
-        project_id=project_id,
-        transcript=transcript,
-        reconciliation_key=hashlib.sha256(b"fixture-range-again").hexdigest(),
-        invoke=invoke,
-        cas_retries=3,
-        as_of=date(2026, 10, 8),
-        now="2026-10-08T12:01:00.000000Z",
-    )
-    entry_id = result.changed_entry_ids[0]
     assert run_memory_command(
         registry,
         project_id,
         f"accept {entry_id}",
         authorization=MemoryMutationAuthorization.direct_slash(),
     ) == f"memory accepted: {entry_id}"
-    requests = ProjectRequests(
+    assert "undo complete" in run_memory_command(
+        registry,
+        project_id,
+        f"undo {entry_id}",
+        authorization=MemoryMutationAuthorization.direct_slash(),
+    )
+
+    shown = ProjectRequests(
         home=first,
         runtime=SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list)),
         codec=FrameCodec(),
-    )
-    shown = requests.dispatch(
+    ).dispatch(
         1,
         "project_show",
         {"project_id": project_id},
         features=frozenset({"projects-memory-v2"}),
     )
     assert shown["memory"]["profile"] == "zeta"
+    assert push_project_memory(
+        first, LocalTransport(second), project_id=project_id
+    ).conflicts == ()
+    assert ProjectRegistry(second / "projects").memory_format(project_id) == 2
 
-    synced = push_project_memory(first, LocalTransport(second), project_id=project_id)
-    assert synced.conflicts == ()
-    remote_entry = ProjectRegistry(second / "projects")._entry_memory_state(
-        project_id
-    ).state.entries[entry_id]
-    assert isinstance(remote_entry, MemoryEntry)
-    assert remote_entry.accepted_by == "user"
+    registry.rollback_memory_migration(project_id)
+    assert registry.memory_format(project_id) == 1
+    assert dict(registry.load_memory(project_id)) == original_contents
 
 
 def test_messaging_profile_correction_completion_and_expiry_matrix() -> None:
@@ -540,6 +546,104 @@ def _legacy_fixture(tmp_path: Path) -> tuple[ProjectRegistry, str, dict[str, str
     for name, content in contents.items():
         registry.update_memory(project.project_id, {name: content})
     return registry, project.project_id, contents
+
+
+@pytest.mark.asyncio
+async def test_inflight_format_one_reconciliation_during_migration(
+    tmp_path: Path,
+) -> None:
+    registry, project_id, contents = _legacy_fixture(tmp_path)
+    home = tmp_path / "home"
+    session_dir = home / "sessions" / ("b" * 32)
+    session_dir.mkdir(parents=True)
+    (session_dir / "conversation.jsonl").write_text(
+        json.dumps(
+            {
+                "seq": 1,
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Remember in flight."}],
+                        "metadata": {"zeta.origin": "user"},
+                    }
+                },
+            }
+        ) + "\n"
+    )
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def invoke(_prompt: str) -> str:
+        provider_started.set()
+        await release_provider.wait()
+        return json.dumps(
+            {
+                "changes": [
+                    {
+                        "file": "state.md",
+                        "content": "# Current state\n\nin-flight format one write\n",
+                        "sources": [
+                            {
+                                "session_id": "b" * 32,
+                                "seq_start": 1,
+                                "seq_end": 1,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+    runner = AutoMemoryReconciler(
+        registry=registry,
+        project_id=project_id,
+        session_id="b" * 32,
+        session_dir=session_dir,
+        invoke=invoke,
+        config=AutoMemoryConfig(minimum_interval=0),
+    )
+    runner.before_eviction(1, 1)
+    drain = asyncio.create_task(runner.drain())
+    await provider_started.wait()
+    await asyncio.to_thread(registry.migrate_memory, project_id)
+    release_provider.set()
+    await drain
+    await runner.close()
+
+    assert registry.memory_format(project_id) == 2
+    snapshot = registry._entry_memory_state(project_id)
+    assert snapshot.state.project_id == project_id
+    assert "in-flight format one write" not in {
+        entry.text
+        for entry in snapshot.state.entries.values()
+        if isinstance(entry, MemoryEntry)
+    }
+    assert {
+        f"{kind}.md": content
+        for kind, content in render_all_kinds(snapshot.state).items()
+    } == contents
+
+
+@pytest.mark.parametrize("step", ("snapshot", "manifest", "publish"))
+def test_migration_publication_failure_at_each_step_leaves_readable_state(
+    tmp_path: Path, step: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, project_id, contents = _legacy_fixture(tmp_path)
+
+    def fail_at(actual: str) -> None:
+        if actual == step:
+            raise RuntimeError(f"failed at {step}")
+
+    monkeypatch.setattr(registry, "_memory_transaction_step", fail_at)
+    with pytest.raises(RuntimeError, match=f"failed at {step}"):
+        registry.migrate_memory(project_id)
+
+    fresh = ProjectRegistry(tmp_path / "home" / "projects")
+    if fresh.memory_format(project_id) == 1:
+        assert dict(fresh.load_memory(project_id)) == contents
+    else:
+        assert fresh._entry_memory_state(project_id).state.project_id == project_id
 
 
 def test_legacy_five_file_migration_round_trips_exactly(tmp_path: Path) -> None:

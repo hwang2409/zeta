@@ -29,6 +29,8 @@ fall back to the packaged identity.
 
 from __future__ import annotations
 
+SUPPORTED_MEMORY_FORMATS = frozenset({1, 2})
+
 import hashlib
 import logging
 import os

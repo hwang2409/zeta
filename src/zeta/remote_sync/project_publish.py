@@ -446,12 +446,17 @@ def _manifest_payloads(
 ) -> tuple[dict[str, bytes], bool]:
     value = manifest.get(key)
     memory_format = manifest.get("format", 1)
+    migration_source = (
+        memory_format == 2
+        and manifest.get("kind") == "migrate"
+        and key == "before_snapshot"
+    )
     if memory_format == 2 and isinstance(value, str):
         values = {"state": value}
         scalar = True
     elif isinstance(value, dict) and (
         (memory_format == 2 and set(value) == {"state"})
-        or (memory_format == 1 and set(value) == set(MEMORY_FILES))
+        or ((memory_format == 1 or migration_source) and set(value) == set(MEMORY_FILES))
     ):
         values = value
         scalar = False
@@ -474,7 +479,7 @@ def _manifest_payloads(
             or hashlib.sha256(payload).hexdigest() != digest
         ):
             raise ProjectPublicationError("project memory blob is invalid")
-        if memory_format == 1:
+        if memory_format == 1 or migration_source:
             try:
                 project_schema.decode_legacy_memory(payload, name)
             except ValueError as exc:
