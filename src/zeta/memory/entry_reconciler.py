@@ -77,7 +77,42 @@ _RELEVANCE_OPAQUE = re.compile(
     r"|(?:[A-Za-z]:)?/[^\s\"'`]+"
     r"|\b(?:[0-9a-fA-F]{7,64}|[A-Za-z0-9]+[_:@.-][A-Za-z0-9_.:@-]+)\b"
 )
-_RELEVANCE_WORD = re.compile(r"[A-Za-z0-9]{2,}")
+_RELEVANCE_WORD = re.compile(r"\w+", re.UNICODE)
+_RELEVANCE_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "content",
+        "for",
+        "from",
+        "in",
+        "is",
+        "it",
+        "message",
+        "now",
+        "of",
+        "on",
+        "or",
+        "text",
+        "that",
+        "the",
+        "this",
+        "to",
+        "user",
+        "was",
+        "we",
+        "were",
+        "with",
+        "you",
+        "your",
+    }
+)
 _DURABLE_LITERAL_CUES = (
     "validated",
     "established",
@@ -179,21 +214,49 @@ def _relevance_terms(
             return frozenset(opaque), frozenset()
     words: set[str] = set()
     for match in _RELEVANCE_WORD.finditer(text):
-        words.add(match.group().casefold())
+        word = match.group().casefold()
+        if word.isdecimal() or word in _RELEVANCE_STOPWORDS:
+            continue
+        if len(word) < (3 if word.isascii() else 2):
+            continue
+        words.add(word)
         if len(opaque) + len(words) >= max_tokens:
             break
     return frozenset(opaque), frozenset(words)
+
+
+def _transcript_relevance_text(transcript: Transcript) -> str:
+    chunks: list[str] = []
+    remaining = _MAX_RELEVANCE_TRANSCRIPT_CHARS
+
+    def collect(value: object) -> None:
+        nonlocal remaining
+        if remaining <= 0:
+            return
+        if isinstance(value, str):
+            chunks.append(value[:remaining])
+            remaining -= min(len(value), remaining)
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                collect(item)
+                if remaining <= 0:
+                    break
+        elif isinstance(value, Sequence):
+            for item in value:
+                collect(item)
+                if remaining <= 0:
+                    break
+
+    collect(_rendered_transcript_rows(transcript))
+    return "\n".join(chunks)
 
 
 def _active_entries_for_request(
     state: MemoryState, transcript: Transcript
 ) -> list[MemoryEntry]:
     active = _active_entries_by_priority(state)
-    transcript_text = json.dumps(
-        _rendered_transcript_rows(transcript), ensure_ascii=False, separators=(",", ":")
-    )
     transcript_opaque, transcript_words = _relevance_terms(
-        transcript_text,
+        _transcript_relevance_text(transcript),
         max_chars=_MAX_RELEVANCE_TRANSCRIPT_CHARS,
         max_tokens=_MAX_RELEVANCE_TRANSCRIPT_TOKENS,
     )

@@ -172,6 +172,7 @@ def _crowded_priority_state(
     registry: ProjectRegistry,
     project_id: str,
     *targets: tuple[str, str],
+    filler_text: str = "Unrelated brief",
 ):
     current = registry._entry_memory_state(project_id)
     target_operations = tuple(
@@ -192,7 +193,7 @@ def _crowded_priority_state(
     filler = tuple(
         AddOperation(
             "brief",
-            f"Unrelated brief {index:03d} " + (chr(65 + index % 26) * 180),
+            f"{filler_text} {index:03d} " + (chr(65 + index % 26) * 180),
             (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),),
         )
         for index in range(100)
@@ -465,6 +466,46 @@ async def test_correction_makes_omitted_entry_visible_and_supersedes_it(
     superseded = registry._entry_memory_state(project_id).state.entries[target]
     assert isinstance(superseded, MemoryEntry)
     assert superseded.status == "superseded"
+
+
+def test_name_relevance_ignores_common_words_and_transcript_keys(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, (target,) = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "Atlas migration remains open."),
+        filler_text="The user message content is now text",
+    )
+
+    request = _prepare_request(
+        _transcript(_row(1, "The Atlas migration is now complete.")),
+        state,
+        as_of=date(2026, 10, 9),
+    )
+
+    assert target in request.visible_entry_ids
+
+
+def test_non_ascii_name_relevance_makes_omitted_entry_visible(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, (target,) = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "李明 owns the release."),
+        filler_text="The user message content is now text",
+    )
+
+    request = _prepare_request(
+        _transcript(_row(1, "李明 finished the work.")),
+        state,
+        as_of=date(2026, 10, 9),
+    )
+
+    assert target in request.visible_entry_ids
 
 
 def test_relevance_selection_is_stable_and_preserves_no_overlap_order(
