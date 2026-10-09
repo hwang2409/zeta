@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import warnings
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -828,24 +829,41 @@ async def test_streamed_message_log_is_cadence_stable(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_stream_update_queue_drops_oldest_without_truncating_result(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     call = ToolCall("burst-1", "stream", {})
     chunks = [f"chunk-{index}\n" for index in range(200)]
     final_text = "".join(chunks)
-    publish_duration = 0.0
+    nonblocking_updates = 0
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    original_put_nowait = asyncio.Queue.put_nowait
+
+    def put_nowait(queue: asyncio.Queue[object], item: object) -> None:
+        nonlocal nonblocking_updates
+        if (
+            isinstance(item, StreamEvent)
+            and item.type is StreamEventType.TOOL_EXECUTION_UPDATE
+            and item.tool_call == call
+        ):
+            nonblocking_updates += 1
+        original_put_nowait(queue, item)
+
+    def fail_blocking_call(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("stream publication used a blocking operation")
+
+    monkeypatch.setattr(asyncio.Queue, "put_nowait", put_nowait)
+    monkeypatch.setattr(asyncio.Queue, "put", fail_blocking_call)
+    monkeypatch.setattr(time, "sleep", fail_blocking_call)
 
     async def stream(
         arguments: dict[str, object],
         abort_signal: object,
         publisher: ToolStreamPublisher,
     ) -> str:
-        nonlocal publish_duration
         del arguments, abort_signal
-        started = asyncio.get_running_loop().time()
         for chunk in chunks:
             publisher.publish(chunk, "stdout")
-        publish_duration = asyncio.get_running_loop().time() - started
         return final_text
 
     events: list[StreamEvent] = []
@@ -871,7 +889,7 @@ skill_catalog=SkillCatalog.empty(),
         for event in events
         if event.type is StreamEventType.TOOL_EXECUTION_END
     )
-    assert publish_duration < 0.1
+    assert nonblocking_updates >= len(chunks)
     assert len(updates) == 128
     assert updates[0].delta == "chunk-72\n"
     assert updates[-1].delta == "chunk-199\n"

@@ -61,7 +61,7 @@ PNG = bytes.fromhex(
 IMAGE_FIXTURES = (
     ("png", "image/png", PNG),
     ("jpeg", "image/jpeg", _image_bytes("JPEG")),
-    ("gif", "image/gif", b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"),
+    ("gif", "image/gif", _image_bytes("GIF")),
     ("webp", "image/webp", _image_bytes("WEBP")),
 )
 
@@ -1061,6 +1061,26 @@ async def test_watchdog_kills_runaway_worker(
     assert result.image is not None
     assert result.image.data is None
     assert "RSS safety budget" in (result.image.note or "")
+
+
+@pytest.mark.asyncio
+async def test_watchdog_accepts_worker_exit_during_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExitedProcess:
+        pid = 1234
+        returncode: int | None = None
+
+        def kill(self) -> None:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(
+        image_normalization, "_process_rss_bytes", lambda _pid: 2**63
+    )
+
+    limit = await image_normalization._watch_worker(ExitedProcess())  # type: ignore[arg-type]
+
+    assert limit is None
 
 
 @pytest.mark.asyncio
