@@ -195,6 +195,53 @@ def test_visible_approval_card_is_removed_when_request_ends() -> None:
     assert removed == [unit]
 
 
+def test_replaced_approval_handle_renders_new_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    removed: list[object] = []
+    cards: list[tuple[str, dict[str, object], str | None]] = []
+    units: list[object] = []
+
+    class Visible(ForkRuntimeMixin):
+        pass
+
+    def render_card(
+        tool_name: str, arguments: dict[str, object], **kwargs: object
+    ) -> tuple[str, dict[str, object], str | None]:
+        card = (tool_name, arguments, kwargs.get("key"))
+        cards.append(card)
+        return card
+
+    def print_unit(card: object) -> object:
+        unit = object()
+        units.append(unit)
+        return unit
+
+    monkeypatch.setattr("zeta.tui.fork_session.render_approval_card", render_card)
+    app = Visible()
+    app._init_fork_runtime()
+    app._presenter = SimpleNamespace(print_unit=print_unit)
+    app._transcript = SimpleNamespace(
+        remove=lambda old, *, leading_blank: removed.append(old)
+    )
+    app._invalidate_prompt = lambda: None
+    owner = SimpleNamespace()
+    old_request = ApprovalRequest("same", ToolCall("same", "read", {"path": "x"}))
+    replacement = ApprovalRequest(
+        "same", ToolCall("same", "bash", {"command": "pwd"})
+    )
+
+    app.sync_visible_approvals((OwnedApproval(owner, old_request, "approval-1"),))
+    app.sync_visible_approvals((OwnedApproval(owner, replacement, "approval-2"),))
+
+    assert cards == [
+        ("read", {"path": "x"}, "approval-1"),
+        ("bash", {"command": "pwd"}, "approval-2"),
+    ]
+    assert removed == [units[0]]
+    assert set(app._approval_units) == {"approval-2"}
+
+
 def test_tui_close_failure_still_runs_later_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

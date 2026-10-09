@@ -64,7 +64,7 @@ class ForkRuntimeMixin:
 
     def _init_fork_runtime(self) -> None:
         self._fork_controller: ForkStackController | None = None
-        self._approval_units: dict[tuple[int, object], object] = {}
+        self._approval_units: dict[str, object] = {}
         self._run_result = RuntimeResult.EXIT
 
     def set_fork_controller(self, controller: ForkStackController | None) -> None:
@@ -110,14 +110,14 @@ class ForkRuntimeMixin:
         )
 
     def sync_visible_approvals(self, approvals: tuple[OwnedApproval, ...]) -> None:
-        current = {(id(item.owner), item.request.key) for item in approvals}
-        for key in self._approval_units.keys() - current:
-            unit = self._approval_units.pop(key)
+        current = {item.handle or str(item.request.key) for item in approvals}
+        for handle in self._approval_units.keys() - current:
+            unit = self._approval_units.pop(handle)
             self._transcript.remove(unit, leading_blank=True)
         for index, item in enumerate(approvals):
             request = item.request
-            key = (id(item.owner), request.key)
-            if key in self._approval_units:
+            handle = item.handle or str(request.key)
+            if handle in self._approval_units:
                 continue
             unit = self._presenter.print_unit(
                 render_approval_card(
@@ -145,7 +145,7 @@ class ForkRuntimeMixin:
                 )
             )
             if unit is not None:
-                self._approval_units[key] = unit
+                self._approval_units[handle] = unit
         self._invalidate_prompt()
 
 
@@ -161,7 +161,14 @@ class ForkStackController:
         self._build_fork = build_fork
         self._resuming: set[int] = set()
         self._main_notification_baselines: dict[int, int] = {}
-        self._approval_handles: dict[tuple[int, object], str] = {}
+        self._owner_tokens: dict[int, tuple[ForkHost, int]] = {
+            id(main_app): (main_app, 1)
+        }
+        self._next_owner_token = count(2)
+        self._approval_handles: dict[
+            tuple[int, object], tuple[ApprovalRequest, str]
+        ] = {}
+        self._issued_approval_handles: set[str] = set()
         self._next_approval_handle = count(1)
         main_app.set_fork_controller(self)
 
@@ -179,19 +186,22 @@ class ForkStackController:
             for owner in reversed(self._stack)
             for request in owner.local_pending_approvals
         ]
-        active = {(id(owner), request.key) for owner, request in pending}
+        active = {(self._owner_token(owner), request.key) for owner, request in pending}
         self._approval_handles = {
-            key: handle
-            for key, handle in self._approval_handles.items()
+            key: value
+            for key, value in self._approval_handles.items()
             if key in active
         }
         approvals = []
         for owner, request in pending:
-            key = (id(owner), request.key)
-            handle = self._approval_handles.get(key)
-            if handle is None:
+            key = (self._owner_token(owner), request.key)
+            current = self._approval_handles.get(key)
+            if current is None or current[0] is not request:
                 handle = f"approval-{next(self._next_approval_handle)}"
-                self._approval_handles[key] = handle
+                self._issued_approval_handles.add(handle)
+                self._approval_handles[key] = (request, handle)
+            else:
+                handle = current[1]
             approvals.append(OwnedApproval(owner, request, handle))
         return tuple(approvals)
 
@@ -252,6 +262,7 @@ class ForkStackController:
                 current.set_fork_controller(None)
                 self._main_notification_baselines.pop(id(current), None)
                 self._stack.pop()
+                self._owner_tokens.pop(id(current), None)
                 self._resuming.add(id(self.visible))
                 self.approvals_changed()
         except BaseException:
@@ -269,6 +280,15 @@ class ForkStackController:
         if first_error is not None:
             raise first_error
 
+    def _owner_token(self, owner: ForkHost) -> int:
+        identity = id(owner)
+        current = self._owner_tokens.get(identity)
+        if current is not None and current[0] is owner:
+            return current[1]
+        token = next(self._next_owner_token)
+        self._owner_tokens[identity] = (owner, token)
+        return token
+
     def _find_approval(self, requested_key: str | None) -> OwnedApproval | None:
         approvals = self.pending_approvals
         if requested_key is None:
@@ -276,6 +296,8 @@ class ForkStackController:
         for approval in approvals:
             if approval.handle == requested_key:
                 return approval
+        if requested_key in self._issued_approval_handles:
+            raise ValueError(f"unknown or expired approval handle {requested_key!r}")
         raw_matches = [
             approval
             for approval in approvals

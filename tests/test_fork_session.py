@@ -114,8 +114,9 @@ class _FakeApp:
         )
 
 
-def _approval(key: str) -> ApprovalRequest:
-    return ApprovalRequest(key, ToolCall(key, "read", {"path": key}))
+def _approval(key: str, tool_name: str = "read") -> ApprovalRequest:
+    arguments = {"path": key} if tool_name == "read" else {"command": key}
+    return ApprovalRequest(key, ToolCall(key, tool_name, arguments))
 
 
 def test_opening_discussion_keeps_main_runtime_live_and_untouched() -> None:
@@ -309,6 +310,33 @@ def test_same_raw_approval_keys_have_owner_qualified_handles() -> None:
         assert len(main.resolved) == 1
         gate.set()
         await task
+
+    asyncio.run(driver())
+
+
+def test_replaced_approval_gets_new_handle_and_rejects_stale_handle() -> None:
+    async def driver() -> None:
+        request = _approval("same")
+        main = _FakeApp("main", [], approvals=[request])
+        controller = ForkStackController(main, pytest.fail)
+
+        controller.approvals_changed()
+        old_handle = controller.pending_approvals[0].handle
+        assert main.approval_views[-1] == (old_handle,)
+
+        replacement = _approval("same", "bash")
+        main.approvals = [replacement]
+        controller.approvals_changed()
+        new_handle = controller.pending_approvals[0].handle
+
+        assert new_handle != old_handle
+        assert main.approval_views[-1] == (new_handle,)
+        with pytest.raises(
+            ValueError, match=rf"unknown or expired approval handle {old_handle!r}"
+        ):
+            await controller.resolve_approval(ApprovalDecision.ALLOW, old_handle)
+        assert main.resolved == []
+        assert main.approvals == [replacement]
 
     asyncio.run(driver())
 
