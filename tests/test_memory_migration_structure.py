@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -119,6 +121,37 @@ def test_migration_splits_overlong_blocks_at_paragraph_boundaries() -> None:
 
 
 @pytest.mark.parametrize(
+    ("lead_in", "item"),
+    (
+        ("x" * (MAX_ENTRY_TEXT_BYTES - 4) + ":", "€"),
+        ("x" * (MAX_ENTRY_TEXT_BYTES - 4) + ":", "😀"),
+        ("x" * (MAX_ENTRY_TEXT_BYTES + 1000) + ":", "item"),
+    ),
+)
+def test_migration_splits_context_that_cannot_share_an_entry(
+    lead_in: str, item: str
+) -> None:
+    source = f"{lead_in}\n\n- {item}"
+    code = f"""
+from zeta.memory_migration_plan import split_memory_document
+split_memory_document({source!r}, {MAX_ENTRY_TEXT_BYTES})
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        timeout=2,
+    )
+    restored = state_from_bytes(
+        canonical_state_bytes(_plan(_contents(**{"state.md": source})).state)
+    )
+    facts = [entry.text for entry in active_entries(restored, kind="state")]
+
+    assert "".join(facts[:-1]).encode() == lead_in.encode()
+    assert facts[-1] == item
+    assert all(len(fact.encode()) <= MAX_ENTRY_TEXT_BYTES for fact in facts)
+
+
+@pytest.mark.parametrize(
     ("fixture", "expected_counts", "dated_context", "plain_paragraph"),
     (
         (
@@ -191,6 +224,14 @@ def test_synthetic_memory_fixture_produces_standalone_typed_entries(
     assert any(
         dated_context in text and not text.rstrip().endswith(":") for text in texts
     )
+    if fixture == "alpha":
+        assert (
+            texts.count(
+                "[Current items] As of 2025-01-02: The amber tile is in the first row.\n"
+                "  - Its label is visible."
+            )
+            == 1
+        )
     assert any("\n  - " in text or "\n   - " in text for text in texts)
     assert all(len(text.encode()) <= MAX_ENTRY_TEXT_BYTES for text in texts)
     if fixture == "charlie":

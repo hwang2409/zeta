@@ -123,6 +123,8 @@ def _bounded_text(text: str, maximum: int) -> list[str]:
         byte_end = maximum
         while byte_end and (encoded[byte_end] & 0xC0) == 0x80:
             byte_end -= 1
+        if not byte_end:
+            raise ValueError("migration entry limit cannot fit the next character")
         prefix = encoded[:byte_end].decode()
         split = max(prefix.rfind("\n"), prefix.rfind(" "))
         if split <= 0:
@@ -137,15 +139,20 @@ def _bounded_text(text: str, maximum: int) -> list[str]:
 def _fact_chunks(
     text: str, context: str | None, section: str | None, maximum: int
 ) -> list[str]:
+    if context and normalize_migration_text(text).startswith(
+        normalize_migration_text(context)
+    ):
+        context = None
     prefixes = [f"[{section}]" if section else "", context or ""]
     prefix = " ".join(item for item in prefixes if item)
+    if not prefix:
+        return _bounded_text(text, maximum)
     available = maximum - len((prefix + " ").encode())
-    if available <= 0:
-        raise ValueError("migration context exceeds maximum entry size")
-    return [
-        f"{prefix} {piece}" if prefix else piece
-        for piece in _bounded_text(text, available)
-    ]
+    if available > 0 and all(
+        len(character.encode()) <= available for character in text
+    ):
+        return [f"{prefix} {piece}" for piece in _bounded_text(text, available)]
+    return [*_bounded_text(prefix, maximum), *_bounded_text(text, maximum)]
 
 
 def split_memory_document(text: str, maximum: int) -> tuple[str | None, list[str]]:

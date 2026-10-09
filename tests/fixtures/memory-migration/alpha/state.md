@@ -6,7 +6,7 @@ The board is ready for another pass.
 
 As of 2025-01-02:
 
-- The amber tile is in the first row.
+- As of 2025-01-02: The amber tile is in the first row.
   - Its label is visible.
 - The blue tile is in the second row.
 
