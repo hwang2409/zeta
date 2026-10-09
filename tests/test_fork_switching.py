@@ -104,6 +104,18 @@ class _FakeForkStatus(ForkViewMixin):
         self._main_notification_baseline = 0
 
 
+def test_main_approval_is_forwarded_to_visible_fork() -> None:
+    rendered: list[str] = []
+    fork = SimpleNamespace(
+        _present_pending_approvals=lambda: rendered.append("approval")
+    )
+    main = SimpleNamespace(_visible_fork=fork, pending_approvals=(object(),))
+
+    TUIApp._present_pending_approvals(main)
+
+    assert rendered == ["approval"]
+
+
 def test_main_activity_pending_tracks_new_notifications() -> None:
     fork = _FakeForkStatus()
     assert fork.main_activity_pending is False  # not attached to a main runtime

@@ -37,6 +37,9 @@ class ForkHost(Protocol):
     def attach_main(self, main: ForkHost) -> None:
         """Teach a fork which runtime stays live behind it (for its status bar)."""
 
+    async def close(self) -> None:
+        """Close this runtime, including its background work."""
+
 
 async def run_fork_stack(
     main_app: ForkHost,
@@ -51,23 +54,29 @@ async def run_fork_stack(
     """
 
     stack: list[ForkHost] = [main_app]
-    while stack:
-        current = stack[-1]
-        await current.run()
-        target = current.take_open_fork()
-        if target is not None:
-            fork = await build_fork(target)
-            fork.attach_main(current)
-            stack.append(fork)
-            continue
-        if len(stack) == 1:
-            # The main runtime exited (it closed itself); the caller resumes
-            # with a new session or a real resume as requested.
-            return
-        # A fork left (returned to its parent or hit Ctrl-D) and closed itself;
-        # release its binding and re-show its parent.
-        await current.leave_fork()
-        stack.pop()
+    try:
+        while stack:
+            current = stack[-1]
+            await current.run()
+            target = current.take_open_fork()
+            if target is not None:
+                fork = await build_fork(target)
+                fork.attach_main(current)
+                stack.append(fork)
+                continue
+            if len(stack) == 1:
+                # The main runtime exited (it closed itself); the caller resumes
+                # with a new session or a real resume as requested.
+                return
+            # A fork left (returned to its parent) and closed itself; release
+            # its binding and re-show its parent.
+            await current.leave_fork()
+            stack.pop()
+    except BaseException:
+        # A process-level exit must close suspended parents too, newest first.
+        for runtime in reversed(stack):
+            await runtime.close()
+        raise
 
 
 __all__ = ["ForkHost", "run_fork_stack"]

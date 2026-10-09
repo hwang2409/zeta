@@ -36,6 +36,7 @@ class ForkViewMixin:
         self._open_fork_target: str | None = None
         self._main_app: ForkViewMixin | None = None
         self._main_notification_baseline = 0
+        self._visible_fork: ForkViewMixin | None = None
         self._load_fork_context()
 
     def request_open_fork(self, fork_session_id: str) -> None:
@@ -142,6 +143,8 @@ class ForkViewMixin:
         """Release this fork's binding before it closes; a no-op for main."""
         if self._fork_context is None:
             return
+        if self._main_app is not None:
+            self._main_app._visible_fork = None
         import asyncio
 
         from ...attention_forks import release_discussion_fork
@@ -157,6 +160,7 @@ class ForkViewMixin:
         """Teach a fork which runtime stays live behind it (for its status bar)."""
         self._main_app = main
         self._main_notification_baseline = main._notification_count()
+        main._visible_fork = self
 
     @property
     def main_activity_pending(self) -> bool:

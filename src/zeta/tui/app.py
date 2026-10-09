@@ -382,6 +382,9 @@ class TUIApp(
 
     @property
     def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
+        owner = getattr(self, "_main_app", None)
+        if owner is not None:
+            return owner.pending_approvals
         return self._submissions.pending_approvals
 
     @property
@@ -412,6 +415,10 @@ class TUIApp(
             self.refresh_model_picker()
 
     def _present_pending_approvals(self) -> None:
+        visible_fork = getattr(self, "_visible_fork", None)
+        if visible_fork is not None:
+            visible_fork._present_pending_approvals()
+            return
         for index, request in enumerate(self.pending_approvals):
             self._print_unit(
                 render_approval_card(
@@ -664,9 +671,10 @@ class TUIApp(
     def _answer_first_pending(self, verb: str) -> None:
         """Answer the request the y/n shortcuts point at, if it is still there."""
 
-        pending = self.pending_approvals
+        owner = getattr(self, "_main_app", None) or self
+        pending = owner.pending_approvals
         if pending:
-            self._submit_input(f"/{verb} {pending[0].key}", internal=True)
+            owner._submit_input(f"/{verb} {pending[0].key}", internal=True)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> bool:
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
@@ -1101,13 +1109,15 @@ class TUIApp(
         """Run the alternate-screen app until Ctrl-D or an exit request.
 
         Re-entrant: the fork controller re-shows a suspended main runtime by
-        calling this again, presenting one-time startup output only once.
+        calling this again without replaying its transcript.
         """
+        resuming = self._suspended
         self._exit_requested = False
         self._suspended = False
         self._decisions_switching = False
         try:
-            self._begin_startup_replay()
+            if not resuming:
+                self._begin_startup_replay()
             await self.loop.activate()
             session = session or self._session or self._make_session()
             self._active_session = session
@@ -1117,12 +1127,15 @@ class TUIApp(
                 self._install_full_screen_layout(session)
                 prompt_task = asyncio.create_task(session.app.run_async())
             try:
-                try:
-                    replay_completed = await self._rebuild_transcript_async()
-                except BaseException:
-                    self._finish_startup_replay(completed=False)
-                    raise
-                self._finish_startup_replay(completed=replay_completed is not False)
+                if resuming:
+                    replay_completed = True
+                else:
+                    try:
+                        replay_completed = await self._rebuild_transcript_async()
+                    except BaseException:
+                        self._finish_startup_replay(completed=False)
+                        raise
+                    self._finish_startup_replay(completed=replay_completed is not False)
                 if replay_completed is False or self._exit_requested:
                     return
                 await self.loop.ensure_mcp_servers()
@@ -1192,6 +1205,8 @@ class TUIApp(
             self._print_unit(Text(header, style=theme.DIM))
 
     async def close(self) -> None:
+        if self._closed:
+            return
         self._closed = True
         self.stop_decisions_poll()
         self._stop_decisions_refresh()

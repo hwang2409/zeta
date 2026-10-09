@@ -46,6 +46,9 @@ class _FakeApp:
     async def leave_fork(self) -> None:
         self.left = True
 
+    async def close(self) -> None:
+        self.closed = True
+
     def take_open_fork(self) -> str | None:
         target, self._pending_fork = self._pending_fork, None
         return target
@@ -104,6 +107,35 @@ def test_main_notification_during_discussion_is_seen_by_the_fork() -> None:
         await task
 
     asyncio.run(driver())
+
+
+def test_process_exit_closes_fork_and_suspended_main_in_reverse_order() -> None:
+    order: list[str] = []
+
+    class ExitApp(_FakeApp):
+        async def run(self) -> None:
+            if self.is_fork:
+                raise KeyboardInterrupt
+            await super().run()
+
+        async def close(self) -> None:
+            order.append(self.name)
+            await super().close()
+
+    main = ExitApp("main", script=["fork-1"])
+    fork = ExitApp("fork", script=[], is_fork=True)
+
+    async def build_fork(target: str) -> _FakeApp:
+        del target
+        return fork
+
+    try:
+        asyncio.run(run_fork_stack(main, build_fork))
+    except KeyboardInterrupt:
+        pass
+
+    assert order == ["fork", "main"]
+    assert main.closed and fork.closed
 
 
 def test_forks_can_stack_and_unwind_newest_first() -> None:

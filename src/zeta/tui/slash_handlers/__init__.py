@@ -44,7 +44,8 @@ class SlashHandlerMixin:
     async def slash_approve(self, args: str) -> str:
         """Approve the first pending request, or the request with this key."""
 
-        await self._submissions.approval_command(
+        owner = getattr(self, "_main_app", None) or self
+        await owner._submissions.approval_command(
             ApprovalDecision.ALLOW, args.strip() or None
         )
         return ""
@@ -52,7 +53,8 @@ class SlashHandlerMixin:
     async def slash_always(self, args: str) -> str:
         """Approve and remember this action for the current session."""
 
-        await self._submissions.approval_command(
+        owner = getattr(self, "_main_app", None) or self
+        await owner._submissions.approval_command(
             ApprovalDecision.ALLOW, args.strip() or None, always=True
         )
         return ""
@@ -60,7 +62,8 @@ class SlashHandlerMixin:
     async def slash_deny(self, args: str) -> str:
         """Deny the first pending request, or the request with this key."""
 
-        await self._submissions.approval_command(
+        owner = getattr(self, "_main_app", None) or self
+        await owner._submissions.approval_command(
             ApprovalDecision.DENY, args.strip() or None
         )
         return ""
