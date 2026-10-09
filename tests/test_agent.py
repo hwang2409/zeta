@@ -2170,7 +2170,7 @@ async def test_agent_returns_child_text_and_persists_child_session(
         schema["name"]
         for schema in backend.calls[0][1]
         if schema["name"] != "request_attention"
-    } | {"ask_parent"}
+    }
 
 
 @pytest.mark.asyncio
@@ -3191,7 +3191,6 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
     assert grandchild_tools == {
         "agent_status",
         "agent_output",
-        "ask_parent",
         "fetch",
         "read",
         "skill",
@@ -4815,8 +4814,15 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
         close_after_restart_check,
     )
 
+    child_loop = SimpleNamespace(
+        notification_wake=SimpleNamespace(pending_message=lambda: None),
+        _background_owner=SimpleNamespace(
+            conversation_channel=SimpleNamespace(has_live_children=lambda _id: False)
+        ),
+        agent_instance_id=None,
+    )
     result = await agent_runner.consume_run(
-        object(),
+        child_loop,
         "initial",
         child_store=child_store,
         child_turns=lambda: len(prompts),

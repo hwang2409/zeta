@@ -189,18 +189,28 @@ class NotificationStateMixin:
         question_id: str,
         question: str,
         options: list[str] | None = None,
+        routed_from_parent: bool = False,
     ) -> ConversationEntry:
         """Persist one child question for its direct parent."""
         if (
-            not child_instance_id
+            type(child_instance_id) is not str
+            or not child_instance_id
+            or type(question_id) is not str
             or not question_id
+            or type(question) is not str
             or not question.strip()
             or len(question) > 4_000
             or options is not None
             and (
-                not options
+                type(options) is not list
+                or not options
                 or len(options) > 10
-                or any(not option.strip() or len(option) > 1_000 for option in options)
+                or any(
+                    type(option) is not str
+                    or not option.strip()
+                    or len(option) > 1_000
+                    for option in options
+                )
             )
         ):
             raise ValueError("invalid child question")
@@ -212,11 +222,59 @@ class NotificationStateMixin:
             "question": question,
             "description": "child question",
             "status": "pending",
-            "text": question,
+            "text": (
+                f"child {child_instance_id} asks: {question}\n"
+                f"Answer with agent_send to {child_instance_id}; you can reference "
+                f"question id {question_id} in the message."
+            ),
         }
         if options is not None:
             data["options"] = list(options)
+        if routed_from_parent:
+            data["routing_note"] = (
+                "direct parent is no longer alive; routed to the next live ancestor"
+            )
         return self._append_row("notification", data)
+
+    def close_child_questions(
+        self: ConversationStore, child_instance_id: str, *, reason: str
+    ) -> int:
+        """Close pending questions and append one terminal notice for each."""
+
+        if not child_instance_id or reason not in {"finished", "canceled"}:
+            raise ValueError("invalid child question closure")
+        with self._append_lock():
+            self._load()
+            questions = [
+                entry
+                for notification_id, entry in self._active_notifications.items()
+                if notification_id not in self._active_notification_acks
+                and entry.data.get("kind") == "child_question"
+                and entry.data.get("child_instance_id") == child_instance_id
+            ]
+            if not questions:
+                return 0
+            rows: list[tuple[str, dict[str, Any]]] = []
+            for question in questions:
+                rows.extend(
+                    [
+                        ("notification_ack", {"notification_id": question.id}),
+                        (
+                            "notification",
+                            {
+                                "origin": MessageOrigin.NOTIFICATION.value,
+                                "kind": "child_question_withdrawn",
+                                "child_instance_id": child_instance_id,
+                                "question_id": question.data["question_id"],
+                                "description": "child question withdrawn",
+                                "status": "withdrawn",
+                                "text": f"question withdrawn: child {reason}",
+                            },
+                        ),
+                    ]
+                )
+            self._append_many_unlocked(rows)
+            return len(questions)
 
     def append_agent_notification(
         self: ConversationStore,

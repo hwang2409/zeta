@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ...agent.conversation_channel import has_follow_up_loop
 from ...core.store import (
     ConversationStore,
     PendingPromptCommitTimeoutError,
@@ -22,7 +23,6 @@ def send_to_run(
     parent_store: ConversationStore,
     child_instance_id: object,
     message: object,
-    question_id: object = None,
 ) -> str | None:
     """Queue a follow-up for an eligible live child."""
 
@@ -30,10 +30,6 @@ def send_to_run(
         return "child_instance_id must be a nonempty string"
     if type(message) is not str or not message.strip():
         return "message must be a nonempty string"
-    if question_id is not None and (
-        type(question_id) is not str or not question_id.strip()
-    ):
-        return "question_id must be a nonempty string when provided"
     no_live_run = (
         f"no live run/child {child_instance_id!r}; it was canceled, finished, "
         "or never started"
@@ -41,7 +37,10 @@ def send_to_run(
     marker = parent_store.agent_children().get(child_instance_id)
     if marker is None:
         return no_live_run
-    if marker.get("accepts_follow_ups") is not True:
+    if not has_follow_up_loop(
+        accepts_follow_ups=marker.get("accepts_follow_ups") is True,
+        background=marker.get("background") is True,
+    ):
         agent_type = marker.get("agent_type") or "general"
         return (
             f"agent_send rejected for {agent_type} child {child_instance_id!r}: "
@@ -61,7 +60,6 @@ def send_to_run(
                 message,
                 origin=MessageOrigin.AGENT_SEND,
                 deadline=deadline,
-                question_id=question_id if isinstance(question_id, str) else None,
             )
     except PendingPromptCommitTimeoutError:
         return "pending prompt commit timed out before the queue could be changed"
@@ -84,7 +82,6 @@ async def _agent_send(
             registry.session_store,
             arguments.get("child_instance_id"),
             arguments.get("message"),
-            arguments.get("question_id"),
         )
     )
     while True:
@@ -122,15 +119,14 @@ def register_send(registry: ToolRegistry) -> None:
         _agent_send,
         description=(
             "Send a follow-up to an eligible child you started. It arrives at "
-            "the next turn boundary and never interrupts a tool call. Include "
-            "question_id when answering ask_parent."
+            "the next turn boundary and never interrupts a tool call. When "
+            "answering ask_parent, you can reference its question id in the message."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "child_instance_id": {"type": "string", "minLength": 1},
                 "message": {"type": "string", "minLength": 1},
-                "question_id": {"type": "string", "minLength": 1},
             },
             "required": ["child_instance_id", "message"],
             "additionalProperties": False,

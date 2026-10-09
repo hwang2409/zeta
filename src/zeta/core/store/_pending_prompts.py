@@ -42,24 +42,20 @@ class PendingPromptQueue:
         *,
         origin: MessageOrigin = MessageOrigin.UNKNOWN,
         deadline: float | None = None,
-        question_id: str | None = None,
     ) -> ConversationEntry:
         if type(text) is not str or not text.strip():
             raise ValueError("pending prompt text must be a nonempty string")
         if len(text) > MAX_PENDING_PROMPT_TEXT:
             raise ValueError("pending prompt text is too long")
-        if question_id is not None and not question_id:
-            raise ValueError("question id must be nonempty")
         with self._store._append_lock(deadline=deadline):
             self._store._load()
             self._check_deadline(deadline)
             if self._queue_closed_unlocked():
                 raise PendingPromptsClosedError("pending prompt queue is closed")
-            data = {"text": text, "origin": origin.value}
-            if question_id is not None:
-                data["question_id"] = question_id
             entry = self._store._append_row_unlocked(
-                "pending_prompt", data, deadline=deadline
+                "pending_prompt",
+                {"text": text, "origin": origin.value},
+                deadline=deadline,
             )
             return self._store._snapshot_entry(entry)
 
