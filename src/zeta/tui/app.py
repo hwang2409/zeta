@@ -373,24 +373,18 @@ class TUIApp(
             for block in message.content[:1]
             if isinstance(block, TextContent)
         )
-
     @property
     def active(self) -> bool:
         return self._submissions.active or (
             self._active_task is not None and not self._active_task.done()
         )
-
     @property
     def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
         owner = getattr(self, "_main_app", None)
-        if owner is not None:
-            return owner.pending_approvals
-        return self._submissions.pending_approvals
-
+        return owner.pending_approvals if owner is not None else self._submissions.pending_approvals
     @property
     def approval_policy(self) -> ApprovalPolicy | None:
         return self._approval_policy
-
     def _start_model_catalog_load(self) -> None:
         if self._model_catalog_task is not None:
             return
@@ -413,12 +407,10 @@ class TUIApp(
             self._model_catalog_loaded = True
             self._model_catalog_task = None
             self.refresh_model_picker()
-
     def _present_pending_approvals(self) -> None:
         visible_fork = getattr(self, "_visible_fork", None)
         if visible_fork is not None:
-            visible_fork._present_pending_approvals()
-            return
+            visible_fork._present_pending_approvals(); return
         for index, request in enumerate(self.pending_approvals):
             self._print_unit(
                 render_approval_card(
@@ -672,9 +664,8 @@ class TUIApp(
         """Answer the request the y/n shortcuts point at, if it is still there."""
 
         owner = getattr(self, "_main_app", None) or self
-        pending = owner.pending_approvals
-        if pending:
-            owner._submit_input(f"/{verb} {pending[0].key}", internal=True)
+        if owner.pending_approvals:
+            owner._submit_input(f"/{verb} {owner.pending_approvals[0].key}", internal=True)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> bool:
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
@@ -757,7 +748,6 @@ class TUIApp(
             self._presenter.print_unit(renderable, blank_before=True)
         else:
             self._presenter.print_unit(renderable)
-
     def _handle_tool_event(self, event: StreamEvent) -> bool:
         if event.type is StreamEventType.TOOL_APPROVAL_START:
             if event.tool_call is not None and not event.data.get("inline_shell"):
@@ -1104,7 +1094,6 @@ class TUIApp(
             session.layout, session.default_buffer, self._invalidate_prompt
         )
         self._bind_fork_navigation()
-
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request.
 
@@ -1116,8 +1105,7 @@ class TUIApp(
         self._suspended = False
         self._decisions_switching = False
         try:
-            if not resuming:
-                self._begin_startup_replay()
+            if not resuming: self._begin_startup_replay()
             await self.loop.activate()
             session = session or self._session or self._make_session()
             self._active_session = session
@@ -1127,8 +1115,7 @@ class TUIApp(
                 self._install_full_screen_layout(session)
                 prompt_task = asyncio.create_task(session.app.run_async())
             try:
-                if resuming:
-                    replay_completed = True
+                if resuming: replay_completed = True
                 else:
                     try:
                         replay_completed = await self._rebuild_transcript_async()
@@ -1181,7 +1168,6 @@ class TUIApp(
         finally:
             if not self._suspending_for_fork:
                 await self.close()
-
     def _present_startup_output(self) -> None:
         for warning in self._startup_warnings:
             self._print_unit(Text(warning, style=theme.WARNING))
@@ -1203,7 +1189,6 @@ class TUIApp(
         header = self.fork_header_notice
         if header is not None:
             self._print_unit(Text(header, style=theme.DIM))
-
     async def close(self) -> None:
         if self._closed:
             return
