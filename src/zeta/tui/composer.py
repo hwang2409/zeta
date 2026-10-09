@@ -570,6 +570,7 @@ class ComposerAttachmentMixin:
                 self.loop.store.cwd,
                 attachment_value=source,
                 session_store=self.loop.store,
+                on_reference_notice=self._print_system,
             )
         except AttachmentError as exc:
             self._print_system(f"attachment rejected: {exc}")
