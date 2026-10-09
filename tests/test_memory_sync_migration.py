@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -45,6 +46,7 @@ from zeta.remote_sync import (
 )
 from zeta.remote_sync.errors import RemoteSyncError
 from zeta.remote_sync.memory import project_digest
+from zeta.remote_sync.project_publish import ProjectPublicationError, _validate_snapshot
 from zeta.remote_sync.ssh import SshTransport
 from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
@@ -665,6 +667,49 @@ def test_legacy_five_file_migration_round_trips_exactly(tmp_path: Path) -> None:
         source_version=registry.memory_state(project_id).version,
         migrated_at="2026-10-08T12:00:00Z",
     ) == plan
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("source-digest", "before-snapshot", "source-version", "migrated-state"),
+)
+def test_sync_rejects_migration_manifest_without_source_and_plan_integrity(
+    tmp_path: Path, tamper: str
+) -> None:
+    registry, project_id, _ = _legacy_fixture(tmp_path)
+    registry.migrate_memory(project_id, migrated_at="2026-10-09T00:00:00Z")
+    source = registry.root / project_id
+    snapshot = tmp_path / "snapshot" / project_id
+    shutil.copytree(source, snapshot)
+    pointer = json.loads((snapshot / "memory-current.json").read_text())
+    current = pointer["current"]
+    manifest_path = snapshot / "memory-versions" / "versions" / f"{current}.json"
+    manifest = json.loads(manifest_path.read_text())
+    blobs = snapshot / "memory-versions" / "blobs"
+
+    if tamper == "source-digest":
+        manifest["source_digest"] = "0" * 64
+    elif tamper == "before-snapshot":
+        before = manifest["before_snapshot"]
+        before["brief.md"] = before["state.md"]
+    elif tamper == "source-version":
+        manifest["source_version"] = pointer["history"][0]
+    else:
+        state_digest = manifest["snapshot"]
+        state = json.loads((blobs / state_digest).read_text())
+        entry = next(iter(state["entries"].values()))
+        entry["text"] = "Tampered migrated fact."
+        payload = json.dumps(
+            state, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        replacement = hashlib.sha256(payload).hexdigest()
+        (blobs / replacement).write_bytes(payload)
+        (blobs / replacement).chmod(0o600)
+        manifest["snapshot"] = replacement
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+
+    with pytest.raises(ProjectPublicationError, match="migration"):
+        _validate_snapshot(snapshot, project_id)
 
 
 def test_migration_rollback_restores_format_one_pointer(tmp_path: Path) -> None:

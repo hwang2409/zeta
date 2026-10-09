@@ -11,6 +11,7 @@ import pytest
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import (
     EntryReconciliationFailure,
+    _prepare_request,
     reconcile_entry_range,
 )
 from zeta.memory.entry_store import (
@@ -163,6 +164,75 @@ def _seed_user_entry(
         now=observed_at,
     )
     return next(iter(result.state.entries))
+
+
+@pytest.mark.asyncio
+async def test_oversized_memory_indexes_every_active_entry_and_allows_targeting(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    current = registry._entry_memory_state(project_id)
+    operations = tuple(
+        AddOperation(
+            "state",
+            f"Entry {index:02d} " + (chr(65 + index % 26) * 1800),
+            (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),),
+        )
+        for index in range(24)
+    )
+    state, _ = apply_operations(
+        current.state,
+        operations,
+        reconciliation_key=_key("large-memory"),
+        automatic=True,
+        now=NOW,
+    )
+    registry._replace_entry_state_for_test(
+        project_id, state, expected_digest=current.digest
+    )
+    transcript = _transcript(_row(1, "Correct one indexed entry."))
+    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    active_ids = {
+        entry.id
+        for entry in state.entries.values()
+        if isinstance(entry, MemoryEntry) and entry.status == "active"
+    }
+
+    assert "Current entries (full=" in request.prompt
+    assert all(entry_id in request.prompt for entry_id in active_ids)
+    indexed = [
+        line for line in request.prompt.splitlines() if line.startswith("INDEX ")
+    ]
+    assert indexed
+    target = indexed[-1].split()[1]
+
+    async def invoke(prompt: str) -> str:
+        assert f"INDEX {target} " in prompt
+        return _proposal(
+            {
+                "op": "update",
+                "target": target,
+                "text": "Corrected indexed entry.",
+                "sources": [{"seq_start": 1, "seq_end": 1}],
+                "reason": "direct correction",
+            }
+        )
+
+    result = await reconcile_entry_range(
+        registry=registry,
+        project_id=project_id,
+        transcript=transcript,
+        reconciliation_key=_key("indexed-update"),
+        invoke=invoke,
+        cas_retries=1,
+        as_of=date(2026, 10, 9),
+        now=NOW,
+    )
+
+    assert result.changed_entry_ids == (target,)
+    changed = registry._entry_memory_state(project_id).state.entries[target]
+    assert isinstance(changed, MemoryEntry)
+    assert changed.text == "Corrected indexed entry."
 
 
 def test_zeta_and_messaging_profiles_apply_distinct_defaults() -> None:
