@@ -91,9 +91,11 @@ def run(
             if len(profiles) != 1:
                 raise ProjectRegistryError("--memory-profile may be specified only once")
             project = registry.create_project(
-                args.name, args.scope, args.canonical_integration_root
+                args.name,
+                args.scope,
+                args.canonical_integration_root,
+                memory_profile=profiles[0],
             )
-            registry.activate_entry_memory(project.project_id, profiles[0])
             value = project.to_dict()
         elif args.project_verb == "init":
             profiles = getattr(args, "memory_profile", None) or ["zeta"]
@@ -106,8 +108,8 @@ def run(
                     args.name or directory.name,
                     args.scope or directory.name,
                     str(directory),
+                    memory_profile=profiles[0],
                 )
-                registry.activate_entry_memory(project.project_id, profiles[0])
             registry.ensure_memory_supported(project.project_id)
             value = project.to_dict()
         elif args.project_verb == "discover":

@@ -245,9 +245,9 @@ def _find_or_create_valid_project(
     ]
     for name in names:
         try:
-            project = registry.create_project(name, "git", root)
-            registry.activate_entry_memory(project.project_id, "zeta")
-            return project
+            return registry.create_project(
+                name, "git", root, memory_profile="zeta"
+            )
         except ProjectRegistryError:
             project = _valid_registry_candidate(
                 registry.find_for_directory(root), discovery

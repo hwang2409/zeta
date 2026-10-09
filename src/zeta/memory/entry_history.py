@@ -175,6 +175,14 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
     """Adapt the format-2 domain module to the existing version protocol."""
 
     @staticmethod
+    def _ensure_entry_memory_capabilities(
+        capabilities: frozenset[str] | None = None,
+    ) -> None:
+        _require_format_two_capabilities(
+            FORMAT_TWO_CAPABILITIES if capabilities is None else capabilities
+        )
+
+    @staticmethod
     def _entry_blob(blobs_fd: int, digest: object) -> tuple[EntryMemoryState, str]:
         if isinstance(digest, dict) and set(digest) == {"state"}:
             digest = digest["state"]
@@ -437,6 +445,38 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             finally:
                 os.close(directory_fd)
 
+    def _activate_entry_memory_locked(
+        self, directory_fd: int, project_id: str, profile: str
+    ) -> EntryMemorySnapshot:
+        try:
+            schema = memory_profile(profile)
+        except ValueError as exc:
+            raise ProjectRegistryError(str(exc)) from exc
+        if self._pointer(directory_fd) is not None:
+            raise ProjectRegistryError(
+                "existing project memory must be activated with migrate"
+            )
+        expected = {
+            "brief.md": "# Brief\n",
+            "state.md": "# Current state\n",
+            "backlog.md": "# Backlog\n",
+            "changelog.md": "# Changelog\n",
+            "decisions.md": "# Decisions\n",
+        }
+        if self._legacy_contents(directory_fd) != expected:
+            raise ProjectRegistryError(
+                "existing project memory must be activated with migrate"
+            )
+        state = empty_state(project_id, schema)
+        return self._publish_entry_version(
+            directory_fd,
+            state=state,
+            before=state,
+            kind="entry-activate",
+            receipts=(),
+            reset_history=True,
+        )
+
     def activate_entry_memory(
         self,
         project_id: str,
@@ -445,39 +485,12 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         capabilities: frozenset[str] | None = None,
     ) -> EntryMemorySnapshot:
         """Activate an empty real project when every format-2 consumer is ready."""
-        _require_format_two_capabilities(
-            FORMAT_TWO_CAPABILITIES if capabilities is None else capabilities
-        )
-        try:
-            schema = memory_profile(profile)
-        except ValueError as exc:
-            raise ProjectRegistryError(str(exc)) from exc
+        self._ensure_entry_memory_capabilities(capabilities)
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
-                if self._pointer(directory_fd) is not None:
-                    raise ProjectRegistryError(
-                        "existing project memory must be activated with migrate"
-                    )
-                expected = {
-                    "brief.md": "# Brief\n",
-                    "state.md": "# Current state\n",
-                    "backlog.md": "# Backlog\n",
-                    "changelog.md": "# Changelog\n",
-                    "decisions.md": "# Decisions\n",
-                }
-                if self._legacy_contents(directory_fd) != expected:
-                    raise ProjectRegistryError(
-                        "existing project memory must be activated with migrate"
-                    )
-                state = empty_state(project_id, schema)
-                return self._publish_entry_version(
-                    directory_fd,
-                    state=state,
-                    before=state,
-                    kind="entry-activate",
-                    receipts=(),
-                    reset_history=True,
+                return self._activate_entry_memory_locked(
+                    directory_fd, project_id, profile
                 )
             finally:
                 os.close(directory_fd)
@@ -573,9 +586,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         capabilities: frozenset[str] | None = None,
         migrated_at: str | None = None,
     ) -> MigrationPlan:
-        _require_format_two_capabilities(
-            FORMAT_TWO_CAPABILITIES if capabilities is None else capabilities
-        )
+        self._ensure_entry_memory_capabilities(capabilities)
         return self._migrate_memory_for_test(
             project_id, migrated_at=migrated_at or utc_now()
         )
