@@ -18,6 +18,21 @@ def has_follow_up_loop(*, accepts_follow_ups: bool, background: bool) -> bool:
     return accepts_follow_ups and background
 
 
+def recover_orphaned_questions(store: ConversationStore) -> int:
+    """Withdraw persisted questions whose child did not survive restart."""
+
+    child_ids = {
+        child_id
+        for entry in store.agent_notifications()
+        if entry.data.get("kind") == "child_question"
+        and type(child_id := entry.data.get("child_instance_id")) is str
+    }
+    return sum(
+        store.close_child_questions(child_id, reason="canceled")
+        for child_id in child_ids
+    )
+
+
 class ConversationChannel:
     """Own follow-up eligibility, question routing, and child-loop wakes."""
 
@@ -121,20 +136,6 @@ class ConversationChannel:
         for store in self._owner.conversation_stores():
             closed += store.close_child_questions(child_instance_id, reason=reason)
         return closed
-
-    def recover_orphaned_questions(self, store: ConversationStore) -> int:
-        """Withdraw persisted questions whose child did not survive restart."""
-
-        child_ids = {
-            entry.data.get("child_instance_id")
-            for entry in store.agent_notifications()
-            if entry.data.get("kind") == "child_question"
-        }
-        return sum(
-            store.close_child_questions(child_id, reason="canceled")
-            for child_id in child_ids
-            if type(child_id) is str and not self._owner.owns_running(child_id)
-        )
 
     def _live_parent(
         self, child_instance_id: str
