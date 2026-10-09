@@ -107,6 +107,159 @@ def test_range_receipt_coalesces_runs_of_old_receipts() -> None:
     assert "bash" not in receipt  # Protected bash-call tail remains outside the range.
 
 
+def _legacy_tool_receipt_pair(
+    seq: int, content: str, *, name: str = "read"
+) -> list[tuple[int, Message]]:
+    call_id = f"legacy-{seq}"
+    return [
+        (
+            seq,
+            Message(
+                MessageRole.ASSISTANT,
+                [ToolUseContent(ToolCall(call_id, name, {"path": "secret.txt"}))],
+            ),
+        ),
+        (
+            seq + 1,
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult(call_id, content),
+                metadata={
+                    "context_evicted": True,
+                    "source_seq": seq + 1,
+                    "eviction_content_digest": "0" * 64,
+                },
+            ),
+        ),
+    ]
+
+
+def test_legacy_semantic_digest_with_appended_raw_text_breaks_range() -> None:
+    records = [
+        *_legacy_tool_receipt_pair(
+            1, "[semantic read digest · seq 2] RAW SECRET"
+        ),
+        (3, _assistant_receipt(3)),
+    ]
+
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=lambda message: (
+            1 if message.metadata.get("eviction_range") else 100
+        ),
+    )
+
+    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert result.messages[1].tool_result is not None
+    assert result.messages[1].tool_result.content.endswith("RAW SECRET")
+
+
+def test_legacy_workflow_receipt_with_appended_raw_text_breaks_range() -> None:
+    records = [
+        *_legacy_tool_receipt_pair(
+            1,
+            "[workflow result receipt] recall_history seq_start=2, seq_end=2 "
+            "for exact result\nRAW SECRET",
+            name="recall_history",
+        ),
+        (3, _assistant_receipt(3)),
+    ]
+
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=lambda message: (
+            1 if message.metadata.get("eviction_range") else 100
+        ),
+    )
+
+    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert result.messages[1].tool_result is not None
+    assert result.messages[1].tool_result.content.endswith("RAW SECRET")
+
+
+def test_legacy_orchestration_receipt_with_appended_raw_text_breaks_range() -> None:
+    records = [
+        *_legacy_tool_receipt_pair(
+            1,
+            "[orchestration result receipt] {}"
+            "; recall_history seq_start=2, seq_end=2 for exact result\nRAW SECRET",
+            name="agent",
+        ),
+        (3, _assistant_receipt(3)),
+    ]
+
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=lambda message: (
+            1 if message.metadata.get("eviction_range") else 100
+        ),
+    )
+
+    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert result.messages[1].tool_result is not None
+    assert result.messages[1].tool_result.content.endswith("RAW SECRET")
+
+
+def test_legacy_notification_receipt_with_appended_raw_text_breaks_range() -> None:
+    malicious = Message(
+        MessageRole.SYSTEM,
+        [
+            TextContent(
+                "[notification receipt] recall_history seq_start=1, seq_end=1 "
+                "for exact notification\nRAW SECRET"
+            )
+        ],
+        metadata={
+            "context_evicted": True,
+            "source_seq": 1,
+            "eviction_content_digest": "0" * 64,
+        },
+    )
+
+    result = evict_messages(
+        [(1, malicious), (2, _assistant_receipt(2))],
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=lambda message: (
+            1 if message.metadata.get("eviction_range") else 100
+        ),
+    )
+
+    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    block = result.messages[0].content[0]
+    assert isinstance(block, TextContent)
+    assert block.text.endswith("RAW SECRET")
+
+
+def test_complete_legacy_receipts_still_coalesce() -> None:
+    records = [
+        *_legacy_tool_receipt_pair(
+            1,
+            "[semantic read digest · seq 2] read secret.txt; 1 lines; safe. "
+            "recall_history seq_start=2, seq_end=2 for exact output; "
+            "re-read only if the source may have changed.",
+        ),
+        (3, _assistant_receipt(3)),
+    ]
+
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=lambda message: (
+            1 if message.metadata.get("eviction_range") else 100
+        ),
+    )
+
+    assert sum(bool(message.metadata.get("eviction_range")) for message in result.messages) == 1
+
+
 def test_reasoning_evicted_messages_with_raw_text_or_images_break_ranges() -> None:
     records = [
         (
