@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,10 @@ ATTACHMENT_TOKEN_RE = re.compile(r'(?<!\S)@(?:"([^"\n]+)"|([^\s]+))')
 class AttachmentError(ValueError):
     """Raised when a composer attachment cannot be read or decoded."""
 
+    def __init__(self, message: str, *, reason: str = "unreadable") -> None:
+        super().__init__(message)
+        self.reason = reason
+
 
 @dataclass(frozen=True, slots=True)
 class AttachmentRef:
@@ -63,10 +68,14 @@ def attachment_refs(value: str, base_dir: str | Path) -> tuple[AttachmentRef, ..
             "/" in raw_path or raw_path.startswith(("./", "../", "~/"))
         ):
             continue
-        path = Path(raw_path).expanduser()
-        if not path.is_absolute():
-            path = base / path
-        refs.append(AttachmentRef(match.group(0), _attachment_path(path)))
+        try:
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute():
+                path = base / path
+            path = _attachment_path(path)
+        except (RuntimeError, OSError, ValueError):
+            continue
+        refs.append(AttachmentRef(match.group(0), path))
     return tuple(refs)
 
 
@@ -123,24 +132,30 @@ def _read_attachment(
                 )
             else:
                 if not path.exists():
-                    raise AttachmentError(f"file does not exist: {path}")
+                    raise AttachmentError(
+                        f"file does not exist: {path}", reason="missing"
+                    )
                 if not path.is_file():
                     raise AttachmentError(
-                        f"directory attachments are not supported: {path}"
+                        f"directory attachments are not supported: {path}",
+                        reason="directory",
                     )
                 handle = cleanup.enter_context(path.open("rb"))
             size = os.fstat(handle.fileno()).st_size
             prefix = handle.read(64)
             if _image_media_type(prefix) is None and size > ATTACHMENT_MAX_TEXT_BYTES:
                 raise AttachmentError(
-                    f"text file is {size} bytes; limit is {ATTACHMENT_MAX_TEXT_BYTES} bytes: {path}"
+                    f"text file is {size} bytes; limit is {ATTACHMENT_MAX_TEXT_BYTES} bytes: {path}",
+                    reason="too large",
                 )
             data = prefix + handle.read()
     except FileNotFoundError as exc:
-        raise AttachmentError(f"file does not exist: {path}") from exc
+        raise AttachmentError(
+            f"file does not exist: {path}", reason="missing"
+        ) from exc
     except IsADirectoryError as exc:
         raise AttachmentError(
-            f"directory attachments are not supported: {path}"
+            f"directory attachments are not supported: {path}", reason="directory"
         ) from exc
     except AttachmentError:
         raise
@@ -149,7 +164,9 @@ def _read_attachment(
     media_type = _image_media_type(prefix)
     if media_type is not None:
         if not image_signature_matches(media_type, data):
-            raise AttachmentError(f"binary file is not an image: {path}")
+            raise AttachmentError(
+                f"binary file is not an image: {path}", reason="not decodable"
+            )
         return ImageContent(
             base64.b64encode(data).decode("ascii"),
             media_type,
@@ -157,11 +174,15 @@ def _read_attachment(
             size,
         )
     if b"\x00" in data:
-        raise AttachmentError(f"binary file is not an image: {path}")
+        raise AttachmentError(
+            f"binary file is not an image: {path}", reason="not decodable"
+        )
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        raise AttachmentError(f"binary file is not an image: {path}") from None
+        raise AttachmentError(
+            f"binary file is not an image: {path}", reason="not decodable"
+        ) from None
     labeled = f"[file: {path} · {size} bytes]\n{text}"
     return TextContent(labeled, str(path), size)
 
@@ -173,20 +194,31 @@ def build_user_message(
     *,
     attachment_value: str | None = None,
     session_store: ConversationStore | None = None,
+    on_reference_notice: Callable[[str], None] | None = None,
 ) -> Message:
-    """Resolve references into one message, deduplicating resolved paths."""
+    """Resolve readable references and pending paths into one message."""
 
     paths: list[Path] = []
+    reference_paths: set[Path] = set()
+    blocks = [TextContent(value)]
     source = value if attachment_value is None else attachment_value
     for ref in attachment_refs(source, base_dir):
-        if ref.path not in paths:
+        if ref.path in reference_paths:
+            continue
+        reference_paths.add(ref.path)
+        try:
+            attachment = _read_attachment(ref.path, session_store)
+        except AttachmentError as exc:
+            if exc.reason != "missing" and on_reference_notice is not None:
+                on_reference_notice(f"{ref.token} not attached: {exc.reason}")
+        else:
             paths.append(ref.path)
+            blocks.append(attachment)
     for path in pending_paths:
         resolved = _attachment_path(path)
         if resolved not in paths:
             paths.append(resolved)
-    blocks = [TextContent(value)]
-    blocks.extend(_read_attachment(path, session_store) for path in paths)
+            blocks.append(_read_attachment(resolved, session_store))
     return with_message_origin(
         Message(MessageRole.USER, blocks), MessageOrigin.USER
     )
