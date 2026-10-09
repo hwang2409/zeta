@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from functools import partial
 from typing import BinaryIO, TypeVar
@@ -56,6 +56,8 @@ MAX_RESPONSE_BYTES = 2 * RESOURCE_MAX_BYTES
 MAX_LIST_ITEMS = 10_000
 MAX_LIST_PAGES = 1_000
 MAX_ERROR_DETAIL_BYTES = 8192
+NOTIFICATION_RECONNECT_INITIAL_SECONDS = 0.1
+NOTIFICATION_RECONNECT_MAX_SECONDS = 5.0
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 OAUTH_HINT = "run /mcp auth {name} to reauthorize"
@@ -359,33 +361,28 @@ class StreamableHTTPMCPClient(MCPClient):
         headers["mcp-session-id"] = self._session_id
         if self.protocol_version is not None:
             headers["mcp-protocol-version"] = self.protocol_version
-        try:
-            async with self._client.stream("GET", self.config.url, headers=headers) as response:
-                if response.status_code >= 400:
-                    return
-                data: list[str] = []
-                async for line in response.aiter_lines():
-                    if self._closed:
+        delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
+        while not self._closed:
+            try:
+                async with self._client.stream(
+                    "GET", self.config.url, headers=headers
+                ) as response:
+                    if response.status_code == 405:
                         return
-                    if line.startswith("data:"):
-                        data.append(line[5:].lstrip())
-                    elif not line and data:
-                        try:
-                            value = json.loads("\\n".join(data))
-                        except ValueError:
-                            data.clear()
-                            continue
-                        data.clear()
-                        if (
-                            isinstance(value, dict)
-                            and isinstance(value.get("method"), str)
-                            and self._notification_sink is not None
-                        ):
-                            self._notification_sink(value["method"])
-        except (asyncio.CancelledError, httpx.HTTPError):
-            raise
-        except Exception:
-            logger.debug("MCP HTTP notification stream ended", exc_info=True)
+                    response.raise_for_status()
+                    async for value in _iter_sse_events(
+                        response, self._spill_store, MAX_RESPONSE_BYTES
+                    ):
+                        delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
+                        _dispatch_sse_notification(value, self._notification_sink)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("MCP HTTP notification stream ended", exc_info=True)
+            if self._closed:
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, NOTIFICATION_RECONNECT_MAX_SECONDS)
 
     async def _send_notification(
         self, method: str, params: Mapping[str, object]
@@ -530,7 +527,30 @@ async def _read_sse_response(
     memory_bound: int,
     notification_sink: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
-    """Parse SSE incrementally without materializing complete data lines."""
+    async for value in _iter_sse_events(response, spill_store, memory_bound):
+        if type(value) is dict and value.get("id") == request_id:
+            return parse_rpc_response(value, request_id)
+        _dispatch_sse_notification(value, notification_sink)
+    raise MCPProtocolError("MCP SSE response ended before the result")
+
+
+def _dispatch_sse_notification(
+    value: object, notification_sink: Callable[[str], None] | None
+) -> None:
+    if type(value) is not dict or type(value.get("method")) is not str:
+        return
+    method = value["method"]
+    logger.debug("MCP stream notification: %s", method)
+    if notification_sink is not None:
+        notification_sink(method)
+
+
+async def _iter_sse_events(
+    response: httpx.Response,
+    spill_store: SpillStore,
+    memory_bound: int,
+) -> AsyncIterator[object]:
+    """Parse SSE JSON events without materializing oversized data fields."""
 
     data_parts: list[bytes] = []
     total = 0
@@ -576,19 +596,6 @@ async def _read_sse_response(
         temporary = None
         handle = None
         return value
-
-    async def finish_event() -> dict[str, object] | None:
-        if not has_data_line:
-            return None
-        value = await parse_event()
-        if type(value) is dict and value.get("id") == request_id:
-            return parse_rpc_response(value, request_id)
-        if type(value) is dict and type(value.get("method")) is str:
-            method = value["method"]
-            logger.debug("MCP stream notification: %s", method)
-            if notification_sink is not None:
-                notification_sink(method)
-        return None
 
     line_prefix = bytearray()
     line_is_data = False
@@ -664,17 +671,12 @@ async def _read_sse_response(
                             position += 1
                         elif position == len(window):
                             pending_cr = True
-                    if blank:
-                        result = await finish_event()
-                        if result is not None:
-                            return result
+                    if blank and has_data_line:
+                        yield await parse_event()
         if line_prefix or line_is_data or line_ignored:
             await feed_line(b"", end_line=True)
         if has_data_line:
-            result = await finish_event()
-            if result is not None:
-                return result
-        raise MCPProtocolError("MCP SSE response ended before the result")
+            yield await parse_event()
     finally:
         if temporary is not None:
             await asyncio.to_thread(temporary.__exit__, None, None, None)

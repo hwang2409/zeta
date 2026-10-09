@@ -32,7 +32,7 @@ class ToolRefreshActor:
         self._setup_client: MCPClient | None = None
         self._task: asyncio.Task[list[MCPTool]] | None = None
         self._pending = False
-        self._setup_notification_pending = False
+        self._setup_notification_client: MCPClient | None = None
 
     def start_setup(self, client: MCPClient) -> None:
         self._setup_client = client
@@ -43,20 +43,27 @@ class ToolRefreshActor:
             )
 
     def finish_setup(self, client: MCPClient) -> None:
+        if self._setup_client is not client:
+            return
         self._setup_client = None
-        if self._setup_notification_pending:
-            self._setup_notification_pending = False
+        if self._setup_notification_client is client:
+            self._setup_notification_client = None
             self.handle_changed(ToolsListChanged(client))
+
+    def abort_setup(self, client: MCPClient) -> None:
+        if self._setup_client is client:
+            self._setup_client = None
+        if self._setup_notification_client is client:
+            self._setup_notification_client = None
 
     def notify(self, client: MCPClient, method: str) -> None:
         if method != "notifications/tools/list_changed":
             return
         owner = self._owner
         if (
-            (client is owner._client or client is self._setup_client)
-            and owner._status.state != "mounted"
-        ):
-            self._setup_notification_pending = True
+            client is owner._client or client is self._setup_client
+        ) and owner._status.state != "mounted":
+            self._setup_notification_client = client
         else:
             owner._queue.put_nowait(ToolsListChanged(client))
 

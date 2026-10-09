@@ -269,6 +269,13 @@ class SetupNotificationClient(FilterClient):
         self.notification_sink("notifications/tools/list_changed")
 
 
+class FailedSetupNotificationClient(FilterClient):
+    async def connect(self) -> None:
+        assert self.notification_sink is not None
+        self.notification_sink("notifications/tools/list_changed")
+        raise RuntimeError("setup failed")
+
+
 class BlockingRefreshClient(FilterClient):
     def __init__(self, config: MCPServerConfig) -> None:
         super().__init__(config)
@@ -304,6 +311,28 @@ async def test_mcp_setup_notification_is_refreshed_after_publication(
 
 
 @pytest.mark.asyncio
+async def test_failed_setup_notification_is_not_applied_to_next_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("files", "stdio", "unused")
+    failed = FailedSetupNotificationClient(config)
+    connected = FilterClient(config)
+    clients = iter((failed, connected))
+    monkeypatch.setattr("zeta.mcp.mount._build_client", lambda _config: next(clients))
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {config.name: config})
+    )
+    try:
+        await mount.reconnect("files")
+        assert connected.list_calls == 1
+    finally:
+        await mount.close()
+
+
+@pytest.mark.asyncio
 async def test_mcp_close_cancels_blocked_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -323,8 +352,39 @@ async def test_mcp_close_cancels_blocked_refresh(
     await asyncio.wait_for(mount.close(), 1)
 
 
+def _http_rpc_response(
+    request: httpx.Request, tools: set[str], requests: list[str]
+) -> httpx.Response:
+    payload = json.loads(request.content) if request.content else {}
+    if "id" not in payload:
+        return httpx.Response(202, request=request)
+    requests.append(payload["method"])
+    result = (
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {"listChanged": True}},
+        }
+        if payload["method"] == "initialize"
+        else {
+            "tools": [
+                {"name": name, "description": "", "inputSchema": {"type": "object"}}
+                for name in sorted(tools)
+            ]
+        }
+    )
+    headers = (
+        {"mcp-session-id": "test-session"} if payload["method"] == "initialize" else {}
+    )
+    return httpx.Response(
+        200,
+        headers=headers,
+        json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+        request=request,
+    )
+
+
 @pytest.mark.asyncio
-async def test_mcp_http_idle_list_changed_updates_registry(
+async def test_mcp_http_multiline_idle_notification_updates_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tools = {"gone", "stay"}
@@ -339,37 +399,13 @@ async def test_mcp_http_idle_list_changed_updates_registry(
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
-                content=b'data: {"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n\n',
+                content=(
+                    b'data: {"jsonrpc":"2.0",\n'
+                    b'data: "method":"notifications/tools/list_changed"}\n\n'
+                ),
                 request=request,
             )
-        payload = json.loads(request.content) if request.content else {}
-        if "id" not in payload:
-            return httpx.Response(202, request=request)
-        requests.append(payload["method"])
-        result = (
-            {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {"tools": {"listChanged": True}},
-            }
-            if payload["method"] == "initialize"
-            else {
-                "tools": [
-                    {"name": name, "description": "", "inputSchema": {"type": "object"}}
-                    for name in sorted(tools)
-                ]
-            }
-        )
-        headers = (
-            {"mcp-session-id": "test-session"}
-            if payload["method"] == "initialize"
-            else {}
-        )
-        return httpx.Response(
-            200,
-            headers=headers,
-            json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
-            request=request,
-        )
+        return _http_rpc_response(request, tools, requests)
 
     config = MCPServerConfig("http", "streamable-http", url="https://mcp.test")
     monkeypatch.setattr(
@@ -397,5 +433,112 @@ async def test_mcp_http_idle_list_changed_updates_registry(
             await asyncio.sleep(0.01)
         assert registry.registered_names == {"http__stay"}
         assert "tools/list" in requests
+    finally:
+        await mount.close()
+
+
+@pytest.mark.parametrize("first_stream", ["eof", "error"])
+@pytest.mark.asyncio
+async def test_mcp_http_notification_listener_reconnects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_stream: str
+) -> None:
+    tools = {"gone", "stay"}
+    requests: list[str] = []
+    get_count = 0
+    first_get = asyncio.Event()
+    allow_second = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        if request.method != "GET":
+            return _http_rpc_response(request, tools, requests)
+        get_count += 1
+        if get_count == 1:
+            first_get.set()
+            if first_stream == "error":
+                raise httpx.ConnectError("stream failed", request=request)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"",
+                request=request,
+            )
+        if get_count == 2:
+            await allow_second.wait()
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b'data: {"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n\n',
+                request=request,
+            )
+        return httpx.Response(405, request=request)
+
+    config = MCPServerConfig("http", "streamable-http", url="https://mcp.test")
+    monkeypatch.setattr(
+        "zeta.mcp.mount._build_client",
+        lambda _config: __import__(
+            "zeta.mcp.http", fromlist=["StreamableHTTPMCPClient"]
+        ).StreamableHTTPMCPClient(
+            _config, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        ),
+    )
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"http": config})
+    )
+    try:
+        await asyncio.wait_for(first_get.wait(), 1)
+        tools.remove("gone")
+        allow_second.set()
+        for _ in range(200):
+            if registry.registered_names == {"http__stay"}:
+                break
+            await asyncio.sleep(0.01)
+        assert registry.registered_names == {"http__stay"}
+        assert get_count >= 2
+    finally:
+        await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_http_notification_listener_stops_retrying_on_405(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools = {"stay"}
+    requests: list[str] = []
+    get_count = 0
+    get_finished = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        if request.method == "GET":
+            get_count += 1
+            if get_count == 2:
+                get_finished.set()
+                return httpx.Response(405, request=request)
+            return httpx.Response(500, request=request)
+        return _http_rpc_response(request, tools, requests)
+
+    config = MCPServerConfig("http", "streamable-http", url="https://mcp.test")
+    monkeypatch.setattr(
+        "zeta.mcp.mount._build_client",
+        lambda _config: __import__(
+            "zeta.mcp.http", fromlist=["StreamableHTTPMCPClient"]
+        ).StreamableHTTPMCPClient(
+            _config, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        ),
+    )
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"http": config})
+    )
+    try:
+        await asyncio.wait_for(get_finished.wait(), 1)
+        await asyncio.sleep(0.2)
+        assert get_count == 2
     finally:
         await mount.close()
