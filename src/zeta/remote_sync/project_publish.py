@@ -2,37 +2,22 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import fcntl
 import hashlib
 import json
 import os
-import re
 import shutil
 import stat
 import uuid
 from pathlib import Path
 
+from .. import project_schema
+
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
-MAX_MEMORY_FILE_SIZE = 128 * 1024
-MAX_RECORD_SIZE = 10_000_000
-MAX_NAME_LENGTH = 128
-MAX_SCOPE_LENGTH = 4096
-SCHEMA_VERSION = 1
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
 _MAX_HISTORY = 128
 _MAX_FORMAT_TWO_STATE_SIZE = 8 * 1024 * 1024
-_PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
-_PROJECT_FIELDS = {
-    "schema_version",
-    "project_id",
-    "name",
-    "scope",
-    "created_at",
-    "updated_at",
-    "canonical_integration_root",
-}
 
 
 class ProjectPublicationError(Exception):
@@ -174,46 +159,13 @@ def project_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_project_record(
-    value: dict[str, object], expected_id: str | None = None
-) -> tuple[str, str, str, str, str, str | None]:
-    """Validate one complete registry record using only the standard library."""
-
-    if (
-        not _PROJECT_FIELDS.issubset(value)
-        or not set(value).issubset(_PROJECT_FIELDS | {"lanes"})
-        or value.get("schema_version") != SCHEMA_VERSION
-    ):
-        raise ValueError("unknown or invalid project schema")
-    project_id = _validated_id(value["project_id"])
-    if expected_id is not None and project_id != expected_id:
-        raise ValueError("project ID does not match its path")
-    name = _validated_text(value["name"], "name", MAX_NAME_LENGTH)
-    scope = _validated_text(value["scope"], "scope", MAX_SCOPE_LENGTH)
-    created = _validated_timestamp(value["created_at"], "created_at")
-    updated = _validated_timestamp(value["updated_at"], "updated_at")
-    root = _validated_root(value["canonical_integration_root"])
-    return project_id, name, scope, created, updated, root
-
-
-def decode_legacy_memory(payload: bytes, name: str) -> str:
-    """Apply the registry's size and UTF-8 rules to one legacy memory file."""
-
-    if len(payload) > MAX_MEMORY_FILE_SIZE:
-        raise ValueError(f"project memory file {name} is too large")
-    try:
-        return payload.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"project memory file {name} is unreadable") from exc
-
-
 def _validate_snapshot(snapshot: Path, project_id: str) -> None:
     if snapshot.name != project_id or not snapshot.is_dir() or snapshot.is_symlink():
         raise ProjectPublicationError(
             "project snapshot path does not match its project ID"
         )
     try:
-        validate_project_record(_read_record(snapshot / "project.json"), project_id)
+        project_schema.validate_project_record(_read_record(snapshot / "project.json"), project_id)
     except ValueError as exc:
         raise ProjectPublicationError(str(exc)) from exc
     pointer_path = snapshot / "memory-current.json"
@@ -239,11 +191,11 @@ def _read_record(path: Path) -> dict[str, object]:
             not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1
             or stat.S_IMODE(info.st_mode) & 0o077
-            or info.st_size > MAX_RECORD_SIZE
+            or info.st_size > project_schema.MAX_RECORD_SIZE
         ):
             raise ProjectPublicationError("invalid project snapshot file: project.json")
         payload = path.read_bytes()
-        if len(payload) > MAX_RECORD_SIZE:
+        if len(payload) > project_schema.MAX_RECORD_SIZE:
             raise ProjectPublicationError("invalid project snapshot file: project.json")
         value = json.loads(payload, object_pairs_hook=_unique_object)
     except ProjectPublicationError:
@@ -276,48 +228,6 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
-def _validated_id(value: object) -> str:
-    if not isinstance(value, str) or not _PROJECT_ID.fullmatch(value):
-        raise ValueError("invalid project_id")
-    return value
-
-
-def _validated_text(value: object, field: str, maximum: int) -> str:
-    if not isinstance(value, str) or not value or len(value) > maximum:
-        raise ValueError(
-            f"{field} must be a non-empty string of at most {maximum} characters"
-        )
-    if "\x00" in value or any(ord(character) < 32 for character in value):
-        raise ValueError(f"{field} contains a control character")
-    return value
-
-
-def _validated_timestamp(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value.endswith("Z"):
-        raise ValueError(f"invalid {field}")
-    try:
-        parsed = dt.datetime.strptime(
-            value, "%Y-%m-%dT%H:%M:%S.%fZ"
-        ).replace(tzinfo=dt.timezone.utc)  # noqa: UP017 - remote Python can be 3.9
-    except ValueError as exc:
-        raise ValueError(f"invalid {field}") from exc
-    if parsed.strftime("%Y-%m-%dT%H:%M:%S.%fZ") != value:
-        raise ValueError(f"invalid {field}")
-    return value
-
-
-def _validated_root(value: object) -> str | None:
-    if value is None:
-        return None
-    root = _validated_text(value, "canonical_integration_root", 4096)
-    path = Path(root)
-    if not path.is_absolute() or ".." in path.parts or os.path.normpath(root) != root:
-        raise ValueError(
-            "canonical_integration_root must be an absolute normalized path"
-        )
-    return str(path.expanduser().resolve(strict=False))
-
-
 def _validate_legacy_memory(snapshot: Path) -> None:
     memory = snapshot / "memory"
     try:
@@ -339,7 +249,7 @@ def _validate_legacy_memory(snapshot: Path) -> None:
                     f"project memory file {name} is unsafe"
                 )
             payload = path.read_bytes()
-            decode_legacy_memory(payload, name)
+            project_schema.decode_legacy_memory(payload, name)
         except ProjectPublicationError:
             raise
         except (OSError, ValueError) as exc:
@@ -409,7 +319,7 @@ def _manifest_payloads(
             raise ProjectPublicationError("project memory blob is invalid")
         if memory_format == 1:
             try:
-                decode_legacy_memory(payload, name)
+                project_schema.decode_legacy_memory(payload, name)
             except ValueError as exc:
                 raise ProjectPublicationError(str(exc)) from exc
         else:

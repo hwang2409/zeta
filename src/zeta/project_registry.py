@@ -25,22 +25,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
+from . import project_schema
 from .core.session_files import atomic_publish_file
 from .project_errors import ProjectNotFoundError, ProjectRegistryError
 from .project_memory_history import ProjectMemoryHistoryMixin
+from .project_schema import (
+    ID_HEX_LENGTH,
+    ID_PREFIX,
+    MAX_MEMORY_FILE_SIZE,
+    MAX_NAME_LENGTH,
+    MAX_RECORD_SIZE,
+    MAX_SCOPE_LENGTH,
+    SCHEMA_VERSION,
+    decode_legacy_memory,
+    validate_project_record,
+    validate_project_root,
+    validate_project_text,
+)
 
-SCHEMA_VERSION = 1
-ID_PREFIX = "p_"
-ID_HEX_LENGTH = 32
-MAX_NAME_LENGTH = 128
-MAX_SCOPE_LENGTH = 4096
 MAX_PROJECTS = 10_000
-MAX_RECORD_SIZE = 10_000_000
-MAX_MEMORY_FILE_SIZE = 128 * 1024
 MAX_SESSION_REFERENCE_SIZE = 4096
 MAX_SESSION_REFERENCES = 10_000
 MAX_CREATE_RETRIES = 32
-_PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
+_PROJECT_ID = project_schema.PROJECT_ID_PATTERN
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SESSION_ROLES = {"session", "orchestrator", "worker"}
 _READ_RETRIES = 10
@@ -109,19 +116,12 @@ def _validate_id(value: object, pattern: re.Pattern[str], field: str) -> str:
 
 
 def _validate_root(value: object) -> str | None:
-    if value is None:
-        return None
     if isinstance(value, Path):
         value = str(value)
-    root = _validate_text(value, "canonical_integration_root", 4096)
-    path = Path(root)
-    if not path.is_absolute() or ".." in path.parts or os.path.normpath(root) != root:
-        raise ProjectRegistryError(
-            "canonical_integration_root must be an absolute normalized path"
-        )
-    # Directory identity is canonical, not textual; this also avoids /var vs
-    # /private/var mismatches on macOS.
-    return str(path.expanduser().resolve(strict=False))
+    try:
+        return validate_project_root(value)
+    except ValueError as exc:
+        raise ProjectRegistryError(str(exc)) from exc
 
 
 def _new_id(prefix: str) -> str:
@@ -417,9 +417,6 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
 
     @staticmethod
     def _decode(value: dict[str, object], expected_id: str | None = None) -> Project:
-        # Imported lazily because remote_sync imports ProjectRegistry during startup.
-        from .remote_sync.project_publish import validate_project_record
-
         try:
             fields = validate_project_record(value, expected_id)
         except ValueError as exc:
@@ -435,8 +432,11 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
     def create_project(
         self, name: str, scope: str, canonical_integration_root: str | None = None
     ) -> Project:
-        name = _validate_text(name, "name", MAX_NAME_LENGTH)
-        scope = _validate_text(scope, "scope", MAX_SCOPE_LENGTH)
+        try:
+            name = validate_project_text(name, "name", MAX_NAME_LENGTH)
+            scope = validate_project_text(scope, "scope", MAX_SCOPE_LENGTH)
+        except ValueError as exc:
+            raise ProjectRegistryError(str(exc)) from exc
         canonical_integration_root = _validate_root(canonical_integration_root)
         with self._locked(write=True) as root_fd:
             projects = self._list_locked(root_fd)
@@ -671,8 +671,6 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                         f"project memory file {name} is too large"
                     )
                 chunks.append(chunk)
-            from .remote_sync.project_publish import decode_legacy_memory
-
             try:
                 return decode_legacy_memory(b"".join(chunks), name)
             except ValueError as exc:

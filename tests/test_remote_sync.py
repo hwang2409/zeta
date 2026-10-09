@@ -15,6 +15,7 @@ import pytest
 
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
+from zeta.memory.profiles import memory_profile
 from zeta.project_registry import MAX_MEMORY_FILE_SIZE, ProjectRegistry
 from zeta.protocol.types import (
     Message,
@@ -820,6 +821,40 @@ def _pointerless_project_snapshot(tmp_path: Path) -> tuple[Path, str]:
     return source / "projects" / project.project_id, project.project_id
 
 
+def _format_two_project_snapshot(
+    tmp_path: Path, *, invalid: bool = False
+) -> tuple[Path, str]:
+    source = tmp_path / "source"
+    registry = ProjectRegistry(source / "projects")
+    project = registry.create_project("format-two", "test")
+    registry._create_entry_memory_for_test(project.project_id, memory_profile("zeta"))
+    snapshot = source / "projects" / project.project_id
+    if invalid:
+        pointer = json.loads((snapshot / "memory-current.json").read_text())
+        manifest_path = (
+            snapshot
+            / "memory-versions"
+            / "versions"
+            / f"{pointer['current']}.json"
+        )
+        manifest = json.loads(manifest_path.read_text())
+        old_digest = manifest["snapshot"]
+        blob = snapshot / "memory-versions" / "blobs" / old_digest
+        state = json.loads(blob.read_text())
+        state["schema"]["version"] = 0
+        payload = json.dumps(
+            state, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        new_digest = hashlib.sha256(payload).hexdigest()
+        blob.unlink()
+        (blob.parent / new_digest).write_bytes(payload)
+        for field in ("snapshot", "before_snapshot"):
+            if manifest[field] == old_digest:
+                manifest[field] = new_digest
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+    return snapshot, project.project_id
+
+
 def _publish_initial_project(
     kind: str,
     remote: Path,
@@ -837,6 +872,74 @@ def _publish_initial_project(
     SshTransport("fake", str(remote), name="cloud").publish_project(
         project_id, snapshot, expected_digest="missing"
     )
+
+
+@pytest.mark.parametrize("kind", ("local", "ssh"))
+def test_initial_format_two_snapshot_is_validated_and_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    snapshot, project_id = _format_two_project_snapshot(tmp_path)
+    remote = tmp_path / "remote"
+    if kind == "local":
+        LocalTransport(remote).publish_project(
+            project_id, snapshot, expected_digest="missing"
+        )
+    else:
+        _install_ssh_shim(tmp_path, monkeypatch)
+        SshTransport("fake", str(remote), name="cloud").publish_project(
+            project_id, snapshot, expected_digest="missing"
+        )
+
+    assert ProjectRegistry(remote / "projects")._entry_memory_state(project_id)
+
+
+@pytest.mark.parametrize("kind", ("local", "ssh"))
+def test_initial_format_two_snapshot_rejects_semantically_invalid_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    snapshot, project_id = _format_two_project_snapshot(tmp_path, invalid=True)
+    remote = tmp_path / "remote"
+    transport = (
+        LocalTransport(remote)
+        if kind == "local"
+        else SshTransport("fake", str(remote), name="cloud")
+    )
+    if kind == "ssh":
+        _install_ssh_shim(tmp_path, monkeypatch)
+
+    with pytest.raises(RemoteSyncError, match="invalid project"):
+        transport.publish_project(project_id, snapshot, expected_digest="missing")
+
+    projects = remote / "projects"
+    assert not (projects / project_id).exists()
+    assert not list(projects.glob(f".{project_id}.incoming-*"))
+
+
+def test_ssh_pull_rejects_semantically_invalid_initial_format_two_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, project_id = _format_two_project_snapshot(tmp_path, invalid=True)
+    remote = tmp_path / "remote"
+    projects = remote / "projects"
+    projects.mkdir(parents=True)
+    snapshot.rename(projects / project_id)
+    _install_ssh_shim(tmp_path, monkeypatch)
+
+    with pytest.raises(RemoteSyncError, match="invalid project"):
+        pull_project_memory(
+            tmp_path / "local",
+            SshTransport("fake", str(remote), name="cloud"),
+            project_id=project_id,
+        )
+
+    local_projects = tmp_path / "local" / "projects"
+    assert not (local_projects / project_id).exists()
+    assert not list(local_projects.glob(f".{project_id}.incoming-*"))
 
 
 @pytest.mark.parametrize("kind", ("local", "ssh"))
@@ -894,6 +997,28 @@ def test_initial_pointerless_project_rejects_invalid_snapshot_without_artifacts(
     projects = remote / "projects"
     assert not (projects / project_id).exists()
     assert not list(projects.glob(f".{project_id}.incoming-*"))
+
+
+def test_project_schema_has_single_source() -> None:
+    import zeta.project_registry as registry_module
+    import zeta.project_schema as schema
+    import zeta.remote_sync.project_publish as publication
+
+    assert registry_module.project_schema is schema
+    assert publication.project_schema is schema
+    for name in (
+        "SCHEMA_VERSION",
+        "ID_PREFIX",
+        "ID_HEX_LENGTH",
+        "MAX_NAME_LENGTH",
+        "MAX_SCOPE_LENGTH",
+        "MAX_RECORD_SIZE",
+        "MAX_MEMORY_FILE_SIZE",
+    ):
+        assert getattr(registry_module, name) is getattr(schema, name)
+
+    schema_source = Path(schema.__file__).read_text(encoding="utf-8")
+    assert schema_source in ssh_module._project_install_script()
 
 
 def test_interrupted_initial_creation_leaves_no_incoming_artifacts_local(

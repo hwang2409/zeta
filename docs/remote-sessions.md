@@ -118,3 +118,10 @@ clobbers either version.
 Memory sync uses the versioned project-memory store. It retains automatic
 provenance, records an undoable remote-sync import, and never marks content as
 accepted by the user.
+
+For format-2 snapshots, the Zeta-installed side performs full semantic decoding
+before initial publication. A push validates the exact bytes before upload; a
+pull validates them locally before publication. The SSH destination needs only
+`/usr/bin/python3`, so its shipped publisher applies the shared dependency-free
+project schema plus structural and hash checks. Those hashes ensure that the
+remote publishes the same bytes that the sender validated.

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import unquote, urlparse
 
+from .. import project_schema
 from . import (
     RemoteSyncError,
     _append_resume_hint,
@@ -179,8 +180,8 @@ finally:
 _PROJECT_INSTALL_WRAPPER = r"""
 import sys, tarfile, tempfile
 home = Path(sys.argv[1]).expanduser().resolve()
-ident, expected = sys.argv[2], sys.argv[3]
-max_members, max_bytes = int(sys.argv[4]), int(sys.argv[5])
+ident, expected, validated = sys.argv[2], sys.argv[3], sys.argv[4]
+max_members, max_bytes = int(sys.argv[5]), int(sys.argv[6])
 if Path(ident).parts != (ident,): sys.exit(45)
 home.mkdir(parents=True, exist_ok=True, mode=0o700)
 with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as temporary:
@@ -214,6 +215,7 @@ with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as tempor
                     if source.read(1): sys.exit(50)
                 target.chmod(0o600)
             else: sys.exit(46)
+    if project_digest(staging) != validated: sys.exit(46)
     try:
         publish_local_project(home, ident, staging, expected_digest=expected)
     except ProjectPublicationError as exc:
@@ -223,12 +225,27 @@ with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as tempor
 
 
 def _project_install_script() -> str:
-    """Ship the exact destination publication module to an uninstalled peer."""
+    """Ship the dependency-free schema and publisher to an uninstalled peer."""
 
-    filename = project_publish.__file__
-    if filename is None:
+    schema_filename = project_schema.__file__
+    publisher_filename = project_publish.__file__
+    if schema_filename is None or publisher_filename is None:
         raise RemoteSyncError("project publication module source is unavailable")
-    return Path(filename).read_text(encoding="utf-8") + "\n" + _PROJECT_INSTALL_WRAPPER
+    schema_source = Path(schema_filename).read_text(encoding="utf-8")
+    publisher_source = Path(publisher_filename).read_text(encoding="utf-8")
+    dependency_import = "from .. import project_schema\n"
+    if dependency_import not in publisher_source:
+        raise RemoteSyncError("project publication schema import is unavailable")
+    publisher_source = publisher_source.replace(
+        "from __future__ import annotations\n\n", "", 1
+    ).replace(dependency_import, "", 1)
+    return (
+        schema_source
+        + "\nimport sys\nproject_schema = sys.modules[__name__]\n"
+        + publisher_source
+        + "\n"
+        + _PROJECT_INSTALL_WRAPPER
+    )
 
 
 @dataclass(slots=True)
@@ -307,9 +324,20 @@ class SshTransport:
     def publish_project(
         self, project_id: str, snapshot: Path, *, expected_digest: str
     ) -> None:
-        self._install_project(
-            _safe_component(project_id, "project id"), snapshot, expected_digest
-        )
+        # The remote publisher has no Zeta install, so decode before upload.
+        from .memory import _validate_project_snapshot
+
+        project_id = _safe_component(project_id, "project id")
+        with tempfile.TemporaryDirectory(prefix="zeta-ssh-project-") as temporary:
+            outgoing = Path(temporary) / project_id
+            _copy_tree(snapshot, outgoing)
+            _validate_project_snapshot(outgoing, project_id)
+            self._install_project(
+                project_id,
+                outgoing,
+                expected_digest,
+                project_publish.project_digest(outgoing),
+            )
 
     def _existing_state(
         self, kind: str, ident: str, source: Path, force: bool
@@ -369,7 +397,9 @@ class SshTransport:
                 max_bytes=self.max_archive_bytes,
             )
 
-    def _install_project(self, ident: str, source: Path, expected: str) -> None:
+    def _install_project(
+        self, ident: str, source: Path, expected: str, validated: str
+    ) -> None:
         with tempfile.TemporaryDirectory(prefix="zeta-ssh-install-") as temporary:
             archive = Path(temporary) / "snapshot.tar.gz"
             _pack(source, archive)
@@ -380,6 +410,7 @@ class SshTransport:
                         self._home(),
                         ident,
                         expected,
+                        validated,
                         str(self.max_archive_members),
                         str(self.max_archive_bytes),
                     ],
