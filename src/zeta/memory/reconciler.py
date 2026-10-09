@@ -374,7 +374,17 @@ def _is_lossy_generated_row(row: Mapping[str, Any]) -> bool:
     }:
         return True
     message = _message(row)
-    return message is not None and message.get("role") == "tool_result"
+    if message is not None and message.get("role") == "tool_result":
+        return True
+    metadata = message.get("metadata") if message is not None else None
+    return (
+        message is not None
+        and message.get("role") == "system"
+        and isinstance(metadata, Mapping)
+        and metadata.get("zeta_event") == "agent_notifications"
+        and isinstance(metadata.get("notifications"), list)
+        and metadata.get("turn_context") is not True
+    )
 
 
 def project_transcript_row(row: dict[str, Any]) -> dict[str, Any] | None:
