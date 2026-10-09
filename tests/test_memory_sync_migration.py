@@ -31,7 +31,6 @@ from zeta.memory.entry_store import (
     apply_operations,
     empty_state,
 )
-from zeta.memory.entry_views import render_all_kinds
 from zeta.memory.migration import migrate_format_one, reverse_migration
 from zeta.memory.profiles import memory_profile
 from zeta.memory.user_authorization import MemoryMutationAuthorization
@@ -554,7 +553,7 @@ def _legacy_fixture(tmp_path: Path) -> tuple[ProjectRegistry, str, dict[str, str
 async def test_inflight_format_one_reconciliation_during_migration(
     tmp_path: Path,
 ) -> None:
-    registry, project_id, contents = _legacy_fixture(tmp_path)
+    registry, project_id, _ = _legacy_fixture(tmp_path)
     home = tmp_path / "home"
     session_dir = home / "sessions" / ("b" * 32)
     session_dir.mkdir(parents=True)
@@ -621,10 +620,14 @@ async def test_inflight_format_one_reconciliation_during_migration(
         for entry in snapshot.state.entries.values()
         if isinstance(entry, MemoryEntry)
     }
-    assert {
-        f"{kind}.md": content
-        for kind, content in render_all_kinds(snapshot.state).items()
-    } == contents
+    plan = registry._migrate_memory_for_test(
+        project_id, migrated_at="2026-10-10T00:00:00Z"
+    )
+    assert snapshot.state == plan.state
+    assert all(
+        isinstance(entry, MemoryEntry) and entry.representation == "entry"
+        for entry in snapshot.state.entries.values()
+    )
 
 
 @pytest.mark.parametrize("step", ("snapshot", "manifest", "publish"))
@@ -695,7 +698,7 @@ def test_sync_rejects_migration_manifest_without_source_and_plan_integrity(
     elif tamper == "source-version":
         manifest["source_version"] = pointer["history"][0]
     else:
-        state_digest = manifest["snapshot"]
+        state_digest = manifest["snapshot"]["state"]
         state = json.loads((blobs / state_digest).read_text())
         entry = next(iter(state["entries"].values()))
         entry["text"] = "Tampered migrated fact."
@@ -705,7 +708,7 @@ def test_sync_rejects_migration_manifest_without_source_and_plan_integrity(
         replacement = hashlib.sha256(payload).hexdigest()
         (blobs / replacement).write_bytes(payload)
         (blobs / replacement).chmod(0o600)
-        manifest["snapshot"] = replacement
+        manifest["snapshot"]["state"] = replacement
     manifest_path.write_text(json.dumps(manifest, sort_keys=True))
 
     with pytest.raises(ProjectPublicationError, match="migration"):

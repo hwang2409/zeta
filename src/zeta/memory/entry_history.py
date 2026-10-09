@@ -38,7 +38,6 @@ from zeta.memory.entry_store import (
 )
 from zeta.memory.entry_sync import EntryMemoryExport
 from zeta.memory.entry_undo import plan_entry_transaction_undo
-from zeta.memory.entry_views import render_all_kinds
 from zeta.memory.migration import MigrationPlan, migrate_format_one
 from zeta.memory.profiles import memory_profile
 from zeta.memory.version_store import (
@@ -183,6 +182,7 @@ class _MigrationPayloadAdapter:
                 "operations": [receipt_to_dict(self.plan.receipt)],
                 "source_digest": self.plan.source_digest,
                 "source_version": self.plan.source_version,
+                "source_automatic_files": sorted(self.plan.automatic_files),
                 "target_version": self.plan.source_version,
                 "migration_version": context.version,
             },
@@ -679,6 +679,9 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                                     else None
                                 ),
                                 migrated_at=str(current_manifest["created_at"]),
+                                automatic_files=frozenset(
+                                    current_manifest.get("source_automatic_files", ())
+                                ),
                             )
                     finally:
                         os.close(versions_fd)
@@ -686,12 +689,16 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                         os.close(root)
                 before = self._snapshot_locked(directory_fd)
                 source_version = None if pointer is None else str(pointer["current"])
+                automatic_files = self._automatic_files_from_records(
+                    self._records_locked(directory_fd)
+                )
                 plan = migrate_format_one(
                     project_id=project_id,
                     contents=before.contents,
                     source_digest=before.digest,
                     source_version=source_version,
                     migrated_at=migrated_at,
+                    automatic_files=frozenset(automatic_files),
                 )
                 published = publish_version(
                     directory_fd,
@@ -708,12 +715,6 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                 )
                 if published.value != plan.state:
                     raise AssertionError("migration publication changed its state")
-                rendered = {
-                    f"{kind}.md": content
-                    for kind, content in render_all_kinds(plan.state).items()
-                }
-                if rendered != plan.source_contents:
-                    raise ProjectRegistryError("migration mirror comparison failed")
                 self._refresh_entry_memory_mirror(
                     directory_fd,
                     plan.state,

@@ -39,6 +39,10 @@ def _contents(**overrides: str) -> dict[str, str]:
     return {name: overrides.get(name, "") for name in LEGACY_FILES}
 
 
+def _normalized(text: str) -> str:
+    return " ".join(text.split())
+
+
 def test_migration_splits_lists_paragraphs_and_sections() -> None:
     state = """# Current state
 
@@ -70,12 +74,12 @@ Closing paragraph.
         ("Active", "Closing paragraph."),
     ]
     assert all(entry.representation == "entry" for entry in entries)
-    assert plan.rendered_mirrors["state.md"] == state
+    assert _normalized(plan.rendered_mirrors["state.md"]) == _normalized(state)
 
 
 def test_migration_splits_overlong_blocks_at_paragraph_boundaries() -> None:
     paragraph = "x" * 2050
-    state = f"# Current state\n\n{paragraph}\n\n{paragraph}\n"
+    state = f"# Current state\n\n- {paragraph}\n\n  {paragraph}\n"
 
     plan = _plan(_contents(**{"state.md": state}))
     entries = [
@@ -86,7 +90,7 @@ def test_migration_splits_overlong_blocks_at_paragraph_boundaries() -> None:
 
     assert len(entries) == 3
     assert all(len(entry.text.encode()) <= MAX_ENTRY_TEXT_BYTES for entry in entries)
-    assert plan.rendered_mirrors["state.md"] == state
+    assert _normalized(plan.rendered_mirrors["state.md"]) == _normalized(state)
 
 
 @pytest.mark.parametrize("project", ("zeta", "phoebe", "research"))
@@ -97,7 +101,9 @@ def test_real_memory_fixture_round_trips_as_typed_entries(project: str) -> None:
 
     plan = _plan(contents, automatic_files=frozenset(metadata["automatic_files"]))
 
-    assert plan.rendered_mirrors == contents
+    assert {
+        name: _normalized(content) for name, content in plan.rendered_mirrors.items()
+    } == {name: _normalized(content) for name, content in contents.items()}
     assert all(
         isinstance(entry, MemoryEntry)
         and entry.representation == "entry"

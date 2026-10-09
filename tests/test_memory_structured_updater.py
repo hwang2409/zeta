@@ -226,7 +226,7 @@ async def test_oversized_memory_indexes_every_active_entry_and_allows_targeting(
         invoke=invoke,
         cas_retries=1,
         as_of=date(2026, 10, 9),
-        now=NOW,
+        now="2026-10-08T12:01:00.000000Z",
     )
 
     assert result.changed_entry_ids == (target,)

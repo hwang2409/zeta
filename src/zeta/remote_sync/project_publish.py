@@ -23,12 +23,18 @@ from pathlib import Path
 from typing import NamedTuple
 
 from .. import project_schema
+from ..memory_migration_plan import (
+    LEGACY_MEMORY_FILES,
+    build_migration_entries,
+    legacy_memory_digest,
+)
 
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
 _MAX_HISTORY = 128
 _MAX_FORMAT_TWO_STATE_SIZE = 8 * 1024 * 1024
+_MAX_MIGRATED_ENTRY_BYTES = 4 * 1024
 _PROJECT_DIGEST_PREFIX = "tree-v2:"
 _TREE_DIGEST_DOMAIN = b"zeta-project-tree-v2\0"
 _SNAPSHOT_PATH_CHARACTERS = frozenset(
@@ -326,8 +332,18 @@ def _validate_snapshot(snapshot: Path, project_id: str) -> None:
         pointer = _read_pointer(snapshot)
         for version in pointer["history"]:
             manifest = _read_manifest(snapshot, version)
-            _manifest_payloads(snapshot, manifest, "snapshot")
-            _manifest_payloads(snapshot, manifest, "before_snapshot")
+            current_payloads, _ = _manifest_payloads(snapshot, manifest, "snapshot")
+            before_payloads, _ = _manifest_payloads(
+                snapshot, manifest, "before_snapshot"
+            )
+            if manifest.get("format") == 2 and manifest.get("kind") == "migrate":
+                _validate_migration_manifest(
+                    snapshot,
+                    project_id,
+                    manifest,
+                    current_payloads,
+                    before_payloads,
+                )
     else:
         if (snapshot / "memory-versions").exists():
             raise ProjectPublicationError("project memory pointer is missing")
@@ -488,6 +504,66 @@ def _manifest_payloads(
             _validate_format_two_payload(payload)
         payloads[name] = payload
     return payloads, scalar
+
+
+def _validate_migration_manifest(
+    root: Path,
+    project_id: str,
+    manifest: dict[str, object],
+    current_payloads: dict[str, bytes],
+    before_payloads: dict[str, bytes],
+) -> None:
+    try:
+        contents = {
+            name: project_schema.decode_legacy_memory(before_payloads[name], name)
+            for name in LEGACY_MEMORY_FILES
+        }
+    except (KeyError, ValueError) as exc:
+        raise ProjectPublicationError("migration source snapshot is invalid") from exc
+    source_digest = manifest.get("source_digest")
+    source_version = manifest.get("source_version")
+    migrated_at = manifest.get("created_at")
+    automatic_raw = manifest.get("source_automatic_files")
+    if (
+        not isinstance(source_digest, str)
+        or legacy_memory_digest(contents) != source_digest
+        or (source_version is not None and not isinstance(source_version, str))
+        or not isinstance(migrated_at, str)
+        or not isinstance(automatic_raw, list)
+        or any(
+            not isinstance(name, str) or name not in LEGACY_MEMORY_FILES
+            for name in automatic_raw
+        )
+        or len(set(automatic_raw)) != len(automatic_raw)
+    ):
+        raise ProjectPublicationError("migration source integrity check failed")
+    if source_version is not None:
+        source_manifest = _read_manifest(root, source_version)
+        source_payloads, scalar = _manifest_payloads(
+            root, source_manifest, "snapshot"
+        )
+        if scalar or source_payloads != before_payloads:
+            raise ProjectPublicationError("migration source version does not match")
+    try:
+        state = json.loads(current_payloads["state"], object_pairs_hook=_unique_object)
+    except (KeyError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ProjectPublicationError("migration state is invalid") from exc
+    expected_entries = build_migration_entries(
+        project_id=project_id,
+        contents=contents,
+        source_digest=source_digest,
+        source_version=source_version,
+        migrated_at=migrated_at,
+        automatic_files=frozenset(automatic_raw),
+        max_entry_bytes=_MAX_MIGRATED_ENTRY_BYTES,
+    )
+    if (
+        not isinstance(state, dict)
+        or state.get("project_id") != project_id
+        or state.get("generation") != 1
+        or state.get("entries") != expected_entries
+    ):
+        raise ProjectPublicationError("migration state does not match its source")
 
 
 def _validate_format_two_payload(payload: bytes) -> None:
