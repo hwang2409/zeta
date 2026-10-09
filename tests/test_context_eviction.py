@@ -2334,21 +2334,7 @@ def test_evict_digests_old_agent_prompts_valid_tool_calls_all_providers(
     agent_call = _tool_calls_for_test(evicted.messages)[0]
     assert agent_call.id == "agent-1"
     assert agent_call.name == "agent"
-    assert agent_call.arguments == {
-        "eviction_receipt": {
-            "original_chars": len(
-                json.dumps(
-                    call.content[0].tool_call.arguments,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            ),
-            "sha256": agent_call.arguments["eviction_receipt"]["sha256"],
-            "source_seq": 10,
-        },
-        "recall_history": {"seq_start": 10, "seq_end": 10},
-    }
-    assert len(agent_call.arguments["eviction_receipt"]["sha256"]) == 16
+    assert agent_call.arguments == {"eviction_receipt": {"source_seq": 10}}
     assert "delegated implementation needle" not in str(agent_call.arguments)
     assert_payload_pairing(evicted.messages)
 
@@ -2585,10 +2571,6 @@ def test_evict_replaces_edit_write_arguments_with_call_receipts(tmp_path: Path) 
             3,
             5,
         }
-        assert calls[call_id].arguments["recall_history"] == {
-            "seq_start": calls[call_id].arguments["eviction_receipt"]["source_seq"],
-            "seq_end": calls[call_id].arguments["eviction_receipt"]["source_seq"],
-        }
     assert calls["write-failed"].arguments["content"] == "failed payload stays"
     results = {
         result.tool_call_id: result.content
@@ -2629,10 +2611,6 @@ def test_evict_bash_args_keeps_recent_tail(tmp_path: Path) -> None:
         assert calls[f"bash-{index}"].arguments["eviction_receipt"][
             "source_seq"
         ] == index * 2 + 1
-        assert calls[f"bash-{index}"].arguments["recall_history"] == {
-            "seq_start": index * 2 + 1,
-            "seq_end": index * 2 + 1,
-        }
     for index in range(2, 22):
         assert calls[f"bash-{index}"].arguments["command"] == (
             f"printf bash-command-{index}-needle " * 100

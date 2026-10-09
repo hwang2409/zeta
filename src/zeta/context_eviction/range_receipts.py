@@ -32,7 +32,9 @@ def range_receipt_candidate(
     records: Sequence[tuple[int, Message]],
     *,
     allows: Callable[[int], bool],
-    is_smaller: Callable[[Sequence[Message], Sequence[Message]], bool],
+    is_smaller: Callable[
+        [Sequence[tuple[int, Message]], Sequence[Message]], bool
+    ],
 ) -> RangeCandidate:
     """Coalesce smaller maximal runs; existing ranges permanently break runs.
 
@@ -51,7 +53,7 @@ def range_receipt_candidate(
         if len(run) >= 2:
             start, end = flattened[0][0], flattened[-1][0]
             receipt = _range_receipt(start, end, run)
-            if is_smaller([message for _, message in flattened], [receipt]):
+            if is_smaller(flattened, [receipt]):
                 output.append((start, receipt))
                 coalesced.update(seq for seq, _ in flattened)
             else:
@@ -185,16 +187,7 @@ def _round_trip_notification(message: Message, seq: int) -> Message | None:
 def _round_trip_tool_call(message: Message, seq: int) -> Message | None:
     from .receipt_constructors import _tool_call_receipt
 
-    fields = message.metadata.get(RECEIPT_FIELDS_METADATA)
-    calls = fields.get("calls") if isinstance(fields, Mapping) else None
-    if not isinstance(calls, list) or not all(isinstance(call, Mapping) for call in calls):
-        return None
-    return _tool_call_receipt(
-        message,
-        seq,
-        fields=calls,
-        metadata=_base_metadata(message),
-    )
+    return _tool_call_receipt(message, seq, metadata=_base_metadata(message))
 
 
 def _round_trip_tool_result(

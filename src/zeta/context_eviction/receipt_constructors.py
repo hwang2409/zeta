@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 
 from ..protocol.types import (
     ContentBlock,
@@ -26,69 +25,29 @@ def _tool_call_receipt(
     message: Message,
     seq: int,
     *,
-    fields: Sequence[Mapping[str, object]] | None = None,
     metadata: Mapping[str, object] | None = None,
 ) -> Message:
     """Replace complete tool arguments while preserving provider call pairing."""
 
-    calls = [
-        block.tool_call for block in message.content if isinstance(block, ToolUseContent)
-    ]
-    if not calls:
-        return message
-    if fields is None:
-        generated: list[dict[str, object]] = []
-        for call in calls:
-            encoded = json.dumps(
-                call.arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    found = False
+    content: list[ContentBlock] = []
+    for block in message.content:
+        if not isinstance(block, ToolUseContent):
+            content.append(block)
+            continue
+        found = True
+        call = block.tool_call
+        content.append(
+            ToolUseContent(
+                ToolCall(
+                    call.id,
+                    call.name,
+                    {"eviction_receipt": {"source_seq": seq}},
+                )
             )
-            generated.append(
-                {
-                    "id": call.id,
-                    "name": call.name,
-                    "original_chars": len(encoded),
-                    "sha256": hashlib.sha256(encoded.encode()).hexdigest()[:16],
-                }
-            )
-        fields = generated
-    if len(fields) != len(calls):
-        return message
-
-    receipt_fields: list[dict[str, object]] = []
-    replacements: dict[str, ToolCall] = {}
-    for call, field in zip(calls, fields, strict=True):
-        if (
-            field.get("id") != call.id
-            or field.get("name") != call.name
-            or type(field.get("original_chars")) is not int
-            or not isinstance(field.get("sha256"), str)
-        ):
-            return message
-        canonical = {
-            "id": call.id,
-            "name": call.name,
-            "original_chars": field["original_chars"],
-            "sha256": field["sha256"],
-        }
-        receipt_fields.append(canonical)
-        replacements[call.id] = ToolCall(
-            call.id,
-            call.name,
-            {
-                "eviction_receipt": {
-                    "original_chars": canonical["original_chars"],
-                    "sha256": canonical["sha256"],
-                    "source_seq": seq,
-                },
-                "recall_history": {"seq_start": seq, "seq_end": seq},
-            },
         )
-    content: list[ContentBlock] = [
-        ToolUseContent(replacements[block.tool_call.id])
-        if isinstance(block, ToolUseContent)
-        else block
-        for block in message.content
-    ]
+    if not found:
+        return message
     return Message(
         message.role,
         content,
@@ -97,7 +56,6 @@ def _tool_call_receipt(
             **(metadata if metadata is not None else message.metadata),
             "context_evicted": True,
             RECEIPT_KIND_METADATA: "tool_call",
-            RECEIPT_FIELDS_METADATA: {"calls": receipt_fields},
             "source_seq": seq,
         },
     )

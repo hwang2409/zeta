@@ -155,7 +155,8 @@ def evict_messages(
         records,
         allows=eligibility.allows,
         is_smaller=lambda originals, candidates: _strictly_smaller(
-            sum(map(token_counter, originals)), sum(map(token_counter, candidates))
+            sum(token_counter(message) for _, message in originals),
+            sum(map(token_counter, candidates)),
         ),
     )
     if range_candidate.coalesced_source_seqs:
