@@ -6,7 +6,8 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,7 @@ from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
     CompletionBackend,
     Message,
     MessageOrigin,
@@ -59,6 +61,18 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
+
+
+@dataclass(slots=True)
+class _FinishGateState:
+    deadline: float
+    max_turns: int
+    turns: int = 0
+    handoff: tuple[str, str] | None = None
+
+    @property
+    def exhausted(self) -> bool:
+        return self.turns >= self.max_turns
 
 
 async def consume_child(
@@ -101,12 +115,12 @@ async def consume_child(
             return child_loop.agent_depth + 1
         return child_loop.agent_depth
 
-    try:
-        events = (
-            child_loop.run_notification_turn()
-            if notification_turn
-            else child_loop.run_turn(prompt, origin=origin)
-        )
+    async def consume_events(
+        events: AsyncIterator[StreamEvent],
+        gate_state: _FinishGateState | None = None,
+    ) -> bool:
+        nonlocal failure_message, final_message, tool_calls
+        final_message = None
         async for event in events:
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
@@ -156,8 +170,148 @@ async def consume_child(
                 update_turns(turns)
                 if event.data.get("tool_calls") == 0 and event.message is not None:
                     final_message = event.message
+                if gate_state is not None:
+                    gate_state.turns += 1
+                    if gate_state.handoff is not None or gate_state.exhausted:
+                        return False
             elif event.type is StreamEventType.ERROR and event.error is not None:
                 failure_message = event.error.message
+        return True
+
+    def owned_children() -> tuple[tuple[str, str], ...]:
+        instance_id = child_loop.agent_instance_id
+        if instance_id is None:
+            return ()
+        return child_loop._background_owner.owned_running(instance_id)
+
+    def finish_gate_message(children: tuple[tuple[str, str], ...]) -> Message:
+        child_list = ", ".join(
+            f"{handle}: {description}" for handle, description in children
+        )
+        text = (
+            f"You have {len(children)} background sub-agents still running: "
+            f"{child_list}. You cannot finish yet. Choose one: "
+            "(a) wait: reply WAIT and end this turn; completions will wake you, "
+            "with no polling; (b) cancel them with agent_cancel; "
+            "(c) hand them off with agent_handoff, providing the reason and "
+            "where their outputs will appear."
+        )
+        return Message(
+            MessageRole.USER,
+            [TextContent(text)],
+            metadata={
+                "zeta_event": "agent_finish_gate",
+                MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
+            },
+        )
+
+    try:
+        events = (
+            child_loop.run_notification_turn()
+            if notification_turn
+            else child_loop.run_turn(prompt, origin=origin)
+        )
+        await consume_events(events)
+        children = owned_children()
+        if final_message is not None and children:
+            fallback_message = final_message
+            gate_state = _FinishGateState(
+                deadline=(
+                    asyncio.get_running_loop().time()
+                    + child_loop._background_owner.finish_gate_timeout
+                ),
+                max_turns=child_loop._background_owner.finish_gate_max_turns,
+            )
+            bound_exited = False
+
+            async def handoff(arguments: dict[str, Any]) -> str:
+                gate_state.handoff = (arguments["reason"], arguments["outputs"])
+                return "background children handed off"
+
+            async def consume_gate_events(events: AsyncIterator[StreamEvent]) -> bool:
+                try:
+                    async with asyncio.timeout_at(gate_state.deadline):
+                        return await consume_events(events, gate_state)
+                except TimeoutError:
+                    nonlocal bound_exited
+                    bound_exited = True
+                    return False
+                finally:
+                    close = getattr(events, "aclose", None)
+                    if close is not None:
+                        await close()
+
+            child_loop.tool_registry.register(
+                "agent_handoff",
+                handoff,
+                description=(
+                    "Hand off running background children to the parent. The children "
+                    "continue running and their completion receipts go to the parent."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string", "minLength": 1},
+                        "outputs": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["reason", "outputs"],
+                    "additionalProperties": False,
+                },
+                requires_approval=False,
+            )
+            try:
+                gate = finish_gate_message(children)
+                keep_going = await consume_gate_events(
+                    child_loop.run_turn(
+                        "",
+                        origin=MessageOrigin.HARNESS_NUDGE,
+                        user_message=gate,
+                    )
+                )
+                if gate_state.exhausted and gate_state.handoff is None:
+                    bound_exited = True
+                while keep_going and failure_message is None:
+                    children = owned_children()
+                    pending_notification = (
+                        child_loop.notification_system_message() is not None
+                    )
+                    if not children and not pending_notification:
+                        break
+                    if children:
+                        remaining = (
+                            gate_state.deadline - asyncio.get_running_loop().time()
+                        )
+                        if remaining <= 0:
+                            bound_exited = True
+                            break
+                        try:
+                            async with asyncio.timeout(remaining):
+                                await child_loop._background_owner.conversation_channel.wait(
+                                    child_loop.agent_instance_id or ""
+                                )
+                        except TimeoutError:
+                            bound_exited = True
+                            break
+                    if child_loop.notification_system_message() is None:
+                        continue
+                    keep_going = await consume_gate_events(
+                        child_loop.run_notification_turn()
+                    )
+            finally:
+                child_loop.tool_registry.unregister("agent_handoff")
+            if gate_state.handoff is not None:
+                reason, outputs = gate_state.handoff
+                final_message = Message(
+                    MessageRole.ASSISTANT,
+                    [
+                        TextContent(
+                            "Handed off running background children.\n"
+                            f"Reason: {reason}\nOutputs: {outputs}"
+                        )
+                    ],
+                )
+            elif (bound_exited and owned_children()) or final_message is None:
+                final_message = fallback_message
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
@@ -303,11 +457,6 @@ async def consume_run(
                     notification_turn=True,
                     **kwargs,
                 )
-                continue
-            channel = child_loop._background_owner.conversation_channel
-            instance_id = child_loop.agent_instance_id
-            if instance_id is not None and channel.has_live_children(instance_id):
-                await channel.wait(instance_id)
                 continue
             pending = child_store.close_pending_queue_if_empty()
             if pending:
@@ -685,20 +834,14 @@ async def run_agent_tool(
             usage_sink=record_child_usage,
         )
         child_loop.one_shot = getattr(loop, "one_shot", False)
-        if follow_up_loop:
-            loop._background_owner.conversation_channel.register_loop(
-                child_instance_id
-            )
+        loop._background_owner.conversation_channel.register_loop(child_instance_id)
         if loop.plan_mode:
             child_loop.set_plan_mode(True)
         child_loop.set_background_event_sink(loop._publish_background_event)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - setup failures become receipts
-        if follow_up_loop:
-            loop._background_owner.conversation_channel.unregister_loop(
-                child_instance_id
-            )
+        loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
         if child_registry is not None:
             child_registry.background_tasks.release_directory()
         failure_text = f"agent error: {error_message(exc)}"
@@ -1033,6 +1176,7 @@ async def run_agent_tool(
         await cancel_child()
         raise
     finally:
+        loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
         loop._background_owner.unregister(child_instance_id)
         if child_policy is not None:
             child_policy.cleanup()

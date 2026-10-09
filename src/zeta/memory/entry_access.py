@@ -1,4 +1,4 @@
-"""Read models and derived mirrors for dormant format-2 project memory."""
+"""Read models and derived mirrors for format-2 project memory."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ class EntryMemoryViewMixin:
                 os.close(directory_fd)
 
     def _entry_memory_state(self, project_id: str) -> EntryMemorySnapshot:
-        """Read dormant format-2 state through the private storage seam."""
+        """Read format-2 state through the storage seam."""
         def read(root_fd: int) -> EntryMemorySnapshot:
             directory_fd = self._project_dir(root_fd, project_id)
             try:

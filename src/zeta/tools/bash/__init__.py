@@ -16,6 +16,7 @@ from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
 from .._results import _spill_preview
 from .._shared.process import (
+    _child_priority_preexec,
     _kill_and_reap,
     create_subprocess_shell_in_fd,
     tool_subprocess_env,
@@ -251,6 +252,7 @@ async def _bash(
                     start_new_session=True,
                     pass_fds=(write_fd,),
                     env=tool_subprocess_env(),
+                    preexec_fn=_child_priority_preexec(registry.command_niceness),
                 )
             finally:
                 os.close(cwd_fd)
@@ -263,6 +265,7 @@ async def _bash(
                 start_new_session=True,
                 pass_fds=(write_fd,),
                 env=tool_subprocess_env(),
+                preexec_fn=_child_priority_preexec(registry.command_niceness),
             )
         os.close(write_fd)
         write_fd = -1

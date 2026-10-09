@@ -15,7 +15,7 @@ from zeta.project_errors import ProjectRegistryError, UnsupportedMemoryFormatErr
 
 CURRENT_POINTER = "memory-current.json"
 UNSUPPORTED_FORMAT_2 = (
-    "project memory uses format 2, which this Zeta version does not support yet"
+    "project memory uses format 2; this operation requires the entry-memory interface"
 )
 
 @dataclass(frozen=True, slots=True)

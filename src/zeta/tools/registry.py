@@ -217,6 +217,7 @@ class ToolRegistry:
         approval_store: ConversationStore | None = None,
         session_store: ConversationStore | None = None,
         max_output_chars: int = 10_000,
+        command_niceness: int = 10,
         register_builtin: bool = True,
         enforce_approvals: bool = False,
         skill_catalog: SkillCatalog,
@@ -262,6 +263,9 @@ class ToolRegistry:
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
         if type(max_output_chars) is not int or max_output_chars < 1:
             raise ValueError("max_output_chars must be a positive integer")
+        if type(command_niceness) is not int or not 0 <= command_niceness <= 19:
+            raise ValueError("command_niceness must be an integer from 0 to 19")
+        self.command_niceness = command_niceness
         if pre_execute_hook is not None and hook is not None:
             raise ValueError("pass only one pre-execution hook")
         self.pre_execute_hook = pre_execute_hook or hook
@@ -302,6 +306,7 @@ class ToolRegistry:
             directory_fd=session_store.directory_fd
             if session_store is not None
             else None,
+            command_niceness=command_niceness,
         )
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
@@ -681,6 +686,7 @@ class ToolRegistry:
         clone.background_tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
+            command_niceness=clone.command_niceness,
         )
         clone.bash_cwd = store.bash_cwd
         clone.abort_signal = clone._abort_registry.new_generation()

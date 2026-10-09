@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+SUPPORTED_MEMORY_FORMATS = frozenset({1, 2})
+
 import copy
 import fcntl
 import hashlib

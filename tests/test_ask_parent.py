@@ -5,11 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend
 from zeta.agent.background import BackgroundAgentOwner
-from zeta.agent.runner import consume_run
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.protocol.types import ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.skills.catalog import SkillCatalog
 from zeta.tools.agent_send import send_to_run
@@ -150,100 +149,6 @@ async def test_child_finish_and_cancel_withdraw_pending_questions(
         "question withdrawn: child finished",
         "question withdrawn: child canceled",
     ]
-
-
-@pytest.mark.asyncio
-async def test_grandchild_question_wakes_idle_direct_parent_loop(
-    tmp_path: Path,
-) -> None:
-    root = ConversationStore(tmp_path / "root")
-    parent = ConversationStore(root.session_dir / "agents", session_id="1", cwd=tmp_path)
-    owner = BackgroundAgentOwner(root)
-    parent_id = "root:1"
-    grandchild_id = "root:1:1"
-    owner.register(
-        parent_id,
-        lambda: None,
-        None,  # type: ignore[arg-type] - consume_run is driven directly below
-        parent_store=root,
-        active_store=parent,
-    )
-    owner.register(
-        grandchild_id,
-        lambda: None,
-        None,  # type: ignore[arg-type] - only live ownership is relevant
-        parent_store=parent,
-        parent_instance_id=parent_id,
-    )
-    owner.conversation_channel.register_loop(parent_id)
-    backend = FakeBackend(
-        [
-            ScriptedTurn([TextContent("initial work done")]),
-            ScriptedTurn([TextContent("question observed")]),
-        ]
-    )
-    loop = AgentLoop(
-        backend,
-        parent,
-        max_turns=None,
-        skill_catalog=SkillCatalog.empty(),
-        agent_depth=1,
-        agent_instance_id=parent_id,
-        background_owner=owner,
-    )
-    turns = 0
-
-    def update_turns(value: int) -> None:
-        nonlocal turns
-        turns = value
-
-    task = asyncio.create_task(
-        consume_run(
-            loop,
-            "work",
-            child_store=parent,
-            child_path=str(parent.session_dir),
-            publish=lambda _status: None,
-            child_turns=lambda: turns,
-            update_turns=update_turns,
-            update_step=lambda _step: None,
-            update_tool_calls=lambda _count: None,
-            finish_lifecycle=lambda _state, _text: {},
-            publish_lifecycle=lambda *_args, **_kwargs: None,
-            child_result=lambda text, **_kwargs: {
-                "content": [{"type": "text", "text": text}],
-                "isError": False,
-                "structuredContent": None,
-            },
-            error_message=str,
-        )
-    )
-    for _ in range(100):
-        if backend.calls:
-            break
-        await asyncio.sleep(0.01)
-    assert len(backend.calls) == 1
-
-    owner.conversation_channel.publish_question(
-        child_instance_id=grandchild_id,
-        question_id="wake-parent",
-        question="Need input",
-        options=None,
-    )
-    for _ in range(100):
-        if len(backend.calls) == 2:
-            break
-        await asyncio.sleep(0.01)
-    assert len(backend.calls) == 2
-    assert any(
-        message.metadata.get("zeta_event") == "agent_notifications"
-        for message in backend.calls[1][0]
-    )
-
-    owner.unregister(grandchild_id)
-    owner.conversation_channel.wake(parent_id)
-    result = await asyncio.wait_for(task, timeout=1)
-    assert result["isError"] is False
 
 
 def test_resume_closes_question_for_child_that_no_longer_runs_once(

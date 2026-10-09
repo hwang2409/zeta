@@ -69,6 +69,15 @@ The user system prompt is `~/.zeta/AGENTS.md`. Repository `AGENTS.md` files
 add project instructions as Zeta walks from the repository root to the current
 directory.
 
+Agent shell commands run at a lower CPU scheduling priority by default so the
+Zeta interface stays responsive during builds and tests. Configure this in the
+global settings file; `0` disables it and the valid range is `0` through `19`:
+
+```toml
+[commands]
+command_niceness = 10
+```
+
 ## Docs
 
 - [Agents and orchestration](docs/agents.md)

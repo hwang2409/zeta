@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from ..config.settings import load_settings
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.session import OpenedSession, SessionManager
 from ..media.image_policy import image_policy_for_provider
@@ -51,6 +52,7 @@ def build_unattended_loop(
         tool_deny=metadata.tool_deny,
         tool_allow_layers=metadata.tool_allow_layers,
         image_policy=image_policy_for_provider(metadata.provider),
+        command_niceness=load_settings(home=home).settings.command_niceness,
     )
     return AgentLoop(
         backend,

@@ -127,13 +127,10 @@ def test_extraction_metrics_count_expected_and_spurious_propositions(
     workspace.mkdir()
     registry = ProjectRegistry(tmp_path / "projects")
     project = registry.find_or_create_for_directory(workspace)
-    registry.update_memory(
+    registry._replace_entry_kind(
         project.project_id,
-        {
-            "decisions.md": (
-                "# Decisions\n\nExpected `RIGHT-TOKEN-1A` and stray `WRONG-TOKEN-2B`.\n"
-            )
-        },
+        "decisions",
+        "# Decisions\n\nExpected `RIGHT-TOKEN-1A` and stray `WRONG-TOKEN-2B`.\n",
     )
 
     precision, recall = _extraction_metrics(

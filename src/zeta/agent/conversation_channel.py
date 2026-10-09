@@ -55,9 +55,6 @@ class ConversationChannel:
     def unregister_loop(self, instance_id: str) -> None:
         self._wakes.pop(instance_id, None)
 
-    def has_live_children(self, instance_id: str) -> bool:
-        return self._owner.has_live_children(instance_id)
-
     async def wait(self, instance_id: str) -> None:
         event = self._wakes[instance_id]
         await event.wait()
