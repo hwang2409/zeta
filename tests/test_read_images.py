@@ -1064,6 +1064,26 @@ async def test_watchdog_kills_runaway_worker(
 
 
 @pytest.mark.asyncio
+async def test_watchdog_accepts_worker_exit_during_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExitedProcess:
+        pid = 1234
+        returncode: int | None = None
+
+        def kill(self) -> None:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(
+        image_normalization, "_process_rss_bytes", lambda _pid: 2**63
+    )
+
+    limit = await image_normalization._watch_worker(ExitedProcess())  # type: ignore[arg-type]
+
+    assert limit == "RSS safety budget"
+
+
+@pytest.mark.asyncio
 async def test_huge_png_bounded_memory(tmp_path: Path) -> None:
     path = tmp_path / "huge.png"
     _write_huge_compressed_png(path)

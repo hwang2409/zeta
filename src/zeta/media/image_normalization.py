@@ -255,15 +255,22 @@ def _process_rss_bytes(process_id: int) -> int:
         return 0
 
 
+def _kill_worker(process: asyncio.subprocess.Process) -> None:
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+
+
 async def _watch_worker(process: asyncio.subprocess.Process) -> str | None:
     started = time.monotonic()
     while process.returncode is None:
         rss = await asyncio.to_thread(_process_rss_bytes, process.pid)
         if rss > WORKER_RSS_BUDGET_BYTES:
-            process.kill()
+            _kill_worker(process)
             return "RSS safety budget"
         if time.monotonic() - started > WORKER_DEADLINE_SECONDS:
-            process.kill()
+            _kill_worker(process)
             return "time safety deadline"
         await asyncio.sleep(_RSS_POLL_SECONDS)
     return None
@@ -324,7 +331,7 @@ async def prepare_image(
                 _stdout, stderr = await communication
                 limit = await watcher
             except asyncio.CancelledError:
-                process.kill()
+                _kill_worker(process)
                 await process.wait()
                 communication.cancel()
                 watcher.cancel()
