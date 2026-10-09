@@ -46,8 +46,24 @@ class _AgentLoopForRecovery(Protocol):
 class BackgroundAgentOwner:
     """Own cancellation and watcher state for one complete agent tree."""
 
-    def __init__(self, notification_store: ConversationStore) -> None:
+    def __init__(
+        self,
+        notification_store: ConversationStore,
+        *,
+        finish_gate_max_turns: int = 8,
+        finish_gate_timeout: float = 600,
+    ) -> None:
+        if type(finish_gate_max_turns) is not int or finish_gate_max_turns < 1:
+            raise ValueError("finish_gate_max_turns must be a positive integer")
+        if (
+            not isinstance(finish_gate_timeout, (int, float))
+            or isinstance(finish_gate_timeout, bool)
+            or not finish_gate_timeout > 0
+        ):
+            raise ValueError("finish_gate_timeout must be positive")
         self.notification_store = notification_store
+        self.finish_gate_max_turns = finish_gate_max_turns
+        self.finish_gate_timeout = float(finish_gate_timeout)
         # Receipts and adopted descendants can outlive their immediate loop.
         # The tree owns child leases until root shutdown joins all watchers.
         self.store_leases = ExitStack()
@@ -200,6 +216,32 @@ class BackgroundAgentOwner:
     @property
     def active_descriptions(self) -> tuple[str, ...]:
         return tuple(self._descriptions.values())
+
+    def owned_running(self, parent_instance_id: str) -> tuple[tuple[str, str], ...]:
+        """Return running children directly owned by one agent."""
+
+        return tuple(
+            (instance_id, self._descriptions.get(instance_id, "background task"))
+            for instance_id in self._cancellers
+            if self._parent_ids.get(instance_id) == parent_instance_id
+        )
+
+    async def wait_for_owned_completion(
+        self, parent_instance_id: str, timeout: float
+    ) -> bool:
+        """Idle until one directly owned child finishes or the bound expires."""
+
+        watchers = tuple(
+            watcher
+            for instance_id, watcher in self._watchers.items()
+            if self._parent_ids.get(instance_id) == parent_instance_id
+        )
+        if not watchers:
+            return True
+        done, _ = await asyncio.wait(
+            watchers, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+        )
+        return bool(done)
 
     async def wait(self) -> None:
         current = asyncio.current_task()
