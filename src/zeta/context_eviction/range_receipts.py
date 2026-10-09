@@ -6,16 +6,8 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
-from ..protocol.types import (
-    ContentBlock,
-    ImageContent,
-    Message,
-    MessageRole,
-    RedactedThinkingContent,
-    TextContent,
-    ThinkingContent,
-    ToolUseContent,
-)
+from ..protocol.types import Message, MessageRole, TextContent, ToolUseContent
+from .receipt_constructors import RECEIPT_FIELDS_METADATA, RECEIPT_KIND_METADATA
 
 _RANGE_LIMIT = 440
 _MAX_TOOL_KINDS = 12
@@ -39,16 +31,14 @@ class _ReceiptUnit:
 def range_receipt_candidate(
     records: Sequence[tuple[int, Message]],
     *,
-    source_messages: Mapping[int, Message],
     allows: Callable[[int], bool],
     is_smaller: Callable[[Sequence[Message], Sequence[Message]], bool],
 ) -> RangeCandidate:
-    """Coalesce maximal runs that contain no content from their source rows.
+    """Coalesce smaller maximal runs; existing ranges permanently break runs.
 
-    A provider tool call and all its receipted results are one unit. Unchanged
-    tool-use blocks are structural pairing, not removable raw content; rewritten
-    argument values must not retain their original payload. The source rows stay
-    available through ``recall_history`` after the whole unit is coalesced.
+    A provider tool call and all its receipted results are one unit. This removes
+    the complete exchange or leaves it intact, so no provider sees an orphan.
+    Each run is accepted separately through the caller's shared size policy.
     """
 
     output: list[tuple[int, Message]] = []
@@ -71,9 +61,7 @@ def range_receipt_candidate(
         run.clear()
 
     while index < len(records):
-        unit, next_index = _receipt_unit(
-            records, index, source_messages=source_messages, allows=allows
-        )
+        unit, next_index = _receipt_unit(records, index, allows)
         if unit is None:
             flush()
             output.append(records[index])
@@ -90,20 +78,16 @@ def range_receipt_candidate(
 def _receipt_unit(
     records: Sequence[tuple[int, Message]],
     index: int,
-    *,
-    source_messages: Mapping[int, Message],
     allows: Callable[[int], bool],
 ) -> tuple[_ReceiptUnit | None, int]:
     seq, message = records[index]
-    source = source_messages.get(seq)
     if (
         not allows(seq)
         or message.metadata.get("eviction_range")
-        or message.role is MessageRole.USER
-        or source is None
-        or source.role is MessageRole.USER
-        or _shares_source_content(message, source)
+        or message.metadata.get("eviction_view_invalid")
     ):
+        return None, index + 1
+    if message.role is MessageRole.USER:
         return None, index + 1
 
     calls = [
@@ -112,6 +96,8 @@ def _receipt_unit(
         if isinstance(block, ToolUseContent)
     ]
     if calls:
+        if any(not isinstance(block, ToolUseContent) for block in message.content):
+            return None, index + 1
         expected = {call.id: call.name for call in calls}
         grouped = [records[index]]
         names: list[str] = []
@@ -121,13 +107,11 @@ def _receipt_unit(
             result = result_message.tool_result
             if result is None or result.tool_call_id not in expected:
                 break
-            result_source = source_messages.get(result_seq)
-            if (
-                not allows(result_seq)
-                or result_source is None
-                or result_message.role is MessageRole.USER
-                or result_source.role is MessageRole.USER
-                or _shares_source_content(result_message, result_source)
+            if not allows(result_seq) or not _is_receipt_kind(
+                result_message,
+                result_seq,
+                "tool_result",
+                tool_name=expected[result.tool_call_id],
             ):
                 return None, index + 1
             grouped.append(records[cursor])
@@ -137,103 +121,125 @@ def _receipt_unit(
             return None, index + 1
         return _ReceiptUnit(tuple(grouped), "tool", tuple(names)), cursor
 
-    if message.tool_result is not None or any(
-        isinstance(block, ToolUseContent) for block in message.content
-    ):
-        return None, index + 1
-    kind = "notification" if source.role is MessageRole.SYSTEM else "assistant"
-    return _ReceiptUnit((records[index],), kind), index + 1
+    for kind in ("assistant", "notification"):
+        if _is_receipt_kind(message, seq, kind):
+            return _ReceiptUnit((records[index],), kind), index + 1
+    return None, index + 1
 
 
-def _shares_source_content(view: Message, source: Message) -> bool:
-    """Return whether provider-visible source content survives in the view."""
-
-    for source_block in source.content:
-        if isinstance(source_block, ToolUseContent):
-            view_call = next(
-                (
-                    block.tool_call
-                    for block in view.content
-                    if isinstance(block, ToolUseContent)
-                    and block.tool_call.id == source_block.tool_call.id
-                ),
-                None,
-            )
-            if view_call is None:
-                continue
-            for key, source_value in source_block.tool_call.arguments.items():
-                if (
-                    key in view_call.arguments
-                    and view_call.arguments[key] != source_value
-                    and _payload_survives(source_value, view_call.arguments[key])
-                ):
-                    return True
-            continue
-        if any(
-            not isinstance(view_block, ToolUseContent)
-            and _block_payload_survives(source_block, view_block)
-            for view_block in view.content
-        ):
-            return True
-
-    source_result = source.tool_result
-    view_result = view.tool_result
-    if source_result is None or view_result is None:
+def _is_receipt_kind(
+    message: Message, seq: int, kind: str, *, tool_name: str | None = None
+) -> bool:
+    marked = message.metadata.get(RECEIPT_KIND_METADATA)
+    if marked != kind:
         return False
-    if _payload_survives(source_result.content, view_result.content):
-        return True
-    if (
-        source_result.content_blocks is not None
-        and view_result.content_blocks is not None
-        and any(
-            _tool_block_payload_survives(source_block, view_block)
-            for source_block in source_result.content_blocks
-            for view_block in view_result.content_blocks
+    if message.metadata.get("source_seq") != seq:
+        return False
+    if kind == "assistant":
+        rendered = _round_trip_assistant(message, seq)
+    elif kind == "notification":
+        rendered = _round_trip_notification(message, seq)
+    else:
+        rendered = _round_trip_tool_result(message, seq, tool_name)
+    return rendered is not None and rendered.to_dict() == message.to_dict()
+
+
+def _round_trip_assistant(message: Message, seq: int) -> Message | None:
+    from .receipt_constructors import _assistant_receipt, _collapsed_assistant_receipt
+
+    fields = message.metadata.get(RECEIPT_FIELDS_METADATA)
+    if not isinstance(fields, Mapping):
+        return None
+    kind = fields.get("kind")
+    if isinstance(kind, str):
+        return _assistant_receipt(
+            seq,
+            kind,
+            role=message.role,
+            metadata=_base_metadata(message, "collapsed_into_seq"),
         )
-    ):
-        return True
-    return (
-        source_result.structured_content is not None
-        and view_result.structured_content is not None
-        and _payload_survives(
-            source_result.structured_content, view_result.structured_content
-        )
+    collapsed_into = fields.get("collapsed_into_seq")
+    older_read = fields.get("older_read")
+    if type(collapsed_into) is not int or type(older_read) is not bool:
+        return None
+    return _collapsed_assistant_receipt(seq, collapsed_into, older_read=older_read)
+
+
+def _round_trip_notification(message: Message, seq: int) -> Message | None:
+    from .receipt_constructors import _notification_receipt_from_fields
+
+    fields = message.metadata.get(RECEIPT_FIELDS_METADATA)
+    payload = fields.get("payload") if isinstance(fields, Mapping) else None
+    digest = message.metadata.get("eviction_content_digest")
+    if not isinstance(payload, Mapping) or not isinstance(digest, str):
+        return None
+    return _notification_receipt_from_fields(
+        role=message.role, seq=seq, payload=payload, content_digest=digest
     )
 
 
-def _block_payload_survives(source: ContentBlock, view: ContentBlock) -> bool:
-    if type(source) is not type(view):
-        return False
-    if isinstance(source, (TextContent, ThinkingContent)):
-        assert isinstance(view, (TextContent, ThinkingContent))
-        return _payload_survives(source.text, view.text)
-    if isinstance(source, (ImageContent, RedactedThinkingContent)):
-        assert isinstance(view, (ImageContent, RedactedThinkingContent))
-        return _payload_survives(source.data, view.data)
-    return False
+def _round_trip_tool_result(
+    message: Message, seq: int, tool_name: str | None
+) -> Message | None:
+    from .receipt_constructors import (
+        _semantic_result_receipt,
+        _structured_result_receipt,
+    )
+
+    result = message.tool_result
+    fields = message.metadata.get(RECEIPT_FIELDS_METADATA)
+    digest = message.metadata.get("eviction_content_digest")
+    if (
+        result is None
+        or not isinstance(fields, Mapping)
+        or not isinstance(digest, str)
+        or fields.get("tool_name") != tool_name
+        or tool_name is None
+    ):
+        return None
+    base = _base_metadata(message, "eviction_content_digest")
+    semantic_digest = fields.get("digest")
+    if isinstance(semantic_digest, str):
+        return _semantic_result_receipt(
+            role=message.role,
+            tool_name=tool_name,
+            tool_call_id=result.tool_call_id,
+            seq=seq,
+            digest=semantic_digest,
+            content_digest=digest,
+            is_error=result.is_error,
+            is_canceled=result.is_canceled,
+            metadata=base,
+        )
+    receipt_kind = fields.get("receipt_kind")
+    payload = fields.get("payload")
+    if receipt_kind not in {"orchestration", "workflow"} or not isinstance(
+        payload, Mapping
+    ):
+        return None
+    return _structured_result_receipt(
+        role=message.role,
+        receipt_kind=receipt_kind,
+        tool_name=tool_name,
+        tool_call_id=result.tool_call_id,
+        seq=seq,
+        payload=payload,
+        content_digest=digest,
+        is_error=result.is_error,
+        is_canceled=result.is_canceled,
+        metadata=base,
+    )
 
 
-def _tool_block_payload_survives(
-    source: Mapping[str, object], view: Mapping[str, object]
-) -> bool:
-    if source.get("type") != view.get("type"):
-        return False
-    for key in ("text", "data"):
-        if key in source and key in view:
-            return _payload_survives(source[key], view[key])
-    source_resource = source.get("resource")
-    view_resource = view.get("resource")
-    if isinstance(source_resource, Mapping) and isinstance(view_resource, Mapping):
-        for key in ("text", "blob"):
-            if key in source_resource and key in view_resource:
-                return _payload_survives(source_resource[key], view_resource[key])
-    return source == view
-
-
-def _payload_survives(source: object, view: object) -> bool:
-    if isinstance(source, str) and isinstance(view, str):
-        return bool(source) and source in view
-    return source == view
+def _base_metadata(message: Message, *extra_owned: str) -> dict[str, object]:
+    owned = {
+        "context_evicted",
+        RECEIPT_KIND_METADATA,
+        RECEIPT_FIELDS_METADATA,
+        "source_seq",
+        *extra_owned,
+    }
+    return {key: value for key, value in message.metadata.items() if key not in owned}
 
 
 def _range_receipt(start: int, end: int, units: Sequence[_ReceiptUnit]) -> Message:
@@ -268,6 +274,7 @@ def _range_receipt(start: int, end: int, units: Sequence[_ReceiptUnit]) -> Messa
         [TextContent(text)],
         metadata={
             "context_evicted": True,
+            RECEIPT_KIND_METADATA: "range",
             "eviction_range": True,
             "source_seq": start,
             "range_seq_end": end,

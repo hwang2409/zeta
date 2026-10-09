@@ -1,16 +1,24 @@
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from zeta.agent.tool_results import validated_tool_result
 from zeta.context_accounting import message_token_count
-from zeta.context_eviction import evict_messages as _real_evict_messages
-from zeta.context_eviction import eviction_view
+from zeta.context_eviction import (
+    _assistant_receipt as build_assistant_receipt,
+)
+from zeta.context_eviction import (
+    _collapsed_assistant_receipt,
+    _notification_receipt_from_fields,
+    _semantic_result_receipt,
+    _structured_result_receipt,
+    evict_messages,
+    eviction_view,
+)
+from zeta.context_eviction.range_receipts import _is_receipt_kind
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
-    ContentBlock,
     ImageContent,
     Message,
     MessageOrigin,
@@ -29,69 +37,16 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
 
-def _source_messages(records: list[tuple[int, Message]]) -> dict[int, Message]:
-    sources: dict[int, Message] = {}
-    for seq, message in records:
-        if any(isinstance(block, ToolUseContent) for block in message.content):
-            sources[seq] = message
-        elif message.tool_result is not None:
-            sources[seq] = Message(
-                message.role,
-                tool_result=ToolResult(
-                    message.tool_result.tool_call_id, f"original raw result {seq}"
-                ),
-            )
-        else:
-            sources[seq] = Message(
-                message.role, [TextContent(f"original raw message {seq}")]
-            )
-    return sources
-
-
-def _evict_messages(
-    records: list[tuple[int, Message]],
-    **kwargs: Any,
-):
-    kwargs.setdefault("source_messages", _source_messages(records))
-    return _real_evict_messages(records, **kwargs)
-
-
-def _sources_with_tool_result(
-    records: list[tuple[int, Message]], seq: int, content: str
-) -> dict[int, Message]:
-    sources = _source_messages(records)
-    result = dict(records)[seq].tool_result
-    assert result is not None
-    sources[seq] = Message(
-        MessageRole.TOOL_RESULT,
-        tool_result=ToolResult(result.tool_call_id, content),
-    )
-    return sources
-
-
 def _assistant_receipt(seq: int, kind: str = "assistant text") -> Message:
-    return Message(
-        MessageRole.ASSISTANT,
-        [TextContent(f"[{kind} evicted · seq {seq}]")],
-        metadata={
-            "context_evicted": True,
-            "eviction_receipt": "assistant",
-            "source_seq": seq,
-        },
-    )
+    return build_assistant_receipt(seq, kind)
 
 
 def _notification_receipt(seq: int) -> Message:
-    return Message(
-        MessageRole.SYSTEM,
-        [TextContent(f"[notification receipt] seq {seq}")],
-        metadata={
-            "context_evicted": True,
-            "eviction_receipt": "notification",
-            "source_seq": seq,
-            "zeta_event": "agent_notifications",
-            "notifications": [],
-        },
+    return _notification_receipt_from_fields(
+        role=MessageRole.SYSTEM,
+        seq=seq,
+        payload={"notifications": [], "original_chars": 2, "sha256": "0" * 16},
+        content_digest="0" * 64,
     )
 
 
@@ -100,17 +55,13 @@ def _tool_receipt_pair(seq: int, name: str, call_id: str) -> list[tuple[int, Mes
         MessageRole.ASSISTANT,
         [ToolUseContent(ToolCall(call_id, name, {"path": f"{call_id}.txt"}))],
     )
-    result = Message(
-        MessageRole.TOOL_RESULT,
-        tool_result=ToolResult(
-            call_id,
-            f"[semantic {name} digest · seq {seq + 1}] exact receipt",
-        ),
-        metadata={
-            "context_evicted": True,
-            "eviction_receipt": "tool_result",
-            "source_seq": seq + 1,
-        },
+    result = _semantic_result_receipt(
+        role=MessageRole.TOOL_RESULT,
+        tool_name=name,
+        tool_call_id=call_id,
+        seq=seq + 1,
+        digest="exact receipt",
+        content_digest="0" * 64,
     )
     return [(seq, call), (seq + 1, result)]
 
@@ -121,6 +72,66 @@ def _range_text(message: Message) -> str:
     block = message.content[0]
     assert isinstance(block, TextContent)
     return block.text
+
+
+@pytest.mark.parametrize(
+    ("message", "kind", "tool_name"),
+    [
+        (build_assistant_receipt(1, "assistant text"), "assistant", None),
+        (build_assistant_receipt(1, "assistant reasoning"), "assistant", None),
+        (_collapsed_assistant_receipt(1, 9, older_read=True), "assistant", None),
+        (_collapsed_assistant_receipt(1, 9, older_read=False), "assistant", None),
+        (_notification_receipt(1), "notification", None),
+        (
+            _semantic_result_receipt(
+                role=MessageRole.TOOL_RESULT,
+                tool_name="read",
+                tool_call_id="call-1",
+                seq=1,
+                digest="read file; safe",
+                content_digest="0" * 64,
+            ),
+            "tool_result",
+            "read",
+        ),
+        (
+            _structured_result_receipt(
+                role=MessageRole.TOOL_RESULT,
+                receipt_kind="workflow",
+                tool_name="inbox",
+                tool_call_id="call-1",
+                seq=1,
+                payload={"action": "list", "messages": []},
+                content_digest="0" * 64,
+            ),
+            "tool_result",
+            "inbox",
+        ),
+        (
+            _structured_result_receipt(
+                role=MessageRole.TOOL_RESULT,
+                receipt_kind="orchestration",
+                tool_name="agent",
+                tool_call_id="call-1",
+                seq=1,
+                payload={
+                    "call": "call-1",
+                    "original_chars": 10,
+                    "sha256": "0" * 16,
+                    "status": "success",
+                    "tool": "agent",
+                },
+                content_digest="0" * 64,
+            ),
+            "tool_result",
+            "agent",
+        ),
+    ],
+)
+def test_receipts_round_trip_through_constructors(
+    message: Message, kind: str, tool_name: str | None
+) -> None:
+    assert _is_receipt_kind(message, 1, kind, tool_name=tool_name)
 
 
 def test_range_receipt_coalesces_runs_of_old_receipts() -> None:
@@ -135,18 +146,18 @@ def test_range_receipt_coalesces_runs_of_old_receipts() -> None:
         *_tool_receipt_pair(18, "bash", "bash-1"),
     ]
 
-    result = _evict_messages(records, fixed_tokens=0, target_tokens=1)
+    result = evict_messages(records, fixed_tokens=0, target_tokens=1)
 
-    ranges = [message for message in result.messages if message.metadata.get("eviction_range")]
+    ranges = [
+        message for message in result.messages if message.metadata.get("eviction_range")
+    ]
     assert len(ranges) == 1
     receipt = _range_text(ranges[0])
-    assert "[evicted range] seq 10-14:" in receipt
+    assert "[evicted range] seq 10-17:" in receipt
     assert "1 tool result (read 1)" in receipt
-    assert "2 notifications" in receipt
+    assert "5 notifications" in receipt
     assert "1 assistant note" in receipt
-    assert receipt.endswith(
-        "recall_history seq_start=10, seq_end=14 for exact content"
-    )
+    assert receipt.endswith("recall_history seq_start=10, seq_end=17 for exact content")
     assert "bash" not in receipt  # Protected bash-call tail remains outside the range.
 
 
@@ -179,23 +190,22 @@ def _legacy_tool_receipt_pair(
 
 def test_legacy_semantic_digest_with_appended_raw_text_breaks_range() -> None:
     records = [
-        *_legacy_tool_receipt_pair(
-            1, "[semantic read digest · seq 2] RAW SECRET"
-        ),
+        *_legacy_tool_receipt_pair(1, "[semantic read digest · seq 2] RAW SECRET"),
         (3, _assistant_receipt(3)),
     ]
 
-    result = _evict_messages(
+    result = evict_messages(
         records,
         fixed_tokens=0,
         target_tokens=1,
         token_counter=lambda message: (
             1 if message.metadata.get("eviction_range") else 100
         ),
-        source_messages=_sources_with_tool_result(records, 2, "RAW SECRET"),
     )
 
-    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert not any(
+        message.metadata.get("eviction_range") for message in result.messages
+    )
     assert result.messages[1].tool_result is not None
     assert result.messages[1].tool_result.content.endswith("RAW SECRET")
 
@@ -211,17 +221,18 @@ def test_legacy_workflow_receipt_with_appended_raw_text_breaks_range() -> None:
         (3, _assistant_receipt(3)),
     ]
 
-    result = _evict_messages(
+    result = evict_messages(
         records,
         fixed_tokens=0,
         target_tokens=1,
         token_counter=lambda message: (
             1 if message.metadata.get("eviction_range") else 100
         ),
-        source_messages=_sources_with_tool_result(records, 2, "RAW SECRET"),
     )
 
-    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert not any(
+        message.metadata.get("eviction_range") for message in result.messages
+    )
     assert result.messages[1].tool_result is not None
     assert result.messages[1].tool_result.content.endswith("RAW SECRET")
 
@@ -237,17 +248,18 @@ def test_legacy_orchestration_receipt_with_appended_raw_text_breaks_range() -> N
         (3, _assistant_receipt(3)),
     ]
 
-    result = _evict_messages(
+    result = evict_messages(
         records,
         fixed_tokens=0,
         target_tokens=1,
         token_counter=lambda message: (
             1 if message.metadata.get("eviction_range") else 100
         ),
-        source_messages=_sources_with_tool_result(records, 2, "RAW SECRET"),
     )
 
-    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert not any(
+        message.metadata.get("eviction_range") for message in result.messages
+    )
     assert result.messages[1].tool_result is not None
     assert result.messages[1].tool_result.content.endswith("RAW SECRET")
 
@@ -268,214 +280,223 @@ def test_legacy_notification_receipt_with_appended_raw_text_breaks_range() -> No
         },
     )
 
-    result = _evict_messages(
+    result = evict_messages(
         [(1, malicious), (2, _assistant_receipt(2))],
         fixed_tokens=0,
         target_tokens=1,
         token_counter=lambda message: (
             1 if message.metadata.get("eviction_range") else 100
         ),
-        source_messages={
-            1: Message(MessageRole.SYSTEM, [TextContent("RAW SECRET")]),
-            2: Message(MessageRole.ASSISTANT, [TextContent("original answer")]),
-        },
     )
 
-    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert not any(
+        message.metadata.get("eviction_range") for message in result.messages
+    )
     block = result.messages[0].content[0]
     assert isinstance(block, TextContent)
     assert block.text.endswith("RAW SECRET")
 
 
-def test_provenance_rule_coalesces_legacy_receipts_without_shared_content() -> None:
-    records = [
-        *_legacy_tool_receipt_pair(
-            1,
-            "[semantic read digest · seq 2] read secret.txt; 1 lines; safe. "
-            "recall_history seq_start=2, seq_end=2 for exact output; "
-            "re-read only if the source may have changed.",
-        ),
-        (3, _assistant_receipt(3)),
-    ]
-
-    result = _evict_messages(
-        records,
-        fixed_tokens=0,
-        target_tokens=1,
-        token_counter=lambda message: (
-            1 if message.metadata.get("eviction_range") else 100
-        ),
-    )
-
-    assert sum(bool(message.metadata.get("eviction_range")) for message in result.messages) == 1
-
-
 @pytest.mark.parametrize(
-    ("role", "view", "source"),
+    ("kind", "message"),
     [
         (
-            MessageRole.ASSISTANT,
-            [TextContent("[assistant receipt] RAW SECRET")],
-            [TextContent("RAW SECRET")],
+            "assistant",
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent("RAW SECRET")],
+                metadata={
+                    "context_evicted": True,
+                    "eviction_receipt": "assistant",
+                    "source_seq": 1,
+                },
+            ),
         ),
         (
-            MessageRole.SYSTEM,
-            [TextContent("[notification receipt] RAW SECRET")],
-            [TextContent("RAW SECRET")],
+            "notification",
+            Message(
+                MessageRole.SYSTEM,
+                [TextContent("RAW SECRET")],
+                metadata={
+                    "context_evicted": True,
+                    "eviction_receipt": "notification",
+                    "source_seq": 1,
+                },
+            ),
         ),
         (
-            MessageRole.ASSISTANT,
-            [ImageContent("aW1hZ2U=", "image/png"), TextContent("receipt")],
-            [ImageContent("aW1hZ2U=", "image/png")],
-        ),
-        (
-            MessageRole.ASSISTANT,
-            [ThinkingContent("private reasoning"), TextContent("receipt")],
-            [ThinkingContent("private reasoning")],
+            "tool_result",
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult("raw-1", "RAW SECRET"),
+                metadata={
+                    "context_evicted": True,
+                    "eviction_receipt": "tool_result",
+                    "source_seq": 2,
+                },
+            ),
         ),
     ],
 )
-def test_view_item_sharing_any_source_content_is_a_boundary(
-    role: MessageRole, view: list[ContentBlock], source: list[ContentBlock]
+def test_spoofed_marker_with_raw_text_is_not_coalesced(
+    kind: str, message: Message
 ) -> None:
-    records = [
-        (1, Message(role, view, metadata={"context_evicted": True, "source_seq": 1})),
-        (2, _assistant_receipt(2)),
-    ]
-
-    result = _evict_messages(
-        records,
-        fixed_tokens=0,
-        target_tokens=1,
-        token_counter=lambda message: (
-            1 if message.metadata.get("eviction_range") else 100
-        ),
-        source_messages={
-            1: Message(role, source),
-            2: Message(MessageRole.ASSISTANT, [TextContent("original answer")]),
-        },
-    )
-
-    assert not any(message.metadata.get("eviction_range") for message in result.messages)
-
-
-@pytest.mark.parametrize("kind", ["assistant", "notification", "tool_result"])
-def test_spoofed_marker_with_raw_text_is_not_coalesced(kind: str) -> None:
-    role = MessageRole.SYSTEM if kind == "notification" else MessageRole.ASSISTANT
-    raw = Message(
-        role,
-        [TextContent("RAW SECRET")],
-        metadata={
-            "context_evicted": True,
-            "eviction_receipt": kind,
-            "source_seq": 1,
-        },
-    )
-    records = [(1, raw), (2, _assistant_receipt(2))]
-    sources = {
-        1: Message(role, [TextContent("RAW SECRET")]),
-        2: Message(MessageRole.ASSISTANT, [TextContent("original answer")]),
-    }
-    if kind == "tool_result":
-        call = Message(
-            MessageRole.ASSISTANT,
-            [ToolUseContent(ToolCall("raw-1", "read", {"path": "secret"}))],
-        )
-        raw = Message(
-            MessageRole.TOOL_RESULT,
-            tool_result=ToolResult("raw-1", "RAW SECRET"),
-            metadata={
-                "context_evicted": True,
-                "eviction_receipt": kind,
-                "source_seq": 2,
-            },
-        )
-        records = [(1, call), (2, raw), (3, _assistant_receipt(3))]
-        sources = {
-            1: call,
-            2: Message(
-                MessageRole.TOOL_RESULT,
-                tool_result=ToolResult("raw-1", "RAW SECRET"),
+    records = (
+        [
+            (
+                1,
+                Message(
+                    MessageRole.ASSISTANT,
+                    [ToolUseContent(ToolCall("raw-1", "read", {"path": "secret"}))],
+                ),
             ),
-            3: Message(MessageRole.ASSISTANT, [TextContent("original answer")]),
-        }
+            (2, message),
+            (3, _assistant_receipt(3)),
+        ]
+        if kind == "tool_result"
+        else [(1, message), (2, _assistant_receipt(2))]
+    )
 
-    result = _evict_messages(
+    result = evict_messages(
         records,
         fixed_tokens=0,
         target_tokens=1,
-        token_counter=lambda message: (
-            1 if message.metadata.get("eviction_range") else 100
+        token_counter=lambda candidate: (
+            1 if candidate.metadata.get("eviction_range") else 100
         ),
-        source_messages=sources,
     )
 
-    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert not any(
+        candidate.metadata.get("eviction_range") for candidate in result.messages
+    )
+    assert "RAW SECRET" in json.dumps(
+        [candidate.to_dict() for candidate in result.messages]
+    )
 
 
 def test_inbox_title_beyond_constructor_limit_is_not_coalesced() -> None:
     title = "x" * 81
+    payload = {
+        "action": "list",
+        "messages": [
+            {
+                "claimed": False,
+                "done": False,
+                "id": "message-1",
+                "kind": "question",
+                "status": "new",
+                "title": title,
+            }
+        ],
+    }
+    text = (
+        "[workflow result receipt] "
+        + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        + "; recall_history seq_start=2, seq_end=2 for exact result"
+    )
     records = [
-        *_legacy_tool_receipt_pair(
-            1,
-            f"[workflow result receipt] title={title}; "
-            "recall_history seq_start=2, seq_end=2 for exact result",
-            name="inbox",
-        ),
+        *_legacy_tool_receipt_pair(1, text, name="inbox"),
         (3, _assistant_receipt(3)),
     ]
 
-    result = _evict_messages(
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=lambda candidate: (
+            1 if candidate.metadata.get("eviction_range") else 100
+        ),
+    )
+
+    assert not any(
+        candidate.metadata.get("eviction_range") for candidate in result.messages
+    )
+    assert title in result.messages[1].tool_result.content
+
+
+def test_only_generated_receipts_coalesce() -> None:
+    generated = _assistant_receipt(1)
+    unmarked = Message(
+        generated.role,
+        list(generated.content),
+        metadata={
+            key: value
+            for key, value in generated.metadata.items()
+            if key != "eviction_receipt"
+        },
+    )
+    altered = Message(
+        generated.role,
+        [TextContent("not the constructor output")],
+        metadata=generated.metadata,
+    )
+
+    assert _is_receipt_kind(generated, 1, "assistant")
+    assert not _is_receipt_kind(unmarked, 1, "assistant")
+    assert not _is_receipt_kind(altered, 1, "assistant")
+
+    result = evict_messages(
+        [(1, generated), (2, _assistant_receipt(2))],
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=lambda message: (
+            1 if message.metadata.get("eviction_range") else 100
+        ),
+    )
+    assert len(result.messages) == 1
+    assert result.messages[0].metadata.get("eviction_range") is True
+
+
+def test_legacy_view_receipts_are_regenerated_from_source_once() -> None:
+    source = Message(MessageRole.ASSISTANT, [TextContent("original " * 200)])
+    legacy = Message(
+        MessageRole.ASSISTANT,
+        [TextContent("an obsolete receipt that must not be trusted")],
+        metadata={"context_evicted": True, "source_seq": 1},
+    )
+    counter = lambda message: 10 if message.metadata.get("context_evicted") else 100
+
+    first = evict_messages(
+        [(1, legacy)],
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=counter,
+        source_messages={1: source},
+    )
+    second = evict_messages(
+        [(1, first.messages[0])],
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=counter,
+        source_messages={1: source},
+    )
+
+    assert first.messages[0].metadata["eviction_receipt"] == "assistant"
+    assert first.messages[0].to_dict() == second.messages[0].to_dict()
+    assert first.items_evicted == 1
+    assert second.items_evicted == 0
+
+
+def test_semantic_digest_excerpts_may_coalesce() -> None:
+    records = [
+        *_tool_receipt_pair(1, "read", "read-1"),
+        *_tool_receipt_pair(3, "read", "read-2"),
+    ]
+
+    result = evict_messages(
         records,
         fixed_tokens=0,
         target_tokens=1,
         token_counter=lambda message: (
             1 if message.metadata.get("eviction_range") else 100
         ),
-        source_messages=_sources_with_tool_result(records, 2, title),
     )
 
-    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert len(result.messages) == 1
+    assert result.messages[0].metadata.get("eviction_range") is True
 
 
-def test_rewritten_tool_argument_sharing_source_content_is_a_boundary() -> None:
-    source_call = Message(
-        MessageRole.ASSISTANT,
-        [ToolUseContent(ToolCall("agent-1", "agent", {"prompt": "RAW PROMPT"}))],
-    )
-    view_call = Message(
-        MessageRole.ASSISTANT,
-        [
-            ToolUseContent(
-                ToolCall("agent-1", "agent", {"prompt": "[receipt] RAW PROMPT"})
-            )
-        ],
-        metadata={"context_evicted": True, "source_seq": 1},
-    )
-    records = [
-        (1, view_call),
-        (2, _tool_receipt_pair(1, "agent", "agent-1")[1][1]),
-        (3, _assistant_receipt(3)),
-    ]
-
-    result = _evict_messages(
-        records,
-        fixed_tokens=0,
-        target_tokens=1,
-        source_messages={
-            1: source_call,
-            2: Message(
-                MessageRole.TOOL_RESULT,
-                tool_result=ToolResult("agent-1", "original output"),
-            ),
-            3: Message(MessageRole.ASSISTANT, [TextContent("original answer")]),
-        },
-    )
-
-    assert not any(message.metadata.get("eviction_range") for message in result.messages)
-
-
-def test_reasoning_evicted_messages_with_raw_text_or_images_break_ranges() -> None:
+def test_reasoning_evicted_raw_text_or_images_never_coalesce() -> None:
     records = [
         (
             1,
@@ -488,12 +509,15 @@ def test_reasoning_evicted_messages_with_raw_text_or_images_break_ranges() -> No
             2,
             Message(
                 MessageRole.ASSISTANT,
-                [ThinkingContent("more reasoning"), ImageContent("aW1hZ2U=", "image/png")],
+                [
+                    ThinkingContent("more reasoning"),
+                    ImageContent("aW1hZ2U=", "image/png"),
+                ],
             ),
         ),
     ]
 
-    first = _evict_messages(
+    first = evict_messages(
         records,
         fixed_tokens=0,
         target_tokens=2,
@@ -502,19 +526,15 @@ def test_reasoning_evicted_messages_with_raw_text_or_images_break_ranges() -> No
             if any(isinstance(block, ThinkingContent) for block in message.content)
             else 1
         ),
-        source_messages=dict(records),
     )
     replay = [
         (int(message.metadata["source_seq"]), message) for message in first.messages
     ]
-    second = _evict_messages(
-        replay,
-        fixed_tokens=0,
-        target_tokens=1,
-        source_messages=dict(records),
-    )
+    second = evict_messages(replay, fixed_tokens=0, target_tokens=1)
 
-    assert not any(message.metadata.get("eviction_range") for message in second.messages)
+    assert not any(
+        message.metadata.get("eviction_range") for message in second.messages
+    )
     assert [message.to_dict() for message in second.messages] == [
         message.to_dict() for message in first.messages
     ]
@@ -522,9 +542,7 @@ def test_reasoning_evicted_messages_with_raw_text_or_images_break_ranges() -> No
         isinstance(block, TextContent) and block.text == "keep this answer"
         for block in second.messages[0].content
     )
-    assert any(
-        isinstance(block, ImageContent) for block in second.messages[1].content
-    )
+    assert any(isinstance(block, ImageContent) for block in second.messages[1].content)
 
 
 def test_range_receipt_never_coalesces_user_messages() -> None:
@@ -540,10 +558,15 @@ def test_range_receipt_never_coalesces_user_messages() -> None:
         (5, _assistant_receipt(5)),
     ]
 
-    result = _evict_messages(records, fixed_tokens=0, target_tokens=1)
+    result = evict_messages(records, fixed_tokens=0, target_tokens=1)
 
-    assert sum(bool(message.metadata.get("eviction_range")) for message in result.messages) == 2
-    kept_user = next(message for message in result.messages if message.role is MessageRole.USER)
+    assert (
+        sum(bool(message.metadata.get("eviction_range")) for message in result.messages)
+        == 2
+    )
+    kept_user = next(
+        message for message in result.messages if message.role is MessageRole.USER
+    )
     assert kept_user.to_dict() == user.to_dict()
 
 
@@ -555,7 +578,7 @@ def test_range_receipt_keeps_provider_payload_valid() -> None:
         *_tool_receipt_pair(7, "search", "protected-1"),
     ]
 
-    messages = _evict_messages(
+    messages = evict_messages(
         records,
         fixed_tokens=0,
         target_tokens=1,
@@ -587,9 +610,14 @@ async def test_range_receipt_recall_returns_exact_originals(tmp_path: Path) -> N
     store = ConversationStore(tmp_path / "sessions")
     originals = [_assistant_receipt(seq) for seq in range(1, 5)]
     entries = [store.append_message(message) for message in originals]
-    records = [(entry.seq, message) for entry, message in zip(entries, originals, strict=True)]
-    result = _evict_messages(records, fixed_tokens=0, target_tokens=1)
-    assert sum(bool(message.metadata.get("eviction_range")) for message in result.messages) == 1
+    records = [
+        (entry.seq, message) for entry, message in zip(entries, originals, strict=True)
+    ]
+    result = evict_messages(records, fixed_tokens=0, target_tokens=1)
+    assert (
+        sum(bool(message.metadata.get("eviction_range")) for message in result.messages)
+        == 1
+    )
     store.append_compaction_marker(
         "evicted",
         entries[0].seq,
@@ -618,80 +646,9 @@ async def test_range_receipt_recall_returns_exact_originals(tmp_path: Path) -> N
         assert f"seq {entry.seq}: {encoded}" in recalled
 
 
-@pytest.mark.asyncio
-async def test_range_receipt_keeps_original_tool_arguments_recallable(
-    tmp_path: Path,
-) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    source_call = Message(
-        MessageRole.ASSISTANT,
-        [ToolUseContent(ToolCall("agent-1", "agent", {"prompt": "RAW PROMPT"}))],
-    )
-    source_result = Message(
-        MessageRole.TOOL_RESULT,
-        tool_result=ToolResult("agent-1", "RAW OUTPUT"),
-    )
-    source_answer = Message(MessageRole.ASSISTANT, [TextContent("RAW ANSWER")])
-    sources = [source_call, source_result, source_answer]
-    entries = [store.append_message(message) for message in sources]
-    view_call = Message(
-        MessageRole.ASSISTANT,
-        [
-            ToolUseContent(
-                ToolCall(
-                    "agent-1",
-                    "agent",
-                    {"prompt": "[agent prompt receipt] recall_history for exact prompt"},
-                )
-            )
-        ],
-        metadata={"context_evicted": True, "source_seq": entries[0].seq},
-    )
-    records = [
-        (entries[0].seq, view_call),
-        (entries[1].seq, _tool_receipt_pair(1, "agent", "agent-1")[1][1]),
-        (entries[2].seq, _assistant_receipt(entries[2].seq)),
-    ]
-    result = _real_evict_messages(
-        records,
-        fixed_tokens=0,
-        target_tokens=1,
-        source_messages={
-            entry.seq: message
-            for entry, message in zip(entries, sources, strict=True)
-        },
-    )
-    assert any(message.metadata.get("eviction_range") for message in result.messages)
-    store.append_compaction_marker(
-        "evicted",
-        entries[0].seq,
-        entries[-1].seq,
-        kind="evict",
-        view=eviction_view(records, result),
-    )
-    registry = ToolRegistry(
-        tmp_path,
-        session_store=store,
-        skill_catalog=SkillCatalog.empty(),
-    )
-    try:
-        call = ToolCall(
-            "recall-range",
-            "recall_history",
-            {"seq_start": entries[0].seq, "seq_end": entries[-1].seq},
-        )
-        recalled = validated_tool_result(await registry.execute(call), call.id).content
-    finally:
-        await registry.close()
-        store.close()
-
-    assert "RAW PROMPT" in recalled
-    assert "RAW OUTPUT" in recalled
-
-
 def test_range_receipts_are_stable_as_history_grows() -> None:
     initial = [(seq, _assistant_receipt(seq)) for seq in range(1, 7)]
-    first = _evict_messages(initial, fixed_tokens=0, target_tokens=1)
+    first = evict_messages(initial, fixed_tokens=0, target_tokens=1)
     first_range = next(
         message.to_dict()
         for message in first.messages
@@ -702,7 +659,7 @@ def test_range_receipts_are_stable_as_history_grows() -> None:
     ]
     replay.extend((seq, _assistant_receipt(seq)) for seq in range(7, 11))
 
-    grown = _evict_messages(replay, fixed_tokens=0, target_tokens=1)
+    grown = evict_messages(replay, fixed_tokens=0, target_tokens=1)
 
     ranges = [
         message.to_dict()
@@ -717,13 +674,18 @@ def test_long_session_eviction_frees_target_with_range_receipts() -> None:
     records = [(seq, _assistant_receipt(seq)) for seq in range(1, 4_001)]
     before = sum(message_token_count(message) for _, message in records)
 
-    result = _evict_messages(records, fixed_tokens=0, target_tokens=500)
+    result = evict_messages(records, fixed_tokens=0, target_tokens=500)
 
     assert before > 20_000
     assert result.reached_target is True
     assert result.tokens_after <= 500
-    assert result.tokens_after == sum(message_token_count(message) for message in result.messages)
-    assert sum(bool(message.metadata.get("eviction_range")) for message in result.messages) == 1
+    assert result.tokens_after == sum(
+        message_token_count(message) for message in result.messages
+    )
+    assert (
+        sum(bool(message.metadata.get("eviction_range")) for message in result.messages)
+        == 1
+    )
 
 
 def test_all_eviction_candidates_use_supplied_counter() -> None:
@@ -740,7 +702,7 @@ def test_all_eviction_candidates_use_supplied_counter() -> None:
     def adversarial_counter(message: Message) -> int:
         return 100_001 if message.metadata.get("context_evicted") else 2
 
-    evicted = _evict_messages(
+    evicted = evict_messages(
         records,
         fixed_tokens=0,
         target_tokens=1,
@@ -767,7 +729,7 @@ def test_all_eviction_candidates_use_supplied_counter() -> None:
             return 1 if message.metadata["source_seq"] == 1 else 100
         return 100 if message.metadata.get("source_seq", 99) <= 2 else 2
 
-    range_evicted = _evict_messages(
+    range_evicted = evict_messages(
         receipted_records,
         fixed_tokens=0,
         target_tokens=1,

@@ -23,7 +23,7 @@ from zeta.context_eviction import (
     recall_history,
 )
 from zeta.core.context import CompactionPolicy, ContextAssembler
-from zeta.core.store import ConversationStore
+from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
@@ -48,6 +48,52 @@ from zeta.providers.ollama import _messages as build_ollama_messages
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+
+
+@pytest.mark.parametrize("seqs", [[2, 1], [1, 1], [1, 3], [None]])
+def test_invalid_eviction_view_sequences_are_boundaries(
+    seqs: list[int | None],
+) -> None:
+    message = Message(
+        MessageRole.ASSISTANT,
+        [TextContent("[assistant text evicted · seq 1]")],
+        metadata={
+            "context_evicted": True,
+            "eviction_receipt": "assistant",
+            "source_seq": 1,
+        },
+    )
+    marker = ConversationEntry(
+        seq=3,
+        id="marker",
+        parent_id=None,
+        lane="main",
+        type="compaction",
+        data={
+            "kind": "evict",
+            "source_seq_start": 1,
+            "source_seq_end": 2,
+            "view": [{"seq": seq, "message": message.to_dict()} for seq in seqs],
+        },
+    )
+
+    items = ContextAssembler._marker_items(marker, {1, 2})
+
+    assert all(item.message.metadata["eviction_view_invalid"] for item in items)
+
+
+def test_view_seq_is_authoritative_over_metadata_source_seq() -> None:
+    message = Message(
+        MessageRole.ASSISTANT,
+        [TextContent("receipt")],
+        metadata={"source_seq": 2},
+    )
+
+    projected = ContextAssembler._eviction_view_message(
+        {"seq": 1, "message": message.to_dict()}
+    )
+
+    assert projected.metadata["source_seq"] == 1
 
 
 def text(role: MessageRole, value: str) -> Message:
@@ -1086,14 +1132,7 @@ def _full_recount_eviction_reference(
             or message.metadata.get("context_evicted")
         ):
             continue
-        messages[index] = Message(
-            MessageRole.ASSISTANT,
-            [TextContent(f"[assistant text evicted · seq {seq}]")],
-            metadata={
-                "context_evicted": True,
-                "source_seq": seq,
-            },
-        )
+        messages[index] = eviction_module._assistant_receipt(seq, "assistant text")
         changed.add(index)
         if total() <= target_tokens:
             return complete(True)

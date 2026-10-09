@@ -596,7 +596,9 @@ class ContextAssembler:
                 branch_changed = True
                 stale_plans += 1
                 if stale_plans == 3:
-                    logger.debug("eviction planning repeatedly invalidated by branch changes")
+                    logger.debug(
+                        "eviction planning repeatedly invalidated by branch changes"
+                    )
                 items = self._visible_items(branch)
                 snapshot = {
                     **snapshot,
@@ -1014,13 +1016,16 @@ class ContextAssembler:
             for entry in markers
         ]
         markers_by_start = {entry.data["source_seq_start"]: entry for entry in markers}
+        active_message_seqs = {
+            entry.seq for entry in entries if entry.type == "message"
+        }
         items: list[_ContextItem] = []
         emitted_marker_ids: set[str] = set()
         failed_tool_call_ids: set[str] = set()
         for entry in entries:
             marker = markers_by_start.get(entry.seq)
             if marker is not None:
-                items.extend(self._marker_items(marker))
+                items.extend(self._marker_items(marker, active_message_seqs))
                 emitted_marker_ids.add(marker.id)
             if entry.type == "compaction":
                 continue
@@ -1047,18 +1052,47 @@ class ContextAssembler:
             items.append(_ContextItem(entry, without_client_delivery_marker(message)))
         for marker in markers:
             if marker.id not in emitted_marker_ids:
-                items.extend(self._marker_items(marker))
+                items.extend(self._marker_items(marker, active_message_seqs))
         return items
 
     @staticmethod
-    def _marker_items(entry: ConversationEntry) -> list[_ContextItem]:
+    def _marker_items(
+        entry: ConversationEntry, active_message_seqs: set[int]
+    ) -> list[_ContextItem]:
         if entry.data.get("kind") == EVICTION_KIND:
-            items = [
-                _ContextItem(entry, message)
-                for message in ContextAssembler._eviction_view_messages(
-                    entry.data["view"]
+            view = entry.data["view"]
+            seqs = [item.get("seq") for item in view]
+            valid = (
+                all(type(seq) is int for seq in seqs)
+                and seqs == sorted(set(seqs))
+                and all(
+                    entry.data["source_seq_start"]
+                    <= seq
+                    <= entry.data["source_seq_end"]
+                    and seq in active_message_seqs
+                    for seq in seqs
                 )
-            ]
+            )
+            if valid:
+                messages = ContextAssembler._eviction_view_messages(view)
+            else:
+                messages = [
+                    normalize_evicted_tool_result(
+                        Message(
+                            message.role,
+                            list(message.content),
+                            tool_result=message.tool_result,
+                            metadata={
+                                **message.metadata,
+                                "eviction_view_invalid": True,
+                            },
+                        )
+                    )
+                    for item in view
+                    if isinstance(item.get("message"), Mapping)
+                    for message in [Message.from_dict(item["message"])]
+                ]
+            items = [_ContextItem(entry, message) for message in messages]
         else:
             messages = ContextAssembler._marker_messages(
                 entry.data["source_seq_start"],
@@ -1090,7 +1124,7 @@ class ContextAssembler:
                 message.role,
                 list(message.content),
                 tool_result=message.tool_result,
-                metadata={"source_seq": item["seq"], **message.metadata},
+                metadata={**message.metadata, "source_seq": item["seq"]},
             )
         )
 
