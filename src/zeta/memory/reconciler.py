@@ -57,9 +57,7 @@ _MARKDOWN_PREFIX = re.compile(
     r"^(?:(?:>\s*)|(?:#{1,6}\s+)|(?:[-*+]\s+)|(?:\d+[.)]\s+))+"
 )
 _AGENT_ACTION_PATTERNS = (
-    re.compile(
-        rf"\b(?:ensure|make sure)\b[^.\n]*\b(?:{_ACTION_VERBS})\b", re.IGNORECASE
-    ),
+    re.compile(rf"\b(?:ensure|make sure)\b[^.\n]*\b(?:{_ACTION_VERBS})\b", re.IGNORECASE),
     re.compile(
         rf"\b(?:the\s+)?(?:assistant|agent|model|you)\s+(?:should|must|shall|need to)\s+"
         rf"(?:{_ACTION_VERBS})\b",
@@ -133,6 +131,7 @@ class Proposal:
     base_digest: str
     replacements: tuple[FileReplacement, ...]
     rejected_files: tuple[str, ...] = ()
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,11 +392,7 @@ def project_transcript_row(row: dict[str, Any]) -> dict[str, Any] | None:
         return None
     projected = row
     data = row.get("data")
-    if (
-        row.get("type") == "compaction"
-        and isinstance(data, dict)
-        and isinstance(data.get("view"), list)
-    ):
+    if row.get("type") == "compaction" and isinstance(data, dict) and isinstance(data.get("view"), list):
         projected = dict(row)
         projected_data = dict(data)
         projected_data["view"] = [{"omitted_compaction_entries": len(data["view"])}]
@@ -420,14 +415,14 @@ def project_transcript_row(row: dict[str, Any]) -> dict[str, Any] | None:
     return projected
 
 
-def _prompt(transcript: Transcript, memory: Mapping[str, str], *, as_of: date) -> str:
+def _prompt(
+    transcript: Transcript, memory: Mapping[str, str], *, as_of: date
+) -> str:
     rendered_memory = json.dumps(
         {name: _sanitized(memory.get(name, "")) for name in MEMORY_FILES},
         ensure_ascii=False,
     )
-    rendered_rows = json.dumps(
-        _rendered_transcript_rows(transcript), ensure_ascii=False
-    )
+    rendered_rows = json.dumps(_rendered_transcript_rows(transcript), ensure_ascii=False)
     return f"""You reconcile one transcript range into durable project memory.
 Return one JSON object only. Do not use Markdown fences.
 
@@ -506,7 +501,9 @@ def prepare_request(
     """
     if max_bytes < 2_000:
         raise ReconciliationError("reconciliation request limit is too small")
-    safe_memory = {name: str(_sanitized(memory.get(name, ""))) for name in MEMORY_FILES}
+    safe_memory = {
+        name: str(_sanitized(memory.get(name, ""))) for name in MEMORY_FILES
+    }
     # Memory is lower priority than transcript provenance. Reduce it before rows.
     while True:
         empty = Transcript(transcript.session_id, ())
@@ -644,9 +641,7 @@ def parse_proposal(
                     "the prior decision described below is **Superseded**.\n"
                 )
                 heading_end = content.find("\n")
-                content = (
-                    content[: heading_end + 1] + marker + content[heading_end + 1 :]
-                )
+                content = content[: heading_end + 1] + marker + content[heading_end + 1 :]
         if not isinstance(sources, list) or not sources:
             raise ReconciliationError("change must have source provenance")
         parsed_sources: list[SourceRange] = []
