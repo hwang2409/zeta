@@ -23,7 +23,7 @@ from ..protocol.types import (
     ToolResult,
     ToolUseContent,
 )
-from .range_receipts import range_receipt_candidate
+from .range_receipts import RECEIPT_KIND_METADATA, range_receipt_candidate
 
 EVICTION_KIND = "evict"
 TARGET_RATIO = 0.55
@@ -251,7 +251,11 @@ def evict_messages(
             Message(
                 MessageRole.ASSISTANT,
                 [TextContent(f"[assistant text evicted · seq {seq}]")],
-                metadata={"context_evicted": True, "source_seq": seq},
+                metadata={
+                    "context_evicted": True,
+                    RECEIPT_KIND_METADATA: "assistant",
+                    "source_seq": seq,
+                },
             ),
         )
         if running_total <= target_tokens:
@@ -519,6 +523,7 @@ def _collapse_repeated_reads(
                         [TextContent(f"[older duplicate read collapsed into seq {newest[2]}]")],
                         metadata={
                             "context_evicted": True,
+                            RECEIPT_KIND_METADATA: "assistant",
                             "source_seq": records[call_index][0],
                             "collapsed_into_seq": newest[2],
                         },
@@ -531,6 +536,7 @@ def _collapse_repeated_reads(
                         [TextContent(f"[duplicate result collapsed into seq {newest[2]}]")],
                         metadata={
                             "context_evicted": True,
+                            RECEIPT_KIND_METADATA: "assistant",
                             "source_seq": seq,
                             "collapsed_into_seq": newest[2],
                         },
@@ -579,6 +585,7 @@ def _digest_result(
         metadata={
             **message.metadata,
             "context_evicted": True,
+            RECEIPT_KIND_METADATA: "tool_result",
             "source_seq": seq,
             "eviction_content_digest": _content_digest(result.content),
         },
@@ -764,6 +771,7 @@ def _orchestration_result_receipt(
         metadata={
             **message.metadata,
             "context_evicted": True,
+            RECEIPT_KIND_METADATA: "tool_result",
             "source_seq": seq,
             "eviction_content_digest": _content_digest(result.content),
         },
@@ -795,6 +803,7 @@ def _workflow_result_receipt(message: Message, call: ToolCall, seq: int) -> Mess
         metadata={
             **message.metadata,
             "context_evicted": True,
+            RECEIPT_KIND_METADATA: "tool_result",
             "source_seq": seq,
             "eviction_content_digest": _content_digest(result.content),
         },
@@ -978,6 +987,7 @@ def _notification_receipt(message: Message, seq: int) -> Message:
         [TextContent(receipt)],
         metadata={
             "context_evicted": True,
+            RECEIPT_KIND_METADATA: "notification",
             "source_seq": seq,
             "eviction_content_digest": _content_digest(encoded),
         },

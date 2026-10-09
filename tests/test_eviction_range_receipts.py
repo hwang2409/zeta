@@ -8,10 +8,12 @@ from zeta.context_accounting import message_token_count
 from zeta.context_eviction import evict_messages, eviction_view
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
+    ImageContent,
     Message,
     MessageOrigin,
     MessageRole,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
@@ -28,7 +30,11 @@ def _assistant_receipt(seq: int, kind: str = "assistant text") -> Message:
     return Message(
         MessageRole.ASSISTANT,
         [TextContent(f"[{kind} evicted · seq {seq}]")],
-        metadata={"context_evicted": True, "source_seq": seq},
+        metadata={
+            "context_evicted": True,
+            "eviction_receipt": "assistant",
+            "source_seq": seq,
+        },
     )
 
 
@@ -38,6 +44,7 @@ def _notification_receipt(seq: int) -> Message:
         [TextContent(f"[notification receipt] seq {seq}")],
         metadata={
             "context_evicted": True,
+            "eviction_receipt": "notification",
             "source_seq": seq,
             "zeta_event": "agent_notifications",
             "notifications": [],
@@ -56,7 +63,11 @@ def _tool_receipt_pair(seq: int, name: str, call_id: str) -> list[tuple[int, Mes
             call_id,
             f"[semantic {name} digest · seq {seq + 1}] exact receipt",
         ),
-        metadata={"context_evicted": True, "source_seq": seq + 1},
+        metadata={
+            "context_evicted": True,
+            "eviction_receipt": "tool_result",
+            "source_seq": seq + 1,
+        },
     )
     return [(seq, call), (seq + 1, result)]
 
@@ -94,6 +105,52 @@ def test_range_receipt_coalesces_runs_of_old_receipts() -> None:
         "recall_history seq_start=10, seq_end=14 for exact content"
     )
     assert "bash" not in receipt  # Protected bash-call tail remains outside the range.
+
+
+def test_reasoning_evicted_messages_with_raw_text_or_images_break_ranges() -> None:
+    records = [
+        (
+            1,
+            Message(
+                MessageRole.ASSISTANT,
+                [ThinkingContent("private reasoning"), TextContent("keep this answer")],
+            ),
+        ),
+        (
+            2,
+            Message(
+                MessageRole.ASSISTANT,
+                [ThinkingContent("more reasoning"), ImageContent("aW1hZ2U=", "image/png")],
+            ),
+        ),
+    ]
+
+    first = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=2,
+        token_counter=lambda message: (
+            100
+            if any(isinstance(block, ThinkingContent) for block in message.content)
+            else 1
+        ),
+    )
+    replay = [
+        (int(message.metadata["source_seq"]), message) for message in first.messages
+    ]
+    second = evict_messages(replay, fixed_tokens=0, target_tokens=1)
+
+    assert not any(message.metadata.get("eviction_range") for message in second.messages)
+    assert [message.to_dict() for message in second.messages] == [
+        message.to_dict() for message in first.messages
+    ]
+    assert any(
+        isinstance(block, TextContent) and block.text == "keep this answer"
+        for block in second.messages[0].content
+    )
+    assert any(
+        isinstance(block, ImageContent) for block in second.messages[1].content
+    )
 
 
 def test_range_receipt_never_coalesces_user_messages() -> None:
