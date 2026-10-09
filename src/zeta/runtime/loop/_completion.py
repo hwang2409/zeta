@@ -131,6 +131,15 @@ def task_is_cancelling() -> bool:
     return task is not None and task.cancelling() > 0
 
 
+def ensure_context_reduced(current: int | None, previous: int | None) -> None:
+    if current is not None and previous is not None and current >= previous:
+        raise RuntimeError(
+            "provider context overflow recovery could not reduce the prompt below "
+            f"{previous} estimated tokens; raise --token-budget only if the provider "
+            "limit also increased, or start a new session"
+        )
+
+
 def can_retry_context(
     error: ErrorInfo, retrying: bool, partial: list[ContentBlock], message: Message | None
 ) -> bool:

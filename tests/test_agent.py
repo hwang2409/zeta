@@ -116,7 +116,12 @@ async def test_context_overflow_compacts_and_retries_same_turn(
 
     backend = ContextLimitBackend()
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old work")]), MessageOrigin.USER))
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("old reasoning " * 100), TextContent("old work")],
+        )
+    )
     loop = AgentLoop(
         backend,
         store,
@@ -128,13 +133,112 @@ async def test_context_overflow_compacts_and_retries_same_turn(
 
     events = await _collect(loop.run_turn("current request", origin=MessageOrigin.USER))
 
-    assert len(backend.calls) == 3
+    assert len(backend.calls) == 2
     assert store.compaction_marker_count() == 1
     assert sum(event.type is StreamEventType.TURN_START for event in events) == 1
     assert sum(event.type is StreamEventType.TURN_END for event in events) == 1
     assert any(event.type is StreamEventType.RETRY for event in events)
     assert not any(event.type is StreamEventType.ERROR for event in events)
     assert not any(message.metadata.get("turn_failed") for message in store.messages())
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_forces_emergency_eviction_and_retries_once(
+    tmp_path: Path,
+) -> None:
+    class ContextLimitBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                error = RuntimeError(
+                    "prompt is too long: 120 tokens > 100 maximum"
+                )
+                error.code = "context_length_exceeded"
+                raise error
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("recovered")]),
+            )
+
+    store = ConversationStore(tmp_path)
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("old reasoning " * 100), TextContent("old result")],
+        )
+    )
+    backend = ContextLimitBackend()
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        backend=backend,
+        token_counter=lambda message: 1
+        if message.metadata.get("context_evicted")
+        else 40,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        context_assembler=assembler,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    events = await _collect(loop.run_turn("current request", origin=MessageOrigin.USER))
+
+    assert len(backend.calls) == 2
+    assert sum(map(assembler.token_counter, backend.calls[1])) <= 50
+    assert sum(map(assembler.token_counter, backend.calls[1])) < sum(
+        map(assembler.token_counter, backend.calls[0])
+    )
+    assert assembler.calibration_ratio == pytest.approx(1.5)
+    completed = store.messages()[-1]
+    assert completed.metadata["context_calibration_ratio"] == pytest.approx(1.5)
+    assert not any(event.type is StreamEventType.ERROR for event in events)
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_overflow_without_reduction_fails_with_diagnostic(tmp_path: Path) -> None:
+    class AlwaysOverflowBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            self.calls += 1
+            error = RuntimeError("prompt is too long: 220 tokens > 200 maximum")
+            error.code = "context_length_exceeded"
+            raise error
+            yield  # pragma: no cover
+
+    backend = AlwaysOverflowBackend()
+    store = ConversationStore(tmp_path)
+    assembler = ContextAssembler(
+        store,
+        token_budget=200,
+        retained_tail=1,
+        system_prompt="",
+        token_counter=lambda _: 1,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        context_assembler=assembler,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    events = await _collect(loop.run_turn("only request", origin=MessageOrigin.USER))
+
+    errors = [event.error for event in events if event.type is StreamEventType.ERROR]
+    assert backend.calls == 1
+    assert errors and "could not reduce" in errors[0].message
+    assert "raise --token-budget" in errors[0].message
     await loop.close()
 
 
@@ -5078,7 +5182,7 @@ async def test_context_retry_of_ordinary_empty_reply_still_nudged_once(
                 raise error
             if not tool_schemas:
                 blocks = [TextContent("summary")]
-            elif call == 3:
+            elif call == 2:
                 blocks = [ThinkingContent("quiet", "sig")]
             else:
                 blocks = [TextContent("recovered")]
@@ -5088,7 +5192,12 @@ async def test_context_retry_of_ordinary_empty_reply_still_nudged_once(
             )
 
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old work")]), MessageOrigin.USER))
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("old reasoning " * 100), TextContent("old work")],
+        )
+    )
     backend = Backend()
     loop = AgentLoop(
         backend,
@@ -5107,7 +5216,7 @@ async def test_context_retry_of_ordinary_empty_reply_still_nudged_once(
         if message.metadata.get("zeta_event") == "empty_turn_nudge"
     ]
     assert len(nudges) == 1
-    assert len(backend.calls) == 4
+    assert len(backend.calls) == 3
     await loop.close()
 
 

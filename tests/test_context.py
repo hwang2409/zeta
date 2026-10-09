@@ -764,6 +764,44 @@ async def test_provider_usage_informs_next_assembly(context_root: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_eviction_triggers_with_safety_margin_and_calibration(
+    context_root: Path,
+) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(text(MessageRole.ASSISTANT, "old"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        token_counter=lambda message: 1
+        if message.metadata.get("context_evicted")
+        else 40,
+        safety_margin=0.1,
+    )
+    assembler.last_context = assembler._context(
+        [text(MessageRole.ASSISTANT, "previous")], False
+    )
+    assembler.record_usage({"input_tokens": 48})
+
+    compacted = await assembler.assemble_context()
+
+    assert compacted.compacted is True
+    assert assembler.calibration_ratio == pytest.approx(1.2)
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("completed")],
+            metadata=assembler.completion_metadata(),
+        )
+    )
+    reopened = ContextAssembler(
+        ConversationStore(context_root, session_id=store.session_id)
+    )
+    assert reopened.calibration_ratio == pytest.approx(1.2)
+
+
+@pytest.mark.asyncio
 async def test_cached_provider_usage_triggers_compaction(context_root: Path) -> None:
     store = ConversationStore(context_root)
     store.append_message(with_message_origin(text(MessageRole.USER, "old"), MessageOrigin.USER))

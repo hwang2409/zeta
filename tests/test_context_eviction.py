@@ -1571,13 +1571,13 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
         retained_tail=1,
         telemetry_sink=telemetry.append,
     )
-    assembler._provider_token_total = 4321
+    assembler._calibration.provider_token_total = 4321
     assembler.last_compaction_telemetry = {"existing": True}
     assembler.last_usage = {"input_tokens": 91}
     before_entries = store.replay()
     before_state = (
         assembler.last_context,
-        assembler._provider_token_total,
+        assembler._calibration.provider_token_total,
         dict(assembler.last_compaction_telemetry),
         dict(assembler.last_usage),
         assembler.tokens_used_this_session,
@@ -1618,7 +1618,7 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
     assert not any(entry.type == "compaction" for entry in store.replay())
     assert (
         assembler.last_context,
-        assembler._provider_token_total,
+        assembler._calibration.provider_token_total,
         dict(assembler.last_compaction_telemetry),
         dict(assembler.last_usage),
         assembler.tokens_used_this_session,
@@ -3176,30 +3176,83 @@ def test_recall_query_matches_non_ascii_text(tmp_path: Path, needle: str) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "view_seqs,active_count",
-    [([2, 1], 2), ([1, 1], 2), ([1, 3], 2), ([1, 2], 1)],
-    ids=["order", "duplicate", "out-of-range", "inactive-branch"],
-)
-async def test_invalid_eviction_views_survive_forced_eviction_unchanged(
-    tmp_path: Path, view_seqs: list[int], active_count: int
-) -> None:
+async def test_view_with_nested_compaction_rows_is_valid(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    for index in range(active_count):
-        store.append_message(text(MessageRole.ASSISTANT, f"source-{index}"))
-    original = Message(
+    source = store.append_message(text(MessageRole.ASSISTANT, "original history"))
+    receipt = Message(
         MessageRole.ASSISTANT,
-        [ThinkingContent("private " * 100), TextContent("kept raw")],
-        metadata={"source_seq": 999},
+        [TextContent("[assistant text evicted · seq 1]")],
+        metadata={"context_evicted": True, "source_seq": source.seq},
     )
+    first = store.append_compaction_marker(
+        "evicted",
+        source.seq,
+        source.seq,
+        kind="evict",
+        view=[{"seq": source.seq, "message": receipt.to_dict()}],
+    )
+    nested = Message(MessageRole.ASSISTANT, [TextContent("nested marker receipt")])
+    second = store.append_compaction_marker(
+        "evicted again",
+        source.seq,
+        first.seq,
+        replaces=[first.id],
+        kind="evict",
+        view=[{"seq": first.seq, "message": nested.to_dict()}],
+    )
+    store.append_message(text(MessageRole.ASSISTANT, "new reasoning " * 100))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest"), MessageOrigin.USER))
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        token_counter=lambda message: 1
+        if message.role is MessageRole.USER
+        or message.metadata.get("context_evicted")
+        else 100,
+    )
+
+    visible = assembler._visible_items(store.replay())
+    context = await assembler.assemble_context(
+        force=True, bypass_eviction_hysteresis=True
+    )
+
+    assert not any(
+        item.message.metadata.get("eviction_view_invalid") for item in visible
+    )
+    assert context.token_count < sum(estimated_tokens(item.message) for item in visible)
+    third = ContextAssembler._active_markers(store.replay())[0]
+    assert third.id != second.id
+    assert third.data["source_seq_start"] == source.seq
+    assert third.data["source_seq_end"] >= second.seq
+    assert f"seq {source.seq}:" in recall_history(
+        store, seq_start=source.seq, seq_end=source.seq
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_view_falls_back_to_fresh_eviction(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    source = store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("private " * 100), TextContent("kept raw")],
+        )
+    )
+    tail = store.append_message(
+        with_message_origin(text(MessageRole.USER, "latest"), MessageOrigin.USER)
+    )
+    invalid = Message(MessageRole.ASSISTANT, [TextContent("corrupt view")])
     marker = store.append_compaction_marker(
         "evicted",
-        1,
-        2,
+        source.seq,
+        tail.seq,
         kind="evict",
-        view=[{"seq": seq, "message": original.to_dict()} for seq in view_seqs],
+        view=[
+            {"seq": source.seq, "message": invalid.to_dict()},
+            {"seq": source.seq, "message": invalid.to_dict()},
+        ],
     )
-    recall_bounds = (marker.data["source_seq_start"], marker.data["source_seq_end"])
     assembler = ContextAssembler(
         store,
         token_budget=10,
@@ -3208,17 +3261,12 @@ async def test_invalid_eviction_views_survive_forced_eviction_unchanged(
         if any(isinstance(block, ThinkingContent) for block in message.content)
         else 1,
     )
-    before = [item.message.to_dict() for item in assembler._visible_items(store.replay())]
 
     context = await assembler.assemble_context(force=True)
 
-    assert [message.to_dict() for message in context.messages] == before
+    assert context.token_count < 100
+    assert "kept raw" in rendered_text(context.messages)
     active_markers = ContextAssembler._active_markers(store.replay())
-    assert [entry.id for entry in active_markers] == [marker.id]
-    assert (
-        active_markers[0].data["source_seq_start"],
-        active_markers[0].data["source_seq_end"],
-    ) == recall_bounds
-    assert not any(
-        message.metadata.get("eviction_range") for message in context.messages
-    )
+    assert len(active_markers) == 1
+    assert active_markers[0].id != marker.id
+    assert marker.id in active_markers[0].data["replaces"]

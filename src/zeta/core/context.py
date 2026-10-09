@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from ..context_calibration import ContextCalibration
 from ..context_accounting import (
     context_digest as _digest,
     cooperative_call as _cooperative_call,
@@ -23,6 +24,7 @@ from ..context_eviction import (
     evict_messages,
     eviction_view,
     normalize_evicted_tool_result,
+    valid_eviction_view,
 )
 from ..compaction import (
     CompactionPolicy,
@@ -49,6 +51,9 @@ SummaryCompletionError = _SummaryCompletionError
 SummaryInputTooLarge = _SummaryInputTooLarge
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_SAFETY_MARGIN = 0.1
+EMERGENCY_TARGET_RATIO = 0.5
 
 
 class BudgetExceeded(RuntimeError):
@@ -129,14 +134,18 @@ class ContextAssembler:
         telemetry_sink: Callable[[Mapping[str, Any]], None] | None = None,
         on_token_growth: Callable[[int], None] | None = None,
         on_before_eviction: Callable[[int, int], None] | None = None,
+        safety_margin: float = DEFAULT_SAFETY_MARGIN,
     ) -> None:
         if token_budget <= 0:
             raise ValueError("token budget must be positive")
         if retained_tail < 1:
             raise ValueError("retained tail must be at least one")
+        if not 0 <= safety_margin < 1:
+            raise ValueError("safety margin must be between zero and one")
         self.store = store
         self.token_budget = token_budget
         self.retained_tail = retained_tail
+        self.safety_margin = safety_margin
         self.backend = backend
         self.compaction_policy = compaction_policy or CompactionPolicy(backend)
         self.token_counter = token_counter or _message_token_count
@@ -160,7 +169,7 @@ class ContextAssembler:
         )
         self.last_context: AssembledContext | None = None
         self.last_usage: dict[str, Any] = {}
-        self._provider_token_total: int | None = None
+        self._calibration = ContextCalibration(self.store.replay())
         self._tokens_used_this_session = 0
         self._cache_read_input_tokens_this_session = 0
         self._cache_creation_input_tokens_this_session = 0
@@ -185,12 +194,20 @@ class ContextAssembler:
             *(item.message for item in items),
         ]
         return self.compaction_policy.should_compact(
-            self._total_tokens(messages), self.token_budget
+            self._total_tokens(messages), self.trigger_token_budget
         )
 
     @property
     def token_count(self) -> int | None:
         return self.last_context.token_count if self.last_context is not None else None
+
+    @property
+    def calibration_ratio(self) -> float:
+        return self._calibration.ratio
+
+    @property
+    def trigger_token_budget(self) -> int:
+        return max(1, int(self.token_budget * (1 - self.safety_margin)))
 
     @property
     def tokens_used_this_session(self) -> int:
@@ -248,8 +265,21 @@ class ContextAssembler:
         if self.telemetry_sink is not None:
             self.telemetry_sink(telemetry)
 
+    def record_context_overflow(self, message: str) -> int | None:
+        estimate = None if self.last_context is None else self.last_context.token_count
+        return self._calibration.observe_overflow(message, estimate)
+
+    def completion_metadata(self) -> dict[str, Any]:
+        estimate = None if self.last_context is None else self.last_context.token_count
+        return self._calibration.completion_metadata(self.last_usage, estimate)
+
+    def begin_provider_attempt(self) -> None:
+        self.last_usage = {}
+
     def record_usage(self, usage: Mapping[str, Any]) -> None:
         self.last_usage = dict(usage)
+        estimate = None if self.last_context is None else self.last_context.token_count
+        self._calibration.observe_usage(usage, estimate)
         input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
         output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
         cache_read_tokens = usage.get("cache_read_input_tokens")
@@ -277,7 +307,7 @@ class ContextAssembler:
             if known_tokens:
                 total = sum(known_tokens)
         if type(total) is int and total >= 0:
-            self._provider_token_total = total
+            self._calibration.provider_token_total = total
             self._tokens_used_this_session += total
         if self.usage_sink is not None:
             self.usage_sink(usage)
@@ -294,8 +324,11 @@ class ContextAssembler:
         *,
         backend: CompletionBackend | None = None,
         force: bool = False,
+        emergency: bool = False,
     ) -> list[Message]:
-        context = await self.assemble_context(backend=backend, force=force)
+        context = await self.assemble_context(
+            backend=backend, force=force, emergency=emergency
+        )
         return list(context.messages)
 
     async def assemble_context(
@@ -304,6 +337,7 @@ class ContextAssembler:
         backend: CompletionBackend | None = None,
         force: bool = False,
         bypass_eviction_hysteresis: bool = False,
+        emergency: bool = False,
     ) -> AssembledContext:
         """Assemble context, optionally forcing work for a retry or manual compact.
 
@@ -364,7 +398,8 @@ class ContextAssembler:
             items=items,
             latest_user=latest_user,
             system_messages=system_messages,
-            bypass_hysteresis=bypass_eviction_hysteresis,
+            bypass_hysteresis=bypass_eviction_hysteresis or emergency,
+            target_ratio=EMERGENCY_TARGET_RATIO if emergency else TARGET_RATIO,
         )
         if evicted is not None:
             return evicted
@@ -477,7 +512,7 @@ class ContextAssembler:
             )
         except ValueError as exc:
             raise StaleBranchError("active branch changed during compaction") from exc
-        self._provider_token_total = None
+        self._calibration.reset_provider_total()
         self.last_context = proposed
         return proposed
 
@@ -503,7 +538,7 @@ class ContextAssembler:
         all_messages = [*system_messages, *(item.message for item in items)]
         total_tokens = self._total_tokens(all_messages)
         should_compact = force or self.compaction_policy.should_compact(
-            total_tokens, self.token_budget
+            total_tokens, self.trigger_token_budget
         )
         adaptive_tail = committed_tokens > self.token_budget
         if adaptive_tail:
@@ -590,7 +625,7 @@ class ContextAssembler:
                     stale = True
                 else:
                     self._record_compaction_telemetry(plan.telemetry or {})
-                    self._provider_token_total = None
+                    self._calibration.reset_provider_total()
             if stale:
                 branch = list(self.store.active_branch_snapshot())
                 branch_changed = True
@@ -616,6 +651,7 @@ class ContextAssembler:
                     backend=backend,
                     force=force,
                     bypass_eviction_hysteresis=kwargs["bypass_hysteresis"],
+                    emergency=kwargs["target_ratio"] == EMERGENCY_TARGET_RATIO,
                 )
             return None
 
@@ -628,19 +664,23 @@ class ContextAssembler:
         latest_user: int | None,
         system_messages: Sequence[Message],
         bypass_hysteresis: bool,
+        target_ratio: float,
     ) -> _EvictionPlan:
         """Pure eviction planning. This method does not read or mutate the store."""
-        if any(item.message.metadata.get("eviction_view_invalid") for item in items):
-            return _EvictionPlan(
-                "reuse",
-                self._context(
-                    [*system_messages, *(item.message for item in items)], False
-                ),
-            )
         active_markers = self._active_markers(branch)
+        active_source_seqs = {
+            entry.seq for entry in branch if entry.type in {"message", "compaction"}
+        }
         eviction_markers = [
             m for m in active_markers if m.data.get("kind") == EVICTION_KIND
         ]
+        invalid_markers = [
+            marker
+            for marker in eviction_markers
+            if not valid_eviction_view(marker, active_source_seqs)
+        ]
+        if invalid_markers:
+            bypass_hysteresis = True
         previous_ends = [m.data["source_seq_end"] for m in eviction_markers]
         if previous_ends:
             previous_end = max(previous_ends)
@@ -677,7 +717,12 @@ class ContextAssembler:
             max(b for _, b in source_ranges),
         )
         replaces = tuple(
-            e.id for e in source_entries.values() if e.type == "compaction"
+            dict.fromkeys(
+                [
+                    *(e.id for e in source_entries.values() if e.type == "compaction"),
+                    *(marker.id for marker in invalid_markers),
+                ]
+            )
         )
         records = [
             (int(i.message.metadata.get("source_seq", i.entry.seq)), i.message)
@@ -708,7 +753,7 @@ class ContextAssembler:
         result = evict_messages(
             records,
             fixed_tokens=self._count(fixed),
-            target_tokens=max(1, int(self.token_budget * TARGET_RATIO)),
+            target_tokens=max(1, int(self.token_budget * target_ratio)),
             token_counter=self.token_counter,
             unconsumed_source_seqs=unconsumed,
             source_messages=source_messages,
@@ -1005,10 +1050,7 @@ class ContextAssembler:
         return self.system_prompt
 
     def _total_tokens(self, messages: Sequence[Message]) -> int:
-        estimated = self._count(messages)
-        if self._provider_token_total is None:
-            return estimated
-        return max(estimated, self._provider_token_total)
+        return self._calibration.calibrated_tokens(self._count(messages))
 
     def _visible_items(
         self, entries: Sequence[ConversationEntry]
@@ -1018,13 +1060,21 @@ class ContextAssembler:
         for marker in all_markers:
             superseded_ids.update(marker.data.get("replaces", []))
         markers = [entry for entry in all_markers if entry.id not in superseded_ids]
+        active_source_seqs = {
+            entry.seq for entry in entries if entry.type in {"message", "compaction"}
+        }
+        valid_markers = [
+            entry
+            for entry in markers
+            if entry.data.get("kind") != EVICTION_KIND
+            or valid_eviction_view(entry, active_source_seqs)
+        ]
         compacted_ranges = [
             (entry.data["source_seq_start"], entry.data["source_seq_end"])
-            for entry in markers
+            for entry in valid_markers
         ]
-        markers_by_start = {entry.data["source_seq_start"]: entry for entry in markers}
-        active_message_seqs = {
-            entry.seq for entry in entries if entry.type == "message"
+        markers_by_start = {
+            entry.data["source_seq_start"]: entry for entry in valid_markers
         }
         items: list[_ContextItem] = []
         emitted_marker_ids: set[str] = set()
@@ -1032,7 +1082,7 @@ class ContextAssembler:
         for entry in entries:
             marker = markers_by_start.get(entry.seq)
             if marker is not None:
-                items.extend(self._marker_items(marker, active_message_seqs))
+                items.extend(self._marker_items(marker, active_source_seqs))
                 emitted_marker_ids.add(marker.id)
             if entry.type == "compaction":
                 continue
@@ -1057,29 +1107,18 @@ class ContextAssembler:
             ):
                 continue
             items.append(_ContextItem(entry, without_client_delivery_marker(message)))
-        for marker in markers:
+        for marker in valid_markers:
             if marker.id not in emitted_marker_ids:
-                items.extend(self._marker_items(marker, active_message_seqs))
+                items.extend(self._marker_items(marker, active_source_seqs))
         return items
 
     @staticmethod
     def _marker_items(
-        entry: ConversationEntry, active_message_seqs: set[int]
+        entry: ConversationEntry, active_source_seqs: set[int]
     ) -> list[_ContextItem]:
         if entry.data.get("kind") == EVICTION_KIND:
             view = entry.data["view"]
-            seqs = [item.get("seq") for item in view]
-            valid = (
-                all(type(seq) is int for seq in seqs)
-                and seqs == sorted(set(seqs))
-                and all(
-                    entry.data["source_seq_start"]
-                    <= seq
-                    <= entry.data["source_seq_end"]
-                    and seq in active_message_seqs
-                    for seq in seqs
-                )
-            )
+            valid = valid_eviction_view(entry, active_source_seqs)
             if valid:
                 messages = ContextAssembler._eviction_view_messages(view)
             else:
