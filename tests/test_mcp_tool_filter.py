@@ -3,8 +3,10 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
+import httpx
 import pytest
 
+from zeta.automations.delivery import SlackDelivery
 from zeta.core.abort import AbortSignal
 from zeta.mcp import (
     MCPConfig,
@@ -63,9 +65,19 @@ def test_mcp_tool_filter_config_rejects_invalid_lists(
     tmp_path: Path, field: str, value: object
 ) -> None:
     path = tmp_path / "mcp.json"
-    path.write_text(json.dumps({"servers": {"files": {
-        "transport": "stdio", "command": "files", field: value,
-    }}}))
+    path.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "files": {
+                        "transport": "stdio",
+                        "command": "files",
+                        field: value,
+                    }
+                }
+            }
+        )
+    )
 
     config = load_mcp_config(path)
 
@@ -75,12 +87,20 @@ def test_mcp_tool_filter_config_rejects_invalid_lists(
 
 def test_mcp_tool_filter_config_round_trips(tmp_path: Path) -> None:
     path = tmp_path / "mcp.json"
-    path.write_text(json.dumps({"servers": {"files": {
-        "transport": "stdio",
-        "command": "files",
-        "allowed_tools": ["read_*", "search"],
-        "disallowed_tools": ["read_secret"],
-    }}}))
+    path.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "files": {
+                        "transport": "stdio",
+                        "command": "files",
+                        "allowed_tools": ["read_*", "search"],
+                        "disallowed_tools": ["read_secret"],
+                    }
+                }
+            }
+        )
+    )
 
     server = load_mcp_config(path).servers["files"]
 
@@ -120,9 +140,7 @@ async def _mount(
 async def test_mcp_allowed_tools_filter_before_registration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = MCPServerConfig(
-        "files", "stdio", "unused", allowed_tools=("read_*",)
-    )
+    config = MCPServerConfig("files", "stdio", "unused", allowed_tools=("read_*",))
     registry, mount, _client = await _mount(monkeypatch, tmp_path, config)
     try:
         assert registry.registered_names == {"files__read_file"}
@@ -135,9 +153,7 @@ async def test_mcp_allowed_tools_filter_before_registration(
 async def test_mcp_disallowed_tools_filter_and_global_policy_combine(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = MCPServerConfig(
-        "files", "stdio", "unused", disallowed_tools=("write_*",)
-    )
+    config = MCPServerConfig("files", "stdio", "unused", disallowed_tools=("write_*",))
     registry, mount, _client = await _mount(
         monkeypatch,
         tmp_path,
@@ -186,9 +202,7 @@ async def test_mcp_unknown_filter_names_warn_and_zero_tools_notice(
 async def test_mcp_filtered_tool_call_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = MCPServerConfig(
-        "files", "stdio", "unused", allowed_tools=("read_file",)
-    )
+    config = MCPServerConfig("files", "stdio", "unused", allowed_tools=("read_file",))
     registry, mount, client = await _mount(monkeypatch, tmp_path, config)
     try:
         actor = mount._actors["files"]
@@ -205,12 +219,26 @@ async def test_mcp_filtered_tool_call_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_mcp_tools_list_changed_reapplies_filter(
+async def test_mcp_automation_resolve_fails_closed_for_filtered_tool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = MCPServerConfig(
-        "files", "stdio", "unused", allowed_tools=("read_*",)
+        "slack", "stdio", "unused", allowed_tools=("slack_send_message",)
     )
+    _registry, mount, client = await _mount(monkeypatch, tmp_path, config)
+    try:
+        with pytest.raises(ValueError, match="filtered"):
+            await SlackDelivery(mount).resolve("slack:@austin")
+        assert client.calls == []
+    finally:
+        await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_list_changed_reapplies_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("files", "stdio", "unused", allowed_tools=("read_*",))
     registry, mount, client = await _mount(monkeypatch, tmp_path, config)
     try:
         client.tools = [
@@ -221,10 +249,153 @@ async def test_mcp_tools_list_changed_reapplies_filter(
         client.notification_sink("notifications/tools/list_changed")
         client.notification_sink("notifications/tools/list_changed")
         for _ in range(20):
-            if "files__read_next" in registry.registered_names and client.list_calls == 3:
+            if (
+                "files__read_next" in registry.registered_names
+                and client.list_calls == 3
+            ):
                 break
             await asyncio.sleep(0)
         assert registry.registered_names == {"files__read_next"}
         assert client.list_calls == 3
+    finally:
+        await mount.close()
+
+
+class SetupNotificationClient(FilterClient):
+    async def connect(self) -> None:
+        self.tools = [MCPTool("after_setup", "", {"type": "object"})]
+        await super().connect()
+        assert self.notification_sink is not None
+        self.notification_sink("notifications/tools/list_changed")
+
+
+class BlockingRefreshClient(FilterClient):
+    def __init__(self, config: MCPServerConfig) -> None:
+        super().__init__(config)
+        self.refresh_started = asyncio.Event()
+        self.release_refresh = asyncio.Event()
+
+    async def list_tools(self) -> list[MCPTool]:
+        self.list_calls += 1
+        if self.list_calls > 1:
+            self.refresh_started.set()
+            await self.release_refresh.wait()
+        return list(self.tools)
+
+
+@pytest.mark.asyncio
+async def test_mcp_setup_notification_is_refreshed_after_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("files", "stdio", "unused")
+    client = SetupNotificationClient(config)
+    monkeypatch.setattr("zeta.mcp.mount._build_client", lambda _config: client)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {config.name: config})
+    )
+    try:
+        assert registry.registered_names == {"files__after_setup"}
+        assert client.list_calls == 2
+    finally:
+        await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_close_cancels_blocked_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("files", "stdio", "unused")
+    client = BlockingRefreshClient(config)
+    monkeypatch.setattr("zeta.mcp.mount._build_client", lambda _config: client)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {config.name: config})
+    )
+    client.tools = [MCPTool("changed", "", {"type": "object"})]
+    assert client.notification_sink is not None
+    client.notification_sink("notifications/tools/list_changed")
+    await asyncio.wait_for(client.refresh_started.wait(), 1)
+    await asyncio.wait_for(mount.close(), 1)
+
+
+@pytest.mark.asyncio
+async def test_mcp_http_idle_list_changed_updates_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools = {"gone", "stay"}
+    requests: list[str] = []
+    notify = asyncio.Event()
+    get_started = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            get_started.set()
+            await notify.wait()
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b'data: {"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n\n',
+                request=request,
+            )
+        payload = json.loads(request.content) if request.content else {}
+        if "id" not in payload:
+            return httpx.Response(202, request=request)
+        requests.append(payload["method"])
+        result = (
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {"listChanged": True}},
+            }
+            if payload["method"] == "initialize"
+            else {
+                "tools": [
+                    {"name": name, "description": "", "inputSchema": {"type": "object"}}
+                    for name in sorted(tools)
+                ]
+            }
+        )
+        headers = (
+            {"mcp-session-id": "test-session"}
+            if payload["method"] == "initialize"
+            else {}
+        )
+        return httpx.Response(
+            200,
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+            request=request,
+        )
+
+    config = MCPServerConfig("http", "streamable-http", url="https://mcp.test")
+    monkeypatch.setattr(
+        "zeta.mcp.mount._build_client",
+        lambda _config: __import__(
+            "zeta.mcp.http", fromlist=["StreamableHTTPMCPClient"]
+        ).StreamableHTTPMCPClient(
+            _config, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        ),
+    )
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"http": config})
+    )
+    try:
+        assert registry.registered_names == {"http__gone", "http__stay"}
+        await asyncio.wait_for(get_started.wait(), 1)
+        tools.remove("gone")
+        notify.set()
+        for _ in range(100):
+            if registry.registered_names == {"http__stay"}:
+                break
+            await asyncio.sleep(0.01)
+        assert registry.registered_names == {"http__stay"}
+        assert "tools/list" in requests
     finally:
         await mount.close()
