@@ -802,6 +802,136 @@ def test_unmarked_tool_call_with_receipted_results_is_a_range_boundary() -> None
     assert not any(message.metadata.get("eviction_range") for message in result.messages)
 
 
+def test_persisted_raw_calls_are_evicted_then_coalesced_and_stable() -> None:
+    raw_calls = [
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("read-1", "read", {"path": "raw/" * 100}))],
+        ),
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("search-1", "search", {"query": "raw " * 100}))],
+        ),
+    ]
+    records = [
+        (1, raw_calls[0]),
+        _tool_receipt_pair(1, "read", "read-1")[1],
+        (3, raw_calls[1]),
+        _tool_receipt_pair(3, "search", "search-1")[1],
+    ]
+    source_messages = {
+        1: raw_calls[0],
+        2: Message(
+            MessageRole.TOOL_RESULT, tool_result=ToolResult("read-1", "raw output " * 20)
+        ),
+        3: raw_calls[1],
+        4: Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult("search-1", "raw output " * 20),
+        ),
+    }
+
+    first = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        source_messages=source_messages,
+    )
+    replay = list(zip(first.source_seqs, first.messages, strict=True))
+    second = evict_messages(
+        replay,
+        fixed_tokens=0,
+        target_tokens=1,
+        source_messages=source_messages,
+    )
+
+    assert len(first.messages) == 1
+    assert first.messages[0].metadata.get("eviction_range") is True
+    assert first.messages[0].to_dict() == second.messages[0].to_dict()
+    assert second.items_evicted == 0
+
+
+def test_persisted_raw_call_eviction_respects_protection() -> None:
+    raw_call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("read-1", "read", {"path": "raw.txt"}))],
+    )
+    persisted_result = _tool_receipt_pair(1, "read", "read-1")[1]
+    source_messages = {
+        1: raw_call,
+        2: Message(
+            MessageRole.TOOL_RESULT, tool_result=ToolResult("read-1", "raw output " * 20)
+        ),
+    }
+
+    result = evict_messages(
+        [(1, raw_call), persisted_result],
+        fixed_tokens=0,
+        target_tokens=1,
+        unconsumed_source_seqs={2},
+        source_messages=source_messages,
+    )
+
+    assert result.messages[0].to_dict() == raw_call.to_dict()
+    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+
+
+def test_persisted_reasoning_eviction_with_raw_text_is_not_replaced() -> None:
+    source = Message(
+        MessageRole.ASSISTANT,
+        [
+            ThinkingContent("private reasoning"),
+            TextContent("keep this answer"),
+            ToolUseContent(ToolCall("read-1", "read", {"path": "raw/" * 100})),
+        ],
+    )
+    persisted = Message(
+        MessageRole.ASSISTANT,
+        [
+            TextContent("keep this answer"),
+            ToolUseContent(ToolCall("read-1", "read", {"path": "raw/" * 100})),
+            TextContent("[assistant reasoning evicted · seq 1]"),
+        ],
+        metadata={"context_evicted": True, "source_seq": 1},
+    )
+
+    result = evict_messages(
+        [(1, persisted)],
+        fixed_tokens=0,
+        target_tokens=1,
+        source_messages={1: source},
+    )
+
+    assert result.messages[0].to_dict() == persisted.to_dict()
+
+
+def test_persisted_raw_call_eviction_respects_size_guard() -> None:
+    raw_call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("read-1", "read", {"path": "raw.txt"}))],
+    )
+    persisted_result = _tool_receipt_pair(1, "read", "read-1")[1]
+    source_messages = {
+        1: raw_call,
+        2: Message(
+            MessageRole.TOOL_RESULT, tool_result=ToolResult("read-1", "raw output " * 20)
+        ),
+    }
+
+    result = evict_messages(
+        [(1, raw_call), persisted_result],
+        fixed_tokens=0,
+        target_tokens=1,
+        source_messages=source_messages,
+        token_counter=lambda message: (
+            100 if message.metadata.get("eviction_receipt") == "tool_call" else 1
+        ),
+    )
+
+    assert result.messages[0].to_dict() == raw_call.to_dict()
+    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+
+
 def test_legacy_regeneration_respects_unconsumed_and_notification_protection() -> None:
     source_result = Message(
         MessageRole.TOOL_RESULT,

@@ -144,7 +144,7 @@ def evict_messages(
     changed: set[int] = set()
     eligibility = _eviction_eligibility(records, unconsumed_source_seqs)
     if source_messages is not None:
-        records, regenerated = _regenerate_legacy_receipts(
+        records, regenerated = _evict_persisted_records(
             records, source_messages, token_counter, eligibility
         )
         messages = [message for _, message in records]
@@ -337,13 +337,13 @@ def evict_messages(
     )
 
 
-def _regenerate_legacy_receipts(
+def _evict_persisted_records(
     records: Sequence[tuple[int, Message]],
     source_messages: Mapping[int, Message],
     token_counter: Callable[[Message], int],
     eligibility: _EvictionEligibility,
 ) -> tuple[list[tuple[int, Message]], set[int]]:
-    """Rebuild persisted legacy receipts from active-branch source rows once."""
+    """Evict eligible persisted rows again from their active-branch sources."""
 
     from .range_receipts import _is_receipt_kind
 
@@ -380,7 +380,6 @@ def _regenerate_legacy_receipts(
         replacement = generated_by_seq.get(seq)
         if (
             eligibility.allows(seq)
-            and message.metadata.get("context_evicted")
             and not message.metadata.get("eviction_view_invalid")
             and not current
             and replacement is not None
