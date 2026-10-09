@@ -168,6 +168,69 @@ def _large_index_state(
     return state
 
 
+def _crowded_priority_state(
+    registry: ProjectRegistry,
+    project_id: str,
+    *targets: tuple[str, str],
+):
+    current = registry._entry_memory_state(project_id)
+    target_operations = tuple(
+        AddOperation(
+            kind,
+            text,
+            (MemorySource(SESSION, 1, 1, ("user",), "2026-10-01T12:00:00.000000Z", 2),),
+        )
+        for kind, text in targets
+    )
+    state, _ = apply_operations(
+        current.state,
+        target_operations,
+        reconciliation_key=_key("relevance-targets"),
+        automatic=True,
+        now="2026-10-01T12:00:00.000000Z",
+    )
+    filler = tuple(
+        AddOperation(
+            "brief",
+            f"Unrelated brief {index:03d} " + (chr(65 + index % 26) * 180),
+            (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),),
+        )
+        for index in range(100)
+    )
+    for offset in range(0, len(filler), 64):
+        state, _ = apply_operations(
+            state,
+            filler[offset : offset + 64],
+            reconciliation_key=_key(f"relevance-fillers-{offset}"),
+            automatic=True,
+            now=NOW,
+        )
+    registry._replace_entry_state_for_test(
+        project_id, state, expected_digest=current.digest
+    )
+    target_ids = tuple(
+        entry.id
+        for kind, text in targets
+        for entry in state.entries.values()
+        if isinstance(entry, MemoryEntry) and entry.kind == kind and entry.text == text
+    )
+    return state, target_ids
+
+
+def _listed_entry_ids(prompt: str) -> list[str]:
+    lines = prompt.splitlines()
+    heading = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("Current entries (full=")
+    )
+    full = json.loads(lines[heading + 1])
+    indexed = [
+        line.split()[1] for line in lines[heading + 2 :] if line.startswith("INDEX ")
+    ]
+    return [entry["id"] for entry in full] + indexed
+
+
 def _seed_user_entry(
     registry: ProjectRegistry,
     project_id: str,
@@ -324,6 +387,110 @@ def test_bounded_index_reports_omitted_entries_and_is_deterministic(
     assert "Entries omitted from this request:" in first.prompt
     assert f'"state":{300 - len(first_index)}' in first.prompt
     assert "You may only update, supersede, or resolve entries listed below" in first.prompt
+
+
+@pytest.mark.asyncio
+async def test_completion_makes_omitted_entry_visible_and_resolves_it(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, (target,) = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "PR #425 remains open pending final review."),
+    )
+    transcript = _transcript(_row(1, "PR #425 merged after final review."))
+
+    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    assert target in request.visible_entry_ids
+    result, _ = await _run(
+        registry,
+        project_id,
+        transcript,
+        [
+            _proposal(
+                {
+                    "op": "resolve",
+                    "target": target,
+                    "sources": [{"seq_start": 1, "seq_end": 1}],
+                    "reason": "the tracked PR merged",
+                }
+            )
+        ],
+        key="relevant-completion",
+    )
+
+    assert result.changed_entry_ids == (target,)
+    resolved = registry._entry_memory_state(project_id).state.entries[target]
+    assert isinstance(resolved, MemoryEntry)
+    assert resolved.status == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_correction_makes_omitted_entry_visible_and_supersedes_it(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, (target,) = _crowded_priority_state(
+        registry,
+        project_id,
+        ("state", "Service Atlas uses path /srv/atlas-old."),
+    )
+    transcript = _transcript(
+        _row(1, "Correction: Service Atlas now uses path /srv/atlas-new instead.")
+    )
+
+    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    assert target in request.visible_entry_ids
+    result, _ = await _run(
+        registry,
+        project_id,
+        transcript,
+        [
+            _proposal(
+                {
+                    "op": "supersede",
+                    "targets": [target],
+                    "kind": "state",
+                    "text": "Service Atlas uses path /srv/atlas-new.",
+                    "sources": [{"seq_start": 1, "seq_end": 1}],
+                    "reason": "direct correction",
+                }
+            )
+        ],
+        key="relevant-correction",
+    )
+
+    assert target in result.changed_entry_ids
+    superseded = registry._entry_memory_state(project_id).state.entries[target]
+    assert isinstance(superseded, MemoryEntry)
+    assert superseded.status == "superseded"
+
+
+def test_relevance_selection_is_stable_and_preserves_no_overlap_order(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, targets = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "PR #425 needs Linux verification."),
+        ("backlog", "PR #425 needs macOS verification."),
+    )
+    no_overlap = _prepare_request(
+        _transcript(_row(1, "Quartz hummingbird.")),
+        state,
+        as_of=date(2026, 10, 9),
+    )
+    baseline = _prepare_request(_transcript(), state, as_of=date(2026, 10, 9))
+    assert _listed_entry_ids(no_overlap.prompt) == _listed_entry_ids(baseline.prompt)
+
+    transcript = _transcript(_row(1, "PR #425 merged."))
+    first = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    second = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+
+    assert all(target in first.visible_entry_ids for target in targets)
+    assert _listed_entry_ids(first.prompt) == _listed_entry_ids(second.prompt)
 
 
 @pytest.mark.asyncio

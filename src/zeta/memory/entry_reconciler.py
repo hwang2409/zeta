@@ -63,11 +63,21 @@ _MAX_RESPONSE_BYTES = 32 * 1024
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_PRIMARY_REQUEST_BYTES = 28 * 1024
 _MIN_TRANSCRIPT_REQUEST_BYTES = 12 * 1024
+_MAX_RELEVANCE_TRANSCRIPT_CHARS = 16 * 1024
+_MAX_RELEVANCE_TRANSCRIPT_TOKENS = 512
+_MAX_RELEVANCE_ENTRY_CHARS = 2048
+_MAX_RELEVANCE_ENTRY_TOKENS = 128
 _MAX_OPERATIONS = 64
 _MAX_PROPOSED_TEXT_BYTES = 24 * 1024
 _MAX_REASON_BYTES = 1024
 _COMPLETION_KINDS = frozenset({"state", "backlog", "threads", "commitments"})
 _CODE_LITERAL = re.compile(r"`([^`\\n]{1,256})`")
+_RELEVANCE_OPAQUE = re.compile(
+    r"#[A-Za-z0-9][A-Za-z0-9_.-]*"
+    r"|(?:[A-Za-z]:)?/[^\s\"'`]+"
+    r"|\b(?:[0-9a-fA-F]{7,64}|[A-Za-z0-9]+[_:@.-][A-Za-z0-9_.:@-]+)\b"
+)
+_RELEVANCE_WORD = re.compile(r"[A-Za-z0-9]{2,}")
 _DURABLE_LITERAL_CUES = (
     "validated",
     "established",
@@ -154,6 +164,54 @@ def _active_entries_by_priority(state: MemoryState) -> list[MemoryEntry]:
         ),
         reverse=True,
     )
+
+
+def _relevance_terms(
+    text: str, *, max_chars: int, max_tokens: int
+) -> tuple[frozenset[str], frozenset[str]]:
+    if len(text) > max_chars:
+        half = max_chars // 2
+        text = text[:half] + text[-half:]
+    opaque: set[str] = set()
+    for match in _RELEVANCE_OPAQUE.finditer(text):
+        opaque.add(match.group().rstrip(".,;:!?)]}").casefold())
+        if len(opaque) >= max_tokens:
+            return frozenset(opaque), frozenset()
+    words: set[str] = set()
+    for match in _RELEVANCE_WORD.finditer(text):
+        words.add(match.group().casefold())
+        if len(opaque) + len(words) >= max_tokens:
+            break
+    return frozenset(opaque), frozenset(words)
+
+
+def _active_entries_for_request(
+    state: MemoryState, transcript: Transcript
+) -> list[MemoryEntry]:
+    active = _active_entries_by_priority(state)
+    transcript_text = json.dumps(
+        _rendered_transcript_rows(transcript), ensure_ascii=False, separators=(",", ":")
+    )
+    transcript_opaque, transcript_words = _relevance_terms(
+        transcript_text,
+        max_chars=_MAX_RELEVANCE_TRANSCRIPT_CHARS,
+        max_tokens=_MAX_RELEVANCE_TRANSCRIPT_TOKENS,
+    )
+    if not transcript_opaque and not transcript_words:
+        return active
+
+    def score(entry: MemoryEntry) -> tuple[int, int]:
+        entry_opaque, entry_words = _relevance_terms(
+            f"{entry.id} {entry.text}",
+            max_chars=_MAX_RELEVANCE_ENTRY_CHARS,
+            max_tokens=_MAX_RELEVANCE_ENTRY_TOKENS,
+        )
+        return (
+            len(transcript_opaque & entry_opaque),
+            len(transcript_words & entry_words),
+        )
+
+    return sorted(active, key=score, reverse=True)
 
 
 def _entry_projection(entry: MemoryEntry) -> dict[str, object]:
@@ -243,7 +301,7 @@ Completed transcript rows:
 def _prompt_with_visible_entries(
     transcript: Transcript, state: MemoryState, *, as_of: date
 ) -> tuple[str, frozenset[str]]:
-    active = _active_entries_by_priority(state)
+    active = _active_entries_for_request(state, transcript)
     entry_limit = _MAX_PRIMARY_REQUEST_BYTES - _MIN_TRANSCRIPT_REQUEST_BYTES
 
     visible: list[MemoryEntry] = []
