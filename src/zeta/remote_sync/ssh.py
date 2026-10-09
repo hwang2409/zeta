@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import unquote, urlparse
 
-from .. import project_schema
+from .. import memory_migration_plan, project_schema
 from . import (
     RemoteSyncError,
     _append_resume_hint,
@@ -232,20 +232,37 @@ def _project_install_script() -> str:
     """Ship the dependency-free schema and publisher to an uninstalled peer."""
 
     schema_filename = project_schema.__file__
+    migration_filename = memory_migration_plan.__file__
     publisher_filename = project_publish.__file__
-    if schema_filename is None or publisher_filename is None:
+    if None in {schema_filename, migration_filename, publisher_filename}:
         raise RemoteSyncError("project publication module source is unavailable")
     schema_source = Path(schema_filename).read_text(encoding="utf-8")
+    migration_source = Path(migration_filename).read_text(encoding="utf-8").replace(
+        "from __future__ import annotations\n\n", "", 1
+    )
     publisher_source = Path(publisher_filename).read_text(encoding="utf-8")
-    dependency_import = "from .. import project_schema\n"
-    if dependency_import not in publisher_source:
-        raise RemoteSyncError("project publication schema import is unavailable")
+    dependencies = (
+        "from .. import project_schema\n",
+        (
+            "from ..memory_migration_plan import (\n"
+            "    LEGACY_MEMORY_FILES,\n"
+            "    build_migration_plan,\n"
+            "    legacy_memory_digest,\n"
+            "    reachable_version_pruning_plan,\n"
+            ")\n"
+        ),
+    )
+    if any(dependency not in publisher_source for dependency in dependencies):
+        raise RemoteSyncError("project publication dependency import is unavailable")
     publisher_source = publisher_source.replace(
         "from __future__ import annotations\n\n", "", 1
-    ).replace(dependency_import, "", 1)
+    )
+    for dependency in dependencies:
+        publisher_source = publisher_source.replace(dependency, "", 1)
     return (
         schema_source
         + "\nimport sys\nproject_schema = sys.modules[__name__]\n"
+        + migration_source
         + publisher_source
         + "\n"
         + _PROJECT_INSTALL_WRAPPER

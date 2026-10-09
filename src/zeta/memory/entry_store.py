@@ -1,8 +1,7 @@
-"""Dormant typed project-memory state and deterministic mutations.
+"""Typed project-memory state and deterministic mutations.
 
 The module is the format-2 domain seam. It validates copied schemas, canonicalizes
 complete snapshots, and applies grouped operations without storage side effects.
-Production project creation and commands remain on format 1.
 """
 
 from __future__ import annotations
@@ -92,6 +91,12 @@ class MemorySource:
 
 
 @dataclass(frozen=True, slots=True)
+class MigrationSource:
+    source_digest: str
+    source_version: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryEntry:
     id: str
     project_id: str
@@ -112,6 +117,9 @@ class MemoryEntry:
     accepted_at: str | None
     accepted_by: str | None
     last_operation_id: str
+    section: str | None = None
+    migration_order: int | None = None
+    migration_source: MigrationSource | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,6 +331,26 @@ def _validate_entry(entry: MemoryEntry, state: MemoryState, kinds: set[str]) -> 
         _timestamp(value)
     for value in (entry.expires_at, entry.valid_until, entry.accepted_at):
         _timestamp(value, optional=True)
+    if entry.section is not None:
+        _safe_text(entry.section, maximum=256, label="entry section")
+        if "\n" in entry.section or entry.section.startswith("#"):
+            _fail("invalid memory entry section")
+    if (entry.migration_order is None) != (entry.migration_source is None) or (
+        entry.migration_order is not None
+        and (
+            type(entry.migration_order) is not int
+            or not 0 <= entry.migration_order < MAX_ENTRIES
+        )
+    ):
+        _fail("invalid memory entry migration order")
+    if entry.migration_source is not None and (
+        not _matches(_DIGEST, entry.migration_source.source_digest)
+        or (
+            entry.migration_source.source_version is not None
+            and not _matches(_VERSION_ID, entry.migration_source.source_version)
+        )
+    ):
+        _fail("invalid memory entry migration source")
     if type(entry.automatic) is not bool:
         _fail("invalid memory entry provenance")
     if (entry.accepted_at is None) != (entry.accepted_by is None):
@@ -444,6 +472,11 @@ def _entry_dict(entry: MemoryEntry | MissingEntry) -> dict[str, object]:
         "accepted_at": entry.accepted_at,
         "accepted_by": entry.accepted_by,
         "last_operation_id": entry.last_operation_id,
+        "section": entry.section,
+        "migration_order": entry.migration_order,
+        "migration_source": (
+            None if entry.migration_source is None else dataclasses.asdict(entry.migration_source)
+        ),
     }
 
 
@@ -512,7 +545,8 @@ def state_from_bytes(payload: bytes) -> MemoryState:
         "id", "project_id", "kind", "text", "representation", "status",
         "created_at", "updated_at", "seen_at", "expires_at", "valid_from",
         "valid_until", "supersedes", "superseded_by", "sources", "automatic",
-        "accepted_at", "accepted_by", "last_operation_id",
+        "accepted_at", "accepted_by", "last_operation_id", "section",
+        "migration_order", "migration_source",
     }
     source_fields = {
         "session_id", "seq_start", "seq_end", "origins", "observed_at",
@@ -543,12 +577,22 @@ def state_from_bytes(payload: bytes) -> MemoryState:
         )
         if len(sources) != len(sources_raw):
             _fail("invalid memory entry sources")
+        migration_raw = value["migration_source"]
+        if migration_raw is not None:
+            migration_raw = _exact_dict(
+                migration_raw,
+                {"source_digest", "source_version"},
+                "memory entry migration source",
+            )
         entries[entry_id] = MemoryEntry(
             **{
                 **value,
                 "supersedes": tuple(value["supersedes"]),
                 "superseded_by": tuple(value["superseded_by"]),
                 "sources": sources,
+                "migration_source": (
+                    None if migration_raw is None else MigrationSource(**migration_raw)
+                ),
             }
         )
     state = MemoryState(
