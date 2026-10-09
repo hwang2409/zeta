@@ -6583,8 +6583,7 @@ async def test_full_screen_startup_replay_requests_redraw_without_input(
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
     )
-    redraws: list[None] = []
-    app._invalidate_prompt = lambda: redraws.append(None)  # type: ignore[method-assign]
+    invalidations: list[str] = []
 
     async def stop_full_screen(
         session: FullScreenPromptSession, prompt_task: asyncio.Task[object] | None
@@ -6603,9 +6602,17 @@ async def test_full_screen_startup_replay_requests_redraw_without_input(
             ),
             multiline=True,
         )
+        original_invalidate = session.app.invalidate
+
+        def spy_invalidate() -> None:
+            invalidations.append(Text.from_ansi(app._transcript.render(120)).plain)
+            original_invalidate()
+
+        session.app.invalidate = spy_invalidate
         run_task = asyncio.create_task(app.run(session))
         await run_task
-        assert redraws
+        assert any("remembered" in rendered for rendered in invalidations)
+        assert "remembered" in Text.from_ansi(app._transcript.render(120)).plain
 
 
 @pytest.mark.asyncio
