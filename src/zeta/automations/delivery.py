@@ -6,7 +6,6 @@ import json
 import re
 from typing import Protocol
 
-from ..core.abort import AbortSignal
 from ..mcp.mount import MCPMount
 from ..protocol.types import StructuredToolResult
 
@@ -28,10 +27,7 @@ class SlackDelivery:
     async def _call(
         self, tool: str, arguments: dict[str, object]
     ) -> StructuredToolResult:
-        client = self.mount.client_for("slack")
-        if client is None:
-            raise ValueError("Slack is not connected")
-        result = await client.call_tool(tool, arguments, AbortSignal())
+        result = await self.mount.call_tool("slack", tool, arguments)
         if result.get("isError"):
             raise ValueError(
                 f"Slack {tool} failed: {json.dumps(result, ensure_ascii=False)[:1000]}"

@@ -171,7 +171,13 @@ class MCPDefinitionPublisher:
 
     def _notify(self, client: MCPClient, method: str) -> None:
         if method == "notifications/tools/list_changed":
-            self._queue.put_nowait(ToolsListChanged(client))
+            if (
+                (client is self._client or client is self._setup_client)
+                and self._status.state != "mounted"
+            ):
+                self._setup_notification_pending = True
+            else:
+                self._queue.put_nowait(ToolsListChanged(client))
 
     def _handle_tools_list_changed(self, message: ToolsListChanged) -> None:
         if message.client is not self._client or self._status.state != "mounted":
@@ -179,7 +185,9 @@ class MCPDefinitionPublisher:
         if self._tool_refresh_task is not None:
             self._tool_refresh_pending = True
             return
-        task = asyncio.create_task(message.client.list_tools())
+        task = asyncio.create_task(
+            asyncio.wait_for(message.client.list_tools(), self._setup_timeout)
+        )
         self._tool_refresh_task = task
         self._children.add(task)
         task.add_done_callback(

@@ -82,6 +82,7 @@ class StreamableHTTPMCPClient(MCPClient):
         self._closed = False
         self._failure_sink: Callable[[str], None] | None = None
         self._notification_sink: Callable[[str], None] | None = None
+        self._notification_task: asyncio.Task[None] | None = None
         self._home = home
         self._spill_store = spill_store or SpillStore()
         self._owns_spill_store = spill_store is None
@@ -107,6 +108,7 @@ class StreamableHTTPMCPClient(MCPClient):
         capabilities = result.get("capabilities", {})
         self.capabilities = dict(capabilities) if type(capabilities) is dict else {}
         await self._send_notification("notifications/initialized", {})
+        self._notification_task = asyncio.create_task(self._listen_notifications())
 
     async def list_tools(self) -> list[MCPTool]:
         return await _drain_pages(
@@ -167,6 +169,10 @@ class StreamableHTTPMCPClient(MCPClient):
         if self._closed:
             return
         self._closed = True
+        if self._notification_task is not None:
+            self._notification_task.cancel()
+            await asyncio.gather(self._notification_task, return_exceptions=True)
+            self._notification_task = None
         if self._owns_client:
             await self._client.aclose()
         if self._owns_spill_store:
@@ -344,6 +350,42 @@ class StreamableHTTPMCPClient(MCPClient):
                 return parse_rpc_response(value, request_id)
         except httpx.HTTPError as exc:
             raise MCPHTTPError(0, str(exc)) from exc
+
+    async def _listen_notifications(self) -> None:
+        if self._session_id is None:
+            return
+        headers = self._auth_headers()
+        headers["accept"] = "text/event-stream"
+        headers["mcp-session-id"] = self._session_id
+        if self.protocol_version is not None:
+            headers["mcp-protocol-version"] = self.protocol_version
+        try:
+            async with self._client.stream("GET", self.config.url, headers=headers) as response:
+                if response.status_code >= 400:
+                    return
+                data: list[str] = []
+                async for line in response.aiter_lines():
+                    if self._closed:
+                        return
+                    if line.startswith("data:"):
+                        data.append(line[5:].lstrip())
+                    elif not line and data:
+                        try:
+                            value = json.loads("\\n".join(data))
+                        except ValueError:
+                            data.clear()
+                            continue
+                        data.clear()
+                        if (
+                            isinstance(value, dict)
+                            and isinstance(value.get("method"), str)
+                            and self._notification_sink is not None
+                        ):
+                            self._notification_sink(value["method"])
+        except (asyncio.CancelledError, httpx.HTTPError):
+            raise
+        except Exception:
+            logger.debug("MCP HTTP notification stream ended", exc_info=True)
 
     async def _send_notification(
         self, method: str, params: Mapping[str, object]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
@@ -688,8 +689,8 @@ class SlackMount:
     def __init__(self, client) -> None:
         self.client = client
 
-    def client_for(self, name):
-        return self.client
+    async def call_tool(self, server, name, arguments):
+        return await self.client.call_tool(name, arguments, AbortSignal())
 
 
 async def test_slack_delivery_pins_recipient_and_bounds_output() -> None:
