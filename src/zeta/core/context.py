@@ -403,6 +403,8 @@ class ContextAssembler:
         )
         if evicted is not None:
             return evicted
+        if emergency:
+            return self._save(all_messages, False)
         if not candidates and adaptive_tail:
             truncated = self._truncate_tool_results(
                 committed_messages,

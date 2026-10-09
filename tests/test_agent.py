@@ -218,6 +218,12 @@ async def test_overflow_without_reduction_fails_with_diagnostic(tmp_path: Path) 
 
     backend = AlwaysOverflowBackend()
     store = ConversationStore(tmp_path)
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("old request")]),
+            MessageOrigin.USER,
+        )
+    )
     assembler = ContextAssembler(
         store,
         token_budget=200,
