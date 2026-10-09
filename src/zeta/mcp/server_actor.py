@@ -28,12 +28,8 @@ from .client import (
     unavailable_result as _unavailable_result,
 )
 from .config import MCPServerConfig, mcp_log_path, tool_prefix
-from .definition_publisher import (
-    MCPDefinitionPublisher,
-    ToolsListChanged as _ToolsListChanged,
-    ToolsListRefreshed as _ToolsListRefreshed,
-)
-from .resource_actor import (
+from .definition_publisher import MCPDefinitionPublisher
+from .actors.resource import (
     ResourceFinished as _ResourceFinished,
     ResourceRequest as _ResourceRequest,
     cancel_terminated_resources,
@@ -42,7 +38,12 @@ from .resource_actor import (
     request_resource as _request_resource,
     resolve_resource_message,
 )
-from .prompt_actor import (
+from .actors.tool_refresh import (
+    ToolRefreshActor,
+    ToolsListChanged as _ToolsListChanged,
+    ToolsListRefreshed as _ToolsListRefreshed,
+)
+from .actors.prompt import (
     CallFinished as _CallFinished,
     CallRequest as _CallRequest,
     cancel_request as _cancel_request,
@@ -173,6 +174,7 @@ PublishSnapshot = Callable[["MCPServerActor", MCPServerStatus, MCPClient | None]
 
 class MCPServerActor(MCPDefinitionPublisher):
     """Own one server lifecycle and serialize all lifecycle messages."""
+
     def __init__(
         self,
         config: MCPServerConfig,
@@ -212,16 +214,13 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._scheduled_closes: dict[int, tuple[MCPClient, asyncio.Task[object]]] = {}
         self._next_identifier = 0
         self._client: MCPClient | None = None
-        self._setup_client: MCPClient | None = None
         self._tools: tuple[MCPTool, ...] = ()
         self._prompts: tuple[MCPPrompt, ...] = ()
         self._generation = 0
         self._failure_count = 0
         self._manual_recovery_probe = False
         self._notice_sink: NoticeSink | None = None
-        self._tool_refresh_task: asyncio.Task[list[MCPTool]] | None = None
-        self._tool_refresh_pending = False
-        self._setup_notification_pending = False
+        self._tool_refresh = ToolRefreshActor(self)
         self._status = MCPServerStatus(
             config.name,
             config.transport,
@@ -229,25 +228,32 @@ class MCPServerActor(MCPDefinitionPublisher):
             stderr_log_path=str(mcp_log_path(config.name)),
         )
         self._closed = False
+
     @property
     def name(self) -> str:
         return self.config.name
+
     @property
     def status(self) -> MCPServerStatus:
         return self._status
+
     @property
     def prompts(self) -> tuple[MCPPrompt, ...]:
         return self._prompts
+
     @property
     def generation(self) -> int:
         return self._generation
+
     @property
     def is_terminal(self) -> bool:
         return self._closed or (self._task is not None and self._task.done())
+
     def start(self) -> asyncio.Task[None]:
         if self._task is None:
             self._task = asyncio.create_task(self._run())
         return self._task
+
     async def wait_started(
         self,
         notice_sink: NoticeSink | None = None,
@@ -417,9 +423,9 @@ class MCPServerActor(MCPDefinitionPublisher):
                 elif isinstance(message, _TransportFailure):
                     self._handle_transport_failure(message)
                 elif isinstance(message, _ToolsListChanged):
-                    self._handle_tools_list_changed(message)
+                    self._tool_refresh.handle_changed(message)
                 elif isinstance(message, _ToolsListRefreshed):
-                    self._handle_tools_list_refreshed(message)
+                    self._tool_refresh.handle_refreshed(message)
                 elif isinstance(message, _CallRequest):
                     self._handle_call(message)
                 elif isinstance(message, _CallFinished):
@@ -602,15 +608,10 @@ class MCPServerActor(MCPDefinitionPublisher):
 
         try:
             client = self._build_client(config)
-            self._setup_client = client
+            self._tool_refresh.start_setup(client)
             set_failure_sink = getattr(client, "set_failure_sink", None)
             if set_failure_sink is not None:
                 set_failure_sink(report_failure)
-            set_notification_sink = getattr(client, "set_notification_sink", None)
-            if set_notification_sink is not None:
-                set_notification_sink(
-                    lambda method, client=client: self._notify(client, method)
-                )
             tools = await asyncio.wait_for(
                 self._connect_and_list(client), timeout=self._setup_timeout
             )
@@ -702,7 +703,6 @@ class MCPServerActor(MCPDefinitionPublisher):
             self._generation = operation.generation
             self._failure_count = 0
             self._manual_recovery_probe = False
-            self._setup_client = None
             self._set_status(
                 MCPServerStatus(
                     self.name,
@@ -719,9 +719,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 self._client,
             )
             self._complete_operation(operation, self._status)
-            if self._setup_notification_pending:
-                self._setup_notification_pending = False
-                self._handle_tools_list_changed(_ToolsListChanged(self._client))
+            self._tool_refresh.finish_setup(self._client)
             if operation.waiter is not None:
                 operation.waiter.generation = self._generation
                 self._dispatch_call(operation.waiter, self._client)
@@ -1033,10 +1031,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 _set_result(result, None)
             return
         self._closed = True
-        if self._tool_refresh_task is not None:
-            self._tool_refresh_task.cancel()
-            await asyncio.gather(self._tool_refresh_task, return_exceptions=True)
-            self._tool_refresh_task = None
+        await self._tool_refresh.close()
         operation = self._operation
         if operation is not None:
             self._close_completed_setup_client(operation)

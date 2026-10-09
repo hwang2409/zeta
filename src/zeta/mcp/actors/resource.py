@@ -14,12 +14,12 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from ..core.abort import AbortSignal
-from .client import MCPClient, MCPProtocolError, MCPTransportError
-from .prompt_actor import cancel_request, set_exception, set_result
+from ...core.abort import AbortSignal
+from ..client import MCPClient, MCPProtocolError, MCPTransportError
+from .prompt import cancel_request, set_exception, set_result
 
 if TYPE_CHECKING:
-    from .server_actor import MCPServerActor
+    from ..server_actor import MCPServerActor
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ def _error_text(error: BaseException) -> str:
 def _resource_timeout_seconds() -> float:
     # Read lazily so tests can monkeypatch server_actor's module-level bound and
     # so this module does not import server_actor at load time (it would cycle).
-    from . import server_actor
+    from .. import server_actor
 
     return server_actor.RESOURCE_REQUEST_TIMEOUT_SECONDS
 

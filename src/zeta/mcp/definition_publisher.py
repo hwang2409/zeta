@@ -10,29 +10,16 @@ activations survive instead of collapsing into the primary registry.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
 
 from ..core.abort import AbortSignal
 from ..protocol.types import StructuredToolResult
 from ..tools.registry import ToolRegistry
-from .client import MCPClient, MCPTool, error_text, notice
-from .config import MCPServerConfig, mcp_log_path, tool_prefix
+from .client import MCPTool, notice
+from .config import MCPServerConfig, tool_prefix
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True, slots=True)
-class ToolsListChanged:
-    client: MCPClient
-
-
-@dataclass(frozen=True, slots=True)
-class ToolsListRefreshed:
-    client: MCPClient
-    task: asyncio.Task[list[MCPTool]]
 
 
 class MCPDefinitionPublisher:
@@ -168,66 +155,3 @@ class MCPDefinitionPublisher:
             logger.warning(warning)
             notice(notice_sink, warning)
         return [tool for tool in tools if server_config.allows_tool(tool.name)]
-
-    def _notify(self, client: MCPClient, method: str) -> None:
-        if method == "notifications/tools/list_changed":
-            if (
-                (client is self._client or client is self._setup_client)
-                and self._status.state != "mounted"
-            ):
-                self._setup_notification_pending = True
-            else:
-                self._queue.put_nowait(ToolsListChanged(client))
-
-    def _handle_tools_list_changed(self, message: ToolsListChanged) -> None:
-        if message.client is not self._client or self._status.state != "mounted":
-            return
-        if self._tool_refresh_task is not None:
-            self._tool_refresh_pending = True
-            return
-        task = asyncio.create_task(
-            asyncio.wait_for(message.client.list_tools(), self._setup_timeout)
-        )
-        self._tool_refresh_task = task
-        self._children.add(task)
-        task.add_done_callback(
-            lambda done, client=message.client: self._queue.put_nowait(
-                ToolsListRefreshed(client, done)
-            )
-        )
-
-    def _handle_tools_list_refreshed(self, message: ToolsListRefreshed) -> None:
-        from .server_actor import MCPServerStatus
-
-        self._children.discard(message.task)
-        if self._tool_refresh_task is message.task:
-            self._tool_refresh_task = None
-        if message.client is not self._client or self._status.state != "mounted":
-            self._tool_refresh_pending = False
-            return
-        try:
-            tools = self._filter_tools(message.task.result(), self._notice_sink)
-        except Exception as exc:  # noqa: BLE001 - refresh failure degrades the server
-            self._tool_refresh_pending = False
-            self._degrade_current(error_text(exc))
-            return
-        self._unregister_tools()
-        self._tools = tuple(tools)
-        self._set_status(
-            MCPServerStatus(
-                self.name,
-                self.config.transport,
-                "mounted",
-                tool_count=len(self._tools),
-                stderr_log_path=str(mcp_log_path(self.name)),
-            )
-        )
-        self._republish_definitions()
-        self._publish_callback(self, self._status, self._client)
-        if not tools and (
-            self.config.allowed_tools is not None or self.config.disallowed_tools
-        ):
-            notice(self._notice_sink, f"mcp · {self.name} mounted with zero tools")
-        if self._tool_refresh_pending:
-            self._tool_refresh_pending = False
-            self._handle_tools_list_changed(ToolsListChanged(message.client))
