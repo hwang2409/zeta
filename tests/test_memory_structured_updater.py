@@ -30,7 +30,11 @@ from zeta.memory.profiles import (
     early_update_max_wait_seconds,
     memory_profile,
 )
-from zeta.memory.reconciler import ReconciliationResponse, Transcript
+from zeta.memory.reconciler import (
+    ReconciliationError,
+    ReconciliationResponse,
+    Transcript,
+)
 from zeta.project_errors import ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
 
@@ -140,6 +144,26 @@ def _entries(registry: ProjectRegistry, project_id: str) -> list[MemoryEntry]:
     ]
 
 
+def _large_index_state(registry: ProjectRegistry, project_id: str):
+    current = registry._entry_memory_state(project_id)
+    operations = tuple(
+        AddOperation(
+            "state",
+            f"Entry {index:03d} " + (chr(65 + index % 26) * 1800),
+            (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),),
+        )
+        for index in range(124)
+    )
+    state, _ = apply_operations(
+        current.state,
+        operations,
+        reconciliation_key=_key("large-notification-index"),
+        automatic=True,
+        now=NOW,
+    )
+    return state
+
+
 def _seed_user_entry(
     registry: ProjectRegistry,
     project_id: str,
@@ -164,6 +188,47 @@ def _seed_user_entry(
         now=observed_at,
     )
     return next(iter(result.state.entries))
+
+
+def test_oversized_harness_notification_is_bounded_with_large_index(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id)
+    notification = {
+        "seq": 71,
+        "type": "message",
+        "data": {
+            "message": {
+                "role": "system",
+                "content": [{"type": "text", "text": "x" * 7_500}],
+                "metadata": {
+                    "zeta_event": "agent_notifications",
+                    "notifications": [{"notification_id": "child-1"}],
+                },
+            }
+        },
+    }
+
+    request = _prepare_request(
+        _transcript(notification), state, as_of=date(2026, 10, 9)
+    )
+
+    assert request.transcript.rows[0]["seq"] == 71
+    assert len(request.prompt.encode()) <= 28 * 1024
+    text = request.transcript.rows[0]["data"]["message"]["content"][0]["text"]
+    assert len(text.encode()) < 7_500
+
+
+def test_oversized_user_row_still_requires_lossless_handling(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id)
+    user_row = _row(45, "x" * 7_500)
+
+    with pytest.raises(ReconciliationError, match="user row exceeds"):
+        _prepare_request(_transcript(user_row), state, as_of=date(2026, 10, 9))
 
 
 @pytest.mark.asyncio
@@ -435,26 +500,20 @@ async def test_repeated_opaque_fact_does_not_create_duplicate_entry(
         registry,
         project_id,
         _transcript(_row(1, "The validated token is `PROC-QUARTZ-8N3F`.")),
-        [
-            _proposal(
-                _add("decisions", "The validated token is PROC-QUARTZ-8N3F.")
-            )
-        ],
+        [_proposal(_add("decisions", "The validated token is PROC-QUARTZ-8N3F."))],
         key="opaque-first",
     )
     result, _ = await _run(
         registry,
         project_id,
         _transcript(_row(2, "Recall `PROC-QUARTZ-8N3F`.")),
-        [
-            _proposal(
-                _add("decisions", "Project procedure token: PROC-QUARTZ-8N3F.", 2)
-            )
-        ],
+        [_proposal(_add("decisions", "Project procedure token: PROC-QUARTZ-8N3F.", 2))],
         key="opaque-repeat",
     )
     assert result.changed_entry_ids == ()
-    assert result.rejected_groups == ("group[0]: add duplicates an existing active entry",)
+    assert result.rejected_groups == (
+        "group[0]: add duplicates an existing active entry",
+    )
     assert len(_entries(registry, project_id)) == 1
 
 
@@ -546,9 +605,7 @@ async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -
 async def test_updater_response_bounds(tmp_path: Path) -> None:
     registry, project_id = _registry(tmp_path)
     oversized = "x" * (32 * 1024 + 1)
-    with pytest.raises(
-        EntryReconciliationFailure, match="response exceeds"
-    ) as raised:
+    with pytest.raises(EntryReconciliationFailure, match="response exceeds") as raised:
         await _run(
             registry,
             project_id,
@@ -657,7 +714,12 @@ async def test_agent_update_cannot_change_user_backed_entry(tmp_path: Path) -> N
     )
     assert not result.changed_entry_ids
     assert result.rejected_groups
-    assert next(entry for entry in _entries(registry, project_id) if entry.id == target).text == "Use Postgres."
+    assert (
+        next(
+            entry for entry in _entries(registry, project_id) if entry.id == target
+        ).text
+        == "Use Postgres."
+    )
 
 
 @pytest.mark.asyncio
@@ -692,7 +754,9 @@ async def test_agent_cannot_resolve_user_backed_decision(tmp_path: Path) -> None
     )
     assert not result.changed_entry_ids
     assert result.rejected_groups
-    entry = next(entry for entry in _entries(registry, project_id) if entry.id == target)
+    entry = next(
+        entry for entry in _entries(registry, project_id) if entry.id == target
+    )
     assert entry.status == "active"
 
 
@@ -720,7 +784,12 @@ async def test_newer_user_evidence_can_update_user_backed_entry(tmp_path: Path) 
         key="newer-user-update",
     )
     assert result.changed_entry_ids == (target,)
-    assert next(entry for entry in _entries(registry, project_id) if entry.id == target).text == "Use SQLite."
+    assert (
+        next(
+            entry for entry in _entries(registry, project_id) if entry.id == target
+        ).text
+        == "Use SQLite."
+    )
 
 
 @pytest.mark.asyncio
@@ -754,7 +823,12 @@ async def test_equal_rank_older_evidence_cannot_update_entry(tmp_path: Path) -> 
     )
     assert not result.changed_entry_ids
     assert result.rejected_groups
-    assert next(entry for entry in _entries(registry, project_id) if entry.id == target).text == "Deploy on Friday."
+    assert (
+        next(
+            entry for entry in _entries(registry, project_id) if entry.id == target
+        ).text
+        == "Deploy on Friday."
+    )
 
 
 @pytest.mark.asyncio
@@ -780,7 +854,9 @@ async def test_completion_resolves_backlog_entry(tmp_path: Path) -> None:
         key="backlog-complete",
     )
     assert result.changed_entry_ids == (target,)
-    entry = next(entry for entry in _entries(registry, project_id) if entry.id == target)
+    entry = next(
+        entry for entry in _entries(registry, project_id) if entry.id == target
+    )
     assert entry.status == "resolved"
 
 
@@ -1109,7 +1185,9 @@ async def test_five_rapid_user_turns_coalesce_into_one_request(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_user_turns_ninety_seconds_apart_make_two_requests(tmp_path: Path) -> None:
+async def test_user_turns_ninety_seconds_apart_make_two_requests(
+    tmp_path: Path,
+) -> None:
     calls = 0
 
     async def invoke(_prompt: str) -> str:
@@ -1118,9 +1196,7 @@ async def test_user_turns_ninety_seconds_apart_make_two_requests(tmp_path: Path)
         return _proposal()
 
     clock = _MutableClock()
-    runner, _, _ = _auto_runner(
-        tmp_path, invoke, clock=clock, debounce_seconds=0
-    )
+    runner, _, _ = _auto_runner(tmp_path, invoke, clock=clock, debounce_seconds=0)
     first = (_row(1, "First fact."), _completed_assistant(2))
     _write_session(runner.session_dir, *first)
     runner.activity(2)
@@ -1138,7 +1214,9 @@ async def test_user_turns_ninety_seconds_apart_make_two_requests(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_notification_does_not_retrigger_consumed_user_turn(tmp_path: Path) -> None:
+async def test_notification_does_not_retrigger_consumed_user_turn(
+    tmp_path: Path,
+) -> None:
     calls = 0
 
     async def invoke(_prompt: str) -> str:
@@ -1173,14 +1251,13 @@ async def test_restart_does_not_retrigger_consumed_user_turn(tmp_path: Path) -> 
         calls += 1
         return _proposal()
 
-    runner, registry, project_id = _auto_runner(
-        tmp_path, invoke, debounce_seconds=60
-    )
+    runner, registry, project_id = _auto_runner(tmp_path, invoke, debounce_seconds=60)
     _write_session(runner.session_dir, _row(1, "A fact."), _completed_assistant(2))
     runner.activity(2)
-    while not runner.position_path.exists() or json.loads(
-        runner.position_path.read_text()
-    ).get("early_trigger_seq") != 2:
+    while (
+        not runner.position_path.exists()
+        or json.loads(runner.position_path.read_text()).get("early_trigger_seq") != 2
+    ):
         await asyncio.sleep(0)
     await runner.close()
 
@@ -1259,6 +1336,7 @@ async def test_reconciliation_retry_is_idempotent_after_cursor_crash(
     assert len(_entries(registry, project_id)) == 1
     assert history_after_retry == history_after_commit
     assert replacement.last_reconciled_seq == 1
+
 
 @pytest.mark.asyncio
 async def test_stored_correction_rejects_newer_ordinary_user_statement(
@@ -1363,7 +1441,9 @@ async def test_agent_correction_language_cannot_inflate_ordinary_user_evidence(
 
 
 @pytest.mark.asyncio
-async def test_each_source_range_keeps_its_own_code_derived_rank(tmp_path: Path) -> None:
+async def test_each_source_range_keeps_its_own_code_derived_rank(
+    tmp_path: Path,
+) -> None:
     registry, project_id = _registry(tmp_path)
     result, _ = await _run(
         registry,
@@ -1496,9 +1576,7 @@ async def test_continuous_turns_fire_by_default_max_wait_and_repeat(
         fired_at.append(clock.now)
         return _proposal()
 
-    runner, _, _ = _auto_runner(
-        tmp_path, invoke, clock=clock, debounce_seconds=60
-    )
+    runner, _, _ = _auto_runner(tmp_path, invoke, clock=clock, debounce_seconds=60)
     rows: list[dict[str, object]] = []
     for turn in range(21):
         seq = turn * 2 + 1
