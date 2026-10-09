@@ -71,6 +71,7 @@ directory.
 
 ## Docs
 
+- [Agents and orchestration](docs/agents.md)
 - [Attention panel](docs/attention-panel.md)
 - [Automations](docs/automations.md)
 - [Design notes](docs/design.md)

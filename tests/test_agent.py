@@ -27,6 +27,7 @@ from zeta.agent.background import (
 from zeta.agent.presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
+    AgentPreset,
 )
 from zeta.agent.runner import _child_base_system_prompt
 from zeta.core.abort import AbortGenerationRegistry
@@ -57,6 +58,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog, SkillMeta
+from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
@@ -2168,7 +2170,7 @@ async def test_agent_returns_child_text_and_persists_child_session(
         schema["name"]
         for schema in backend.calls[0][1]
         if schema["name"] != "request_attention"
-    }
+    } | {"ask_parent"}
 
 
 @pytest.mark.asyncio
@@ -3189,6 +3191,7 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
     assert grandchild_tools == {
         "agent_status",
         "agent_output",
+        "ask_parent",
         "fetch",
         "read",
         "skill",
@@ -4545,6 +4548,44 @@ class RunBackend(CompletionBackend):
         )
 
 
+class WorkerBackend(RunBackend):
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        if last_user != "start":
+            async for event in super().complete(messages, tool_schemas):
+                yield event
+            return
+        call = ToolCall(
+            "worker-1",
+            "agent",
+            {
+                "prompt": "work the big task",
+                "description": "worker",
+                "preset": "worker",
+                "background": True,
+            },
+        )
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=ToolUseContent(call))
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        )
+
+
 def _run_agent_call(call_id: str = "run-1") -> ToolCall:
     return ToolCall(
         call_id,
@@ -4809,6 +4850,7 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
         agent_type="run",
         background=True,
         child_instance_id="parent:1",
+        accepts_follow_ups=True,
     )
 
     started = threading.Event()
@@ -4867,6 +4909,7 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
         agent_type="run",
         background=True,
         child_instance_id="parent:1",
+        accepts_follow_ups=True,
     )
 
     cleanup_started = asyncio.Event()
@@ -4919,6 +4962,7 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
         agent_type="run",
         background=True,
         child_instance_id="parent:1",
+        accepts_follow_ups=True,
     )
 
     registry = ToolRegistry(
@@ -5029,6 +5073,37 @@ async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> N
 
     # The model queues follow-ups by the child_instance_id it saw in the tool
     # result, not by the provider tool_call.id, so round-trip that handle.
+    handle = _run_handle_from_receipt(store)
+    assert send_to_run(store, handle, "also check the tests") is None
+
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+
+    assert backend.child_prompts == ["work the big task", "also check the tests"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_reaches_a_worker_at_its_next_turn(tmp_path: Path) -> None:
+    backend = WorkerBackend()
+    store = ConversationStore(tmp_path)
+    worker = AgentPreset(
+        name="worker",
+        tool_names=None,
+        preamble="",
+        selection_guidance="implementation worker",
+        accepts_follow_ups=True,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog((worker,)),
+    )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
     handle = _run_handle_from_receipt(store)
     assert send_to_run(store, handle, "also check the tests") is None
 

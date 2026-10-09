@@ -67,6 +67,13 @@ def test_agent_discovery_precedence_and_malformed_warnings(tmp_path: Path) -> No
         "body",
         "allow_delegation: nope\n",
     )
+    _write_agent(
+        home / "agents" / "bad-follow-ups.md",
+        "bad-follow-ups",
+        "invalid",
+        "body",
+        "accepts_follow_ups: nope\n",
+    )
 
     catalog = discover_session_agents(home=home, project_dir=project)
 
@@ -77,8 +84,13 @@ def test_agent_discovery_precedence_and_malformed_warnings(tmp_path: Path) -> No
     assert catalog.find("plain").tool_names is None
     assert catalog.find("modelled").model == "gpt-5.4"
     assert "bad-delegation" not in catalog.names()
+    assert "bad-follow-ups" not in catalog.names()
     assert any(
         "allow_delegation must be a boolean" in notice for notice in catalog.notices
+    )
+    assert any(
+        "accepts_follow_ups must be a boolean" in notice
+        for notice in catalog.notices
     )
     assert any("unknown model" in notice for notice in catalog.notices)
     assert any("overrides packaged preset" in notice for notice in catalog.notices)
@@ -142,6 +154,21 @@ def test_agent_snapshot_omits_body_and_loads_current_file(tmp_path: Path) -> Non
     path.unlink()
     with pytest.raises(ValueError, match="no longer exists"):
         load_agent(AgentCatalog.from_snapshot(snapshot).find("custom"))
+
+
+def test_custom_agent_can_accept_follow_ups(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_agent(
+        home / "agents" / "worker.md",
+        "worker",
+        "implementation worker",
+        "body",
+        "accepts_follow_ups: true\n",
+    )
+
+    worker = discover_session_agents(home=home).find("worker")
+
+    assert worker.accepts_follow_ups is True
 
 
 def test_agent_snapshot_restores_the_same_set() -> None:

@@ -589,6 +589,11 @@ class ConversationStore(
                     raise ValueError("pending prompt text must be a nonempty string")
                 if len(text) > MAX_PENDING_PROMPT_TEXT:
                     raise ValueError("pending prompt text is too long")
+                question_id = entry.data.get("question_id")
+                if question_id is not None and (
+                    type(question_id) is not str or not question_id
+                ):
+                    raise ValueError("pending prompt question id must be nonempty")
             elif entry.type == "pending_prompt_ack":
                 prompt_id = entry.data.get("prompt_id")
                 if type(prompt_id) is not str or not prompt_id:

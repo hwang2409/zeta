@@ -36,6 +36,7 @@ from ..providers.factory import build_backend, credential_store
 from ..skills.agent_catalog import load_agent
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
+from ..tools.ask_parent import register_ask_parent
 from ..tools.registry import ToolExecutionContext
 from .background import finish_background_child
 from .budget import MAX_AGENT_DEPTH
@@ -465,7 +466,7 @@ async def run_agent_tool(
             f"agent error: {error_message(exc)}",
             state="failed",
         )
-    is_run = preset.source == "packaged" and preset.name == RUN_PRESET.name
+    accepts_follow_ups = preset.accepts_follow_ups
     stored_agent_type = (
         None
         if preset.source == "packaged" and preset.name == GENERAL_PRESET.name
@@ -516,6 +517,7 @@ async def run_agent_tool(
         agent_type=stored_agent_type,
         background=background,
         child_instance_id=child_instance_id,
+        accepts_follow_ups=accepts_follow_ups,
     )
     if loop.root_project_id is not None and loop.project_registry is not None:
         link = {
@@ -591,6 +593,14 @@ async def run_agent_tool(
         loop._background_owner.store_leases.callback(
             child_registry.background_tasks.release_directory
         )
+        if accepts_follow_ups:
+            register_ask_parent(
+                child_registry,
+                parent_store=loop.store,
+                child_store=child_store,
+                child_instance_id=child_instance_id,
+                notify_parent=loop.notify_background_persisted,
+            )
         parent_policy = loop.tool_registry.approval_policy
         child_policy: ChildApprovalPolicy | None = None
         if parent_policy is not None:
@@ -707,14 +717,11 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(current_step=step)
 
     def finish_lifecycle(state: str, text: str) -> dict[str, object]:
-        if is_run and state == "completed":
-            child_store.update_agent_lifecycle(turns_used=child_turns())
-        else:
-            child_store.finish_agent_lifecycle(
-                state,
-                final_result=text,
-                turns_used=child_turns(),
-            )
+        child_store.finish_agent_lifecycle(
+            state,
+            final_result=text,
+            turns_used=child_turns(),
+        )
         return agent_stats(child_store.agent_lifecycle(), turns_used=child_turns())
 
     def child_result(
@@ -798,7 +805,7 @@ async def run_agent_tool(
     def update_tool_calls(tool_calls: int) -> None:
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
-    consume = consume_run if is_run else consume_child
+    consume = consume_run if accepts_follow_ups else consume_child
     receipt_components: dict[str, str] = {}
     run_kwargs: dict[str, Any] = (
         {
@@ -809,7 +816,7 @@ async def run_agent_tool(
             ),
             "receipt_components": receipt_components,
         }
-        if is_run
+        if accepts_follow_ups
         else {
             "origin": MessageOrigin.AGENT_PROMPT,
             "record_report": lambda report: receipt_components.setdefault(
@@ -965,7 +972,19 @@ async def run_agent_tool(
         # A completed child wins a same-turn abort race so its descendants can
         # be adopted by receipt processing rather than canceled as unreachable.
         if child_task in done:
-            return child_task.result()
+            result = child_task.result()
+            if accepts_follow_ups:
+                content = result.get("content")
+                if (
+                    isinstance(content, list)
+                    and content
+                    and isinstance(content[0], dict)
+                    and isinstance(content[0].get("text"), str)
+                ):
+                    child_store.update_agent_lifecycle_result(
+                        content[0]["text"], canonical_receipt=True
+                    )
+            return result
         if abort_task in done:
             await cancel_child()
             raise asyncio.CancelledError()

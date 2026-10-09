@@ -1,4 +1,4 @@
-"""Send follow-up prompts to live run agents."""
+"""Send follow-up prompts to eligible live child agents."""
 
 from __future__ import annotations
 
@@ -22,29 +22,31 @@ def send_to_run(
     parent_store: ConversationStore,
     child_instance_id: object,
     message: object,
+    question_id: object = None,
 ) -> str | None:
-    """Queue a follow-up for a live run, returning an error if not possible."""
+    """Queue a follow-up for an eligible live child."""
 
     if type(child_instance_id) is not str or not child_instance_id.strip():
         return "child_instance_id must be a nonempty string"
     if type(message) is not str or not message.strip():
         return "message must be a nonempty string"
-    # The marker is removed once a run's result is durable, so a missing one
-    # means the run already finished rather than that it never existed.
+    if question_id is not None and (
+        type(question_id) is not str or not question_id.strip()
+    ):
+        return "question_id must be a nonempty string when provided"
     no_live_run = (
-        f"no live run {child_instance_id!r}; it already finished or was "
-        "never started"
+        f"no live run/child {child_instance_id!r}; it was canceled, finished, "
+        "or never started"
     )
     marker = parent_store.agent_children().get(child_instance_id)
     if marker is None:
         return no_live_run
-    # Only runs drain queued follow-ups. Other agent types would leave the
-    # prompt in the child's store with no one to consume it.
-    agent_type = marker.get("agent_type") or "general"
-    if agent_type != "run":
+    if marker.get("accepts_follow_ups") is not True:
+        agent_type = marker.get("agent_type") or "general"
         return (
-            f"{child_instance_id!r} is a {agent_type} agent, not a run; "
-            "agent_send only works with agent_type=run"
+            f"agent_send rejected for {agent_type} child {child_instance_id!r}: "
+            "it does not accept follow-ups; reviewers are one-shot; start a "
+            "fresh reviewer"
         )
     deadline = time.monotonic() + AGENT_SEND_COMMIT_TIMEOUT_SECONDS
     try:
@@ -56,7 +58,10 @@ def send_to_run(
             _lock_deadline=deadline,
         ) as child_store:
             child_store.pending_prompt_queue.append(
-                message, origin=MessageOrigin.AGENT_SEND, deadline=deadline
+                message,
+                origin=MessageOrigin.AGENT_SEND,
+                deadline=deadline,
+                question_id=question_id if isinstance(question_id, str) else None,
             )
     except PendingPromptCommitTimeoutError:
         return "pending prompt commit timed out before the queue could be changed"
@@ -79,6 +84,7 @@ async def _agent_send(
             registry.session_store,
             arguments.get("child_instance_id"),
             arguments.get("message"),
+            arguments.get("question_id"),
         )
     )
     while True:
@@ -102,7 +108,7 @@ async def _agent_send(
         "content": [
             text_block(
                 f"queued a follow-up for {child_instance_id}; it is delivered "
-                "when the run finishes its current turn"
+                "when the child finishes its current turn"
             )
         ],
         "isError": False,
@@ -115,16 +121,16 @@ def register_send(registry: ToolRegistry) -> None:
         "agent_send",
         _agent_send,
         description=(
-            "Send a follow-up instruction to a run you started that is still "
-            "working. The run picks it up at its next turn boundary, so it "
-            "never interrupts a tool call. Use the child_instance_id the agent "
-            "tool returned."
+            "Send a follow-up to an eligible child you started. It arrives at "
+            "the next turn boundary and never interrupts a tool call. Include "
+            "question_id when answering ask_parent."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "child_instance_id": {"type": "string", "minLength": 1},
                 "message": {"type": "string", "minLength": 1},
+                "question_id": {"type": "string", "minLength": 1},
             },
             "required": ["child_instance_id", "message"],
             "additionalProperties": False,

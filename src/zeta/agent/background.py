@@ -251,6 +251,7 @@ def adopt_agent_children(
             agent_type=marker.get("agent_type"),
             background=marker.get("background", False),
             child_instance_id=marker.get("child_instance_id"),
+            accepts_follow_ups=marker.get("accepts_follow_ups", False) is True,
         )
         turns_used = marker.get("turns_used", 0)
         if turns_used:

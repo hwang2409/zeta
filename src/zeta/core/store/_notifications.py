@@ -182,6 +182,42 @@ class NotificationStateMixin:
             appended = self._append_row_unlocked("notification", data)
             return self._snapshot_entry(appended), True
 
+    def append_child_question(
+        self: ConversationStore,
+        *,
+        child_instance_id: str,
+        question_id: str,
+        question: str,
+        options: list[str] | None = None,
+    ) -> ConversationEntry:
+        """Persist one child question for its direct parent."""
+        if (
+            not child_instance_id
+            or not question_id
+            or not question.strip()
+            or len(question) > 4_000
+            or options is not None
+            and (
+                not options
+                or len(options) > 10
+                or any(not option.strip() or len(option) > 1_000 for option in options)
+            )
+        ):
+            raise ValueError("invalid child question")
+        data: dict[str, Any] = {
+            "origin": MessageOrigin.NOTIFICATION.value,
+            "kind": "child_question",
+            "child_instance_id": child_instance_id,
+            "question_id": question_id,
+            "question": question,
+            "description": "child question",
+            "status": "pending",
+            "text": question,
+        }
+        if options is not None:
+            data["options"] = list(options)
+        return self._append_row("notification", data)
+
     def append_agent_notification(
         self: ConversationStore,
         child_instance_id: str,
