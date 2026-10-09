@@ -93,6 +93,7 @@ class AgentCatalog:
                     "model": agent.model,
                     "preamble": agent.preamble,
                     "allow_delegation": agent.allow_delegation,
+                    "accepts_follow_ups": agent.accepts_follow_ups,
                 }
             )
             snapshots.append(snapshot)
@@ -112,6 +113,7 @@ class AgentCatalog:
             model = item.get("model")
             preamble = item.get("preamble", "")
             allow_delegation = item.get("allow_delegation", True)
+            accepts_follow_ups = item.get("accepts_follow_ups", False)
             source = item.get("source", "")
             path = item.get("path")
             agents_root = item.get("agents_root")
@@ -130,6 +132,7 @@ class AgentCatalog:
                 or (model is not None and type(model) is not str)
                 or type(preamble) is not str
                 or type(allow_delegation) is not bool
+                or type(accepts_follow_ups) is not bool
                 or type(source) is not str
                 or (path is not None and type(path) is not str)
                 or (agents_root is not None and type(agents_root) is not str)
@@ -147,6 +150,7 @@ class AgentCatalog:
                     path=Path(path) if path is not None else None,
                     agents_root=Path(agents_root) if agents_root is not None else None,
                     allow_delegation=allow_delegation,
+                    accepts_follow_ups=accepts_follow_ups,
                 )
             )
         return cls(tuple(agents))
@@ -211,6 +215,11 @@ def _build_agent(
         raise ValueError(
             f"agent {document.path} frontmatter allow_delegation must be a boolean"
         )
+    accepts_follow_ups = metadata.get("accepts_follow_ups", False)
+    if type(accepts_follow_ups) is not bool:
+        raise ValueError(
+            f"agent {document.path} frontmatter accepts_follow_ups must be a boolean"
+        )
     assert isinstance(name, str)
     assert isinstance(description, str)
     return AgentPreset(
@@ -224,6 +233,7 @@ def _build_agent(
         path=document.entry_path.absolute(),
         agents_root=document.root,
         allow_delegation=allow_delegation,
+        accepts_follow_ups=accepts_follow_ups,
     )
 
 
