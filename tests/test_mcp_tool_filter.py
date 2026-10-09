@@ -640,7 +640,9 @@ async def test_mcp_http_notification_listener_healthy_idle_resets_backoff(
             )
         return httpx.Response(405, request=request)
 
-    monkeypatch.setattr("zeta.mcp.http.NOTIFICATION_STREAM_HEALTHY_SECONDS", 0.01)
+    monkeypatch.setattr(
+        "zeta.mcp.http.NOTIFICATION_STREAM_HEALTHY_SECONDS", 0.01, raising=False
+    )
     await _run_notification_listener(
         MCPServerConfig("http", "streamable-http", url="https://mcp.test"), handler
     )
