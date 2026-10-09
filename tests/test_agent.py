@@ -1366,10 +1366,7 @@ async def test_background_completion_leaves_no_pending_abort_waiter(
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
-    for _ in range(100):
-        if not loop._tracked_tasks:
-            break
-        await asyncio.sleep(0)
+    await loop._background_owner.wait()
 
     assert not [
         task for task in asyncio.all_tasks() if task not in baseline and not task.done()
@@ -1807,9 +1804,9 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await asyncio.wait_for(backend.children_started.wait(), timeout=1)
+    await backend.children_started.wait()
     backend.release_children.set()
-    await asyncio.wait_for(task, timeout=1)
+    await task
 
     results = [
         message.tool_result for message in store.messages() if message.tool_result

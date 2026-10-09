@@ -61,7 +61,7 @@ PNG = bytes.fromhex(
 IMAGE_FIXTURES = (
     ("png", "image/png", PNG),
     ("jpeg", "image/jpeg", _image_bytes("JPEG")),
-    ("gif", "image/gif", b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"),
+    ("gif", "image/gif", _image_bytes("GIF")),
     ("webp", "image/webp", _image_bytes("WEBP")),
 )
 

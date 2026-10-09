@@ -832,7 +832,7 @@ async def test_stream_update_queue_drops_oldest_without_truncating_result(
     call = ToolCall("burst-1", "stream", {})
     chunks = [f"chunk-{index}\n" for index in range(200)]
     final_text = "".join(chunks)
-    publish_duration = 0.0
+    publish_yielded = False
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
 
     async def stream(
@@ -840,12 +840,13 @@ async def test_stream_update_queue_drops_oldest_without_truncating_result(
         abort_signal: object,
         publisher: ToolStreamPublisher,
     ) -> str:
-        nonlocal publish_duration
+        nonlocal publish_yielded
         del arguments, abort_signal
-        started = asyncio.get_running_loop().time()
+        scheduled = asyncio.Event()
+        asyncio.get_running_loop().call_soon(scheduled.set)
         for chunk in chunks:
             publisher.publish(chunk, "stdout")
-        publish_duration = asyncio.get_running_loop().time() - started
+            publish_yielded = publish_yielded or scheduled.is_set()
         return final_text
 
     events: list[StreamEvent] = []
@@ -871,7 +872,7 @@ skill_catalog=SkillCatalog.empty(),
         for event in events
         if event.type is StreamEventType.TOOL_EXECUTION_END
     )
-    assert publish_duration < 0.1
+    assert publish_yielded is False
     assert len(updates) == 128
     assert updates[0].delta == "chunk-72\n"
     assert updates[-1].delta == "chunk-199\n"
