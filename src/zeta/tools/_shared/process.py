@@ -16,6 +16,7 @@ import weakref
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import IO, Any, Literal
 
@@ -38,6 +39,20 @@ def tool_subprocess_env() -> dict[str, str]:
     """Return the scrubbed parent environment for a tool child."""
 
     return subprocess_env()
+
+
+def _child_priority_preexec(niceness: int) -> Callable[[], None] | None:
+    """Return a best-effort child-only priority adjustment."""
+
+    return partial(_lower_child_priority, niceness) if niceness else None
+
+
+def _lower_child_priority(niceness: int) -> None:
+    try:
+        current = os.getpriority(os.PRIO_PROCESS, 0)
+        os.setpriority(os.PRIO_PROCESS, 0, min(19, current + niceness))
+    except (AttributeError, OSError):
+        logger.debug("could not lower tool subprocess priority", exc_info=True)
 
 
 _FD_SHELL_WRAPPER = (
@@ -162,6 +177,7 @@ class BackgroundTaskRegistry:
         notice_sink: Callable[[BackgroundTaskNoticeSinkValue], None] | None = None,
         notification_store: ConversationStore | None = None,
         notification_callback: Callable[[], None] | None = None,
+        command_niceness: int = 10,
     ) -> None:
         if type(output_limit) is not int or output_limit < 1:
             raise ValueError("output_limit must be a positive integer")
@@ -171,10 +187,13 @@ class BackgroundTaskRegistry:
             raise ValueError("term_grace must be positive")
         if stdin_drain_timeout <= 0:
             raise ValueError("stdin_drain_timeout must be positive")
+        if type(command_niceness) is not int or not 0 <= command_niceness <= 19:
+            raise ValueError("command_niceness must be an integer from 0 to 19")
         self.output_limit = output_limit
         self.call_limit = call_limit
         self.term_grace = term_grace
         self.stdin_drain_timeout = stdin_drain_timeout
+        self.command_niceness = command_niceness
         self._notice_sink = notice_sink
         self._notification_store = notification_store
         self._notification_callback = notification_callback
@@ -347,6 +366,7 @@ class BackgroundTaskRegistry:
                     "stderr": asyncio.subprocess.STDOUT,
                     "start_new_session": True,
                     "env": tool_subprocess_env(),
+                    "preexec_fn": _child_priority_preexec(self.command_niceness),
                 }
                 if cwd_fd is None:
                     process = await asyncio.create_subprocess_shell(

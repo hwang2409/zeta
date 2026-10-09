@@ -39,6 +39,10 @@ def _python_command(source: str) -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}"
 
 
+def _niceness_command() -> str:
+    return _python_command("import os; print(os.getpriority(os.PRIO_PROCESS, 0))")
+
+
 def _descendant_command(marker: Path, delay: float = 0.3) -> str:
     child = (
         "import pathlib,time; "
@@ -183,6 +187,63 @@ async def test_bash_captures_stdout_stderr_and_exit_code(tmp_path: Path) -> None
     assert structured["error"]["kind"] == "exit_nonzero"
     assert structured["error"]["hint"]
     assert "stdout:\nout\nstderr:\nerr" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_bash_lowers_child_priority_without_changing_parent(tmp_path: Path) -> None:
+    parent_niceness = os.getpriority(os.PRIO_PROCESS, 0)
+    registry = ToolRegistry(
+        tmp_path, command_niceness=10, skill_catalog=SkillCatalog.empty()
+    )
+
+    result = await registry.execute(
+        ToolCall("bash-niceness", "bash", {"command": _niceness_command()})
+    )
+
+    assert int(result["structuredContent"]["stdout"]) == min(
+        19, parent_niceness + 10
+    )
+    assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
+
+
+@pytest.mark.asyncio
+async def test_bash_command_niceness_zero_leaves_priority_unchanged(
+    tmp_path: Path,
+) -> None:
+    parent_niceness = os.getpriority(os.PRIO_PROCESS, 0)
+    registry = ToolRegistry(
+        tmp_path, command_niceness=0, skill_catalog=SkillCatalog.empty()
+    )
+
+    result = await registry.execute(
+        ToolCall("bash-niceness-zero", "bash", {"command": _niceness_command()})
+    )
+
+    assert int(result["structuredContent"]["stdout"]) == parent_niceness
+    assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
+
+
+@pytest.mark.asyncio
+async def test_bash_tolerates_setpriority_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent_niceness = os.getpriority(os.PRIO_PROCESS, 0)
+    registry = ToolRegistry(
+        tmp_path, command_niceness=10, skill_catalog=SkillCatalog.empty()
+    )
+
+    def fail_setpriority(*args: object) -> None:
+        del args
+        raise PermissionError("injected setpriority failure")
+
+    monkeypatch.setattr("zeta.tools._shared.process.os.setpriority", fail_setpriority)
+    result = await registry.execute(
+        ToolCall("bash-niceness-failure", "bash", {"command": _niceness_command()})
+    )
+
+    assert result["isError"] is False
+    assert int(result["structuredContent"]["stdout"]) == parent_niceness
+    assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
 
 
 @pytest.mark.asyncio
@@ -2037,6 +2098,35 @@ async def test_bash_tool_subprocess_sets_tool_marker(
         ToolCall("bg-marker-read", "task_output", {"task_id": task_id})
     )
     assert "ZETA_TOOL_SUBPROCESS=1" in output["structuredContent"]["output"]
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_run_background_lowers_child_priority_without_changing_parent(
+    tmp_path: Path,
+) -> None:
+    parent_niceness = os.getpriority(os.PRIO_PROCESS, 0)
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        command_niceness=10,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    started = await registry.execute(
+        ToolCall("bg-niceness", "run_background", {"command": _niceness_command()})
+    )
+    task_id = started["structuredContent"]["task_id"]
+    await asyncio.wait_for(registry.background_tasks.wait(task_id), timeout=15)
+    output = await registry.execute(
+        ToolCall("bg-niceness-output", "task_output", {"task_id": task_id})
+    )
+
+    assert int(output["structuredContent"]["output"]) == min(
+        19, parent_niceness + 10
+    )
+    assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
     await registry.close()
 
 
