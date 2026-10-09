@@ -25,6 +25,7 @@ class AgentPreset:
     path: Path | None = field(default=None, compare=False)
     agents_root: Path | None = field(default=None, compare=False)
     allow_delegation: bool = True
+    accepts_follow_ups: bool = False
 
     @property
     def description(self) -> str:
@@ -44,6 +45,7 @@ GENERAL_PRESET = AgentPreset(
     tool_names=None,
     preamble="",
     selection_guidance="full tool set",
+    accepts_follow_ups=True,
 )
 EXPLORE_PRESET = AgentPreset(
     name="explore",
@@ -94,6 +96,7 @@ RUN_PRESET = AgentPreset(
         "full tool set, runs in the background and accepts follow-up messages; "
         "use for a big task rather than a single lookup"
     ),
+    accepts_follow_ups=True,
 )
 
 AGENT_PRESETS: dict[AgentType, AgentPreset] = {
