@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -15,9 +14,25 @@ from weakref import WeakKeyDictionary, WeakSet
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..protocol.types import StructuredToolResult
-from .client import MCPClient, MCPPrompt, MCPResourceContent, MCPTool, make_error_result
+from .client import (
+    MCPClient,
+    MCPPrompt,
+    MCPResourceContent,
+    MCPTool,
+    degraded_result as _degraded_result,
+    error_text as _error_text,
+    make_error_result,
+    notice as _notice,
+    retry_text as _retry_text,
+    safe_close,
+    unavailable_result as _unavailable_result,
+)
 from .config import MCPServerConfig, mcp_log_path, tool_prefix
-from .definition_publisher import MCPDefinitionPublisher
+from .definition_publisher import (
+    MCPDefinitionPublisher,
+    ToolsListChanged as _ToolsListChanged,
+    ToolsListRefreshed as _ToolsListRefreshed,
+)
 from .resource_actor import (
     ResourceFinished as _ResourceFinished,
     ResourceRequest as _ResourceRequest,
@@ -128,17 +143,6 @@ class _TransportFailure:
 
 
 @dataclass(frozen=True, slots=True)
-class _ToolsListChanged:
-    client: MCPClient
-
-
-@dataclass(frozen=True, slots=True)
-class _ToolsListRefreshed:
-    client: MCPClient
-    task: asyncio.Task[list[MCPTool]]
-
-
-@dataclass(frozen=True, slots=True)
 class _ChildFinished:
     task: asyncio.Task[object]
 
@@ -166,6 +170,9 @@ class _Close:
 
 PublishSnapshot = Callable[["MCPServerActor", MCPServerStatus, MCPClient | None], None]
 
+
+async def _safe_close(client: MCPClient) -> None:
+    await safe_close(client, CLIENT_CLOSE_TIMEOUT_SECONDS)
 
 class MCPServerActor(MCPDefinitionPublisher):
     """Own one server lifecycle and serialize all lifecycle messages."""
@@ -833,79 +840,6 @@ class MCPServerActor(MCPDefinitionPublisher):
             )
         self._complete_operation(operation, self._status)
 
-    def _filter_tools(
-        self,
-        tools: list[MCPTool],
-        notice_sink: NoticeSink | None,
-        *,
-        config: MCPServerConfig | None = None,
-    ) -> list[MCPTool]:
-        server_config = config or self.config
-        names = {tool.name for tool in tools}
-        unknown = server_config.unknown_tool_patterns(names)
-        if unknown:
-            detail = "; ".join(
-                f"unknown {field}: {', '.join(patterns)}"
-                for field, patterns in unknown
-            )
-            warning = f"mcp · {self.name} {detail}"
-            logger.warning(warning)
-            _notice(notice_sink, warning)
-        return [tool for tool in tools if server_config.allows_tool(tool.name)]
-
-    def _notify(self, client: MCPClient, method: str) -> None:
-        if method == "notifications/tools/list_changed":
-            self._queue.put_nowait(_ToolsListChanged(client))
-
-    def _handle_tools_list_changed(self, message: _ToolsListChanged) -> None:
-        if message.client is not self._client or self._status.state != "mounted":
-            return
-        if self._tool_refresh_task is not None:
-            self._tool_refresh_pending = True
-            return
-        task = asyncio.create_task(message.client.list_tools())
-        self._tool_refresh_task = task
-        self._children.add(task)
-        task.add_done_callback(
-            lambda done, client=message.client: self._queue.put_nowait(
-                _ToolsListRefreshed(client, done)
-            )
-        )
-
-    def _handle_tools_list_refreshed(self, message: _ToolsListRefreshed) -> None:
-        self._children.discard(message.task)
-        if self._tool_refresh_task is message.task:
-            self._tool_refresh_task = None
-        if message.client is not self._client or self._status.state != "mounted":
-            self._tool_refresh_pending = False
-            return
-        try:
-            tools = self._filter_tools(message.task.result(), self._notice_sink)
-        except Exception as exc:  # noqa: BLE001 - refresh failure degrades the server
-            self._tool_refresh_pending = False
-            self._degrade_current(_error_text(exc))
-            return
-        self._unregister_tools()
-        self._tools = tuple(tools)
-        self._set_status(
-            MCPServerStatus(
-                self.name,
-                self.config.transport,
-                "mounted",
-                tool_count=len(self._tools),
-                stderr_log_path=str(mcp_log_path(self.name)),
-            )
-        )
-        self._republish_definitions()
-        self._publish_callback(self, self._status, self._client)
-        if not tools and (
-            self.config.allowed_tools is not None or self.config.disallowed_tools
-        ):
-            _notice(self._notice_sink, f"mcp · {self.name} mounted with zero tools")
-        if self._tool_refresh_pending:
-            self._tool_refresh_pending = False
-            self._handle_tools_list_changed(_ToolsListChanged(message.client))
-
     def _handle_transport_failure(self, message: _TransportFailure) -> None:
         operation = self._operation
         if operation is not None and message.operation == operation.identifier:
@@ -1292,56 +1226,6 @@ class MCPServerActor(MCPDefinitionPublisher):
             _set_result(operation.request, status)
         if self._operation is operation:
             self._operation = None
-
-
-async def _safe_close(client: MCPClient) -> None:
-    try:
-        await asyncio.wait_for(client.close(), CLIENT_CLOSE_TIMEOUT_SECONDS)
-    except TimeoutError:
-        logger.warning(
-            "timed out closing MCP server %s; abandoning transport", client.config.name
-        )
-    except Exception:  # noqa: BLE001 - cleanup cannot mask lifecycle state
-        logger.exception("failed to close MCP server %s", client.config.name)
-
-
-def _notice(sink: NoticeSink | None, message: str) -> None:
-    if sink is not None:
-        sink(message)
-
-
-def _error_text(error: BaseException) -> str:
-    try:
-        return str(error).strip() or type(error).__name__
-    except Exception:  # noqa: BLE001 - error reporting must not mask the failure
-        return type(error).__name__
-
-
-def _retry_text(retry_at: float | None) -> str:
-    if retry_at is None:
-        return "when backoff expires"
-    remaining = retry_at - time.monotonic()
-    if remaining <= 0:
-        return "now"
-    return f"in {math.ceil(remaining * 10) / 10:.1f}s"
-
-
-def _degraded_result(
-    name: str,
-    status: MCPServerStatus | None,
-) -> StructuredToolResult:
-    reason = (
-        status.reason if status is not None and status.reason else "transport failure"
-    )
-    return make_error_result(
-        f"MCP server '{name}' is degraded: {reason}. Use /mcp reconnect {name}."
-    )
-
-
-def _unavailable_result(name: str) -> StructuredToolResult:
-    return make_error_result(
-        f"MCP server '{name}' is unavailable. Use /mcp reconnect {name}."
-    )
 
 
 def _unavailable_status(name: str, config: MCPServerConfig) -> MCPServerStatus:

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import logging
 import math
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -17,6 +20,9 @@ from ..protocol.types import (
 )
 from ..tools.registry import text_block
 from .config import MCPServerConfig
+
+logger = logging.getLogger(__name__)
+CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
 class MCPError(RuntimeError):
@@ -134,6 +140,53 @@ class MCPClient(Protocol):
 
     async def close(self) -> None:
         """Close the transport and release child processes or clients."""
+
+
+async def safe_close(
+    client: MCPClient, timeout: float = CLIENT_CLOSE_TIMEOUT_SECONDS
+) -> None:
+    try:
+        await asyncio.wait_for(client.close(), timeout)
+    except TimeoutError:
+        logger.warning(
+            "timed out closing MCP server %s; abandoning transport", client.config.name
+        )
+    except Exception:
+        logger.exception("failed to close MCP server %s", client.config.name)
+
+
+def notice(sink: Callable[[str], None] | None, message: str) -> None:
+    if sink is not None:
+        sink(message)
+
+
+def error_text(error: BaseException) -> str:
+    try:
+        return str(error).strip() or type(error).__name__
+    except Exception:  # noqa: BLE001 - error reporting must not mask the failure
+        return type(error).__name__
+
+
+def retry_text(retry_at: float | None) -> str:
+    if retry_at is None:
+        return "when backoff expires"
+    remaining = retry_at - time.monotonic()
+    if remaining <= 0:
+        return "now"
+    return f"in {math.ceil(remaining * 10) / 10:.1f}s"
+
+
+def degraded_result(name: str, status: object | None) -> StructuredToolResult:
+    reason = getattr(status, "reason", None) or "transport failure"
+    return make_error_result(
+        f"MCP server '{name}' is degraded: {reason}. Use /mcp reconnect {name}."
+    )
+
+
+def unavailable_result(name: str) -> StructuredToolResult:
+    return make_error_result(
+        f"MCP server '{name}' is unavailable. Use /mcp reconnect {name}."
+    )
 
 
 def initialize_params() -> dict[str, object]:
