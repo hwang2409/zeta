@@ -272,9 +272,12 @@ async def consume_child(
                     bound_exited = True
                 while keep_going and failure_message is None:
                     children = owned_children()
+                    pending_follow_up = bool(child_loop.store.pending_prompts())
                     pending_notification = (
                         child_loop.notification_system_message() is not None
                     )
+                    if pending_follow_up:
+                        break
                     if not children and not pending_notification:
                         break
                     if children:

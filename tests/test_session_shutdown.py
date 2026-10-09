@@ -386,7 +386,12 @@ def test_recovery_and_send_release_borrowed_child_stores(
         retained.append(self)
 
     monkeypatch.setattr(ConversationStore, "__init__", record)
-    assert send_to_run(opened.store, "child", "follow-up") is None
+    assert send_to_run(
+        opened.store,
+        "child",
+        "follow-up",
+        channel=loop._background_owner.conversation_channel,
+    ) is None
     recover_agent_children(loop)
     assert len(retained) == 3
     assert all(not store._release_lease.alive for store in retained)

@@ -1012,6 +1012,98 @@ class FinishGateBackend(CompletionBackend):
         )
 
 
+class FollowUpFinishGateBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.gate_started = asyncio.Event()
+        self.release_gate_turn = asyncio.Event()
+        self.follow_up_processed = asyncio.Event()
+        self.follow_up_prompts: list[str] = []
+        self.gate_turns = 0
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        gate = next(
+            (
+                message
+                for message in reversed(messages)
+                if message.metadata.get("zeta_event") == "agent_finish_gate"
+            ),
+            None,
+        )
+        child_started = any(
+            message.tool_result is not None
+            and message.tool_result.tool_call_id == "child"
+            for message in messages
+        )
+        grandchild_started = any(
+            message.tool_result is not None
+            and message.tool_result.tool_call_id == "grandchild"
+            for message in messages
+        )
+        if last_user == "start" and not child_started:
+            child = _background_agent_call("child")
+            child.arguments.update(prompt="child prompt", description="worker")
+            blocks = [ToolUseContent(child)]
+        elif last_user == "child prompt" and not grandchild_started:
+            grandchild = _background_agent_call("grandchild")
+            grandchild.arguments.update(
+                prompt="grandchild prompt", description="evidence"
+            )
+            blocks = [ToolUseContent(grandchild)]
+        elif last_user == "grandchild prompt":
+            await asyncio.Event().wait()
+        elif last_user.startswith("follow-up"):
+            self.follow_up_prompts.append(last_user)
+            self.follow_up_processed.set()
+            blocks = [TextContent("processed follow-up")]
+        elif grandchild_started and gate is None:
+            blocks = [TextContent("child ready to finish")]
+        elif gate is not None:
+            self.gate_turns += 1
+            self.gate_started.set()
+            if self.gate_turns == 1:
+                await self.release_gate_turn.wait()
+                blocks = [TextContent("I will wait for my child.")]
+            else:
+                blocks = [
+                    ToolUseContent(
+                        ToolCall(
+                            "handoff-grandchild",
+                            "agent_handoff",
+                            {
+                                "reason": "The follow-up is complete.",
+                                "outputs": "The grandchild result appears in the root.",
+                            },
+                        )
+                    )
+                ]
+        elif child_started:
+            blocks = [TextContent("root complete")]
+        else:
+            blocks = [TextContent("unexpected turn")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 class ConversationFinishGateBackend(CompletionBackend):
     def __init__(self) -> None:
         self.gate_seen = asyncio.Event()
@@ -1993,7 +2085,12 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
     await asyncio.wait_for(backend.question_published.wait(), timeout=2)
     child_handle = next(iter(store.agent_children()))
-    assert send_to_run(store, child_handle, "queued follow-up") is None
+    assert send_to_run(
+        store,
+        child_handle,
+        "queued follow-up",
+        channel=loop._background_owner.conversation_channel,
+    ) is None
 
     await _wait_for_notification(store, "completed")
     assert backend.notification_turns == 1
@@ -2002,6 +2099,86 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
 
     backend.release_grandchild.set()
     await loop._background_owner.wait()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_follow_up_wakes_worker_waiting_in_finish_gate(tmp_path: Path) -> None:
+    backend = FollowUpFinishGateBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.gate_started.wait(), timeout=2)
+    backend.release_gate_turn.set()
+    await asyncio.sleep(0.01)
+    child_handle = next(iter(store.agent_children()))
+    assert send_to_run(
+        store,
+        child_handle,
+        "follow-up while waiting",
+        channel=loop._background_owner.conversation_channel,
+    ) is None
+
+    await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=0.1)
+    assert backend.follow_up_prompts == ["follow-up while waiting"]
+    await _wait_for_notification(store, "completed")
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_follow_up_between_gate_turns_is_delivered_once(tmp_path: Path) -> None:
+    backend = FollowUpFinishGateBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.gate_started.wait(), timeout=2)
+    child_handle = next(iter(store.agent_children()))
+    assert send_to_run(
+        store,
+        child_handle,
+        "follow-up between gate turns",
+        channel=loop._background_owner.conversation_channel,
+    ) is None
+    backend.release_gate_turn.set()
+
+    await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=0.1)
+    await _wait_for_notification(store, "completed")
+    assert backend.follow_up_prompts == ["follow-up between gate turns"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_follow_up_is_processed_before_finish_gate_timeout(
+    tmp_path: Path,
+) -> None:
+    backend = FollowUpFinishGateBackend()
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store, finish_gate_timeout=0.5)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.gate_started.wait(), timeout=2)
+    backend.release_gate_turn.set()
+    await asyncio.sleep(0.01)
+    child_handle = next(iter(store.agent_children()))
+    assert send_to_run(
+        store,
+        child_handle,
+        "follow-up before bound",
+        channel=loop._background_owner.conversation_channel,
+    ) is None
+
+    await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=0.1)
+    assert backend.follow_up_prompts == ["follow-up before bound"]
+    await _wait_for_notification(store, "completed")
     await loop.close()
 
 
@@ -5426,15 +5603,16 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     release = threading.Event()
     original_send = agent_send_module.send_to_run
 
-    def blocked_send(*args):
+    def blocked_send(*args, **kwargs):
         started.set()
         release.wait(timeout=2)
-        return original_send(*args)
+        return original_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_send_module, "send_to_run", blocked_send)
     registry = ToolRegistry(
         tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
     )
+    registry._agent_owner = BackgroundAgentOwner(parent_store)
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
@@ -5494,6 +5672,7 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
     registry = ToolRegistry(
         tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
     )
+    registry._agent_owner = BackgroundAgentOwner(parent_store)
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
@@ -5537,6 +5716,7 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
     registry = ToolRegistry(
         tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
     )
+    registry._agent_owner = BackgroundAgentOwner(parent_store)
     lock = child_store._append_lock()
     lock.__enter__()
     try:
@@ -5586,7 +5766,12 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
     )
     assert child_store.close_pending_queue_if_empty() == []
 
-    error = send_to_run(store, handle, "too late")
+    error = send_to_run(
+        store,
+        handle,
+        "too late",
+        channel=loop._background_owner.conversation_channel,
+    )
     assert error is not None and "no live run" in error
 
     backend.release_child.set()
@@ -5643,7 +5828,12 @@ async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> N
     # The model queues follow-ups by the child_instance_id it saw in the tool
     # result, not by the provider tool_call.id, so round-trip that handle.
     handle = _run_handle_from_receipt(store)
-    assert send_to_run(store, handle, "also check the tests") is None
+    assert send_to_run(
+        store,
+        handle,
+        "also check the tests",
+        channel=loop._background_owner.conversation_channel,
+    ) is None
 
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
@@ -5674,7 +5864,12 @@ async def test_a_follow_up_reaches_a_worker_at_its_next_turn(tmp_path: Path) -> 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
     handle = _run_handle_from_receipt(store)
-    assert send_to_run(store, handle, "also check the tests") is None
+    assert send_to_run(
+        store,
+        handle,
+        "also check the tests",
+        channel=loop._background_owner.conversation_channel,
+    ) is None
 
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
@@ -5701,13 +5896,14 @@ async def test_a_run_with_an_empty_queue_finishes_normally(tmp_path: Path) -> No
 def test_send_to_run_rejects_unknown_and_finished_runs(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
-    error = send_to_run(store, "run-1", "hello")
+    channel = BackgroundAgentOwner(store).conversation_channel
+    error = send_to_run(store, "run-1", "hello", channel=channel)
     assert error is not None and "no live run" in error
 
-    assert send_to_run(store, "", "hello") == (
+    assert send_to_run(store, "", "hello", channel=channel) == (
         "child_instance_id must be a nonempty string"
     )
-    error = send_to_run(store, "run-1", "  ")
+    error = send_to_run(store, "run-1", "  ", channel=channel)
     assert error == "message must be a nonempty string"
 
 
@@ -5729,7 +5925,12 @@ def test_send_to_run_rejects_non_run_children(tmp_path: Path) -> None:
         child_instance_id="sess:1",
     )
 
-    error = send_to_run(store, "sess:1", "hello")
+    error = send_to_run(
+        store,
+        "sess:1",
+        "hello",
+        channel=BackgroundAgentOwner(store).conversation_channel,
+    )
     assert error is not None
     assert "explore" in error and "agent_send" in error
 
@@ -7368,7 +7569,12 @@ async def test_run_followup_message_row_origin_is_agent_send(tmp_path: Path) -> 
     handle = _run_handle_from_receipt(store)
     marker = store.agent_children()[handle]
     child_path = Path(str(marker["child_session_path"]))
-    assert send_to_run(store, handle, "also check the tests") is None
+    assert send_to_run(
+        store,
+        handle,
+        "also check the tests",
+        channel=loop._background_owner.conversation_channel,
+    ) is None
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
 

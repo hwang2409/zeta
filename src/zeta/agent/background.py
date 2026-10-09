@@ -958,19 +958,21 @@ async def finish_background_child(
             killed_task_ids_truncated=killed_task_ids_truncated,
             canonical_receipt=True,
         )
-        notification = notification_store.append_agent_notification(
-            child_instance_id,
-            child_session_path=child_path,
-            description=description,
-            status=status,
-            text=notification_text,
-            stats=terminal_stats,
-            killed_task_ids=killed_task_metadata or None,
-            killed_task_count=killed_task_count or None,
-            killed_task_ids_truncated=killed_task_ids_truncated,
-        )
-        if notification_store is not effective_parent_store:
-            effective_parent_store.append_agent_notification(
+        if background_owner is not None:
+            notification = background_owner.conversation_channel.publish_completion(
+                child_instance_id=child_instance_id,
+                marker_key=marker_key or tool_call.id,
+                child_session_path=child_path,
+                description=description,
+                status=status,
+                text=notification_text,
+                stats=terminal_stats,
+                killed_task_ids=killed_task_metadata or None,
+                killed_task_count=killed_task_count or None,
+                killed_task_ids_truncated=killed_task_ids_truncated,
+            )
+        else:
+            notification = notification_store.append_agent_notification(
                 child_instance_id,
                 child_session_path=child_path,
                 description=description,
@@ -981,9 +983,19 @@ async def finish_background_child(
                 killed_task_count=killed_task_count or None,
                 killed_task_ids_truncated=killed_task_ids_truncated,
             )
-        effective_parent_store.finish_agent_child(marker_key or tool_call.id)
-        if background_owner is not None:
-            background_owner.conversation_channel.notify_child_event(child_instance_id)
+            if notification_store is not effective_parent_store:
+                effective_parent_store.append_agent_notification(
+                    child_instance_id,
+                    child_session_path=child_path,
+                    description=description,
+                    status=status,
+                    text=notification_text,
+                    stats=terminal_stats,
+                    killed_task_ids=killed_task_metadata or None,
+                    killed_task_count=killed_task_count or None,
+                    killed_task_ids_truncated=killed_task_ids_truncated,
+                )
+            effective_parent_store.finish_agent_child(marker_key or tool_call.id)
         event_data: dict[str, object] = {"notification_id": notification.id}
         if agent_instance_id is not None:
             event_data["agent_instance_id"] = agent_instance_id

@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-from ..core.store import ConversationStore
+from ..core.checkpoints import ConversationEntry
+from ..core.store import (
+    ConversationStore,
+    PendingPromptCommitTimeoutError,
+    PendingPromptsClosedError,
+)
+from ..protocol.types import MessageOrigin
 
 if TYPE_CHECKING:
     from .background import BackgroundAgentOwner
@@ -43,20 +51,20 @@ class ConversationChannel:
     ) -> None:
         self._owner = owner
         self._root_store = root_store
-        self._wakes: dict[str, asyncio.Event] = {}
+        self._wakes: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Event]] = {}
         self._root_wake: Callable[[], None] | None = None
 
     def set_root_wake(self, callback: Callable[[], None] | None) -> None:
         self._root_wake = callback
 
     def register_loop(self, instance_id: str) -> None:
-        self._wakes[instance_id] = asyncio.Event()
+        self._wakes[instance_id] = (asyncio.get_running_loop(), asyncio.Event())
 
     def unregister_loop(self, instance_id: str) -> None:
         self._wakes.pop(instance_id, None)
 
     async def wait(self, instance_id: str) -> None:
-        event = self._wakes[instance_id]
+        _loop, event = self._wakes[instance_id]
         await event.wait()
         event.clear()
 
@@ -65,9 +73,106 @@ class ConversationChannel:
             if self._root_wake is not None:
                 self._root_wake()
             return
-        event = self._wakes.get(instance_id)
-        if event is not None:
-            event.set()
+        target = self._wakes.get(instance_id)
+        if target is not None:
+            loop, event = target
+            loop.call_soon_threadsafe(event.set)
+
+    def publish_follow_up(
+        self,
+        parent_store: ConversationStore,
+        child_instance_id: object,
+        message: object,
+        *,
+        commit_timeout: float,
+    ) -> str | None:
+        """Durably queue one eligible follow-up, then wake its child loop."""
+
+        if type(child_instance_id) is not str or not child_instance_id.strip():
+            return "child_instance_id must be a nonempty string"
+        if type(message) is not str or not message.strip():
+            return "message must be a nonempty string"
+        no_live_run = (
+            f"no live run/child {child_instance_id!r}; it was canceled, finished, "
+            "or never started"
+        )
+        marker = parent_store.agent_children().get(child_instance_id)
+        if marker is None:
+            return no_live_run
+        if not has_follow_up_loop(
+            accepts_follow_ups=marker.get("accepts_follow_ups") is True,
+            background=marker.get("background") is True,
+        ):
+            agent_type = marker.get("agent_type") or "general"
+            return (
+                f"agent_send rejected for {agent_type} child {child_instance_id!r}: "
+                "it does not accept follow-ups; reviewers are one-shot; start a "
+                "fresh reviewer"
+            )
+        deadline = time.monotonic() + commit_timeout
+        try:
+            child_path = Path(str(marker["child_session_path"]))
+            with ConversationStore(
+                child_path.parent,
+                session_id=child_path.name,
+                cwd=parent_store.cwd,
+                _lock_deadline=deadline,
+            ) as child_store:
+                child_store.pending_prompt_queue.append(
+                    message,
+                    origin=MessageOrigin.AGENT_SEND,
+                    deadline=deadline,
+                )
+        except PendingPromptCommitTimeoutError:
+            return "pending prompt commit timed out before the queue could be changed"
+        except PendingPromptsClosedError:
+            return no_live_run
+        self.wake(child_instance_id)
+        return None
+
+    def publish_completion(
+        self,
+        *,
+        child_instance_id: str,
+        marker_key: str,
+        child_session_path: str,
+        description: str,
+        status: str,
+        text: str,
+        stats: dict[str, Any] | None,
+        killed_task_ids: list[str] | None,
+        killed_task_count: int | None,
+        killed_task_ids_truncated: bool,
+    ) -> ConversationEntry:
+        """Persist a child completion for its recipients, then wake its parent."""
+
+        parent_store, parent_id = self._live_parent(child_instance_id)
+        notification = self._root_store.append_agent_notification(
+            child_instance_id,
+            child_session_path=child_session_path,
+            description=description,
+            status=status,
+            text=text,
+            stats=stats,
+            killed_task_ids=killed_task_ids,
+            killed_task_count=killed_task_count,
+            killed_task_ids_truncated=killed_task_ids_truncated,
+        )
+        if self._root_store is not parent_store:
+            parent_store.append_agent_notification(
+                child_instance_id,
+                child_session_path=child_session_path,
+                description=description,
+                status=status,
+                text=text,
+                stats=stats,
+                killed_task_ids=killed_task_ids,
+                killed_task_count=killed_task_count,
+                killed_task_ids_truncated=killed_task_ids_truncated,
+            )
+        parent_store.finish_agent_child(marker_key)
+        self.wake(parent_id)
+        return notification
 
     def publish_question(
         self,
@@ -123,10 +228,6 @@ class ConversationChannel:
             self.wake(parent_id)
             moved += 1
         return moved
-
-    def notify_child_event(self, child_instance_id: str) -> None:
-        _store, parent_id = self._live_parent(child_instance_id)
-        self.wake(parent_id)
 
     def close_questions(self, child_instance_id: str, *, reason: str) -> int:
         closed = 0
