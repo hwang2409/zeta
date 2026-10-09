@@ -40,21 +40,16 @@ def _validate_model_name(provider: str, model: str) -> None:
 class SlashHandlerMixin:
     """Serve the session-state slash commands the registry dispatches."""
 
-
     async def slash_approve(self, args: str) -> str:
         """Approve the first pending request, or the request with this key."""
 
-        owner = getattr(self, "_main_app", None) or self
-        await owner._submissions.approval_command(
-            ApprovalDecision.ALLOW, args.strip() or None
-        )
+        await self._resolve_approval(ApprovalDecision.ALLOW, args.strip() or None)
         return ""
 
     async def slash_always(self, args: str) -> str:
         """Approve and remember this action for the current session."""
 
-        owner = getattr(self, "_main_app", None) or self
-        await owner._submissions.approval_command(
+        await self._resolve_approval(
             ApprovalDecision.ALLOW, args.strip() or None, always=True
         )
         return ""
@@ -62,11 +57,21 @@ class SlashHandlerMixin:
     async def slash_deny(self, args: str) -> str:
         """Deny the first pending request, or the request with this key."""
 
-        owner = getattr(self, "_main_app", None) or self
-        await owner._submissions.approval_command(
-            ApprovalDecision.DENY, args.strip() or None
-        )
+        await self._resolve_approval(ApprovalDecision.DENY, args.strip() or None)
         return ""
+
+    async def _resolve_approval(
+        self,
+        decision: ApprovalDecision,
+        requested_key: str | None,
+        *,
+        always: bool = False,
+    ) -> None:
+        controller = self._fork_controller
+        if controller is None:
+            await self.resolve_local_approval(decision, requested_key, always=always)
+            return
+        await controller.resolve_approval(decision, requested_key, always=always)
 
     def slash_status(self) -> SlashStatus:
         context_assembler = self.loop.context_assembler
@@ -94,7 +99,9 @@ class SlashHandlerMixin:
             uncached_input_tokens=context_assembler.uncached_input_tokens_this_session,
             output_tokens_this_session=context_assembler.output_tokens_this_session,
             child_cache_read_input_tokens=child_usage["cache_read_input_tokens"],
-            child_cache_creation_input_tokens=child_usage["cache_creation_input_tokens"],
+            child_cache_creation_input_tokens=child_usage[
+                "cache_creation_input_tokens"
+            ],
             child_uncached_input_tokens=child_usage["input_tokens"],
             child_output_tokens_this_session=child_usage["output_tokens"],
             context_files=self._context_files,
@@ -360,9 +367,7 @@ class SlashHandlerMixin:
             if policy.deny:
                 summary += f"; deny: {', '.join(policy.deny)}"
             if pending:
-                waiting = ", ".join(
-                    sorted({tool.module_stem for tool in pending})
-                )
+                waiting = ", ".join(sorted({tool.module_stem for tool in pending}))
                 summary = (
                     f"{summary}; untrusted project tools waiting: {waiting}; "
                     "run /tools trust to enable"
@@ -377,9 +382,7 @@ class SlashHandlerMixin:
             )
         if discovery is None or not pending:
             return "tools: no project tools waiting for trust"
-        notices, trusted = trust_project_tools(
-            self.loop.tool_registry, discovery
-        )
+        notices, trusted = trust_project_tools(self.loop.tool_registry, discovery)
         self.loop.tool_schemas = list(self.loop.tool_registry.schemas)
         for notice in notices:
             self._print_system(notice)
@@ -425,7 +428,10 @@ class SlashHandlerMixin:
             return "project registry unavailable"
         project = None
         if args.strip() == "init":
-            root = discover_project_root(self.loop.store.cwd) or Path(self.loop.store.cwd).resolve()
+            root = (
+                discover_project_root(self.loop.store.cwd)
+                or Path(self.loop.store.cwd).resolve()
+            )
             try:
                 project = registry.find_or_create_for_directory(root)
                 metadata = self.loop.manager.associate_project(
@@ -437,7 +443,9 @@ class SlashHandlerMixin:
         else:
             if self.loop.session_metadata.project_id:
                 try:
-                    project = registry.show_project(self.loop.session_metadata.project_id)
+                    project = registry.show_project(
+                        self.loop.session_metadata.project_id
+                    )
                 except ProjectRegistryError:
                     project = None
             if project is None:
@@ -445,11 +453,14 @@ class SlashHandlerMixin:
         if project is None:
             return "unassociated (run /project init to associate this directory)"
         if registry.memory_format(project.project_id) == 2:
-            memory = ", ".join(registry._entry_memory_mirrors(project.project_id)) or "none"
+            memory = (
+                ", ".join(registry._entry_memory_mirrors(project.project_id)) or "none"
+            )
         else:
-            memory = ", ".join(
-                name for name, _ in registry.load_memory(project.project_id)
-            ) or "none"
+            memory = (
+                ", ".join(name for name, _ in registry.load_memory(project.project_id))
+                or "none"
+            )
         return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
 
     def slash_memory(self, args: str) -> str:
@@ -488,17 +499,14 @@ class SlashHandlerMixin:
         requested = args.strip()
         if not requested or requested.lower() == "list":
             available = ", ".join(_theme.list_available(home))
-            return (
-                f"theme: {_theme.active_palette().name} · available: {available}"
-            )
+            return f"theme: {_theme.active_palette().name} · available: {available}"
         palette, notice = _theme.resolve_palette(requested, home=home)
         if palette is None:
             if notice is not None:
                 return f"theme unchanged: {notice}"
             available = ", ".join(_theme.list_available(home))
             return (
-                f"theme unchanged: unknown theme {requested!r}; "
-                f"available: {available}"
+                f"theme unchanged: unknown theme {requested!r}; available: {available}"
             )
         _theme.set_active_palette(palette)
         self._on_theme_change()

@@ -3,7 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from zeta.tui.app import TUIApp
+from zeta.tui.runtime_close import RuntimeCloseMixin
 from zeta.tui.slash_handlers.fork_view import ForkContext, ForkViewMixin
 
 # -- request_open_fork / request_return_to_main keep the main turn alive -----
@@ -87,40 +90,128 @@ def test_resolved_item_returns_immediately() -> None:
     assert app.returned is True
 
 
-# -- status-bar main-activity indicator -------------------------------------
+# -- resuming a suspended TUI does not replay its transcript -----------------
 
 
-class _FakeMain:
-    def __init__(self, count: int) -> None:
-        self._count = count
+def test_tui_run_replays_transcript_only_on_initial_start() -> None:
+    import asyncio
 
-    def _notification_count(self) -> int:
-        return self._count
+    async def driver() -> None:
+        app = object.__new__(TUIApp)
+        replay_count = 0
+        read_count = 0
+
+        class Loop:
+            async def activate(self) -> None:
+                pass
+
+            async def ensure_mcp_servers(self) -> None:
+                pass
+
+        async def rebuild() -> bool:
+            nonlocal replay_count
+            replay_count += 1
+            return True
+
+        async def read_prompt(session: object) -> None:
+            nonlocal read_count
+            read_count += 1
+            if read_count == 1:
+                app._open_fork_target = "fork-1"
+
+        async def close() -> None:
+            pass
+
+        app.loop = Loop()
+        app._exit_requested = False
+        app._decisions_switching = False
+        app._session = None
+        app._active_session = None
+        app._active_task = None
+        app._open_fork_target = None
+        app._input_loop_active = False
+        app._startup_presented = True
+        app._begin_startup_replay = lambda: None
+        app._attach_draft = lambda session: None
+        app._rebuild_transcript_async = rebuild
+        app._finish_startup_replay = lambda **kwargs: None
+        app._present_pending_approvals = lambda: None
+        app.start_decisions_poll = lambda: None
+        app._read_prompt = read_prompt
+        app.close = close
+        session = SimpleNamespace()
+
+        await TUIApp.run(app, session)
+        app._open_fork_target = None
+        await TUIApp.run(app, session, resume_ui=True)
+
+        assert replay_count == 1
+
+    asyncio.run(driver())
 
 
-class _FakeForkStatus(ForkViewMixin):
-    def __init__(self) -> None:
-        self._main_app = None
-        self._main_notification_baseline = 0
+def test_tui_close_failure_still_runs_later_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
 
+    cleaned: list[str] = []
 
-def test_main_approval_is_forwarded_to_visible_fork() -> None:
-    rendered: list[str] = []
-    fork = SimpleNamespace(
-        _present_pending_approvals=lambda: rendered.append("approval")
+    class ClosingApp(RuntimeCloseMixin):
+        pass
+
+    class Loop:
+        store = SimpleNamespace(agent_notifications=lambda: ())
+        tool_registry = SimpleNamespace(
+            background_tasks=SimpleNamespace(
+                set_notice_sink=lambda value: cleaned.append("task sink")
+            )
+        )
+
+        def set_background_event_sink(self, value: object) -> None:
+            cleaned.append("event sink")
+
+        def set_background_wake_callback(self, value: object) -> None:
+            cleaned.append("wake callback")
+
+        def set_mcp_notice_sink(self, value: object) -> None:
+            cleaned.append("mcp sink")
+
+        def set_mcp_prompt_refresh(self, value: object) -> None:
+            cleaned.append("prompt refresh")
+
+    async def fail_finder() -> None:
+        cleaned.append("finder")
+        raise RuntimeError("finder close failed")
+
+    async def async_cleanup(name: str) -> None:
+        cleaned.append(name)
+
+    async def close_session(*args: object, **kwargs: object) -> None:
+        cleaned.append("session")
+
+    monkeypatch.setattr("zeta.tui.runtime_close.close_session", close_session)
+    app = ClosingApp()
+    app._init_runtime_close()
+    app.loop = Loop()
+    app._terminal_restored = False
+    app._workspace_snapshot_store = None
+    app._hooks = None
+    app._active_session = app._draft_session = app._session = object()
+    app.stop_decisions_poll = lambda: cleaned.append("poll")
+    app._stop_decisions_refresh = lambda: cleaned.append("refresh")
+    app._close_finder_workers = fail_finder
+    app._agent_navigation = SimpleNamespace(
+        unbind_layout=lambda: cleaned.append("navigation")
     )
-    main = SimpleNamespace(_visible_fork=fork, pending_approvals=(object(),))
+    app._cancel_mcp_wizard = lambda: async_cleanup("wizard")
+    app._submissions = SimpleNamespace(close=lambda: async_cleanup("submissions"))
+    app._draft = SimpleNamespace(detach=lambda: cleaned.append("draft"))
 
-    TUIApp._present_pending_approvals(main)
+    with pytest.raises(RuntimeError, match="finder close failed"):
+        asyncio.run(app.close())
 
-    assert rendered == ["approval"]
-
-
-def test_main_activity_pending_tracks_new_notifications() -> None:
-    fork = _FakeForkStatus()
-    assert fork.main_activity_pending is False  # not attached to a main runtime
-    main = _FakeMain(3)
-    fork.attach_main(main)
-    assert fork.main_activity_pending is False
-    main._count = 4  # a main notification arrives while the fork is shown
-    assert fork.main_activity_pending is True
+    assert app._closed is True
+    assert "submissions" in cleaned
+    assert "session" in cleaned
+    assert "task sink" in cleaned

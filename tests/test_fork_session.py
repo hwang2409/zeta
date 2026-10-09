@@ -3,27 +3,23 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
-from zeta.tui.fork_session import run_fork_stack
+import pytest
+
+from zeta.core.approval import ApprovalDecision, ApprovalRequest
+from zeta.protocol.types import ToolCall
+from zeta.tui.fork_session import ForkStackController, OwnedApproval, run_fork_stack
 
 
 @dataclass
 class _Resource:
-    """A live piece of main-runtime work that a discussion must not disturb."""
-
     alive: bool = True
-
-    def stop(self) -> None:
-        self.alive = False
 
 
 @dataclass
 class _FakeApp:
     name: str
-    # Scripted UI results: each run() consumes one. A str opens that fork id;
-    # None means the app exited (return-to-parent / real exit).
     script: list[str | None]
     is_fork: bool = False
-    # Main-runtime work that stays live across a discussion.
     child: _Resource = field(default_factory=_Resource)
     task: _Resource = field(default_factory=_Resource)
     turn: _Resource = field(default_factory=_Resource)
@@ -31,15 +27,24 @@ class _FakeApp:
     runs: int = 0
     closed: bool = False
     left: bool = False
-    main: _FakeApp | None = None
-    baseline: int = 0
     _pending_fork: str | None = None
+    controller: ForkStackController | None = None
+    approvals: list[ApprovalRequest] = field(default_factory=list)
+    resolved: list[tuple[ApprovalDecision, str | None, bool]] = field(
+        default_factory=list
+    )
+    approval_views: list[tuple[str, ...]] = field(default_factory=list)
+    run_gate: asyncio.Event | None = None
+    close_order: list[str] | None = None
+    close_error: BaseException | None = None
+    resume_values: list[bool] = field(default_factory=list)
 
-    async def run(self) -> None:
+    async def run(self, *, resume_ui: bool = False) -> None:
         self.runs += 1
+        self.resume_values.append(resume_ui)
+        if self.run_gate is not None:
+            await self.run_gate.wait()
         self._pending_fork = self.script.pop(0) if self.script else None
-        # A real exit or a return closes the app itself; suspending to open a
-        # fork leaves it live (and the controller re-runs it later).
         if self._pending_fork is None:
             self.closed = True
 
@@ -47,92 +52,179 @@ class _FakeApp:
         self.left = True
 
     async def close(self) -> None:
+        if self.close_order is not None:
+            self.close_order.append(self.name)
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
     def take_open_fork(self) -> str | None:
         target, self._pending_fork = self._pending_fork, None
         return target
 
-    def attach_main(self, main: _FakeApp) -> None:
-        self.main = main
-        self.baseline = main.notifications
+    def set_fork_controller(self, controller: ForkStackController | None) -> None:
+        self.controller = controller
+
+    @property
+    def local_pending_approvals(self) -> tuple[ApprovalRequest, ...]:
+        return tuple(self.approvals)
+
+    async def resolve_local_approval(
+        self,
+        decision: ApprovalDecision,
+        requested_key: str | None,
+        *,
+        always: bool = False,
+    ) -> None:
+        self.resolved.append((decision, requested_key, always))
+        self.approvals = [
+            request for request in self.approvals if str(request.key) != requested_key
+        ]
+
+    def sync_visible_approvals(self, approvals: tuple[OwnedApproval, ...]) -> None:
+        self.approval_views.append(
+            tuple(str(approval.request.key) for approval in approvals)
+        )
+
+    def notification_count(self) -> int:
+        return self.notifications
 
     @property
     def main_activity_pending(self) -> bool:
-        return self.main is not None and self.main.notifications > self.baseline
+        return self.controller is not None and self.controller.main_activity_pending(
+            self
+        )
+
+
+def _approval(key: str) -> ApprovalRequest:
+    return ApprovalRequest(key, ToolCall(key, "read", {"path": key}))
 
 
 def test_opening_discussion_keeps_main_runtime_live_and_untouched() -> None:
     main = _FakeApp("main", script=["fork-1", None])
     fork = _FakeApp("fork", script=[None], is_fork=True)
-
     built: list[str] = []
 
     async def build_fork(target: str) -> _FakeApp:
         built.append(target)
-        # The discussion opens while main has a running child, task, and turn.
         assert (main.child.alive, main.task.alive, main.turn.alive) == (True,) * 3
-        # The main runtime is suspended, not closed, to show the fork.
         assert main.closed is False
         return fork
 
     asyncio.run(run_fork_stack(main, build_fork))
 
     assert built == ["fork-1"]
-    # Main kept its live work through the whole discussion and after return.
     assert (main.child.alive, main.task.alive, main.turn.alive) == (True,) * 3
-    # Main ran twice: before the discussion and again after returning.
     assert main.runs == 2
-    # The fork was released and closed itself on return. Main closed only when
-    # it finally exited (its second run), never to show the fork.
+    assert main.resume_values == [False, True]
     assert (fork.left, fork.closed) == (True, True)
     assert main.left is False
     assert main.closed is True
 
 
 def test_main_notification_during_discussion_is_seen_by_the_fork() -> None:
-    main = _FakeApp("main", script=["fork-1", None])
-    fork = _FakeApp("fork", script=[None], is_fork=True)
-
-    async def build_fork(target: str) -> _FakeApp:
-        return fork
-
     async def driver() -> None:
-        task = asyncio.ensure_future(run_fork_stack(main, build_fork))
-        # Let the stack open the fork, then deliver a main-runtime notification
-        # while the discussion is shown.
+        gate = asyncio.Event()
+        main = _FakeApp("main", script=["fork-1", None])
+        fork = _FakeApp("fork", script=[None], is_fork=True, run_gate=gate)
+
+        async def build_fork(target: str) -> _FakeApp:
+            return fork
+
+        task = asyncio.create_task(run_fork_stack(main, build_fork))
         await asyncio.sleep(0)
         main.notifications += 1
         assert fork.main_activity_pending is True
+        gate.set()
         await task
 
     asyncio.run(driver())
 
 
-def test_process_exit_closes_fork_and_suspended_main_in_reverse_order() -> None:
+@pytest.mark.parametrize(
+    ("main_keys", "fork_keys", "expected"),
+    [
+        ((), ("fork",), ("fork",)),
+        (("main",), (), ("main",)),
+        (("main",), ("fork",), ("fork", "main")),
+    ],
+)
+def test_visible_approvals_include_each_owning_runtime(
+    main_keys: tuple[str, ...],
+    fork_keys: tuple[str, ...],
+    expected: tuple[str, ...],
+) -> None:
+    async def driver() -> None:
+        gate = asyncio.Event()
+        main = _FakeApp(
+            "main", ["fork-1", None], approvals=[_approval(k) for k in main_keys]
+        )
+        fork = _FakeApp(
+            "fork",
+            [None],
+            is_fork=True,
+            approvals=[_approval(k) for k in fork_keys],
+            run_gate=gate,
+        )
+
+        async def build_fork(target: str) -> _FakeApp:
+            return fork
+
+        task = asyncio.create_task(run_fork_stack(main, build_fork))
+        await asyncio.sleep(0)
+        assert fork.approval_views[-1] == expected
+        for key in expected:
+            await fork.controller.resolve_approval(ApprovalDecision.ALLOW, key)
+        assert [item[1] for item in fork.resolved] == list(fork_keys)
+        assert [item[1] for item in main.resolved] == list(main_keys)
+        gate.set()
+        await task
+
+    asyncio.run(driver())
+
+
+def test_forwarded_approval_is_invalidated_after_external_resolution_and_return() -> (
+    None
+):
+    async def driver() -> None:
+        gate = asyncio.Event()
+        main = _FakeApp("main", ["fork-1", None], approvals=[_approval("main")])
+        fork = _FakeApp("fork", [None], is_fork=True, run_gate=gate)
+
+        async def build_fork(target: str) -> _FakeApp:
+            return fork
+
+        task = asyncio.create_task(run_fork_stack(main, build_fork))
+        await asyncio.sleep(0)
+        assert fork.approval_views[-1] == ("main",)
+        main.approvals.clear()
+        main.controller.approvals_changed()
+        assert fork.approval_views[-1] == ()
+        gate.set()
+        await task
+        assert main.approval_views[-1] == ()
+
+    asyncio.run(driver())
+
+
+def test_early_fork_close_failure_still_closes_main_and_reraises() -> None:
     order: list[str] = []
 
     class ExitApp(_FakeApp):
-        async def run(self) -> None:
+        async def run(self, *, resume_ui: bool = False) -> None:
             if self.is_fork:
                 raise KeyboardInterrupt
-            await super().run()
+            await super().run(resume_ui=resume_ui)
 
-        async def close(self) -> None:
-            order.append(self.name)
-            await super().close()
-
-    main = ExitApp("main", script=["fork-1"])
-    fork = ExitApp("fork", script=[], is_fork=True)
+    main = ExitApp("main", ["fork-1"], close_order=order)
+    failure = RuntimeError("fork close failed")
+    fork = ExitApp("fork", [], is_fork=True, close_order=order, close_error=failure)
 
     async def build_fork(target: str) -> _FakeApp:
-        del target
         return fork
 
-    try:
+    with pytest.raises(RuntimeError, match="fork close failed"):
         asyncio.run(run_fork_stack(main, build_fork))
-    except KeyboardInterrupt:
-        pass
 
     assert order == ["fork", "main"]
     assert main.closed and fork.closed
@@ -152,5 +244,4 @@ def test_forks_can_stack_and_unwind_newest_first() -> None:
     assert (inner.left, inner.closed) == (True, True)
     assert (deepest.left, deepest.closed) == (True, True)
     assert main.closed is True
-    # main runs 2x, inner runs 2x (open deepest, then after return), deepest 1x.
     assert (main.runs, inner.runs, deepest.runs) == (2, 2, 1)

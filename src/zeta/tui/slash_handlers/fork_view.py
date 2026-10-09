@@ -34,9 +34,6 @@ class ForkViewMixin:
         self._fork_return_armed = False
         self._fork_returning = False
         self._open_fork_target: str | None = None
-        self._main_app: ForkViewMixin | None = None
-        self._main_notification_baseline = 0
-        self._visible_fork: ForkViewMixin | None = None
         self._load_fork_context()
 
     def request_open_fork(self, fork_session_id: str) -> None:
@@ -91,9 +88,9 @@ class ForkViewMixin:
         source_dir = home / "sessions" / fork.forked_from_session
         try:
             record = AttentionStore(source_dir).get(fork.attention_id)
-            source_name = SessionManager(home).read_metadata(
-                fork.forked_from_session
-            ).name
+            source_name = (
+                SessionManager(home).read_metadata(fork.forked_from_session).name
+            )
         except (OSError, ValueError, KeyError):
             return
         self._fork_context = ForkContext(
@@ -143,8 +140,6 @@ class ForkViewMixin:
         """Release this fork's binding before it closes; a no-op for main."""
         if self._fork_context is None:
             return
-        if self._main_app is not None:
-            self._main_app._visible_fork = None
         import asyncio
 
         from ...attention_forks import release_discussion_fork
@@ -156,25 +151,17 @@ class ForkViewMixin:
         except (OSError, ValueError):
             pass
 
-    def attach_main(self, main: ForkViewMixin) -> None:
-        """Teach a fork which runtime stays live behind it (for its status bar)."""
-        self._main_app = main
-        self._main_notification_baseline = main._notification_count()
-        main._visible_fork = self
-
     @property
     def main_activity_pending(self) -> bool:
         """True while a discussion is shown and the main runtime has new activity."""
-        main = self._main_app
-        if main is None:
-            return False
-        return main._notification_count() > self._main_notification_baseline
+        controller = self._fork_controller
+        return controller is not None and controller.main_activity_pending(self)
 
-    def _notification_count(self) -> int:
+    def notification_count(self) -> int:
         try:
             return len(self.loop.store.agent_notifications())
         except (OSError, ValueError):
-            return self._main_notification_baseline
+            return 0
 
     def _fork_item_open(self) -> bool:
         from ...attention_records import AttentionStore
