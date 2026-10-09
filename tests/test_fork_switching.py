@@ -133,6 +133,7 @@ def test_tui_run_replays_transcript_only_on_initial_start() -> None:
         app._session = None
         app._active_session = None
         app._active_task = None
+        app._fork_controller = None
         app._open_fork_target = None
         app._input_loop_active = False
         app._startup_presented = True

@@ -1113,6 +1113,8 @@ class TUIApp(
                     self._startup_presented = True
                 self._present_pending_approvals()
                 self.start_decisions_poll()
+                # Replay runs after the full-screen application paints its first frame.
+                self._invalidate_prompt()
                 if isinstance(session, FullScreenPromptSession):
                     await self._run_full_screen(session, prompt_task)
                     return self._run_result
