@@ -30,7 +30,11 @@ from zeta.memory.profiles import (
     early_update_max_wait_seconds,
     memory_profile,
 )
-from zeta.memory.reconciler import ReconciliationError, ReconciliationResponse, Transcript
+from zeta.memory.reconciler import (
+    ReconciliationError,
+    ReconciliationResponse,
+    Transcript,
+)
 from zeta.project_errors import ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
 
