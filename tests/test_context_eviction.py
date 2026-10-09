@@ -23,7 +23,7 @@ from zeta.context_eviction import (
     recall_history,
 )
 from zeta.core.context import CompactionPolicy, ContextAssembler
-from zeta.core.store import ConversationStore
+from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
@@ -48,6 +48,52 @@ from zeta.providers.ollama import _messages as build_ollama_messages
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+
+
+@pytest.mark.parametrize("seqs", [[2, 1], [1, 1], [1, 3], [None]])
+def test_invalid_eviction_view_sequences_are_boundaries(
+    seqs: list[int | None],
+) -> None:
+    message = Message(
+        MessageRole.ASSISTANT,
+        [TextContent("[assistant text evicted · seq 1]")],
+        metadata={
+            "context_evicted": True,
+            "eviction_receipt": "assistant",
+            "source_seq": 1,
+        },
+    )
+    marker = ConversationEntry(
+        seq=3,
+        id="marker",
+        parent_id=None,
+        lane="main",
+        type="compaction",
+        data={
+            "kind": "evict",
+            "source_seq_start": 1,
+            "source_seq_end": 2,
+            "view": [{"seq": seq, "message": message.to_dict()} for seq in seqs],
+        },
+    )
+
+    items = ContextAssembler._marker_items(marker, {1, 2})
+
+    assert all(item.message.metadata["eviction_view_invalid"] for item in items)
+
+
+def test_view_seq_is_authoritative_over_metadata_source_seq() -> None:
+    message = Message(
+        MessageRole.ASSISTANT,
+        [TextContent("receipt")],
+        metadata={"source_seq": 2},
+    )
+
+    projected = ContextAssembler._eviction_view_message(
+        {"seq": 1, "message": message.to_dict()}
+    )
+
+    assert projected.metadata["source_seq"] == 1
 
 
 def text(role: MessageRole, value: str) -> Message:
@@ -998,11 +1044,30 @@ def _full_recount_eviction_reference(
     before = fixed_tokens + sum(token_counter(message) for message in messages)
     calls = eviction_module._tool_calls(messages)
     call_indexes = eviction_module._call_indexes(messages)
-    results = eviction_module._tool_results(messages)
     eligibility = eviction_module._eviction_eligibility(
         records, unconsumed_source_seqs
     )
     changed: set[int] = set()
+    for index, (seq, message) in enumerate(records):
+        if (
+            not eligibility.allows(seq)
+            or message.metadata.get("context_evicted")
+            or not any(isinstance(block, ToolUseContent) for block in message.content)
+        ):
+            continue
+        replacement = eviction_module._tool_call_receipt(message, seq)
+        if token_counter(replacement) >= token_counter(message):
+            continue
+        messages[index] = replacement
+        changed.add(index)
+        if fixed_tokens + sum(map(token_counter, messages)) <= target_tokens:
+            return EvictionResult(
+                messages=list(messages),
+                items_evicted=len(changed),
+                tokens_before=before,
+                tokens_after=fixed_tokens + sum(map(token_counter, messages)),
+                reached_target=True,
+            )
     read_counts = eviction_module._collapse_repeated_reads(
         records, messages, calls, call_indexes, changed, eligibility
     )
@@ -1086,11 +1151,7 @@ def _full_recount_eviction_reference(
             or message.metadata.get("context_evicted")
         ):
             continue
-        messages[index] = Message(
-            MessageRole.ASSISTANT,
-            [TextContent(f"[assistant text evicted · seq {seq}]")],
-            metadata={"context_evicted": True, "source_seq": seq},
-        )
+        messages[index] = eviction_module._assistant_receipt(seq, "assistant text")
         changed.add(index)
         if total() <= target_tokens:
             return complete(True)
@@ -1106,18 +1167,6 @@ def _full_recount_eviction_reference(
         ):
             continue
         messages[index] = eviction_module._notification_receipt(message, seq)
-        changed.add(index)
-        if total() <= target_tokens:
-            return complete(True)
-
-    for index, (seq, _) in enumerate(records):
-        message = messages[index]
-        if not eligibility.allows(seq):
-            continue
-        replacement = eviction_module._digest_agent_prompts(message, seq)
-        if replacement is message:
-            continue
-        messages[index] = replacement
         changed.add(index)
         if total() <= target_tokens:
             return complete(True)
@@ -1154,32 +1203,6 @@ def _full_recount_eviction_reference(
         ):
             continue
         replacement = eviction_module._workflow_result_receipt(message, call, seq)
-        if replacement is message:
-            continue
-        messages[index] = replacement
-        changed.add(index)
-        if total() <= target_tokens:
-            return complete(True)
-
-    for index, (seq, _) in enumerate(records):
-        message = messages[index]
-        if not eligibility.allows(seq):
-            continue
-        replacement = eviction_module._digest_edit_write_payloads(
-            message, seq, results
-        )
-        if replacement is message:
-            continue
-        messages[index] = replacement
-        changed.add(index)
-        if total() <= target_tokens:
-            return complete(True)
-
-    for index, (seq, _) in enumerate(records):
-        message = messages[index]
-        if not eligibility.allows(seq):
-            continue
-        replacement = eviction_module._digest_bash_commands(message, seq)
         if replacement is message:
             continue
         messages[index] = replacement
@@ -1411,11 +1434,9 @@ def test_eviction_matches_independent_full_recount_reference(tmp_path: Path) -> 
         "successful_results": 0,
         "failed_results": 0,
         "notifications": 0,
-        "agent_prompts": 0,
+        "call_receipts": 0,
         "agent_output": 0,
         "orchestration_receipts": 0,
-        "edit_receipts": 0,
-        "bash_receipts": 0,
         "truncation": 0,
     }
     calls = eviction_module._tool_calls([message for _, message in records])
@@ -1434,12 +1455,8 @@ def test_eviction_matches_independent_full_recount_reference(tmp_path: Path) -> 
                 counters["successful_results"] += 1
         if "notification receipt" in rendered:
             counters["notifications"] += 1
-        if "agent prompt receipt" in json.dumps(replacement.to_dict()):
-            counters["agent_prompts"] += 1
-        if "edit/write payload receipt" in json.dumps(replacement.to_dict()):
-            counters["edit_receipts"] += 1
-        if "bash command receipt" in json.dumps(replacement.to_dict()):
-            counters["bash_receipts"] += 1
+        if replacement.metadata.get("eviction_receipt") == "tool_call":
+            counters["call_receipts"] += 1
         if "orchestration result receipt" in rendered:
             counters["orchestration_receipts"] += 1
             result = original.tool_result
@@ -2217,8 +2234,8 @@ async def test_old_turn_content_still_evicted(tmp_path: Path) -> None:
     assert "orchestration result receipt" in output
     assert "OLD_RESULT_NEEDLE" not in output
     calls = {call.id: call for call in _tool_calls_for_test(context.messages)}
-    assert "agent prompt receipt" in calls["old-agent"].arguments["prompt"]
-    assert "OLD_PROMPT_NEEDLE" not in calls["old-agent"].arguments["prompt"]
+    assert calls["old-agent"].arguments["eviction_receipt"]["source_seq"] == 1
+    assert "OLD_PROMPT_NEEDLE" not in str(calls["old-agent"].arguments)
 
 
 @pytest.mark.asyncio
@@ -2317,12 +2334,8 @@ def test_evict_digests_old_agent_prompts_valid_tool_calls_all_providers(
     agent_call = _tool_calls_for_test(evicted.messages)[0]
     assert agent_call.id == "agent-1"
     assert agent_call.name == "agent"
-    assert agent_call.arguments["description"] == "implement feature"
-    assert agent_call.arguments["model"] == "sonnet"
-    assert agent_call.arguments["cwd"] == "/repo"
-    assert "agent prompt receipt" in agent_call.arguments["prompt"]
-    assert "seq 10" in agent_call.arguments["prompt"]
-    assert "delegated implementation needle" not in agent_call.arguments["prompt"]
+    assert agent_call.arguments == {"eviction_receipt": {"source_seq": 10}}
+    assert "delegated implementation needle" not in str(agent_call.arguments)
     assert_payload_pairing(evicted.messages)
 
     anthropic = build_messages_payload(
@@ -2334,8 +2347,7 @@ def test_evict_digests_old_agent_prompts_valid_tool_calls_all_providers(
         for block in message["content"]
         if block["type"] == "tool_use"
     )
-    assert isinstance(anthropic_input, dict)
-    assert "agent prompt receipt" in anthropic_input["prompt"]
+    assert anthropic_input == agent_call.arguments
 
     codex = build_responses_payload(evicted.messages, [], model="gpt-test")["input"]
     codex_arguments = next(
@@ -2343,8 +2355,7 @@ def test_evict_digests_old_agent_prompts_valid_tool_calls_all_providers(
         for item in codex
         if item.get("type") == "function_call"
     )
-    assert isinstance(codex_arguments, dict)
-    assert "agent prompt receipt" in codex_arguments["prompt"]
+    assert codex_arguments == agent_call.arguments
 
     ollama = build_ollama_messages(evicted.messages)
     ollama_arguments = next(
@@ -2352,8 +2363,7 @@ def test_evict_digests_old_agent_prompts_valid_tool_calls_all_providers(
         for message in ollama
         for item in message.get("tool_calls", [])
     )
-    assert isinstance(ollama_arguments, dict)
-    assert "agent prompt receipt" in ollama_arguments["prompt"]
+    assert ollama_arguments == agent_call.arguments
 
     store = ConversationStore(tmp_path)
     call_entry = store.append_message(call)
@@ -2516,7 +2526,7 @@ def test_receipt_json_escapes_hostile_field_values() -> None:
     }
 
 
-def test_evict_digests_edit_write_payloads_keeps_path(tmp_path: Path) -> None:
+def test_evict_replaces_edit_write_arguments_with_call_receipts(tmp_path: Path) -> None:
     calls_and_results = [
         tool_pair(
             "write",
@@ -2555,12 +2565,12 @@ def test_evict_digests_edit_write_payloads_keeps_path(tmp_path: Path) -> None:
     evicted = evict_messages(records, fixed_tokens=0, target_tokens=1)
 
     calls = {call.id: call for call in _tool_calls_for_test(evicted.messages)}
-    assert calls["write-1"].arguments["path"] == "src/generated.py"
-    assert calls["write-1"].arguments["create_parents"] is True
-    assert "edit/write payload receipt" in calls["write-1"].arguments["content"]
-    assert calls["edit-1"].arguments["path"] == "src/existing.py"
-    assert "edit/write payload receipt" in calls["edit-1"].arguments["old_string"]
-    assert "edit/write payload receipt" in calls["edit-1"].arguments["new_string"]
+    for call_id in ("write-1", "edit-1"):
+        assert calls[call_id].arguments["eviction_receipt"]["source_seq"] in {
+            1,
+            3,
+            5,
+        }
     assert calls["write-failed"].arguments["content"] == "failed payload stays"
     results = {
         result.tool_call_id: result.content
@@ -2598,8 +2608,9 @@ def test_evict_bash_args_keeps_recent_tail(tmp_path: Path) -> None:
 
     calls = {call.id: call for call in _tool_calls_for_test(evicted.messages)}
     for index in range(2):
-        assert "bash command receipt" in calls[f"bash-{index}"].arguments["command"]
-        assert calls[f"bash-{index}"].arguments["timeout"] == 30
+        assert calls[f"bash-{index}"].arguments["eviction_receipt"][
+            "source_seq"
+        ] == index * 2 + 1
     for index in range(2, 22):
         assert calls[f"bash-{index}"].arguments["command"] == (
             f"printf bash-command-{index}-needle " * 100
@@ -2729,18 +2740,10 @@ async def test_eviction_replay_deterministic_with_new_rules(tmp_path: Path) -> N
     assert "notification receipt" in output
     assert "orchestration result receipt" in output
     calls = _tool_calls_for_test(first.messages)
-    assert any(
-        "agent prompt receipt" in str(call.arguments.get("prompt", ""))
-        for call in calls
-    )
-    assert any(
-        "edit/write payload receipt" in str(call.arguments.get("content", ""))
-        for call in calls
-    )
-    assert any(
-        "bash command receipt" in str(call.arguments.get("command", ""))
-        for call in calls
-    )
+    call_receipts = [
+        call for call in calls if "eviction_receipt" in call.arguments
+    ]
+    assert {call.name for call in call_receipts} >= {"agent", "write", "bash"}
     assert "latest request verbatim" in output
     replay_records = [
         (int(message.metadata.get("source_seq", index)), message)
@@ -2867,7 +2870,8 @@ async def test_manual_eviction_bypasses_hysteresis_without_summary_fallback(
 
     assert policy.calls == 0
     assert first.compacted is True
-    assert refreshed.compacted is True
+    # The remaining deterministic candidates are not smaller, even when forced.
+    assert refreshed.compacted is False
     assert "next request" in rendered_text(refreshed.messages)
     assert all(
         entry.data.get("kind") == "evict"
@@ -3169,3 +3173,52 @@ def test_recall_query_matches_non_ascii_text(tmp_path: Path, needle: str) -> Non
 
     assert "No matching compacted messages" not in found
     assert f"seq {entry.seq}:" in found
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "view_seqs,active_count",
+    [([2, 1], 2), ([1, 1], 2), ([1, 3], 2), ([1, 2], 1)],
+    ids=["order", "duplicate", "out-of-range", "inactive-branch"],
+)
+async def test_invalid_eviction_views_survive_forced_eviction_unchanged(
+    tmp_path: Path, view_seqs: list[int], active_count: int
+) -> None:
+    store = ConversationStore(tmp_path)
+    for index in range(active_count):
+        store.append_message(text(MessageRole.ASSISTANT, f"source-{index}"))
+    original = Message(
+        MessageRole.ASSISTANT,
+        [ThinkingContent("private " * 100), TextContent("kept raw")],
+        metadata={"source_seq": 999},
+    )
+    marker = store.append_compaction_marker(
+        "evicted",
+        1,
+        2,
+        kind="evict",
+        view=[{"seq": seq, "message": original.to_dict()} for seq in view_seqs],
+    )
+    recall_bounds = (marker.data["source_seq_start"], marker.data["source_seq_end"])
+    assembler = ContextAssembler(
+        store,
+        token_budget=10,
+        retained_tail=1,
+        token_counter=lambda message: 100
+        if any(isinstance(block, ThinkingContent) for block in message.content)
+        else 1,
+    )
+    before = [item.message.to_dict() for item in assembler._visible_items(store.replay())]
+
+    context = await assembler.assemble_context(force=True)
+
+    assert [message.to_dict() for message in context.messages] == before
+    active_markers = ContextAssembler._active_markers(store.replay())
+    assert [entry.id for entry in active_markers] == [marker.id]
+    assert (
+        active_markers[0].data["source_seq_start"],
+        active_markers[0].data["source_seq_end"],
+    ) == recall_bounds
+    assert not any(
+        message.metadata.get("eviction_range") for message in context.messages
+    )
