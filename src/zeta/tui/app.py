@@ -1114,6 +1114,8 @@ class TUIApp(
                     )
                     self._print_unit(Text(f"command · {notice}", style=style))
                 self._present_pending_approvals()
+                # Replay runs after the full-screen application paints its first frame.
+                self._invalidate_prompt()
                 if isinstance(session, FullScreenPromptSession):
                     await self._run_full_screen(session, prompt_task)
                     return
