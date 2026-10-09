@@ -411,26 +411,41 @@ class ParallelChildrenBackend(CompletionBackend):
     def __init__(self, calls: Sequence[ToolCall]) -> None:
         self.parent_calls = list(calls)
         self.call_count = 0
-        self.child_count = 0
+        self.child_prompts = {
+            call.arguments["prompt"] for call in calls if "prompt" in call.arguments
+        }
+        self.started_prompts: set[object] = set()
         self.children_started = asyncio.Event()
-        self.release_children = asyncio.Event()
+        self.release_children = {
+            prompt: asyncio.Event() for prompt in self.child_prompts
+        }
+        self.children_completed = {
+            prompt: asyncio.Event() for prompt in self.child_prompts
+        }
 
     async def complete(
         self,
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
-        del messages, tool_schemas
+        del tool_schemas
         self.call_count += 1
         if self.call_count == 1:
             blocks = [ToolUseContent(call) for call in self.parent_calls]
         else:
-            self.child_count += 1
-            child_index = self.child_count
-            if self.child_count == len(self.parent_calls):
+            prompt = next(
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            )
+            self.started_prompts.add(prompt)
+            if self.started_prompts == self.child_prompts:
                 self.children_started.set()
-            await self.release_children.wait()
-            blocks = [TextContent(f"child-{child_index}")]
+            await self.release_children[prompt].wait()
+            blocks = [TextContent(f"response for {prompt}")]
+            self.children_completed[prompt].set()
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
@@ -1804,19 +1819,21 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await backend.children_started.wait()
-    backend.release_children.set()
-    await task
+    await asyncio.wait_for(backend.children_started.wait(), timeout=30)
+    backend.release_children["inspect 2"].set()
+    await asyncio.wait_for(backend.children_completed["inspect 2"].wait(), timeout=30)
+    backend.release_children["inspect 1"].set()
+    await asyncio.wait_for(task, timeout=30)
 
-    results = [
-        message.tool_result for message in store.messages() if message.tool_result
-    ]
-    assert len(results) == 2
-    assert all(result is not None for result in results)
-    assert all(
-        any(result.content.startswith(expected) for result in results if result is not None)
-        for expected in ("child-1", "child-2")
-    )
+    results = {
+        message.tool_result.tool_call_id: message.tool_result.content.split(" · ", 1)[0]
+        for message in store.messages()
+        if message.tool_result is not None
+    }
+    assert results == {
+        "agent-1": "response for inspect 1",
+        "agent-2": "response for inspect 2",
+    }
     assert sorted(path.name for path in (store.session_dir / "agents").iterdir()) == [
         "1",
         "2",
@@ -1891,9 +1908,9 @@ async def test_parent_abort_cancels_all_parallel_children(tmp_path: Path) -> Non
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await backend.children_started.wait()
+    await asyncio.wait_for(backend.children_started.wait(), timeout=30)
     loop.abort()
-    await task
+    await asyncio.wait_for(task, timeout=30)
 
     results = [
         message.tool_result for message in store.messages() if message.tool_result
