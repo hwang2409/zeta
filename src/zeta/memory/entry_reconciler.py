@@ -875,7 +875,7 @@ async def reconcile_entry_range(
     as_of: date,
     now: str,
 ) -> EntryReconciliationResult:
-    """Reconcile one durable transcript fragment into dormant format-2 state."""
+    """Reconcile one durable transcript fragment into format-2 state."""
     usage: dict[str, int] = {}
     budget = ProviderRetryBudget()
     for attempt in range(cas_retries):

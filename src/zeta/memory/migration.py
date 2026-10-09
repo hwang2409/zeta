@@ -1,8 +1,7 @@
-"""Pure dormant format-1 to format-2 project-memory migration.
+"""Pure format-1 to format-2 project-memory migration.
 
 This module has no registry, command, CLI, import, or project-discovery dependency.
-Callers must provide an already locked snapshot and an explicit clock value. PR 5
-uses it only through private fixture helpers.
+Callers provide an already locked snapshot and an explicit clock value.
 """
 
 from __future__ import annotations

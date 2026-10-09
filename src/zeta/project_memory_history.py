@@ -440,15 +440,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         return MemorySnapshot(contents, self._memory_digest_value(contents))
 
     def ensure_memory_supported(self, project_id: str) -> None:
-        """Reject a project whose authoritative memory format is not active."""
-        def read(root_fd: int) -> None:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                self._require_format_one(directory_fd)
-            finally:
-                os.close(directory_fd)
-
-        self._read(read)
+        """Validate that the project uses a memory format supported by this build."""
+        self.memory_format(project_id)
 
     def memory_snapshot(self, project_id: str) -> MemorySnapshot:
         """Read the complete bounded memory set and digest atomically."""
@@ -698,13 +691,26 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
     def _prune_versions(self, blobs_fd: int, versions_fd: int, retained: set[str]) -> None:
         referenced: set[str] = set()
         pending = list(retained)
+        migration_finalized = any(
+            self._manifest(versions_fd, version).get("kind") == "migration-finalize"
+            for version in retained
+        )
         while pending:
             version = pending.pop()
             manifest = self._manifest(versions_fd, version)
-            target = manifest.get("target_version")
-            if isinstance(target, str) and target not in retained:
-                retained.add(target)
-                pending.append(target)
+            targets = [manifest.get("target_version")]
+            if not migration_finalized:
+                targets.append(manifest.get("migration_version"))
+            for target in targets:
+                if (
+                    isinstance(target, str)
+                    and target not in retained
+                    and not (
+                        migration_finalized and manifest.get("kind") == "migrate"
+                    )
+                ):
+                    retained.add(target)
+                    pending.append(target)
             for key in ("snapshot", "before_snapshot"):
                 values = manifest.get(key)
                 if isinstance(values, dict):

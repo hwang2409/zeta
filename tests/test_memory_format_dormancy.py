@@ -129,7 +129,7 @@ def _cli_args(verb: str, project_id: str, workspace: Path) -> argparse.Namespace
     return argparse.Namespace(**common)
 
 
-def test_format_two_views_are_dormant_while_activation_paths_reject(
+def test_format_two_views_are_available_after_per_project_activation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home, registry, project_id, workspace = _format_two_project(tmp_path)
@@ -146,19 +146,17 @@ def test_format_two_views_are_dormant_while_activation_paths_reject(
     assert '"state.md"' in memory_out.getvalue()
 
     for verb in ("show", "init"):
-        stderr = io.StringIO()
         assert project_cli.run(
             _cli_args(verb, project_id, workspace),
             stdout=io.StringIO(),
-            stderr=stderr,
-        ) == 1
-        assert UNSUPPORTED_FORMAT_2 in stderr.getvalue()
+            stderr=io.StringIO(),
+        ) == 0
 
     index_args = _cli_args("index", project_id, workspace)
     index_args.index_action = "status"
-    stderr = io.StringIO()
-    assert project_cli.run(index_args, stdout=io.StringIO(), stderr=stderr) == 1
-    assert UNSUPPORTED_FORMAT_2 in stderr.getvalue()
+    assert project_cli.run(
+        index_args, stdout=io.StringIO(), stderr=io.StringIO()
+    ) == 0
 
     reconciler = SimpleNamespace(terminal_receipts=lambda: (), retry_terminal=lambda key: False)
     authorization = MemoryMutationAuthorization.direct_slash()
@@ -264,31 +262,28 @@ async def test_private_format_two_fixture_reaches_dormant_updater(
     assert notices == []
 
 
-def test_no_public_path_can_apply_a_profile_to_a_real_project(tmp_path: Path) -> None:
+def test_profile_cli_activates_only_the_created_project(tmp_path: Path) -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
     project_cli.add_subcommand(commands)
-    with pytest.raises(SystemExit):
-        parser.parse_args(
-            [
-                "project",
-                "create",
-                "demo",
-                "--scope",
-                "scope",
-                "--memory-profile",
-                "messaging",
-            ]
-        )
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    registry = ProjectRegistry(tmp_path / "projects")
-    project = registry.create_project("demo", "scope", workspace)
-    registry.initialize_memory(project.project_id)
-    assert registry.memory_snapshot(project.project_id).contents
-    with pytest.raises(UnsupportedMemoryFormatError, match="uses format 1"):
-        registry._entry_memory_state(project.project_id)
+    args = parser.parse_args(
+        [
+            "project",
+            "create",
+            "demo",
+            "--scope",
+            "scope",
+            "--memory-profile",
+            "messaging",
+        ]
+    )
+    home = tmp_path / "home"
+    with patch.dict("os.environ", {"ZETA_HOME": str(home)}):
+        assert project_cli.run(args, stdout=io.StringIO(), stderr=io.StringIO()) == 0
+    registry = ProjectRegistry(home / "projects")
+    project = registry.show_project(name="demo")
+    assert registry.memory_format(project.project_id) == 2
+    assert registry._entry_memory_state(project.project_id).state.schema.profile == "messaging"
 
 
 def test_format_one_manifest_and_pointer_remain_byte_identical(tmp_path: Path) -> None:

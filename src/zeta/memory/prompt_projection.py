@@ -1,4 +1,4 @@
-"""Deterministic prompt projection for dormant format-2 project memory.
+"""Deterministic prompt projection for format-2 project memory.
 
 The module owns selection, ordering, framing, and the independent prompt byte
 budget. Callers supply one validated state and an explicit composition time.

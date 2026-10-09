@@ -1,7 +1,6 @@
-"""Immutable built-in schemas for dormant format-2 project memory.
+"""Immutable built-in schemas for format-2 project memory.
 
-Profiles are trusted code data. Activation commands do not import this module;
-PR 2 uses them only through format-2 test fixtures and the dormant updater.
+Profiles are trusted code data copied into each activated project's versioned state.
 """
 
 from __future__ import annotations

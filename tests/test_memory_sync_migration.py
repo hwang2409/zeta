@@ -17,6 +17,7 @@ from unittest.mock import patch
 import pytest
 
 from zeta.cli import project as project_cli
+from zeta.core.project_context import load_project_context, refresh_project_memory
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import reconcile_entry_range
 from zeta.memory.entry_store import (
@@ -32,10 +33,8 @@ from zeta.memory.entry_store import (
 )
 from zeta.memory.migration import migrate_format_one, reverse_migration
 from zeta.memory.profiles import memory_profile
-from zeta.memory.prompt_projection import render_entry_memory
 from zeta.memory.reconciler import Transcript
 from zeta.memory.user_authorization import MemoryMutationAuthorization
-from zeta.project_errors import ProjectRegistryError
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_memory_history import PROJECT_MEMORY_FILES
 from zeta.project_registry import ProjectRegistry
@@ -51,6 +50,7 @@ from zeta.remote_sync.ssh import SshTransport
 from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
 from zeta.server.slash_commands import ServerSlashSession
+from zeta.skills import SkillCatalog
 from zeta.tui.slash_handlers import SlashHandlerMixin
 
 
@@ -71,8 +71,7 @@ def _fixture(home: Path, workspace: Path) -> tuple[ProjectRegistry, str]:
     workspace.mkdir(parents=True)
     registry = ProjectRegistry(home / "projects")
     project = registry.create_project("test", "test", workspace)
-    registry.initialize_memory(project.project_id)
-    registry._create_entry_memory_for_test(project.project_id, memory_profile("zeta"))
+    registry.activate_entry_memory(project.project_id, "zeta")
     return registry, project.project_id
 
 
@@ -300,12 +299,20 @@ def test_entry_sync_propagates_status_and_conflicts_schema(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_format_two_fixture_end_to_end_updater_prompt_commands_and_sync(
+async def test_real_project_activation_end_to_end_updater_resume_commands_serve_and_sync(
     tmp_path: Path,
 ) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
-    registry, project_id = _fixture(first, tmp_path / "workspace")
+    workspace = tmp_path / "workspace"
+    registry, project_id = _fixture(first, workspace)
+    starting_context = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=first,
+        catalog=SkillCatalog.empty(),
+        project_id=project_id,
+    )
     transcript = Transcript(
         "fixture-session",
         (
@@ -349,17 +356,51 @@ async def test_format_two_fixture_end_to_end_updater_prompt_commands_and_sync(
         now="2026-10-08T12:00:00.000000Z",
     )
     entry_id = result.changed_entry_ids[0]
-    projection = render_entry_memory(
-        registry._entry_memory_state(project_id).state,
-        now="2026-10-08T12:00:00.000000Z",
+    resumed = refresh_project_memory(
+        starting_context.system_prompt,
+        home=first,
+        project_id=project_id,
+        memory_offset=starting_context.memory_offset,
+        memory_length=starting_context.memory_length,
+        memory_digest=starting_context.memory_digest,
     )
-    assert "PR 5 is ready." in projection.block
+    assert "PR 5 is ready." in resumed
+    assert entry_id in run_memory_command(registry, project_id, "log")
+    assert "undo complete" in run_memory_command(
+        registry,
+        project_id,
+        f"undo {entry_id}",
+        authorization=MemoryMutationAuthorization.direct_slash(),
+    )
+    result = await reconcile_entry_range(
+        registry=registry,
+        project_id=project_id,
+        transcript=transcript,
+        reconciliation_key=hashlib.sha256(b"fixture-range-again").hexdigest(),
+        invoke=invoke,
+        cas_retries=3,
+        as_of=date(2026, 10, 8),
+        now="2026-10-08T12:01:00.000000Z",
+    )
+    entry_id = result.changed_entry_ids[0]
     assert run_memory_command(
         registry,
         project_id,
         f"accept {entry_id}",
         authorization=MemoryMutationAuthorization.direct_slash(),
     ) == f"memory accepted: {entry_id}"
+    requests = ProjectRequests(
+        home=first,
+        runtime=SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list)),
+        codec=FrameCodec(),
+    )
+    shown = requests.dispatch(
+        1,
+        "project_show",
+        {"project_id": project_id},
+        features=frozenset({"projects-memory-v2"}),
+    )
+    assert shown["memory"]["profile"] == "zeta"
 
     synced = push_project_memory(first, LocalTransport(second), project_id=project_id)
     assert synced.conflicts == ()
@@ -777,17 +818,25 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
         "remote": _format_snapshot(remote),
     }
     assert set(before["local"]).issubset(after["local"])
-    assert all(memory_format == 1 for stores in after.values() for memory_format in stores.values())
+    assert after["local"][project_id] == 1
+    if entry_point in {"project-create", "project-init"}:
+        assert list(after["local"].values()).count(2) == 1
+    else:
+        assert all(
+            memory_format == 1
+            for stores in after.values()
+            for memory_format in stores.values()
+        )
 
 
-def test_migration_engine_is_dormant_from_public_paths(tmp_path: Path) -> None:
+def test_migration_engine_activates_only_the_explicit_project(tmp_path: Path) -> None:
     registry, project_id, _ = _legacy_fixture(tmp_path)
-    assert registry.memory_format(project_id) == 1
-    assert not hasattr(registry, "migrate_memory")
-    assert not hasattr(registry, "rollback_memory_migration")
-    with pytest.raises(ProjectRegistryError):
-        registry.import_memory(project_id, object(), expected_digest="0" * 64)  # type: ignore[arg-type]
-    assert registry.memory_format(project_id) == 1
+    other = registry.create_project("other", "test", tmp_path / "other")
+
+    registry.migrate_memory(project_id, migrated_at="2026-10-09T00:00:00Z")
+
+    assert registry.memory_format(project_id) == 2
+    assert registry.memory_format(other.project_id) == 1
 
 
 def _replace_schema(registry: ProjectRegistry, project_id: str, schema: object) -> None:

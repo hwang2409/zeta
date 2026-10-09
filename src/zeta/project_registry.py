@@ -583,7 +583,9 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
             return existing
         base_name = name or path.name
         try:
-            return self.create_project(base_name, scope, path)
+            project = self.create_project(base_name, scope, path)
+            self.activate_entry_memory(project.project_id, "zeta")
+            return project
         except ProjectRegistryError:
             existing = self.find_for_directory(path)
             if existing is not None:
@@ -595,7 +597,9 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                           f"{base_name}-{hashlib.sha256(str(path).encode()).hexdigest()[:8]}"]
             for candidate in candidates:
                 try:
-                    return self.create_project(candidate, scope, path)
+                    project = self.create_project(candidate, scope, path)
+                    self.activate_entry_memory(project.project_id, "zeta")
+                    return project
                 except ProjectRegistryError:
                     existing = self.find_for_directory(path)
                     if existing is not None:

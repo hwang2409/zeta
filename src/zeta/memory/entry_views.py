@@ -1,4 +1,4 @@
-"""Human and structured read models for dormant format-2 project memory.
+"""Human and structured read models for format-2 project memory.
 
 This module is the view seam for mirrors, tools, the CLI, and serve. Callers pass
 one validated snapshot and do not need to understand entry lifecycle rules.

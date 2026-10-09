@@ -1,4 +1,4 @@
-"""Private storage adapter for dormant format-2 project memory."""
+"""Storage adapter and activation controls for format-2 project memory."""
 
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ from zeta.memory.entry_sync import EntryMemoryExport
 from zeta.memory.entry_undo import plan_entry_transaction_undo
 from zeta.memory.entry_views import render_all_kinds
 from zeta.memory.migration import MigrationPlan, migrate_format_one
+from zeta.memory.profiles import memory_profile
 from zeta.memory.version_store import (
     PreparedVersion,
     PublicationContext,
@@ -50,6 +51,17 @@ from zeta.project_errors import ProjectRegistryError
 
 _CURRENT = "memory-current.json"
 _MAX_STATE_BYTES = 8 * 1024 * 1024
+FORMAT_TWO_CAPABILITIES = frozenset(
+    {"updater", "prompt_projection", "commands_api", "sync"}
+)
+
+
+def _require_format_two_capabilities(capabilities: frozenset[str]) -> None:
+    missing = sorted(FORMAT_TWO_CAPABILITIES - capabilities)
+    if missing:
+        raise ProjectRegistryError(
+            "missing format-2 capabilities: " + ", ".join(missing)
+        )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -65,6 +77,7 @@ class _FormatTwoPayloadAdapter:
     rejected_groups: tuple[str, ...] = ()
     source_history: tuple[dict[str, object], ...] = ()
     provenance: Mapping[str, object] | None = None
+    migration_version: str | None = None
 
     def prepare(self, context: PublicationContext) -> PreparedVersion[EntryMemoryState]:
         retained_operation_ids = {receipt.operation_id for receipt in self.receipts}
@@ -124,6 +137,8 @@ class _FormatTwoPayloadAdapter:
             fields["source_history"] = [dict(item) for item in self.source_history]
         if self.provenance is not None:
             fields["provenance"] = dict(self.provenance)
+        if self.migration_version is not None:
+            fields["migration_version"] = self.migration_version
         return PreparedVersion(
             {"state": canonical_state_bytes(state)},
             {"state": canonical_state_bytes(before)},
@@ -149,6 +164,7 @@ class _MigrationPayloadAdapter:
                 "source_digest": self.plan.source_digest,
                 "source_version": self.plan.source_version,
                 "target_version": self.plan.source_version,
+                "migration_version": context.version,
             },
             self.plan.state,
             scalar_payload=False,
@@ -225,6 +241,25 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         source_history: tuple[dict[str, object], ...] = (),
         provenance: Mapping[str, object] | None = None,
     ) -> EntryMemorySnapshot:
+        migration_version = None
+        if kind != "migration-finalize":
+            pointer = self._pointer(directory_fd)
+            if pointer is not None:
+                root, blobs_fd, versions_fd = self._version_handles(
+                    directory_fd, create=False
+                )
+                try:
+                    current_version = str(pointer["current"])
+                    current_manifest = self._manifest(versions_fd, current_version)
+                    candidate = current_manifest.get("migration_version")
+                    if current_manifest.get("kind") == "migrate":
+                        migration_version = current_version
+                    elif isinstance(candidate, str):
+                        migration_version = candidate
+                finally:
+                    os.close(versions_fd)
+                    os.close(blobs_fd)
+                    os.close(root)
         adapter = _FormatTwoPayloadAdapter(
             state=state,
             before=before,
@@ -235,6 +270,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             rejected_groups=rejected_groups,
             source_history=source_history,
             provenance=provenance,
+            migration_version=migration_version,
         )
         published = publish_version(
             directory_fd,
@@ -329,7 +365,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         changed_entry_ids: tuple[str, ...],
         provenance: Mapping[str, object],
     ) -> EntryMemorySnapshot:
-        """CAS-import one validated format-2 fixture snapshot."""
+        """CAS-import one validated format-2 snapshot."""
         if (
             not isinstance(exported, EntryMemoryExport)
             or exported.state.project_id != project_id
@@ -397,6 +433,190 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                     receipts=(receipt,),
                     source_history=exported.versions,
                     provenance=provenance,
+                )
+            finally:
+                os.close(directory_fd)
+
+    def activate_entry_memory(
+        self,
+        project_id: str,
+        profile: str = "zeta",
+        *,
+        capabilities: frozenset[str] | None = None,
+    ) -> EntryMemorySnapshot:
+        """Activate an empty real project when every format-2 consumer is ready."""
+        _require_format_two_capabilities(
+            FORMAT_TWO_CAPABILITIES if capabilities is None else capabilities
+        )
+        try:
+            schema = memory_profile(profile)
+        except ValueError as exc:
+            raise ProjectRegistryError(str(exc)) from exc
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                if self._pointer(directory_fd) is not None:
+                    raise ProjectRegistryError(
+                        "existing project memory must be activated with migrate"
+                    )
+                expected = {
+                    "brief.md": "# Brief\n",
+                    "state.md": "# Current state\n",
+                    "backlog.md": "# Backlog\n",
+                    "changelog.md": "# Changelog\n",
+                    "decisions.md": "# Decisions\n",
+                }
+                if self._legacy_contents(directory_fd) != expected:
+                    raise ProjectRegistryError(
+                        "existing project memory must be activated with migrate"
+                    )
+                state = empty_state(project_id, schema)
+                return self._publish_entry_version(
+                    directory_fd,
+                    state=state,
+                    before=state,
+                    kind="entry-activate",
+                    receipts=(),
+                    reset_history=True,
+                )
+            finally:
+                os.close(directory_fd)
+
+    def set_memory_profile(
+        self,
+        project_id: str,
+        profile: str,
+        *,
+        kind_mappings: Mapping[str, str] | None = None,
+        resolve_kinds: frozenset[str] = frozenset(),
+    ) -> EntryMemorySnapshot:
+        """Replace the copied schema and explicitly handle removed populated kinds."""
+        try:
+            selected = memory_profile(profile)
+        except ValueError as exc:
+            raise ProjectRegistryError(str(exc)) from exc
+        mappings = dict(kind_mappings or {})
+        if set(mappings) & set(resolve_kinds):
+            raise ProjectRegistryError("a memory kind cannot be mapped and resolved")
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                current = self._entry_snapshot_locked(directory_fd)
+                target_keys = {kind.key for kind in selected.kinds}
+                source_keys = {kind.key for kind in current.state.schema.kinds}
+                if set(mappings) - source_keys or set(resolve_kinds) - source_keys:
+                    raise ProjectRegistryError("profile change names an unknown source kind")
+                if any(target not in target_keys for target in mappings.values()):
+                    raise ProjectRegistryError("profile mapping targets an unknown kind")
+                removed = source_keys - target_keys
+                if (set(mappings) | set(resolve_kinds)) - removed:
+                    raise ProjectRegistryError("profile mapping applies only to removed kinds")
+                populated = {
+                    entry.kind
+                    for entry in current.state.entries.values()
+                    if isinstance(entry, MemoryEntry) and entry.kind in removed
+                }
+                missing = sorted(populated - set(mappings) - set(resolve_kinds))
+                if missing:
+                    raise ProjectRegistryError(
+                        "profile change requires --map-kind or --resolve-kind for: "
+                        + ", ".join(missing)
+                    )
+                operation_id = new_operation_id()
+                entries = {}
+                touched: list[str] = []
+                for entry_id, entry in current.state.entries.items():
+                    if not isinstance(entry, MemoryEntry) or entry.kind not in removed:
+                        entries[entry_id] = entry
+                    elif entry.kind in mappings:
+                        entries[entry_id] = dataclasses.replace(
+                            entry,
+                            kind=mappings[entry.kind],
+                            last_operation_id=operation_id,
+                        )
+                        touched.append(entry_id)
+                    elif entry.kind in resolve_kinds:
+                        touched.append(entry_id)
+                schema = dataclasses.replace(
+                    selected, version=current.state.schema.version + 1
+                )
+                state = dataclasses.replace(
+                    current.state,
+                    generation=current.state.generation + 1,
+                    schema=schema,
+                    entries=entries,
+                )
+                canonical_state_bytes(state)
+                receipt = OperationReceipt(
+                    operation_id,
+                    "sync",
+                    tuple(touched),
+                    tuple(entry_id for entry_id in touched if entry_id in entries),
+                    f"set memory profile to {profile}",
+                    None,
+                    False,
+                )
+                return self._publish_entry_version(
+                    directory_fd,
+                    state=state,
+                    before=current.state,
+                    kind="schema-profile",
+                    receipts=(receipt,),
+                )
+            finally:
+                os.close(directory_fd)
+
+    def migrate_memory(
+        self,
+        project_id: str,
+        *,
+        capabilities: frozenset[str] | None = None,
+        migrated_at: str | None = None,
+    ) -> MigrationPlan:
+        _require_format_two_capabilities(
+            FORMAT_TWO_CAPABILITIES if capabilities is None else capabilities
+        )
+        return self._migrate_memory_for_test(
+            project_id, migrated_at=migrated_at or utc_now()
+        )
+
+    def rollback_memory_migration(self, project_id: str) -> None:
+        """Restore the protected format-1 migration target."""
+        self._rollback_memory_migration_for_test(project_id)
+
+    def finalize_memory_migration(self, project_id: str) -> EntryMemorySnapshot:
+        """End special rollback protection while retaining normal history."""
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                current = self._entry_snapshot_locked(directory_fd)
+                pointer = self._pointer(directory_fd)
+                assert pointer is not None
+                root, blobs_fd, versions_fd = self._version_handles(
+                    directory_fd, create=False
+                )
+                try:
+                    records = [
+                        self._manifest(versions_fd, version)
+                        for version in pointer["history"]
+                    ]
+                finally:
+                    os.close(versions_fd)
+                    os.close(blobs_fd)
+                    os.close(root)
+                if any(record.get("kind") == "migration-finalize" for record in records):
+                    raise ProjectRegistryError("memory migration is already finalized")
+                current_manifest = records[-1]
+                if not any(record.get("kind") == "migrate" for record in records) and not isinstance(
+                    current_manifest.get("migration_version"), str
+                ):
+                    raise ProjectRegistryError("memory migration is not initialized")
+                return self._publish_entry_version(
+                    directory_fd,
+                    state=current.state,
+                    before=current.state,
+                    kind="migration-finalize",
+                    receipts=(),
                 )
             finally:
                 os.close(directory_fd)
@@ -491,42 +711,73 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                     directory_fd, create=False
                 )
                 try:
-                    manifest = self._manifest(versions_fd, str(pointer["current"]))
-                    source_version = manifest.get("source_version")
-                    if manifest.get("kind") != "migrate" or not isinstance(
-                        source_version, str
-                    ):
-                        raise ProjectRegistryError(
-                            "memory is not a reversible migration fixture"
+                    migration = None
+                    for version in reversed(pointer["history"]):
+                        candidate = self._manifest(versions_fd, str(version))
+                        if candidate.get("kind") == "migration-finalize":
+                            raise ProjectRegistryError("memory migration is finalized")
+                        if candidate.get("kind") == "migrate":
+                            migration = candidate
+                            break
+                    if migration is None:
+                        current = self._manifest(versions_fd, str(pointer["current"]))
+                        migration_version = current.get("migration_version")
+                        if isinstance(migration_version, str):
+                            migration = self._manifest(versions_fd, migration_version)
+                    if migration is None:
+                        raise ProjectRegistryError("memory is not a reversible migration")
+                    source_version = migration.get("source_version")
+                    if source_version is None:
+                        source_contents = self._contents_from_manifest(
+                            blobs_fd, migration, key="before_snapshot"
                         )
-                    source_manifest = self._manifest(versions_fd, source_version)
-                    source_contents = self._contents_from_manifest(
-                        blobs_fd, source_manifest
-                    )
-                    history = list(pointer["history"])
-                    restored = (
-                        history[: history.index(source_version) + 1]
-                        if source_version in history
-                        else [source_version]
-                    )
+                        restored: list[str] = []
+                    elif isinstance(source_version, str):
+                        source_manifest = self._manifest(versions_fd, source_version)
+                        source_contents = self._contents_from_manifest(
+                            blobs_fd, source_manifest
+                        )
+                        history = list(pointer["history"])
+                        restored = (
+                            history[: history.index(source_version) + 1]
+                            if source_version in history
+                            else [source_version]
+                        )
+                    else:
+                        raise ProjectRegistryError("memory is not a reversible migration")
                 finally:
                     os.close(versions_fd)
                     os.close(blobs_fd)
                     os.close(root)
-                atomic_publish_file(
-                    directory_fd,
-                    _CURRENT,
-                    json.dumps(
-                        {"current": source_version, "history": restored},
-                        sort_keys=True,
-                    ).encode(),
-                    sync_directory=True,
-                )
-                self._refresh_memory_mirror(
-                    directory_fd,
-                    source_contents,
-                    mirror_path=self.root / project_id / "memory",
-                )
+                if source_version is None:
+                    os.unlink(_CURRENT, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                else:
+                    atomic_publish_file(
+                        directory_fd,
+                        _CURRENT,
+                        json.dumps(
+                            {"current": source_version, "history": restored},
+                            sort_keys=True,
+                        ).encode(),
+                        sync_directory=True,
+                    )
+                if source_version is None:
+                    memory_fd = self._memory_fd(directory_fd)
+                    try:
+                        for name, content in source_contents.items():
+                            self._publish_mirror_file(
+                                memory_fd, name, content.encode("utf-8")
+                            )
+                        os.fsync(memory_fd)
+                    finally:
+                        os.close(memory_fd)
+                else:
+                    self._refresh_memory_mirror(
+                        directory_fd,
+                        source_contents,
+                        mirror_path=self.root / project_id / "memory",
+                    )
             finally:
                 os.close(directory_fd)
 
@@ -585,7 +836,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         rejected_groups: tuple[str, ...] = (),
         now: str | None = None,
     ) -> EntryCASResult:
-        """Apply one dormant format-2 transaction."""
+        """Apply one format-2 transaction."""
         if not isinstance(expected_digest, str) or not re.fullmatch(
             r"[0-9a-f]{64}", expected_digest
         ):

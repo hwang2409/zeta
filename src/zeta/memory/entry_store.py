@@ -1,8 +1,7 @@
-"""Dormant typed project-memory state and deterministic mutations.
+"""Typed project-memory state and deterministic mutations.
 
 The module is the format-2 domain seam. It validates copied schemas, canonicalizes
 complete snapshots, and applies grouped operations without storage side effects.
-Production project creation and commands remain on format 1.
 """
 
 from __future__ import annotations
