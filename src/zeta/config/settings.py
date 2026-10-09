@@ -79,6 +79,7 @@ _TOP_KEYS = frozenset(
         "auto_project",
         "memory",
         "inbox",
+        "commands",
         "tools",
         "disallowed_tools",
         "allow_hooks",
@@ -100,6 +101,7 @@ _PROJECT_SAFE_KEYS = frozenset(
 )
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
 _INBOX_KEYS = frozenset({"enabled"})
+_COMMAND_KEYS = frozenset({"command_niceness"})
 _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
 
 
@@ -131,6 +133,7 @@ class Settings:
     memory_model: str | None = None
     memory_token_threshold: int | None = None
     memory_idle_minutes: int | None = None
+    command_niceness: int = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +163,7 @@ class ResolvedConfig:
     memory_model: str = "gpt-5.6-luna"
     memory_token_threshold: int = 50_000
     memory_idle_minutes: int = 10
+    command_niceness: int = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +298,7 @@ def resolve(
         memory_model=settings.memory_model or "gpt-5.6-luna",
         memory_token_threshold=settings.memory_token_threshold or 50_000,
         memory_idle_minutes=settings.memory_idle_minutes or 10,
+        command_niceness=settings.command_niceness,
     )
 
 
@@ -498,6 +503,15 @@ def _validate(
         memory, "token_threshold", notices
     )
     memory_idle_minutes = _validated_positive_int(memory, "idle_minutes", notices)
+    commands = data.get("commands", {})
+    if not isinstance(commands, Mapping):
+        notices.append("settings · ignored key 'commands': expected table")
+        commands = {}
+    for key in commands.keys() - _COMMAND_KEYS:
+        notices.append(f"settings · ignored unknown key 'commands.{key}'")
+    command_niceness = _validated_int_range(
+        commands, "command_niceness", notices, minimum=0, maximum=19
+    )
     tool_allow = _validated_tool_patterns(data, "tools", notices, optional=True)
     tool_deny = _validated_tool_patterns(
         data, "disallowed_tools", notices, optional=False
@@ -529,6 +543,7 @@ def _validate(
         memory_model=memory_model,
         memory_token_threshold=memory_token_threshold,
         memory_idle_minutes=memory_idle_minutes,
+        command_niceness=10 if command_niceness is None else command_niceness,
     )
 
 
@@ -606,6 +621,26 @@ def _validated_bool(
     value = data[key]
     if type(value) is not bool:
         notices.append(f"settings · ignored key '{key}': expected boolean")
+        return None
+    return value
+
+
+def _validated_int_range(
+    data: Mapping[str, Any],
+    key: str,
+    notices: list[str],
+    *,
+    minimum: int,
+    maximum: int,
+) -> int | None:
+    if key not in data:
+        return None
+    value = data[key]
+    if type(value) is not int or not minimum <= value <= maximum:
+        notices.append(
+            f"settings · ignored key 'commands.{key}': "
+            f"expected integer from {minimum} to {maximum}"
+        )
         return None
     return value
 

@@ -34,8 +34,9 @@ def plan_entry_transaction_undo(
     """Invert only the target transaction while preserving independent changes."""
     if before.project_id != current.project_id or after.project_id != current.project_id:
         raise ProjectRegistryError("memory undo snapshots target different projects")
-    if before.schema != after.schema:
-        raise ProjectRegistryError("memory schema transactions cannot be undone as entries")
+    schema_changed = before.schema != after.schema
+    if schema_changed and current.schema != after.schema:
+        raise ProjectRegistryError("memory undo has dependent later schema changes")
 
     changed_ids = {
         entry_id
@@ -77,7 +78,12 @@ def plan_entry_transaction_undo(
             entries.pop(entry_id, None)
         else:
             entries[entry_id] = prior
-    state = replace(current, generation=current.generation + 1, entries=entries)
+    state = replace(
+        current,
+        generation=current.generation + 1,
+        schema=before.schema if schema_changed else current.schema,
+        entries=entries,
+    )
     canonical_state_bytes(state)
     target_ids = tuple(
         dict.fromkeys(

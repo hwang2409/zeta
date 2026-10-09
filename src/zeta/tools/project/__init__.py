@@ -73,6 +73,10 @@ async def _update_project(
         if projects is None:
             raise ProjectRegistryError("project registry capability is unavailable")
         project = _project(registry, projects)
+        if projects.memory_format(project.project_id) == 2:
+            raise ProjectRegistryError(
+                "this project uses entry memory; memory is maintained automatically"
+            )
         projects.update_memory(
             project.project_id, {arguments["name"]: arguments["content"]}
         )

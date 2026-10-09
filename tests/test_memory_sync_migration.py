@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import dataclasses
 import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
-from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,8 +18,8 @@ from unittest.mock import patch
 import pytest
 
 from zeta.cli import project as project_cli
+from zeta.core.project_context import load_project_context, refresh_project_memory
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
-from zeta.memory.entry_reconciler import reconcile_entry_range
 from zeta.memory.entry_store import (
     AddOperation,
     ExpireOperation,
@@ -32,10 +33,7 @@ from zeta.memory.entry_store import (
 )
 from zeta.memory.migration import migrate_format_one, reverse_migration
 from zeta.memory.profiles import memory_profile
-from zeta.memory.prompt_projection import render_entry_memory
-from zeta.memory.reconciler import Transcript
 from zeta.memory.user_authorization import MemoryMutationAuthorization
-from zeta.project_errors import ProjectRegistryError
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_memory_history import PROJECT_MEMORY_FILES
 from zeta.project_registry import ProjectRegistry
@@ -47,10 +45,17 @@ from zeta.remote_sync import (
 )
 from zeta.remote_sync.errors import RemoteSyncError
 from zeta.remote_sync.memory import project_digest
+from zeta.remote_sync.project_publish import (
+    ProjectPublicationError,
+    _validate_snapshot,
+    prepare_project_transfer,
+)
+from zeta.remote_sync.project_publish import publish_version as publish_remote_version
 from zeta.remote_sync.ssh import SshTransport
 from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
 from zeta.server.slash_commands import ServerSlashSession
+from zeta.skills import SkillCatalog
 from zeta.tui.slash_handlers import SlashHandlerMixin
 
 
@@ -71,8 +76,7 @@ def _fixture(home: Path, workspace: Path) -> tuple[ProjectRegistry, str]:
     workspace.mkdir(parents=True)
     registry = ProjectRegistry(home / "projects")
     project = registry.create_project("test", "test", workspace)
-    registry.initialize_memory(project.project_id)
-    registry._create_entry_memory_for_test(project.project_id, memory_profile("zeta"))
+    registry.activate_entry_memory(project.project_id, "zeta")
     return registry, project.project_id
 
 
@@ -300,15 +304,36 @@ def test_entry_sync_propagates_status_and_conflicts_schema(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_format_two_fixture_end_to_end_updater_prompt_commands_and_sync(
-    tmp_path: Path,
-) -> None:
-    first = tmp_path / "first"
+async def test_public_migration_end_to_end_with_real_content(tmp_path: Path) -> None:
+    first = tmp_path / "home"
     second = tmp_path / "second"
-    registry, project_id = _fixture(first, tmp_path / "workspace")
-    transcript = Transcript(
-        "fixture-session",
-        (
+    workspace = tmp_path / "workspace"
+    registry, project_id, original_contents = _legacy_fixture(tmp_path)
+    starting_context = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=first,
+        catalog=SkillCatalog.empty(),
+        project_id=project_id,
+    )
+    monkey_home = os.environ.get("ZETA_HOME")
+    os.environ["ZETA_HOME"] = str(first)
+    try:
+        assert project_cli.run(
+            _cli_args(project_id, remote="migrate"),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+        ) == 0
+    finally:
+        if monkey_home is None:
+            os.environ.pop("ZETA_HOME", None)
+        else:
+            os.environ["ZETA_HOME"] = monkey_home
+
+    session_dir = first / "sessions" / ("a" * 32)
+    session_dir.mkdir(parents=True)
+    (session_dir / "conversation.jsonl").write_text(
+        json.dumps(
             {
                 "seq": 1,
                 "type": "message",
@@ -319,8 +344,8 @@ async def test_format_two_fixture_end_to_end_updater_prompt_commands_and_sync(
                         "metadata": {"zeta.origin": "user"},
                     }
                 },
-            },
-        ),
+            }
+        ) + "\n"
     )
 
     async def invoke(_prompt: str) -> str:
@@ -338,36 +363,64 @@ async def test_format_two_fixture_end_to_end_updater_prompt_commands_and_sync(
             }
         )
 
-    result = await reconcile_entry_range(
+    runner = AutoMemoryReconciler(
         registry=registry,
         project_id=project_id,
-        transcript=transcript,
-        reconciliation_key=hashlib.sha256(b"fixture-range").hexdigest(),
+        session_id="a" * 32,
+        session_dir=session_dir,
         invoke=invoke,
-        cas_retries=3,
-        as_of=date(2026, 10, 8),
-        now="2026-10-08T12:00:00.000000Z",
+        config=AutoMemoryConfig(minimum_interval=0),
     )
-    entry_id = result.changed_entry_ids[0]
-    projection = render_entry_memory(
-        registry._entry_memory_state(project_id).state,
-        now="2026-10-08T12:00:00.000000Z",
+    runner.before_eviction(1, 1)
+    await runner.drain()
+    await runner.close()
+    entry_id = next(
+        entry.id
+        for entry in registry._entry_memory_state(project_id).state.entries.values()
+        if isinstance(entry, MemoryEntry) and entry.text == "PR 5 is ready."
     )
-    assert "PR 5 is ready." in projection.block
+    resumed = refresh_project_memory(
+        starting_context.system_prompt,
+        home=first,
+        project_id=project_id,
+        memory_offset=starting_context.memory_offset,
+        memory_length=starting_context.memory_length,
+        memory_digest=starting_context.memory_digest,
+    )
+    assert "PR 5 is ready." in resumed
+    assert entry_id in run_memory_command(registry, project_id, "log")
     assert run_memory_command(
         registry,
         project_id,
         f"accept {entry_id}",
         authorization=MemoryMutationAuthorization.direct_slash(),
     ) == f"memory accepted: {entry_id}"
+    assert "undo complete" in run_memory_command(
+        registry,
+        project_id,
+        f"undo {entry_id}",
+        authorization=MemoryMutationAuthorization.direct_slash(),
+    )
 
-    synced = push_project_memory(first, LocalTransport(second), project_id=project_id)
-    assert synced.conflicts == ()
-    remote_entry = ProjectRegistry(second / "projects")._entry_memory_state(
-        project_id
-    ).state.entries[entry_id]
-    assert isinstance(remote_entry, MemoryEntry)
-    assert remote_entry.accepted_by == "user"
+    shown = ProjectRequests(
+        home=first,
+        runtime=SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list)),
+        codec=FrameCodec(),
+    ).dispatch(
+        1,
+        "project_show",
+        {"project_id": project_id},
+        features=frozenset({"projects-memory-v2"}),
+    )
+    assert shown["memory"]["profile"] == "zeta"
+    assert push_project_memory(
+        first, LocalTransport(second), project_id=project_id
+    ).conflicts == ()
+    assert ProjectRegistry(second / "projects").memory_format(project_id) == 2
+
+    registry.rollback_memory_migration(project_id)
+    assert registry.memory_format(project_id) == 1
+    assert dict(registry.load_memory(project_id)) == original_contents
 
 
 def test_messaging_profile_correction_completion_and_expiry_matrix() -> None:
@@ -501,6 +554,108 @@ def _legacy_fixture(tmp_path: Path) -> tuple[ProjectRegistry, str, dict[str, str
     return registry, project.project_id, contents
 
 
+@pytest.mark.asyncio
+async def test_inflight_format_one_reconciliation_during_migration(
+    tmp_path: Path,
+) -> None:
+    registry, project_id, _ = _legacy_fixture(tmp_path)
+    home = tmp_path / "home"
+    session_dir = home / "sessions" / ("b" * 32)
+    session_dir.mkdir(parents=True)
+    (session_dir / "conversation.jsonl").write_text(
+        json.dumps(
+            {
+                "seq": 1,
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Remember in flight."}],
+                        "metadata": {"zeta.origin": "user"},
+                    }
+                },
+            }
+        ) + "\n"
+    )
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def invoke(_prompt: str) -> str:
+        provider_started.set()
+        await release_provider.wait()
+        return json.dumps(
+            {
+                "changes": [
+                    {
+                        "file": "state.md",
+                        "content": "# Current state\n\nin-flight format one write\n",
+                        "sources": [
+                            {
+                                "session_id": "b" * 32,
+                                "seq_start": 1,
+                                "seq_end": 1,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+    runner = AutoMemoryReconciler(
+        registry=registry,
+        project_id=project_id,
+        session_id="b" * 32,
+        session_dir=session_dir,
+        invoke=invoke,
+        config=AutoMemoryConfig(minimum_interval=0),
+    )
+    runner.before_eviction(1, 1)
+    drain = asyncio.create_task(runner.drain())
+    await provider_started.wait()
+    await asyncio.to_thread(registry.migrate_memory, project_id)
+    release_provider.set()
+    await drain
+    await runner.close()
+
+    assert registry.memory_format(project_id) == 2
+    snapshot = registry._entry_memory_state(project_id)
+    assert snapshot.state.project_id == project_id
+    assert "in-flight format one write" not in {
+        entry.text
+        for entry in snapshot.state.entries.values()
+        if isinstance(entry, MemoryEntry)
+    }
+    plan = registry._migrate_memory_for_test(
+        project_id, migrated_at="2026-10-10T00:00:00Z"
+    )
+    assert snapshot.state == plan.state
+    assert all(
+        isinstance(entry, MemoryEntry) and entry.representation == "entry"
+        for entry in snapshot.state.entries.values()
+    )
+
+
+@pytest.mark.parametrize("step", ("snapshot", "manifest", "publish"))
+def test_migration_publication_failure_at_each_step_leaves_readable_state(
+    tmp_path: Path, step: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, project_id, contents = _legacy_fixture(tmp_path)
+
+    def fail_at(actual: str) -> None:
+        if actual == step:
+            raise RuntimeError(f"failed at {step}")
+
+    monkeypatch.setattr(registry, "_memory_transaction_step", fail_at)
+    with pytest.raises(RuntimeError, match=f"failed at {step}"):
+        registry.migrate_memory(project_id)
+
+    fresh = ProjectRegistry(tmp_path / "home" / "projects")
+    if fresh.memory_format(project_id) == 1:
+        assert dict(fresh.load_memory(project_id)) == contents
+    else:
+        assert fresh._entry_memory_state(project_id).state.project_id == project_id
+
+
 def test_legacy_five_file_migration_round_trips_exactly(tmp_path: Path) -> None:
     registry, project_id, contents = _legacy_fixture(tmp_path)
     source = registry.memory_snapshot(project_id)
@@ -520,6 +675,110 @@ def test_legacy_five_file_migration_round_trips_exactly(tmp_path: Path) -> None:
         source_version=registry.memory_state(project_id).version,
         migrated_at="2026-10-08T12:00:00Z",
     ) == plan
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "source-digest",
+        "before-snapshot",
+        "source-version",
+        "entry",
+        "schema",
+        "profile",
+        "format",
+        "compacted-through-version",
+    ),
+)
+def test_sync_rejects_migration_manifest_without_source_and_plan_integrity(
+    tmp_path: Path, tamper: str
+) -> None:
+    registry, project_id, _ = _legacy_fixture(tmp_path)
+    registry.migrate_memory(project_id, migrated_at="2026-10-09T00:00:00Z")
+    source = registry.root / project_id
+    snapshot = tmp_path / "snapshot" / project_id
+    shutil.copytree(source, snapshot)
+    pointer = json.loads((snapshot / "memory-current.json").read_text())
+    current = pointer["current"]
+    manifest_path = snapshot / "memory-versions" / "versions" / f"{current}.json"
+    manifest = json.loads(manifest_path.read_text())
+    blobs = snapshot / "memory-versions" / "blobs"
+
+    if tamper == "source-digest":
+        manifest["source_digest"] = "0" * 64
+    elif tamper == "before-snapshot":
+        before = manifest["before_snapshot"]
+        before["brief.md"] = before["state.md"]
+    elif tamper == "source-version":
+        manifest["source_version"] = pointer["history"][0]
+    else:
+        state_digest = manifest["snapshot"]["state"]
+        state = json.loads((blobs / state_digest).read_text())
+        if tamper == "entry":
+            next(iter(state["entries"].values()))["text"] = "Tampered migrated fact."
+        elif tamper == "schema":
+            state["schema"]["version"] += 1
+        elif tamper == "profile":
+            state["schema"]["profile"] = "messaging"
+        elif tamper == "format":
+            state["format"] = 3
+        else:
+            state["compacted_through_version"] = "f" * 32
+        payload = json.dumps(
+            state, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        replacement = hashlib.sha256(payload).hexdigest()
+        (blobs / replacement).write_bytes(payload)
+        (blobs / replacement).chmod(0o600)
+        manifest["snapshot"]["state"] = replacement
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+
+    with pytest.raises(ProjectPublicationError):
+        _validate_snapshot(snapshot, project_id)
+
+
+def test_migration_references_survive_bounded_local_and_remote_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "home"
+    second = tmp_path / "second"
+    second.mkdir()
+    registry, project_id, contents = _legacy_fixture(tmp_path)
+    registry.migrate_memory(project_id, migrated_at="2026-10-09T00:00:00Z")
+    transport = LocalTransport(second)
+    _add(registry, project_id, "post-migration update 0")
+    push_project_memory(first, transport, project_id=project_id)
+
+    remote = ProjectRegistry(second / "projects")
+    for index in range(1, 130):
+        _add(registry, project_id, f"post-migration update {index}")
+        publish_remote_version(remote.root / project_id, registry.root / project_id)
+
+    prepare_project_transfer(registry.root / project_id)
+    prepare_project_transfer(remote.root / project_id)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "ssh"
+    shim.write_text(
+        '#!/bin/sh\n[ "$1" = -- ] && shift\nshift\nexec /bin/sh -c "$1"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    result = push_project_memory(
+        first,
+        SshTransport("fixture", str(second), name="fixture"),
+        project_id=project_id,
+    )
+    assert result.conflicts == ()
+
+    registry.rollback_memory_migration(project_id)
+    remote.rollback_memory_migration(project_id)
+    assert dict(registry.load_memory(project_id)) == contents
+    assert dict(remote.load_memory(project_id)) == contents
+    updated = "# Current state\n\nUpdated after rollback.\n"
+    registry.update_memory(project_id, {"state.md": updated})
+    assert dict(registry.load_memory(project_id))["state.md"] == updated
 
 
 def test_migration_rollback_restores_format_one_pointer(tmp_path: Path) -> None:
@@ -777,17 +1036,25 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
         "remote": _format_snapshot(remote),
     }
     assert set(before["local"]).issubset(after["local"])
-    assert all(memory_format == 1 for stores in after.values() for memory_format in stores.values())
+    assert after["local"][project_id] == 1
+    if entry_point in {"project-create", "project-init"}:
+        assert list(after["local"].values()).count(2) == 1
+    else:
+        assert all(
+            memory_format == 1
+            for stores in after.values()
+            for memory_format in stores.values()
+        )
 
 
-def test_migration_engine_is_dormant_from_public_paths(tmp_path: Path) -> None:
+def test_migration_engine_activates_only_the_explicit_project(tmp_path: Path) -> None:
     registry, project_id, _ = _legacy_fixture(tmp_path)
-    assert registry.memory_format(project_id) == 1
-    assert not hasattr(registry, "migrate_memory")
-    assert not hasattr(registry, "rollback_memory_migration")
-    with pytest.raises(ProjectRegistryError):
-        registry.import_memory(project_id, object(), expected_digest="0" * 64)  # type: ignore[arg-type]
-    assert registry.memory_format(project_id) == 1
+    other = registry.create_project("other", "test", tmp_path / "other")
+
+    registry.migrate_memory(project_id, migrated_at="2026-10-09T00:00:00Z")
+
+    assert registry.memory_format(project_id) == 2
+    assert registry.memory_format(other.project_id) == 1
 
 
 def _replace_schema(registry: ProjectRegistry, project_id: str, schema: object) -> None:

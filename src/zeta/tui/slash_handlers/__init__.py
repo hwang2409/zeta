@@ -444,7 +444,12 @@ class SlashHandlerMixin:
                 project = registry.find_for_directory(self.loop.store.cwd)
         if project is None:
             return "unassociated (run /project init to associate this directory)"
-        memory = ", ".join(name for name, _ in registry.load_memory(project.project_id)) or "none"
+        if registry.memory_format(project.project_id) == 2:
+            memory = ", ".join(registry._entry_memory_mirrors(project.project_id)) or "none"
+        else:
+            memory = ", ".join(
+                name for name, _ in registry.load_memory(project.project_id)
+            ) or "none"
         return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
 
     def slash_memory(self, args: str) -> str:

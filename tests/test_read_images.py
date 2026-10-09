@@ -11,6 +11,7 @@ import sys
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Self
 
 import pytest
 from PIL import Image
@@ -1016,6 +1017,32 @@ async def test_over_one_gigapixel_returns_metadata_only(tmp_path: Path) -> None:
     assert "1 gigapixel" in result["content"][0]["text"]
     assert result["structuredContent"]["sha256"]
     assert result["structuredContent"]["path"] == str(path)
+
+
+def test_worker_rss_tolerates_exit_while_reading_procfs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class VanishedStatus:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def __iter__(self) -> Self:
+            return self
+
+        def __next__(self) -> str:
+            raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: VanishedStatus())
+    monkeypatch.setattr(
+        image_normalization.subprocess,
+        "check_output",
+        lambda *args, **kwargs: "",
+    )
+
+    assert image_normalization._process_rss_bytes(1234) == 0
 
 
 @pytest.mark.asyncio

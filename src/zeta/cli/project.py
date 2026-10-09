@@ -26,10 +26,12 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
     create.add_argument("name")
     create.add_argument("--scope", required=True)
     create.add_argument("--canonical-integration-root")
+    create.add_argument("--memory-profile", action="append", choices=("zeta", "messaging"))
     init = verbs.add_parser("init", help="create or discover a project for a directory")
     init.add_argument("directory", nargs="?", default=".")
     init.add_argument("--name")
     init.add_argument("--scope", default="")
+    init.add_argument("--memory-profile", action="append", choices=("zeta", "messaging"))
     verbs.add_parser("list", help="list projects")
     discover = verbs.add_parser(
         "discover", help="find the project associated with a directory"
@@ -49,6 +51,7 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
     memory.add_argument("project", help="project, or push/pull/resolve for remote sync")
     memory.add_argument("remote", nargs="?", help="remote alias or explicit SSH host")
     memory.add_argument("action", nargs="?", help="memory action file")
+    memory.add_argument("detail", nargs="?", help="memory action value")
     memory.add_argument("--project", dest="sync_project", help="project ID or exact name")
     memory.add_argument("--remote-home", help="remote ZETA_HOME (default: ~/.zeta)")
     memory.add_argument(
@@ -67,6 +70,8 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
     memory.add_argument(
         "--from-file", nargs=2, metavar=("FILE", "PATH"), action="append", default=[]
     )
+    memory.add_argument("--map-kind", action="append", default=[], metavar="OLD=NEW")
+    memory.add_argument("--resolve-kind", action="append", default=[], metavar="KIND")
     show = verbs.add_parser("show", help="show a project")
     show.add_argument("project", help="project ID or exact name")
 
@@ -82,11 +87,20 @@ def run(
     registry = ProjectRegistry(env_home() / "projects")
     try:
         if args.project_verb == "create":
+            profiles = getattr(args, "memory_profile", None) or ["zeta"]
+            if len(profiles) != 1:
+                raise ProjectRegistryError("--memory-profile may be specified only once")
             project = registry.create_project(
-                args.name, args.scope, args.canonical_integration_root
+                args.name,
+                args.scope,
+                args.canonical_integration_root,
+                memory_profile=profiles[0],
             )
             value = project.to_dict()
         elif args.project_verb == "init":
+            profiles = getattr(args, "memory_profile", None) or ["zeta"]
+            if len(profiles) != 1:
+                raise ProjectRegistryError("--memory-profile may be specified only once")
             directory = Path(args.directory).expanduser().resolve()
             project = registry.find_for_directory(directory)
             if project is None:
@@ -94,6 +108,7 @@ def run(
                     args.name or directory.name,
                     args.scope or directory.name,
                     str(directory),
+                    memory_profile=profiles[0],
                 )
             registry.ensure_memory_supported(project.project_id)
             value = project.to_dict()
@@ -150,12 +165,65 @@ def run(
                 return 0
             if args.project in {"push", "pull", "resolve"}:
                 return _run_memory_sync(args, registry, out, err)
+            project_id = (
+                args.project
+                if _PROJECT_ID.fullmatch(args.project)
+                else registry.show_project(name=args.project).project_id
+            )
+            if args.remote in {"migrate", "rollback", "finalize"}:
+                if args.action is not None or getattr(args, "detail", None) is not None:
+                    raise ProjectRegistryError(f"memory {args.remote} takes no arguments")
+                print(
+                    "warning: memory history is bounded to 128 versions; transcripts "
+                    "and external backups can retain older content",
+                    file=err,
+                )
+                if args.remote == "migrate":
+                    registry.migrate_memory(project_id)
+                elif args.remote == "rollback":
+                    registry.rollback_memory_migration(project_id)
+                else:
+                    print(
+                        "warning: finalize removes the protected format-1 rollback target",
+                        file=err,
+                    )
+                    registry.finalize_memory_migration(project_id)
+                value = (
+                    registry._entry_memory_view(project_id)
+                    if registry.memory_format(project_id) == 2
+                    else {name: content for name, content in registry.load_memory(project_id)}
+                )
+                print(json.dumps(value, indent=2, sort_keys=True), file=out)
+                return 0
+            if args.remote == "schema":
+                if args.action != "set-profile" or not getattr(args, "detail", None):
+                    raise ProjectRegistryError(
+                        "memory schema requires: set-profile PROFILE"
+                    )
+                mappings: dict[str, str] = {}
+                for item in getattr(args, "map_kind", []):
+                    old, separator, new = item.partition("=")
+                    if not separator or not old or not new or old in mappings:
+                        raise ProjectRegistryError("--map-kind requires unique OLD=NEW values")
+                    mappings[old] = new
+                registry.set_memory_profile(
+                    project_id,
+                    args.detail,
+                    kind_mappings=mappings,
+                    resolve_kinds=frozenset(getattr(args, "resolve_kind", [])),
+                )
+                value = registry._entry_memory_view(project_id)
+                print(json.dumps(value, indent=2, sort_keys=True), file=out)
+                return 0
             if (
                 args.remote is not None
                 or args.sync_project is not None
                 or args.remote_home is not None
                 or args.accept is not None
                 or args.action is not None
+                or getattr(args, "detail", None) is not None
+                or getattr(args, "map_kind", [])
+                or getattr(args, "resolve_kind", [])
             ):
                 raise ProjectRegistryError(
                     "remote arguments require: project memory push|pull|resolve HOST"
