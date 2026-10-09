@@ -72,3 +72,32 @@ interpolation, project-over-user precedence, tool/prompt naming, and malformed
 or missing-environment reporting remain compatible. Trusted enabled servers
 start connecting in the background after the TUI renders; degraded servers keep
 their persisted definitions.
+
+## Per-server tool filters
+
+A server definition can restrict the tools that Zeta registers. Patterns match
+the server's exact, unqualified tool names and use simple shell-style globs.
+For example, this read-only Google connector exposes search and read operations
+but never mutation operations:
+
+```json
+{
+  "servers": {
+    "google": {
+      "transport": "streamable-http",
+      "url": "https://google.example/mcp",
+      "allowed_tools": ["search_*", "get_*", "list_*"],
+      "disallowed_tools": ["*_create", "*_update", "*_delete"]
+    }
+  }
+}
+```
+
+When `allowed_tools` is present, only matching tools are available.
+`disallowed_tools` always removes matching tools. The global `--tools` and
+`--disallowed-tools` policy also applies, so a tool must pass both allow rules
+and neither deny rule. Zeta applies the server filter again after a
+`tools/list_changed` notification. Unknown patterns produce a warning. A server
+whose filter matches no tools remains mounted with zero tools and reports a
+notice. Filtered tools are not registered or discoverable, and direct calls to
+them fail closed.

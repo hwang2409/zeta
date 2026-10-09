@@ -46,7 +46,11 @@ class MCPDefinitionPublisher:
         self, tool: MCPTool, generation: int, *, registry: ToolRegistry | None = None
     ) -> bool:
         target = registry or self._registry
-        if target is None or self._client is None:
+        if (
+            target is None
+            or self._client is None
+            or not self.config.allows_tool(tool.name)
+        ):
             return False
         if getattr(target, "_closed", False):
             return False

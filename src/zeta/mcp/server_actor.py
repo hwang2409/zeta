@@ -99,6 +99,7 @@ class _Operation:
     waiter: _CallRequest | None = None
     task: asyncio.Task[_SetupOutcome] | None = None
     failure_reason: str | None = None
+    notice_sink: NoticeSink | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +125,17 @@ class _TransportFailure:
     operation: int | None
     client: MCPClient
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolsListChanged:
+    client: MCPClient
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolsListRefreshed:
+    client: MCPClient
+    task: asyncio.Task[list[MCPTool]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +214,8 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._generation = 0
         self._failure_count = 0
         self._manual_recovery_probe = False
+        self._notice_sink: NoticeSink | None = None
+        self._tool_refresh_task: asyncio.Task[list[MCPTool]] | None = None
         self._status = MCPServerStatus(
             config.name,
             config.transport,
@@ -403,6 +417,10 @@ class MCPServerActor(MCPDefinitionPublisher):
                     self._handle_setup_finished(message)
                 elif isinstance(message, _TransportFailure):
                     self._handle_transport_failure(message)
+                elif isinstance(message, _ToolsListChanged):
+                    self._handle_tools_list_changed(message)
+                elif isinstance(message, _ToolsListRefreshed):
+                    self._handle_tools_list_refreshed(message)
                 elif isinstance(message, _CallRequest):
                     self._handle_call(message)
                 elif isinstance(message, _CallFinished):
@@ -507,6 +525,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             preserve_degraded,
             message.request,
             message.waiter,
+            notice_sink=message.notice_sink,
         )
         self._operation = operation
         task = asyncio.create_task(
@@ -590,6 +609,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             tools = await asyncio.wait_for(
                 self._connect_and_list(client), timeout=self._setup_timeout
             )
+            tools = self._filter_tools(tools, notice_sink, config=config)
             prompts = await discover_prompts(
                 client,
                 self.name,
@@ -635,6 +655,10 @@ class MCPServerActor(MCPDefinitionPublisher):
             stderr_log_path=str(mcp_log_path(self.name)),
         )
         _notice(notice_sink, f"mcp · {self.name} mounted ({len(tools)} tools)")
+        if not tools and (
+            config.allowed_tools is not None or config.disallowed_tools
+        ):
+            _notice(notice_sink, f"mcp · {self.name} mounted with zero tools")
         failure_reason = failure_future.result() if failure_future.done() else None
         return _SetupOutcome(status, client, tuple(tools), prompts, failure_reason)
 
@@ -666,11 +690,18 @@ class MCPServerActor(MCPDefinitionPublisher):
             self.config = operation.config
             self.source = operation.source
             self._client = outcome.client
+            if operation.notice_sink is not None:
+                self._notice_sink = operation.notice_sink
             self._tools = outcome.tools
             self._prompts = outcome.prompts
             self._generation = operation.generation
             self._failure_count = 0
             self._manual_recovery_probe = False
+            set_notification_sink = getattr(self._client, "set_notification_sink", None)
+            if set_notification_sink is not None:
+                set_notification_sink(
+                    lambda method, client=self._client: self._notify(client, method)
+                )
             self._set_status(
                 MCPServerStatus(
                     self.name,
@@ -801,6 +832,75 @@ class MCPServerActor(MCPDefinitionPublisher):
             )
         self._complete_operation(operation, self._status)
 
+    def _filter_tools(
+        self,
+        tools: list[MCPTool],
+        notice_sink: NoticeSink | None,
+        *,
+        config: MCPServerConfig | None = None,
+    ) -> list[MCPTool]:
+        server_config = config or self.config
+        names = {tool.name for tool in tools}
+        unknown = server_config.unknown_tool_patterns(names)
+        if unknown:
+            detail = "; ".join(
+                f"unknown {field}: {', '.join(patterns)}"
+                for field, patterns in unknown
+            )
+            warning = f"mcp · {self.name} {detail}"
+            logger.warning(warning)
+            _notice(notice_sink, warning)
+        return [tool for tool in tools if server_config.allows_tool(tool.name)]
+
+    def _notify(self, client: MCPClient, method: str) -> None:
+        if method == "notifications/tools/list_changed":
+            self._queue.put_nowait(_ToolsListChanged(client))
+
+    def _handle_tools_list_changed(self, message: _ToolsListChanged) -> None:
+        if (
+            message.client is not self._client
+            or self._status.state != "mounted"
+            or self._tool_refresh_task is not None
+        ):
+            return
+        task = asyncio.create_task(message.client.list_tools())
+        self._tool_refresh_task = task
+        self._children.add(task)
+        task.add_done_callback(
+            lambda done, client=message.client: self._queue.put_nowait(
+                _ToolsListRefreshed(client, done)
+            )
+        )
+
+    def _handle_tools_list_refreshed(self, message: _ToolsListRefreshed) -> None:
+        self._children.discard(message.task)
+        if self._tool_refresh_task is message.task:
+            self._tool_refresh_task = None
+        if message.client is not self._client or self._status.state != "mounted":
+            return
+        try:
+            tools = self._filter_tools(message.task.result(), self._notice_sink)
+        except Exception as exc:  # noqa: BLE001 - refresh failure degrades the server
+            self._degrade_current(_error_text(exc))
+            return
+        self._unregister_tools()
+        self._tools = tuple(tools)
+        self._set_status(
+            MCPServerStatus(
+                self.name,
+                self.config.transport,
+                "mounted",
+                tool_count=len(self._tools),
+                stderr_log_path=str(mcp_log_path(self.name)),
+            )
+        )
+        self._republish_definitions()
+        self._publish_callback(self, self._status, self._client)
+        if not tools and (
+            self.config.allowed_tools is not None or self.config.disallowed_tools
+        ):
+            _notice(self._notice_sink, f"mcp · {self.name} mounted with zero tools")
+
     def _handle_transport_failure(self, message: _TransportFailure) -> None:
         operation = self._operation
         if operation is not None and message.operation == operation.identifier:
@@ -832,6 +932,16 @@ class MCPServerActor(MCPDefinitionPublisher):
         )
 
     def _handle_call(self, request: _CallRequest) -> None:
+        if not self.config.allows_tool(request.tool_name) or not any(
+            tool.name == request.tool_name for tool in self._tools
+        ):
+            _set_result(
+                request.result,
+                make_error_result(
+                    f"MCP tool {self.name}__{request.tool_name} is filtered or unavailable"
+                ),
+            )
+            return
         if self._closed:
             _set_result(request.result, _unavailable_result(self.name))
             return
@@ -1130,6 +1240,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         set_failure_sink = getattr(client, "set_failure_sink", None)
         if set_failure_sink is not None:
             set_failure_sink(None)
+        set_notification_sink = getattr(client, "set_notification_sink", None)
+        if set_notification_sink is not None:
+            set_notification_sink(None)
 
     async def _shutdown_children(self) -> None:
         tasks = tuple(

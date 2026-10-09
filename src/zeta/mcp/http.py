@@ -81,6 +81,7 @@ class StreamableHTTPMCPClient(MCPClient):
         self._next_id = 0
         self._closed = False
         self._failure_sink: Callable[[str], None] | None = None
+        self._notification_sink: Callable[[str], None] | None = None
         self._home = home
         self._spill_store = spill_store or SpillStore()
         self._owns_spill_store = spill_store is None
@@ -91,6 +92,9 @@ class StreamableHTTPMCPClient(MCPClient):
 
     def set_failure_sink(self, sink: Callable[[str], None] | None) -> None:
         self._failure_sink = sink
+
+    def set_notification_sink(self, sink: Callable[[str], None] | None) -> None:
+        self._notification_sink = sink
 
     async def connect(self) -> None:
         if self._closed:
@@ -329,6 +333,7 @@ class StreamableHTTPMCPClient(MCPClient):
                         request_id,
                         self._spill_store,
                         MAX_RESPONSE_BYTES,
+                        self._notification_sink,
                     )
                 try:
                     value = await _read_json_body(
@@ -481,6 +486,7 @@ async def _read_sse_response(
     request_id: int,
     spill_store: SpillStore,
     memory_bound: int,
+    notification_sink: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     """Parse SSE incrementally without materializing complete data lines."""
 
@@ -536,7 +542,10 @@ async def _read_sse_response(
         if type(value) is dict and value.get("id") == request_id:
             return parse_rpc_response(value, request_id)
         if type(value) is dict and type(value.get("method")) is str:
-            logger.debug("MCP stream notification: %s", value["method"])
+            method = value["method"]
+            logger.debug("MCP stream notification: %s", method)
+            if notification_sink is not None:
+                notification_sink(method)
         return None
 
     line_prefix = bytearray()

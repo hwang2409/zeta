@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, field, replace
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Literal
 
@@ -57,6 +58,38 @@ class MCPServerConfig:
     approval_subjects: dict[str, str] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
+    allowed_tools: tuple[str, ...] | None = None
+    disallowed_tools: tuple[str, ...] = ()
+
+    def allows_tool(self, name: str) -> bool:
+        """Return whether this server may expose or call an exact tool name."""
+
+        allowed = self.allowed_tools
+        return (
+            (allowed is None or any(fnmatchcase(name, pattern) for pattern in allowed))
+            and not any(fnmatchcase(name, pattern) for pattern in self.disallowed_tools)
+        )
+
+    def unknown_tool_patterns(
+        self, names: set[str]
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """Return configured patterns that match no advertised tool."""
+
+        fields = (
+            ("allowed_tools", self.allowed_tools or ()),
+            ("disallowed_tools", self.disallowed_tools),
+        )
+        return tuple(
+            (field, unknown)
+            for field, patterns in fields
+            if (
+                unknown := tuple(
+                    pattern
+                    for pattern in patterns
+                    if not any(fnmatchcase(name, pattern) for name in names)
+                )
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +370,8 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
     enabled = value.get("enabled", True)
     if type(enabled) is not bool:
         raise ValueError("enabled must be a boolean")
+    allowed_tools = _tool_patterns(value, "allowed_tools", optional=True)
+    disallowed_tools = _tool_patterns(value, "disallowed_tools", optional=False)
     if type(subjects) is not dict or any(type(key) is not str or type(item) is not str or not item for key, item in subjects.items()):
         raise ValueError("approval_subjects must map tool names to argument names")
     token = raw_auth.get("token")
@@ -374,7 +409,22 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
         approval_subjects=dict(subjects),
         headers=dict(raw_headers),
         enabled=enabled,
+        allowed_tools=allowed_tools,
+        disallowed_tools=disallowed_tools or (),
     )
+
+
+def _tool_patterns(
+    value: dict[str, object], field: str, *, optional: bool
+) -> tuple[str, ...] | None:
+    raw = value.get(field)
+    if raw is None and optional:
+        return None
+    if raw is None:
+        return ()
+    if type(raw) is not list or any(type(item) is not str or not item for item in raw):
+        raise ValueError(f"{field} must be an array of nonempty strings")
+    return tuple(dict.fromkeys(raw))
 
 
 def _server_config_for_missing_env(name: str, value: object) -> MCPServerConfig:
@@ -439,6 +489,10 @@ def server_to_json(config: MCPServerConfig) -> dict[str, object]:
         payload["headers"] = dict(config.headers)
     if not config.enabled:
         payload["enabled"] = False
+    if config.allowed_tools is not None:
+        payload["allowed_tools"] = list(config.allowed_tools)
+    if config.disallowed_tools:
+        payload["disallowed_tools"] = list(config.disallowed_tools)
     if config.approval_subjects:
         payload["approval_subjects"] = dict(config.approval_subjects)
     return payload

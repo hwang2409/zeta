@@ -71,6 +71,7 @@ class StdioMCPClient(MCPClient):
         self._closed = False
         self._suppress_failure = False
         self._failure_sink: Callable[[str], None] | None = None
+        self._notification_sink: Callable[[str], None] | None = None
         self._spill_store = spill_store or SpillStore()
         self._owns_spill_store = spill_store is None
 
@@ -78,6 +79,9 @@ class StdioMCPClient(MCPClient):
         """Set a callback for unexpected transport termination."""
 
         self._failure_sink = sink
+
+    def set_notification_sink(self, sink: Callable[[str], None] | None) -> None:
+        self._notification_sink = sink
 
     def _report_failure(self, error: BaseException) -> None:
         if self._failure_sink is not None and not self._suppress_failure:
@@ -397,9 +401,10 @@ class StdioMCPClient(MCPClient):
                     if not future.done():
                         future.set_result(value)
                 elif type(value.get("method")) is str:
-                    logger.debug(
-                        "MCP %s notification: %s", self.config.name, value["method"]
-                    )
+                    method = value["method"]
+                    logger.debug("MCP %s notification: %s", self.config.name, method)
+                    if self._notification_sink is not None:
+                        self._notification_sink(method)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - reader failure is transport failure
