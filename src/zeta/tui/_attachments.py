@@ -68,10 +68,14 @@ def attachment_refs(value: str, base_dir: str | Path) -> tuple[AttachmentRef, ..
             "/" in raw_path or raw_path.startswith(("./", "../", "~/"))
         ):
             continue
-        path = Path(raw_path).expanduser()
-        if not path.is_absolute():
-            path = base / path
-        refs.append(AttachmentRef(match.group(0), _attachment_path(path)))
+        try:
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute():
+                path = base / path
+            path = _attachment_path(path)
+        except (RuntimeError, OSError, ValueError):
+            continue
+        refs.append(AttachmentRef(match.group(0), path))
     return tuple(refs)
 
 
@@ -195,11 +199,13 @@ def build_user_message(
     """Resolve readable references and pending paths into one message."""
 
     paths: list[Path] = []
+    reference_paths: set[Path] = set()
     blocks = [TextContent(value)]
     source = value if attachment_value is None else attachment_value
     for ref in attachment_refs(source, base_dir):
-        if ref.path in paths:
+        if ref.path in reference_paths:
             continue
+        reference_paths.add(ref.path)
         try:
             attachment = _read_attachment(ref.path, session_store)
         except AttachmentError as exc:

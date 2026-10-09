@@ -98,6 +98,24 @@ def test_missing_path_like_references_remain_plain_text(tmp_path: Path) -> None:
         assert message.content == [TextContent(value)]
 
 
+@pytest.mark.parametrize(
+    "value",
+    (
+        "read @~__zeta_user_that_does_not_exist__/notes.txt",
+        "read @./bad\0name.txt",
+    ),
+)
+def test_unresolvable_reference_remains_plain_text(
+    tmp_path: Path, value: str
+) -> None:
+    notices: list[str] = []
+
+    message = build_user_message(value, tmp_path, on_reference_notice=notices.append)
+
+    assert message.content == [TextContent(value)]
+    assert notices == []
+
+
 def test_build_user_message_inlines_text_and_preserves_prompt(tmp_path: Path) -> None:
     path = tmp_path / "notes.txt"
     path.write_text("hello", encoding="utf-8")
@@ -133,6 +151,20 @@ def test_unusable_reference_remains_text_and_reports_short_notice(
         "@./folder not attached: directory",
         "@./large.txt not attached: too large",
     ]
+
+
+def test_duplicate_unusable_reference_reports_one_notice(tmp_path: Path) -> None:
+    (tmp_path / "folder").mkdir()
+    notices: list[str] = []
+
+    message = build_user_message(
+        "compare @./folder with @./folder",
+        tmp_path,
+        on_reference_notice=notices.append,
+    )
+
+    assert message.content == [TextContent("compare @./folder with @./folder")]
+    assert notices == ["@./folder not attached: directory"]
 
 
 def test_real_and_missing_references_are_resolved_independently(tmp_path: Path) -> None:
