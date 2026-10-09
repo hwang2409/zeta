@@ -242,7 +242,7 @@ def _process_rss_bytes(process_id: int) -> int:
             for line in status:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) * 1024
-    except (FileNotFoundError, PermissionError, ValueError):
+    except (OSError, ValueError):
         pass
     try:
         value = subprocess.check_output(
