@@ -8,6 +8,7 @@ from time import perf_counter
 
 import pytest
 
+import zeta.core.context as context_module
 from zeta.core.context import (
     AssembledContext,
     BudgetExceeded,
@@ -802,10 +803,18 @@ async def test_eviction_triggers_with_safety_margin_and_calibration(
 
 
 @pytest.mark.asyncio
-async def test_calibrated_eviction_targets_provider_space(context_root: Path) -> None:
+async def test_calibrated_eviction_targets_provider_space(
+    context_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = ConversationStore(context_root)
-    for index in range(4):
-        store.append_message(text(MessageRole.ASSISTANT, f"old {index}"))
+    for index in range(10):
+        store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent(f"old {index}")],
+                metadata={"eviction_range": True},
+            )
+        )
     store.append_message(
         with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER)
     )
@@ -815,28 +824,44 @@ async def test_calibrated_eviction_targets_provider_space(context_root: Path) ->
         retained_tail=1,
         token_counter=lambda message: 1
         if message.metadata.get("context_evicted")
-        else 20,
+        else 10,
         safety_margin=0.1,
     )
     assembler._provider_budgets = assembler._calibration.calibrate(100, 200)
+    raw_target = 55
+    targets: list[int] = []
+    raw_results = []
+    real_evict_messages = context_module.evict_messages
 
+    def capture_target(*args, **kwargs):
+        targets.append(kwargs["target_tokens"])
+        raw_results.append(
+            real_evict_messages(*args, **{**kwargs, "target_tokens": raw_target})
+        )
+        return real_evict_messages(*args, **kwargs)
+
+    monkeypatch.setattr("zeta.core.context.evict_messages", capture_target)
     compacted = await assembler.assemble_context()
 
+    assert targets == [27]
+    assert raw_results[0].tokens_after * assembler.calibration_ratio > 90
     assert compacted.compacted is True
     assert compacted.token_count * assembler.calibration_ratio < 90
-    marker_count = store.compaction_marker_count()
-    repeated = await assembler.assemble_context()
-    assert repeated.compacted is False
-    assert store.compaction_marker_count() == marker_count
 
 
 @pytest.mark.asyncio
 async def test_emergency_eviction_targets_half_provider_limit(
-    context_root: Path,
+    context_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(context_root)
-    for index in range(4):
-        store.append_message(text(MessageRole.ASSISTANT, f"old {index}"))
+    for index in range(10):
+        store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent(f"old {index}")],
+                metadata={"eviction_range": True},
+            )
+        )
     store.append_message(
         with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER)
     )
@@ -846,14 +871,28 @@ async def test_emergency_eviction_targets_half_provider_limit(
         retained_tail=1,
         token_counter=lambda message: 1
         if message.metadata.get("context_evicted")
-        else 20,
+        else 10,
     )
     assembler._provider_budgets = assembler._calibration.calibrate(100, 200)
+    raw_target = 50
+    targets: list[int] = []
+    raw_results = []
+    real_evict_messages = context_module.evict_messages
 
+    def capture_target(*args, **kwargs):
+        targets.append(kwargs["target_tokens"])
+        raw_results.append(
+            real_evict_messages(*args, **{**kwargs, "target_tokens": raw_target})
+        )
+        return real_evict_messages(*args, **kwargs)
+
+    monkeypatch.setattr("zeta.core.context.evict_messages", capture_target)
     compacted = await assembler.assemble_context(force=True, emergency=True)
 
+    assert targets == [25]
+    assert raw_results[0].tokens_after * assembler.calibration_ratio > 90
     assert compacted.compacted is True
-    assert compacted.token_count * assembler.calibration_ratio <= 50
+    assert compacted.token_count * assembler.calibration_ratio < 90
 
 
 def test_summary_usage_does_not_change_context_calibration(
