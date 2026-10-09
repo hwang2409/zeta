@@ -1091,7 +1091,6 @@ def _full_recount_eviction_reference(
             [TextContent(f"[assistant text evicted · seq {seq}]")],
             metadata={
                 "context_evicted": True,
-                eviction_module.RECEIPT_KIND_METADATA: "assistant",
                 "source_seq": seq,
             },
         )

@@ -675,6 +675,11 @@ class ContextAssembler:
             for i in candidates
             if i.entry is not None
         ]
+        source_messages = {
+            entry.seq: Message.from_dict(entry.data["message"])
+            for entry in branch
+            if entry.type == "message"
+        }
         latest_assistant_seq = self._latest_persisted_assistant_entry_seq(items)
         unconsumed = {
             int(i.message.metadata.get("source_seq", i.entry.seq))
@@ -697,6 +702,7 @@ class ContextAssembler:
             target_tokens=max(1, int(self.token_budget * TARGET_RATIO)),
             token_counter=self.token_counter,
             unconsumed_source_seqs=unconsumed,
+            source_messages=source_messages,
         )
         if not result.items_evicted:
             return (
