@@ -33,6 +33,8 @@ from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistry
 from .errors import RemoteSyncError
 from .project_publish import (
     ProjectPublicationError,
+    materialize_project_transfer,
+    prepare_project_transfer,
     project_digest,
 )
 from .project_publish import (
@@ -393,13 +395,14 @@ def publish_local_project(
     *,
     expected_digest: str,
 ) -> None:
-    """Validate, then use the shared destination-side publisher."""
+    """Prepare once, then publish the exact validated archive payload."""
 
-    _validate_project_snapshot(snapshot, project_id)
     try:
-        _publish_local_project(
-            home, project_id, snapshot, expected_digest=expected_digest
-        )
+        prepared = prepare_project_transfer(snapshot)
+        with materialize_project_transfer(prepared, project_id) as validated:
+            _publish_local_project(
+                home, project_id, validated, expected_digest=expected_digest
+            )
     except ProjectPublicationError as exc:
         raise RemoteSyncError(str(exc)) from exc
 

@@ -1,15 +1,26 @@
-"""Destination-side project snapshot publication, safe to ship over SSH."""
+"""Prepare and publish authenticated project snapshots.
+
+The sender filesystem is trusted. The transfer format ensures that publication uses
+exactly the regular-file payload that passed semantic validation, and rejects
+corruption or archive bugs before publication.
+"""
 
 from __future__ import annotations
 
 import fcntl
 import hashlib
+import io
 import json
 import os
 import shutil
 import stat
+import tarfile
+import tempfile
 import uuid
-from pathlib import Path
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 from .. import project_schema
 
@@ -22,6 +33,96 @@ _MAX_FORMAT_TWO_STATE_SIZE = 8 * 1024 * 1024
 
 class ProjectPublicationError(Exception):
     """The staged project cannot be published without losing concurrent work."""
+
+
+class PreparedTransfer(NamedTuple):
+    archive_bytes: bytes
+    transfer_digest: str
+
+
+def prepare_project_transfer(project: Path) -> PreparedTransfer:
+    """Pack regular files, then validate and digest that exact archive payload."""
+
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        for path in sorted(project.rglob("*")):
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise ProjectPublicationError(
+                    "project snapshot contains a non-regular file"
+                )
+            relative = path.relative_to(project).as_posix()
+            member = tarfile.TarInfo(f"payload/{relative}")
+            member.size = info.st_size
+            member.mode = 0o600
+            with path.open("rb") as stream:
+                archive.addfile(member, stream)
+    archive_bytes = output.getvalue()
+    with materialize_project_transfer(
+        PreparedTransfer(archive_bytes, ""), project.name, verify_digest=False
+    ) as extracted:
+        digest = transfer_digest(extracted)
+    return PreparedTransfer(archive_bytes, digest)
+
+
+@contextmanager
+def materialize_project_transfer(
+    prepared: PreparedTransfer,
+    project_id: str,
+    *,
+    verify_digest: bool = True,
+) -> Iterator[Path]:
+    """Extract and validate one immutable prepared payload in a private directory."""
+
+    with tempfile.TemporaryDirectory(prefix="zeta-project-transfer-") as temporary:
+        snapshot = Path(temporary) / project_id
+        snapshot.mkdir(mode=0o700)
+        _extract_archive(prepared.archive_bytes, snapshot)
+        digest = transfer_digest(snapshot)
+        if verify_digest and digest != prepared.transfer_digest:
+            raise ProjectPublicationError("project transfer digest does not match")
+        _validate_snapshot(snapshot, project_id)
+        if __package__:
+            from .memory import _validate_project_snapshot
+
+            _validate_project_snapshot(snapshot, project_id)
+        yield snapshot
+
+
+def _extract_archive(archive_bytes: bytes, destination: Path) -> None:
+    seen: set[str] = set()
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+            for member in archive:
+                parts = PurePosixPath(member.name).parts
+                if (
+                    not member.isfile()
+                    or len(parts) < 2
+                    or parts[0] != "payload"
+                    or any(part in {"", ".", ".."} for part in parts)
+                    or member.name in seen
+                ):
+                    raise ProjectPublicationError(
+                        "project archive contains a non-regular or unsafe member"
+                    )
+                seen.add(member.name)
+                target = destination.joinpath(*parts[1:])
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise ProjectPublicationError(
+                        "project archive member is unreadable"
+                    )
+                with target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+                target.chmod(0o600)
+        for directory in destination.rglob("*"):
+            if directory.is_dir():
+                directory.chmod(0o700)
+    except (OSError, tarfile.TarError) as exc:
+        raise ProjectPublicationError("project archive is invalid") from exc
 
 
 def publish_local_project(
@@ -181,7 +282,9 @@ def _validate_snapshot(snapshot: Path, project_id: str) -> None:
             "project snapshot path does not match its project ID"
         )
     try:
-        project_schema.validate_project_record(_read_record(snapshot / "project.json"), project_id)
+        project_schema.validate_project_record(
+            _read_record(snapshot / "project.json"), project_id
+        )
     except ValueError as exc:
         raise ProjectPublicationError(str(exc)) from exc
     pointer_path = snapshot / "memory-current.json"
@@ -217,7 +320,9 @@ def _read_record(path: Path) -> dict[str, object]:
     except ProjectPublicationError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
-        raise ProjectPublicationError("invalid project snapshot file: project.json") from exc
+        raise ProjectPublicationError(
+            "invalid project snapshot file: project.json"
+        ) from exc
     if not isinstance(value, dict):
         raise ProjectPublicationError("invalid project snapshot file: project.json")
     return value
@@ -225,7 +330,9 @@ def _read_record(path: Path) -> dict[str, object]:
 
 def _read_json(path: Path) -> dict[str, object]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
+        value = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object
+        )
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ProjectPublicationError(
             f"invalid project snapshot file: {path.name}"
@@ -249,7 +356,9 @@ def _validate_legacy_memory(snapshot: Path) -> None:
     try:
         info = memory.lstat()
     except OSError as exc:
-        raise ProjectPublicationError("project memory directory is unavailable") from exc
+        raise ProjectPublicationError(
+            "project memory directory is unavailable"
+        ) from exc
     if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
         raise ProjectPublicationError("project memory directory is unsafe")
     for name in MEMORY_FILES:
@@ -261,9 +370,7 @@ def _validate_legacy_memory(snapshot: Path) -> None:
                 or info.st_nlink != 1
                 or stat.S_IMODE(info.st_mode) & 0o077
             ):
-                raise ProjectPublicationError(
-                    f"project memory file {name} is unsafe"
-                )
+                raise ProjectPublicationError(f"project memory file {name} is unsafe")
             payload = path.read_bytes()
             project_schema.decode_legacy_memory(payload, name)
         except ProjectPublicationError:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ...project_registry import ProjectRegistry, ProjectRegistryError
+from ...project_schema import MAX_MEMORY_FILE_SIZE
 from ...protocol.types import StructuredToolResult
 from ..registry import ToolRegistry, _success_result, text_block
 
@@ -116,7 +117,7 @@ def register(registry: ToolRegistry) -> None:
             "type": "object",
             "properties": {
                 "name": {"type": "string", "enum": list(_MEMORY_FILES)},
-                "content": {"type": "string", "maxLength": 131072},
+                "content": {"type": "string", "maxLength": MAX_MEMORY_FILE_SIZE},
             },
             "required": ["name", "content"],
             "additionalProperties": False,

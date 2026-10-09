@@ -27,6 +27,7 @@ from . import (
     _write_json,
     project_publish,
 )
+from .project_publish import PreparedTransfer, prepare_project_transfer
 
 _HOST = re.compile(r"[A-Za-z0-9_.@-]+\Z")
 DEFAULT_MAX_ARCHIVE_BYTES = 1 << 30
@@ -197,24 +198,24 @@ with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as tempor
             if declared > max_bytes: sys.exit(50)
             if shutil.disk_usage(home).free < declared - extracted: sys.exit(51)
             parts = Path(member.name).parts
-            if not parts or parts[0] != "payload" or any(p in {"", ".", ".."} for p in parts) or member.issym() or member.islnk(): sys.exit(46)
+            if not member.isfile() or len(parts) < 2 or parts[0] != "payload" or any(p in {"", ".", ".."} for p in parts): sys.exit(46)
             target = staging.joinpath(*parts[1:])
-            if member.isdir(): target.mkdir(parents=True, exist_ok=True, mode=0o700)
-            elif member.isfile():
-                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                source = archive.extractfile(member)
-                if source is None: sys.exit(46)
-                with target.open("wb") as output:
-                    remaining = member.size
-                    while remaining:
-                        chunk = source.read(min(1024 * 1024, remaining))
-                        if not chunk: sys.exit(46)
-                        extracted += len(chunk); remaining -= len(chunk)
-                        if extracted > max_bytes: sys.exit(50)
-                        output.write(chunk)
-                    if source.read(1): sys.exit(50)
-                target.chmod(0o600)
-            else: sys.exit(46)
+            if target.exists(): sys.exit(46)
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            source = archive.extractfile(member)
+            if source is None: sys.exit(46)
+            with target.open("xb") as output:
+                remaining = member.size
+                while remaining:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    if not chunk: sys.exit(46)
+                    extracted += len(chunk); remaining -= len(chunk)
+                    if extracted > max_bytes: sys.exit(50)
+                    output.write(chunk)
+                if source.read(1): sys.exit(50)
+            target.chmod(0o600)
+    for directory in staging.rglob("*"):
+        if directory.is_dir(): directory.chmod(0o700)
     if transfer_digest(staging) != transfer: sys.exit(46)
     try:
         publish_local_project(home, ident, staging, expected_digest=expected)
@@ -324,20 +325,9 @@ class SshTransport:
     def publish_project(
         self, project_id: str, snapshot: Path, *, expected_digest: str
     ) -> None:
-        # The remote publisher has no Zeta install, so decode before upload.
-        from .memory import _validate_project_snapshot
-
         project_id = _safe_component(project_id, "project id")
-        with tempfile.TemporaryDirectory(prefix="zeta-ssh-project-") as temporary:
-            outgoing = Path(temporary) / project_id
-            _copy_tree(snapshot, outgoing)
-            _validate_project_snapshot(outgoing, project_id)
-            self._install_project(
-                project_id,
-                outgoing,
-                expected_digest,
-                project_publish.transfer_digest(outgoing),
-            )
+        prepared = prepare_project_transfer(snapshot)
+        self._install_project(project_id, prepared, expected_digest)
 
     def _existing_state(
         self, kind: str, ident: str, source: Path, force: bool
@@ -398,25 +388,24 @@ class SshTransport:
             )
 
     def _install_project(
-        self, ident: str, source: Path, expected: str, transfer: str
+        self, ident: str, prepared: PreparedTransfer, expected: str
     ) -> None:
-        with tempfile.TemporaryDirectory(prefix="zeta-ssh-install-") as temporary:
-            archive = Path(temporary) / "snapshot.tar.gz"
-            _pack(source, archive)
-            with archive.open("rb") as incoming:
-                result = self._run(
-                    _project_install_script(),
-                    [
-                        self._home(),
-                        ident,
-                        expected,
-                        transfer,
-                        str(self.max_archive_members),
-                        str(self.max_archive_bytes),
-                    ],
-                    stdin=incoming,
-                    check=False,
-                )
+        with tempfile.TemporaryFile() as incoming:
+            incoming.write(prepared.archive_bytes)
+            incoming.seek(0)
+            result = self._run(
+                _project_install_script(),
+                [
+                    self._home(),
+                    ident,
+                    expected,
+                    prepared.transfer_digest,
+                    str(self.max_archive_members),
+                    str(self.max_archive_bytes),
+                ],
+                stdin=incoming,
+                check=False,
+            )
         self._raise_install_error(result, project=True)
 
     def _install(self, kind: str, ident: str, source: Path, expected: str) -> None:

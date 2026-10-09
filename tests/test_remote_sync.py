@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import ast
 import concurrent.futures
 import hashlib
+import io
 import json
 import multiprocessing
 import os
 import stat
 import subprocess
 import sys
+import tarfile
 import threading
 from pathlib import Path
 
@@ -37,7 +40,10 @@ from zeta.remote_sync import (
 from zeta.remote_sync import memory as memory_module
 from zeta.remote_sync import ssh as ssh_module
 from zeta.remote_sync.memory import _machine_id
-from zeta.remote_sync.project_publish import ProjectPublicationError
+from zeta.remote_sync.project_publish import (
+    ProjectPublicationError,
+    prepare_project_transfer,
+)
 from zeta.remote_sync.project_publish import (
     publish_local_project as publish_destination_project,
 )
@@ -919,41 +925,95 @@ def test_initial_format_two_snapshot_rejects_semantically_invalid_state(
     assert not list(projects.glob(f".{project_id}.incoming-*"))
 
 
-@pytest.mark.parametrize("archive_change", ("alter", "extra", "missing"))
-def test_ssh_project_publish_rejects_unvalidated_archive_files(
+def test_prepared_project_transfer_is_immutable_after_source_change(
+    tmp_path: Path,
+) -> None:
+    snapshot, project_id = _format_two_project_snapshot(tmp_path)
+
+    prepared = prepare_project_transfer(snapshot)
+    before = prepared.archive_bytes
+    (snapshot / "changed-after-prepare").write_text("new source file\n")
+
+    assert prepared.archive_bytes == before
+    with tarfile.open(fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz") as archive:
+        assert all(member.isfile() for member in archive.getmembers())
+        brief = archive.extractfile("payload/memory/brief.md")
+        assert brief is not None
+        assert brief.read() != b"new source file\n"
+        assert "payload/changed-after-prepare" not in archive.getnames()
+    assert project_id in snapshot.name
+
+
+@pytest.mark.parametrize(
+    ("member_name", "member_type", "link_name"),
+    (
+        ("payload/empty", tarfile.DIRTYPE, ""),
+        ("payload/link", tarfile.SYMTYPE, "target"),
+        ("payload/hard", tarfile.LNKTYPE, "payload/project.json"),
+        ("payload/fifo", tarfile.FIFOTYPE, ""),
+    ),
+)
+def test_ssh_project_publish_rejects_non_regular_archive_member(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    archive_change: str,
+    member_name: str,
+    member_type: bytes,
+    link_name: str,
 ) -> None:
     snapshot, project_id = _format_two_project_snapshot(tmp_path)
     remote = tmp_path / "remote"
     _install_ssh_shim(tmp_path, monkeypatch)
-    original_pack = ssh_module._pack
+    prepared = prepare_project_transfer(snapshot)
+    changed = io.BytesIO()
+    with tarfile.open(fileobj=changed, mode="w:gz") as output:
+        with tarfile.open(fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz") as source:
+            for member in source.getmembers():
+                stream = source.extractfile(member)
+                output.addfile(member, stream)
+        injected = tarfile.TarInfo(member_name)
+        injected.type = member_type
+        injected.linkname = link_name
+        output.addfile(injected)
 
-    if archive_change == "extra":
-        mirror = snapshot / "memory" / "brief.md"
-        mirror.unlink()
-
-    def corrupt_archive_source(source: Path, destination: Path) -> None:
-        mirror = source / "memory" / "brief.md"
-        if archive_change == "alter":
-            mirror.write_text("unvalidated mirror\n", encoding="utf-8")
-        elif archive_change == "extra":
-            mirror.write_text("injected mirror\n", encoding="utf-8")
-        else:
-            mirror.unlink()
-        original_pack(source, destination)
-
-    monkeypatch.setattr(ssh_module, "_pack", corrupt_archive_source)
-
+    monkeypatch.setattr(
+        "zeta.remote_sync.ssh.prepare_project_transfer",
+        lambda _snapshot: prepared.__class__(changed.getvalue(), prepared.transfer_digest),
+    )
     with pytest.raises(RemoteSyncError):
         SshTransport("fake", str(remote), name="cloud").publish_project(
             project_id, snapshot, expected_digest="missing"
         )
 
-    projects = remote / "projects"
-    assert not (projects / project_id).exists()
-    assert not list(projects.glob(f".{project_id}.incoming-*"))
+    assert not (remote / "projects" / project_id).exists()
+
+
+def test_ssh_upload_uses_validated_archive_after_source_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, project_id = _format_two_project_snapshot(tmp_path)
+    real_prepare = prepare_project_transfer
+    captured: dict[str, bytes] = {}
+
+    def prepare_then_change(source: Path):
+        prepared = real_prepare(source)
+        captured["validated"] = prepared.archive_bytes
+        (source / "changed-after-validation").write_text("new source file\n")
+        return prepared
+
+    def capture_upload(self, ident, prepared, expected):
+        captured["uploaded"] = prepared.archive_bytes
+
+    monkeypatch.setattr(ssh_module, "prepare_project_transfer", prepare_then_change)
+    monkeypatch.setattr(SshTransport, "_install_project", capture_upload)
+
+    SshTransport("fake", str(tmp_path / "remote"), name="cloud").publish_project(
+        project_id, snapshot, expected_digest="missing"
+    )
+
+    assert captured["uploaded"] == captured["validated"]
+    with tarfile.open(fileobj=io.BytesIO(captured["uploaded"]), mode="r:gz") as archive:
+        assert "payload/changed-after-validation" not in archive.getnames()
 
 
 def test_ssh_pull_rejects_semantically_invalid_initial_format_two_snapshot(
@@ -1057,11 +1117,38 @@ def test_project_schema_has_single_source() -> None:
     schema_source = Path(schema.__file__).read_text(encoding="utf-8")
     assert schema_source in ssh_module._project_install_script()
 
+    def integer_value(node: ast.expr) -> int | None:
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            return node.value
+        if isinstance(node, ast.BinOp):
+            left = integer_value(node.left)
+            right = integer_value(node.right)
+            if left is None or right is None:
+                return None
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.LShift):
+                return left << right
+        return None
+
+    def owns_limit(source: str) -> bool:
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = integer_value(node.value)
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if value == MAX_MEMORY_FILE_SIZE and any(
+                    isinstance(target, ast.Name) for target in targets
+                ):
+                    return True
+        return False
+
+    assert owns_limit("OTHER_LIMIT = 131072")
+    assert owns_limit("OTHER_LIMIT = 128 << 10")
     source_root = Path(schema.__file__).parent
     limit_owners = {
         path.relative_to(source_root).as_posix()
         for path in source_root.rglob("*.py")
-        if "128 * 1024" in path.read_text(encoding="utf-8")
+        if owns_limit(path.read_text(encoding="utf-8"))
     }
     assert limit_owners == {"project_schema.py"}
 
