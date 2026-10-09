@@ -58,6 +58,7 @@ MAX_LIST_PAGES = 1_000
 MAX_ERROR_DETAIL_BYTES = 8192
 NOTIFICATION_RECONNECT_INITIAL_SECONDS = 0.1
 NOTIFICATION_RECONNECT_MAX_SECONDS = 5.0
+NOTIFICATION_STREAM_HEALTHY_SECONDS = 5.0
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 OAUTH_HINT = "run /mcp auth {name} to reauthorize"
@@ -356,33 +357,62 @@ class StreamableHTTPMCPClient(MCPClient):
     async def _listen_notifications(self) -> None:
         if self._session_id is None:
             return
+        delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
+        while not self._closed:
+            try:
+                healthy = await self._with_auth(self._listen_notification_stream)
+            except asyncio.CancelledError:
+                raise
+            except MCPHTTPError as exc:
+                if exc.status_code == 405:
+                    return
+                if exc.status_code not in {0, 408, 429} and exc.status_code < 500:
+                    if self._failure_sink is not None:
+                        self._failure_sink(str(exc))
+                    return
+                logger.debug("MCP HTTP notification stream ended", exc_info=True)
+            except Exception as exc:  # noqa: BLE001 - report terminal stream failures
+                if self._failure_sink is not None:
+                    self._failure_sink(str(exc))
+                return
+            else:
+                if healthy:
+                    delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
+            if self._closed:
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, NOTIFICATION_RECONNECT_MAX_SECONDS)
+
+    async def _listen_notification_stream(self) -> bool:
+        if self._session_id is None:
+            return False
         headers = self._auth_headers()
         headers["accept"] = "text/event-stream"
         headers["mcp-session-id"] = self._session_id
         if self.protocol_version is not None:
             headers["mcp-protocol-version"] = self.protocol_version
-        delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
-        while not self._closed:
-            try:
-                async with self._client.stream(
-                    "GET", self.config.url, headers=headers
-                ) as response:
-                    if response.status_code == 405:
-                        return
-                    response.raise_for_status()
-                    async for value in _iter_sse_events(
-                        response, self._spill_store, MAX_RESPONSE_BYTES
-                    ):
-                        delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
-                        _dispatch_sse_notification(value, self._notification_sink)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.debug("MCP HTTP notification stream ended", exc_info=True)
-            if self._closed:
-                return
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, NOTIFICATION_RECONNECT_MAX_SECONDS)
+        try:
+            async with self._client.stream(
+                "GET", self.config.url, headers=headers
+            ) as response:
+                if response.status_code >= 400:
+                    detail = await _response_detail(response)
+                    raise MCPHTTPError(
+                        response.status_code, detail or "request failed"
+                    )
+                started = asyncio.get_running_loop().time()
+                delivered = False
+                async for value in _iter_sse_events(
+                    response, self._spill_store, MAX_RESPONSE_BYTES
+                ):
+                    delivered = True
+                    _dispatch_sse_notification(value, self._notification_sink)
+                return delivered or (
+                    asyncio.get_running_loop().time() - started
+                    >= NOTIFICATION_STREAM_HEALTHY_SECONDS
+                )
+        except httpx.HTTPError as exc:
+            raise MCPHTTPError(0, str(exc)) from exc
 
     async def _send_notification(
         self, method: str, params: Mapping[str, object]

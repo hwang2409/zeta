@@ -1026,6 +1026,54 @@ async def test_http_client_single_flights_concurrent_refresh(
 
 
 @pytest.mark.asyncio
+async def test_http_get_notification_refreshes_on_401(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = _monkey_home(monkeypatch, tmp_path)
+    _write_token("live", home, access_token="stale-token")
+    get_auth: list[str] = []
+    refresh_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal refresh_count
+        if str(request.url).endswith("/token"):
+            refresh_count += 1
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "fresh-token",
+                    "refresh_token": "refresh-token-2",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+                request=request,
+            )
+        assert request.method == "GET"
+        auth = request.headers.get("authorization", "")
+        get_auth.append(auth)
+        return httpx.Response(
+            401 if auth == "Bearer stale-token" and len(get_auth) < 3 else 405,
+            text="expired",
+            request=request,
+        )
+
+    config = MCPServerConfig(
+        "live",
+        "streamable-http",
+        url="https://mcp.test/rpc",
+        auth_type="oauth",
+    )
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(config, client=transport, home=str(home))
+    client._session_id = "session-1"
+    await client._listen_notifications()
+
+    assert get_auth == ["Bearer stale-token", "Bearer fresh-token"]
+    assert refresh_count == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_http_notification_refreshes_on_401(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

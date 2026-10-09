@@ -1,6 +1,7 @@
 import asyncio
 import json
-from collections.abc import Callable
+import time
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import httpx
@@ -12,10 +13,12 @@ from zeta.mcp import (
     MCPConfig,
     MCPServerConfig,
     MCPTool,
+    StreamableHTTPMCPClient,
     load_mcp_config,
     mount_mcp_servers,
     server_to_json,
 )
+from zeta.mcp.http import NOTIFICATION_RECONNECT_INITIAL_SECONDS
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -500,6 +503,152 @@ async def test_mcp_http_notification_listener_reconnects(
         assert get_count >= 2
     finally:
         await mount.close()
+
+
+async def _run_notification_listener(
+    config: MCPServerConfig,
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> tuple[StreamableHTTPMCPClient, list[str]]:
+    failures: list[str] = []
+    client = StreamableHTTPMCPClient(
+        config, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    client._session_id = "session-1"
+    client.set_failure_sink(failures.append)
+    await client._listen_notifications()
+    await client.close()
+    return client, failures
+
+
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.asyncio
+async def test_mcp_http_notification_listener_reports_terminal_4xx(
+    status: int,
+) -> None:
+    get_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        get_count += 1
+        return httpx.Response(
+            status if get_count == 1 else 405,
+            text="session rejected",
+            request=request,
+        )
+
+    _, failures = await _run_notification_listener(
+        MCPServerConfig("http", "streamable-http", url="https://mcp.test"), handler
+    )
+
+    assert get_count == 1
+    assert failures == [f"MCP HTTP {status}: session rejected"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_http_notification_listener_retries_503_with_fresh_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions: list[str] = []
+    delays: list[float] = []
+    client: StreamableHTTPMCPClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sessions.append(request.headers["mcp-session-id"])
+        return httpx.Response(
+            503 if len(sessions) <= 2 else 405, text="unavailable", request=request
+        )
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+        client._session_id = "session-2"
+
+    monkeypatch.setattr("zeta.mcp.http.asyncio.sleep", sleep)
+    config = MCPServerConfig("http", "streamable-http", url="https://mcp.test")
+    client = StreamableHTTPMCPClient(
+        config, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    client._session_id = "session-1"
+    await client._listen_notifications()
+    await client.close()
+
+    assert sessions == ["session-1", "session-2", "session-2"]
+    assert delays == [0.1, 0.2]
+
+
+@pytest.mark.asyncio
+async def test_mcp_http_notification_listener_immediate_eof_backs_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions: list[str] = []
+    delays: list[float] = []
+    client: StreamableHTTPMCPClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sessions.append(request.headers["mcp-session-id"])
+        return httpx.Response(
+            200 if len(sessions) <= 2 else 405,
+            headers={"content-type": "text/event-stream"},
+            content=b"",
+            request=request,
+        )
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+        client._session_id = "session-2"
+
+    monkeypatch.setattr("zeta.mcp.http.asyncio.sleep", sleep)
+    config = MCPServerConfig("http", "streamable-http", url="https://mcp.test")
+    client = StreamableHTTPMCPClient(
+        config, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    client._session_id = "session-1"
+    await client._listen_notifications()
+    await client.close()
+
+    assert sessions == ["session-1", "session-2", "session-2"]
+    assert delays == [0.1, 0.2]
+
+
+class _DelayedEOFStream(httpx.AsyncByteStream):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.02)
+        if False:
+            yield b""
+
+
+@pytest.mark.asyncio
+async def test_mcp_http_notification_listener_healthy_idle_resets_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_at: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_at.append(time.monotonic())
+        if len(requested_at) <= 2:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"",
+                request=request,
+            )
+        if len(requested_at) == 3:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=_DelayedEOFStream(),
+                request=request,
+            )
+        return httpx.Response(405, request=request)
+
+    monkeypatch.setattr("zeta.mcp.http.NOTIFICATION_STREAM_HEALTHY_SECONDS", 0.01)
+    await _run_notification_listener(
+        MCPServerConfig("http", "streamable-http", url="https://mcp.test"), handler
+    )
+
+    reconnect_delay = requested_at[3] - requested_at[2] - 0.02
+    assert reconnect_delay == pytest.approx(
+        NOTIFICATION_RECONNECT_INITIAL_SECONDS, abs=0.08
+    )
 
 
 @pytest.mark.asyncio
