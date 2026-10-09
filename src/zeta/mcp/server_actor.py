@@ -171,9 +171,6 @@ class _Close:
 PublishSnapshot = Callable[["MCPServerActor", MCPServerStatus, MCPClient | None], None]
 
 
-async def _safe_close(client: MCPClient) -> None:
-    await safe_close(client, CLIENT_CLOSE_TIMEOUT_SECONDS)
-
 class MCPServerActor(MCPDefinitionPublisher):
     """Own one server lifecycle and serialize all lifecycle messages."""
 
@@ -627,7 +624,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             await asyncio.sleep(0)
         except asyncio.CancelledError:
             if client is not None:
-                await _safe_close(client)
+                await safe_close(client, CLIENT_CLOSE_TIMEOUT_SECONDS)
             raise
         except TimeoutError:
             reason = f"after {self._setup_timeout:.1f}s"
@@ -1141,7 +1138,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             return existing[1]
         if detach:
             self._detach_failure_sink(client)
-        task = asyncio.create_task(_safe_close(client))
+        task = asyncio.create_task(safe_close(client, CLIENT_CLOSE_TIMEOUT_SECONDS))
         self._scheduled_closes[id(client)] = (client, task)
         self._children.add(task)
         task.add_done_callback(
