@@ -1010,16 +1010,11 @@ class AgentNavigation:
                 if isinstance(child_path, str):
                     fallback[Path(child_path)] = marker
         children = self._children(self.current_path, fallback)
+        at_root = self.current_path == self.root_path
         main_entry = (
-            [self._main_entry()]
-            if self._fork_main_path is not None and self.current_path == self.root_path
-            else []
+            [self._main_entry()] if self._fork_main_path is not None and at_root else []
         )
-        if (
-            self.current_path == self.root_path
-            and not children
-            and not main_entry
-        ):
+        if at_root and not children and not main_entry:
             self.entries = []
         else:
             self.entries = [self._root_entry(), *main_entry, *children]
@@ -1102,16 +1097,12 @@ class AgentNavigation:
 
     def _root_entry(self) -> AgentEntry:
         metadata = self._cached_agent_metadata(self.root_path)
-        label = (
-            f"discussion: {self._fork_title}"
-            if self._fork_title is not None
-            else "main"
-        )
-        agent_type = "discussion" if self._fork_title is not None else "main"
+        forked = self._fork_title is not None
+        label = f"discussion: {self._fork_title}" if forked else "main"
         return AgentEntry(
             self.root_path,
             label,
-            str(metadata.get("agent_type") or agent_type),
+            str(metadata.get("agent_type") or ("discussion" if forked else "main")),
             str(metadata.get("state") or "running"),
         )
 
@@ -1120,14 +1111,9 @@ class AgentNavigation:
         return AgentEntry(self._fork_main_path, "(main)", "orchestrator", "running")
 
     def set_fork_context(
-        self,
-        *,
-        title: str,
-        main_path: Path,
-        on_return: Callable[[], None],
+        self, *, title: str, main_path: Path, on_return: Callable[[], None]
     ) -> None:
         """Teach the view that this session is a discussion fork of ``main_path``."""
-
         self._fork_title = title
         self._fork_main_path = main_path
         self._on_return_to_main = on_return
