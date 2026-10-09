@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 from zeta.memory.safety import contains_secret
 from zeta.project_errors import ProjectRegistryError
+from zeta.project_schema import MAX_MEMORY_FILE_SIZE
 from zeta.protocol.types import MessageOrigin
 
 MAX_ENTRIES = 1_000
@@ -32,7 +33,7 @@ MAX_REASON_BYTES = 1024
 
 EntryStatus = Literal["active", "superseded", "resolved", "expired"]
 ReceiptType = Literal[
-    "add", "update", "supersede", "resolve", "expire", "accept", "undo"
+    "add", "update", "supersede", "resolve", "expire", "accept", "undo", "migrate", "sync"
 ]
 _TIMESTAMP = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z"
@@ -303,7 +304,15 @@ def _validate_entry(entry: MemoryEntry, state: MemoryState, kinds: set[str]) -> 
         or entry.representation not in {"entry", "legacy_document"}
     ):
         _fail("invalid memory entry kind or representation")
-    _safe_text(entry.text, maximum=MAX_ENTRY_TEXT_BYTES, label="entry text")
+    _safe_text(
+        entry.text,
+        maximum=(
+            MAX_MEMORY_FILE_SIZE
+            if entry.representation == "legacy_document"
+            else MAX_ENTRY_TEXT_BYTES
+        ),
+        label="entry text",
+    )
     if contains_secret(entry.text):
         _fail("memory entry text contains a secret")
     if not isinstance(entry.status, str) or entry.status not in {
@@ -596,7 +605,7 @@ def validate_receipt(receipt: OperationReceipt) -> None:
     if not _matches(_OPERATION_ID, receipt.operation_id) or not isinstance(
         receipt.type, str
     ) or receipt.type not in {
-        "add", "update", "supersede", "resolve", "expire", "accept", "undo"
+        "add", "update", "supersede", "resolve", "expire", "accept", "undo", "migrate", "sync"
     }:
         _fail("invalid memory operation receipt")
     if any(not _matches(_ENTRY_ID, item) for item in (*receipt.target_ids, *receipt.result_ids)):

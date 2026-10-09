@@ -1,12 +1,8 @@
-"""Transactional project-memory synchronization.
-
-This module owns the complete memory-sync transaction: local snapshot locking,
-remote snapshot acquisition, baseline and conflict interpretation, and CAS
-publication. Transports only fetch and publish validated project snapshots.
-"""
+"""Transactional memory sync: locking, merge state, and CAS publication."""
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import hashlib
 import json
@@ -22,16 +18,36 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
+from ..memory.entry_store import state_digest
+from ..memory.entry_sync import (
+    EntryMemoryExport,
+    ResolutionCandidate,
+    merge_entry_states,
+    merge_version_receipts,
+    parse_resolution_candidates,
+    select_resolution_choices,
+)
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
 from .errors import RemoteSyncError
+from .project_publish import (
+    ProjectPublicationError,
+    materialize_project_transfer,
+    normalize_project_digest,
+    prepare_project_transfer,
+    project_digest,
+)
+from .project_publish import (
+    publish_local_project as _publish_local_project,
+)
 
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
 _MACHINE_ID = ".machine-id"
-_MAX_STATE_BYTES = 64 * 1024
+_MAX_STATE_BYTES = 512 * 1024
+MemorySyncExport = MemoryExport | EntryMemoryExport
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +55,15 @@ class MemoryTransferResult:
     project_id: str
     updated: tuple[str, ...]
     conflicts: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SharedSyncState:
+    state: dict[str, object]
+    previous_digest: str
+    transition_id: str | None = None
+    resolutions: dict[str, Literal["local", "remote"]] | None = None
+    candidates: dict[str, ResolutionCandidate] | None = None
 
 
 class _Digest(Protocol):
@@ -72,45 +97,88 @@ def sync_project_memory(
     _reject_same_machine(local_id, peer)
     state_key = _state_key(local_id, peer)
     local_project = home / "projects" / project_id
-    with _registry_lock(home / "projects"):
-        local_expected = project_digest(local_project)
+    with tempfile.TemporaryDirectory(prefix="zeta-memory-sync-") as temporary:
+        root = Path(temporary)
+        local_root = root / "local"
+        remote_root = root / "remote"
+        local_root.mkdir(mode=0o700)
+        remote_root.mkdir(mode=0o700)
+        local = local_root / project_id
+        remote = remote_root / project_id
+        local_expected = fetch_local_project(home, project_id, local, peer=peer)
         if local_expected == _MISSING and direction == "push":
             raise RemoteSyncError(f"project {project_id} was not found")
-        with tempfile.TemporaryDirectory(prefix="zeta-memory-sync-") as temporary:
-            root = Path(temporary)
-            local_root = root / "local"
-            remote_root = root / "remote"
-            local_root.mkdir(mode=0o700)
-            remote_root.mkdir(mode=0o700)
-            local = local_root / project_id
-            remote = remote_root / project_id
-            local_export: MemoryExport | None = None
-            if local_expected != _MISSING:
-                copy_project_snapshot(local_project, local)
-                _validate_project_snapshot(local, project_id)
-                local_export = _materialize_memory_export(local, project_id)
-            remote_expected = transport.fetch_project(project_id, remote)
-            if remote_expected == _MISSING:
-                if direction == "pull":
-                    raise RemoteSyncError(f"remote project {project_id} was not found")
-                copy_project_snapshot(local, remote)
-                remote_export = local_export
-            else:
-                _validate_project_snapshot(remote, project_id)
-                remote_export = _materialize_memory_export(remote, project_id)
-            if local_expected == _MISSING:
-                copy_project_snapshot(remote, local)
-                local_export = remote_export
-            if local_export is None or remote_export is None:
-                raise RemoteSyncError("project memory snapshot is missing")
-            source, destination = (local, remote) if direction == "push" else (remote, local)
-            source_export, destination_export = (
-                (local_export, remote_export)
-                if direction == "push"
-                else (remote_export, local_export)
+        local_export: MemorySyncExport | None = None
+        if local_expected != _MISSING:
+            _validate_project_snapshot(local, project_id)
+            local_export = _materialize_memory_export(local, project_id)
+        remote_expected = normalize_project_digest(
+            transport.fetch_project(project_id, remote), remote
+        )
+        if remote_expected == _MISSING:
+            if direction == "pull":
+                raise RemoteSyncError(f"remote project {project_id} was not found")
+            copy_project_snapshot(local, remote)
+            remote_export = local_export
+        else:
+            _validate_project_snapshot(remote, project_id)
+            remote_export = _materialize_memory_export(remote, project_id)
+        if local_expected == _MISSING:
+            copy_project_snapshot(remote, local)
+            local_export = remote_export
+        if local_export is None or remote_export is None:
+            raise RemoteSyncError("project memory snapshot is missing")
+        source, destination = (local, remote) if direction == "push" else (remote, local)
+        source_export, destination_export = (
+            (local_export, remote_export)
+            if direction == "push"
+            else (remote_export, local_export)
+        )
+        if type(source_export) is not type(destination_export):
+            raise RemoteSyncError(
+                "mixed project memory formats cannot synchronize; migration is required"
             )
-            state = _shared_state(source, destination, state_key, project_id)
-            result, merged = _merge(
+        memory_format = 2 if isinstance(source_export, EntryMemoryExport) else 1
+        shared = _shared_state(
+            source, destination, state_key, project_id, memory_format=memory_format
+        )
+        state = shared.state
+        if isinstance(local_export, EntryMemoryExport) and isinstance(
+            remote_export, EntryMemoryExport
+        ):
+            recovery_resolutions = select_resolution_choices(
+                local_export.state,
+                remote_export.state,
+                candidates=shared.candidates or {},
+                stored=shared.resolutions or {},
+                conflict_keys=(),
+            )
+            (
+                result,
+                local_merged,
+                remote_merged,
+                local_changed,
+                remote_changed,
+                transition_candidates,
+            ) = _merge_entries(
+                local_export,
+                remote_export,
+                state=state,
+                project_id=project_id,
+                resolutions=recovery_resolutions,
+            )
+            _finish_entry_transition(
+                state,
+                shared,
+                recovery_resolutions,
+                transition_candidates,
+            )
+            merged = remote_merged
+            source_merged = local_merged
+            source = local
+            destination = remote
+        else:
+            result, merged, source_merged = _merge(
                 source,
                 destination,
                 source_export=source_export,
@@ -119,22 +187,45 @@ def sync_project_memory(
                 project_id=project_id,
                 source_label="local" if direction == "push" else peer,
             )
-            _write_state(local, state_key, state)
-            _write_state(remote, state_key, state)
+        _write_state(local, state_key, state)
+        _write_state(remote, state_key, state)
+        _import_merged_memory(
+            destination,
+            project_id,
+            merged,
+            changed_entry_ids=(
+                remote_changed
+                if isinstance(merged, EntryMemoryExport)
+                else ()
+            ),
+            provenance={"source": "remote_sync", "peer": peer},
+        )
+        if source_merged is not None:
             _import_merged_memory(
-                destination,
+                source,
                 project_id,
-                merged,
+                source_merged,
+                changed_entry_ids=local_changed,
                 provenance={"source": "remote_sync", "peer": peer},
             )
-            transport.publish_project(
-                project_id, remote, expected_digest=remote_expected
+        transport.publish_project(
+            project_id, remote, expected_digest=remote_expected
+        )
+        if local_expected == _MISSING:
+            publish_local_project(
+                home, project_id, local, expected_digest=_MISSING
             )
-            if project_digest(local_project) != local_expected:
-                raise RemoteSyncError("local project changed during memory sync; retry")
-            _atomic_replace_directory(local, local_project)
-            return result
-
+        else:
+            _publish_memory_snapshot(
+                local_project,
+                local,
+                expected_export=local_export,
+                changed_entry_ids=(
+                    local_changed if isinstance(local_export, EntryMemoryExport) else ()
+                ),
+                provenance={"source": "remote_sync", "peer": peer},
+            )
+        return result
 
 def resolve_project_memory(
     home: Path,
@@ -152,70 +243,137 @@ def resolve_project_memory(
     _reject_same_machine(local_id, peer)
     state_key = _state_key(local_id, peer)
     local_project = home / "projects" / project_id
-    with _registry_lock(home / "projects"):
-        if not local_project.is_dir():
+    with tempfile.TemporaryDirectory(prefix="zeta-memory-resolve-") as temporary:
+        root = Path(temporary)
+        local_root = root / "local"
+        remote_root = root / "remote"
+        local_root.mkdir(mode=0o700)
+        remote_root.mkdir(mode=0o700)
+        local = local_root / project_id
+        remote = remote_root / project_id
+        local_expected = fetch_local_project(home, project_id, local, peer=peer)
+        if local_expected == _MISSING:
             raise RemoteSyncError(f"project {project_id} was not found")
-        local_expected = project_digest(local_project)
-        with tempfile.TemporaryDirectory(prefix="zeta-memory-resolve-") as temporary:
-            root = Path(temporary)
-            local_root = root / "local"
-            remote_root = root / "remote"
-            local_root.mkdir(mode=0o700)
-            remote_root.mkdir(mode=0o700)
-            local = local_root / project_id
-            remote = remote_root / project_id
-            copy_project_snapshot(local_project, local)
-            _validate_project_snapshot(local, project_id)
-            local_export = _materialize_memory_export(local, project_id)
-            remote_expected = transport.fetch_project(project_id, remote)
-            if remote_expected == _MISSING:
-                raise RemoteSyncError(f"remote project {project_id} was not found")
-            _validate_project_snapshot(remote, project_id)
-            remote_export = _materialize_memory_export(remote, project_id)
-            state = _shared_state(local, remote, state_key, project_id)
-            conflicts = state["conflicts"]
-            if not conflicts:
-                raise RemoteSyncError("project memory has no unresolved conflicts")
-            chosen = local if accept == "local" else remote
-            other = remote if accept == "local" else local
-            chosen_export = local_export if accept == "local" else remote_export
-            other_export = remote_export if accept == "local" else local_export
-            contents = dict(other_export.contents)
-            automatic = set(other_export.automatic_files)
-            updated: list[str] = []
-            files = state["files"]
-            for name in sorted(conflicts):
-                _copy_memory_file(chosen / "memory" / name, other / "memory" / name)
-                contents[name] = chosen_export.contents[name]
-                if name in chosen_export.automatic_files:
-                    automatic.add(name)
-                else:
-                    automatic.discard(name)
-                files[name] = _file_digest(chosen / "memory" / name)
-                updated.append(name)
-            state["conflicts"] = {}
+        _validate_project_snapshot(local, project_id)
+        local_export = _materialize_memory_export(local, project_id)
+        remote_expected = normalize_project_digest(
+            transport.fetch_project(project_id, remote), remote
+        )
+        if remote_expected == _MISSING:
+            raise RemoteSyncError(f"remote project {project_id} was not found")
+        _validate_project_snapshot(remote, project_id)
+        remote_export = _materialize_memory_export(remote, project_id)
+        shared = _shared_state(local, remote, state_key, project_id)
+        state = shared.state
+        conflicts = state["conflicts"]
+        if not conflicts:
+            raise RemoteSyncError("project memory has no unresolved conflicts")
+        chosen = local if accept == "local" else remote
+        other = remote if accept == "local" else local
+        chosen_export = local_export if accept == "local" else remote_export
+        other_export = remote_export if accept == "local" else local_export
+        if type(chosen_export) is not type(other_export):
+            raise RemoteSyncError(
+                "mixed project memory formats cannot synchronize; migration is required"
+            )
+        if isinstance(local_export, EntryMemoryExport) and isinstance(
+            remote_export, EntryMemoryExport
+        ):
+            resolution_choices = select_resolution_choices(
+                local_export.state,
+                remote_export.state,
+                candidates=shared.candidates or {},
+                stored=shared.resolutions or {},
+                conflict_keys=tuple(conflicts),
+                explicit=accept,
+            )
+            (
+                merged_result,
+                local_merged,
+                remote_merged,
+                local_changed,
+                remote_changed,
+                transition_candidates,
+            ) = _merge_entries(
+                local_export,
+                remote_export,
+                state=state,
+                project_id=project_id,
+                resolutions=resolution_choices,
+            )
+            _finish_entry_transition(
+                state,
+                shared,
+                resolution_choices,
+                transition_candidates,
+            )
             _write_state(local, state_key, state)
             _write_state(remote, state_key, state)
-            merged = MemoryExport(
-                contents,
-                ProjectRegistry._memory_digest_value(contents),
-                _merge_versions(local_export.versions, remote_export.versions),
-                tuple(sorted(automatic)),
+            _import_merged_memory(
+                local,
+                project_id,
+                local_merged,
+                changed_entry_ids=local_changed,
+                provenance={"source": "remote_sync", "peer": peer},
             )
             _import_merged_memory(
-                other,
+                remote,
                 project_id,
-                merged,
+                remote_merged,
+                changed_entry_ids=remote_changed,
                 provenance={"source": "remote_sync", "peer": peer},
             )
             transport.publish_project(
                 project_id, remote, expected_digest=remote_expected
             )
-            if project_digest(local_project) != local_expected:
-                raise RemoteSyncError("local project changed during memory resolution; retry")
-            _atomic_replace_directory(local, local_project)
-            return MemoryTransferResult(project_id, tuple(updated), ())
-
+            _publish_memory_snapshot(
+                local_project,
+                local,
+                expected_export=local_export,
+                changed_entry_ids=local_changed,
+                provenance={"source": "remote_sync", "peer": peer},
+            )
+            return merged_result
+        assert isinstance(chosen_export, MemoryExport)
+        assert isinstance(other_export, MemoryExport)
+        contents = dict(other_export.contents)
+        automatic = set(other_export.automatic_files)
+        updated: list[str] = []
+        files = state["files"]
+        for name in sorted(conflicts):
+            _copy_memory_file(chosen / "memory" / name, other / "memory" / name)
+            contents[name] = chosen_export.contents[name]
+            if name in chosen_export.automatic_files:
+                automatic.add(name)
+            else:
+                automatic.discard(name)
+            files[name] = _file_digest(chosen / "memory" / name)
+            updated.append(name)
+        state["conflicts"] = {}
+        _write_state(local, state_key, state)
+        _write_state(remote, state_key, state)
+        merged = MemoryExport(
+            contents,
+            ProjectRegistry._memory_digest_value(contents),
+            merge_version_receipts(local_export.versions, remote_export.versions),
+            tuple(sorted(automatic)),
+        )
+        _import_merged_memory(
+            other,
+            project_id,
+            merged,
+            provenance={"source": "remote_sync", "peer": peer},
+        )
+        transport.publish_project(
+            project_id, remote, expected_digest=remote_expected
+        )
+        _publish_memory_snapshot(
+            local_project,
+            local,
+            expected_export=local_export,
+            provenance={"source": "remote_sync", "peer": peer},
+        )
+        return MemoryTransferResult(project_id, tuple(updated), ())
 
 def fetch_local_project(
     home: Path, project_id: str, destination: Path, *, peer: str
@@ -242,19 +400,16 @@ def publish_local_project(
     *,
     expected_digest: str,
 ) -> None:
-    """CAS-publish one local-adapter snapshot under the registry lease."""
+    """Prepare once, then publish the exact validated archive payload."""
 
-    _validate_project_snapshot(snapshot, project_id)
-    project = home / "projects" / project_id
-    with _registry_lock(home / "projects"):
-        if project_digest(project) != expected_digest:
-            raise RemoteSyncError("remote changed during transfer; retry after inspection")
-        project.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        staging = project.parent / f".{project_id}.incoming-{os.getpid()}"
-        if staging.exists():
-            shutil.rmtree(staging)
-        copy_project_snapshot(snapshot, staging)
-        _atomic_replace_directory(staging, project)
+    try:
+        prepared = prepare_project_transfer(snapshot)
+        with materialize_project_transfer(prepared, project_id) as validated:
+            _publish_local_project(
+                home, project_id, validated, expected_digest=expected_digest
+            )
+    except ProjectPublicationError as exc:
+        raise RemoteSyncError(str(exc)) from exc
 
 
 def copy_project_snapshot(source: Path, destination: Path) -> None:
@@ -309,50 +464,97 @@ def copy_project_snapshot(source: Path, destination: Path) -> None:
 def _import_merged_memory(
     target: Path,
     project_id: str,
-    merged: MemoryExport,
+    merged: MemorySyncExport,
     *,
+    changed_entry_ids: tuple[str, ...] = (),
     provenance: dict[str, str],
 ) -> None:
     registry = ProjectRegistry(target.parent)
-    current = registry.export_memory(project_id)
-    registry.import_memory(
-        project_id,
-        merged,
-        expected_digest=current.digest,
-        provenance=provenance,
-    )
+    if isinstance(merged, EntryMemoryExport):
+        current = registry._export_entry_memory(project_id)
+        registry._import_entry_memory(
+            project_id,
+            merged,
+            expected_digest=current.digest,
+            changed_entry_ids=changed_entry_ids,
+            provenance=provenance,
+        )
+    else:
+        current = registry.export_memory(project_id)
+        registry.import_memory(
+            project_id,
+            merged,
+            expected_digest=current.digest,
+            provenance=provenance,
+        )
 
 
-def _materialize_memory_export(snapshot: Path, project_id: str) -> MemoryExport:
+def _publish_memory_snapshot(
+    project: Path,
+    snapshot: Path,
+    *,
+    expected_export: MemorySyncExport,
+    changed_entry_ids: tuple[str, ...] | None = None,
+    provenance: dict[str, str],
+) -> None:
+    """Publish memory by pointer swap, then atomically publish sync state files."""
+
+    project_id = project.name
+    if not project.is_dir():
+        raise RemoteSyncError(f"project {project_id} was not found")
+    current = _materialize_memory_export(project, project_id)
+    if type(current) is not type(expected_export) or current.digest != expected_export.digest:
+        raise RemoteSyncError("local project memory changed during sync; retry")
+    merged = _materialize_memory_export(snapshot, project_id)
+    if type(merged) is not type(current):
+        raise RemoteSyncError(
+            "mixed project memory formats cannot synchronize; migration is required"
+        )
+    if isinstance(merged, EntryMemoryExport):
+        assert isinstance(current, EntryMemoryExport)
+        if changed_entry_ids is None:
+            changed_entry_ids = tuple(
+                sorted(
+                    entry_id
+                    for entry_id in current.state.entries.keys() | merged.state.entries.keys()
+                    if current.state.entries.get(entry_id)
+                    != merged.state.entries.get(entry_id)
+                )
+            )
     try:
-        exported = ProjectRegistry(snapshot.parent).export_memory(project_id)
+        _import_merged_memory(
+            project,
+            project_id,
+            merged,
+            changed_entry_ids=changed_entry_ids or (),
+            provenance=provenance,
+        )
+    except ProjectRegistryError as exc:
+        raise RemoteSyncError(f"project memory changed during sync: {exc}") from exc
+    source_memory = snapshot / "memory"
+    if source_memory.is_dir():
+        for source in sorted(source_memory.iterdir()):
+            if source.is_file() and any(
+                source.name.startswith(f"{name}.conflict-") for name in MEMORY_FILES
+            ):
+                _atomic_copy_file(source, project / "memory" / source.name)
+    source_sync = snapshot / "sync"
+    if source_sync.is_dir():
+        for source in sorted(source_sync.glob("*.json")):
+            _atomic_copy_file(source, project / "sync" / source.name)
+
+
+def _materialize_memory_export(snapshot: Path, project_id: str) -> MemorySyncExport:
+    try:
+        registry = ProjectRegistry(snapshot.parent)
+        if registry.memory_format(project_id) == 2:
+            return registry._export_entry_memory(project_id)
+        exported = registry.export_memory(project_id)
     except ProjectRegistryError as exc:
         raise RemoteSyncError("invalid project memory store") from exc
     for name, content in exported.contents.items():
         _atomic_write_file(content.encode("utf-8"), snapshot / "memory" / name)
     return exported
-
-
-def project_digest(root: Path) -> str:
-    digest = hashlib.sha256()
-    if not root.exists():
-        return _MISSING
-    has_version_store = (root / "memory-current.json").is_file()
-    for path in sorted(root.rglob("*")):
-        if (
-            not path.is_file()
-            or path.is_symlink()
-            or path.name in _EXCLUDED_NAMES
-            or (
-                has_version_store
-                and path.parent == root / "memory"
-                and path.name in MEMORY_FILES
-            )
-        ):
-            continue
-        digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
-        _update_digest_from_file(digest, path)
-    return digest.hexdigest()
 
 
 def _validate_project_snapshot(snapshot: Path, project_id: str) -> None:
@@ -365,7 +567,10 @@ def _validate_project_snapshot(snapshot: Path, project_id: str) -> None:
             path = snapshot / "memory" / name
             if path.is_file() and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE:
                 raise ProjectRegistryError(f"memory file {name} is too large")
-        registry.load_memory(project_id, byte_cap=MAX_RECORD_SIZE)
+        if registry.memory_format(project_id) == 2:
+            registry._entry_memory_state(project_id)
+        else:
+            registry.load_memory(project_id, byte_cap=MAX_RECORD_SIZE)
     except UnsupportedMemoryFormatError:
         raise
     except ProjectRegistryError as exc:
@@ -376,12 +581,18 @@ def _merge(
     source: Path,
     destination: Path,
     *,
-    source_export: MemoryExport,
-    destination_export: MemoryExport,
+    source_export: MemorySyncExport,
+    destination_export: MemorySyncExport,
     state: dict[str, object],
     project_id: str,
     source_label: str,
-) -> tuple[MemoryTransferResult, MemoryExport]:
+) -> tuple[MemoryTransferResult, MemorySyncExport, EntryMemoryExport | None]:
+    if not isinstance(source_export, MemoryExport) or not isinstance(
+        destination_export, MemoryExport
+    ):
+        raise RemoteSyncError(
+            "mixed project memory formats cannot synchronize; migration is required"
+        )
     files = state["files"]
     unresolved = state["conflicts"]
     updated: list[str] = []
@@ -420,40 +631,215 @@ def _merge(
     merged = MemoryExport(
         contents,
         ProjectRegistry._memory_digest_value(contents),
-        _merge_versions(destination_export.versions, source_export.versions),
+        merge_version_receipts(destination_export.versions, source_export.versions),
         tuple(sorted(automatic)),
     )
-    return MemoryTransferResult(project_id, tuple(updated), tuple(conflicts)), merged
+    return (
+        MemoryTransferResult(project_id, tuple(updated), tuple(conflicts)),
+        merged,
+        None,
+    )
 
 
-def _merge_versions(
-    first: tuple[dict[str, object], ...], second: tuple[dict[str, object], ...]
-) -> tuple[dict[str, object], ...]:
-    merged: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for record in (*first, *second):
-        version = record.get("version")
-        if isinstance(version, str):
-            if version in seen:
-                continue
-            seen.add(version)
-        merged.append(record)
-    return tuple(merged)
+def _merge_entries(
+    local: EntryMemoryExport,
+    remote: EntryMemoryExport,
+    *,
+    state: dict[str, object],
+    project_id: str,
+    resolutions: dict[str, Literal["local", "remote"]] | None = None,
+) -> tuple[
+    MemoryTransferResult,
+    EntryMemoryExport,
+    EntryMemoryExport,
+    tuple[str, ...],
+    tuple[str, ...],
+    dict[str, ResolutionCandidate],
+]:
+    baseline = state.get("entries")
+    schema_baseline = state.get("schema_digest")
+    conflicts = state.get("conflicts")
+    if (
+        not isinstance(baseline, dict)
+        or not isinstance(conflicts, dict)
+        or schema_baseline is not None
+        and not _valid_digest(schema_baseline)
+    ):
+        raise RemoteSyncError("memory synchronization state is invalid")
+    try:
+        result = merge_entry_states(
+            local.state,
+            remote.state,
+            entry_baseline=baseline,
+            schema_baseline=schema_baseline,
+            conflicts=conflicts,
+            resolutions=resolutions,
+        )
+    except ProjectRegistryError as exc:
+        raise RemoteSyncError(f"memory synchronization state is invalid: {exc}") from exc
+    state["entries"] = result.entry_baseline
+    state["schema_digest"] = result.schema_baseline
+    state["conflicts"] = {
+        key: conflict.to_dict() for key, conflict in result.conflicts.items()
+    }
+    versions = merge_version_receipts(local.versions, remote.versions)
+    local_export = EntryMemoryExport(
+        result.local,
+        state_digest(result.local),
+        local.version,
+        versions,
+    )
+    remote_export = EntryMemoryExport(
+        result.remote,
+        state_digest(result.remote),
+        remote.version,
+        versions,
+    )
+    return (
+        MemoryTransferResult(project_id, result.updated, result.conflict_keys),
+        local_export,
+        remote_export,
+        result.local_changed,
+        result.remote_changed,
+        result.resolved_candidates,
+    )
 
 
 def _shared_state(
-    first: Path, second: Path, peer: str, project_id: str
-) -> dict[str, dict[str, object] | object]:
+    first: Path,
+    second: Path,
+    peer: str,
+    project_id: str,
+    *,
+    memory_format: int = 1,
+) -> _SharedSyncState:
     first_state = _read_state(first, peer, project_id, required=False)
     second_state = _read_state(second, peer, project_id, required=False)
-    if first_state is not None and second_state is not None and first_state != second_state:
+    if first_state is not None and second_state is not None:
+        if first_state == second_state:
+            return _shared_sync_state(first_state)
+        recovered = _recover_partial_entry_transition(first_state, second_state)
+        if recovered is not None:
+            return recovered
         raise RemoteSyncError("memory synchronization state differs between peers")
     if first_state is not None:
-        return first_state
+        return _recover_missing_entry_predecessor(
+            first_state, project_id
+        ) or _shared_sync_state(first_state)
     if second_state is not None:
-        return second_state
-    return {"schema": 2, "project_id": project_id, "files": {}, "conflicts": {}}
+        return _recover_missing_entry_predecessor(
+            second_state, project_id
+        ) or _shared_sync_state(second_state)
+    if memory_format == 2:
+        return _shared_sync_state(
+            {
+                "schema": 3,
+                "project_id": project_id,
+                "format": 2,
+                "entries": {},
+                "schema_digest": None,
+                "conflicts": {},
+            }
+        )
+    return _shared_sync_state(
+        {"schema": 2, "project_id": project_id, "files": {}, "conflicts": {}}
+    )
 
+
+def _shared_sync_state(state: dict[str, object]) -> _SharedSyncState:
+    copied = copy.deepcopy(state)
+    return _SharedSyncState(copied, _sync_state_digest(copied))
+
+
+def _recover_partial_entry_transition(
+    first: dict[str, object], second: dict[str, object]
+) -> _SharedSyncState | None:
+    for newer, older in ((first, second), (second, first)):
+        transition = newer.get("transition")
+        if (
+            newer.get("schema") != 3
+            or not isinstance(transition, dict)
+            or transition.get("previous_state") != _sync_state_digest(older)
+        ):
+            continue
+        transition_id = transition.get("id")
+        resolutions = transition.get("resolutions")
+        candidates = parse_resolution_candidates(transition.get("candidates"))
+        if (
+            not isinstance(transition_id, str)
+            or not isinstance(resolutions, dict)
+            or candidates is None
+        ):
+            continue
+        return _SharedSyncState(
+            copy.deepcopy(older),
+            _sync_state_digest(older),
+            transition_id=transition_id,
+            resolutions=dict(resolutions),  # validated by _read_state
+            candidates=candidates,
+        )
+    return None
+
+
+def _recover_missing_entry_predecessor(
+    newer: dict[str, object], project_id: str
+) -> _SharedSyncState | None:
+    transition = newer.get("transition")
+    if newer.get("schema") != 3 or not isinstance(transition, dict):
+        return None
+    predecessor = {
+        "schema": 3,
+        "project_id": project_id,
+        "format": 2,
+        "entries": {},
+        "schema_digest": None,
+        "conflicts": {},
+    }
+    previous_digest = _sync_state_digest(predecessor)
+    if transition.get("previous_state") != previous_digest:
+        return None
+    transition_id = transition.get("id")
+    resolutions = transition.get("resolutions")
+    candidates = parse_resolution_candidates(transition.get("candidates"))
+    if (
+        not isinstance(transition_id, str)
+        or not isinstance(resolutions, dict)
+        or candidates is None
+    ):
+        return None
+    return _SharedSyncState(
+        predecessor,
+        previous_digest,
+        transition_id=transition_id,
+        resolutions=dict(resolutions),  # validated by _read_state
+        candidates=candidates,
+    )
+
+
+def _finish_entry_transition(
+    state: dict[str, object],
+    shared: _SharedSyncState,
+    resolutions: dict[str, Literal["local", "remote"]],
+    candidates: dict[str, ResolutionCandidate],
+) -> None:
+    if state.get("schema") != 3:
+        return
+    state["transition"] = {
+        "id": shared.transition_id or uuid.uuid4().hex,
+        "previous_state": shared.previous_digest,
+        "resolutions": dict(sorted(resolutions.items())),
+        "candidates": {
+            key: candidate.to_dict() for key, candidate in sorted(candidates.items())
+        },
+    }
+
+
+def _sync_state_digest(state: dict[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            state, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
 
 def _read_state(
     project: Path,
@@ -481,6 +867,8 @@ def _read_state(
 
 
 def _valid_state(value: object, project_id: str) -> bool:
+    if isinstance(value, dict) and value.get("schema") == 3:
+        return _valid_entry_sync_state(value, project_id)
     if not isinstance(value, dict) or set(value) != {
         "schema",
         "project_id",
@@ -514,6 +902,106 @@ def _valid_state(value: object, project_id: str) -> bool:
             return False
     return True
 
+
+def _valid_entry_sync_state(value: dict[str, object], project_id: str) -> bool:
+    required = {
+        "schema",
+        "project_id",
+        "format",
+        "entries",
+        "schema_digest",
+        "conflicts",
+    }
+    if set(value) not in {frozenset(required), frozenset((*required, "transition"))}:
+        return False
+    transition = value.get("transition")
+    if transition is not None and not _valid_entry_transition(transition):
+        return False
+    entries = value.get("entries")
+    conflicts = value.get("conflicts")
+    schema_value = value.get("schema_digest")
+    if (
+        value.get("project_id") != project_id
+        or value.get("format") != 2
+        or not isinstance(entries, dict)
+        or not isinstance(conflicts, dict)
+        or schema_value is not None
+        and not _valid_digest(schema_value)
+        or any(
+            not isinstance(entry_id, str)
+            or not entry_id.startswith("m_")
+            or not _valid_digest(digest)
+            for entry_id, digest in entries.items()
+        )
+        or any(
+            key != "schema" and (not isinstance(key, str) or not key.startswith("m_"))
+            for key in conflicts
+        )
+    ):
+        return False
+    occupied: set[str] = set()
+    for key, conflict in conflicts.items():
+        if not isinstance(key, str) or not isinstance(conflict, dict):
+            return False
+        kind = conflict.get("kind")
+        digests = conflict.get("digests")
+        if (
+            kind not in {"entries", "schema"}
+            or not isinstance(digests, list)
+            or len(digests) not in {1, 2}
+            or digests != sorted(set(digests))
+            or any(not _valid_digest(digest) for digest in digests)
+        ):
+            return False
+        if kind == "schema":
+            if key != "schema" or set(conflict) != {"kind", "digests"}:
+                return False
+            continue
+        entry_ids = conflict.get("entry_ids")
+        if (
+            set(conflict) != {"kind", "entry_ids", "digests"}
+            or not isinstance(entry_ids, list)
+            or not entry_ids
+            or entry_ids != sorted(set(entry_ids))
+            or key != min(entry_ids)
+            or occupied.intersection(entry_ids)
+            or any(
+                not isinstance(entry_id, str) or not entry_id.startswith("m_")
+                for entry_id in entry_ids
+            )
+        ):
+            return False
+        occupied.update(entry_ids)
+    return True
+
+
+
+def _valid_entry_transition(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "id",
+        "previous_state",
+        "resolutions",
+        "candidates",
+    }:
+        return False
+    transition_id = value.get("id")
+    resolutions = value.get("resolutions")
+    candidates = parse_resolution_candidates(value.get("candidates"))
+    return (
+        isinstance(transition_id, str)
+        and len(transition_id) == 32
+        and all(character in "0123456789abcdef" for character in transition_id)
+        and _valid_digest(value.get("previous_state"))
+        and isinstance(resolutions, dict)
+        and candidates is not None
+        and set(candidates) == set(resolutions)
+        and all(
+            isinstance(key, str)
+            and (key == "schema" or key.startswith("m_"))
+            and choice in {"local", "remote"}
+            for key, choice in resolutions.items()
+        )
+    )
 
 def _valid_digest(value: object) -> bool:
     return value == _MISSING or (
@@ -582,20 +1070,12 @@ def _registry_lock(
         os.close(fd)
 
 
-def _atomic_replace_directory(staging: Path, destination: Path) -> None:
-    backup = destination.parent / f".{destination.name}.replaced-{os.getpid()}"
-    if backup.exists():
-        shutil.rmtree(backup)
-    if destination.exists():
-        destination.rename(backup)
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
     try:
-        staging.rename(destination)
-    except BaseException:
-        if backup.exists() and not destination.exists():
-            backup.rename(destination)
-        raise
-    if backup.exists():
-        shutil.rmtree(backup)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _atomic_write_file(payload: bytes, destination: Path) -> None:

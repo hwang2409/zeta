@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import unquote, urlparse
 
+from .. import project_schema
 from . import (
     RemoteSyncError,
     _append_resume_hint,
@@ -24,7 +25,9 @@ from . import (
     _safe_component,
     _tree_state,
     _write_json,
+    project_publish,
 )
+from .project_publish import PreparedTransfer, prepare_project_transfer
 
 _HOST = re.compile(r"[A-Za-z0-9_.@-]+\Z")
 DEFAULT_MAX_ARCHIVE_BYTES = 1 << 30
@@ -175,6 +178,80 @@ finally:
 '''
 
 
+_PROJECT_INSTALL_WRAPPER = r"""
+import sys, tarfile, tempfile
+home = Path(sys.argv[1]).expanduser().resolve()
+ident, expected, transfer = sys.argv[2], sys.argv[3], sys.argv[4]
+max_members, max_bytes = int(sys.argv[5]), int(sys.argv[6])
+if Path(ident).parts != (ident,): sys.exit(45)
+home.mkdir(parents=True, exist_ok=True, mode=0o700)
+with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as temporary:
+    staging = Path(temporary) / ident
+    staging.mkdir(mode=0o700)
+    members = declared = extracted = 0
+    with tarfile.open(fileobj=sys.stdin.buffer, mode="r|gz") as archive:
+        for member in archive:
+            members += 1
+            if members > max_members: sys.exit(49)
+            if member.size < 0: sys.exit(46)
+            declared += member.size
+            if declared > max_bytes: sys.exit(50)
+            if shutil.disk_usage(home).free < declared - extracted: sys.exit(51)
+            parts = tuple(member.name.split("/"))
+            if not member.isfile() or len(parts) < 2 or parts[0] != "payload": sys.exit(46)
+            try: _canonical_snapshot_path(parts[1:])
+            except ProjectPublicationError as exc:
+                print(str(exc), file=sys.stderr); sys.exit(46)
+            target = staging.joinpath(*parts[1:])
+            if target.exists(): sys.exit(46)
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            source = archive.extractfile(member)
+            if source is None: sys.exit(46)
+            with target.open("xb") as output:
+                remaining = member.size
+                while remaining:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    if not chunk: sys.exit(46)
+                    extracted += len(chunk); remaining -= len(chunk)
+                    if extracted > max_bytes: sys.exit(50)
+                    output.write(chunk)
+                if source.read(1): sys.exit(50)
+            target.chmod(0o600)
+    for directory in staging.rglob("*"):
+        if directory.is_dir(): directory.chmod(0o700)
+    if transfer_digest(staging) != transfer: sys.exit(46)
+    try:
+        publish_local_project(home, ident, staging, expected_digest=expected)
+    except ProjectPublicationError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(47)
+"""
+
+
+def _project_install_script() -> str:
+    """Ship the dependency-free schema and publisher to an uninstalled peer."""
+
+    schema_filename = project_schema.__file__
+    publisher_filename = project_publish.__file__
+    if schema_filename is None or publisher_filename is None:
+        raise RemoteSyncError("project publication module source is unavailable")
+    schema_source = Path(schema_filename).read_text(encoding="utf-8")
+    publisher_source = Path(publisher_filename).read_text(encoding="utf-8")
+    dependency_import = "from .. import project_schema\n"
+    if dependency_import not in publisher_source:
+        raise RemoteSyncError("project publication schema import is unavailable")
+    publisher_source = publisher_source.replace(
+        "from __future__ import annotations\n\n", "", 1
+    ).replace(dependency_import, "", 1)
+    return (
+        schema_source
+        + "\nimport sys\nproject_schema = sys.modules[__name__]\n"
+        + publisher_source
+        + "\n"
+        + _PROJECT_INSTALL_WRAPPER
+    )
+
+
 @dataclass(slots=True)
 class SshTransport:
     """Transfer snapshots through one configured SSH host and remote ZETA_HOME."""
@@ -246,17 +323,14 @@ class SshTransport:
             if "was not found" in str(exc):
                 return "missing"
             raise
-        return _directory_digest(destination)
+        return project_publish.project_digest(destination)
 
     def publish_project(
         self, project_id: str, snapshot: Path, *, expected_digest: str
     ) -> None:
-        self._install(
-            "projects",
-            _safe_component(project_id, "project id"),
-            snapshot,
-            expected_digest,
-        )
+        project_id = _safe_component(project_id, "project id")
+        prepared = prepare_project_transfer(snapshot)
+        self._install_project(project_id, prepared, expected_digest)
 
     def _existing_state(
         self, kind: str, ident: str, source: Path, force: bool
@@ -316,6 +390,27 @@ class SshTransport:
                 max_bytes=self.max_archive_bytes,
             )
 
+    def _install_project(
+        self, ident: str, prepared: PreparedTransfer, expected: str
+    ) -> None:
+        with tempfile.TemporaryFile() as incoming:
+            incoming.write(prepared.archive_bytes)
+            incoming.seek(0)
+            result = self._run(
+                _project_install_script(),
+                [
+                    self._home(),
+                    ident,
+                    expected,
+                    prepared.transfer_digest,
+                    str(self.max_archive_members),
+                    str(self.max_archive_bytes),
+                ],
+                stdin=incoming,
+                check=False,
+            )
+        self._raise_install_error(result, project=True)
+
     def _install(self, kind: str, ident: str, source: Path, expected: str) -> None:
         with tempfile.TemporaryDirectory(prefix="zeta-ssh-install-") as temporary:
             archive = Path(temporary) / "snapshot.tar.gz"
@@ -334,10 +429,19 @@ class SshTransport:
                     stdin=incoming,
                     check=False,
                 )
+        self._raise_install_error(result, project=False)
+
+    def _raise_install_error(
+        self, result: subprocess.CompletedProcess[bytes], *, project: bool
+    ) -> None:
         if result.returncode == 47:
-            raise RemoteSyncError("remote changed during transfer; retry after inspection")
+            raise RemoteSyncError(
+                "remote changed during transfer; retry after inspection"
+            )
         if result.returncode == 48:
-            raise RemoteSyncError("remote session is active; stop it before replacement")
+            raise RemoteSyncError(
+                "remote session is active; stop it before replacement"
+            )
         if result.returncode == 49:
             raise RemoteSyncError("remote archive exceeds the member limit")
         if result.returncode == 50:
@@ -345,8 +449,10 @@ class SshTransport:
         if result.returncode == 51:
             raise RemoteSyncError("remote has insufficient free space for the archive")
         if result.returncode:
+            kind = "project" if project else "session"
             raise RemoteSyncError(
-                f"SSH publication failed on {self.host} (exit {result.returncode}): "
+                f"SSH {kind} publication failed on {self.host} "
+                f"(exit {result.returncode}): "
                 f"{result.stderr.decode(errors='replace').strip()}"
             )
 

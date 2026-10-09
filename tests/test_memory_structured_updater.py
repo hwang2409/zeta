@@ -307,6 +307,110 @@ async def test_repair_receives_indexed_validation_errors(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_repair_preserves_exact_cited_code_literals(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    result, prompts = await _run(
+        registry,
+        project_id,
+        _transcript(_row(1, "The validated opaque token is `PROC-QUARTZ-8N3F`.")),
+        [
+            _proposal(),
+            _proposal(
+                _add(
+                    "decisions",
+                    "The validated token is PROC-QUARTZ-8N3F.",
+                )
+            ),
+        ],
+        key="exact-code-literal",
+    )
+    assert len(prompts) == 2
+    assert "omits durable exact code literal" in prompts[1]
+    assert result.changed_entry_ids
+    assert next(iter(_entries(registry, project_id))).text == (
+        "The validated token is PROC-QUARTZ-8N3F."
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_literal_validation_ignores_cited_tool_output(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    operation = _add(
+        "decisions",
+        "The validated token is PROC-QUARTZ-8N3F.",
+    )
+    operation["sources"] = [{"seq_start": 1, "seq_end": 2}]
+    result, prompts = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(1, "The validated token is `PROC-QUARTZ-8N3F`."),
+            _row(2, "Write `value` in the output.", origin="tool_output", role="tool"),
+        ),
+        [_proposal(operation)],
+        key="ignore-tool-code-literal",
+    )
+    assert len(prompts) == 1
+    assert result.changed_entry_ids
+
+
+@pytest.mark.asyncio
+async def test_repeated_opaque_fact_does_not_create_duplicate_entry(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    await _run(
+        registry,
+        project_id,
+        _transcript(_row(1, "The validated token is `PROC-QUARTZ-8N3F`.")),
+        [
+            _proposal(
+                _add("decisions", "The validated token is PROC-QUARTZ-8N3F.")
+            )
+        ],
+        key="opaque-first",
+    )
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(_row(2, "Recall `PROC-QUARTZ-8N3F`.")),
+        [
+            _proposal(
+                _add("decisions", "Project procedure token: PROC-QUARTZ-8N3F.", 2)
+            )
+        ],
+        key="opaque-repeat",
+    )
+    assert result.changed_entry_ids == ()
+    assert result.rejected_groups == ("group[0]: add duplicates an existing active entry",)
+    assert len(_entries(registry, project_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_one_proposal_cannot_add_duplicate_opaque_facts(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(_row(1, "Remember `HERON-RELATED-5B3X`.")),
+        [
+            _proposal(
+                _add("brief", "Related token HERON-RELATED-5B3X."),
+                _add("decisions", "The related value is HERON-RELATED-5B3X."),
+            )
+        ],
+        key="same-proposal-duplicate",
+    )
+    assert len(result.changed_entry_ids) == 1
+    assert result.rejected_groups == (
+        "group[1]: add duplicates an existing active entry",
+    )
+    assert len(_entries(registry, project_id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -> None:
     registry, project_id = _registry(tmp_path)
     initial = registry._entry_memory_state(project_id)
@@ -709,6 +813,35 @@ async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> N
             entry for entry in _entries(registry, project_id) if entry.id == expiring_id
         ).status
         == "expired"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_user_validated_procedure_is_stored_as_data(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(
+            _row(
+                1,
+                "The validated procedure uses `PROC-QUARTZ-8N3F` before packaging.",
+            )
+        ),
+        [
+            _proposal(
+                _add(
+                    "decisions",
+                    "Validated procedure: run PROC-QUARTZ-8N3F before packaging.",
+                )
+            )
+        ],
+    )
+    assert result.rejected_groups == ()
+    assert next(iter(_entries(registry, project_id))).text == (
+        "Validated procedure: run PROC-QUARTZ-8N3F before packaging."
     )
 
 

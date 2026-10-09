@@ -18,6 +18,7 @@ from typing import Any
 
 from zeta.memory.safety import contains_secret
 from zeta.project_memory_history import PROJECT_MEMORY_FILES
+from zeta.project_schema import MAX_MEMORY_FILE_SIZE
 from zeta.protocol.types import (
     ASSISTANT_RESPONSE_SYNTHETIC,
     MESSAGE_ORIGIN_METADATA,
@@ -209,9 +210,30 @@ def _unsafe_reason(content: str) -> str | None:
     return None
 
 
+def _sanitize_text(value: str) -> str:
+    if contains_secret(value):
+        return "[unsafe content omitted]"
+    if not _unsafe_reason(value):
+        return value
+    safe_parts = [
+        part
+        for part in re.split(r"(?<=[.!?])\s+|\n+", value)
+        if part
+        and (
+            (
+                any(word in part.lower() for word in ("validated", "established"))
+                and "`" in part
+            )
+            or not _is_agent_directed_action(part)
+        )
+        and not any(pattern.search(part) for pattern in _INJECTION_PATTERNS)
+    ]
+    return " ".join(safe_parts) or "[unsafe content omitted]"
+
+
 def _sanitized(value: Any) -> Any:
     if isinstance(value, str):
-        return "[unsafe content omitted]" if _unsafe_reason(value) else value
+        return _sanitize_text(value)
     if isinstance(value, list):
         return [_sanitized(item) for item in value]
     if isinstance(value, tuple):
@@ -593,7 +615,7 @@ def parse_proposal(
         seen.add(name)
         if not isinstance(content, str) or not content.startswith("# "):
             raise ReconciliationError("replacement must be headed Markdown text")
-        if len(content.encode()) > 128 * 1024 or "\x00" in content:
+        if len(content.encode()) > MAX_MEMORY_FILE_SIZE or "\x00" in content:
             raise ReconciliationError("replacement is too large or contains NUL")
         if name == "state.md" and f"As of {as_of.isoformat()}" not in content:
             raise ReconciliationError("state replacement lacks its as-of date")
