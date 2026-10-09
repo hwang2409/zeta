@@ -173,7 +173,7 @@ class _MigrationPayloadAdapter:
 
     def prepare(self, context: PublicationContext) -> PreparedVersion[EntryMemoryState]:
         return PreparedVersion(
-            {"state": canonical_state_bytes(self.plan.state)},
+            {"state": self.plan.canonical_state},
             {name: content.encode() for name, content in self.plan.source_contents.items()},
             {
                 "format": 2,

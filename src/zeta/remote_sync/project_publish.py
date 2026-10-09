@@ -25,8 +25,9 @@ from typing import NamedTuple
 from .. import project_schema
 from ..memory_migration_plan import (
     LEGACY_MEMORY_FILES,
-    build_migration_entries,
+    build_migration_plan,
     legacy_memory_digest,
+    reachable_version_pruning_plan,
 )
 
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
@@ -545,24 +546,18 @@ def _validate_migration_manifest(
         if scalar or source_payloads != before_payloads:
             raise ProjectPublicationError("migration source version does not match")
     try:
-        state = json.loads(current_payloads["state"], object_pairs_hook=_unique_object)
-    except (KeyError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        expected = build_migration_plan(
+            project_id=project_id,
+            contents=contents,
+            source_digest=source_digest,
+            source_version=source_version,
+            migrated_at=migrated_at,
+            automatic_files=frozenset(automatic_raw),
+            max_entry_bytes=_MAX_MIGRATED_ENTRY_BYTES,
+        )
+    except ValueError as exc:
         raise ProjectPublicationError("migration state is invalid") from exc
-    expected_entries = build_migration_entries(
-        project_id=project_id,
-        contents=contents,
-        source_digest=source_digest,
-        source_version=source_version,
-        migrated_at=migrated_at,
-        automatic_files=frozenset(automatic_raw),
-        max_entry_bytes=_MAX_MIGRATED_ENTRY_BYTES,
-    )
-    if (
-        not isinstance(state, dict)
-        or state.get("project_id") != project_id
-        or state.get("generation") != 1
-        or state.get("entries") != expected_entries
-    ):
+    if current_payloads.get("state") != expected.canonical_state:
         raise ProjectPublicationError("migration state does not match its source")
 
 
@@ -633,17 +628,14 @@ def _publish_side_files(project: Path, snapshot: Path) -> None:
 
 def _prune_versions(root: Path, retained: set[str]) -> None:
     versions, blobs = root / "versions", root / "blobs"
-    referenced: set[str] = set()
-    for version in retained:
-        manifest = _read_manifest(root.parent, version)
-        for key in ("snapshot", "before_snapshot"):
-            value = manifest[key]
-            referenced.update(value.values() if isinstance(value, dict) else (value,))
+    plan = reachable_version_pruning_plan(
+        retained, lambda version: _read_manifest(root.parent, version)
+    )
     for path in versions.glob("*.json"):
-        if path.stem not in retained:
+        if path.stem not in plan.versions:
             path.unlink()
     for path in blobs.iterdir():
-        if path.name not in referenced:
+        if path.name not in plan.blobs:
             path.unlink()
 
 

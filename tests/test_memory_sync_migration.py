@@ -45,7 +45,12 @@ from zeta.remote_sync import (
 )
 from zeta.remote_sync.errors import RemoteSyncError
 from zeta.remote_sync.memory import project_digest
-from zeta.remote_sync.project_publish import ProjectPublicationError, _validate_snapshot
+from zeta.remote_sync.project_publish import (
+    ProjectPublicationError,
+    _validate_snapshot,
+    prepare_project_transfer,
+)
+from zeta.remote_sync.project_publish import publish_version as publish_remote_version
 from zeta.remote_sync.ssh import SshTransport
 from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
@@ -674,7 +679,16 @@ def test_legacy_five_file_migration_round_trips_exactly(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "tamper",
-    ("source-digest", "before-snapshot", "source-version", "migrated-state"),
+    (
+        "source-digest",
+        "before-snapshot",
+        "source-version",
+        "entry",
+        "schema",
+        "profile",
+        "format",
+        "compacted-through-version",
+    ),
 )
 def test_sync_rejects_migration_manifest_without_source_and_plan_integrity(
     tmp_path: Path, tamper: str
@@ -700,8 +714,16 @@ def test_sync_rejects_migration_manifest_without_source_and_plan_integrity(
     else:
         state_digest = manifest["snapshot"]["state"]
         state = json.loads((blobs / state_digest).read_text())
-        entry = next(iter(state["entries"].values()))
-        entry["text"] = "Tampered migrated fact."
+        if tamper == "entry":
+            next(iter(state["entries"].values()))["text"] = "Tampered migrated fact."
+        elif tamper == "schema":
+            state["schema"]["version"] += 1
+        elif tamper == "profile":
+            state["schema"]["profile"] = "messaging"
+        elif tamper == "format":
+            state["format"] = 3
+        else:
+            state["compacted_through_version"] = "f" * 32
         payload = json.dumps(
             state, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode()
@@ -711,8 +733,52 @@ def test_sync_rejects_migration_manifest_without_source_and_plan_integrity(
         manifest["snapshot"]["state"] = replacement
     manifest_path.write_text(json.dumps(manifest, sort_keys=True))
 
-    with pytest.raises(ProjectPublicationError, match="migration"):
+    with pytest.raises(ProjectPublicationError):
         _validate_snapshot(snapshot, project_id)
+
+
+def test_migration_references_survive_bounded_local_and_remote_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "home"
+    second = tmp_path / "second"
+    second.mkdir()
+    registry, project_id, contents = _legacy_fixture(tmp_path)
+    registry.migrate_memory(project_id, migrated_at="2026-10-09T00:00:00Z")
+    transport = LocalTransport(second)
+    _add(registry, project_id, "post-migration update 0")
+    push_project_memory(first, transport, project_id=project_id)
+
+    remote = ProjectRegistry(second / "projects")
+    for index in range(1, 130):
+        _add(registry, project_id, f"post-migration update {index}")
+        publish_remote_version(remote.root / project_id, registry.root / project_id)
+
+    prepare_project_transfer(registry.root / project_id)
+    prepare_project_transfer(remote.root / project_id)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "ssh"
+    shim.write_text(
+        '#!/bin/sh\n[ "$1" = -- ] && shift\nshift\nexec /bin/sh -c "$1"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    result = push_project_memory(
+        first,
+        SshTransport("fixture", str(second), name="fixture"),
+        project_id=project_id,
+    )
+    assert result.conflicts == ()
+
+    registry.rollback_memory_migration(project_id)
+    remote.rollback_memory_migration(project_id)
+    assert dict(registry.load_memory(project_id)) == contents
+    assert dict(remote.load_memory(project_id)) == contents
+    updated = "# Current state\n\nUpdated after rollback.\n"
+    registry.update_memory(project_id, {"state.md": updated})
+    assert dict(registry.load_memory(project_id))["state.md"] == updated
 
 
 def test_migration_rollback_restores_format_one_pointer(tmp_path: Path) -> None:

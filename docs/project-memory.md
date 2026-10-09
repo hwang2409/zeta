@@ -97,8 +97,10 @@ confirmation interface.
 ## Migrate, roll back, and finalize
 
 Migration uses the deterministic migration engine. It does not call a model.
-Each top-level list item and non-list paragraph becomes one typed entry; `##`
-headings become stable section metadata. Oversized blocks split without
+A leading `#` title is document metadata, not an entry. Each top-level list item
+and non-list paragraph becomes one typed entry. A paragraph ending in `:` is
+folded into each list item that it introduces, and each `##` section title is
+folded into its entries as a short text prefix. Oversized facts split without
 truncation. Entries keep their source order and the migration source digest and
 version. A file's entries remain automatic only when that format-1 file was
 automatic; other migrated entries are accepted. The exact five source files

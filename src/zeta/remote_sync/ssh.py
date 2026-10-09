@@ -246,8 +246,9 @@ def _project_install_script() -> str:
         (
             "from ..memory_migration_plan import (\n"
             "    LEGACY_MEMORY_FILES,\n"
-            "    build_migration_entries,\n"
+            "    build_migration_plan,\n"
             "    legacy_memory_digest,\n"
+            "    reachable_version_pruning_plan,\n"
             ")\n"
         ),
     )

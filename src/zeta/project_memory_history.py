@@ -22,6 +22,7 @@ from .memory.version_store import (
     publish_version,
     require_memory_format,
 )
+from .memory_migration_plan import reachable_version_pruning_plan
 from .project_errors import ProjectRegistryError
 from .project_schema import MAX_MEMORY_FILE_SIZE
 
@@ -689,41 +690,14 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         return published.version
 
     def _prune_versions(self, blobs_fd: int, versions_fd: int, retained: set[str]) -> None:
-        referenced: set[str] = set()
-        pending = list(retained)
-        migration_finalized = any(
-            self._manifest(versions_fd, version).get("kind") == "migration-finalize"
-            for version in retained
+        plan = reachable_version_pruning_plan(
+            retained, lambda version: self._manifest(versions_fd, version)
         )
-        while pending:
-            version = pending.pop()
-            manifest = self._manifest(versions_fd, version)
-            targets = [manifest.get("target_version")]
-            if not migration_finalized:
-                targets.append(manifest.get("migration_version"))
-            for target in targets:
-                if (
-                    isinstance(target, str)
-                    and target not in retained
-                    and not (
-                        migration_finalized and manifest.get("kind") == "migrate"
-                    )
-                ):
-                    retained.add(target)
-                    pending.append(target)
-            for key in ("snapshot", "before_snapshot"):
-                values = manifest.get(key)
-                if isinstance(values, dict):
-                    referenced.update(
-                        item for item in values.values() if isinstance(item, str)
-                    )
-                elif isinstance(values, str):
-                    referenced.add(values)
         for name in os.listdir(versions_fd):
-            if name.endswith(".json") and name[:-5] not in retained:
+            if name.endswith(".json") and name[:-5] not in plan.versions:
                 os.unlink(name, dir_fd=versions_fd)
         for name in os.listdir(blobs_fd):
-            if name not in referenced:
+            if name not in plan.blobs:
                 os.unlink(name, dir_fd=blobs_fd)
         os.fsync(versions_fd)
         os.fsync(blobs_fd)
