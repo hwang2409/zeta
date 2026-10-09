@@ -5,10 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from zeta.core.approval import ApprovalRequest
+from zeta.core.approval import ApprovalDecision, ApprovalRequest
 from zeta.protocol.types import ToolCall
 from zeta.tui.app import TUIApp
-from zeta.tui.fork_session import ForkRuntimeMixin, OwnedApproval
+from zeta.tui.fork_session import (
+    ForkRuntimeMixin,
+    ForkStackController,
+    OwnedApproval,
+)
 from zeta.tui.runtime_close import RuntimeCloseMixin
 from zeta.tui.slash_handlers.fork_view import ForkContext, ForkViewMixin
 
@@ -193,6 +197,88 @@ def test_visible_approval_card_is_removed_when_request_ends() -> None:
     app.sync_visible_approvals(())
 
     assert removed == [unit]
+
+
+def test_shortcut_card_tracks_first_pending_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    class Visible(ForkRuntimeMixin):
+        def __init__(self, approvals: list[ApprovalRequest]) -> None:
+            self._init_fork_runtime()
+            self.approvals = approvals
+            self.resolved: list[str | None] = []
+            self._presenter = SimpleNamespace(print_unit=lambda card: card)
+            self._transcript = SimpleNamespace(
+                remove=lambda unit, *, leading_blank: None
+            )
+            self._invalidate_prompt = lambda: None
+
+        @property
+        def local_pending_approvals(self) -> tuple[ApprovalRequest, ...]:
+            return tuple(self.approvals)
+
+        async def resolve_local_approval(
+            self,
+            decision: object,
+            requested_key: str | None,
+            *,
+            always: bool = False,
+        ) -> None:
+            self.resolved.append(requested_key)
+            self.approvals = [
+                request
+                for request in self.approvals
+                if str(request.key) != requested_key
+            ]
+
+    def render_card(
+        tool_name: str, arguments: dict[str, object], **kwargs: object
+    ) -> SimpleNamespace:
+        return SimpleNamespace(key=kwargs["key"], shortcut=kwargs["shortcut"])
+
+    async def driver() -> None:
+        main = Visible(
+            [ApprovalRequest("main", ToolCall("main", "read", {"path": "main"}))]
+        )
+        fork = Visible([])
+        controller = ForkStackController(main, pytest.fail)
+        controller._stack.append(fork)
+        fork.set_fork_controller(controller)
+
+        controller.approvals_changed()
+        main_handle = controller.pending_approvals[0].handle
+        assert [
+            (unit.key, shortcut)
+            for unit, shortcut in fork._approval_units.values()
+        ] == [(main_handle, True)]
+
+        fork.approvals = [
+            ApprovalRequest("fork", ToolCall("fork", "read", {"path": "fork"}))
+        ]
+        controller.approvals_changed()
+        first_handle = fork.first_pending_approval_key
+        shortcut_handles = [
+            unit.key
+            for unit, shortcut in fork._approval_units.values()
+            if shortcut
+        ]
+        assert shortcut_handles == [first_handle], (
+            "exactly the approval resolved by y/n must advertise the shortcut"
+        )
+
+        await controller.resolve_approval(
+            ApprovalDecision.ALLOW, fork.first_pending_approval_key
+        )
+        assert fork.resolved == ["fork"], "y must resolve the advertised fork approval"
+        assert [
+            (unit.key, shortcut)
+            for unit, shortcut in fork._approval_units.values()
+        ] == [(main_handle, True)], "main must gain y/n after the fork approval resolves"
+
+    monkeypatch.setattr("zeta.tui.fork_session.render_approval_card", render_card)
+    asyncio.run(driver())
 
 
 def test_replaced_approval_handle_renders_new_card(

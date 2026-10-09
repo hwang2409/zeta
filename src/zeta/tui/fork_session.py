@@ -64,7 +64,7 @@ class ForkRuntimeMixin:
 
     def _init_fork_runtime(self) -> None:
         self._fork_controller: ForkStackController | None = None
-        self._approval_units: dict[str, object] = {}
+        self._approval_units: dict[str, tuple[object, bool]] = {}
         self._run_result = RuntimeResult.EXIT
 
     def set_fork_controller(self, controller: ForkStackController | None) -> None:
@@ -110,13 +110,19 @@ class ForkRuntimeMixin:
         )
 
     def sync_visible_approvals(self, approvals: tuple[OwnedApproval, ...]) -> None:
-        current = {item.handle or str(item.request.key) for item in approvals}
-        for handle in self._approval_units.keys() - current:
-            unit = self._approval_units.pop(handle)
+        current = {
+            item.handle or str(item.request.key): index == 0
+            for index, item in enumerate(approvals)
+        }
+        for handle, (unit, shortcut) in tuple(self._approval_units.items()):
+            if current.get(handle) == shortcut:
+                continue
+            self._approval_units.pop(handle)
             self._transcript.remove(unit, leading_blank=True)
         for index, item in enumerate(approvals):
             request = item.request
             handle = item.handle or str(request.key)
+            shortcut = index == 0
             if handle in self._approval_units:
                 continue
             unit = self._presenter.print_unit(
@@ -125,7 +131,7 @@ class ForkRuntimeMixin:
                     request.tool_call.arguments,
                     label=request.label,
                     key=item.handle or str(request.key),
-                    shortcut=index == 0,
+                    shortcut=shortcut,
                     trusted_display=trusted_macro_display(request.tool_call.id),
                     project_display=(
                         request.project_id,
@@ -145,7 +151,7 @@ class ForkRuntimeMixin:
                 )
             )
             if unit is not None:
-                self._approval_units[handle] = unit
+                self._approval_units[handle] = (unit, shortcut)
         self._invalidate_prompt()
 
 
@@ -168,8 +174,7 @@ class ForkStackController:
         self._approval_handles: dict[
             tuple[int, object], tuple[ApprovalRequest, str]
         ] = {}
-        self._issued_approval_handles: set[str] = set()
-        self._next_approval_handle = count(1)
+        self._approval_handle_counter = 0
         main_app.set_fork_controller(self)
 
     @property
@@ -197,8 +202,8 @@ class ForkStackController:
             key = (self._owner_token(owner), request.key)
             current = self._approval_handles.get(key)
             if current is None or current[0] is not request:
-                handle = f"approval-{next(self._next_approval_handle)}"
-                self._issued_approval_handles.add(handle)
+                self._approval_handle_counter += 1
+                handle = f"approval-{self._approval_handle_counter}"
                 self._approval_handles[key] = (request, handle)
             else:
                 handle = current[1]
@@ -296,8 +301,14 @@ class ForkStackController:
         for approval in approvals:
             if approval.handle == requested_key:
                 return approval
-        if requested_key in self._issued_approval_handles:
-            raise ValueError(f"unknown or expired approval handle {requested_key!r}")
+        if requested_key is not None and requested_key.startswith("approval-"):
+            number = requested_key.removeprefix("approval-")
+            if (
+                number.isdecimal()
+                and str(int(number)) == number
+                and 0 < int(number) <= self._approval_handle_counter
+            ):
+                raise ValueError(f"unknown or expired approval handle {requested_key!r}")
         raw_matches = [
             approval
             for approval in approvals

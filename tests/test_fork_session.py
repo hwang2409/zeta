@@ -331,6 +331,9 @@ def test_replaced_approval_gets_new_handle_and_rejects_stale_handle() -> None:
 
         assert new_handle != old_handle
         assert main.approval_views[-1] == (new_handle,)
+        assert old_handle not in {
+            approval.handle for approval in controller.pending_approvals
+        }
         with pytest.raises(
             ValueError, match=rf"unknown or expired approval handle {old_handle!r}"
         ):
