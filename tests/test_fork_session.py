@@ -38,9 +38,10 @@ class _FakeApp:
     async def run(self) -> None:
         self.runs += 1
         self._pending_fork = self.script.pop(0) if self.script else None
-
-    async def close(self) -> None:
-        self.closed = True
+        # A real exit or a return closes the app itself; suspending to open a
+        # fork leaves it live (and the controller re-runs it later).
+        if self._pending_fork is None:
+            self.closed = True
 
     async def leave_fork(self) -> None:
         self.left = True
@@ -68,7 +69,7 @@ def test_opening_discussion_keeps_main_runtime_live_and_untouched() -> None:
         built.append(target)
         # The discussion opens while main has a running child, task, and turn.
         assert (main.child.alive, main.task.alive, main.turn.alive) == (True,) * 3
-        # The main runtime is never closed to show the fork.
+        # The main runtime is suspended, not closed, to show the fork.
         assert main.closed is False
         return fork
 
@@ -79,11 +80,11 @@ def test_opening_discussion_keeps_main_runtime_live_and_untouched() -> None:
     assert (main.child.alive, main.task.alive, main.turn.alive) == (True,) * 3
     # Main ran twice: before the discussion and again after returning.
     assert main.runs == 2
-    # The fork was released and closed; the main runtime was closed only by the
-    # caller (so run_fork_stack never closed it).
+    # The fork was released and closed itself on return. Main closed only when
+    # it finally exited (its second run), never to show the fork.
     assert (fork.left, fork.closed) == (True, True)
-    assert main.closed is False
     assert main.left is False
+    assert main.closed is True
 
 
 def test_main_notification_during_discussion_is_seen_by_the_fork() -> None:
@@ -118,6 +119,6 @@ def test_forks_can_stack_and_unwind_newest_first() -> None:
 
     assert (inner.left, inner.closed) == (True, True)
     assert (deepest.left, deepest.closed) == (True, True)
-    assert main.closed is False
+    assert main.closed is True
     # main runs 2x, inner runs 2x (open deepest, then after return), deepest 1x.
     assert (main.runs, inner.runs, deepest.runs) == (2, 2, 1)

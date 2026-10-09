@@ -19,13 +19,14 @@ from typing import Protocol
 
 
 class ForkHost(Protocol):
-    """Lifecycle a TUI app exposes to the fork controller."""
+    """Lifecycle a TUI app exposes to the fork controller.
+
+    ``run`` closes the app on a real exit and keeps it live when it suspends to
+    open a fork; the controller never closes an app itself.
+    """
 
     async def run(self) -> None:
         """Present this runtime's UI until it exits, returns, or opens a fork."""
-
-    async def close(self) -> None:
-        """Tear this runtime down (session, loop, children, tasks)."""
 
     async def leave_fork(self) -> None:
         """Release the discussion fork binding; a no-op for a non-fork runtime."""
@@ -43,8 +44,10 @@ async def run_fork_stack(
 ) -> None:
     """Drive the main app and any discussion forks stacked on top of it.
 
-    ``main_app`` is never closed while a fork is shown; it is only closed by the
-    caller after this returns. Forks are closed as they are left, newest first.
+    Each app's own ``run`` closes it on a real exit and leaves it live when it
+    suspends to open a fork, so this controller never closes an app itself: it
+    only releases a left fork's binding and re-shows its parent. The main app is
+    closed by its own ``run`` when it finally exits, after this returns.
     """
 
     stack: list[ForkHost] = [main_app]
@@ -58,13 +61,12 @@ async def run_fork_stack(
             stack.append(fork)
             continue
         if len(stack) == 1:
-            # The main runtime asked to exit, start a new session, or resume;
-            # the caller owns that teardown.
+            # The main runtime exited (it closed itself); the caller resumes
+            # with a new session or a real resume as requested.
             return
-        # A fork left (returned to its parent or hit Ctrl-D): release its
-        # binding and close only the fork, then re-show its parent.
+        # A fork left (returned to its parent or hit Ctrl-D) and closed itself;
+        # release its binding and re-show its parent.
         await current.leave_fork()
-        await current.close()
         stack.pop()
 
 
