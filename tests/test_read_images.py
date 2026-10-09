@@ -1080,7 +1080,7 @@ async def test_watchdog_accepts_worker_exit_during_kill(
 
     limit = await image_normalization._watch_worker(ExitedProcess())  # type: ignore[arg-type]
 
-    assert limit == "RSS safety budget"
+    assert limit is None
 
 
 @pytest.mark.asyncio
