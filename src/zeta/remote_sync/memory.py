@@ -34,6 +34,7 @@ from .errors import RemoteSyncError
 from .project_publish import (
     ProjectPublicationError,
     materialize_project_transfer,
+    normalize_project_digest,
     prepare_project_transfer,
     project_digest,
 )
@@ -111,7 +112,9 @@ def sync_project_memory(
         if local_expected != _MISSING:
             _validate_project_snapshot(local, project_id)
             local_export = _materialize_memory_export(local, project_id)
-        remote_expected = transport.fetch_project(project_id, remote)
+        remote_expected = normalize_project_digest(
+            transport.fetch_project(project_id, remote), remote
+        )
         if remote_expected == _MISSING:
             if direction == "pull":
                 raise RemoteSyncError(f"remote project {project_id} was not found")
@@ -253,7 +256,9 @@ def resolve_project_memory(
             raise RemoteSyncError(f"project {project_id} was not found")
         _validate_project_snapshot(local, project_id)
         local_export = _materialize_memory_export(local, project_id)
-        remote_expected = transport.fetch_project(project_id, remote)
+        remote_expected = normalize_project_digest(
+            transport.fetch_project(project_id, remote), remote
+        )
         if remote_expected == _MISSING:
             raise RemoteSyncError(f"remote project {project_id} was not found")
         _validate_project_snapshot(remote, project_id)

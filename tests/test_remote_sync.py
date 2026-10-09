@@ -41,8 +41,11 @@ from zeta.remote_sync import memory as memory_module
 from zeta.remote_sync import ssh as ssh_module
 from zeta.remote_sync.memory import _machine_id
 from zeta.remote_sync.project_publish import (
+    PreparedTransfer,
     ProjectPublicationError,
+    materialize_project_transfer,
     prepare_project_transfer,
+    transfer_digest,
 )
 from zeta.remote_sync.project_publish import (
     publish_local_project as publish_destination_project,
@@ -619,6 +622,40 @@ def test_memory_pull_rejects_oversized_memory_before_install(tmp_path: Path) -> 
     assert dict(ProjectRegistry(local / "projects").load_memory(project.project_id)) == original
 
 
+def _legacy_project_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    has_version_store = (root / "memory-current.json").is_file()
+    for path in sorted(root.rglob("*")):
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or path.name in {".lock", ".spill.lock"}
+            or has_version_store
+            and path.parent == root / "memory"
+            and path.name in memory_module.MEMORY_FILES
+        ):
+            continue
+        digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def test_project_tree_digests_frame_file_boundaries(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "x").write_bytes(b"y\0Z")
+    (second / "x").write_bytes(b"")
+    (second / "y").write_bytes(b"Z")
+
+    assert _legacy_project_digest(first) == _legacy_project_digest(second)
+    assert transfer_digest(first) != transfer_digest(second)
+    assert memory_module.project_digest(first) != memory_module.project_digest(second)
+
+
 def test_project_digest_streams_large_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -637,7 +674,7 @@ def test_project_digest_streams_large_files(
 
     monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
 
-    assert len(project_digest(project)) == 64
+    assert len(project_digest(project).removeprefix("tree-v2:")) == 64
 
 
 def test_resolve_project_memory_rejects_invalid_accept(tmp_path: Path) -> None:
@@ -985,6 +1022,106 @@ def test_ssh_project_publish_rejects_non_regular_archive_member(
         )
 
     assert not (remote / "projects" / project_id).exists()
+
+
+def _replace_colliding_archive_tree(prepared: PreparedTransfer) -> bytes:
+    changed = io.BytesIO()
+    with (
+        tarfile.open(fileobj=changed, mode="w:gz") as output,
+        tarfile.open(
+            fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz"
+        ) as source,
+    ):
+        for member in source.getmembers():
+            if member.name == "payload/x":
+                member.size = 0
+                output.addfile(member, io.BytesIO())
+                replacement = tarfile.TarInfo("payload/y")
+                replacement.size = 1
+                replacement.mode = 0o600
+                output.addfile(replacement, io.BytesIO(b"Z"))
+            else:
+                output.addfile(member, source.extractfile(member))
+    return changed.getvalue()
+
+
+def test_materialize_rejects_colliding_altered_archive(tmp_path: Path) -> None:
+    snapshot, project_id = _format_two_project_snapshot(tmp_path)
+    (snapshot / "x").write_bytes(b"y\0Z")
+    prepared = prepare_project_transfer(snapshot)
+    altered = PreparedTransfer(
+        _replace_colliding_archive_tree(prepared), prepared.transfer_digest
+    )
+
+    with (
+        pytest.raises(ProjectPublicationError, match="digest does not match"),
+        materialize_project_transfer(altered, project_id),
+    ):
+        pass
+
+
+def test_ssh_rejects_colliding_altered_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot, project_id = _format_two_project_snapshot(tmp_path)
+    (snapshot / "x").write_bytes(b"y\0Z")
+    prepared = prepare_project_transfer(snapshot)
+    altered = PreparedTransfer(
+        _replace_colliding_archive_tree(prepared), prepared.transfer_digest
+    )
+    remote = tmp_path / "remote"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    monkeypatch.setattr(ssh_module, "prepare_project_transfer", lambda _path: altered)
+
+    with pytest.raises(RemoteSyncError):
+        SshTransport("fake", str(remote), name="cloud").publish_project(
+            project_id, snapshot, expected_digest="missing"
+        )
+
+    assert not (remote / "projects" / project_id).exists()
+
+
+def test_legacy_project_digest_is_upgraded_at_sync_entry(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(first, repo)
+    opened.store.close()
+    push_project_memory(first, LocalTransport(second), project_id=project.project_id)
+
+    class LegacyDigestTransport(LocalTransport):
+        published_expected = ""
+        race = False
+
+        def fetch_project(self, project_id: str, destination: Path) -> str:
+            super().fetch_project(project_id, destination)
+            return _legacy_project_digest(destination)
+
+        def publish_project(
+            self, project_id: str, snapshot: Path, *, expected_digest: str
+        ) -> None:
+            self.published_expected = expected_digest
+            if self.race:
+                (self.home / "projects" / project_id / "concurrent").write_text(
+                    "preserve me\n"
+                )
+            super().publish_project(
+                project_id, snapshot, expected_digest=expected_digest
+            )
+
+    transport = LegacyDigestTransport(second)
+    result = push_project_memory(first, transport, project_id=project.project_id)
+
+    assert result.conflicts == ()
+    assert transport.published_expected.startswith("tree-v2:")
+
+    transport.race = True
+    with pytest.raises(RemoteSyncError, match="remote changed during transfer"):
+        push_project_memory(first, transport, project_id=project.project_id)
+    assert (
+        second / "projects" / project.project_id / "concurrent"
+    ).read_text() == "preserve me\n"
 
 
 def test_ssh_upload_uses_validated_archive_after_source_change(

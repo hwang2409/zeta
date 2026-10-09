@@ -29,6 +29,8 @@ _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
 _MAX_HISTORY = 128
 _MAX_FORMAT_TWO_STATE_SIZE = 8 * 1024 * 1024
+_PROJECT_DIGEST_PREFIX = "tree-v2:"
+_TREE_DIGEST_DOMAIN = b"zeta-project-tree-v2\0"
 
 
 class ProjectPublicationError(Exception):
@@ -236,44 +238,61 @@ def atomic_publish_file(
         temporary.unlink(missing_ok=True)
 
 
+def _tree_digest(root: Path, paths: Iterator[Path]) -> str:
+    """Hash a canonical file tree with unambiguous path/content framing."""
+
+    digest = hashlib.sha256(_TREE_DIGEST_DOMAIN)
+    for path in sorted(
+        paths, key=lambda candidate: candidate.relative_to(root).as_posix()
+    ):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        content = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                content.update(chunk)
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(content.digest())
+    return digest.hexdigest()
+
+
 def transfer_digest(root: Path) -> str:
     """Hash every file in one exact transfer tree."""
 
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
+    paths: list[Path] = []
+    for path in root.rglob("*"):
         if path.is_symlink():
             raise ProjectPublicationError("project snapshot contains a symlink")
-        if not path.is_file():
-            continue
-        digest.update(path.relative_to(root).as_posix().encode() + b"\0")
-        with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-    return digest.hexdigest()
+        if path.is_file():
+            paths.append(path)
+    return _tree_digest(root, iter(paths))
 
 
 def project_digest(root: Path) -> str:
-    digest = hashlib.sha256()
     if not root.exists():
         return _MISSING
     has_version_store = (root / "memory-current.json").is_file()
-    for path in sorted(root.rglob("*")):
-        if (
-            not path.is_file()
-            or path.is_symlink()
-            or path.name in _EXCLUDED_NAMES
-            or (
-                has_version_store
-                and path.parent == root / "memory"
-                and path.name in MEMORY_FILES
-            )
-        ):
-            continue
-        digest.update(path.relative_to(root).as_posix().encode() + b"\0")
-        with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-    return digest.hexdigest()
+    paths = (
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and not path.is_symlink()
+        and path.name not in _EXCLUDED_NAMES
+        and not (
+            has_version_store
+            and path.parent == root / "memory"
+            and path.name in MEMORY_FILES
+        )
+    )
+    return _PROJECT_DIGEST_PREFIX + _tree_digest(root, paths)
+
+
+def normalize_project_digest(reported: str, snapshot: Path) -> str:
+    """Upgrade a legacy fetch baseline to the digest of the fetched bytes."""
+
+    if reported == _MISSING or reported.startswith(_PROJECT_DIGEST_PREFIX):
+        return reported
+    return project_digest(snapshot)
 
 
 def _validate_snapshot(snapshot: Path, project_id: str) -> None:
