@@ -135,6 +135,22 @@ def atomic_publish_file(
         temporary.unlink(missing_ok=True)
 
 
+def transfer_digest(root: Path) -> str:
+    """Hash every file in one exact transfer tree."""
+
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ProjectPublicationError("project snapshot contains a symlink")
+        if not path.is_file():
+            continue
+        digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
 def project_digest(root: Path) -> str:
     digest = hashlib.sha256()
     if not root.exists():

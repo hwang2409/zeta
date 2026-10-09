@@ -23,8 +23,8 @@ from .memory.version_store import (
     require_memory_format,
 )
 from .project_errors import ProjectRegistryError
+from .project_schema import MAX_MEMORY_FILE_SIZE
 
-MAX_MEMORY_FILE_SIZE = 128 * 1024
 MAX_RETAINED_VERSIONS = 128
 PROJECT_MEMORY_FILES = (
     "brief.md",

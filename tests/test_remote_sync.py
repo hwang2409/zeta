@@ -919,6 +919,43 @@ def test_initial_format_two_snapshot_rejects_semantically_invalid_state(
     assert not list(projects.glob(f".{project_id}.incoming-*"))
 
 
+@pytest.mark.parametrize("archive_change", ("alter", "extra", "missing"))
+def test_ssh_project_publish_rejects_unvalidated_archive_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    archive_change: str,
+) -> None:
+    snapshot, project_id = _format_two_project_snapshot(tmp_path)
+    remote = tmp_path / "remote"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    original_pack = ssh_module._pack
+
+    if archive_change == "extra":
+        mirror = snapshot / "memory" / "brief.md"
+        mirror.unlink()
+
+    def corrupt_archive_source(source: Path, destination: Path) -> None:
+        mirror = source / "memory" / "brief.md"
+        if archive_change == "alter":
+            mirror.write_text("unvalidated mirror\n", encoding="utf-8")
+        elif archive_change == "extra":
+            mirror.write_text("injected mirror\n", encoding="utf-8")
+        else:
+            mirror.unlink()
+        original_pack(source, destination)
+
+    monkeypatch.setattr(ssh_module, "_pack", corrupt_archive_source)
+
+    with pytest.raises(RemoteSyncError):
+        SshTransport("fake", str(remote), name="cloud").publish_project(
+            project_id, snapshot, expected_digest="missing"
+        )
+
+    projects = remote / "projects"
+    assert not (projects / project_id).exists()
+    assert not list(projects.glob(f".{project_id}.incoming-*"))
+
+
 def test_ssh_pull_rejects_semantically_invalid_initial_format_two_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1019,6 +1056,14 @@ def test_project_schema_has_single_source() -> None:
 
     schema_source = Path(schema.__file__).read_text(encoding="utf-8")
     assert schema_source in ssh_module._project_install_script()
+
+    source_root = Path(schema.__file__).parent
+    limit_owners = {
+        path.relative_to(source_root).as_posix()
+        for path in source_root.rglob("*.py")
+        if "128 * 1024" in path.read_text(encoding="utf-8")
+    }
+    assert limit_owners == {"project_schema.py"}
 
 
 def test_interrupted_initial_creation_leaves_no_incoming_artifacts_local(

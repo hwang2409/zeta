@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 from zeta.memory.safety import contains_secret
 from zeta.project_errors import ProjectRegistryError
+from zeta.project_schema import MAX_MEMORY_FILE_SIZE
 from zeta.protocol.types import MessageOrigin
 
 MAX_ENTRIES = 1_000
@@ -305,7 +306,11 @@ def _validate_entry(entry: MemoryEntry, state: MemoryState, kinds: set[str]) -> 
         _fail("invalid memory entry kind or representation")
     _safe_text(
         entry.text,
-        maximum=128 * 1024 if entry.representation == "legacy_document" else MAX_ENTRY_TEXT_BYTES,
+        maximum=(
+            MAX_MEMORY_FILE_SIZE
+            if entry.representation == "legacy_document"
+            else MAX_ENTRY_TEXT_BYTES
+        ),
         label="entry text",
     )
     if contains_secret(entry.text):

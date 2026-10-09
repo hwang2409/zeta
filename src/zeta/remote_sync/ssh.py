@@ -180,7 +180,7 @@ finally:
 _PROJECT_INSTALL_WRAPPER = r"""
 import sys, tarfile, tempfile
 home = Path(sys.argv[1]).expanduser().resolve()
-ident, expected, validated = sys.argv[2], sys.argv[3], sys.argv[4]
+ident, expected, transfer = sys.argv[2], sys.argv[3], sys.argv[4]
 max_members, max_bytes = int(sys.argv[5]), int(sys.argv[6])
 if Path(ident).parts != (ident,): sys.exit(45)
 home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -215,7 +215,7 @@ with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as tempor
                     if source.read(1): sys.exit(50)
                 target.chmod(0o600)
             else: sys.exit(46)
-    if project_digest(staging) != validated: sys.exit(46)
+    if transfer_digest(staging) != transfer: sys.exit(46)
     try:
         publish_local_project(home, ident, staging, expected_digest=expected)
     except ProjectPublicationError as exc:
@@ -336,7 +336,7 @@ class SshTransport:
                 project_id,
                 outgoing,
                 expected_digest,
-                project_publish.project_digest(outgoing),
+                project_publish.transfer_digest(outgoing),
             )
 
     def _existing_state(
@@ -398,7 +398,7 @@ class SshTransport:
             )
 
     def _install_project(
-        self, ident: str, source: Path, expected: str, validated: str
+        self, ident: str, source: Path, expected: str, transfer: str
     ) -> None:
         with tempfile.TemporaryDirectory(prefix="zeta-ssh-install-") as temporary:
             archive = Path(temporary) / "snapshot.tar.gz"
@@ -410,7 +410,7 @@ class SshTransport:
                         self._home(),
                         ident,
                         expected,
-                        validated,
+                        transfer,
                         str(self.max_archive_members),
                         str(self.max_archive_bytes),
                     ],
