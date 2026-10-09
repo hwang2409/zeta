@@ -101,7 +101,9 @@ from ._completion import (
     assistant_reset_event,
     can_retry_context,
     close_completion,
+    ensure_context_reduced,
     provider_events,
+    provider_prompt_tokens,
     provider_retry_notice,
     start_provider_attempt,
     task_is_cancelling,
@@ -848,6 +850,7 @@ class AgentLoop(
         yield StreamEvent(StreamEventType.AGENT_START)
         turn_number = 0
         retrying_context = False
+        overflow_context_tokens: int | None = None
         retrying_provider = False
         provider_retry_budget: ProviderRetryBudget | None = None
         self._turn_provider_retry_records = []
@@ -899,11 +902,16 @@ class AgentLoop(
                         data={"turn": turn_number},
                     )
                 context_messages = await self.context_assembler.assemble(
-                    backend=self.backend, force=retrying_context
+                    backend=self.backend,
+                    force=retrying_context,
+                    emergency=retrying_context,
                 )
                 if self._plan_mode:
                     context_messages = plan_mode_messages(context_messages)
                 context = self.context_assembler.last_context
+                if retrying_context:
+                    current_tokens = None if context is None else context.token_count
+                    ensure_context_reduced(current_tokens, overflow_context_tokens)
                 if context is not None and context.compacted:
                     yield StreamEvent(
                         StreamEventType.COMPACTION_END,
@@ -918,6 +926,7 @@ class AgentLoop(
                     context_messages.extend(steering.messages)
                 provider_retry_budget = start_provider_attempt(provider_retry_budget)
                 self._turn_provider_retry_records = provider_retry_budget.records
+                self.context_assembler.begin_provider_attempt(context_messages)
                 completion = apply_retry_budget(
                     self.backend.complete(context_messages, active_tools),
                     provider_retry_budget,
@@ -1002,6 +1011,9 @@ class AgentLoop(
             if provider_error is not None and can_retry_context(
                 provider_error, retrying_context, partial_blocks, assistant_message
             ):
+                context = self.context_assembler.last_context
+                overflow_context_tokens = None if context is None else context.token_count
+                self.context_assembler.record_context_overflow(provider_prompt_tokens(provider_error_source))
                 retrying_context = True
                 yield StreamEvent(
                     StreamEventType.RETRY,
@@ -1060,7 +1072,10 @@ class AgentLoop(
             if assistant_message is None:
                 assistant_message = Message(MessageRole.ASSISTANT)
             assistant_message = self._annotate_current_turn(assistant_message)
-            metadata = dict(assistant_message.metadata)
+            metadata = {
+                **assistant_message.metadata,
+                **self.context_assembler.completion_metadata(),
+            }
             metadata[ASSISTANT_RESPONSE_STATE] = ASSISTANT_RESPONSE_COMPLETED
             assistant_message = Message(
                 assistant_message.role,

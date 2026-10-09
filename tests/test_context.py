@@ -757,10 +757,115 @@ async def test_provider_usage_informs_next_assembly(context_root: Path) -> None:
         backend=backend,
     )
     await assembler.assemble()
-    assembler.record_usage({"total_tokens": 100})
+    assembler.record_usage({"input_tokens": 100})
 
     with pytest.raises(BudgetExceeded):
         await assembler.assemble()
+
+
+@pytest.mark.asyncio
+async def test_eviction_triggers_with_safety_margin_and_calibration(
+    context_root: Path,
+) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(text(MessageRole.ASSISTANT, "old"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        token_counter=lambda message: 1
+        if message.metadata.get("context_evicted")
+        else 40,
+        safety_margin=0.1,
+    )
+    assembler.last_context = assembler._context(
+        [text(MessageRole.ASSISTANT, "previous")], False
+    )
+    assembler.record_usage({"input_tokens": 48})
+
+    compacted = await assembler.assemble_context()
+
+    assert compacted.compacted is True
+    assert assembler.calibration_ratio == pytest.approx(1.2)
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("completed")],
+            metadata=assembler.completion_metadata(),
+        )
+    )
+    reopened = ContextAssembler(
+        ConversationStore(context_root, session_id=store.session_id)
+    )
+    assert reopened.calibration_ratio == pytest.approx(1.2)
+
+
+@pytest.mark.asyncio
+async def test_calibrated_eviction_targets_provider_space(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+    for index in range(4):
+        store.append_message(text(MessageRole.ASSISTANT, f"old {index}"))
+    store.append_message(
+        with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER)
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        token_counter=lambda message: 1
+        if message.metadata.get("context_evicted")
+        else 20,
+        safety_margin=0.1,
+    )
+    assembler._provider_budgets = assembler._calibration.calibrate(100, 200)
+
+    compacted = await assembler.assemble_context()
+
+    assert compacted.compacted is True
+    assert compacted.token_count * assembler.calibration_ratio < 90
+    marker_count = store.compaction_marker_count()
+    repeated = await assembler.assemble_context()
+    assert repeated.compacted is False
+    assert store.compaction_marker_count() == marker_count
+
+
+@pytest.mark.asyncio
+async def test_emergency_eviction_targets_half_provider_limit(
+    context_root: Path,
+) -> None:
+    store = ConversationStore(context_root)
+    for index in range(4):
+        store.append_message(text(MessageRole.ASSISTANT, f"old {index}"))
+    store.append_message(
+        with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER)
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        token_counter=lambda message: 1
+        if message.metadata.get("context_evicted")
+        else 20,
+    )
+    assembler._provider_budgets = assembler._calibration.calibrate(100, 200)
+
+    compacted = await assembler.assemble_context(force=True, emergency=True)
+
+    assert compacted.compacted is True
+    assert compacted.token_count * assembler.calibration_ratio <= 50
+
+
+def test_summary_usage_does_not_change_context_calibration(
+    context_root: Path,
+) -> None:
+    assembler = ContextAssembler(ConversationStore(context_root))
+    assembler._provider_budgets = assembler._calibration.calibrate(100, 200)
+
+    assembler._record_session_usage({"input_tokens": 1})
+
+    assert assembler.calibration_ratio == pytest.approx(2.0)
+    assert assembler.tokens_used_this_session == 1
 
 
 @pytest.mark.asyncio
@@ -1000,7 +1105,7 @@ async def test_same_state_recompaction_survives_cold_reload(context_root: Path) 
 
     await assembler.assemble()
     first_marker = next(entry for entry in store.entries if entry.type == "compaction")
-    assembler.record_usage({"total_tokens": 300})
+    assembler.record_usage({"input_tokens": 300})
     await assembler.assemble()
     markers = [entry for entry in store.entries if entry.type == "compaction"]
 

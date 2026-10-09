@@ -395,6 +395,29 @@ def _evict_persisted_records(
     return output, regenerated
 
 
+def valid_eviction_view(
+    entry: ConversationEntry, active_source_seqs: Collection[int]
+) -> bool:
+    """Accept only ordered source rows from earlier on the active branch."""
+
+    view = entry.data.get("view")
+    if not isinstance(view, list) or not all(
+        isinstance(item, Mapping) for item in view
+    ):
+        return False
+    seqs = [item.get("seq") for item in view]
+    return (
+        all(type(seq) is int for seq in seqs)
+        and seqs == sorted(set(seqs))
+        and all(
+            entry.data["source_seq_start"] <= seq <= entry.data["source_seq_end"]
+            and seq in active_source_seqs
+            and seq < entry.seq
+            for seq in seqs
+        )
+    )
+
+
 def eviction_view(
     records: Sequence[tuple[int, Message]], result: EvictionResult
 ) -> list[dict[str, object]]:

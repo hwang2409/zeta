@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -72,6 +73,19 @@ _COMPATIBILITY_EXPORTS = (
 )
 
 BlockKey = tuple[int, str, int]
+
+_CODEX_RESULT_TOKENS = re.compile(
+    r"\bresulted in ([0-9][0-9,]*) tokens?\b", re.IGNORECASE
+)
+
+
+def _provider_prompt_tokens(detail: Mapping[str, Any]) -> int | None:
+    prompt_tokens = detail.get("prompt_tokens")
+    if type(prompt_tokens) is int and prompt_tokens >= 0:
+        return prompt_tokens
+    message = detail.get("message")
+    match = _CODEX_RESULT_TOKENS.search(message) if type(message) is str else None
+    return int(match.group(1).replace(",", "")) if match is not None else None
 
 
 @dataclass(slots=True)
@@ -341,6 +355,7 @@ def _http_error(
                 and detail.get("code") == "context_length_exceeded"
             ):
                 error.code = "context_length_exceeded"
+                error.provider_prompt_tokens = _provider_prompt_tokens(detail)
     return error
 
 
@@ -440,13 +455,15 @@ def _translate_event(
         if not isinstance(detail, Mapping):
             detail = {key: value for key, value in payload.items() if key != "type"}
         error = decode_stream_error(detail)
-        raise CodexStreamError(
+        failure = CodexStreamError(
             error.message,
             code=error.code,
             status_code=error.status_code,
             retryable=error.retry_reason is not None,
             retry_reason=error.retry_reason,
         )
+        failure.provider_prompt_tokens = _provider_prompt_tokens(detail)
+        raise failure
     if event_type == "response.created":
         if response_state != "not-started":
             raise CodexStreamError("Codex response.created is duplicated")
@@ -894,13 +911,15 @@ def _decode_terminal_response(
         if not isinstance(detail, Mapping):
             detail = {}
         error = decode_stream_error(detail)
-        raise CodexStreamError(
+        failure = CodexStreamError(
             error.message,
             code=error.code,
             status_code=error.status_code,
             retryable=error.retry_reason is not None,
             retry_reason=error.retry_reason,
         )
+        failure.provider_prompt_tokens = _provider_prompt_tokens(detail)
+        raise failure
     if response is not None and not isinstance(response, Mapping):
         raise CodexStreamError("Codex response completion is invalid")
     if any(item.state != "stopped" for item in items.values()):
