@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..context_calibration import ContextCalibration
+from .context_usage import SessionUsage
 from ..context_accounting import (
     context_digest as _digest,
     cooperative_call as _cooperative_call,
@@ -178,11 +179,9 @@ class ContextAssembler:
         )
         self._provider_budgets = self._calibration.provider_budgets
         self._provider_attempt_estimate: int | None = None
-        self._tokens_used_this_session = 0
-        self._cache_read_input_tokens_this_session = 0
-        self._cache_creation_input_tokens_this_session = 0
-        self._uncached_input_tokens_this_session = 0
-        self._output_tokens_this_session = 0
+        self._session_usage = SessionUsage(
+            sink=self.usage_sink, on_growth=self.on_token_growth
+        )
 
     @property
     def digest(self) -> str | None:
@@ -219,23 +218,23 @@ class ContextAssembler:
 
     @property
     def tokens_used_this_session(self) -> int:
-        return self._tokens_used_this_session
+        return self._session_usage.total
 
     @property
     def cache_read_input_tokens_this_session(self) -> int:
-        return self._cache_read_input_tokens_this_session
+        return self._session_usage.cache_read
 
     @property
     def cache_creation_input_tokens_this_session(self) -> int:
-        return self._cache_creation_input_tokens_this_session
+        return self._session_usage.cache_creation
 
     @property
     def uncached_input_tokens_this_session(self) -> int:
-        return self._uncached_input_tokens_this_session
+        return self._session_usage.uncached_input
 
     @property
     def output_tokens_this_session(self) -> int:
-        return self._output_tokens_this_session
+        return self._session_usage.output
 
     @property
     def descendant_usage(self) -> dict[str, int]:
@@ -275,11 +274,10 @@ class ContextAssembler:
 
     def record_context_overflow(self, provider_prompt_tokens: int | None) -> None:
         estimate = self._provider_attempt_estimate
-        if provider_prompt_tokens is None or estimate is None:
-            return
-        self._provider_budgets = self._calibration.calibrate(
-            estimate, provider_prompt_tokens
-        )
+        if provider_prompt_tokens is not None and estimate is not None:
+            self._provider_budgets = self._calibration.calibrate(
+                estimate, provider_prompt_tokens
+            )
 
     def completion_metadata(self) -> dict[str, Any]:
         return self._calibration.completion_metadata(
@@ -293,9 +291,10 @@ class ContextAssembler:
     def record_usage(self, usage: Mapping[str, Any]) -> None:
         self.last_usage = dict(usage)
         provider_tokens = self._calibration.provider_input_tokens(usage)
-        estimate = self._provider_attempt_estimate
-        if estimate is None and self.last_context is not None:
-            estimate = self.last_context.token_count
+        estimate = (
+            self.last_context.token_count if self._provider_attempt_estimate is None
+            and self.last_context is not None else self._provider_attempt_estimate
+        )
         if provider_tokens is not None and estimate is not None:
             self._provider_budgets = self._calibration.calibrate(
                 estimate, provider_tokens
@@ -303,38 +302,7 @@ class ContextAssembler:
         self._record_session_usage(usage)
 
     def _record_session_usage(self, usage: Mapping[str, Any]) -> None:
-        input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
-        output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
-        cache_read_tokens = usage.get("cache_read_input_tokens")
-        cache_creation_tokens = usage.get("cache_creation_input_tokens")
-        if type(input_tokens) is int and input_tokens >= 0:
-            self._uncached_input_tokens_this_session += input_tokens
-        if type(output_tokens) is int and output_tokens >= 0:
-            self._output_tokens_this_session += output_tokens
-        if type(cache_read_tokens) is int and cache_read_tokens >= 0:
-            self._cache_read_input_tokens_this_session += cache_read_tokens
-        if type(cache_creation_tokens) is int and cache_creation_tokens >= 0:
-            self._cache_creation_input_tokens_this_session += cache_creation_tokens
-        total = usage.get("total_tokens")
-        if type(total) is not int:
-            known_tokens = [
-                value
-                for value in (
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_creation_tokens,
-                )
-                if type(value) is int and value >= 0
-            ]
-            if known_tokens:
-                total = sum(known_tokens)
-        if type(total) is int and total >= 0:
-            self._tokens_used_this_session += total
-        if self.usage_sink is not None:
-            self.usage_sink(usage)
-        if self.on_token_growth is not None:
-            self.on_token_growth(self._tokens_used_this_session)
+        self._session_usage.record(usage)
 
     def observe_event(self, event: StreamEvent) -> None:
         usage = event.data.get("usage")

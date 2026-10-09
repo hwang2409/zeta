@@ -757,7 +757,7 @@ async def test_provider_usage_informs_next_assembly(context_root: Path) -> None:
         backend=backend,
     )
     await assembler.assemble()
-    assembler.record_usage({"total_tokens": 100})
+    assembler.record_usage({"input_tokens": 100})
 
     with pytest.raises(BudgetExceeded):
         await assembler.assemble()
@@ -1105,7 +1105,7 @@ async def test_same_state_recompaction_survives_cold_reload(context_root: Path) 
 
     await assembler.assemble()
     first_marker = next(entry for entry in store.entries if entry.type == "compaction")
-    assembler.record_usage({"total_tokens": 300})
+    assembler.record_usage({"input_tokens": 300})
     await assembler.assemble()
     markers = [entry for entry in store.entries if entry.type == "compaction"]
 

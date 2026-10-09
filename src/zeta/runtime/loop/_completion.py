@@ -140,6 +140,11 @@ def ensure_context_reduced(current: int | None, previous: int | None) -> None:
         )
 
 
+def provider_prompt_tokens(error: BaseException | ErrorInfo | None) -> int | None:
+    value = getattr(error, "provider_prompt_tokens", None)
+    return value if type(value) is int and value >= 0 else None
+
+
 def can_retry_context(
     error: ErrorInfo, retrying: bool, partial: list[ContentBlock], message: Message | None
 ) -> bool:

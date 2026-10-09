@@ -103,6 +103,7 @@ from ._completion import (
     close_completion,
     ensure_context_reduced,
     provider_events,
+    provider_prompt_tokens,
     provider_retry_notice,
     start_provider_attempt,
     task_is_cancelling,
@@ -1012,11 +1013,7 @@ class AgentLoop(
             ):
                 context = self.context_assembler.last_context
                 overflow_context_tokens = None if context is None else context.token_count
-                self.context_assembler.record_context_overflow(
-                    getattr(provider_error_source, "provider_prompt_tokens", None)
-                    if provider_error_source is not None
-                    else None
-                )
+                self.context_assembler.record_context_overflow(provider_prompt_tokens(provider_error_source))
                 retrying_context = True
                 yield StreamEvent(
                     StreamEventType.RETRY,
