@@ -375,3 +375,40 @@ skill_catalog=SkillCatalog.empty(),
     result = app.slash_theme("nope")
     assert result.startswith("theme unchanged")
     assert theme_module.active_palette().name == original
+
+
+@pytest.mark.parametrize(
+    ("env", "insert_shape"),
+    [
+        (None, "BEAM"),
+        ("1", "BEAM"),
+        ("0", "BLOCK"),
+        ("false", "BLOCK"),
+        ("off", "BLOCK"),
+    ],
+)
+def test_vim_cursor_shape_follows_zeta_vertical_bar(
+    monkeypatch: pytest.MonkeyPatch, env: str | None, insert_shape: str
+) -> None:
+    from types import SimpleNamespace
+
+    from prompt_toolkit.cursor_shapes import CursorShape
+    from prompt_toolkit.enums import EditingMode
+    from prompt_toolkit.key_binding.vi_state import InputMode
+
+    from zeta.tui.key_bindings import VimCursorShapeConfig
+
+    if env is None:
+        monkeypatch.delenv("ZETA_VERTICAL_BAR", raising=False)
+    else:
+        monkeypatch.setenv("ZETA_VERTICAL_BAR", env)
+    config = VimCursorShapeConfig()
+
+    def shape(mode: InputMode) -> CursorShape:
+        app = SimpleNamespace(
+            editing_mode=EditingMode.VI, vi_state=SimpleNamespace(input_mode=mode)
+        )
+        return config.get_cursor_shape(app)  # type: ignore[arg-type]
+
+    assert shape(InputMode.INSERT) is CursorShape[insert_shape]
+    assert shape(InputMode.NAVIGATION) is CursorShape.BLOCK

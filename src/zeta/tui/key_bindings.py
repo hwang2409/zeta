@@ -6,6 +6,7 @@ it via the ``[keybindings]`` table in ``settings.toml`` — see ZETA-73).
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from functools import partial
 from typing import Any, Final
@@ -252,12 +253,20 @@ class FullScreenPromptSession(PromptSession[str]):
 
 
 class VimCursorShapeConfig(CursorShapeConfig):
-    """Use a beam in insert mode and a block in every other vi mode."""
+    """Use a beam in insert mode and a block in every other vi mode.
+
+    ``ZETA_VERTICAL_BAR=0`` (or ``false``/``no``/``off``) keeps the block in
+    insert mode too.
+    """
+
+    def __init__(self) -> None:
+        value = os.environ.get("ZETA_VERTICAL_BAR", "1").strip().lower()
+        self._insert_beam = value not in {"0", "false", "no", "off"}
 
     def get_cursor_shape(self, application: Application[Any]) -> CursorShape:
         if getattr(application, "editing_mode", None) is not EditingMode.VI:
             return CursorShape._NEVER_CHANGE
-        if getattr(application.vi_state, "input_mode", None) in {
+        if self._insert_beam and getattr(application.vi_state, "input_mode", None) in {
             InputMode.INSERT,
             InputMode.INSERT_MULTIPLE,
         }:
