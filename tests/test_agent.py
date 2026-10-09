@@ -6464,8 +6464,8 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
     registry = ProjectRegistry(home / "projects")
     project_a = registry.find_or_create_for_directory(parent_cwd)
     project_b = registry.find_or_create_for_directory(child_cwd)
-    registry.update_memory(project_a.project_id, {"state.md": "PROJECT A MEMORY"})
-    registry.update_memory(project_b.project_id, {"state.md": "PROJECT B MEMORY"})
+    registry._replace_entry_kind(project_a.project_id, "state", "PROJECT A MEMORY")
+    registry._replace_entry_kind(project_b.project_id, "state", "PROJECT B MEMORY")
     (child_cwd / "AGENTS.md").write_text("CHILD CWD INSTRUCTIONS")
 
     parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
@@ -6499,13 +6499,16 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
             {"name": "state.md", "content": "UPDATED BY CHILD"},
         )
     )
-    assert result["isError"] is False
-    assert dict(registry.load_memory(project_a.project_id))["state.md"] == (
-        "UPDATED BY CHILD"
+    assert result["isError"] is True
+    assert result["structuredContent"]["error"]["message"] == (
+        "this project uses entry memory; memory is maintained automatically"
     )
-    assert dict(registry.load_memory(project_b.project_id))["state.md"] == (
-        "PROJECT B MEMORY"
-    )
+    assert "PROJECT A MEMORY" in registry._entry_memory_mirrors(project_a.project_id)[
+        "state"
+    ]
+    assert "PROJECT B MEMORY" in registry._entry_memory_mirrors(project_b.project_id)[
+        "state"
+    ]
     await child_tools.close()
     await parent_tools.close()
     child_store.close()
