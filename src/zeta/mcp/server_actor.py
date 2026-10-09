@@ -173,7 +173,6 @@ PublishSnapshot = Callable[["MCPServerActor", MCPServerStatus, MCPClient | None]
 
 class MCPServerActor(MCPDefinitionPublisher):
     """Own one server lifecycle and serialize all lifecycle messages."""
-
     def __init__(
         self,
         config: MCPServerConfig,
@@ -230,32 +229,25 @@ class MCPServerActor(MCPDefinitionPublisher):
             stderr_log_path=str(mcp_log_path(config.name)),
         )
         self._closed = False
-
     @property
     def name(self) -> str:
         return self.config.name
-
     @property
     def status(self) -> MCPServerStatus:
         return self._status
-
     @property
     def prompts(self) -> tuple[MCPPrompt, ...]:
         return self._prompts
-
     @property
     def generation(self) -> int:
         return self._generation
-
     @property
     def is_terminal(self) -> bool:
         return self._closed or (self._task is not None and self._task.done())
-
     def start(self) -> asyncio.Task[None]:
         if self._task is None:
             self._task = asyncio.create_task(self._run())
         return self._task
-
     async def wait_started(
         self,
         notice_sink: NoticeSink | None = None,
