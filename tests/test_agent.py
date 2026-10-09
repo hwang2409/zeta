@@ -1966,7 +1966,7 @@ async def test_child_finish_gate_counts_model_turns_and_adopts_after_bound(
 
 
 @pytest.mark.asyncio
-async def test_child_finish_gate_times_out_stalled_stream_and_adopts(
+async def test_child_finish_gate_wait_timeout_adopts(
     tmp_path: Path,
 ) -> None:
     backend = FinishGateBackend("wait")
