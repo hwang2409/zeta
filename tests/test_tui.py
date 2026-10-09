@@ -6567,6 +6567,48 @@ def test_completed_message_rerenders_text_split_by_tool(
 
 
 @pytest.mark.asyncio
+async def test_full_screen_startup_replay_requests_redraw_without_input(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("remembered")]),
+            MessageOrigin.USER,
+        )
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    redraws: list[None] = []
+    app._invalidate_prompt = lambda: redraws.append(None)  # type: ignore[method-assign]
+
+    async def stop_full_screen(
+        session: FullScreenPromptSession, prompt_task: asyncio.Task[object] | None
+    ) -> None:
+        del session, prompt_task
+        app.request_exit()
+
+    app._run_full_screen = stop_full_screen  # type: ignore[method-assign]
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        run_task = asyncio.create_task(app.run(session))
+        await run_task
+        assert redraws
+
+
+@pytest.mark.asyncio
 async def test_startup_replay_rejects_actions_and_defers_runtime_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
