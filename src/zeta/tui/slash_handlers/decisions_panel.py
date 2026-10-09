@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from prompt_toolkit.application import get_app
 from prompt_toolkit.document import Document
 
 from ..cards.decisions import DecisionsPanel

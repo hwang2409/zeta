@@ -371,10 +371,9 @@ class TUIApp(
 
         self._resume_target = session_id
         self._exit_requested = True
-        try:
-            get_app().exit()
-        except Exception:
-            pass
+        session = self._active_session
+        if isinstance(session, FullScreenPromptSession) and session.app.is_running:
+            session.app.exit()
         self.abort_active()
 
     @property
