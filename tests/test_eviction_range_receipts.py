@@ -17,6 +17,7 @@ from zeta.context_eviction import (
     eviction_view,
 )
 from zeta.context_eviction.range_receipts import _is_receipt_kind
+from zeta.context_eviction.receipt_constructors import _tool_call_receipt
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     ImageContent,
@@ -51,9 +52,12 @@ def _notification_receipt(seq: int) -> Message:
 
 
 def _tool_receipt_pair(seq: int, name: str, call_id: str) -> list[tuple[int, Message]]:
-    call = Message(
-        MessageRole.ASSISTANT,
-        [ToolUseContent(ToolCall(call_id, name, {"path": f"{call_id}.txt"}))],
+    call = _tool_call_receipt(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall(call_id, name, {"path": f"{call_id}.txt"}))],
+        ),
+        seq,
     )
     result = _semantic_result_receipt(
         role=MessageRole.TOOL_RESULT,
@@ -82,6 +86,17 @@ def _range_text(message: Message) -> str:
         (_collapsed_assistant_receipt(1, 9, older_read=True), "assistant", None),
         (_collapsed_assistant_receipt(1, 9, older_read=False), "assistant", None),
         (_notification_receipt(1), "notification", None),
+        (
+            _tool_call_receipt(
+                Message(
+                    MessageRole.ASSISTANT,
+                    [ToolUseContent(ToolCall("call-1", "read", {"path": "a.txt"}))],
+                ),
+                1,
+            ),
+            "tool_call",
+            None,
+        ),
         (
             _semantic_result_receipt(
                 role=MessageRole.TOOL_RESULT,
@@ -454,7 +469,13 @@ def test_legacy_view_receipts_are_regenerated_from_source_once() -> None:
         [TextContent("an obsolete receipt that must not be trusted")],
         metadata={"context_evicted": True, "source_seq": 1},
     )
-    counter = lambda message: 10 if message.metadata.get("context_evicted") else 100
+    counter = lambda message: (
+        9
+        if message.metadata.get("eviction_receipt")
+        else 10
+        if message.metadata.get("context_evicted")
+        else 100
+    )
 
     first = evict_messages(
         [(1, legacy)],
@@ -744,3 +765,127 @@ def test_all_eviction_candidates_use_supplied_counter() -> None:
     assert range_evicted.tokens_before == 206
     assert range_evicted.tokens_after == 7
     assert range_evicted.items_evicted == 2
+
+
+def test_unmarked_tool_call_with_receipted_results_is_a_range_boundary() -> None:
+    records = [
+        (
+            1,
+            Message(
+                MessageRole.ASSISTANT,
+                [ToolUseContent(ToolCall("raw-read", "read", {"path": "raw.txt"}))],
+            ),
+        ),
+        (
+            2,
+            _semantic_result_receipt(
+                role=MessageRole.TOOL_RESULT,
+                tool_name="read",
+                tool_call_id="raw-read",
+                seq=2,
+                digest="exact receipt",
+                content_digest="0" * 64,
+            ),
+        ),
+        (3, _assistant_receipt(3)),
+    ]
+
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=lambda message: (
+            1 if message.metadata.get("eviction_range") else 100
+        ),
+    )
+
+    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+
+
+def test_legacy_regeneration_respects_unconsumed_and_notification_protection() -> None:
+    source_result = Message(
+        MessageRole.TOOL_RESULT,
+        tool_result=ToolResult("read-1", "source output " * 100),
+    )
+    persisted_result = Message(
+        MessageRole.TOOL_RESULT,
+        tool_result=ToolResult("read-1", "old receipt"),
+        metadata={"context_evicted": True, "source_seq": 2},
+    )
+    source_notification = Message(
+        MessageRole.SYSTEM,
+        [TextContent("source notification " * 100)],
+        metadata={"zeta_event": "agent_notifications", "notifications": []},
+    )
+    persisted_notification = Message(
+        MessageRole.SYSTEM,
+        [TextContent("old notification receipt")],
+        metadata={"context_evicted": True, "source_seq": 3},
+    )
+    source_call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("read-1", "read", {"path": "secret " * 100}))],
+    )
+    persisted_call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("read-1", "read", {"path": "old receipt"}))],
+        metadata={"context_evicted": True, "source_seq": 1},
+    )
+    source_bash = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("bash-1", "bash", {"command": "secret " * 100}))],
+    )
+    persisted_bash = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("bash-1", "bash", {"command": "old receipt"}))],
+        metadata={"context_evicted": True, "source_seq": 4},
+    )
+    records = [
+        (1, persisted_call),
+        (2, persisted_result),
+        (3, persisted_notification),
+        (4, persisted_bash),
+    ]
+
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        unconsumed_source_seqs={2},
+        source_messages={
+            1: source_call,
+            2: source_result,
+            3: source_notification,
+            4: source_bash,
+        },
+    )
+
+    assert [message.to_dict() for message in result.messages] == [
+        message.to_dict() for _, message in records
+    ]
+
+
+def test_legacy_regeneration_keeps_larger_generated_receipt() -> None:
+    source = Message(MessageRole.ASSISTANT, [TextContent("large source " * 100)])
+    persisted = Message(
+        MessageRole.ASSISTANT,
+        [TextContent("tiny")],
+        metadata={"context_evicted": True, "source_seq": 1},
+    )
+
+    result = evict_messages(
+        [(1, persisted)],
+        fixed_tokens=0,
+        target_tokens=1,
+        source_messages={1: source},
+        token_counter=lambda message: (
+            11
+            if message.metadata.get("eviction_receipt")
+            else 2
+            if message.metadata.get("context_evicted")
+            else 100
+        ),
+    )
+
+    assert result.messages[0].to_dict() == persisted.to_dict()
+    assert result.items_evicted == 0

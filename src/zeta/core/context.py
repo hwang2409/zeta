@@ -630,6 +630,13 @@ class ContextAssembler:
         bypass_hysteresis: bool,
     ) -> _EvictionPlan:
         """Pure eviction planning. This method does not read or mutate the store."""
+        if any(item.message.metadata.get("eviction_view_invalid") for item in items):
+            return _EvictionPlan(
+                "reuse",
+                self._context(
+                    [*system_messages, *(item.message for item in items)], False
+                ),
+            )
         active_markers = self._active_markers(branch)
         eviction_markers = [
             m for m in active_markers if m.data.get("kind") == EVICTION_KIND

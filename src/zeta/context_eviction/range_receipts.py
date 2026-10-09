@@ -98,6 +98,8 @@ def _receipt_unit(
     if calls:
         if any(not isinstance(block, ToolUseContent) for block in message.content):
             return None, index + 1
+        if not _is_receipt_kind(message, seq, "tool_call"):
+            return None, index + 1
         expected = {call.id: call.name for call in calls}
         grouped = [records[index]]
         names: list[str] = []
@@ -139,6 +141,8 @@ def _is_receipt_kind(
         rendered = _round_trip_assistant(message, seq)
     elif kind == "notification":
         rendered = _round_trip_notification(message, seq)
+    elif kind == "tool_call":
+        rendered = _round_trip_tool_call(message, seq)
     else:
         rendered = _round_trip_tool_result(message, seq, tool_name)
     return rendered is not None and rendered.to_dict() == message.to_dict()
@@ -175,6 +179,21 @@ def _round_trip_notification(message: Message, seq: int) -> Message | None:
         return None
     return _notification_receipt_from_fields(
         role=message.role, seq=seq, payload=payload, content_digest=digest
+    )
+
+
+def _round_trip_tool_call(message: Message, seq: int) -> Message | None:
+    from .receipt_constructors import _tool_call_receipt
+
+    fields = message.metadata.get(RECEIPT_FIELDS_METADATA)
+    calls = fields.get("calls") if isinstance(fields, Mapping) else None
+    if not isinstance(calls, list) or not all(isinstance(call, Mapping) for call in calls):
+        return None
+    return _tool_call_receipt(
+        message,
+        seq,
+        fields=calls,
+        metadata=_base_metadata(message),
     )
 
 

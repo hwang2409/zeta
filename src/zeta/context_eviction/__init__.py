@@ -13,7 +13,6 @@ from math import ceil
 from ..context_accounting import message_token_count
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import (
-    ContentBlock,
     Message,
     MessageRole,
     RedactedThinkingContent,
@@ -33,6 +32,7 @@ from .receipt_constructors import (
     _one_line,
     _semantic_result_receipt,
     _structured_result_receipt,
+    _tool_call_receipt,
 )
 
 EVICTION_KIND = "evict"
@@ -142,13 +142,13 @@ def evict_messages(
     messages = [message for _, message in records]
     before = fixed_tokens + sum(token_counter(message) for message in messages)
     changed: set[int] = set()
+    eligibility = _eviction_eligibility(records, unconsumed_source_seqs)
     if source_messages is not None:
         records, regenerated = _regenerate_legacy_receipts(
-            records, source_messages, token_counter
+            records, source_messages, token_counter, eligibility
         )
         messages = [message for _, message in records]
         changed.update(regenerated)
-    eligibility = _eviction_eligibility(records, unconsumed_source_seqs)
     from .range_receipts import range_receipt_candidate
 
     range_candidate = range_receipt_candidate(
@@ -166,7 +166,6 @@ def evict_messages(
 
     calls = _tool_calls(messages)
     call_indexes = _call_indexes(messages)
-    results = _tool_results(messages)
     message_tokens = [token_counter(message) for message in messages]
     running_total = fixed_tokens + sum(message_tokens)
 
@@ -189,6 +188,18 @@ def evict_messages(
 
     def replace(index: int, replacement: Message) -> bool:
         return replace_many(((index, replacement),))
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        if (
+            not eligibility.allows(seq)
+            or message.metadata.get("context_evicted")
+            or not any(isinstance(block, ToolUseContent) for block in message.content)
+        ):
+            continue
+        replace(index, _tool_call_receipt(message, seq))
+        if running_total <= target_tokens:
+            return _result(records, messages, changed, before, running_total, True)
 
     read_counts = _collapse_repeated_reads(
         records,
@@ -281,16 +292,6 @@ def evict_messages(
         if running_total <= target_tokens:
             return _result(records, messages, changed, before, running_total, True)
 
-    for index, (seq, _) in enumerate(records):
-        message = messages[index]
-        if not eligibility.allows(seq):
-            continue
-        replacement = _digest_agent_prompts(message, seq)
-        if replacement is message:
-            continue
-        replace(index, replacement)
-        if running_total <= target_tokens:
-            return _result(records, messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -325,28 +326,6 @@ def evict_messages(
         if running_total <= target_tokens:
             return _result(records, messages, changed, before, running_total, True)
 
-    for index, (seq, _) in enumerate(records):
-        message = messages[index]
-        if not eligibility.allows(seq):
-            continue
-        replacement = _digest_edit_write_payloads(message, seq, results)
-        if replacement is message:
-            continue
-        replace(index, replacement)
-        if running_total <= target_tokens:
-            return _result(records, messages, changed, before, running_total, True)
-
-    for index, (seq, _) in enumerate(records):
-        message = messages[index]
-        if not eligibility.allows(seq):
-            continue
-        replacement = _digest_bash_commands(message, seq)
-        if replacement is message:
-            continue
-        replace(index, replacement)
-        if running_total <= target_tokens:
-            return _result(records, messages, changed, before, running_total, True)
-
     return _result(
         records,
         messages,
@@ -361,6 +340,7 @@ def _regenerate_legacy_receipts(
     records: Sequence[tuple[int, Message]],
     source_messages: Mapping[int, Message],
     token_counter: Callable[[Message], int],
+    eligibility: _EvictionEligibility,
 ) -> tuple[list[tuple[int, Message]], set[int]]:
     """Rebuild persisted legacy receipts from active-branch source rows once."""
 
@@ -374,11 +354,13 @@ def _regenerate_legacy_receipts(
     if not source_records:
         return list(records), set()
     source_calls = _tool_calls(source_messages.values())
+    protected = {seq for seq, _ in records if not eligibility.allows(seq)}
     generated = evict_messages(
         source_records,
         fixed_tokens=0,
         target_tokens=0,
         token_counter=token_counter,
+        unconsumed_source_seqs=protected,
     )
     generated_by_seq = dict(zip(generated.source_seqs, generated.messages, strict=True))
     output: list[tuple[int, Message]] = []
@@ -396,11 +378,15 @@ def _regenerate_legacy_receipts(
         )
         replacement = generated_by_seq.get(seq)
         if (
-            message.metadata.get("context_evicted")
+            eligibility.allows(seq)
+            and message.metadata.get("context_evicted")
             and not message.metadata.get("eviction_view_invalid")
             and not current
             and replacement is not None
             and replacement.metadata.get(RECEIPT_KIND_METADATA)
+            and _strictly_smaller(
+                token_counter(message), token_counter(replacement)
+            )
         ):
             output.append((seq, replacement))
             regenerated.add(seq)
@@ -504,7 +490,12 @@ def _eviction_eligibility(
 ) -> _EvictionEligibility:
     """Classify all records once so transformations cannot infer consumption."""
 
-    protected = set(unconsumed_source_seqs)
+    protected = {
+        seq
+        for seq, message in records
+        if message.metadata.get("eviction_view_invalid")
+    }
+    protected.update(unconsumed_source_seqs)
     unconsumed_result_ids = {
         result.tool_call_id
         for seq, message in records
@@ -621,139 +612,6 @@ def _digest_result(
         is_canceled=result.is_canceled,
         metadata=message.metadata,
     )
-
-
-def _digest_edit_write_payloads(
-    message: Message, seq: int, results: Mapping[str, ToolResult]
-) -> Message:
-    changed = False
-    content: list[ContentBlock] = []
-    for block in message.content:
-        if not isinstance(block, ToolUseContent):
-            content.append(block)
-            continue
-        call = block.tool_call
-        result = results.get(call.id)
-        if (
-            call.name not in {"edit", "write"}
-            or result is None
-            or result.is_error
-            or result.is_canceled
-        ):
-            content.append(block)
-            continue
-        payload_keys = (
-            ("content",)
-            if call.name == "write"
-            else ("old_string", "new_string", "edits")
-        )
-        payload = {
-            key: call.arguments[key] for key in payload_keys if key in call.arguments
-        }
-        if not payload or all(
-            _is_edit_write_receipt(value) for value in payload.values()
-        ):
-            content.append(block)
-            continue
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        receipt = (
-            f"[edit/write payload receipt · seq {seq}] original_chars={len(encoded)} "
-            f"sha256={_content_digest(encoded)[:16]}; recall_history "
-            f"seq_start={seq}, seq_end={seq} for exact payload"
-        )
-        arguments = dict(call.arguments)
-        for key in payload:
-            arguments[key] = (
-                [{"old_string": receipt, "new_string": receipt}]
-                if key == "edits"
-                else receipt
-            )
-        content.append(ToolUseContent(ToolCall(call.id, call.name, arguments)))
-        changed = True
-    return _replaced_tool_call_message(message, content, seq) if changed else message
-
-
-def _is_edit_write_receipt(value: object) -> bool:
-    if isinstance(value, str):
-        return value.startswith("[edit/write payload receipt · seq ")
-    if isinstance(value, list):
-        return bool(value) and all(
-            isinstance(item, Mapping)
-            and bool(item)
-            and all(_is_edit_write_receipt(field) for field in item.values())
-            for item in value
-        )
-    return False
-
-
-def _digest_bash_commands(message: Message, seq: int) -> Message:
-    changed = False
-    content: list[ContentBlock] = []
-    for block in message.content:
-        if not isinstance(block, ToolUseContent):
-            content.append(block)
-            continue
-        call = block.tool_call
-        command_key = "command" if "command" in call.arguments else "cmd"
-        command = call.arguments.get(command_key)
-        if (
-            call.name != "bash"
-            or not isinstance(command, str)
-            or command.startswith("[bash command receipt · seq ")
-        ):
-            content.append(block)
-            continue
-        arguments = dict(call.arguments)
-        arguments[command_key] = (
-            f"[bash command receipt · seq {seq}] original_chars={len(command)} "
-            f"sha256={_content_digest(command)[:16]}; recall_history "
-            f"seq_start={seq}, seq_end={seq} for exact command"
-        )
-        content.append(ToolUseContent(ToolCall(call.id, call.name, arguments)))
-        changed = True
-    return _replaced_tool_call_message(message, content, seq) if changed else message
-
-
-def _replaced_tool_call_message(
-    message: Message, content: list[ContentBlock], seq: int
-) -> Message:
-    return Message(
-        message.role,
-        content,
-        tool_result=message.tool_result,
-        metadata={
-            **message.metadata,
-            "context_evicted": True,
-            "source_seq": seq,
-        },
-    )
-
-
-def _digest_agent_prompts(message: Message, seq: int) -> Message:
-    changed = False
-    content: list[ContentBlock] = []
-    for block in message.content:
-        if not isinstance(block, ToolUseContent):
-            content.append(block)
-            continue
-        call = block.tool_call
-        prompt = call.arguments.get("prompt")
-        if (
-            call.name != "agent"
-            or not isinstance(prompt, str)
-            or prompt.startswith("[agent prompt receipt · seq ")
-        ):
-            content.append(block)
-            continue
-        arguments = dict(call.arguments)
-        arguments["prompt"] = (
-            f"[agent prompt receipt · seq {seq}] original_chars={len(prompt)} "
-            f"sha256={_content_digest(prompt)[:16]}; recall_history "
-            f"seq_start={seq}, seq_end={seq} for exact prompt"
-        )
-        content.append(ToolUseContent(ToolCall(call.id, call.name, arguments)))
-        changed = True
-    return _replaced_tool_call_message(message, content, seq) if changed else message
 
 
 def _orchestration_result_receipt(
