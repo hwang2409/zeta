@@ -220,6 +220,37 @@ def test_oversized_harness_notification_is_bounded_with_large_index(
     assert len(text.encode()) < 7_500
 
 
+def test_oversized_harness_notification_with_turn_context_requires_lossless_handling(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id)
+    notification = {
+        "seq": 71,
+        "type": "message",
+        "data": {
+            "message": {
+                "role": "system",
+                "content": [{"type": "text", "text": "x" * 11_669}],
+                "metadata": {
+                    "zeta_event": "agent_notifications",
+                    "notifications": [{"notification_id": "child-1"}],
+                    "turn_context": True,
+                },
+            }
+        },
+    }
+
+    with pytest.raises(
+        ReconciliationError,
+        match="oversized non-generated transcript row requires lossless handling",
+    ):
+        _prepare_request(
+            _transcript(notification), state, as_of=date(2026, 10, 9)
+        )
+    assert notification["data"]["message"]["content"][0]["text"] == "x" * 11_669
+
+
 def test_oversized_user_row_still_requires_lossless_handling(
     tmp_path: Path,
 ) -> None:

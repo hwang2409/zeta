@@ -383,6 +383,7 @@ def _is_lossy_generated_row(row: Mapping[str, Any]) -> bool:
         and isinstance(metadata, Mapping)
         and metadata.get("zeta_event") == "agent_notifications"
         and isinstance(metadata.get("notifications"), list)
+        and metadata.get("turn_context") is not True
     )
 
 
