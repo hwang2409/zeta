@@ -216,6 +216,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._manual_recovery_probe = False
         self._notice_sink: NoticeSink | None = None
         self._tool_refresh_task: asyncio.Task[list[MCPTool]] | None = None
+        self._tool_refresh_pending = False
         self._status = MCPServerStatus(
             config.name,
             config.transport,
@@ -857,11 +858,10 @@ class MCPServerActor(MCPDefinitionPublisher):
             self._queue.put_nowait(_ToolsListChanged(client))
 
     def _handle_tools_list_changed(self, message: _ToolsListChanged) -> None:
-        if (
-            message.client is not self._client
-            or self._status.state != "mounted"
-            or self._tool_refresh_task is not None
-        ):
+        if message.client is not self._client or self._status.state != "mounted":
+            return
+        if self._tool_refresh_task is not None:
+            self._tool_refresh_pending = True
             return
         task = asyncio.create_task(message.client.list_tools())
         self._tool_refresh_task = task
@@ -877,10 +877,12 @@ class MCPServerActor(MCPDefinitionPublisher):
         if self._tool_refresh_task is message.task:
             self._tool_refresh_task = None
         if message.client is not self._client or self._status.state != "mounted":
+            self._tool_refresh_pending = False
             return
         try:
             tools = self._filter_tools(message.task.result(), self._notice_sink)
         except Exception as exc:  # noqa: BLE001 - refresh failure degrades the server
+            self._tool_refresh_pending = False
             self._degrade_current(_error_text(exc))
             return
         self._unregister_tools()
@@ -900,6 +902,9 @@ class MCPServerActor(MCPDefinitionPublisher):
             self.config.allowed_tools is not None or self.config.disallowed_tools
         ):
             _notice(self._notice_sink, f"mcp · {self.name} mounted with zero tools")
+        if self._tool_refresh_pending:
+            self._tool_refresh_pending = False
+            self._handle_tools_list_changed(_ToolsListChanged(message.client))
 
     def _handle_transport_failure(self, message: _TransportFailure) -> None:
         operation = self._operation

@@ -30,6 +30,7 @@ class FilterClient:
             MCPTool("delete_file", "", {"type": "object"}),
         ]
         self.calls: list[str] = []
+        self.list_calls = 0
         self.notification_sink: Callable[[str], None] | None = None
 
     def set_failure_sink(self, _sink) -> None:
@@ -42,6 +43,7 @@ class FilterClient:
         pass
 
     async def list_tools(self) -> list[MCPTool]:
+        self.list_calls += 1
         return list(self.tools)
 
     async def call_tool(self, name: str, arguments, abort_signal: AbortSignal):
@@ -217,10 +219,12 @@ async def test_mcp_tools_list_changed_reapplies_filter(
         ]
         assert client.notification_sink is not None
         client.notification_sink("notifications/tools/list_changed")
+        client.notification_sink("notifications/tools/list_changed")
         for _ in range(20):
-            if "files__read_next" in registry.registered_names:
+            if "files__read_next" in registry.registered_names and client.list_calls == 3:
                 break
             await asyncio.sleep(0)
         assert registry.registered_names == {"files__read_next"}
+        assert client.list_calls == 3
     finally:
         await mount.close()
