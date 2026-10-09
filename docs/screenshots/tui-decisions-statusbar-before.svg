@@ -40,7 +40,7 @@
     <clipPath id="terminal-2206291627-clip-terminal">
       <rect x="0" y="0" width="1170.1999999999998" height="23.4" />
     </clipPath>
-    
+
     </defs>
 
     <rect fill="#292929" stroke="rgba(255,255,255,0.35)" stroke-width="1" x="1" y="1" width="1188" height="72.4" rx="8"/><text class="terminal-2206291627-title" fill="#c5c8c6" text-anchor="middle" x="594" y="27">tui-decisions-statusbar-before</text>
@@ -49,9 +49,9 @@
             <circle cx="22" cy="0" r="7" fill="#febc2e"/>
             <circle cx="44" cy="0" r="7" fill="#28c840"/>
             </g>
-        
+
     <g transform="translate(9, 41)" clip-path="url(#terminal-2206291627-clip-terminal)">
-    
+
     <g class="terminal-2206291627-matrix">
     <text class="terminal-2206291627-r1" x="0" y="20" textLength="1171.2" clip-path="url(#terminal-2206291627-line-0)">codex/sonnet&#160;&#160;auto&#160;&#160;~/zeta&#160;&#160;idle&#160;&#160;42&#160;(21%)&#160;&#160;&#160;/status&#160;·&#160;ctrl+c&#160;interrupt&#160;·&#160;ctrl+d&#160;quit&#160;·&#160;8e6e6d12</text><text class="terminal-2206291627-r2" x="1171.2" y="20" textLength="12.2" clip-path="url(#terminal-2206291627-line-0)">
 </text>
