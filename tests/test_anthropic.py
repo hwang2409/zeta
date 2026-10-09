@@ -2117,10 +2117,21 @@ def test_anthropic_http_error_redacts_markers_in_valid_json_values() -> None:
 
 def test_anthropic_prompt_too_long_is_context_error() -> None:
     body = json.dumps({
-        "error": {"type": "invalid_request_error", "message": "prompt is too long"}
+        "error": {
+            "type": "invalid_request_error",
+            "message": "prompt is too long: 120 tokens > 100 maximum",
+        }
     }).encode()
 
-    assert anthropic_module._http_error(400, body).code == "context_length_exceeded"
+    error = anthropic_module._http_error(400, body)
+    assert error.code == "context_length_exceeded"
+    assert error.provider_prompt_tokens == 120
+    ambiguous = anthropic_module._http_error(
+        400,
+        b'{"error":{"type":"invalid_request_error","message":"prompt is too long"}}',
+    )
+    assert ambiguous.code == "context_length_exceeded"
+    assert ambiguous.provider_prompt_tokens is None
     assert anthropic_module._http_error(400, b'{"error":{"type":"invalid_request_error","message":"bad tool"}}').code == "http_error"
 
 

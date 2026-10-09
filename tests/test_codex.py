@@ -2887,10 +2887,36 @@ def test_codex_http_error_redacts_markers_in_valid_json_values() -> None:
 
 def test_codex_http_context_error_keeps_structured_code() -> None:
     body = json.dumps({
-        "error": {"code": "context_length_exceeded", "message": "stream error"}
+        "error": {
+            "code": "context_length_exceeded",
+            "message": (
+                "maximum context length is 114688 tokens, however your request "
+                "resulted in 132132 tokens"
+            ),
+        }
     }).encode()
 
-    assert codex_module._http_error(400, body).code == "context_length_exceeded"
+    error = codex_module._http_error(400, body)
+    assert error.code == "context_length_exceeded"
+    assert error.provider_prompt_tokens == 132132
+    structured = codex_module._http_error(
+        400,
+        json.dumps(
+            {
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "stream error",
+                    "prompt_tokens": 140000,
+                }
+            }
+        ).encode(),
+    )
+    assert structured.provider_prompt_tokens == 140000
+    ambiguous = codex_module._http_error(
+        400,
+        b'{"error":{"code":"context_length_exceeded","message":"stream error"}}',
+    )
+    assert ambiguous.provider_prompt_tokens is None
     assert codex_module._http_error(400, b'{"error":{"code":"bad_request"}}').code == "http_error"
 
 

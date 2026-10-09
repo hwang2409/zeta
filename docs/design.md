@@ -83,9 +83,22 @@ bounded no-tools summary fallback. This fallback is internal; users cannot selec
 a model-written summary strategy.
 
 Eviction markers persist the exact replacement view while original messages stay
-in the append-only log. Legacy model-written summary markers remain readable and
-resume as their stored provider view. The read-only `recall_history` tool can
-retrieve exact hidden messages by sequence range or search the active branch.
+in the append-only log. A replacement view can reference an earlier compaction
+row on the active branch. Invalid views are never trusted: assembly rebuilds from
+the original active-branch rows and replaces the invalid marker. Legacy
+model-written summary markers remain readable and resume as their stored provider
+view. The read-only `recall_history` tool can retrieve exact hidden messages by
+sequence range or search the active branch.
+
+Normal eviction starts at 90% of the provider limit by default. `ContextAssembler`
+accepts a `safety_margin` override for provider-specific limits. Provider input
+usage (uncached input plus cache reads and writes) calibrates the local estimate
+with a deterministic, bounded exponential ratio; completed assistant rows persist
+the usage, estimate, and ratio so resume keeps the calibration. A no-output
+provider overflow also records a reported prompt size when the error includes
+one, forces a fresh eviction toward 50% of the limit, and retries once. Recovery
+fails with a diagnostic instead of retrying when it cannot make the context
+strictly smaller.
 
 ## Isolation
 
