@@ -8,6 +8,8 @@ from .memory.reconciliation_state import TerminalReceipt
 from .memory.user_authorization import MemoryMutationAuthorization
 from .project_registry import ProjectRegistryError
 
+SUPPORTED_MEMORY_FORMATS = frozenset({1, 2})
+
 
 class MemoryReconciler(Protocol):
     def terminal_receipts(self) -> tuple[TerminalReceipt, ...]: ...

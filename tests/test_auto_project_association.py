@@ -387,8 +387,8 @@ def test_linked_worktree_loads_primary_project_memory_on_open_and_resume(
     m = SessionManager(home, user_home=user_home)
     primary_session = m.create(provider="codex", model="test", cwd=primary)
     assert primary_session.metadata.project_id is not None
-    m.project_registry.update_memory(
-        primary_session.metadata.project_id, {"state.md": "memory from primary"}
+    m.project_registry._replace_entry_kind(
+        primary_session.metadata.project_id, "state", "memory from primary"
     )
     primary_session.store.close()
     monkeypatch.setenv("HOME", str(user_home))
@@ -573,8 +573,8 @@ def test_first_auto_created_session_refreshes_project_memory_on_resume(
     project_id = app.loop.session_metadata.project_id
     assert project_id is not None
     assert "<zeta-project-memory>" in app.loop.session_metadata.system_prompt
-    ProjectRegistry(home / "projects").update_memory(
-        project_id, {"state.md": "fresh memory after first open"}
+    ProjectRegistry(home / "projects")._replace_entry_kind(
+        project_id, "state", "fresh memory after first open"
     )
     asyncio.run(app.close())
 

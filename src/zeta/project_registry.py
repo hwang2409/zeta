@@ -430,7 +430,12 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
         return result
 
     def create_project(
-        self, name: str, scope: str, canonical_integration_root: str | None = None
+        self,
+        name: str,
+        scope: str,
+        canonical_integration_root: str | None = None,
+        *,
+        memory_profile: str | None = None,
     ) -> Project:
         try:
             name = validate_project_text(name, "name", MAX_NAME_LENGTH)
@@ -438,6 +443,8 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
         except ValueError as exc:
             raise ProjectRegistryError(str(exc)) from exc
         canonical_integration_root = _validate_root(canonical_integration_root)
+        if memory_profile is not None:
+            self._ensure_entry_memory_capabilities()
         with self._locked(write=True) as root_fd:
             projects = self._list_locked(root_fd)
             if len(projects) >= MAX_PROJECTS:
@@ -498,6 +505,10 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                         os.fsync(memory_fd)
                     finally:
                         os.close(memory_fd)
+                    if memory_profile is not None:
+                        self._activate_entry_memory_locked(
+                            directory_fd, project.project_id, memory_profile
+                        )
                     os.fsync(directory_fd)
                 finally:
                     os.close(directory_fd)
@@ -583,7 +594,9 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
             return existing
         base_name = name or path.name
         try:
-            return self.create_project(base_name, scope, path)
+            return self.create_project(
+                base_name, scope, path, memory_profile="zeta"
+            )
         except ProjectRegistryError:
             existing = self.find_for_directory(path)
             if existing is not None:
@@ -595,7 +608,9 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                           f"{base_name}-{hashlib.sha256(str(path).encode()).hexdigest()[:8]}"]
             for candidate in candidates:
                 try:
-                    return self.create_project(candidate, scope, path)
+                    return self.create_project(
+                        candidate, scope, path, memory_profile="zeta"
+                    )
                 except ProjectRegistryError:
                     existing = self.find_for_directory(path)
                     if existing is not None:

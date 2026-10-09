@@ -29,6 +29,8 @@ fall back to the packaged identity.
 
 from __future__ import annotations
 
+SUPPORTED_MEMORY_FORMATS = frozenset({1, 2})
+
 import hashlib
 import logging
 import os
@@ -245,7 +247,9 @@ def _find_or_create_valid_project(
     ]
     for name in names:
         try:
-            return registry.create_project(name, "git", root)
+            return registry.create_project(
+                name, "git", root, memory_profile="zeta"
+            )
         except ProjectRegistryError:
             project = _valid_registry_candidate(
                 registry.find_for_directory(root), discovery
