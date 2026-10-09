@@ -422,6 +422,7 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
         vim_state=vim_state_label(app.vim_mode),
         plan_state="PLAN" if app.loop.plan_mode else None,
         background_count=app.loop.tool_registry.background_tasks.running_count,
+        decisions_count=app.decisions_count,
         undo_available=(
             app._undo_candidate is not None
             and app.active
@@ -460,6 +461,8 @@ def full_screen_content(
     status_active: Callable[[], bool] | None = None,
     tasks_window: AnyContainer | None = None,
     tasks_active: Callable[[], bool] | None = None,
+    decisions_window: AnyContainer | None = None,
+    decisions_active: Callable[[], bool] | None = None,
     finder_window: AnyContainer | None = None,
     finder_active: Callable[[], bool] | None = None,
 ) -> FloatContainer:
@@ -536,6 +539,8 @@ def full_screen_content(
         floats.append(status_card_float(status_window, status_active))
     if tasks_window is not None and tasks_active is not None:
         floats.append(status_card_float(tasks_window, tasks_active))
+    if decisions_window is not None and decisions_active is not None:
+        floats.append(status_card_float(decisions_window, decisions_active))
     if finder_window is not None and finder_active is not None:
         floats.append(finder_float(finder_window, finder_active))
     return FloatContainer(content, floats=floats)

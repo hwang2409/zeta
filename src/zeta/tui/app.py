@@ -95,6 +95,8 @@ from .render import (
 )
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.command_runtime import CommandRuntimeMixin
+from .slash_handlers.decisions_panel import DecisionsMixin
+from .slash_handlers.fork_view import ForkViewMixin
 from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
 from .slash_handlers.tasks_panel import BackgroundTasksMixin
@@ -158,6 +160,8 @@ class TUIApp(
     SlashHandlerMixin,
     MCPManagerMixin,
     BackgroundTasksMixin,
+    DecisionsMixin,
+    ForkViewMixin,
     AgentRunCommandMixin,
     FinderRuntimeMixin,
 ):
@@ -302,6 +306,8 @@ class TUIApp(
         self._status_card_open = False
         self._mcp_manager_open = False
         self._init_background_tasks_panel()
+        self._init_decisions_panel()
+        self._resume_target: str | None = None
         self._mcp_wizard_active = False
         self._mcp_wizard_dialog_active = False
         self._mcp_wizard_task: asyncio.Task[None] | None = None
@@ -314,6 +320,7 @@ class TUIApp(
         self._status_restore_cursor = 0
         self._transcript.set_copy_handler(lambda text: app._copy_selection(text))
         self._agent_navigation = AgentNavigation(self.loop.store)
+        self._init_fork_view()
         self._todo_widget = TodoWidget(
             self.loop.store, selected_store=self._agent_navigation.todo_store
         )
@@ -350,6 +357,25 @@ class TUIApp(
     def request_new_session(self) -> None:
         self._new_session_requested = True
         self.request_exit()
+
+    @property
+    def resume_target(self) -> str | None:
+        return self._resume_target
+
+    def request_resume(self, session_id: str) -> None:
+        """Exit this TUI and resume ``session_id`` in its place.
+
+        Reuses the outer run loop's resume path (the same one ``/new`` uses) so
+        the terminal is restored cleanly instead of re-executing the process.
+        """
+
+        self._resume_target = session_id
+        self._exit_requested = True
+        try:
+            get_app().exit()
+        except Exception:
+            pass
+        self.abort_active()
 
     @property
     def _transcript_lines(self) -> list[str]:
@@ -505,6 +531,11 @@ class TUIApp(
             on_status_action=lambda key: app._status_action(key),
             tasks_active=lambda: app.tasks_panel_active,
             on_tasks_key=lambda key: app._tasks_key(key),
+            decisions_active=lambda: app.decisions_panel_active,
+            decisions_answering=lambda: app._decisions_panel.mode == "answer",
+            on_decisions_open=lambda: app.open_decisions_panel(),
+            on_decisions_key=lambda key: app._decisions_key(key),
+            on_decisions_input=lambda text: app._decisions_answer_input(text),
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_finder_open=lambda: app._finder_open(),
@@ -541,9 +572,10 @@ class TUIApp(
             picker_active=lambda: app.model_picker_active,
             on_agent_list_down=lambda: app._focus_agent_list(),
             agent_list_active=lambda: app._agent_navigation.list_focused(),
-            on_agent_list_move=lambda delta: app._agent_navigation.move_selection(
-                delta
-            ),
+            on_agent_list_move=lambda delta: (
+                app.clear_fork_return_arm(),
+                app._agent_navigation.move_selection(delta),
+            )[-1],
             on_agent_list_open=lambda: app._agent_navigation.open_selected(),
             on_agent_list_back=lambda: app._agent_navigation.list_back(),
             on_agent_navigation_exit=lambda: app._agent_navigation.exit_navigation(),
@@ -1050,6 +1082,7 @@ class TUIApp(
             detach_completion_menus(row)
         self._status_card_window = self._status_card.window()
         self._tasks_panel_window = self._tasks_panel_control.window()
+        self._decisions_panel_window = self._decisions_panel_control.window()
         app = weakref.proxy(self)
         root.children[:] = [
             full_screen_content(
@@ -1065,6 +1098,8 @@ class TUIApp(
                 status_active=lambda: app.status_card_active,
                 tasks_window=self._tasks_panel_window,
                 tasks_active=lambda: app.tasks_panel_active,
+                decisions_window=self._decisions_panel_window,
+                decisions_active=lambda: app.decisions_panel_active,
                 finder_window=self._finder_control.window(),
                 finder_active=lambda: app._transcript.finder_active,
             )
@@ -1072,6 +1107,7 @@ class TUIApp(
         self._agent_navigation.bind_layout(
             session.layout, session.default_buffer, self._invalidate_prompt
         )
+        self._bind_fork_navigation()
 
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request."""
@@ -1114,6 +1150,10 @@ class TUIApp(
                     )
                     self._print_unit(Text(f"command · {notice}", style=style))
                 self._present_pending_approvals()
+                header = self.fork_header_notice
+                if header is not None:
+                    self._print_unit(Text(header, style=theme.DIM))
+                self.start_decisions_poll()
                 if isinstance(session, FullScreenPromptSession):
                     await self._run_full_screen(session, prompt_task)
                     return
@@ -1144,6 +1184,8 @@ class TUIApp(
 
     async def close(self) -> None:
         self._closed = True
+        self.stop_decisions_poll()
+        self._stop_decisions_refresh()
         await self._close_finder_workers()
         pending_before = {
             entry.id for entry in self.loop.store.agent_notifications()

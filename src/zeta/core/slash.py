@@ -572,6 +572,8 @@ class SlashSession(Protocol):
 
     def slash_tasks(self, args: str) -> str: ...
 
+    def slash_decisions(self, args: str) -> str: ...
+
     def slash_send(self, args: str) -> str: ...
 
 
@@ -1070,6 +1072,10 @@ def _run_tasks(session: SlashSession, args: str) -> str:
     return session.slash_tasks(args)
 
 
+def _run_decisions(session: SlashSession, args: str) -> str:
+    return session.slash_decisions(args)
+
+
 def _run_send(session: SlashSession, args: str) -> str:
     return session.slash_send(args)
 
@@ -1204,6 +1210,9 @@ def create_slash_registry(
     registry.register(SlashCommand("runs", _run_runs, "list live agent runs"))
     registry.register(
         SlashCommand("tasks", _run_tasks, "inspect background processes")
+    )
+    registry.register(
+        SlashCommand("decisions", _run_decisions, "answer or discuss open decisions")
     )
     registry.register(
         SlashCommand("send", _run_send, "send a follow-up to a run: /send <id> <message>")

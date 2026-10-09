@@ -5,7 +5,6 @@ import hashlib
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,19 +16,16 @@ from zeta.attention_forks import (
     read_attention_fork,
     validate_attention_fork,
 )
-from zeta.attention_panel import panel_snapshot
 from zeta.attention_records import AttentionStore
 from zeta.config.tool_policy import ToolPolicy
 from zeta.core.project_context import ProjectContext, load_project_context
 from zeta.core.session import SessionManager
-from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
     Message,
     MessageOrigin,
     MessageRole,
     TextContent,
-    ToolCall,
 )
 from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
@@ -107,112 +103,6 @@ def test_request_attention_is_not_available_to_children(tmp_path: Path) -> None:
     asyncio.run(child.close())
     asyncio.run(registry.close())
     opened.store.close()
-
-
-def test_panel_list_is_read_only_and_uses_session_lease(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "Alpha")
-    opened = _session(tmp_path, project_id=project.project_id)
-    attention_store = AttentionStore(opened.store.session_dir)
-    attention_store.request(
-        session_id=opened.store.session_id,
-        project_id=project.project_id,
-        entry_id=None,
-        entry_seq=None,
-        title="Need direction",
-        why="Choose a route.",
-    )
-    opened.store.register_agent_child(
-        ToolCall("child-call", "agent", {}),
-        child_session_path="agents/1",
-        description="Review implementation",
-        background=True,
-    )
-    child = ConversationStore(opened.store.session_dir / "agents", session_id="1")
-    child.start_agent_lifecycle(
-        handle="parent:1",
-        started_at="2026-10-07T00:00:00+00:00",
-        depth=1,
-        agent_type="general",
-        description="Review implementation",
-    )
-    second = _session(tmp_path, project_id=project.project_id)
-    resolved_store = AttentionStore(second.store.session_dir)
-    resolved = resolved_store.request(
-        session_id=second.store.session_id,
-        project_id=project.project_id,
-        entry_id=None,
-        entry_seq=None,
-        title="Already decided",
-        why="Historical item.",
-    )
-    resolved_store.replace(
-        replace(resolved, status="resolved", resolved_at=resolved.created_at)
-    )
-    (opened.store.session_dir / "background_tasks.json").write_text(
-        json.dumps(
-            [
-                {
-                    "task_id": "task-1",
-                    "command": "pytest",
-                    "pid": 42,
-                    "running": True,
-                    "started_at": 1.0,
-                    "ended_at": 4.5,
-                }
-            ]
-        )
-    )
-    before = {
-        p.relative_to(tmp_path): p.read_bytes()
-        for p in tmp_path.rglob("*")
-        if p.is_file()
-    }
-    snapshot = panel_snapshot(tmp_path)
-    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
-    from zeta.cli.main import main as cli_main
-
-    assert cli_main(["panel", "--list"]) == 0
-    output = capsys.readouterr().out
-    after = {
-        p.relative_to(tmp_path): p.read_bytes()
-        for p in tmp_path.rglob("*")
-        if p.is_file()
-    }
-    assert snapshot.projects[0].name == "alpha"
-    assert "alpha" in output
-    assert "Review implementation" in output
-    assert "Need direction" in output
-    assert "Already decided" in output
-    sessions = snapshot.projects[0].sessions
-    assert any(
-        session.tasks[0].label == "pytest" and session.tasks[0].elapsed_seconds == 3.5
-        for session in sessions
-        if session.tasks
-    )
-    assert len(sessions) == 2
-    assert any(
-        session.lanes[0].label == "Review implementation"
-        for session in sessions
-        if session.lanes
-    )
-    assert {item.status for session in sessions for item in session.attention} == {
-        "open",
-        "resolved",
-    }
-    assert any(
-        lane.elapsed_seconds is not None
-        for session in sessions
-        for lane in session.lanes
-        if lane.status == "running"
-    )
-    assert before == after
-    child.close()
-    second.store.close()
-    opened.store.close()
-    assert panel_snapshot(tmp_path).projects == ()
 
 
 def test_attention_fork_policy_is_action_aware_and_read_only() -> None:

@@ -750,6 +750,9 @@ class AgentNavigation:
         self._breadcrumb_labels = ["main"]
         self.entries: list[AgentEntry] = []
         self.selected_index = 0
+        self._fork_title: str | None = None
+        self._fork_main_path: Path | None = None
+        self._on_return_to_main: Callable[[], None] | None = None
         self.list_control = AgentListControl(self)
         self.transcript_control = AgentTranscriptControl()
         self.list_window = Window(
@@ -1007,10 +1010,19 @@ class AgentNavigation:
                 if isinstance(child_path, str):
                     fallback[Path(child_path)] = marker
         children = self._children(self.current_path, fallback)
-        if self.current_path == self.root_path and not children:
+        main_entry = (
+            [self._main_entry()]
+            if self._fork_main_path is not None and self.current_path == self.root_path
+            else []
+        )
+        if (
+            self.current_path == self.root_path
+            and not children
+            and not main_entry
+        ):
             self.entries = []
         else:
-            self.entries = [self._root_entry(), *children]
+            self.entries = [self._root_entry(), *main_entry, *children]
         if selected_path is not None:
             self.selected_index = next(
                 (index for index, entry in enumerate(self.entries) if entry.path == selected_path),
@@ -1090,12 +1102,36 @@ class AgentNavigation:
 
     def _root_entry(self) -> AgentEntry:
         metadata = self._cached_agent_metadata(self.root_path)
+        label = (
+            f"discussion: {self._fork_title}"
+            if self._fork_title is not None
+            else "main"
+        )
+        agent_type = "discussion" if self._fork_title is not None else "main"
         return AgentEntry(
             self.root_path,
-            "main",
-            str(metadata.get("agent_type") or "main"),
+            label,
+            str(metadata.get("agent_type") or agent_type),
             str(metadata.get("state") or "running"),
         )
+
+    def _main_entry(self) -> AgentEntry:
+        assert self._fork_main_path is not None
+        return AgentEntry(self._fork_main_path, "(main)", "orchestrator", "running")
+
+    def set_fork_context(
+        self,
+        *,
+        title: str,
+        main_path: Path,
+        on_return: Callable[[], None],
+    ) -> None:
+        """Teach the view that this session is a discussion fork of ``main_path``."""
+
+        self._fork_title = title
+        self._fork_main_path = main_path
+        self._on_return_to_main = on_return
+        self.refresh(force=True)
 
     def focus_composer(self) -> None:
         if self._layout is not None and self._composer_buffer is not None:
@@ -1151,6 +1187,13 @@ class AgentNavigation:
         if not self.entries:
             return
         entry = self.entries[self.selected_index]
+        if (
+            self._fork_main_path is not None
+            and entry.path == self._fork_main_path
+            and self._on_return_to_main is not None
+        ):
+            self._on_return_to_main()
+            return
         if entry.path == self.root_path:
             if self.child_view_active:
                 self.exit_navigation(preselect_path=self.current_path)
