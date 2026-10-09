@@ -962,6 +962,86 @@ def test_initial_format_two_snapshot_rejects_semantically_invalid_state(
     assert not list(projects.glob(f".{project_id}.incoming-*"))
 
 
+@pytest.mark.parametrize(
+    "name",
+    (
+        "caf\N{LATIN SMALL LETTER E WITH ACUTE}.json",
+        "cafe\N{COMBINING ACUTE ACCENT}.json",
+    ),
+)
+def test_prepare_project_transfer_rejects_non_ascii_path(
+    tmp_path: Path, name: str
+) -> None:
+    snapshot, _project_id = _format_two_project_snapshot(tmp_path)
+    (snapshot / name).write_text("unsupported path\n", encoding="utf-8")
+
+    with pytest.raises(ProjectPublicationError, match="snapshot path"):
+        prepare_project_transfer(snapshot)
+    with pytest.raises(ProjectPublicationError, match="snapshot path"):
+        transfer_digest(snapshot)
+    with pytest.raises(ProjectPublicationError, match="snapshot path"):
+        memory_module.project_digest(snapshot)
+
+
+def _add_archive_file(prepared: PreparedTransfer, name: str) -> PreparedTransfer:
+    changed = io.BytesIO()
+    with (
+        tarfile.open(fileobj=changed, mode="w:gz") as output,
+        tarfile.open(fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz") as source,
+    ):
+        for member in source.getmembers():
+            output.addfile(member, source.extractfile(member))
+        added = tarfile.TarInfo(f"payload/{name}")
+        added.size = 1
+        added.mode = 0o600
+        output.addfile(added, io.BytesIO(b"x"))
+    return PreparedTransfer(changed.getvalue(), prepared.transfer_digest)
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "caf\N{LATIN SMALL LETTER E WITH ACUTE}.json",
+        "cafe\N{COMBINING ACUTE ACCENT}.json",
+    ),
+)
+def test_materialize_project_transfer_rejects_non_ascii_path(
+    tmp_path: Path, name: str
+) -> None:
+    snapshot, project_id = _format_two_project_snapshot(tmp_path)
+    prepared = _add_archive_file(prepare_project_transfer(snapshot), name)
+
+    with (
+        pytest.raises(ProjectPublicationError, match="snapshot path"),
+        materialize_project_transfer(prepared, project_id),
+    ):
+        pass
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "caf\N{LATIN SMALL LETTER E WITH ACUTE}.json",
+        "cafe\N{COMBINING ACUTE ACCENT}.json",
+    ),
+)
+def test_ssh_project_publish_rejects_non_ascii_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    snapshot, project_id = _format_two_project_snapshot(tmp_path)
+    prepared = _add_archive_file(prepare_project_transfer(snapshot), name)
+    remote = tmp_path / "remote"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    monkeypatch.setattr(ssh_module, "prepare_project_transfer", lambda _path: prepared)
+
+    with pytest.raises(RemoteSyncError, match="snapshot path"):
+        SshTransport("fake", str(remote), name="cloud").publish_project(
+            project_id, snapshot, expected_digest="missing"
+        )
+
+    assert not (remote / "projects" / project_id).exists()
+
+
 def test_prepared_project_transfer_is_immutable_after_source_change(
     tmp_path: Path,
 ) -> None:

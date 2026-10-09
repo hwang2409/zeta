@@ -19,7 +19,7 @@ import tempfile
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import NamedTuple
 
 from .. import project_schema
@@ -31,6 +31,9 @@ _MAX_HISTORY = 128
 _MAX_FORMAT_TWO_STATE_SIZE = 8 * 1024 * 1024
 _PROJECT_DIGEST_PREFIX = "tree-v2:"
 _TREE_DIGEST_DOMAIN = b"zeta-project-tree-v2\0"
+_SNAPSHOT_PATH_CHARACTERS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+)
 
 
 class ProjectPublicationError(Exception):
@@ -55,7 +58,7 @@ def prepare_project_transfer(project: Path) -> PreparedTransfer:
                 raise ProjectPublicationError(
                     "project snapshot contains a non-regular file"
                 )
-            relative = path.relative_to(project).as_posix()
+            relative = _canonical_snapshot_path(path.relative_to(project).parts)
             member = tarfile.TarInfo(f"payload/{relative}")
             member.size = info.st_size
             member.mode = 0o600
@@ -98,18 +101,17 @@ def _extract_archive(archive_bytes: bytes, destination: Path) -> None:
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
             for member in archive:
-                parts = PurePosixPath(member.name).parts
-                if (
-                    not member.isfile()
-                    or len(parts) < 2
-                    or parts[0] != "payload"
-                    or any(part in {"", ".", ".."} for part in parts)
-                    or member.name in seen
-                ):
+                parts = tuple(member.name.split("/"))
+                if not member.isfile() or len(parts) < 2 or parts[0] != "payload":
                     raise ProjectPublicationError(
                         "project archive contains a non-regular or unsafe member"
                     )
-                seen.add(member.name)
+                relative = _canonical_snapshot_path(parts[1:])
+                if relative in seen:
+                    raise ProjectPublicationError(
+                        "project archive contains a non-regular or unsafe member"
+                    )
+                seen.add(relative)
                 target = destination.joinpath(*parts[1:])
                 target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 source = archive.extractfile(member)
@@ -238,14 +240,27 @@ def atomic_publish_file(
         temporary.unlink(missing_ok=True)
 
 
+def _canonical_snapshot_path(parts: tuple[str, ...]) -> str:
+    if not parts or any(
+        part in {"", ".", ".."}
+        or any(character not in _SNAPSHOT_PATH_CHARACTERS for character in part)
+        for part in parts
+    ):
+        raise ProjectPublicationError(
+            "project snapshot path contains unsupported characters"
+        )
+    return "/".join(parts)
+
+
 def _tree_digest(root: Path, paths: Iterator[Path]) -> str:
     """Hash a canonical file tree with unambiguous path/content framing."""
 
     digest = hashlib.sha256(_TREE_DIGEST_DOMAIN)
-    for path in sorted(
-        paths, key=lambda candidate: candidate.relative_to(root).as_posix()
-    ):
-        relative = path.relative_to(root).as_posix().encode("utf-8")
+    canonical_paths = (
+        (_canonical_snapshot_path(path.relative_to(root).parts), path) for path in paths
+    )
+    for relative_text, path in sorted(canonical_paths):
+        relative = relative_text.encode("ascii")
         content = hashlib.sha256()
         with path.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):

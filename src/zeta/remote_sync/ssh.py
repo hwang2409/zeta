@@ -197,8 +197,11 @@ with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as tempor
             declared += member.size
             if declared > max_bytes: sys.exit(50)
             if shutil.disk_usage(home).free < declared - extracted: sys.exit(51)
-            parts = Path(member.name).parts
-            if not member.isfile() or len(parts) < 2 or parts[0] != "payload" or any(p in {"", ".", ".."} for p in parts): sys.exit(46)
+            parts = tuple(member.name.split("/"))
+            if not member.isfile() or len(parts) < 2 or parts[0] != "payload": sys.exit(46)
+            try: _canonical_snapshot_path(parts[1:])
+            except ProjectPublicationError as exc:
+                print(str(exc), file=sys.stderr); sys.exit(46)
             target = staging.joinpath(*parts[1:])
             if target.exists(): sys.exit(46)
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
