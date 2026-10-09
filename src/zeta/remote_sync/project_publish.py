@@ -224,6 +224,8 @@ def _validate_snapshot(snapshot: Path, project_id: str) -> None:
             _manifest_payloads(snapshot, manifest, "snapshot")
             _manifest_payloads(snapshot, manifest, "before_snapshot")
     else:
+        if (snapshot / "memory-versions").exists():
+            raise ProjectPublicationError("project memory pointer is missing")
         _validate_legacy_memory(snapshot)
     for path in snapshot.rglob("*"):
         if path.is_symlink():
