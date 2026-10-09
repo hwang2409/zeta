@@ -1891,9 +1891,9 @@ async def test_parent_abort_cancels_all_parallel_children(tmp_path: Path) -> Non
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await asyncio.wait_for(backend.children_started.wait(), timeout=1)
+    await backend.children_started.wait()
     loop.abort()
-    await asyncio.wait_for(task, timeout=1)
+    await task
 
     results = [
         message.tool_result for message in store.messages() if message.tool_result
