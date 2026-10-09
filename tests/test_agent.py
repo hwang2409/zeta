@@ -1969,7 +1969,7 @@ async def test_child_finish_gate_counts_model_turns_and_adopts_after_bound(
 async def test_child_finish_gate_times_out_stalled_stream_and_adopts(
     tmp_path: Path,
 ) -> None:
-    backend = FinishGateBackend("stall")
+    backend = FinishGateBackend("wait")
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(
         store, finish_gate_max_turns=8, finish_gate_timeout=0.05
@@ -1989,6 +1989,9 @@ async def test_child_finish_gate_times_out_stalled_stream_and_adopts(
     assert store.agent_children()
     backend.release_grandchild.set()
     await _wait_for_notification(store, "completed")
+    receipt = store.tool_result("child")
+    assert receipt is not None
+    assert "premature child answer" in receipt.content
     await loop.close()
 
 
@@ -2017,6 +2020,9 @@ async def test_child_finish_gate_turn_bound_falls_back_to_adoption(
     assert marker["description"] == "collect evidence"
     backend.release_grandchild.set()
     await _wait_for_notification(store, "completed")
+    receipt = store.tool_result("child")
+    assert receipt is not None
+    assert "premature child answer" in receipt.content
     await loop.close()
 
 

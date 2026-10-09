@@ -214,6 +214,7 @@ async def consume_child(
                 ),
                 max_turns=child_loop._background_owner.finish_gate_max_turns,
             )
+            bound_exited = False
 
             async def handoff(arguments: dict[str, Any]) -> str:
                 gate_state.handoff = (arguments["reason"], arguments["outputs"])
@@ -224,6 +225,8 @@ async def consume_child(
                     async with asyncio.timeout_at(gate_state.deadline):
                         return await consume_events(events, gate_state)
                 except TimeoutError:
+                    nonlocal bound_exited
+                    bound_exited = True
                     return False
                 finally:
                     close = getattr(events, "aclose", None)
@@ -257,6 +260,8 @@ async def consume_child(
                         user_message=gate,
                     )
                 )
+                if gate_state.exhausted and gate_state.handoff is None:
+                    bound_exited = True
                 while keep_going and failure_message is None:
                     children = owned_children()
                     pending_notification = (
@@ -268,12 +273,13 @@ async def consume_child(
                         remaining = (
                             gate_state.deadline - asyncio.get_running_loop().time()
                         )
-                        if (
-                            remaining <= 0
-                            or not await child_loop._background_owner.wait_for_owned_completion(
-                                child_loop.agent_instance_id or "", remaining
-                            )
+                        if remaining <= 0:
+                            bound_exited = True
+                            break
+                        if not await child_loop._background_owner.wait_for_owned_completion(
+                            child_loop.agent_instance_id or "", remaining
                         ):
+                            bound_exited = True
                             break
                     if child_loop.notification_system_message() is None:
                         continue
@@ -293,7 +299,7 @@ async def consume_child(
                         )
                     ],
                 )
-            elif final_message is None:
+            elif (bound_exited and owned_children()) or final_message is None:
                 final_message = fallback_message
     except asyncio.CancelledError:
         raise
