@@ -158,6 +158,7 @@ async def test_context_overflow_forces_emergency_eviction_and_retries_once(
                     "prompt is too long: 120 tokens > 100 maximum"
                 )
                 error.code = "context_length_exceeded"
+                error.provider_prompt_tokens = 120
                 raise error
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
@@ -200,6 +201,67 @@ async def test_context_overflow_forces_emergency_eviction_and_retries_once(
     completed = store.messages()[-1]
     assert completed.metadata["context_calibration_ratio"] == pytest.approx(1.5)
     assert not any(event.type is StreamEventType.ERROR for event in events)
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_retry_failure_persists_turn_once(
+    tmp_path: Path,
+) -> None:
+    class AlwaysOverflowBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            self.calls.append(list(messages))
+            error = RuntimeError("prompt is too long: 120 tokens > 100 maximum")
+            error.code = "context_length_exceeded"
+            error.provider_prompt_tokens = 120
+            raise error
+            yield  # pragma: no cover
+
+    store = ConversationStore(tmp_path)
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("old reasoning " * 100), TextContent("old result")],
+        )
+    )
+    backend = AlwaysOverflowBackend()
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        token_counter=lambda message: 1
+        if message.metadata.get("context_evicted")
+        else 40,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        context_assembler=assembler,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    events = await _collect(loop.run_turn("current request", origin=MessageOrigin.USER))
+
+    assert len(backend.calls) == 2
+    messages = store.messages()
+    assert sum(
+        message.role is MessageRole.USER
+        and message.content == [TextContent("current request")]
+        for message in messages
+    ) == 1
+    failed = [
+        message
+        for message in messages
+        if message.role is MessageRole.ASSISTANT
+        and message.metadata.get("turn_failed")
+    ]
+    assert len(failed) == 1
+    assert not any(message.role is MessageRole.TOOL_RESULT for message in messages)
+    assert sum(event.type is StreamEventType.RETRY for event in events) == 1
     await loop.close()
 
 

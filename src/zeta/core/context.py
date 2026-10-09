@@ -169,7 +169,15 @@ class ContextAssembler:
         )
         self.last_context: AssembledContext | None = None
         self.last_usage: dict[str, Any] = {}
-        self._calibration = ContextCalibration(self.store.replay())
+        self._calibration = ContextCalibration(
+            self.store.replay(),
+            provider_limit=self.token_budget,
+            safety_margin=self.safety_margin,
+            normal_target_ratio=TARGET_RATIO,
+            emergency_target_ratio=EMERGENCY_TARGET_RATIO,
+        )
+        self._provider_budgets = self._calibration.provider_budgets
+        self._provider_attempt_estimate: int | None = None
         self._tokens_used_this_session = 0
         self._cache_read_input_tokens_this_session = 0
         self._cache_creation_input_tokens_this_session = 0
@@ -207,7 +215,7 @@ class ContextAssembler:
 
     @property
     def trigger_token_budget(self) -> int:
-        return max(1, int(self.token_budget * (1 - self.safety_margin)))
+        return self._provider_budgets.trigger
 
     @property
     def tokens_used_this_session(self) -> int:
@@ -265,21 +273,36 @@ class ContextAssembler:
         if self.telemetry_sink is not None:
             self.telemetry_sink(telemetry)
 
-    def record_context_overflow(self, message: str) -> int | None:
-        estimate = None if self.last_context is None else self.last_context.token_count
-        return self._calibration.observe_overflow(message, estimate)
+    def record_context_overflow(self, provider_prompt_tokens: int | None) -> None:
+        estimate = self._provider_attempt_estimate
+        if provider_prompt_tokens is None or estimate is None:
+            return
+        self._provider_budgets = self._calibration.calibrate(
+            estimate, provider_prompt_tokens
+        )
 
     def completion_metadata(self) -> dict[str, Any]:
-        estimate = None if self.last_context is None else self.last_context.token_count
-        return self._calibration.completion_metadata(self.last_usage, estimate)
+        return self._calibration.completion_metadata(
+            self.last_usage, self._provider_attempt_estimate
+        )
 
-    def begin_provider_attempt(self) -> None:
+    def begin_provider_attempt(self, messages: Sequence[Message]) -> None:
         self.last_usage = {}
+        self._provider_attempt_estimate = self._count(messages)
 
     def record_usage(self, usage: Mapping[str, Any]) -> None:
         self.last_usage = dict(usage)
-        estimate = None if self.last_context is None else self.last_context.token_count
-        self._calibration.observe_usage(usage, estimate)
+        provider_tokens = self._calibration.provider_input_tokens(usage)
+        estimate = self._provider_attempt_estimate
+        if estimate is None and self.last_context is not None:
+            estimate = self.last_context.token_count
+        if provider_tokens is not None and estimate is not None:
+            self._provider_budgets = self._calibration.calibrate(
+                estimate, provider_tokens
+            )
+        self._record_session_usage(usage)
+
+    def _record_session_usage(self, usage: Mapping[str, Any]) -> None:
         input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
         output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
         cache_read_tokens = usage.get("cache_read_input_tokens")
@@ -307,7 +330,6 @@ class ContextAssembler:
             if known_tokens:
                 total = sum(known_tokens)
         if type(total) is int and total >= 0:
-            self._calibration.provider_token_total = total
             self._tokens_used_this_session += total
         if self.usage_sink is not None:
             self.usage_sink(usage)
@@ -471,7 +493,7 @@ class ContextAssembler:
             # Keep the budget-relative bound for small configured budgets.
             max_source_tokens=max_source_tokens,
             on_success=self.on_completion_success,
-            on_usage=self.record_usage,
+            on_usage=self._record_session_usage,
             on_telemetry=self._record_compaction_telemetry,
         )
         if self._branch_id(self.store.replay()) != branch_id:
@@ -755,7 +777,11 @@ class ContextAssembler:
         result = evict_messages(
             records,
             fixed_tokens=self._count(fixed),
-            target_tokens=max(1, int(self.token_budget * target_ratio)),
+            target_tokens=self._calibration.estimator_budget(
+                self._provider_budgets.emergency_target
+                if target_ratio == EMERGENCY_TARGET_RATIO
+                else self._provider_budgets.normal_target
+            ),
             token_counter=self.token_counter,
             unconsumed_source_seqs=unconsumed,
             source_messages=source_messages,

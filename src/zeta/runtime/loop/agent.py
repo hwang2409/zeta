@@ -925,7 +925,7 @@ class AgentLoop(
                     context_messages.extend(steering.messages)
                 provider_retry_budget = start_provider_attempt(provider_retry_budget)
                 self._turn_provider_retry_records = provider_retry_budget.records
-                self.context_assembler.begin_provider_attempt()
+                self.context_assembler.begin_provider_attempt(context_messages)
                 completion = apply_retry_budget(
                     self.backend.complete(context_messages, active_tools),
                     provider_retry_budget,
@@ -1012,7 +1012,11 @@ class AgentLoop(
             ):
                 context = self.context_assembler.last_context
                 overflow_context_tokens = None if context is None else context.token_count
-                self.context_assembler.record_context_overflow(provider_error.message)
+                self.context_assembler.record_context_overflow(
+                    getattr(provider_error_source, "provider_prompt_tokens", None)
+                    if provider_error_source is not None
+                    else None
+                )
                 retrying_context = True
                 yield StreamEvent(
                     StreamEventType.RETRY,

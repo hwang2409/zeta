@@ -3,11 +3,23 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
 from .auth import error_body_excerpt
 from .transport import retry_after_seconds
+
+_ANTHROPIC_PROMPT_TOKENS = re.compile(
+    r"\bprompt is too long:\s*([0-9][0-9,]*) tokens?\s*>\s*"
+    r"[0-9][0-9,]* maximum\b",
+    re.IGNORECASE,
+)
+
+
+def _provider_prompt_tokens(message: str) -> int | None:
+    match = _ANTHROPIC_PROMPT_TOKENS.search(message)
+    return int(match.group(1).replace(",", "")) if match is not None else None
 
 
 class AnthropicBackendError(RuntimeError):
@@ -73,6 +85,11 @@ class AnthropicStreamError(AnthropicBackendError):
         self.retryable = retryable
         self.retry_reason = retry_reason
         self.is_stall = is_stall
+        self.provider_prompt_tokens = (
+            _provider_prompt_tokens(message)
+            if self.code == "context_length_exceeded"
+            else None
+        )
 
 
 def http_error(
@@ -98,6 +115,7 @@ def http_error(
     )
     if status_code == 400 and _is_context_overflow_body(body):
         error.code = "context_length_exceeded"
+        error.provider_prompt_tokens = _provider_prompt_tokens(message)
     return error
 
 

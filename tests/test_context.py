@@ -802,6 +802,73 @@ async def test_eviction_triggers_with_safety_margin_and_calibration(
 
 
 @pytest.mark.asyncio
+async def test_calibrated_eviction_targets_provider_space(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+    for index in range(4):
+        store.append_message(text(MessageRole.ASSISTANT, f"old {index}"))
+    store.append_message(
+        with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER)
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        token_counter=lambda message: 1
+        if message.metadata.get("context_evicted")
+        else 20,
+        safety_margin=0.1,
+    )
+    assembler._provider_budgets = assembler._calibration.calibrate(100, 200)
+
+    compacted = await assembler.assemble_context()
+
+    assert compacted.compacted is True
+    assert compacted.token_count * assembler.calibration_ratio < 90
+    marker_count = store.compaction_marker_count()
+    repeated = await assembler.assemble_context()
+    assert repeated.compacted is False
+    assert store.compaction_marker_count() == marker_count
+
+
+@pytest.mark.asyncio
+async def test_emergency_eviction_targets_half_provider_limit(
+    context_root: Path,
+) -> None:
+    store = ConversationStore(context_root)
+    for index in range(4):
+        store.append_message(text(MessageRole.ASSISTANT, f"old {index}"))
+    store.append_message(
+        with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER)
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        token_counter=lambda message: 1
+        if message.metadata.get("context_evicted")
+        else 20,
+    )
+    assembler._provider_budgets = assembler._calibration.calibrate(100, 200)
+
+    compacted = await assembler.assemble_context(force=True, emergency=True)
+
+    assert compacted.compacted is True
+    assert compacted.token_count * assembler.calibration_ratio <= 50
+
+
+def test_summary_usage_does_not_change_context_calibration(
+    context_root: Path,
+) -> None:
+    assembler = ContextAssembler(ConversationStore(context_root))
+    assembler._provider_budgets = assembler._calibration.calibrate(100, 200)
+
+    assembler._record_session_usage({"input_tokens": 1})
+
+    assert assembler.calibration_ratio == pytest.approx(2.0)
+    assert assembler.tokens_used_this_session == 1
+
+
+@pytest.mark.asyncio
 async def test_cached_provider_usage_triggers_compaction(context_root: Path) -> None:
     store = ConversationStore(context_root)
     store.append_message(with_message_origin(text(MessageRole.USER, "old"), MessageOrigin.USER))

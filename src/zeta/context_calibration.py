@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from .core.store import ConversationEntry
@@ -12,13 +12,33 @@ from .core.store import ConversationEntry
 _ALPHA = 0.5
 _MIN_RATIO = 1.0
 _MAX_RATIO = 2.0
-_PROVIDER_SIZE = re.compile(r"([0-9][0-9,]*)\s+tokens?", re.IGNORECASE)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderContextBudgets:
+    """Provider-space limits derived from one exact request measurement."""
+
+    trigger: int
+    normal_target: int
+    emergency_target: int
 
 
 class ContextCalibration:
-    """Smooth provider measurements and persist a bounded session ratio."""
+    """Smooth exact provider-request measurements into bounded context budgets."""
 
-    def __init__(self, entries: Sequence[ConversationEntry]) -> None:
+    def __init__(
+        self,
+        entries: Sequence[ConversationEntry],
+        *,
+        provider_limit: int,
+        safety_margin: float,
+        normal_target_ratio: float,
+        emergency_target_ratio: float,
+    ) -> None:
+        self._provider_limit = provider_limit
+        self._safety_margin = safety_margin
+        self._normal_target_ratio = normal_target_ratio
+        self._emergency_target_ratio = emergency_target_ratio
         self.ratio = 1.0
         self.has_measurement = False
         self.provider_token_total: int | None = None
@@ -36,7 +56,7 @@ class ContextCalibration:
             if isinstance(usage, Mapping) and type(estimate) is int:
                 actual = self.provider_input_tokens(usage)
                 if actual is not None:
-                    self.observe(actual, estimate)
+                    self._observe(estimate, actual)
 
     @staticmethod
     def provider_input_tokens(usage: Mapping[str, Any]) -> int | None:
@@ -48,7 +68,32 @@ class ContextCalibration:
         known = [value for value in values if type(value) is int and value >= 0]
         return sum(known) if known else None
 
-    def observe(self, actual: int, estimated: int) -> None:
+    def calibrate(
+        self,
+        estimated_prompt_tokens: int,
+        provider_prompt_tokens: int,
+    ) -> ProviderContextBudgets:
+        """Record one exact request pair and return all provider-space budgets."""
+
+        self._observe(estimated_prompt_tokens, provider_prompt_tokens)
+        self.provider_token_total = provider_prompt_tokens
+        return self.provider_budgets
+
+    @property
+    def provider_budgets(self) -> ProviderContextBudgets:
+        return ProviderContextBudgets(
+            trigger=max(
+                1, int(self._provider_limit * (1 - self._safety_margin))
+            ),
+            normal_target=max(
+                1, int(self._provider_limit * self._normal_target_ratio)
+            ),
+            emergency_target=max(
+                1, int(self._provider_limit * self._emergency_target_ratio)
+            ),
+        )
+
+    def _observe(self, estimated: int, actual: int) -> None:
         if actual <= 0 or estimated <= 0:
             return
         observed = min(_MAX_RATIO, max(_MIN_RATIO, actual / estimated))
@@ -59,26 +104,14 @@ class ContextCalibration:
         )
         self.has_measurement = True
 
-    def observe_usage(self, usage: Mapping[str, Any], estimated: int | None) -> None:
-        actual = self.provider_input_tokens(usage)
-        if actual is not None and estimated is not None:
-            self.observe(actual, estimated)
-
-    def observe_overflow(self, message: str, estimated: int | None) -> int | None:
-        match = _PROVIDER_SIZE.search(message)
-        if match is None:
-            return None
-        actual = int(match.group(1).replace(",", ""))
-        if estimated is not None:
-            self.observe(actual, estimated)
-        self.provider_token_total = actual
-        return actual
-
     def calibrated_tokens(self, estimated: int) -> int:
         calibrated = math.ceil(estimated * self.ratio)
         if self.provider_token_total is None:
             return calibrated
         return max(calibrated, self.provider_token_total)
+
+    def estimator_budget(self, provider_budget: int) -> int:
+        return max(1, math.floor(provider_budget / self.ratio))
 
     def reset_provider_total(self) -> None:
         self.provider_token_total = None
