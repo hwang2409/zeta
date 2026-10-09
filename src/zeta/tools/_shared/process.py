@@ -52,7 +52,7 @@ def _lower_child_priority(niceness: int) -> None:
         current = os.getpriority(os.PRIO_PROCESS, 0)
         os.setpriority(os.PRIO_PROCESS, 0, min(19, current + niceness))
     except (AttributeError, OSError):
-        logger.debug("could not lower tool subprocess priority", exc_info=True)
+        pass
 
 
 _FD_SHELL_WRAPPER = (

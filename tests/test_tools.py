@@ -236,7 +236,12 @@ async def test_bash_tolerates_setpriority_failure(
         del args
         raise PermissionError("injected setpriority failure")
 
+    def fail_logger(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("the child pre-exec callback must not log")
+
     monkeypatch.setattr("zeta.tools._shared.process.os.setpriority", fail_setpriority)
+    monkeypatch.setattr("zeta.tools._shared.process.logger.debug", fail_logger)
     result = await registry.execute(
         ToolCall("bash-niceness-failure", "bash", {"command": _niceness_command()})
     )
