@@ -21,7 +21,6 @@ from zeta.tui import composer
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (
     ATTACHMENT_MAX_TEXT_BYTES,
-    AttachmentError,
     attachment_refs,
     build_key_bindings,
     build_user_message,
@@ -90,8 +89,31 @@ def test_attachment_refs_support_quoted_paths(tmp_path: Path) -> None:
 
 def test_attachment_refs_leave_bare_at_words_as_text(tmp_path: Path) -> None:
     assert attachment_refs("mention @dataclass and @user", tmp_path) == ()
-    with pytest.raises(AttachmentError, match="does not exist"):
-        build_user_message("read @./missing.txt", tmp_path)
+
+
+def test_missing_path_like_references_remain_plain_text(tmp_path: Path) -> None:
+    for value in ("call @get/users/{id}", 'read @"missing file.txt"'):
+        message = build_user_message(value, tmp_path)
+
+        assert message.content == [TextContent(value)]
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "read @~__zeta_user_that_does_not_exist__/notes.txt",
+        "read @./bad\0name.txt",
+    ),
+)
+def test_unresolvable_reference_remains_plain_text(
+    tmp_path: Path, value: str
+) -> None:
+    notices: list[str] = []
+
+    message = build_user_message(value, tmp_path, on_reference_notice=notices.append)
+
+    assert message.content == [TextContent(value)]
+    assert notices == []
 
 
 def test_build_user_message_inlines_text_and_preserves_prompt(tmp_path: Path) -> None:
@@ -109,19 +131,58 @@ def test_build_user_message_inlines_text_and_preserves_prompt(tmp_path: Path) ->
     assert attachment.text.endswith("\nhello")
 
 
-def test_build_user_message_rejects_missing_large_and_binary_files(tmp_path: Path) -> None:
-    with pytest.raises(AttachmentError, match="does not exist"):
-        build_user_message("@./missing.txt", tmp_path)
-
+def test_unusable_reference_remains_text_and_reports_short_notice(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "folder"
+    directory.mkdir()
     large = tmp_path / "large.txt"
     large.write_bytes(b"a" * (ATTACHMENT_MAX_TEXT_BYTES + 1))
-    with pytest.raises(AttachmentError, match="limit"):
-        build_user_message("@./large.txt", tmp_path)
+    notices: list[str] = []
 
-    binary = tmp_path / "data.bin"
-    binary.write_bytes(b"header\x00payload")
-    with pytest.raises(AttachmentError, match="binary"):
-        build_user_message("@./data.bin", tmp_path)
+    message = build_user_message(
+        "inspect @./folder and @./large.txt",
+        tmp_path,
+        on_reference_notice=notices.append,
+    )
+
+    assert message.content == [TextContent("inspect @./folder and @./large.txt")]
+    assert notices == [
+        "@./folder not attached: directory",
+        "@./large.txt not attached: too large",
+    ]
+
+
+def test_duplicate_unusable_reference_reports_one_notice(tmp_path: Path) -> None:
+    (tmp_path / "folder").mkdir()
+    notices: list[str] = []
+
+    message = build_user_message(
+        "compare @./folder with @./folder",
+        tmp_path,
+        on_reference_notice=notices.append,
+    )
+
+    assert message.content == [TextContent("compare @./folder with @./folder")]
+    assert notices == ["@./folder not attached: directory"]
+
+
+def test_real_and_missing_references_are_resolved_independently(tmp_path: Path) -> None:
+    path = tmp_path / "notes.txt"
+    path.write_text("hello", encoding="utf-8")
+    notices: list[str] = []
+
+    message = build_user_message(
+        "use @./notes.txt and @get/missing",
+        tmp_path,
+        on_reference_notice=notices.append,
+    )
+
+    assert message.content[0] == TextContent("use @./notes.txt and @get/missing")
+    assert len(message.content) == 2
+    assert isinstance(message.content[1], TextContent)
+    assert message.content[1].path == str(path.resolve())
+    assert notices == []
 
 
 def test_empty_text_attachment_persists_and_replays(tmp_path: Path) -> None:
@@ -153,12 +214,19 @@ def test_webp_attachment_variants_are_detected(tmp_path: Path, data: bytes) -> N
     assert message.content[1].mime_type == "image/webp"
 
 
-def test_corrupt_webp_attachment_is_rejected(tmp_path: Path) -> None:
+def test_corrupt_webp_reference_is_not_attached(tmp_path: Path) -> None:
     path = tmp_path / "corrupt.data"
     path.write_bytes(webp_data(b"VP8 ", b"\x00" * 9))
+    notices: list[str] = []
 
-    with pytest.raises(AttachmentError, match="binary"):
-        build_user_message("inspect @./corrupt.data", tmp_path)
+    message = build_user_message(
+        "inspect @./corrupt.data",
+        tmp_path,
+        on_reference_notice=notices.append,
+    )
+
+    assert message.content == [TextContent("inspect @./corrupt.data")]
+    assert notices == ["@./corrupt.data not attached: not decodable"]
 
 
 def test_image_attachment_round_trips_and_uses_provider_boundaries(tmp_path: Path) -> None:
@@ -569,7 +637,7 @@ async def test_app_submits_attachment_on_the_same_user_message(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_missing_path_like_attachment_blocks_with_notice(tmp_path: Path) -> None:
+async def test_missing_path_like_reference_sends_without_notice(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
@@ -581,17 +649,39 @@ async def test_missing_path_like_attachment_blocks_with_notice(tmp_path: Path) -
 
     await app._handle_prompt_value("read @./missing.txt")
 
-    assert app._active_task is None
-    assert store.messages() == []
-    assert notices == ["attachment rejected: file does not exist: " + str(tmp_path / "missing.txt")]
+    assert app._active_task is not None
+    await app._active_task
+    assert store.messages()[0].content == [TextContent("read @./missing.txt")]
+    assert notices == []
     await app.loop.close()
 
 
 @pytest.mark.asyncio
-async def test_missing_path_preserves_pending_paste_for_retry(tmp_path: Path) -> None:
+async def test_unusable_reference_sends_with_notice(tmp_path: Path) -> None:
+    directory = tmp_path / "folder"
+    directory.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+
+    await app._handle_prompt_value("inspect @./folder")
+
+    assert app._active_task is not None
+    await app._active_task
+    assert store.messages()[0].content == [TextContent("inspect @./folder")]
+    assert notices == ["@./folder not attached: directory"]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_path_sends_pending_paste(tmp_path: Path) -> None:
     pending = tmp_path / "clipboard.png"
     pending.write_bytes(PNG)
-    fixed = tmp_path / "fixed.txt"
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
@@ -604,29 +694,18 @@ async def test_missing_path_preserves_pending_paste_for_retry(tmp_path: Path) ->
 
     await app._handle_prompt_value("read @./missing.txt")
 
-    assert app._active_task is None
-    assert app._pending_attachments == [pending]
-    assert notices == ["attachment rejected: file does not exist: " + str(tmp_path / "missing.txt")]
-
-    fixed.write_text("context", encoding="utf-8")
-    await app._handle_prompt_value("read @./fixed.txt")
     assert app._active_task is not None
     await app._active_task
-
-    users = [
+    user = next(
         message for message in store.messages() if message.role is MessageRole.USER
-    ]
-    assert len(users) == 1
+    )
     assert [
         block.path
-        for block in users[0].content
+        for block in user.content
         if isinstance(block, (ImageContent, TextContent))
-    ] == [
-        None,
-        str(fixed.resolve()),
-        str(pending.resolve()),
-    ]
+    ] == [None, str(pending.resolve())]
     assert app._pending_attachments == []
+    assert notices == []
     await app.loop.close()
 
 
