@@ -187,7 +187,7 @@ async def consume_child(
         if final_message is not None and children:
             deadline = (
                 asyncio.get_running_loop().time()
-                + child_loop.agent_finish_gate_timeout
+                + child_loop._background_owner.finish_gate_timeout
             )
             gate = finish_gate_message(children)
             await consume_events(
@@ -212,7 +212,7 @@ async def consume_child(
                 )
                 if not children and not pending_notification:
                     break
-                if followup_turns >= child_loop.agent_finish_gate_max_turns:
+                if followup_turns >= child_loop._background_owner.finish_gate_max_turns:
                     break
                 if children:
                     remaining = deadline - asyncio.get_running_loop().time()
@@ -717,8 +717,6 @@ async def run_agent_tool(
             project_registry=loop.project_registry,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
-            agent_finish_gate_max_turns=loop.agent_finish_gate_max_turns,
-            agent_finish_gate_timeout=loop.agent_finish_gate_timeout,
         )
         child_loop.one_shot = getattr(loop, "one_shot", False)
         if loop.plan_mode:

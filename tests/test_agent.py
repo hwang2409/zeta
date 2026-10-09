@@ -1861,12 +1861,14 @@ async def test_child_finish_gate_turn_bound_falls_back_to_adoption(
 ) -> None:
     backend = FinishGateBackend("wait")
     store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(
+        store, finish_gate_max_turns=1, finish_gate_timeout=60
+    )
     loop = AgentLoop(
         backend,
         store,
         max_turns=1,
-        agent_finish_gate_max_turns=1,
-        agent_finish_gate_timeout=60,
+        background_owner=owner,
         skill_catalog=SkillCatalog.empty(),
     )
 

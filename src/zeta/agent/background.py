@@ -46,8 +46,24 @@ class _AgentLoopForRecovery(Protocol):
 class BackgroundAgentOwner:
     """Own cancellation and watcher state for one complete agent tree."""
 
-    def __init__(self, notification_store: ConversationStore) -> None:
+    def __init__(
+        self,
+        notification_store: ConversationStore,
+        *,
+        finish_gate_max_turns: int = 8,
+        finish_gate_timeout: float = 600,
+    ) -> None:
+        if type(finish_gate_max_turns) is not int or finish_gate_max_turns < 1:
+            raise ValueError("finish_gate_max_turns must be a positive integer")
+        if (
+            not isinstance(finish_gate_timeout, (int, float))
+            or isinstance(finish_gate_timeout, bool)
+            or not finish_gate_timeout > 0
+        ):
+            raise ValueError("finish_gate_timeout must be positive")
         self.notification_store = notification_store
+        self.finish_gate_max_turns = finish_gate_max_turns
+        self.finish_gate_timeout = float(finish_gate_timeout)
         # Receipts and adopted descendants can outlive their immediate loop.
         # The tree owns child leases until root shutdown joins all watchers.
         self.store_leases = ExitStack()
