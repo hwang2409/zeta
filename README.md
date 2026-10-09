@@ -78,6 +78,7 @@ command_niceness = 10
 
 ## Docs
 
+- [Agents and orchestration](docs/agents.md)
 - [Decisions in the TUI](docs/decisions.md)
 - [Automations](docs/automations.md)
 - [Design notes](docs/design.md)

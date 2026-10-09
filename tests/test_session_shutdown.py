@@ -373,6 +373,7 @@ def test_recovery_and_send_release_borrowed_child_stores(
         opened.store.register_agent_child(
             call, child_session_path=str(child.session_dir), description="child",
             agent_type="run", child_instance_id="child", background=True,
+            accepts_follow_ups=True,
         )
         opened.store.append_task_notification(
             task_id="task-exited", command="echo done", exit_code=0,
@@ -385,7 +386,12 @@ def test_recovery_and_send_release_borrowed_child_stores(
         retained.append(self)
 
     monkeypatch.setattr(ConversationStore, "__init__", record)
-    assert send_to_run(opened.store, "child", "follow-up") is None
+    assert send_to_run(
+        opened.store,
+        "child",
+        "follow-up",
+        channel=loop._background_owner.conversation_channel,
+    ) is None
     recover_agent_children(loop)
     assert len(retained) == 3
     assert all(not store._release_lease.alive for store in retained)

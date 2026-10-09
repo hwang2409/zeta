@@ -38,10 +38,12 @@ from ..providers.factory import build_backend, credential_store
 from ..skills.agent_catalog import load_agent
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
+from ..tools.ask_parent import register_ask_parent
 from ..tools.registry import ToolExecutionContext
 from .background import finish_background_child
 from .budget import MAX_AGENT_DEPTH
 from .budget import child_depth as next_agent_depth
+from .conversation_channel import has_follow_up_loop
 from .presets import (
     GENERAL_PRESET,
     RUN_PRESET,
@@ -89,6 +91,7 @@ async def consume_child(
     child_result: Callable[..., dict[str, object]],
     error_message: Callable[[BaseException], str],
     record_report: Callable[[str], None] | None = None,
+    notification_turn: bool = False,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
 
@@ -203,7 +206,12 @@ async def consume_child(
         )
 
     try:
-        await consume_events(child_loop.run_turn(prompt, origin=origin))
+        events = (
+            child_loop.run_notification_turn()
+            if notification_turn
+            else child_loop.run_turn(prompt, origin=origin)
+        )
+        await consume_events(events)
         children = owned_children()
         if final_message is not None and children:
             fallback_message = final_message
@@ -264,9 +272,12 @@ async def consume_child(
                     bound_exited = True
                 while keep_going and failure_message is None:
                     children = owned_children()
+                    pending_follow_up = bool(child_loop.store.pending_prompts())
                     pending_notification = (
                         child_loop.notification_system_message() is not None
                     )
+                    if pending_follow_up:
+                        break
                     if not children and not pending_notification:
                         break
                     if children:
@@ -276,9 +287,12 @@ async def consume_child(
                         if remaining <= 0:
                             bound_exited = True
                             break
-                        if not await child_loop._background_owner.wait_for_owned_completion(
-                            child_loop.agent_instance_id or "", remaining
-                        ):
+                        try:
+                            async with asyncio.timeout(remaining):
+                                await child_loop._background_owner.conversation_channel.wait(
+                                    child_loop.agent_instance_id or ""
+                                )
+                        except TimeoutError:
                             bound_exited = True
                             break
                     if child_loop.notification_system_message() is None:
@@ -424,17 +438,34 @@ async def consume_run(
             if current_entry is not None:
                 child_store.acknowledge_pending_prompt(current_entry.id)
                 current_entry = None
-            pending = child_store.close_pending_queue_if_empty()
-            if not pending:
-                terminal_result = finalize(result)
-                return terminal_result
-            current_entry = pending[0]
-            result = await consume_child(
-                child_loop,
-                current_entry.data["text"],
-                origin=MessageOrigin.AGENT_SEND,
-                **kwargs,
+            pending = (
+                child_store.close_pending_queue_if_empty()
+                if child_store.pending_prompts()
+                else []
             )
+            if pending:
+                current_entry = pending[0]
+                result = await consume_child(
+                    child_loop,
+                    current_entry.data["text"],
+                    origin=MessageOrigin.AGENT_SEND,
+                    **kwargs,
+                )
+                continue
+            if child_loop.notification_wake.pending_message() is not None:
+                result = await consume_child(
+                    child_loop,
+                    "",
+                    origin=MessageOrigin.NOTIFICATION,
+                    notification_turn=True,
+                    **kwargs,
+                )
+                continue
+            pending = child_store.close_pending_queue_if_empty()
+            if pending:
+                continue
+            terminal_result = finalize(result)
+            return terminal_result
         terminal_result = finalize(result)
         return terminal_result
     finally:
@@ -616,7 +647,10 @@ async def run_agent_tool(
             f"agent error: {error_message(exc)}",
             state="failed",
         )
-    is_run = preset.source == "packaged" and preset.name == RUN_PRESET.name
+    follow_up_loop = has_follow_up_loop(
+        accepts_follow_ups=preset.accepts_follow_ups,
+        background=background,
+    )
     stored_agent_type = (
         None
         if preset.source == "packaged" and preset.name == GENERAL_PRESET.name
@@ -667,6 +701,7 @@ async def run_agent_tool(
         agent_type=stored_agent_type,
         background=background,
         child_instance_id=child_instance_id,
+        accepts_follow_ups=follow_up_loop,
     )
     if loop.root_project_id is not None and loop.project_registry is not None:
         link = {
@@ -742,6 +777,12 @@ async def run_agent_tool(
         loop._background_owner.store_leases.callback(
             child_registry.background_tasks.release_directory
         )
+        if follow_up_loop:
+            register_ask_parent(
+                child_registry,
+                channel=loop._background_owner.conversation_channel,
+                child_instance_id=child_instance_id,
+            )
         parent_policy = loop.tool_registry.approval_policy
         child_policy: ChildApprovalPolicy | None = None
         if parent_policy is not None:
@@ -796,12 +837,14 @@ async def run_agent_tool(
             usage_sink=record_child_usage,
         )
         child_loop.one_shot = getattr(loop, "one_shot", False)
+        loop._background_owner.conversation_channel.register_loop(child_instance_id)
         if loop.plan_mode:
             child_loop.set_plan_mode(True)
         child_loop.set_background_event_sink(loop._publish_background_event)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - setup failures become receipts
+        loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
         if child_registry is not None:
             child_registry.background_tasks.release_directory()
         failure_text = f"agent error: {error_message(exc)}"
@@ -858,14 +901,11 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(current_step=step)
 
     def finish_lifecycle(state: str, text: str) -> dict[str, object]:
-        if is_run and state == "completed":
-            child_store.update_agent_lifecycle(turns_used=child_turns())
-        else:
-            child_store.finish_agent_lifecycle(
-                state,
-                final_result=text,
-                turns_used=child_turns(),
-            )
+        child_store.finish_agent_lifecycle(
+            state,
+            final_result=text,
+            turns_used=child_turns(),
+        )
         return agent_stats(child_store.agent_lifecycle(), turns_used=child_turns())
 
     def child_result(
@@ -949,7 +989,7 @@ async def run_agent_tool(
     def update_tool_calls(tool_calls: int) -> None:
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
-    consume = consume_run if is_run else consume_child
+    consume = consume_run if follow_up_loop else consume_child
     receipt_components: dict[str, str] = {}
     run_kwargs: dict[str, Any] = (
         {
@@ -960,7 +1000,7 @@ async def run_agent_tool(
             ),
             "receipt_components": receipt_components,
         }
-        if is_run
+        if follow_up_loop
         else {
             "origin": MessageOrigin.AGENT_PROMPT,
             "record_report": lambda report: receipt_components.setdefault(
@@ -1022,6 +1062,9 @@ async def run_agent_tool(
             loop._agent_child_types.pop(tool_call.id, None)
             loop._background_child_cancellers.pop(tool_call.id, None)
             loop._background_child_watchers.pop(tool_call.id, None)
+            loop._background_owner.conversation_channel.unregister_loop(
+                child_instance_id
+            )
             loop._background_owner.unregister(child_instance_id)
             loop._background_owner.mark_store_finished(child_store)
             loop._background_owner.release_unused_stores()
@@ -1116,7 +1159,19 @@ async def run_agent_tool(
         # A completed child wins a same-turn abort race so its descendants can
         # be adopted by receipt processing rather than canceled as unreachable.
         if child_task in done:
-            return child_task.result()
+            result = child_task.result()
+            if follow_up_loop:
+                content = result.get("content")
+                if (
+                    isinstance(content, list)
+                    and content
+                    and isinstance(content[0], dict)
+                    and isinstance(content[0].get("text"), str)
+                ):
+                    child_store.update_agent_lifecycle_result(
+                        content[0]["text"], canonical_receipt=True
+                    )
+            return result
         if abort_task in done:
             await cancel_child()
             raise asyncio.CancelledError()
@@ -1124,6 +1179,7 @@ async def run_agent_tool(
         await cancel_child()
         raise
     finally:
+        loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
         loop._background_owner.unregister(child_instance_id)
         if child_policy is not None:
             child_policy.cleanup()

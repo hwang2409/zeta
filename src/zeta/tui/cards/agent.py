@@ -748,7 +748,12 @@ class AgentRunCommandMixin:
         if len(parts) != 2:
             return "use /send <run-id> <message>; /runs lists the live ones"
         run_id, message = parts
-        error = send_to_run(self.loop.store, run_id, message)
+        error = send_to_run(
+            self.loop.store,
+            run_id,
+            message,
+            channel=self.loop._background_owner.conversation_channel,
+        )
         if error is not None:
             return error
         return f"queued for {run_id}; it arrives at the run's next turn boundary"

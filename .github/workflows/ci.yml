@@ -22,7 +22,7 @@ jobs:
   test:
     name: pytest (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       # One platform failing must still report the other; a darwin-only
       # regression is exactly what the second runner is for (ZETA-90).
