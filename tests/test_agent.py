@@ -863,6 +863,120 @@ class ForegroundNestedBackgroundBackend(CompletionBackend):
         )
 
 
+class FinishGateBackend(CompletionBackend):
+    def __init__(self, gate_action: str) -> None:
+        self.gate_action = gate_action
+        self.grandchild_started = asyncio.Event()
+        self.release_grandchild = asyncio.Event()
+        self.gate_seen = asyncio.Event()
+        self.child_final_responses: list[str] = []
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        gate = next(
+            (
+                message
+                for message in reversed(messages)
+                if message.metadata.get("zeta_event") == "agent_finish_gate"
+            ),
+            None,
+        )
+        notification = any(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in messages
+        )
+        canceled = any(
+            message.tool_result is not None
+            and message.tool_result.tool_call_id == "cancel-grandchild"
+            for message in messages
+        )
+        root_child_done = any(
+            message.tool_result is not None
+            and message.tool_result.tool_call_id == "child"
+            for message in messages
+        )
+        grandchild_started = any(
+            message.tool_result is not None
+            and message.tool_result.tool_call_id == "grandchild"
+            for message in messages
+        )
+        if root_child_done:
+            blocks = [TextContent("root complete")]
+        elif last_user == "start":
+            child = _agent_call("child")
+            child.arguments["prompt"] = "child prompt"
+            blocks = [ToolUseContent(child)]
+        elif last_user == "grandchild prompt":
+            self.grandchild_started.set()
+            await self.release_grandchild.wait()
+            blocks = [TextContent("evidence ready")]
+        elif grandchild_started and gate is None and not notification:
+            blocks = [TextContent("premature child answer")]
+        elif last_user == "child prompt" and gate is None:
+            grandchild = _background_agent_call("grandchild")
+            grandchild.arguments["prompt"] = "grandchild prompt"
+            grandchild.arguments["description"] = "collect evidence"
+            blocks = [ToolUseContent(grandchild)]
+        elif canceled:
+            blocks = [TextContent("child canceled unused work and finished")]
+        elif gate is not None and not notification:
+            self.gate_seen.set()
+            gate_text = next(
+                block.text for block in gate.content if isinstance(block, TextContent)
+            )
+            if self.gate_action == "cancel":
+                handle = re.search(r"([\w-]+(?::\d+)+): collect evidence", gate_text)
+                assert handle is not None
+                blocks = [
+                    ToolUseContent(
+                        ToolCall(
+                            "cancel-grandchild",
+                            "agent_cancel",
+                            {"handle": handle.group(1)},
+                        )
+                    )
+                ]
+            elif self.gate_action == "handoff":
+                blocks = [
+                    TextContent(
+                        "HAND OFF: the parent should read the adopted child output "
+                        "because this agent lacks the remaining context."
+                    )
+                ]
+            else:
+                blocks = [TextContent("I will wait for the evidence.")]
+        elif notification:
+            blocks = [TextContent("merged result: evidence ready")]
+        else:
+            blocks = [TextContent("root complete")]
+        for block in blocks:
+            if isinstance(block, TextContent) and (
+                "child" in block.text or "merged result" in block.text
+            ):
+                self.child_final_responses.append(block.text)
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 class ParallelNestedReadBackend(CompletionBackend):
     def __init__(self, count: int) -> None:
         self.calls = []
@@ -1662,30 +1776,129 @@ async def test_foreground_cancel_cancels_owned_background_descendant_only(
 
 
 @pytest.mark.asyncio
-async def test_foreground_child_does_not_wait_for_background_grandchild(
+async def test_child_finish_gate_waits_for_grandchild_and_merges_result(
     tmp_path: Path,
 ) -> None:
-    backend = ForegroundNestedBackgroundBackend()
+    backend = FinishGateBackend("wait")
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
-    events = await asyncio.wait_for(task, timeout=1)
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    assert not task.done()
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    gate_message = next(
+        message
+        for message in child_store.messages()
+        if message.metadata.get("zeta_event") == "agent_finish_gate"
+    )
+    assert gate_message.metadata["zeta.origin"] == MessageOrigin.HARNESS_NUDGE.value
+    assert "collect evidence" in next(
+        block.text for block in gate_message.content if isinstance(block, TextContent)
+    )
 
-    assert any(event.type is StreamEventType.TURN_END for event in events)
-    assert store.agent_notifications() == []
+    child_store.close()
+    backend.release_grandchild.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    lifecycle = child_store.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["final_result"].startswith("merged result: evidence ready")
+    assert backend.child_final_responses.index("premature child answer") < (
+        backend.child_final_responses.index("merged result: evidence ready")
+    )
+    assert not store.agent_children()
+    child_store.close()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_finish_gate_cancel_path(tmp_path: Path) -> None:
+    backend = FinishGateBackend("cancel")
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await asyncio.wait_for(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=2
+    )
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    lifecycle = child_store.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["final_result"].startswith("child canceled unused work")
+    assert not store.agent_children()
+    child_store.close()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_finish_gate_explicit_handoff_adopts_grandchild(
+    tmp_path: Path,
+) -> None:
+    backend = FinishGateBackend("handoff")
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await asyncio.wait_for(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=2
+    )
+
     marker = next(iter(store.agent_children().values()))
+    assert marker["description"] == "collect evidence"
     assert marker["child_session_path"] == str(
         store.session_dir / "agents" / "1" / "agents" / "1"
     )
-    assert loop._background_owner.owns_running(f"{store.session_id}:1:1")
-
     backend.release_grandchild.set()
     notification = await _wait_for_notification(store, "completed")
-    assert notification.data["text"].startswith("grandchild complete")
+    assert notification.data["text"].startswith("evidence ready")
     await loop.close()
-    assert not store.agent_children()
+
+
+@pytest.mark.asyncio
+async def test_child_finish_gate_turn_bound_falls_back_to_adoption(
+    tmp_path: Path,
+) -> None:
+    backend = FinishGateBackend("wait")
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_finish_gate_max_turns=1,
+        agent_finish_gate_timeout=60,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await asyncio.wait_for(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=2
+    )
+
+    marker = next(iter(store.agent_children().values()))
+    assert marker["description"] == "collect evidence"
+    backend.release_grandchild.set()
+    await _wait_for_notification(store, "completed")
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_top_level_finish_is_not_gated_by_background_child(tmp_path: Path) -> None:
+    backend = BackgroundBackend([_background_agent_call()])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await asyncio.wait_for(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=2
+    )
+
+    assert not any(
+        message.metadata.get("zeta_event") == "agent_finish_gate"
+        for message in store.messages()
+    )
+    assert loop._background_owner.running
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+    await loop.close()
 
 
 @pytest.mark.asyncio

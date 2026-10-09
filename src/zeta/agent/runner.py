@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +21,7 @@ from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
     CompletionBackend,
     Message,
     MessageOrigin,
@@ -98,8 +99,10 @@ async def consume_child(
             return child_loop.agent_depth + 1
         return child_loop.agent_depth
 
-    try:
-        async for event in child_loop.run_turn(prompt, origin=origin):
+    async def consume_events(events: AsyncIterator[StreamEvent]) -> None:
+        nonlocal failure_message, final_message, tool_calls
+        final_message = None
+        async for event in events:
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
                 update_step(status)
@@ -150,6 +153,77 @@ async def consume_child(
                     final_message = event.message
             elif event.type is StreamEventType.ERROR and event.error is not None:
                 failure_message = event.error.message
+
+    def owned_children() -> tuple[tuple[str, str], ...]:
+        instance_id = child_loop.agent_instance_id
+        if instance_id is None:
+            return ()
+        return child_loop._background_owner.owned_running(instance_id)
+
+    def finish_gate_message(children: tuple[tuple[str, str], ...]) -> Message:
+        child_list = ", ".join(
+            f"{handle}: {description}" for handle, description in children
+        )
+        text = (
+            f"You have {len(children)} background sub-agents still running: "
+            f"{child_list}. You cannot finish yet. Choose one: "
+            "(a) wait: reply WAIT and end this turn; completions will wake you, "
+            "with no polling; (b) cancel them with agent_cancel; "
+            "(c) hand them off: reply with `HAND OFF:` followed by the reason "
+            "and where their outputs will appear, then finish."
+        )
+        return Message(
+            MessageRole.USER,
+            [TextContent(text)],
+            metadata={
+                "zeta_event": "agent_finish_gate",
+                MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
+            },
+        )
+
+    try:
+        await consume_events(child_loop.run_turn(prompt, origin=origin))
+        children = owned_children()
+        if final_message is not None and children:
+            deadline = (
+                asyncio.get_running_loop().time()
+                + child_loop.agent_finish_gate_timeout
+            )
+            gate = finish_gate_message(children)
+            await consume_events(
+                child_loop.run_turn(
+                    "",
+                    origin=MessageOrigin.HARNESS_NUDGE,
+                    user_message=gate,
+                )
+            )
+            followup_turns = 1
+            while failure_message is None:
+                children = owned_children()
+                final_text = (
+                    assistant_text(final_message).lstrip()
+                    if final_message is not None
+                    else ""
+                )
+                if children and final_text.casefold().startswith("hand off:"):
+                    break
+                pending_notification = (
+                    child_loop.notification_system_message() is not None
+                )
+                if not children and not pending_notification:
+                    break
+                if followup_turns >= child_loop.agent_finish_gate_max_turns:
+                    break
+                if children:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0 or not await child_loop._background_owner.wait_for_owned_completion(
+                        child_loop.agent_instance_id or "", remaining
+                    ):
+                        break
+                if child_loop.notification_system_message() is None:
+                    continue
+                await consume_events(child_loop.run_notification_turn())
+                followup_turns += 1
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
@@ -643,6 +717,8 @@ async def run_agent_tool(
             project_registry=loop.project_registry,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
+            agent_finish_gate_max_turns=loop.agent_finish_gate_max_turns,
+            agent_finish_gate_timeout=loop.agent_finish_gate_timeout,
         )
         child_loop.one_shot = getattr(loop, "one_shot", False)
         if loop.plan_mode:

@@ -168,14 +168,29 @@ class AgentLoop(
         project_registry: Any = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
+        agent_finish_gate_max_turns: int = 8,
+        agent_finish_gate_timeout: float = 600,
     ) -> None:
         if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
+        if (
+            type(agent_finish_gate_max_turns) is not int
+            or agent_finish_gate_max_turns < 1
+        ):
+            raise ValueError("agent_finish_gate_max_turns must be a positive integer")
+        if (
+            not isinstance(agent_finish_gate_timeout, (int, float))
+            or isinstance(agent_finish_gate_timeout, bool)
+            or agent_finish_gate_timeout <= 0
+        ):
+            raise ValueError("agent_finish_gate_timeout must be positive")
         self.backend = backend
         self.store = store
         self.store.recover_client_deliveries()
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
+        self.agent_finish_gate_max_turns = agent_finish_gate_max_turns
+        self.agent_finish_gate_timeout = float(agent_finish_gate_timeout)
         self.root_project_id = root_project_id
         self.parent_session_id = parent_session_id
         # Directory of the ROOT session that owns the durable child-link index;
