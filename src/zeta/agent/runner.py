@@ -467,6 +467,7 @@ async def run_agent_tool(
             state="failed",
         )
     accepts_follow_ups = preset.accepts_follow_ups
+    follow_up_loop = accepts_follow_ups and background
     stored_agent_type = (
         None
         if preset.source == "packaged" and preset.name == GENERAL_PRESET.name
@@ -517,7 +518,7 @@ async def run_agent_tool(
         agent_type=stored_agent_type,
         background=background,
         child_instance_id=child_instance_id,
-        accepts_follow_ups=accepts_follow_ups,
+        accepts_follow_ups=follow_up_loop,
     )
     if loop.root_project_id is not None and loop.project_registry is not None:
         link = {
@@ -805,7 +806,7 @@ async def run_agent_tool(
     def update_tool_calls(tool_calls: int) -> None:
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
-    consume = consume_run if accepts_follow_ups else consume_child
+    consume = consume_run if follow_up_loop else consume_child
     receipt_components: dict[str, str] = {}
     run_kwargs: dict[str, Any] = (
         {
@@ -816,7 +817,7 @@ async def run_agent_tool(
             ),
             "receipt_components": receipt_components,
         }
-        if accepts_follow_ups
+        if follow_up_loop
         else {
             "origin": MessageOrigin.AGENT_PROMPT,
             "record_report": lambda report: receipt_components.setdefault(
@@ -973,7 +974,7 @@ async def run_agent_tool(
         # be adopted by receipt processing rather than canceled as unreachable.
         if child_task in done:
             result = child_task.result()
-            if accepts_follow_ups:
+            if follow_up_loop:
                 content = result.get("content")
                 if (
                     isinstance(content, list)
