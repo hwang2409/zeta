@@ -207,9 +207,6 @@ class AgentLoop(
         self.memory_reconciler: AutoMemoryReconciler | None = None
         self._turn_provider_retry_records: list[dict[str, object]] = []
         recover_agent_children(self)
-        self._background_owner.conversation_channel.recover_orphaned_questions(
-            self.store
-        )
         self.tool_registry = select_tool_registry(
             store,
             tools=tools,

@@ -566,6 +566,9 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
 
     child_markers = loop.store.agent_children()
     if not child_markers:
+        loop._background_owner.conversation_channel.recover_orphaned_questions(
+            loop.store
+        )
         return
     notification_store = loop._background_owner.notification_store
     notification_index = _agent_notification_index(notification_store)
@@ -753,6 +756,7 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                 elif recovered_result is not None or existing_result is not None:
                     child_store.finish_agent_parent()
             loop.store.finish_agent_child(marker_key)
+    loop._background_owner.conversation_channel.recover_orphaned_questions(loop.store)
 
 
 BuildResult = Callable[..., dict[str, object]]
