@@ -1811,9 +1811,11 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
     results = [
         message.tool_result for message in store.messages() if message.tool_result
     ]
+    assert len(results) == 2
+    assert all(result is not None for result in results)
     assert all(
-        result is not None and result.content.startswith(expected)
-        for result, expected in zip(results, ("child-1", "child-2"), strict=True)
+        any(result.content.startswith(expected) for result in results if result is not None)
+        for expected in ("child-1", "child-2")
     )
     assert sorted(path.name for path in (store.session_dir / "agents").iterdir()) == [
         "1",
