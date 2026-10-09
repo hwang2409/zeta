@@ -1,33 +1,74 @@
 # Project memory
 
-Zeta's versioned project memory store is the source of truth. It generates a
-read-only view of `brief.md`, `state.md`, `backlog.md`, `changelog.md`, and
-`decisions.md` in `~/.zeta/projects/<id>/memory/`; direct edits to these files
-are ignored and overwritten. Use `/memory` or `zeta project memory` to change
-memory; see `zeta project memory --help` for the command syntax. If the
-version-store pointer is missing, Zeta reports the damaged store instead of
-using a generated view as legacy memory. The generated files are not a recovery
-source, even if they were edited.
+Zeta stores project state and decisions as typed entries. New CLI-created,
+explicitly initialized, and automatically discovered projects use entry memory
+(format 2). Existing projects stay on the five-file format (format 1) until an
+operator migrates each project. There is no global or implicit migration.
 
-Mirror publication and repair are best-effort. A mirror write failure is logged
-but does not fail an authoritative memory update or context read.
+The Markdown files in `~/.zeta/projects/<id>/memory/` are generated, read-only
+views. Direct edits are ignored and overwritten. The versioned store is the
+source of truth. If its pointer is damaged, Zeta does not use a generated view
+as recovery data. Mirror publication and repair are best effort and cannot fail
+an authoritative update or context read.
+
+Memory is loaded when a session starts or resumes. It does not refresh during a
+running session. Agents can inspect memory, but only the background updater and
+explicit user commands write entry memory. The model-facing `project_update`
+tool remains available for format-1 projects. On a format-2 project it returns:
+`this project uses entry memory; memory is maintained automatically`.
+
+## Profiles
+
+The default `zeta` profile contains `brief`, `decisions`, `state`, `backlog`,
+and `changelog`. A messaging project instead uses `people`, `preferences`,
+`routines`, `threads`, and `commitments`:
+
+```sh
+zeta project create ween --scope messaging --memory-profile messaging
+zeta project init ~/src/ween --memory-profile messaging
+zeta project memory ween schema set-profile messaging \
+  --map-kind brief=people \
+  --map-kind decisions=preferences \
+  --map-kind state=threads \
+  --map-kind backlog=commitments \
+  --resolve-kind changelog
+```
+
+A profile is copied into the project state. It is not a live reference to a
+global default. A profile change preserves entries in kinds with the same key.
+It also preserves every explicit expiry. A new default expiry applies only to
+later entries or later `seen_at` updates.
+
+A removed populated kind requires one explicit action. Use `--map-kind OLD=NEW`
+to retain its entries under a target kind, or `--resolve-kind KIND` to remove its
+entries from the current view. Resolved entries remain in bounded version
+history so undo can restore the complete schema transaction.
+
+Messaging memory stores people, preferences, routines, threads, and
+commitments. Messaging-agent behavior, such as quiet hours and follow-up
+frequency, stays in the messaging agent and is not a memory rule.
 
 ## Automatic updates
 
-Automatic project-memory reconciliation is enabled by default for sessions that
-have an associated project. One background worker reads only durable transcript
-rows and creates updates:
+Automatic reconciliation is enabled by default for sessions with a project.
+One background worker reads durable transcript rows and applies validated entry
+operations:
 
 - before context eviction;
-- after 50,000 estimated new transcript tokens; or
-- after 10 minutes without activity.
+- after 50,000 estimated new transcript tokens;
+- after 10 minutes without activity; or
+- after a coalesced completed user turn.
 
-The token trigger uses transcript growth, not provider usage. Requests use the
-configured memory model. Before provider assembly, Zeta removes secrets and
-agent-directed instructions. Each automatic update records the source session,
-transcript range, model, and usage as provenance. Remote export and import retain this provenance and automatic status; imports are undoable versions and never accept content automatically.
+Requests use the configured memory model. Zeta removes secrets and
+agent-directed instructions before provider assembly. If active memory exceeds
+the request budget, the request includes full text for the highest-priority,
+most recently updated entries and an ID, kind, date, and short-text index for
+every other active entry. Each automatic operation records its transcript
+evidence and origin. Contradictions supersede older entries; completed work
+resolves open entries; elapsed validity expires temporary entries. There is no
+model-facing forget operation.
 
-Configure the global `~/.zeta/settings.toml` file:
+Configure `~/.zeta/settings.toml`:
 
 ```toml
 [memory]
@@ -37,43 +78,65 @@ token_threshold = 50000
 idle_minutes = 10
 ```
 
-Use `--no-auto-memory` to disable automatic reconciliation for one session.
-`--auto-memory` enables it explicitly. These flags are available on the main
-`zeta` command.
+Use `--no-auto-memory` or `--auto-memory` for one session.
 
-## Review and acceptance
+## Review and commands
 
-In the TUI:
+Entry commands use entry IDs, not mirror filenames:
 
-- `/memory log` shows retained update records and their provenance.
-- `/memory undo` restores the latest update that has not already been undone.
-- `/memory accept <file>` explicitly promotes an automatic file to trusted
-  memory.
+- `/memory log [kind|entry-id]` lists retained operation receipts.
+- `/memory undo [entry-id|version-id]` restores a retained transaction.
+- `/memory accept <entry-id>` accepts one active automatic entry.
+- `zeta project memory <project> --json` prints structured entry state.
+- `zeta project memory <project> --set <kind> <content>` replaces one kind with
+  one accepted legacy-document entry.
 
-Manual edits do not remove automatic provenance. Acceptance is a user-only
-operation and is recorded as `accepted_by: user`.
+Acceptance and manual mutation are user-only operations and require the normal
+confirmation interface.
 
-The equivalent CLI forms are:
+## Migrate, roll back, and finalize
+
+Migration uses the deterministic migration engine. It does not call a model.
+A leading `#` title is document metadata, not an entry. Each top-level list item
+and non-list paragraph becomes one typed entry. A paragraph ending in `:` is
+folded into each list item that it introduces, and each `##` section title is
+folded into its entries as a short text prefix. Oversized facts split without
+truncation. Entries keep their source order and the migration source digest and
+version. A file's entries remain automatic only when that format-1 file was
+automatic; other migrated entries are accepted. The exact five source files
+remain protected for rollback. Activation first checks that updater, prompt
+projection, commands/API, and synchronization all report format-2 support.
 
 ```sh
-zeta project memory <project> accept <file>
-zeta project memory accept <file>  # from an associated project directory
+# Migrate one existing project. Its format-1 target remains protected.
+zeta project memory <project-id-or-name> migrate
+
+# Restore that protected format-1 pointer and its exact documents.
+zeta project memory <project-id-or-name> rollback
+
+# After verification, end special rollback protection.
+zeta project memory <project-id-or-name> finalize
 ```
 
-The CLI action requires a terminal and asks for confirmation of the file name.
-The command accepts exactly one standard memory file.
+`migrate`, `rollback`, and `finalize` hold the project-registry lock. Migration
+is idempotent for the source digest. Rollback remains available after normal
+format-2 updates until `finalize`. Finalize is explicit and does not convert
+entries back to files.
 
-## Versions and synchronization
+Zeta retains 128 recent versions. The pre-migration format-1 target is protected
+from that bound only until finalize. After finalize, normal retention can remove
+it. This retention is an undo facility, not secure erasure: session transcripts,
+remote peers, filesystem snapshots, logs, and external backups can retain older
+content beyond Zeta's memory-history window.
 
-Zeta retains 128 recent version records, plus any older version needed by a
-retained undo. The version store is private to `ProjectRegistry`. Code that
-synchronizes or exports project memory must use the logical
-`ProjectRegistry.export_memory()` and CAS-based `ProjectRegistry.import_memory()`
-interfaces. Do not copy the private project-memory paths.
+## Synchronization and safety
 
-## Safety
+Format-2 synchronization transfers canonical entry state and schema. Mixed
+format-1/format-2 peers fail closed for mutation; Zeta never flattens entries
+back into five authoritative documents. Export and synchronization code must use
+the logical registry interfaces, not copy private version-store paths.
 
-The acceptance prompt prevents casual acceptance by an automatic model or by a
-non-interactive CLI caller. Zeta's shell tools run as the current user, so this
-is not protection against a hostile shell that edits the private version store
-directly. Treat shell access and project files as trusted host resources.
+The confirmation prompt prevents casual acceptance by an automatic model or a
+non-interactive CLI caller. Shell access runs as the current user, so it is not
+protection against a hostile process that edits the private store. Treat host
+shell access and project files as trusted resources.

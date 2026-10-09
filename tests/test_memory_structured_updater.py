@@ -11,6 +11,7 @@ import pytest
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import (
     EntryReconciliationFailure,
+    _prepare_request,
     reconcile_entry_range,
 )
 from zeta.memory.entry_store import (
@@ -29,7 +30,11 @@ from zeta.memory.profiles import (
     early_update_max_wait_seconds,
     memory_profile,
 )
-from zeta.memory.reconciler import ReconciliationResponse, Transcript
+from zeta.memory.reconciler import (
+    ReconciliationError,
+    ReconciliationResponse,
+    Transcript,
+)
 from zeta.project_errors import ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
 
@@ -139,6 +144,26 @@ def _entries(registry: ProjectRegistry, project_id: str) -> list[MemoryEntry]:
     ]
 
 
+def _large_index_state(registry: ProjectRegistry, project_id: str):
+    current = registry._entry_memory_state(project_id)
+    operations = tuple(
+        AddOperation(
+            "state",
+            f"Entry {index:03d} " + (chr(65 + index % 26) * 1800),
+            (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),),
+        )
+        for index in range(124)
+    )
+    state, _ = apply_operations(
+        current.state,
+        operations,
+        reconciliation_key=_key("large-notification-index"),
+        automatic=True,
+        now=NOW,
+    )
+    return state
+
+
 def _seed_user_entry(
     registry: ProjectRegistry,
     project_id: str,
@@ -163,6 +188,147 @@ def _seed_user_entry(
         now=observed_at,
     )
     return next(iter(result.state.entries))
+
+
+def test_oversized_harness_notification_is_bounded_with_large_index(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id)
+    notification = {
+        "seq": 71,
+        "type": "message",
+        "data": {
+            "message": {
+                "role": "system",
+                "content": [{"type": "text", "text": "x" * 7_500}],
+                "metadata": {
+                    "zeta_event": "agent_notifications",
+                    "notifications": [{"notification_id": "child-1"}],
+                },
+            }
+        },
+    }
+
+    request = _prepare_request(
+        _transcript(notification), state, as_of=date(2026, 10, 9)
+    )
+
+    assert request.transcript.rows[0]["seq"] == 71
+    assert len(request.prompt.encode()) <= 28 * 1024
+    text = request.transcript.rows[0]["data"]["message"]["content"][0]["text"]
+    assert len(text.encode()) < 7_500
+
+
+def test_oversized_harness_notification_with_turn_context_requires_lossless_handling(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id)
+    notification = {
+        "seq": 71,
+        "type": "message",
+        "data": {
+            "message": {
+                "role": "system",
+                "content": [{"type": "text", "text": "x" * 11_669}],
+                "metadata": {
+                    "zeta_event": "agent_notifications",
+                    "notifications": [{"notification_id": "child-1"}],
+                    "turn_context": True,
+                },
+            }
+        },
+    }
+
+    with pytest.raises(
+        ReconciliationError,
+        match="oversized non-generated transcript row requires lossless handling",
+    ):
+        _prepare_request(
+            _transcript(notification), state, as_of=date(2026, 10, 9)
+        )
+    assert notification["data"]["message"]["content"][0]["text"] == "x" * 11_669
+
+
+def test_oversized_user_row_still_requires_lossless_handling(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id)
+    user_row = _row(45, "x" * 7_500)
+
+    with pytest.raises(ReconciliationError, match="user row exceeds"):
+        _prepare_request(_transcript(user_row), state, as_of=date(2026, 10, 9))
+
+
+@pytest.mark.asyncio
+async def test_oversized_memory_indexes_every_active_entry_and_allows_targeting(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    current = registry._entry_memory_state(project_id)
+    operations = tuple(
+        AddOperation(
+            "state",
+            f"Entry {index:02d} " + (chr(65 + index % 26) * 1800),
+            (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),),
+        )
+        for index in range(24)
+    )
+    state, _ = apply_operations(
+        current.state,
+        operations,
+        reconciliation_key=_key("large-memory"),
+        automatic=True,
+        now=NOW,
+    )
+    registry._replace_entry_state_for_test(
+        project_id, state, expected_digest=current.digest
+    )
+    transcript = _transcript(_row(1, "Correct one indexed entry."))
+    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    active_ids = {
+        entry.id
+        for entry in state.entries.values()
+        if isinstance(entry, MemoryEntry) and entry.status == "active"
+    }
+
+    assert "Current entries (full=" in request.prompt
+    assert all(entry_id in request.prompt for entry_id in active_ids)
+    indexed = [
+        line for line in request.prompt.splitlines() if line.startswith("INDEX ")
+    ]
+    assert indexed
+    target = indexed[-1].split()[1]
+
+    async def invoke(prompt: str) -> str:
+        assert f"INDEX {target} " in prompt
+        return _proposal(
+            {
+                "op": "update",
+                "target": target,
+                "text": "Corrected indexed entry.",
+                "sources": [{"seq_start": 1, "seq_end": 1}],
+                "reason": "direct correction",
+            }
+        )
+
+    result = await reconcile_entry_range(
+        registry=registry,
+        project_id=project_id,
+        transcript=transcript,
+        reconciliation_key=_key("indexed-update"),
+        invoke=invoke,
+        cas_retries=1,
+        as_of=date(2026, 10, 9),
+        now="2026-10-08T12:01:00.000000Z",
+    )
+
+    assert result.changed_entry_ids == (target,)
+    changed = registry._entry_memory_state(project_id).state.entries[target]
+    assert isinstance(changed, MemoryEntry)
+    assert changed.text == "Corrected indexed entry."
 
 
 def test_zeta_and_messaging_profiles_apply_distinct_defaults() -> None:

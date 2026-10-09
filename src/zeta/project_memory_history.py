@@ -22,6 +22,7 @@ from .memory.version_store import (
     publish_version,
     require_memory_format,
 )
+from .memory_migration_plan import reachable_version_pruning_plan
 from .project_errors import ProjectRegistryError
 from .project_schema import MAX_MEMORY_FILE_SIZE
 
@@ -440,15 +441,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         return MemorySnapshot(contents, self._memory_digest_value(contents))
 
     def ensure_memory_supported(self, project_id: str) -> None:
-        """Reject a project whose authoritative memory format is not active."""
-        def read(root_fd: int) -> None:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                self._require_format_one(directory_fd)
-            finally:
-                os.close(directory_fd)
-
-        self._read(read)
+        """Validate that the project uses a memory format supported by this build."""
+        self.memory_format(project_id)
 
     def memory_snapshot(self, project_id: str) -> MemorySnapshot:
         """Read the complete bounded memory set and digest atomically."""
@@ -696,28 +690,14 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         return published.version
 
     def _prune_versions(self, blobs_fd: int, versions_fd: int, retained: set[str]) -> None:
-        referenced: set[str] = set()
-        pending = list(retained)
-        while pending:
-            version = pending.pop()
-            manifest = self._manifest(versions_fd, version)
-            target = manifest.get("target_version")
-            if isinstance(target, str) and target not in retained:
-                retained.add(target)
-                pending.append(target)
-            for key in ("snapshot", "before_snapshot"):
-                values = manifest.get(key)
-                if isinstance(values, dict):
-                    referenced.update(
-                        item for item in values.values() if isinstance(item, str)
-                    )
-                elif isinstance(values, str):
-                    referenced.add(values)
+        plan = reachable_version_pruning_plan(
+            retained, lambda version: self._manifest(versions_fd, version)
+        )
         for name in os.listdir(versions_fd):
-            if name.endswith(".json") and name[:-5] not in retained:
+            if name.endswith(".json") and name[:-5] not in plan.versions:
                 os.unlink(name, dir_fd=versions_fd)
         for name in os.listdir(blobs_fd):
-            if name not in referenced:
+            if name not in plan.blobs:
                 os.unlink(name, dir_fd=blobs_fd)
         os.fsync(versions_fd)
         os.fsync(blobs_fd)

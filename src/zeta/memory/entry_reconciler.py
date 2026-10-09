@@ -80,6 +80,8 @@ _DURABLE_LITERAL_CUES = (
     "decision",
     "remember",
 )
+SUPPORTED_MEMORY_FORMATS = frozenset({1, 2})
+
 _HIGHEST_PRIORITY_WORDS = (
     "correction",
     "actually",
@@ -127,27 +129,47 @@ class _ProposalError(ReconciliationError):
         super().__init__("; ".join(self.errors))
 
 
-def _entry_projection(state: MemoryState) -> list[dict[str, object]]:
-    projected: list[dict[str, object]] = []
-    for entry in state.entries.values():
-        if not isinstance(entry, MemoryEntry):
-            continue
-        projected.append(
-            {
-                "id": entry.id,
-                "kind": entry.kind,
-                "text": _sanitized(entry.text),
-                "status": entry.status,
-                "updated_at": entry.updated_at,
-                "seen_at": entry.seen_at,
-                "expires_at": entry.expires_at,
-                "valid_from": entry.valid_from,
-                "valid_until": entry.valid_until,
-                "accepted": entry.accepted_at is not None,
-                "source_rank": _stored_rank(entry),
-            }
-        )
-    return projected
+def _active_entries_by_priority(state: MemoryState) -> list[MemoryEntry]:
+    priorities = {kind.key: kind.prompt_priority for kind in state.schema.kinds}
+    return sorted(
+        (
+            entry
+            for entry in state.entries.values()
+            if isinstance(entry, MemoryEntry) and entry.status == "active"
+        ),
+        key=lambda entry: (
+            priorities[entry.kind],
+            entry.updated_at,
+            entry.seen_at,
+            entry.id,
+        ),
+        reverse=True,
+    )
+
+
+def _entry_projection(entry: MemoryEntry) -> dict[str, object]:
+    return {
+        "id": entry.id,
+        "kind": entry.kind,
+        "text": _sanitized(entry.text),
+        "status": entry.status,
+        "updated_at": entry.updated_at,
+        "seen_at": entry.seen_at,
+        "expires_at": entry.expires_at,
+        "valid_from": entry.valid_from,
+        "valid_until": entry.valid_until,
+        "accepted": entry.accepted_at is not None,
+        "source_rank": _stored_rank(entry),
+    }
+
+
+def _entry_index(entry: MemoryEntry) -> str:
+    sanitized = _sanitized(entry.text)
+    preview = " ".join(sanitized.split())[:80] if isinstance(sanitized, str) else ""
+    return (
+        f"INDEX {entry.id} kind={entry.kind} date={entry.updated_at[:10]} "
+        f"preview={json.dumps(preview, ensure_ascii=False)}"
+    )
 
 
 def _prompt(
@@ -155,7 +177,8 @@ def _prompt(
     state: MemoryState,
     *,
     as_of: date,
-    entries: Sequence[Mapping[str, object]] | None = None,
+    entries: Sequence[Mapping[str, object]] = (),
+    entry_index: Sequence[str] = (),
 ) -> str:
     kinds = [
         {
@@ -195,12 +218,49 @@ Rules:
 Kind schema:
 {json.dumps(kinds, ensure_ascii=False, separators=(",", ":"))}
 
-Current entries:
-{json.dumps(list(entries) if entries is not None else _entry_projection(state), ensure_ascii=False, separators=(",", ":"))}
+Current entries (full={len(entries)}, indexed={len(entry_index)}):
+{json.dumps(list(entries), ensure_ascii=False, separators=(",", ":"))}
+{chr(10).join(entry_index)}
 
 Completed transcript rows:
 {json.dumps(_rendered_transcript_rows(transcript), ensure_ascii=False, separators=(",", ":"))}
 """
+
+
+def _prompt_with_visible_entries(
+    transcript: Transcript, state: MemoryState, *, as_of: date
+) -> str:
+    active = _active_entries_by_priority(state)
+    indexed = [_entry_index(entry) for entry in active]
+    prompt = _prompt(transcript, state, as_of=as_of, entry_index=indexed)
+    if len(prompt.encode()) > _MAX_PRIMARY_REQUEST_BYTES:
+        raise ReconciliationError("format-2 memory index cannot fit the request limit")
+    full: list[dict[str, object]] = []
+    for position, entry in enumerate(active):
+        candidate_full = [*full, _entry_projection(entry)]
+        candidate_index = [
+            _entry_index(indexed_entry)
+            for indexed_entry in active[position + 1 :]
+        ]
+        candidate = _prompt(
+            transcript,
+            state,
+            as_of=as_of,
+            entries=candidate_full,
+            entry_index=candidate_index,
+        )
+        if len(candidate.encode()) <= _MAX_PRIMARY_REQUEST_BYTES:
+            full = candidate_full
+            indexed = candidate_index
+        else:
+            indexed = [
+                _entry_index(indexed_entry)
+                for indexed_entry in active[position:]
+            ]
+            break
+    return _prompt(
+        transcript, state, as_of=as_of, entries=full, entry_index=indexed
+    )
 
 
 def _prepare_request(
@@ -208,49 +268,48 @@ def _prepare_request(
 ) -> PreparedRequest:
     safe_rows: list[dict[str, Any]] = []
     empty = Transcript(transcript.session_id, ())
-    entries = _entry_projection(state)
-    while (
-        len(_prompt(empty, state, as_of=as_of, entries=entries).encode())
-        > _MAX_PRIMARY_REQUEST_BYTES
-    ):
-        if not entries:
-            raise ReconciliationError("format-2 memory cannot fit the request limit")
-        entries.pop()
+    _prompt_with_visible_entries(empty, state, as_of=as_of)
     for raw in transcript.rows:
         safe = _sanitized(project_transcript_row(raw))
         if not isinstance(safe, dict):
             continue
         candidate = Transcript(transcript.session_id, (*safe_rows, safe))
-        candidate_prompt = _prompt(candidate, state, as_of=as_of, entries=entries)
-        if len(candidate_prompt.encode()) <= _MAX_PRIMARY_REQUEST_BYTES:
-            safe_rows.append(safe)
-            continue
-        if safe_rows:
-            break
-        if _is_user_authored_row(safe):
-            raise ReconciliationError("user row exceeds the request limit")
-        if not _is_lossy_generated_row(safe):
-            raise ReconciliationError(
-                "oversized non-generated transcript row requires lossless handling"
-            )
-        for text_bytes, list_items in (
-            (8192, 32),
-            (4096, 16),
-            (2048, 8),
-            (1024, 4),
-            (512, 2),
-            (128, 1),
-            (0, 0),
-        ):
-            bounded = _bounded_value(safe, text_bytes=text_bytes, list_items=list_items)
-            selected = Transcript(transcript.session_id, (bounded,))
-            bounded_prompt = _prompt(selected, state, as_of=as_of, entries=entries)
-            if len(bounded_prompt.encode()) <= _MAX_PRIMARY_REQUEST_BYTES:
+        try:
+            _prompt_with_visible_entries(candidate, state, as_of=as_of)
+        except ReconciliationError:
+            if safe_rows:
+                break
+            if _is_user_authored_row(safe):
+                raise ReconciliationError("user row exceeds the request limit")
+            if not _is_lossy_generated_row(safe):
+                raise ReconciliationError(
+                    "oversized non-generated transcript row requires lossless handling"
+                )
+            for text_bytes, list_items in (
+                (8192, 32),
+                (4096, 16),
+                (2048, 8),
+                (1024, 4),
+                (512, 2),
+                (128, 1),
+                (0, 0),
+            ):
+                bounded = _bounded_value(
+                    safe, text_bytes=text_bytes, list_items=list_items
+                )
+                selected = Transcript(transcript.session_id, (bounded,))
+                try:
+                    bounded_prompt = _prompt_with_visible_entries(
+                        selected, state, as_of=as_of
+                    )
+                except ReconciliationError:
+                    continue
                 return PreparedRequest(bounded_prompt, selected)
-        raise ReconciliationError("one transcript row cannot fit request limit")
+            raise ReconciliationError("one transcript row cannot fit request limit")
+        safe_rows.append(safe)
     selected = Transcript(transcript.session_id, tuple(safe_rows))
     return PreparedRequest(
-        _prompt(selected, state, as_of=as_of, entries=entries), selected
+        _prompt_with_visible_entries(selected, state, as_of=as_of), selected
     )
 
 
@@ -875,7 +934,7 @@ async def reconcile_entry_range(
     as_of: date,
     now: str,
 ) -> EntryReconciliationResult:
-    """Reconcile one durable transcript fragment into dormant format-2 state."""
+    """Reconcile one durable transcript fragment into format-2 state."""
     usage: dict[str, int] = {}
     budget = ProviderRetryBudget()
     for attempt in range(cas_retries):
