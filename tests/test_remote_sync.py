@@ -1089,6 +1089,7 @@ def test_legacy_project_digest_is_upgraded_at_sync_entry(tmp_path: Path) -> None
     project, opened = _session(first, repo)
     opened.store.close()
     push_project_memory(first, LocalTransport(second), project_id=project.project_id)
+    push_project_memory(first, LocalTransport(second), project_id=project.project_id)
 
     class LegacyDigestTransport(LocalTransport):
         published_expected = ""
