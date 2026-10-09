@@ -50,7 +50,7 @@ class ToolRefreshActor:
             self._setup_notification_client = None
             self.handle_changed(ToolsListChanged(client))
 
-    def abort_setup(self, client: MCPClient) -> None:
+    def abort_setup(self, client: MCPClient | None) -> None:
         if self._setup_client is client:
             self._setup_client = None
         if self._setup_notification_client is client:

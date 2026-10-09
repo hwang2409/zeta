@@ -629,8 +629,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 await safe_close(client, CLIENT_CLOSE_TIMEOUT_SECONDS)
             raise
         except TimeoutError:
-            if client is not None:
-                self._tool_refresh.abort_setup(client)
+            self._tool_refresh.abort_setup(client)
             reason = f"after {self._setup_timeout:.1f}s"
             logger.warning(
                 "timed out connecting to MCP server %s %s", self.name, reason
@@ -645,8 +644,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             _notice(notice_sink, f"mcp · {self.name} timed-out ({reason})")
             return _SetupOutcome(status, client)
         except Exception as exc:  # noqa: BLE001 - isolate one server
-            if client is not None:
-                self._tool_refresh.abort_setup(client)
+            self._tool_refresh.abort_setup(client)
             reason = _error_text(exc)
             logger.warning("failed to mount MCP server %s: %s", self.name, reason)
             status = MCPServerStatus(
@@ -678,7 +676,6 @@ class MCPServerActor(MCPDefinitionPublisher):
         operation = self._operation
         if operation is None or operation.identifier != message.identifier:
             if message.outcome is not None and message.outcome.client is not None:
-                self._tool_refresh.abort_setup(message.outcome.client)
                 self._schedule_close(message.outcome.client)
             return
         if message.outcome is None:
@@ -731,7 +728,6 @@ class MCPServerActor(MCPDefinitionPublisher):
                 self._dispatch_call(operation.waiter, self._client)
             return
         if outcome.client is not None:
-            self._tool_refresh.abort_setup(outcome.client)
             self._schedule_close(outcome.client)
         self._unregister_tools(keep_primary=True)
         if reason is not None and operation.kind != "auto":
@@ -1138,6 +1134,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         *,
         detach: bool = True,
     ) -> asyncio.Task[object]:
+        self._tool_refresh.abort_setup(client)
         existing = self._scheduled_closes.get(id(client))
         if existing is not None:
             return existing[1]
@@ -1172,7 +1169,6 @@ class MCPServerActor(MCPDefinitionPublisher):
         except BaseException:
             return
         if outcome.client is not None:
-            self._tool_refresh.abort_setup(outcome.client)
             self._schedule_close(outcome.client)
 
     def _queue_child_finished(self, task: asyncio.Task[object]) -> None:
