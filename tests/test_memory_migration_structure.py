@@ -119,56 +119,95 @@ def test_migration_splits_overlong_blocks_at_paragraph_boundaries() -> None:
 
 
 @pytest.mark.parametrize(
-    ("project", "expected_counts"),
+    ("fixture", "expected_counts", "dated_context", "plain_paragraph"),
     (
         (
-            "zeta",
-            {"brief": 19, "state": 19, "backlog": 14, "changelog": 11, "decisions": 9},
+            "alpha",
+            {
+                "brief": 4,
+                "state": 4,
+                "backlog": 3,
+                "changelog": 3,
+                "decisions": 3,
+            },
+            "As of 2025-01-02:",
+            "A neutral collection records observations about colored tiles.",
         ),
         (
-            "phoebe",
-            {"brief": 26, "state": 13, "backlog": 18, "changelog": 14, "decisions": 12},
+            "bravo",
+            {
+                "brief": 3,
+                "state": 3,
+                "backlog": 3,
+                "changelog": 2,
+                "decisions": 2,
+            },
+            "As of 2025-02-10:",
+            "This guide describes a small public garden with numbered plots.",
         ),
         (
-            "research",
-            {"brief": 2, "state": 10, "backlog": 28, "changelog": 13, "decisions": 47},
+            "charlie",
+            {
+                "brief": 4,
+                "state": 2,
+                "backlog": 2,
+                "changelog": 2,
+                "decisions": 3,
+            },
+            "As of 2025-03-20:",
+            "The catalog contains imaginary objects with simple measurements.",
         ),
     ),
 )
-def test_real_memory_fixture_produces_standalone_typed_entries(
-    project: str, expected_counts: dict[str, int]
+def test_synthetic_memory_fixture_produces_standalone_typed_entries(
+    fixture: str,
+    expected_counts: dict[str, int],
+    dated_context: str,
+    plain_paragraph: str,
 ) -> None:
-    root = FIXTURES / project
+    root = FIXTURES / fixture
     contents = {
         name: (root / name).read_text(encoding="utf-8") for name in LEGACY_FILES
     }
     metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+    automatic_files = frozenset(metadata["automatic_files"])
 
-    plan = _plan(contents, automatic_files=frozenset(metadata["automatic_files"]))
+    plan = _plan(contents, automatic_files=automatic_files)
 
     counts = Counter(entry.kind for entry in plan.state.entries.values())
     assert counts == expected_counts
+    assert (
+        _plan(contents, automatic_files=automatic_files).canonical_state
+        == plan.canonical_state
+    )
     restored = state_from_bytes(canonical_state_bytes(plan.state))
+    assert canonical_state_bytes(restored) == plan.canonical_state
     for kind, count in counts.items():
         assert [
             entry.migration_order for entry in active_entries(restored, kind=kind)
         ] == list(range(count))
     texts = [entry.text for entry in plan.state.entries.values()]
+    assert plain_paragraph in texts
+    assert any(
+        dated_context in text and not text.rstrip().endswith(":") for text in texts
+    )
+    assert any("\n  - " in text or "\n   - " in text for text in texts)
+    assert all(len(text.encode()) <= MAX_ENTRY_TEXT_BYTES for text in texts)
+    if fixture == "charlie":
+        long_source = contents["brief.md"].split("## Long description\n\n", 1)[1]
+        assert len(long_source.encode()) > MAX_ENTRY_TEXT_BYTES
+        assert sum(text.startswith("[Long description] ") for text in texts) == 2
     assert all(not re.fullmatch(r"#{1,6} .+", text) for text in texts)
     assert all(not text.rstrip().endswith(":") for text in texts)
     for content in contents.values():
         for section in re.findall(r"^## (.+)$", content, flags=re.MULTILINE):
             assert any(text.startswith(f"[{section}] ") for text in texts)
-    if project == "zeta":
-        state_entries = active_entries(restored, kind="state")
-        assert all("As of 2026-10-09" in entry.text for entry in state_entries[:7])
-    assert all(
-        isinstance(entry, MemoryEntry)
-        and entry.representation == "entry"
-        and entry.automatic
-        and entry.accepted_at is None
-        and entry.migration_source is not None
-        and entry.migration_source.source_digest == plan.source_digest
-        and entry.migration_source.source_version == plan.source_version
-        for entry in plan.state.entries.values()
-    )
+    for entry in plan.state.entries.values():
+        assert isinstance(entry, MemoryEntry)
+        assert entry.representation == "entry"
+        assert entry.automatic is (f"{entry.kind}.md" in automatic_files)
+        assert entry.accepted_at == (None if entry.automatic else MIGRATED_AT)
+        assert entry.accepted_by == (None if entry.automatic else "user")
+        assert entry.migration_source is not None
+        assert entry.migration_source.source_digest == plan.source_digest
+        assert entry.migration_source.source_version == plan.source_version
