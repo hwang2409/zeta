@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from zeta.core.approval import ApprovalRequest
+from zeta.protocol.types import ToolCall
 from zeta.tui.app import TUIApp
+from zeta.tui.fork_session import ForkRuntimeMixin, OwnedApproval
 from zeta.tui.runtime_close import RuntimeCloseMixin
 from zeta.tui.slash_handlers.fork_view import ForkContext, ForkViewMixin
 
@@ -148,6 +151,29 @@ def test_tui_run_replays_transcript_only_on_initial_start() -> None:
         assert replay_count == 1
 
     asyncio.run(driver())
+
+
+def test_visible_approval_card_is_removed_when_request_ends() -> None:
+    removed: list[object] = []
+    unit = object()
+
+    class Visible(ForkRuntimeMixin):
+        pass
+
+    app = Visible()
+    app._init_fork_runtime()
+    app._presenter = SimpleNamespace(print_unit=lambda card: unit)
+    app._transcript = SimpleNamespace(
+        remove=lambda old, *, leading_blank: removed.append(old)
+    )
+    app._invalidate_prompt = lambda: None
+    owner = SimpleNamespace()
+    request = ApprovalRequest("main", ToolCall("main", "read", {"path": "x"}))
+
+    app.sync_visible_approvals((OwnedApproval(owner, request),))
+    app.sync_visible_approvals(())
+
+    assert removed == [unit]
 
 
 def test_tui_close_failure_still_runs_later_cleanup(
