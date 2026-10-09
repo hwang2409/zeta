@@ -75,7 +75,7 @@ from .composer import (
     build_key_bindings,
     copy_to_clipboard,
 )
-from .fork_session import ForkRuntimeMixin
+from .fork_session import ForkRuntimeMixin, RuntimeResult
 from .layout import (
     CONTENT_MARGIN,
     content_width,
@@ -634,10 +634,9 @@ class TUIApp(
     def _answer_first_pending(self, verb: str) -> None:
         """Answer the request the y/n shortcuts point at, if it is still there."""
 
-        if self.pending_approvals:
-            self._submit_input(
-                f"/{verb} {self.pending_approvals[0].key}", internal=True
-            )
+        key = self.first_pending_approval_key
+        if key is not None:
+            self._submit_input(f"/{verb} {key}", internal=True)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> bool:
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
@@ -1076,13 +1075,14 @@ class TUIApp(
         session: PromptSession[str] | None = None,
         *,
         resume_ui: bool = False,
-    ) -> None:
-        """Run the alternate-screen app until Ctrl-D or an exit request.
+    ) -> RuntimeResult:
+        """Run the alternate-screen app until it requests a stack transition.
 
         Re-entrant: the fork controller re-shows a suspended main runtime by
         calling this again without replaying its transcript.
         """
         self._exit_requested = False
+        self._run_result = RuntimeResult.EXIT
         self._decisions_switching = False
         try:
             if not resume_ui:
@@ -1106,7 +1106,7 @@ class TUIApp(
                         raise
                     self._finish_startup_replay(completed=replay_completed is not False)
                 if replay_completed is False or self._exit_requested:
-                    return
+                    return self._run_result
                 await self.loop.ensure_mcp_servers()
                 if not self._startup_presented:
                     self._present_startup_output()
@@ -1115,7 +1115,7 @@ class TUIApp(
                 self.start_decisions_poll()
                 if isinstance(session, FullScreenPromptSession):
                     await self._run_full_screen(session, prompt_task)
-                    return
+                    return self._run_result
                 prompt_task = asyncio.create_task(self._read_prompt(session))
                 self._input_loop_active = True
                 while prompt_task is not None and not self._exit_requested:
@@ -1126,6 +1126,7 @@ class TUIApp(
                     if self._exit_requested:
                         break
                     prompt_task = asyncio.create_task(self._read_prompt(session))
+                return self._run_result
             finally:
                 self._input_loop_active = False
                 if prompt_task is not None and not prompt_task.done():

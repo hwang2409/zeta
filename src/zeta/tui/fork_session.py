@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import Enum, auto
+from itertools import count
 from typing import Protocol
 
 from ..core.approval import ApprovalDecision, ApprovalRequest
@@ -11,10 +13,18 @@ from ..tools._shared.shell import trusted_macro_display
 from .render import render_approval_card
 
 
+class RuntimeResult(Enum):
+    """Why a visible runtime released the terminal to its stack controller."""
+
+    OPEN_CHILD = auto()
+    RETURN_TO_PARENT = auto()
+    EXIT = auto()
+
+
 class ForkHost(Protocol):
     """The small interface a TUI runtime exposes to the fork stack."""
 
-    async def run(self, *, resume_ui: bool = False) -> None: ...
+    async def run(self, *, resume_ui: bool = False) -> RuntimeResult: ...
 
     async def leave_fork(self) -> None: ...
 
@@ -42,10 +52,11 @@ class ForkHost(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class OwnedApproval:
-    """A pending request together with the runtime that must resolve it."""
+    """A pending request and its stable, owner-qualified command handle."""
 
     owner: ForkHost
     request: ApprovalRequest
+    handle: str = ""
 
 
 class ForkRuntimeMixin:
@@ -54,6 +65,7 @@ class ForkRuntimeMixin:
     def _init_fork_runtime(self) -> None:
         self._fork_controller: ForkStackController | None = None
         self._approval_units: dict[tuple[int, object], object] = {}
+        self._run_result = RuntimeResult.EXIT
 
     def set_fork_controller(self, controller: ForkStackController | None) -> None:
         self._fork_controller = controller
@@ -69,6 +81,14 @@ class ForkRuntimeMixin:
         return tuple(
             approval.request for approval in self._fork_controller.pending_approvals
         )
+
+    @property
+    def first_pending_approval_key(self) -> str | None:
+        if self._fork_controller is not None:
+            approvals = self._fork_controller.pending_approvals
+            return approvals[0].handle if approvals else None
+        approvals = self.local_pending_approvals
+        return str(approvals[0].key) if approvals else None
 
     async def resolve_local_approval(
         self,
@@ -104,7 +124,7 @@ class ForkRuntimeMixin:
                     request.tool_call.name,
                     request.tool_call.arguments,
                     label=request.label,
-                    key=str(request.key),
+                    key=item.handle or str(request.key),
                     shortcut=index == 0,
                     trusted_display=trusted_macro_display(request.tool_call.id),
                     project_display=(
@@ -141,6 +161,8 @@ class ForkStackController:
         self._build_fork = build_fork
         self._resuming: set[int] = set()
         self._main_notification_baselines: dict[int, int] = {}
+        self._approval_handles: dict[tuple[int, object], str] = {}
+        self._next_approval_handle = count(1)
         main_app.set_fork_controller(self)
 
     @property
@@ -152,11 +174,26 @@ class ForkStackController:
 
     @property
     def pending_approvals(self) -> tuple[OwnedApproval, ...]:
-        return tuple(
-            OwnedApproval(owner, request)
+        pending = [
+            (owner, request)
             for owner in reversed(self._stack)
             for request in owner.local_pending_approvals
-        )
+        ]
+        active = {(id(owner), request.key) for owner, request in pending}
+        self._approval_handles = {
+            key: handle
+            for key, handle in self._approval_handles.items()
+            if key in active
+        }
+        approvals = []
+        for owner, request in pending:
+            key = (id(owner), request.key)
+            handle = self._approval_handles.get(key)
+            if handle is None:
+                handle = f"approval-{next(self._next_approval_handle)}"
+                self._approval_handles[key] = handle
+            approvals.append(OwnedApproval(owner, request, handle))
+        return tuple(approvals)
 
     async def resolve_approval(
         self,
@@ -191,9 +228,11 @@ class ForkStackController:
                 current = self.visible
                 resume_ui = id(current) in self._resuming
                 self._resuming.discard(id(current))
-                await current.run(resume_ui=resume_ui)
-                target = current.take_open_fork()
-                if target is not None:
+                result = await current.run(resume_ui=resume_ui)
+                if result is RuntimeResult.OPEN_CHILD:
+                    target = current.take_open_fork()
+                    if target is None:
+                        raise RuntimeError("runtime requested a child without a target")
                     fork = await self._build_fork(target)
                     fork.set_fork_controller(self)
                     self._main_notification_baselines[id(fork)] = self._stack[
@@ -202,8 +241,13 @@ class ForkStackController:
                     self._stack.append(fork)
                     self.approvals_changed()
                     continue
-                if len(self._stack) == 1:
+                if result is RuntimeResult.EXIT:
+                    await self.close()
                     return
+                if result is not RuntimeResult.RETURN_TO_PARENT:
+                    raise RuntimeError(f"unknown runtime result: {result!r}")
+                if len(self._stack) == 1:
+                    raise RuntimeError("main runtime cannot return to a parent")
                 await current.leave_fork()
                 current.set_fork_controller(None)
                 self._main_notification_baselines.pop(id(current), None)
@@ -229,14 +273,19 @@ class ForkStackController:
         approvals = self.pending_approvals
         if requested_key is None:
             return approvals[0] if approvals else None
-        return next(
-            (
-                approval
-                for approval in approvals
-                if str(approval.request.key) == requested_key
-            ),
-            None,
-        )
+        for approval in approvals:
+            if approval.handle == requested_key:
+                return approval
+        raw_matches = [
+            approval
+            for approval in approvals
+            if str(approval.request.key) == requested_key
+        ]
+        if len(raw_matches) > 1:
+            raise ValueError(
+                f"ambiguous approval key {requested_key!r}; use the approval handle"
+            )
+        return raw_matches[0] if raw_matches else None
 
 
 async def run_fork_stack(
@@ -253,5 +302,6 @@ __all__ = [
     "ForkRuntimeMixin",
     "ForkStackController",
     "OwnedApproval",
+    "RuntimeResult",
     "run_fork_stack",
 ]

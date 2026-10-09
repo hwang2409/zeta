@@ -45,7 +45,9 @@ class ForkViewMixin:
         this runtime on return. The active turn is deliberately not aborted.
         """
         from ...tui.composer import FullScreenPromptSession
+        from ...tui.fork_session import RuntimeResult
 
+        self._run_result = RuntimeResult.OPEN_CHILD
         self._open_fork_target = fork_session_id
         self._exit_requested = True
         session = self._active_session
@@ -63,7 +65,9 @@ class ForkViewMixin:
         runtime; nothing here aborts or tears down the main runtime.
         """
         from ...tui.composer import FullScreenPromptSession
+        from ...tui.fork_session import RuntimeResult
 
+        self._run_result = RuntimeResult.RETURN_TO_PARENT
         self._exit_requested = True
         session = self._active_session
         if isinstance(session, FullScreenPromptSession) and session.app.is_running:

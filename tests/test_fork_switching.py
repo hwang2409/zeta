@@ -25,6 +25,7 @@ def test_request_open_fork_suspends_without_aborting_the_turn() -> None:
     )
     TUIApp.request_open_fork(app, "fork-123")
     assert app._open_fork_target == "fork-123"
+    assert getattr(app, "_run_result", None).name == "OPEN_CHILD"
     assert app._exit_requested is True
     # The in-flight main turn is never aborted when a discussion opens.
     assert aborts == []
@@ -40,6 +41,7 @@ def test_request_return_to_main_does_not_abort() -> None:
         abort_active=lambda *a, **k: aborts.append("abort"),
     )
     TUIApp.request_return_to_main(app)
+    assert getattr(app, "_run_result", None).name == "RETURN_TO_PARENT"
     assert app._exit_requested is True
     assert aborts == []
 
@@ -120,7 +122,7 @@ def test_tui_run_replays_transcript_only_on_initial_start() -> None:
             nonlocal read_count
             read_count += 1
             if read_count == 1:
-                app._open_fork_target = "fork-1"
+                TUIApp.request_open_fork(app, "fork-1")
 
         async def close() -> None:
             pass
@@ -144,13 +146,29 @@ def test_tui_run_replays_transcript_only_on_initial_start() -> None:
         app.close = close
         session = SimpleNamespace()
 
-        await TUIApp.run(app, session)
+        first_result = await TUIApp.run(app, session)
         app._open_fork_target = None
-        await TUIApp.run(app, session, resume_ui=True)
+        second_result = await TUIApp.run(app, session, resume_ui=True)
 
+        assert getattr(first_result, "name", None) == "OPEN_CHILD"
+        assert getattr(second_result, "name", None) == "EXIT"
         assert replay_count == 1
 
     asyncio.run(driver())
+
+
+def test_approval_shortcut_submits_owner_qualified_handle() -> None:
+    submitted: list[tuple[str, bool]] = []
+    app = object.__new__(TUIApp)
+    request = ApprovalRequest("same", ToolCall("same", "read", {"path": "x"}))
+    app._fork_controller = SimpleNamespace(
+        pending_approvals=(OwnedApproval(SimpleNamespace(), request, "approval-7"),)
+    )
+    app._submit_input = lambda value, *, internal: submitted.append((value, internal))
+
+    TUIApp._answer_first_pending(app, "approve")
+
+    assert submitted == [("/approve approval-7", True)]
 
 
 def test_visible_approval_card_is_removed_when_request_ends() -> None:
