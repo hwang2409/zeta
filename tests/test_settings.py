@@ -248,6 +248,30 @@ def test_invalid_types_are_dropped_with_notices(tmp_path: Path) -> None:
     assert "approval.deny" in notice_targets
 
 
+def test_command_niceness_defaults_and_valid_range(tmp_path: Path) -> None:
+    assert load_settings(home=tmp_path / "missing").settings.command_niceness == 10
+
+    home = tmp_path / "home"
+    _write(home, "[commands]\ncommand_niceness = 0\n")
+    assert load_settings(home=home).settings.command_niceness == 0
+
+    _write(home, "[commands]\ncommand_niceness = 19\n")
+    assert load_settings(home=home).settings.command_niceness == 19
+
+
+@pytest.mark.parametrize("value", [True, -1, 20])
+def test_invalid_command_niceness_uses_default(
+    tmp_path: Path, value: object
+) -> None:
+    home = tmp_path / "home"
+    _write(home, f"[commands]\ncommand_niceness = {str(value).lower()}\n")
+
+    loaded = load_settings(home=home)
+
+    assert loaded.settings.command_niceness == 10
+    assert any("commands.command_niceness" in notice for notice in loaded.notices)
+
+
 def test_removed_fake_provider_has_clear_settings_error(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write(home, 'provider = "fake"\n')
