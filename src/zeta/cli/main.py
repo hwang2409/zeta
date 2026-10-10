@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -266,14 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="OAuth provider (default: anthropic)",
     )
     from .inbox import add_subcommand as _add_inbox_subcommand
-    from .panel import add_subcommand as _add_panel_subcommand
     from .project import add_subcommand as _add_project_subcommand
     from .session import add_subcommand as _add_session_subcommand
 
     _add_session_subcommand(commands)
     _add_project_subcommand(commands)
     _add_inbox_subcommand(commands)
-    _add_panel_subcommand(commands)
 
     from ..automations.cli import add_subcommand as _add_automation_subcommand
 
@@ -393,8 +392,30 @@ def _print_exit_hint(app: object) -> None:
     print(f"resume with: zeta --resume {app.loop.store.session_id}", file=sys.stderr)
 
 
-async def _run_tui(app: object) -> None:
-    await app.run()
+async def _run_tui(app: object, args: argparse.Namespace) -> None:
+    """Run the main TUI, keeping it live while discussion forks are shown.
+
+    Opening an attention discussion suspends the main UI and runs a fork app on
+    top in the same process and event loop, so the main runtime's turn,
+    background children, tasks, notifications, and inbox keep running. Returning
+    closes the fork and re-shows the main UI; only a real exit closes the main
+    runtime.
+    """
+    from ..tui.bootstrap import create_app
+    from ..tui.fork_session import run_fork_stack
+
+    def _build_fork(fork_id: str) -> object:
+        fork_args = copy.copy(args)
+        fork_args.resume = fork_id
+        fork_args.continue_session = False
+        fork_args.prompt = None
+        fork_args.no_session = False
+        return create_app(fork_args)
+
+    async def build_fork(fork_id: str) -> object:
+        return await asyncio.to_thread(_build_fork, fork_id)
+
+    await run_fork_stack(app, build_fork)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -501,10 +522,6 @@ def main(argv: list[str] | None = None) -> int:
         from .inbox import run as _run_inbox
 
         return _run_inbox(args)
-    if args.command == "panel":
-        from .panel import run as _run_panel
-
-        return _run_panel(args)
     if args.command == "serve":
         from ..server import ZetaServer, run_server
 
@@ -562,7 +579,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(exc))
         try:
             with patch_stdout(raw=True):
-                asyncio.run(_run_tui(app))
+                asyncio.run(_run_tui(app, args))
             if app.new_session_requested:
                 args.continue_session = False
                 args.resume = None

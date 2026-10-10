@@ -64,6 +64,10 @@ DEFAULTS: Final[Mapping[str, tuple[str, ...]]] = {
     # handles terminal state around the round-trip. Works in both vi and
     # emacs editing modes; the vi ``v``-in-normal shortcut still applies.
     "open-editor": ("c-x", "c-e"),
+    # Opens the attention-decisions popup. The default c-t shadows the Emacs
+    # transpose-char editing chord; remap it (``open-decisions = "c-b"`` etc.)
+    # to keep transpose. ``/decisions`` opens the same popup regardless.
+    "open-decisions": ("c-t",),
 }
 
 ACTIONS: Final[frozenset[str]] = frozenset(DEFAULTS)
@@ -289,6 +293,11 @@ def build_key_bindings(
     on_status_action: Callable[[str], None] | None = None,
     tasks_active: Callable[[], bool] | None = None,
     on_tasks_key: Callable[[str], None] | None = None,
+    decisions_active: Callable[[], bool] | None = None,
+    decisions_answering: Callable[[], bool] | None = None,
+    on_decisions_open: Callable[[], None] | None = None,
+    on_decisions_key: Callable[[str], None] | None = None,
+    on_decisions_input: Callable[[str], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_finder_open: Callable[[], None] | None = None,
@@ -400,6 +409,22 @@ def build_key_bindings(
         return full_screen_mode() and tasks_active is not None and tasks_active()
 
     @Condition
+    def decisions_panel_mode() -> bool:
+        return (
+            full_screen_mode()
+            and decisions_active is not None
+            and decisions_active()
+        )
+
+    @Condition
+    def decisions_answer_mode() -> bool:
+        return (
+            decisions_panel_mode()
+            and decisions_answering is not None
+            and decisions_answering()
+        )
+
+    @Condition
     def finder_mode() -> bool:
         return (
             interactions_enabled()
@@ -413,7 +438,12 @@ def build_key_bindings(
     def panel_mode() -> bool:
         # Any transient overlay that owns the keyboard. Composer keys stay
         # suppressed for all of them; each overlay then adds its own bindings.
-        return status_card_mode() or tasks_panel_mode() or finder_mode()
+        return (
+            status_card_mode()
+            or tasks_panel_mode()
+            or decisions_panel_mode()
+            or finder_mode()
+        )
 
     @Condition
     def transcript_search_mode() -> bool:
@@ -597,6 +627,54 @@ def build_key_bindings(
         def tasks_escape(event: KeyPressEvent) -> None:
             del event
             on_tasks_key("escape")
+
+    if on_decisions_open is not None:
+
+        @bindings.add(
+            *resolved_keys["open-decisions"],
+            filter=full_screen_mode & ~panel_mode & interactions_enabled,
+            eager=True,
+        )
+        def open_decisions(event: KeyPressEvent) -> None:
+            del event
+            on_decisions_open()
+
+    if on_decisions_key is not None:
+        for decisions_key_name in (
+            "up", "down", "j", "k", "enter", "a", "backspace",
+            "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        ):
+
+            @bindings.add(
+                decisions_key_name,
+                filter=decisions_panel_mode & ~decisions_answer_mode,
+                eager=True,
+            )
+            def decisions_key(event: KeyPressEvent, key: str = decisions_key_name) -> None:
+                del event
+                on_decisions_key(key)
+
+        @bindings.add(Keys.Escape, filter=decisions_panel_mode, eager=True)
+        def decisions_escape(event: KeyPressEvent) -> None:
+            del event
+            on_decisions_key("escape")
+
+        @bindings.add("enter", filter=decisions_answer_mode, eager=True)
+        def decisions_answer_submit(event: KeyPressEvent) -> None:
+            del event
+            on_decisions_key("enter")
+
+        @bindings.add("backspace", filter=decisions_answer_mode, eager=True)
+        def decisions_answer_backspace(event: KeyPressEvent) -> None:
+            del event
+            on_decisions_key("backspace")
+
+    if on_decisions_input is not None:
+
+        @bindings.add(Keys.Any, filter=decisions_answer_mode, eager=True)
+        def decisions_answer_input(event: KeyPressEvent) -> None:
+            if event.data:
+                on_decisions_input(event.data)
 
     native_escape = next(
         binding

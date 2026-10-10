@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from pathlib import Path
 
 import pytest
 
 from zeta.attention_forks import create_discussion_fork
 from zeta.attention_records import AttentionStore
-from zeta.cli.panel import PanelApplication
 from zeta.core.session import SessionManager
 from zeta.project_inbox import ProjectInbox
 from zeta.protocol.types import Message, MessageRole, TextContent
@@ -111,35 +109,6 @@ def test_resolve_attention_targets_only_original_and_resolves_record(
     fork.store.close()
     other.store.close()
     original.store.close()
-
-
-def test_panel_refresh_runs_storage_scan_off_event_loop(
-    tmp_path: Path, monkeypatch
-) -> None:
-    def slow_snapshot(_home: Path):
-        time.sleep(0.15)
-        from zeta.attention_panel import PanelSnapshot
-
-        return PanelSnapshot(())
-
-    monkeypatch.setattr("zeta.cli.panel.panel_snapshot", slow_snapshot)
-
-    async def exercise() -> int:
-        panel = PanelApplication(tmp_path)
-        ticks = 0
-
-        async def ticker() -> None:
-            nonlocal ticks
-            for _ in range(8):
-                await asyncio.sleep(0.02)
-                ticks += 1
-
-        await asyncio.gather(panel.refresh(), ticker())
-        return ticks
-
-    assert asyncio.run(exercise()) >= 6
-
-
 def test_forged_fork_cannot_resolve_unbound_attention(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "Alpha")
@@ -188,59 +157,3 @@ def test_forged_fork_cannot_resolve_unbound_attention(tmp_path: Path) -> None:
     asyncio.run(registry.close())
     forged.store.close()
     original.store.close()
-
-
-def test_panel_keeps_dead_target_visible_while_decision_delivery_is_pending(
-    tmp_path: Path,
-) -> None:
-    from zeta.attention_panel import panel_snapshot
-    from zeta.cli.panel import format_snapshot
-
-    manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "Alpha")
-    original = _project_session(tmp_path, project.project_id)
-    anchor = original.store.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
-    )
-    record = AttentionStore(original.store.session_dir).request(
-        session_id=original.store.session_id,
-        project_id=project.project_id,
-        entry_id=anchor.id,
-        entry_seq=anchor.seq,
-        title="Pick one",
-        why="Only the user can choose.",
-    )
-    fork_id = create_discussion_fork(tmp_path, original.store.session_id, record.id)
-    fork = manager.open(fork_id)
-    registry = ToolRegistry(
-        tmp_path,
-        session_store=fork.store,
-        skill_catalog=SkillCatalog.empty(),
-        project_id=project.project_id,
-        project_registry=manager.project_registry,
-        tool_allow=fork.metadata.tool_allow,
-    )
-    register_fork(registry)
-    result = asyncio.run(
-        registry.definitions_by_name["resolve_attention"].handler(
-            {"decision": "Use SQLite."}
-        )
-    )
-    assert result["isError"] is False
-    asyncio.run(registry.close())
-    fork.store.close()
-    original.store.close()
-
-    snapshot = panel_snapshot(tmp_path)
-    sessions = snapshot.projects[0].sessions
-    source = next(
-        session
-        for session in sessions
-        if session.session_id == original.store.session_id
-    )
-    assert source.live is False
-    assert len(source.attention) == 1
-    assert source.attention[0].status == "delivery pending"
-    output = format_snapshot(snapshot)
-    assert "inactive" in output
-    assert "delivery pending" in output

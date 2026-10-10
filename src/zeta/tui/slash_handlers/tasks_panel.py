@@ -51,7 +51,7 @@ class BackgroundTasksMixin:
         command = value.strip()
         if not isinstance(session, FullScreenPromptSession):
             return False
-        if command not in {"/status", "/mcp", "/tasks"}:
+        if command not in {"/status", "/mcp", "/tasks", "/decisions"}:
             return False
         session.default_buffer.reset()
         self._draft.clear()
@@ -59,6 +59,8 @@ class BackgroundTasksMixin:
             self.open_mcp_manager(restore_composer=False)
         elif command == "/tasks":
             self.open_tasks_panel(restore_composer=False)
+        elif command == "/decisions":
+            self.open_decisions_panel(restore_composer=False)
         else:
             self.open_status_card(restore_composer=False)
         return True

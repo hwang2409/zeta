@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import UTC, datetime
 from typing import TypedDict
 
 from ...attention_forks import (
-    attention_decision_message_id,
+    deliver_attention_decision,
     validate_attention_fork,
 )
-from ...attention_records import AttentionStore
 from ...core.session import SessionManager
-from ...project_inbox import ProjectInbox
 from ...protocol.types import StructuredToolResult
 from .._results import _success_result, text_block
 from ..registry import ToolRegistry
@@ -36,43 +32,17 @@ async def _resolve_attention(
         current_project_id=metadata.project_id,
         directory_fd=store.directory_fd,
     )
-    fork = validated.metadata
-    record = validated.record
-    message_id = attention_decision_message_id(record.id)
-    if record.status == "resolved":
+    message_id, already_resolved = deliver_attention_decision(
+        home,
+        validated.record,
+        arguments["decision"],
+        from_session=store.session_id,
+    )
+    if already_resolved:
         return _success_result(
             text_block(f"Decision was already delivered ({message_id})."),
             structured_content={"message_id": message_id, "already_resolved": True},
         )
-    decision = arguments["decision"].strip()
-    if not decision:
-        raise ValueError("decision must be nonempty")
-    body = (
-        f"User decision relayed from discussion fork {store.session_id}. "
-        f"The question was asked at {record.created_at}; check whether the situation "
-        f"has changed before acting.\n\nDecision: {decision}"
-    )
-    ProjectInbox(
-        registry.project_registry,
-        sessions_root=store.session_dir.parent,
-    ).send(
-        from_project=metadata.project_id,
-        from_session=store.session_id,
-        to_project=metadata.project_id,
-        to_session=fork.forked_from_session,
-        kind="reply",
-        title=f"Decision: {record.title}",
-        body=body,
-        message_id=message_id,
-    )
-    AttentionStore(store.session_dir.parent / fork.forked_from_session).replace(
-        replace(
-            record,
-            status="resolved",
-            resolved_at=datetime.now(UTC).isoformat(),
-            decision=decision,
-        )
-    )
     return _success_result(
         text_block(f"Decision delivered to the original session ({message_id})."),
         structured_content={"message_id": message_id, "already_resolved": False},

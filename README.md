@@ -35,8 +35,6 @@ Use `zeta --help` for the complete list of options and subcommands.
   [project memory](docs/project-memory.md).
 - `zeta inbox` — list messages for the current project inbox. See
   [project inboxes](docs/project-inbox.md).
-- `zeta panel` — view live orchestrators and discuss attention requests. See
-  [the attention panel](docs/attention-panel.md).
 - `zeta mcp` — add, list, test, trust, and manage MCP servers. Definitions live
   in `~/.zeta/mcp.json` and `<project>/.zeta/mcp.json`. See
   [MCP management](docs/mcp-management.md).
@@ -81,7 +79,7 @@ command_niceness = 10
 ## Docs
 
 - [Agents and orchestration](docs/agents.md)
-- [Attention panel](docs/attention-panel.md)
+- [Decisions in the TUI](docs/decisions.md)
 - [Automations](docs/automations.md)
 - [Design notes](docs/design.md)
 - [MCP management](docs/mcp-management.md)

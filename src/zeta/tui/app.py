@@ -26,7 +26,7 @@ from rich.text import Text
 from ..config.settings import (
     load_settings,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_settings
 )
-from ..core.approval import ApprovalPolicy, ApprovalRequest
+from ..core.approval import ApprovalPolicy
 from ..core.project_context import (
     discover_project,
     load_project_context,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_project_context
@@ -51,11 +51,9 @@ from ..protocol.types import (
     ThinkingContent,
     assistant_text,
 )
-from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence, history_for
 from ..submission.pipeline import SubmissionPipeline
-from ..tools._shared.shell import trusted_macro_display
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import overlay, theme
 from .agent_card import (
@@ -63,7 +61,7 @@ from .agent_card import (
     AgentRunCommandMixin,
     agent_navigation_style_rules,
 )
-from .bootstrap import background_notice, build_backend, surface_shutdown_notifications
+from .bootstrap import background_notice, build_backend
 from .cards.mcp_manager import MCPManager
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
@@ -77,6 +75,7 @@ from .composer import (
     build_key_bindings,
     copy_to_clipboard,
 )
+from .fork_session import ForkRuntimeMixin, RuntimeResult
 from .layout import (
     CONTENT_MARGIN,
     content_width,
@@ -88,13 +87,15 @@ from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
 from .render import (
-    render_approval_card,
     render_markdown,
     render_thought,
     render_thought_live_delta,
 )
+from .runtime_close import RuntimeCloseMixin
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.command_runtime import CommandRuntimeMixin
+from .slash_handlers.decisions_panel import DecisionsMixin
+from .slash_handlers.fork_view import ForkViewMixin
 from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
 from .slash_handlers.tasks_panel import BackgroundTasksMixin
@@ -115,9 +116,7 @@ def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
         overlay.rule(),
         *([overlay.value(line)] for line in _format_status(status).splitlines()),
         overlay.rule(),
-        overlay.hint(
-            "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"
-        ),
+        overlay.hint("↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"),
     ]
 
 
@@ -125,10 +124,14 @@ def _register_tui_slash_commands(registry: SlashCommandRegistry) -> None:
     """Add commands that require the full-screen terminal UI."""
 
     registry.register(
-        SlashCommand("approve", lambda app, args: app.slash_approve(args), "/approve [key]")
+        SlashCommand(
+            "approve", lambda app, args: app.slash_approve(args), "/approve [key]"
+        )
     )
     registry.register(
-        SlashCommand("always", lambda app, args: app.slash_always(args), "/always [key]")
+        SlashCommand(
+            "always", lambda app, args: app.slash_always(args), "/always [key]"
+        )
     )
     registry.register(
         SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]")
@@ -158,6 +161,10 @@ class TUIApp(
     SlashHandlerMixin,
     MCPManagerMixin,
     BackgroundTasksMixin,
+    DecisionsMixin,
+    ForkRuntimeMixin,
+    ForkViewMixin,
+    RuntimeCloseMixin,
     AgentRunCommandMixin,
     FinderRuntimeMixin,
 ):
@@ -212,7 +219,8 @@ class TUIApp(
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
-        self._closed = False
+        self._init_runtime_close()
+        self._init_fork_runtime()
         self._resumed_session = resumed
         self._startup_replay_active = False
         self._pending_attachments: list[Path] = []
@@ -302,6 +310,8 @@ class TUIApp(
         self._status_card_open = False
         self._mcp_manager_open = False
         self._init_background_tasks_panel()
+        self._init_decisions_panel()
+        self._startup_presented = False
         self._mcp_wizard_active = False
         self._mcp_wizard_dialog_active = False
         self._mcp_wizard_task: asyncio.Task[None] | None = None
@@ -314,6 +324,7 @@ class TUIApp(
         self._status_restore_cursor = 0
         self._transcript.set_copy_handler(lambda text: app._copy_selection(text))
         self._agent_navigation = AgentNavigation(self.loop.store)
+        self._init_fork_view()
         self._todo_widget = TodoWidget(
             self.loop.store, selected_store=self._agent_navigation.todo_store
         )
@@ -327,7 +338,9 @@ class TUIApp(
             lambda event: app._handle_background_event(event)
         )
         self.loop.set_background_wake_callback(lambda: app._schedule_background_wake())
-        self.loop.set_mcp_notice_sink(lambda message: app._handle_background_notice(message))
+        self.loop.set_mcp_notice_sink(
+            lambda message: app._handle_background_notice(message)
+        )
         self._fork_rebuilt = False
         self._startup_notices: tuple[str, ...] = tuple(startup_notices)
         self._startup_warnings: tuple[str, ...] = tuple(startup_warnings)
@@ -373,10 +386,6 @@ class TUIApp(
         )
 
     @property
-    def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
-        return self._submissions.pending_approvals
-
-    @property
     def approval_policy(self) -> ApprovalPolicy | None:
         return self._approval_policy
 
@@ -402,37 +411,6 @@ class TUIApp(
             self._model_catalog_loaded = True
             self._model_catalog_task = None
             self.refresh_model_picker()
-
-    def _present_pending_approvals(self) -> None:
-        for index, request in enumerate(self.pending_approvals):
-            self._print_unit(
-                render_approval_card(
-                    request.tool_call.name,
-                    request.tool_call.arguments,
-                    label=request.label,
-                    key=str(request.key),
-                    shortcut=index == 0,
-                    trusted_display=trusted_macro_display(request.tool_call.id),
-                    project_display=(
-                        request.project_id,
-                        request.project_name,
-                        request.filename,
-                        request.content_bytes,
-                        request.preview,
-                    )
-                    if request.filename is not None
-                    and request.content_bytes is not None
-                    and request.preview is not None
-                    else None,
-                    execution_display=(
-                        request.effective_cwd,
-                        request.resolved_path,
-                    )
-                    if request.effective_cwd is not None
-                    or request.resolved_path is not None
-                    else None,
-                )
-            )
 
     def _prompt_style(self) -> Style:
         focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
@@ -505,6 +483,11 @@ class TUIApp(
             on_status_action=lambda key: app._status_action(key),
             tasks_active=lambda: app.tasks_panel_active,
             on_tasks_key=lambda key: app._tasks_key(key),
+            decisions_active=lambda: app.decisions_panel_active,
+            decisions_answering=lambda: app._decisions_panel.mode == "answer",
+            on_decisions_open=lambda: app.open_decisions_panel(),
+            on_decisions_key=lambda key: app._decisions_key(key),
+            on_decisions_input=lambda text: app._decisions_answer_input(text),
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_finder_open=lambda: app._finder_open(),
@@ -541,12 +524,16 @@ class TUIApp(
             picker_active=lambda: app.model_picker_active,
             on_agent_list_down=lambda: app._focus_agent_list(),
             agent_list_active=lambda: app._agent_navigation.list_focused(),
-            on_agent_list_move=lambda delta: app._agent_navigation.move_selection(
-                delta
-            ),
+            on_agent_list_move=lambda delta: (
+                app.clear_fork_return_arm(),
+                app._agent_navigation.move_selection(delta),
+            )[-1],
             on_agent_list_open=lambda: app._agent_navigation.open_selected(),
             on_agent_list_back=lambda: app._agent_navigation.list_back(),
-            on_agent_navigation_exit=lambda: app._agent_navigation.exit_navigation(),
+            on_agent_navigation_exit=lambda: (
+                app.clear_fork_return_arm(),
+                app._agent_navigation.exit_navigation(),
+            )[-1],
             child_view_focused=lambda: app._agent_navigation.child_view_focused(),
             on_child_view_back=lambda: app._agent_navigation.back_to_parent(),
             on_child_view_down=lambda: app._agent_navigation.focus_child_list(),
@@ -647,9 +634,9 @@ class TUIApp(
     def _answer_first_pending(self, verb: str) -> None:
         """Answer the request the y/n shortcuts point at, if it is still there."""
 
-        pending = self.pending_approvals
-        if pending:
-            self._submit_input(f"/{verb} {pending[0].key}", internal=True)
+        key = self.first_pending_approval_key
+        if key is not None:
+            self._submit_input(f"/{verb} {key}", internal=True)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> bool:
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
@@ -750,6 +737,7 @@ class TUIApp(
             if event.tool_call is not None and not event.data.get("inline_shell"):
                 self._submissions.notify_approval_finished(event.tool_call)
             self._loop_state = "streaming"
+            self._present_pending_approvals()
             return False
         if event.data.get("agent_instance_id") is not None:
             return False
@@ -861,8 +849,13 @@ class TUIApp(
         if isinstance(usage, dict):
             self._usage.update(usage)
 
-    @staticmethod
-    def _invalidate_prompt() -> None:
+    def _invalidate_prompt(self) -> None:
+        # Suspended behind a discussion fork: keep working but do not paint over
+        # the fork that owns the terminal (output rebuilds from the store later).
+        if self._fork_controller is not None and not self._fork_controller.is_visible(
+            self
+        ):
+            return
         get_app().invalidate()
 
     def _flush_stream_kind(self, *, preserve_inline: bool = False) -> None:
@@ -1050,6 +1043,7 @@ class TUIApp(
             detach_completion_menus(row)
         self._status_card_window = self._status_card.window()
         self._tasks_panel_window = self._tasks_panel_control.window()
+        self._decisions_panel_window = self._decisions_panel_control.window()
         app = weakref.proxy(self)
         root.children[:] = [
             full_screen_content(
@@ -1065,6 +1059,8 @@ class TUIApp(
                 status_active=lambda: app.status_card_active,
                 tasks_window=self._tasks_panel_window,
                 tasks_active=lambda: app.tasks_panel_active,
+                decisions_window=self._decisions_panel_window,
+                decisions_active=lambda: app.decisions_panel_active,
                 finder_window=self._finder_control.window(),
                 finder_active=lambda: app._transcript.finder_active,
             )
@@ -1072,11 +1068,25 @@ class TUIApp(
         self._agent_navigation.bind_layout(
             session.layout, session.default_buffer, self._invalidate_prompt
         )
+        self._bind_fork_navigation()
 
-    async def run(self, session: PromptSession[str] | None = None) -> None:
-        """Run the alternate-screen app until Ctrl-D or an exit request."""
+    async def run(
+        self,
+        session: PromptSession[str] | None = None,
+        *,
+        resume_ui: bool = False,
+    ) -> RuntimeResult:
+        """Run the alternate-screen app until it requests a stack transition.
+
+        Re-entrant: the fork controller re-shows a suspended main runtime by
+        calling this again without replaying its transcript.
+        """
+        self._exit_requested = False
+        self._run_result = RuntimeResult.EXIT
+        self._decisions_switching = False
         try:
-            self._begin_startup_replay()
+            if not resume_ui:
+                self._begin_startup_replay()
             await self.loop.activate()
             session = session or self._session or self._make_session()
             self._active_session = session
@@ -1086,39 +1096,28 @@ class TUIApp(
                 self._install_full_screen_layout(session)
                 prompt_task = asyncio.create_task(session.app.run_async())
             try:
-                try:
-                    replay_completed = await self._rebuild_transcript_async()
-                except BaseException:
-                    self._finish_startup_replay(completed=False)
-                    raise
-                self._finish_startup_replay(completed=replay_completed is not False)
+                if resume_ui:
+                    replay_completed = True
+                else:
+                    try:
+                        replay_completed = await self._rebuild_transcript_async()
+                    except BaseException:
+                        self._finish_startup_replay(completed=False)
+                        raise
+                    self._finish_startup_replay(completed=replay_completed is not False)
                 if replay_completed is False or self._exit_requested:
-                    return
+                    return self._run_result
                 await self.loop.ensure_mcp_servers()
-                for warning in self._startup_warnings:
-                    self._print_unit(Text(warning, style=theme.WARNING))
-                # After the MCP mount so argument-scoped rules dropped for a
-                # just-mounted subject-less tool are reported too (ZETA-86).
-                if self._approval_policy is not None:
-                    for notice in self._approval_policy.notices:
-                        self._print_unit(Text(notice, style=theme.WARNING))
-                for alert in self._startup_alerts:
-                    self._print_unit(Text(alert, style=theme.COMMAND))
-                for notice in self._startup_notices:
-                    self._print_unit(Text(notice, style=theme.DIM))
-                for notice in self._slash_commands.notices:
-                    style = (
-                        theme.COMMAND
-                        if notice in self._slash_commands.warning_notices
-                        else theme.DIM
-                    )
-                    self._print_unit(Text(f"command · {notice}", style=style))
+                if not self._startup_presented:
+                    self._present_startup_output()
+                    self._startup_presented = True
                 self._present_pending_approvals()
+                self.start_decisions_poll()
                 # Replay runs after the full-screen application paints its first frame.
                 self._invalidate_prompt()
                 if isinstance(session, FullScreenPromptSession):
                     await self._run_full_screen(session, prompt_task)
-                    return
+                    return self._run_result
                 prompt_task = asyncio.create_task(self._read_prompt(session))
                 self._input_loop_active = True
                 while prompt_task is not None and not self._exit_requested:
@@ -1129,57 +1128,52 @@ class TUIApp(
                     if self._exit_requested:
                         break
                     prompt_task = asyncio.create_task(self._read_prompt(session))
+                return self._run_result
             finally:
                 self._input_loop_active = False
                 if prompt_task is not None and not prompt_task.done():
                     prompt_task.cancel()
                     await asyncio.gather(prompt_task, return_exceptions=True)
-                if self._active_task is not None and not self._active_task.done():
-                    self._active_task.cancel()
-                    await asyncio.gather(self._active_task, return_exceptions=True)
-                if isinstance(session, FullScreenPromptSession):
-                    session.restore_terminal()
-                    self._active_session = None
-                    self._terminal_restored = True
+                # Suspending for a discussion fork keeps the runtime's work
+                # alive: do not cancel the turn or drop the session reference.
+                if self._suspending_for_fork:
+                    self._session = None
+                    if isinstance(session, FullScreenPromptSession):
+                        session.restore_terminal()
+                        self._terminal_restored = True
+                else:
+                    if self._active_task is not None and not self._active_task.done():
+                        self._active_task.cancel()
+                        await asyncio.gather(self._active_task, return_exceptions=True)
+                    if isinstance(session, FullScreenPromptSession):
+                        session.restore_terminal()
+                        self._active_session = None
+                        self._terminal_restored = True
         finally:
-            await self.close()
+            if not self._suspending_for_fork:
+                await self.close()
 
-    async def close(self) -> None:
-        self._closed = True
-        await self._close_finder_workers()
-        pending_before = {
-            entry.id for entry in self.loop.store.agent_notifications()
-        } if self._terminal_restored else set()
-        try:
-            self._agent_navigation.unbind_layout()
-            await self._cancel_mcp_wizard()
-            await self._submissions.close()
-        finally:
-            try:
-                try:
-                    self._draft.detach()
-                finally:
-                    await close_session(
-                        self.loop,
-                        self._workspace_snapshot_store,
-                        before_store_close=(
-                            lambda: surface_shutdown_notifications(self, pending_before)
-                            if self._terminal_restored
-                            else None
-                        ),
-                    )
-            finally:
-                self._workspace_snapshot_store = None
-                self.loop.set_background_event_sink(None)
-                self.loop.set_background_wake_callback(None)
-                self.loop.set_mcp_notice_sink(None)
-                self.loop.set_mcp_prompt_refresh(None)
-                self.loop.tool_registry.background_tasks.set_notice_sink(None)
-                if self._hooks is not None:
-                    self._hooks.notice_sink = None
-                self._active_session = None
-                self._draft_session = None
-                self._session = None
+    def _present_startup_output(self) -> None:
+        for warning in self._startup_warnings:
+            self._print_unit(Text(warning, style=theme.WARNING))
+        # After the MCP mount so dropped argument-scoped rules report too (ZETA-86).
+        if self._approval_policy is not None:
+            for notice in self._approval_policy.notices:
+                self._print_unit(Text(notice, style=theme.WARNING))
+        for alert in self._startup_alerts:
+            self._print_unit(Text(alert, style=theme.COMMAND))
+        for notice in self._startup_notices:
+            self._print_unit(Text(notice, style=theme.DIM))
+        for notice in self._slash_commands.notices:
+            style = (
+                theme.COMMAND
+                if notice in self._slash_commands.warning_notices
+                else theme.DIM
+            )
+            self._print_unit(Text(f"command · {notice}", style=style))
+        header = self.fork_header_notice
+        if header is not None:
+            self._print_unit(Text(header, style=theme.DIM))
 
 
 from .bootstrap import create_app, format_picker_row

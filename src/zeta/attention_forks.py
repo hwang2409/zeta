@@ -8,7 +8,8 @@ import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .attention_records import (
@@ -26,6 +27,8 @@ from .core.session_files import (
     write_session_file,
 )
 from .core.store.prompt_composition import clone_prompt_composition
+from .project_inbox import ProjectInbox
+from .project_registry import ProjectRegistry
 from .protocol.types import Message, MessageRole, TextContent
 
 ATTENTION_FORK_POLICY = ToolPolicy.create(
@@ -112,6 +115,83 @@ def attention_decision_message_id(attention_id: str) -> str:
     return hashlib.sha256(f"attention-decision:{attention_id}".encode()).hexdigest()[
         :32
     ]
+
+
+def deliver_attention_decision(
+    home: Path, record: AttentionRecord, decision: str, *, from_session: str
+) -> tuple[str, bool]:
+    """Send one decision to the asking orchestrator and resolve its record.
+
+    Shared by the ``resolve_attention`` tool (relaying from a discussion fork)
+    and the TUI's quick answer. Returns the deterministic inbox message id and
+    whether the record was already resolved. An already-resolved record is left
+    unchanged so a repeated delivery is idempotent.
+    """
+    decision = decision.strip()
+    if not decision:
+        raise ValueError("decision must be nonempty")
+    if record.project_id is None:
+        raise ValueError("attention record has no project")
+    message_id = attention_decision_message_id(record.id)
+    store = AttentionStore(Path(home) / "sessions" / record.session_id)
+    current = store.get(record.id)
+    if current.status == "resolved":
+        return message_id, True
+    body = (
+        f"User decision relayed from session {from_session}. "
+        f"The question was asked at {record.created_at}; check whether the situation "
+        f"has changed before acting.\n\nDecision: {decision}"
+    )
+    ProjectInbox(
+        ProjectRegistry(Path(home) / "projects"),
+        sessions_root=Path(home) / "sessions",
+    ).send(
+        from_project=record.project_id,
+        from_session=from_session,
+        to_project=record.project_id,
+        to_session=record.session_id,
+        kind="reply",
+        title=f"Decision: {record.title}",
+        body=body,
+        message_id=message_id,
+    )
+    store.replace(
+        replace(
+            current,
+            status="resolved",
+            resolved_at=datetime.now(UTC).isoformat(),
+            decision=decision,
+        )
+    )
+    return message_id, False
+
+
+def release_discussion_fork(home: Path, fork_session_id: str) -> str:
+    """Leave a discussion fork and return its source orchestrator session id.
+
+    When the item is still open (no decision was sent), the source record's
+    fork binding is cleared so the same item can be discussed again with a
+    fresh fork from the same anchor. The fork session directory itself is left
+    on disk, exactly like a reopened fork today; it is unbound, not live, and
+    already excluded from project search.
+    """
+    manager = SessionManager(home)
+    fork = read_attention_fork(manager.sessions_dir / fork_session_id)
+    if fork is None:
+        raise ValueError("session is not a discussion fork")
+    store = AttentionStore(manager.sessions_dir / fork.forked_from_session)
+    try:
+        record = store.get(fork.attention_id)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        record = None
+    if (
+        record is not None
+        and record.status != "resolved"
+        and record.fork_session_id == fork_session_id
+    ):
+        store.replace(replace(record, fork_session_id=None))
+    return fork.forked_from_session
+
 
 
 @contextmanager
