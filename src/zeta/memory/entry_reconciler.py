@@ -11,6 +11,8 @@ import asyncio
 import inspect
 import json
 import re
+import unicodedata
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -61,11 +63,75 @@ ReconciliationKey = str | Callable[[int, int], str]
 _MAX_RESPONSE_BYTES = 32 * 1024
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_PRIMARY_REQUEST_BYTES = 28 * 1024
+_MIN_TRANSCRIPT_REQUEST_BYTES = 12 * 1024
+_MAX_RELEVANCE_TRANSCRIPT_CHARS = 16 * 1024
+_MAX_RELEVANCE_TRANSCRIPT_TOKENS = 512
+_MAX_RELEVANCE_ENTRY_CHARS = 2048
+_MAX_RELEVANCE_ENTRY_TOKENS = 128
 _MAX_OPERATIONS = 64
 _MAX_PROPOSED_TEXT_BYTES = 24 * 1024
 _MAX_REASON_BYTES = 1024
 _COMPLETION_KINDS = frozenset({"state", "backlog", "threads", "commitments"})
 _CODE_LITERAL = re.compile(r"`([^`\\n]{1,256})`")
+_RELEVANCE_OPAQUE = re.compile(
+    r"#[A-Za-z0-9][A-Za-z0-9_.-]*"
+    r"|(?:[A-Za-z]:)?/[^\s\"'`]+"
+    r"|\b(?:[0-9a-fA-F]{7,64}|[A-Za-z0-9]+[_:@.-][A-Za-z0-9_.:@-]+)\b"
+)
+_RELEVANCE_WORD = re.compile(r"\w+", re.UNICODE)
+_RELEVANCE_STOPWORDS = frozenset(
+    {
+        "a",
+        "am",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "but",
+        "by",
+        "content",
+        "do",
+        "for",
+        "from",
+        "go",
+        "he",
+        "hi",
+        "i",
+        "if",
+        "in",
+        "is",
+        "it",
+        "me",
+        "message",
+        "my",
+        "no",
+        "not",
+        "now",
+        "of",
+        "oh",
+        "ok",
+        "on",
+        "or",
+        "so",
+        "text",
+        "that",
+        "the",
+        "this",
+        "to",
+        "up",
+        "us",
+        "user",
+        "was",
+        "we",
+        "were",
+        "with",
+        "yes",
+        "you",
+        "your",
+    }
+)
 _DURABLE_LITERAL_CUES = (
     "validated",
     "established",
@@ -115,6 +181,13 @@ class _ParsedOperation:
     observed_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class _EntryPreparedRequest:
+    prompt: str
+    transcript: Transcript
+    visible_entry_ids: frozenset[str]
+
+
 class EntryReconciliationFailure(ReconciliationError):
     """A failed scheduled attempt with provider usage retained for the ledger."""
 
@@ -145,6 +218,85 @@ def _active_entries_by_priority(state: MemoryState) -> list[MemoryEntry]:
         ),
         reverse=True,
     )
+
+
+def _relevance_terms(
+    text: str, *, max_chars: int, max_tokens: int
+) -> tuple[frozenset[str], frozenset[str]]:
+    if len(text) > max_chars:
+        half = max_chars // 2
+        text = text[:half] + text[-half:]
+    text = unicodedata.normalize("NFC", text)
+    opaque: set[str] = set()
+    for match in _RELEVANCE_OPAQUE.finditer(text):
+        opaque.add(match.group().rstrip(".,;:!?)]}").casefold())
+        if len(opaque) >= max_tokens:
+            return frozenset(opaque), frozenset()
+    words: set[str] = set()
+    for match in _RELEVANCE_WORD.finditer(text):
+        raw = match.group()
+        word = raw.casefold()
+        if word.isdecimal() or word in _RELEVANCE_STOPWORDS:
+            continue
+        # Short capitalized tokens are names or acronyms (CI, Li), not filler.
+        if len(word) < (3 if word.isascii() else 2) and not raw[:1].isupper():
+            continue
+        words.add(word)
+        if len(opaque) + len(words) >= max_tokens:
+            break
+    return frozenset(opaque), frozenset(words)
+
+
+def _transcript_relevance_text(transcript: Transcript) -> str:
+    chunks: list[str] = []
+    remaining = _MAX_RELEVANCE_TRANSCRIPT_CHARS
+
+    def collect(value: object) -> None:
+        nonlocal remaining
+        if remaining <= 0:
+            return
+        if isinstance(value, str):
+            chunks.append(value[:remaining])
+            remaining -= min(len(value), remaining)
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                collect(item)
+                if remaining <= 0:
+                    break
+        elif isinstance(value, Sequence):
+            for item in value:
+                collect(item)
+                if remaining <= 0:
+                    break
+
+    collect(_rendered_transcript_rows(transcript))
+    return "\n".join(chunks)
+
+
+def _active_entries_for_request(
+    state: MemoryState, transcript: Transcript
+) -> list[MemoryEntry]:
+    active = _active_entries_by_priority(state)
+    transcript_opaque, transcript_words = _relevance_terms(
+        _transcript_relevance_text(transcript),
+        max_chars=_MAX_RELEVANCE_TRANSCRIPT_CHARS,
+        max_tokens=_MAX_RELEVANCE_TRANSCRIPT_TOKENS,
+    )
+    if not transcript_opaque and not transcript_words:
+        return active
+
+    def score(entry: MemoryEntry) -> tuple[int, int]:
+        entry_opaque, entry_words = _relevance_terms(
+            f"{entry.id} {entry.text}",
+            max_chars=_MAX_RELEVANCE_ENTRY_CHARS,
+            max_tokens=_MAX_RELEVANCE_ENTRY_TOKENS,
+        )
+        return (
+            len(transcript_opaque & entry_opaque),
+            len(transcript_words & entry_words),
+        )
+
+    return sorted(active, key=score, reverse=True)
 
 
 def _entry_projection(entry: MemoryEntry) -> dict[str, object]:
@@ -179,6 +331,7 @@ def _prompt(
     as_of: date,
     entries: Sequence[Mapping[str, object]] = (),
     entry_index: Sequence[str] = (),
+    omitted_entries: Mapping[str, int] | None = None,
 ) -> str:
     kinds = [
         {
@@ -202,6 +355,8 @@ Rules:
   supersede: op, targets, kind, text, sources, reason, and optional validity/expiry fields.
   resolve: op, target, sources, reason.
 - Source items contain exactly seq_start and seq_end. Use existing entry IDs only.
+  You may only update, supersede, or resolve entries listed below. Other active
+  entries can exist, but their IDs and contents are intentionally unavailable.
 - Supersede incompatible prior facts. Resolve completed state, backlog, threads,
   and commitments. Do not preserve progress narration after completion.
 - Text must be declarative data. Validated commands and procedures are durable
@@ -221,6 +376,7 @@ Kind schema:
 Current entries (full={len(entries)}, indexed={len(entry_index)}):
 {json.dumps(list(entries), ensure_ascii=False, separators=(",", ":"))}
 {chr(10).join(entry_index)}
+Entries omitted from this request: {json.dumps(dict(omitted_entries or {}), ensure_ascii=False, separators=(",", ":"))}
 
 Completed transcript rows:
 {json.dumps(_rendered_transcript_rows(transcript), ensure_ascii=False, separators=(",", ":"))}
@@ -229,43 +385,66 @@ Completed transcript rows:
 
 def _prompt_with_visible_entries(
     transcript: Transcript, state: MemoryState, *, as_of: date
-) -> str:
-    active = _active_entries_by_priority(state)
-    indexed = [_entry_index(entry) for entry in active]
-    prompt = _prompt(transcript, state, as_of=as_of, entry_index=indexed)
-    if len(prompt.encode()) > _MAX_PRIMARY_REQUEST_BYTES:
-        raise ReconciliationError("format-2 memory index cannot fit the request limit")
+) -> tuple[str, frozenset[str]]:
+    active = _active_entries_for_request(state, transcript)
+    entry_limit = _MAX_PRIMARY_REQUEST_BYTES - _MIN_TRANSCRIPT_REQUEST_BYTES
+
+    visible: list[MemoryEntry] = []
+    for entry in active:
+        candidate = [*visible, entry]
+        omitted = Counter(item.kind for item in active[len(candidate) :])
+        prompt = _prompt(
+            Transcript(transcript.session_id, ()),
+            state,
+            as_of=as_of,
+            entry_index=[_entry_index(item) for item in candidate],
+            omitted_entries=omitted,
+        )
+        if len(prompt.encode()) > entry_limit:
+            break
+        visible = candidate
+
+    omitted = Counter(item.kind for item in active[len(visible) :])
     full: list[dict[str, object]] = []
-    for position, entry in enumerate(active):
+    indexed = [_entry_index(entry) for entry in visible]
+    for position, entry in enumerate(visible):
         candidate_full = [*full, _entry_projection(entry)]
-        candidate_index = [
-            _entry_index(indexed_entry)
-            for indexed_entry in active[position + 1 :]
-        ]
+        candidate_index = [_entry_index(item) for item in visible[position + 1 :]]
         candidate = _prompt(
-            transcript,
+            Transcript(transcript.session_id, ()),
             state,
             as_of=as_of,
             entries=candidate_full,
             entry_index=candidate_index,
+            omitted_entries=omitted,
         )
-        if len(candidate.encode()) <= _MAX_PRIMARY_REQUEST_BYTES:
-            full = candidate_full
-            indexed = candidate_index
-        else:
-            indexed = [
-                _entry_index(indexed_entry)
-                for indexed_entry in active[position:]
-            ]
+        if len(candidate.encode()) > entry_limit:
             break
-    return _prompt(
-        transcript, state, as_of=as_of, entries=full, entry_index=indexed
+        full = candidate_full
+        indexed = candidate_index
+
+    prompt = _prompt(
+        transcript,
+        state,
+        as_of=as_of,
+        entries=full,
+        entry_index=indexed,
+        omitted_entries=omitted,
     )
+    if len(prompt.encode()) > _MAX_PRIMARY_REQUEST_BYTES:
+        raise ReconciliationError("format-2 transcript exceeds the request limit")
+    return prompt, frozenset(entry.id for entry in visible)
+
+
+def _is_assistant_row(row: Mapping[str, Any]) -> bool:
+    data = row.get("data")
+    message = data.get("message") if isinstance(data, Mapping) else None
+    return isinstance(message, Mapping) and message.get("role") == "assistant"
 
 
 def _prepare_request(
     transcript: Transcript, state: MemoryState, *, as_of: date
-) -> PreparedRequest:
+) -> _EntryPreparedRequest:
     safe_rows: list[dict[str, Any]] = []
     empty = Transcript(transcript.session_id, ())
     _prompt_with_visible_entries(empty, state, as_of=as_of)
@@ -281,7 +460,7 @@ def _prepare_request(
                 break
             if _is_user_authored_row(safe):
                 raise ReconciliationError("user row exceeds the request limit")
-            if not _is_lossy_generated_row(safe):
+            if not (_is_assistant_row(safe) or _is_lossy_generated_row(safe)):
                 raise ReconciliationError(
                     "oversized non-generated transcript row requires lossless handling"
                 )
@@ -299,18 +478,19 @@ def _prepare_request(
                 )
                 selected = Transcript(transcript.session_id, (bounded,))
                 try:
-                    bounded_prompt = _prompt_with_visible_entries(
+                    bounded_prompt, visible_ids = _prompt_with_visible_entries(
                         selected, state, as_of=as_of
                     )
                 except ReconciliationError:
                     continue
-                return PreparedRequest(bounded_prompt, selected)
+                return _EntryPreparedRequest(bounded_prompt, selected, visible_ids)
             raise ReconciliationError("one transcript row cannot fit request limit")
         safe_rows.append(safe)
     selected = Transcript(transcript.session_id, tuple(safe_rows))
-    return PreparedRequest(
-        _prompt_with_visible_entries(selected, state, as_of=as_of), selected
+    prompt, visible_ids = _prompt_with_visible_entries(
+        selected, state, as_of=as_of
     )
+    return _EntryPreparedRequest(prompt, selected, visible_ids)
 
 
 def _exact(
@@ -762,7 +942,12 @@ def _direct_user_procedure_fact(item: _ParsedOperation, text: str) -> bool:
     )
 
 
-def _semantic_error(item: _ParsedOperation, state: MemoryState, now: str) -> str | None:
+def _semantic_error(
+    item: _ParsedOperation,
+    state: MemoryState,
+    now: str,
+    visible_entry_ids: frozenset[str],
+) -> str | None:
     operation = item.operation
     text = getattr(operation, "text", None)
     if isinstance(text, str):
@@ -788,6 +973,8 @@ def _semantic_error(item: _ParsedOperation, state: MemoryState, now: str) -> str
     if item.source_rank >= 6:
         return "uncorroborated harness or tool evidence"
     for target in item.targets:
+        if target not in visible_entry_ids:
+            return "target was not included in the request"
         entry = state.entries.get(target)
         if not isinstance(entry, MemoryEntry) or entry.status != "active":
             return "target is missing or inactive"
@@ -826,7 +1013,11 @@ def _dependency_groups(
 
 
 def _select_groups(
-    items: tuple[_ParsedOperation, ...], state: MemoryState, key: str, now: str
+    items: tuple[_ParsedOperation, ...],
+    state: MemoryState,
+    key: str,
+    now: str,
+    visible_entry_ids: frozenset[str],
 ) -> tuple[tuple[MemoryOperation, ...], tuple[str, ...]]:
     accepted: list[MemoryOperation] = []
     rejected: list[str] = []
@@ -835,7 +1026,11 @@ def _select_groups(
         errors = tuple(
             error
             for item in group
-            if (error := _semantic_error(item, working_state, now))
+            if (
+                error := _semantic_error(
+                    item, working_state, now, visible_entry_ids
+                )
+            )
         )
         error = errors[0] if errors else None
         if error is None:
@@ -966,7 +1161,9 @@ async def reconcile_entry_range(
                 parsed = _parse(repaired, snapshot.state, request.transcript, now)
             except Exception as exc:
                 raise EntryReconciliationFailure(str(exc), usage) from exc
-        operations, rejected = _select_groups(parsed, snapshot.state, key, now)
+        operations, rejected = _select_groups(
+            parsed, snapshot.state, key, now, request.visible_entry_ids
+        )
         operations = (*_expired_operations(snapshot.state, now), *operations)
         if not operations and not rejected:
             return EntryReconciliationResult(

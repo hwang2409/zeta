@@ -144,7 +144,9 @@ def _entries(registry: ProjectRegistry, project_id: str) -> list[MemoryEntry]:
     ]
 
 
-def _large_index_state(registry: ProjectRegistry, project_id: str):
+def _large_index_state(
+    registry: ProjectRegistry, project_id: str, *, count: int = 124
+):
     current = registry._entry_memory_state(project_id)
     operations = tuple(
         AddOperation(
@@ -152,16 +154,82 @@ def _large_index_state(registry: ProjectRegistry, project_id: str):
             f"Entry {index:03d} " + (chr(65 + index % 26) * 1800),
             (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),),
         )
-        for index in range(124)
+        for index in range(count)
+    )
+    state = current.state
+    for offset in range(0, len(operations), 64):
+        state, _ = apply_operations(
+            state,
+            operations[offset : offset + 64],
+            reconciliation_key=_key(f"large-notification-index-{offset}"),
+            automatic=True,
+            now=NOW,
+        )
+    return state
+
+
+def _crowded_priority_state(
+    registry: ProjectRegistry,
+    project_id: str,
+    *targets: tuple[str, str],
+    filler_text: str = "Unrelated brief",
+):
+    current = registry._entry_memory_state(project_id)
+    target_operations = tuple(
+        AddOperation(
+            kind,
+            text,
+            (MemorySource(SESSION, 1, 1, ("user",), "2026-10-01T12:00:00.000000Z", 2),),
+        )
+        for kind, text in targets
     )
     state, _ = apply_operations(
         current.state,
-        operations,
-        reconciliation_key=_key("large-notification-index"),
+        target_operations,
+        reconciliation_key=_key("relevance-targets"),
         automatic=True,
-        now=NOW,
+        now="2026-10-01T12:00:00.000000Z",
     )
-    return state
+    filler = tuple(
+        AddOperation(
+            "brief",
+            f"{filler_text} {index:03d} " + (chr(65 + index % 26) * 180),
+            (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),),
+        )
+        for index in range(100)
+    )
+    for offset in range(0, len(filler), 64):
+        state, _ = apply_operations(
+            state,
+            filler[offset : offset + 64],
+            reconciliation_key=_key(f"relevance-fillers-{offset}"),
+            automatic=True,
+            now=NOW,
+        )
+    registry._replace_entry_state_for_test(
+        project_id, state, expected_digest=current.digest
+    )
+    target_ids = tuple(
+        entry.id
+        for kind, text in targets
+        for entry in state.entries.values()
+        if isinstance(entry, MemoryEntry) and entry.kind == kind and entry.text == text
+    )
+    return state, target_ids
+
+
+def _listed_entry_ids(prompt: str) -> list[str]:
+    lines = prompt.splitlines()
+    heading = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("Current entries (full=")
+    )
+    full = json.loads(lines[heading + 1])
+    indexed = [
+        line.split()[1] for line in lines[heading + 2 :] if line.startswith("INDEX ")
+    ]
+    return [entry["id"] for entry in full] + indexed
 
 
 def _seed_user_entry(
@@ -190,6 +258,44 @@ def _seed_user_entry(
     return next(iter(result.state.entries))
 
 
+@pytest.mark.parametrize("entry_count", (124, 300))
+def test_large_index_reserves_transcript_budget(
+    tmp_path: Path, entry_count: int
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id, count=entry_count)
+
+    request = _prepare_request(_transcript(), state, as_of=date(2026, 10, 9))
+
+    assert len(request.prompt.encode()) <= 28 * 1024 - 12 * 1024
+
+
+def test_large_index_bounds_oversized_assistant_reply(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id)
+    assistant = _row(72, "\\" * (10 * 1024), origin="agent", role="assistant")
+
+    request = _prepare_request(
+        _transcript(assistant), state, as_of=date(2026, 10, 9)
+    )
+
+    assert request.transcript.rows[0]["seq"] == 72
+    assert len(request.prompt.encode()) <= 28 * 1024
+    text = request.transcript.rows[0]["data"]["message"]["content"][0]["text"]
+    assert "[content omitted for automatic memory request size]" in text
+    assert text.startswith("\\")
+    assert text.endswith("\\")
+
+
+def test_large_index_keeps_oversized_user_reply_lossless(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id, count=300)
+    user_row = _row(45, "\\" * (10 * 1024))
+
+    with pytest.raises(ReconciliationError, match="user row exceeds"):
+        _prepare_request(_transcript(user_row), state, as_of=date(2026, 10, 9))
+
+
 def test_oversized_harness_notification_is_bounded_with_large_index(
     tmp_path: Path,
 ) -> None:
@@ -201,7 +307,7 @@ def test_oversized_harness_notification_is_bounded_with_large_index(
         "data": {
             "message": {
                 "role": "system",
-                "content": [{"type": "text", "text": "x" * 7_500}],
+                "content": [{"type": "text", "text": "x" * 15_000}],
                 "metadata": {
                     "zeta_event": "agent_notifications",
                     "notifications": [{"notification_id": "child-1"}],
@@ -217,7 +323,7 @@ def test_oversized_harness_notification_is_bounded_with_large_index(
     assert request.transcript.rows[0]["seq"] == 71
     assert len(request.prompt.encode()) <= 28 * 1024
     text = request.transcript.rows[0]["data"]["message"]["content"][0]["text"]
-    assert len(text.encode()) < 7_500
+    assert len(text.encode()) < 15_000
 
 
 def test_oversized_harness_notification_with_turn_context_requires_lossless_handling(
@@ -231,7 +337,7 @@ def test_oversized_harness_notification_with_turn_context_requires_lossless_hand
         "data": {
             "message": {
                 "role": "system",
-                "content": [{"type": "text", "text": "x" * 11_669}],
+                "content": [{"type": "text", "text": "x" * 15_000}],
                 "metadata": {
                     "zeta_event": "agent_notifications",
                     "notifications": [{"notification_id": "child-1"}],
@@ -248,7 +354,7 @@ def test_oversized_harness_notification_with_turn_context_requires_lossless_hand
         _prepare_request(
             _transcript(notification), state, as_of=date(2026, 10, 9)
         )
-    assert notification["data"]["message"]["content"][0]["text"] == "x" * 11_669
+    assert notification["data"]["message"]["content"][0]["text"] == "x" * 15_000
 
 
 def test_oversized_user_row_still_requires_lossless_handling(
@@ -256,10 +362,247 @@ def test_oversized_user_row_still_requires_lossless_handling(
 ) -> None:
     registry, project_id = _registry(tmp_path)
     state = _large_index_state(registry, project_id)
-    user_row = _row(45, "x" * 7_500)
+    user_row = _row(45, "x" * 15_000)
 
     with pytest.raises(ReconciliationError, match="user row exceeds"):
         _prepare_request(_transcript(user_row), state, as_of=date(2026, 10, 9))
+
+
+def test_bounded_index_reports_omitted_entries_and_is_deterministic(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id, count=300)
+
+    first = _prepare_request(_transcript(), state, as_of=date(2026, 10, 9))
+    second = _prepare_request(_transcript(), state, as_of=date(2026, 10, 9))
+    first_index = [
+        line for line in first.prompt.splitlines() if line.startswith("INDEX ")
+    ]
+    second_index = [
+        line for line in second.prompt.splitlines() if line.startswith("INDEX ")
+    ]
+
+    assert first_index == second_index
+    assert 0 < len(first_index) < 300
+    assert "Entries omitted from this request:" in first.prompt
+    assert f'"state":{300 - len(first_index)}' in first.prompt
+    assert "You may only update, supersede, or resolve entries listed below" in first.prompt
+
+
+@pytest.mark.asyncio
+async def test_completion_makes_omitted_entry_visible_and_resolves_it(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, (target,) = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "PR #425 remains open pending final review."),
+    )
+    transcript = _transcript(_row(1, "PR #425 merged after final review."))
+
+    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    assert target in request.visible_entry_ids
+    result, _ = await _run(
+        registry,
+        project_id,
+        transcript,
+        [
+            _proposal(
+                {
+                    "op": "resolve",
+                    "target": target,
+                    "sources": [{"seq_start": 1, "seq_end": 1}],
+                    "reason": "the tracked PR merged",
+                }
+            )
+        ],
+        key="relevant-completion",
+    )
+
+    assert result.changed_entry_ids == (target,)
+    resolved = registry._entry_memory_state(project_id).state.entries[target]
+    assert isinstance(resolved, MemoryEntry)
+    assert resolved.status == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_correction_makes_omitted_entry_visible_and_supersedes_it(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, (target,) = _crowded_priority_state(
+        registry,
+        project_id,
+        ("state", "Service Atlas uses path /srv/atlas-old."),
+    )
+    transcript = _transcript(
+        _row(1, "Correction: Service Atlas now uses path /srv/atlas-new instead.")
+    )
+
+    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    assert target in request.visible_entry_ids
+    result, _ = await _run(
+        registry,
+        project_id,
+        transcript,
+        [
+            _proposal(
+                {
+                    "op": "supersede",
+                    "targets": [target],
+                    "kind": "state",
+                    "text": "Service Atlas uses path /srv/atlas-new.",
+                    "sources": [{"seq_start": 1, "seq_end": 1}],
+                    "reason": "direct correction",
+                }
+            )
+        ],
+        key="relevant-correction",
+    )
+
+    assert target in result.changed_entry_ids
+    superseded = registry._entry_memory_state(project_id).state.entries[target]
+    assert isinstance(superseded, MemoryEntry)
+    assert superseded.status == "superseded"
+
+
+def test_name_relevance_ignores_common_words_and_transcript_keys(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, (target,) = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "Atlas migration remains open."),
+        filler_text="The user message content is now text",
+    )
+
+    request = _prepare_request(
+        _transcript(_row(1, "The Atlas migration is now complete.")),
+        state,
+        as_of=date(2026, 10, 9),
+    )
+
+    assert target in request.visible_entry_ids
+
+
+def test_non_ascii_name_relevance_makes_omitted_entry_visible(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, (target,) = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "李明 owns the release."),
+        filler_text="The user message content is now text",
+    )
+
+    request = _prepare_request(
+        _transcript(_row(1, "李明 finished the work.")),
+        state,
+        as_of=date(2026, 10, 9),
+    )
+
+    assert target in request.visible_entry_ids
+
+
+@pytest.mark.parametrize(
+    ("stored", "mentioned"),
+    [
+        ("CI remains pending.", "CI completed."),
+        ("Li owns the release.", "Li finished the work."),
+        ("Jos\u00e9 owns the release.", "Jose\u0301 finished the work."),
+        ("CI remains pending.", "So, CI completed. My bad. Ok. No. If not."),
+    ],
+)
+def test_short_and_unicode_equivalent_names_make_omitted_entry_visible(
+    tmp_path: Path, stored: str, mentioned: str
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, (target,) = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", stored),
+        filler_text="So my ok no if filler remains pending",
+    )
+
+    request = _prepare_request(
+        _transcript(_row(1, mentioned)),
+        state,
+        as_of=date(2026, 10, 9),
+    )
+
+    assert target in request.visible_entry_ids
+
+
+def test_relevance_selection_is_stable_and_preserves_no_overlap_order(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, targets = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "PR #425 needs Linux verification."),
+        ("backlog", "PR #425 needs macOS verification."),
+    )
+    no_overlap = _prepare_request(
+        _transcript(_row(1, "Quartz hummingbird.")),
+        state,
+        as_of=date(2026, 10, 9),
+    )
+    baseline = _prepare_request(_transcript(), state, as_of=date(2026, 10, 9))
+    assert _listed_entry_ids(no_overlap.prompt) == _listed_entry_ids(baseline.prompt)
+
+    transcript = _transcript(_row(1, "PR #425 merged."))
+    first = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    second = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+
+    assert all(target in first.visible_entry_ids for target in targets)
+    assert _listed_entry_ids(first.prompt) == _listed_entry_ids(second.prompt)
+
+
+@pytest.mark.asyncio
+async def test_operation_targeting_entry_omitted_from_request_is_rejected(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    current = registry._entry_memory_state(project_id)
+    state = _large_index_state(registry, project_id, count=300)
+    registry._replace_entry_state_for_test(
+        project_id, state, expected_digest=current.digest
+    )
+    transcript = _transcript(_row(1, "Correct one current entry."))
+    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    omitted = next(
+        entry.id
+        for entry in state.entries.values()
+        if isinstance(entry, MemoryEntry) and entry.id not in request.prompt
+    )
+
+    result, _ = await _run(
+        registry,
+        project_id,
+        transcript,
+        [
+            _proposal(
+                {
+                    "op": "update",
+                    "target": omitted,
+                    "text": "Incorrect hidden update.",
+                    "sources": [{"seq_start": 1, "seq_end": 1}],
+                    "reason": "direct correction",
+                }
+            )
+        ],
+        key="hidden-target",
+    )
+
+    assert not result.changed_entry_ids
+    assert result.rejected_groups == (
+        "group[0]: target was not included in the request",
+    )
 
 
 @pytest.mark.asyncio
