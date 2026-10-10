@@ -207,8 +207,9 @@ class HookManager:
             task.add_done_callback(self._tasks.discard)
 
     async def close(self) -> None:
-        while self._tasks:
-            await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
+        while tasks := tuple(self._tasks):
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._tasks.difference_update(tasks)
 
     def _matching(self, event: str, tool: object = None) -> tuple[Hook, ...]:
         tool_name = tool if isinstance(tool, str) else None
