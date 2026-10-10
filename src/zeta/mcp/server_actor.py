@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -15,10 +14,22 @@ from weakref import WeakKeyDictionary, WeakSet
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..protocol.types import StructuredToolResult
-from .client import MCPClient, MCPPrompt, MCPResourceContent, MCPTool, make_error_result
+from .client import (
+    MCPClient,
+    MCPPrompt,
+    MCPResourceContent,
+    MCPTool,
+    degraded_result as _degraded_result,
+    error_text as _error_text,
+    make_error_result,
+    notice as _notice,
+    retry_text as _retry_text,
+    safe_close,
+    unavailable_result as _unavailable_result,
+)
 from .config import MCPServerConfig, mcp_log_path, tool_prefix
 from .definition_publisher import MCPDefinitionPublisher
-from .resource_actor import (
+from .actors.resource import (
     ResourceFinished as _ResourceFinished,
     ResourceRequest as _ResourceRequest,
     cancel_terminated_resources,
@@ -27,7 +38,12 @@ from .resource_actor import (
     request_resource as _request_resource,
     resolve_resource_message,
 )
-from .prompt_actor import (
+from .actors.tool_refresh import (
+    ToolRefreshActor,
+    ToolsListChanged as _ToolsListChanged,
+    ToolsListRefreshed as _ToolsListRefreshed,
+)
+from .actors.prompt import (
     CallFinished as _CallFinished,
     CallRequest as _CallRequest,
     cancel_request as _cancel_request,
@@ -99,6 +115,7 @@ class _Operation:
     waiter: _CallRequest | None = None
     task: asyncio.Task[_SetupOutcome] | None = None
     failure_reason: str | None = None
+    notice_sink: NoticeSink | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +219,8 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._generation = 0
         self._failure_count = 0
         self._manual_recovery_probe = False
+        self._notice_sink: NoticeSink | None = None
+        self._tool_refresh = ToolRefreshActor(self)
         self._status = MCPServerStatus(
             config.name,
             config.transport,
@@ -403,6 +422,10 @@ class MCPServerActor(MCPDefinitionPublisher):
                     self._handle_setup_finished(message)
                 elif isinstance(message, _TransportFailure):
                     self._handle_transport_failure(message)
+                elif isinstance(message, _ToolsListChanged):
+                    self._tool_refresh.handle_changed(message)
+                elif isinstance(message, _ToolsListRefreshed):
+                    self._tool_refresh.handle_refreshed(message)
                 elif isinstance(message, _CallRequest):
                     self._handle_call(message)
                 elif isinstance(message, _CallFinished):
@@ -507,6 +530,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             preserve_degraded,
             message.request,
             message.waiter,
+            notice_sink=message.notice_sink,
         )
         self._operation = operation
         task = asyncio.create_task(
@@ -584,12 +608,14 @@ class MCPServerActor(MCPDefinitionPublisher):
 
         try:
             client = self._build_client(config)
+            self._tool_refresh.start_setup(client)
             set_failure_sink = getattr(client, "set_failure_sink", None)
             if set_failure_sink is not None:
                 set_failure_sink(report_failure)
             tools = await asyncio.wait_for(
                 self._connect_and_list(client), timeout=self._setup_timeout
             )
+            tools = self._filter_tools(tools, notice_sink, config=config)
             prompts = await discover_prompts(
                 client,
                 self.name,
@@ -599,9 +625,11 @@ class MCPServerActor(MCPDefinitionPublisher):
             await asyncio.sleep(0)
         except asyncio.CancelledError:
             if client is not None:
-                await _safe_close(client)
+                self._tool_refresh.abort_setup(client)
+                await safe_close(client, CLIENT_CLOSE_TIMEOUT_SECONDS)
             raise
         except TimeoutError:
+            self._tool_refresh.abort_setup(client)
             reason = f"after {self._setup_timeout:.1f}s"
             logger.warning(
                 "timed out connecting to MCP server %s %s", self.name, reason
@@ -616,6 +644,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             _notice(notice_sink, f"mcp · {self.name} timed-out ({reason})")
             return _SetupOutcome(status, client)
         except Exception as exc:  # noqa: BLE001 - isolate one server
+            self._tool_refresh.abort_setup(client)
             reason = _error_text(exc)
             logger.warning("failed to mount MCP server %s: %s", self.name, reason)
             status = MCPServerStatus(
@@ -635,6 +664,10 @@ class MCPServerActor(MCPDefinitionPublisher):
             stderr_log_path=str(mcp_log_path(self.name)),
         )
         _notice(notice_sink, f"mcp · {self.name} mounted ({len(tools)} tools)")
+        if not tools and (
+            config.allowed_tools is not None or config.disallowed_tools
+        ):
+            _notice(notice_sink, f"mcp · {self.name} mounted with zero tools")
         failure_reason = failure_future.result() if failure_future.done() else None
         return _SetupOutcome(status, client, tuple(tools), prompts, failure_reason)
 
@@ -666,6 +699,8 @@ class MCPServerActor(MCPDefinitionPublisher):
             self.config = operation.config
             self.source = operation.source
             self._client = outcome.client
+            if operation.notice_sink is not None:
+                self._notice_sink = operation.notice_sink
             self._tools = outcome.tools
             self._prompts = outcome.prompts
             self._generation = operation.generation
@@ -687,6 +722,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 self._client,
             )
             self._complete_operation(operation, self._status)
+            self._tool_refresh.finish_setup(self._client)
             if operation.waiter is not None:
                 operation.waiter.generation = self._generation
                 self._dispatch_call(operation.waiter, self._client)
@@ -832,6 +868,16 @@ class MCPServerActor(MCPDefinitionPublisher):
         )
 
     def _handle_call(self, request: _CallRequest) -> None:
+        if not self.config.allows_tool(request.tool_name) or not any(
+            tool.name == request.tool_name for tool in self._tools
+        ):
+            _set_result(
+                request.result,
+                make_error_result(
+                    f"MCP tool {self.name}__{request.tool_name} is filtered or unavailable"
+                ),
+            )
+            return
         if self._closed:
             _set_result(request.result, _unavailable_result(self.name))
             return
@@ -988,6 +1034,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 _set_result(result, None)
             return
         self._closed = True
+        await self._tool_refresh.close()
         operation = self._operation
         if operation is not None:
             self._close_completed_setup_client(operation)
@@ -1087,12 +1134,13 @@ class MCPServerActor(MCPDefinitionPublisher):
         *,
         detach: bool = True,
     ) -> asyncio.Task[object]:
+        self._tool_refresh.abort_setup(client)
         existing = self._scheduled_closes.get(id(client))
         if existing is not None:
             return existing[1]
         if detach:
             self._detach_failure_sink(client)
-        task = asyncio.create_task(_safe_close(client))
+        task = asyncio.create_task(safe_close(client, CLIENT_CLOSE_TIMEOUT_SECONDS))
         self._scheduled_closes[id(client)] = (client, task)
         self._children.add(task)
         task.add_done_callback(
@@ -1130,6 +1178,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         set_failure_sink = getattr(client, "set_failure_sink", None)
         if set_failure_sink is not None:
             set_failure_sink(None)
+        set_notification_sink = getattr(client, "set_notification_sink", None)
+        if set_notification_sink is not None:
+            set_notification_sink(None)
 
     async def _shutdown_children(self) -> None:
         tasks = tuple(
@@ -1174,56 +1225,6 @@ class MCPServerActor(MCPDefinitionPublisher):
             _set_result(operation.request, status)
         if self._operation is operation:
             self._operation = None
-
-
-async def _safe_close(client: MCPClient) -> None:
-    try:
-        await asyncio.wait_for(client.close(), CLIENT_CLOSE_TIMEOUT_SECONDS)
-    except TimeoutError:
-        logger.warning(
-            "timed out closing MCP server %s; abandoning transport", client.config.name
-        )
-    except Exception:  # noqa: BLE001 - cleanup cannot mask lifecycle state
-        logger.exception("failed to close MCP server %s", client.config.name)
-
-
-def _notice(sink: NoticeSink | None, message: str) -> None:
-    if sink is not None:
-        sink(message)
-
-
-def _error_text(error: BaseException) -> str:
-    try:
-        return str(error).strip() or type(error).__name__
-    except Exception:  # noqa: BLE001 - error reporting must not mask the failure
-        return type(error).__name__
-
-
-def _retry_text(retry_at: float | None) -> str:
-    if retry_at is None:
-        return "when backoff expires"
-    remaining = retry_at - time.monotonic()
-    if remaining <= 0:
-        return "now"
-    return f"in {math.ceil(remaining * 10) / 10:.1f}s"
-
-
-def _degraded_result(
-    name: str,
-    status: MCPServerStatus | None,
-) -> StructuredToolResult:
-    reason = (
-        status.reason if status is not None and status.reason else "transport failure"
-    )
-    return make_error_result(
-        f"MCP server '{name}' is degraded: {reason}. Use /mcp reconnect {name}."
-    )
-
-
-def _unavailable_result(name: str) -> StructuredToolResult:
-    return make_error_result(
-        f"MCP server '{name}' is unavailable. Use /mcp reconnect {name}."
-    )
 
 
 def _unavailable_status(name: str, config: MCPServerConfig) -> MCPServerStatus:

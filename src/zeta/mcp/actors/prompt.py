@@ -7,12 +7,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ..core.abort import AbortSignal
-from ..protocol.types import StructuredToolResult
-from .client import MCPClient, MCPPrompt, MCPTransportError
+from ...core.abort import AbortSignal
+from ...protocol.types import StructuredToolResult
+from ..client import MCPClient, MCPPrompt, MCPTransportError
 
 if TYPE_CHECKING:
-    from .server_actor import MCPServerActor
+    from ..server_actor import MCPServerActor
 
 
 @dataclass(slots=True)

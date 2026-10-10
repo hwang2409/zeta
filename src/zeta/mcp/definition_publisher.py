@@ -8,13 +8,16 @@ and re-publishing new-generation definitions after a reconnect so scoped
 activations survive instead of collapsing into the primary registry.
 """
 
+from __future__ import annotations
+
 import logging
+from collections.abc import Callable
 
 from ..core.abort import AbortSignal
 from ..protocol.types import StructuredToolResult
 from ..tools.registry import ToolRegistry
-from .client import MCPTool
-from .config import tool_prefix
+from .client import MCPTool, notice
+from .config import MCPServerConfig, tool_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +49,11 @@ class MCPDefinitionPublisher:
         self, tool: MCPTool, generation: int, *, registry: ToolRegistry | None = None
     ) -> bool:
         target = registry or self._registry
-        if target is None or self._client is None:
+        if (
+            target is None
+            or self._client is None
+            or not self.config.allows_tool(tool.name)
+        ):
             return False
         if getattr(target, "_closed", False):
             return False
@@ -128,3 +135,23 @@ class MCPDefinitionPublisher:
                 if tool is None or full in registry._mcp_excluded_names:
                     continue
                 self._register_tool(tool, self._generation, registry=registry)
+
+    def _filter_tools(
+        self,
+        tools: list[MCPTool],
+        notice_sink: Callable[[str], None] | None,
+        *,
+        config: MCPServerConfig | None = None,
+    ) -> list[MCPTool]:
+        server_config = config or self.config
+        names = {tool.name for tool in tools}
+        unknown = server_config.unknown_tool_patterns(names)
+        if unknown:
+            detail = "; ".join(
+                f"unknown {field}: {', '.join(patterns)}"
+                for field, patterns in unknown
+            )
+            warning = f"mcp · {self.name} {detail}"
+            logger.warning(warning)
+            notice(notice_sink, warning)
+        return [tool for tool in tools if server_config.allows_tool(tool.name)]

@@ -10,6 +10,7 @@ from contextvars import ContextVar
 from pathlib import Path
 
 from ..core.abort import AbortSignal
+from ..protocol.types import StructuredToolResult
 from ..tools.registry import ToolRegistry
 from . import connection as mcp_connection
 from .client import MCPClient, MCPPrompt, MCPResource, MCPResourceContent, MCPTool
@@ -138,8 +139,27 @@ class MCPMount:
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
 
+    async def call_tool(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, object],
+        abort_signal: AbortSignal | None = None,
+    ) -> StructuredToolResult:
+        """Call a mounted tool through its actor's policy and lifecycle."""
+
+        actor = self._actors.get(server)
+        if actor is None:
+            raise ValueError(f"MCP server {server} is not connected")
+        return await actor.call_tool(
+            tool,
+            arguments,
+            abort_signal or AbortSignal(),
+            generation=actor.generation,
+        )
+
     def client_for(self, name: str) -> MCPClient | None:
-        """Return the live client for one server, or None if it is not mounted."""
+        """Return the live client for non-tool operations."""
 
         return self._clients.get(name)
 

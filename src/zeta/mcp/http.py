@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from functools import partial
 from typing import BinaryIO, TypeVar
@@ -56,6 +56,9 @@ MAX_RESPONSE_BYTES = 2 * RESOURCE_MAX_BYTES
 MAX_LIST_ITEMS = 10_000
 MAX_LIST_PAGES = 1_000
 MAX_ERROR_DETAIL_BYTES = 8192
+NOTIFICATION_RECONNECT_INITIAL_SECONDS = 0.1
+NOTIFICATION_RECONNECT_MAX_SECONDS = 5.0
+NOTIFICATION_STREAM_HEALTHY_SECONDS = 5.0
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 OAUTH_HINT = "run /mcp auth {name} to reauthorize"
@@ -81,6 +84,8 @@ class StreamableHTTPMCPClient(MCPClient):
         self._next_id = 0
         self._closed = False
         self._failure_sink: Callable[[str], None] | None = None
+        self._notification_sink: Callable[[str], None] | None = None
+        self._notification_task: asyncio.Task[None] | None = None
         self._home = home
         self._spill_store = spill_store or SpillStore()
         self._owns_spill_store = spill_store is None
@@ -91,6 +96,9 @@ class StreamableHTTPMCPClient(MCPClient):
 
     def set_failure_sink(self, sink: Callable[[str], None] | None) -> None:
         self._failure_sink = sink
+
+    def set_notification_sink(self, sink: Callable[[str], None] | None) -> None:
+        self._notification_sink = sink
 
     async def connect(self) -> None:
         if self._closed:
@@ -103,6 +111,7 @@ class StreamableHTTPMCPClient(MCPClient):
         capabilities = result.get("capabilities", {})
         self.capabilities = dict(capabilities) if type(capabilities) is dict else {}
         await self._send_notification("notifications/initialized", {})
+        self._notification_task = asyncio.create_task(self._listen_notifications())
 
     async def list_tools(self) -> list[MCPTool]:
         return await _drain_pages(
@@ -163,6 +172,10 @@ class StreamableHTTPMCPClient(MCPClient):
         if self._closed:
             return
         self._closed = True
+        if self._notification_task is not None:
+            self._notification_task.cancel()
+            await asyncio.gather(self._notification_task, return_exceptions=True)
+            self._notification_task = None
         if self._owns_client:
             await self._client.aclose()
         if self._owns_spill_store:
@@ -329,6 +342,7 @@ class StreamableHTTPMCPClient(MCPClient):
                         request_id,
                         self._spill_store,
                         MAX_RESPONSE_BYTES,
+                        self._notification_sink,
                     )
                 try:
                     value = await _read_json_body(
@@ -337,6 +351,66 @@ class StreamableHTTPMCPClient(MCPClient):
                 except ValueError as exc:
                     raise MCPProtocolError("MCP HTTP response was not JSON") from exc
                 return parse_rpc_response(value, request_id)
+        except httpx.HTTPError as exc:
+            raise MCPHTTPError(0, str(exc)) from exc
+
+    async def _listen_notifications(self) -> None:
+        if self._session_id is None:
+            return
+        delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
+        while not self._closed:
+            try:
+                healthy = await self._with_auth(self._listen_notification_stream)
+            except asyncio.CancelledError:
+                raise
+            except MCPHTTPError as exc:
+                if exc.status_code == 405:
+                    return
+                if exc.status_code not in {0, 408, 429} and exc.status_code < 500:
+                    if self._failure_sink is not None:
+                        self._failure_sink(str(exc))
+                    return
+                logger.debug("MCP HTTP notification stream ended", exc_info=True)
+            except Exception as exc:  # noqa: BLE001 - report terminal stream failures
+                if self._failure_sink is not None:
+                    self._failure_sink(str(exc))
+                return
+            else:
+                if healthy:
+                    delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
+            if self._closed:
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, NOTIFICATION_RECONNECT_MAX_SECONDS)
+
+    async def _listen_notification_stream(self) -> bool:
+        if self._session_id is None:
+            return False
+        headers = self._auth_headers()
+        headers["accept"] = "text/event-stream"
+        headers["mcp-session-id"] = self._session_id
+        if self.protocol_version is not None:
+            headers["mcp-protocol-version"] = self.protocol_version
+        try:
+            async with self._client.stream(
+                "GET", self.config.url, headers=headers
+            ) as response:
+                if response.status_code >= 400:
+                    detail = await _response_detail(response)
+                    raise MCPHTTPError(
+                        response.status_code, detail or "request failed"
+                    )
+                started = asyncio.get_running_loop().time()
+                delivered = False
+                async for value in _iter_sse_events(
+                    response, self._spill_store, MAX_RESPONSE_BYTES
+                ):
+                    delivered = True
+                    _dispatch_sse_notification(value, self._notification_sink)
+                return delivered or (
+                    asyncio.get_running_loop().time() - started
+                    >= NOTIFICATION_STREAM_HEALTHY_SECONDS
+                )
         except httpx.HTTPError as exc:
             raise MCPHTTPError(0, str(exc)) from exc
 
@@ -481,8 +555,32 @@ async def _read_sse_response(
     request_id: int,
     spill_store: SpillStore,
     memory_bound: int,
+    notification_sink: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
-    """Parse SSE incrementally without materializing complete data lines."""
+    async for value in _iter_sse_events(response, spill_store, memory_bound):
+        if type(value) is dict and value.get("id") == request_id:
+            return parse_rpc_response(value, request_id)
+        _dispatch_sse_notification(value, notification_sink)
+    raise MCPProtocolError("MCP SSE response ended before the result")
+
+
+def _dispatch_sse_notification(
+    value: object, notification_sink: Callable[[str], None] | None
+) -> None:
+    if type(value) is not dict or type(value.get("method")) is not str:
+        return
+    method = value["method"]
+    logger.debug("MCP stream notification: %s", method)
+    if notification_sink is not None:
+        notification_sink(method)
+
+
+async def _iter_sse_events(
+    response: httpx.Response,
+    spill_store: SpillStore,
+    memory_bound: int,
+) -> AsyncIterator[object]:
+    """Parse SSE JSON events without materializing oversized data fields."""
 
     data_parts: list[bytes] = []
     total = 0
@@ -528,16 +626,6 @@ async def _read_sse_response(
         temporary = None
         handle = None
         return value
-
-    async def finish_event() -> dict[str, object] | None:
-        if not has_data_line:
-            return None
-        value = await parse_event()
-        if type(value) is dict and value.get("id") == request_id:
-            return parse_rpc_response(value, request_id)
-        if type(value) is dict and type(value.get("method")) is str:
-            logger.debug("MCP stream notification: %s", value["method"])
-        return None
 
     line_prefix = bytearray()
     line_is_data = False
@@ -613,17 +701,12 @@ async def _read_sse_response(
                             position += 1
                         elif position == len(window):
                             pending_cr = True
-                    if blank:
-                        result = await finish_event()
-                        if result is not None:
-                            return result
+                    if blank and has_data_line:
+                        yield await parse_event()
         if line_prefix or line_is_data or line_ignored:
             await feed_line(b"", end_line=True)
         if has_data_line:
-            result = await finish_event()
-            if result is not None:
-                return result
-        raise MCPProtocolError("MCP SSE response ended before the result")
+            yield await parse_event()
     finally:
         if temporary is not None:
             await asyncio.to_thread(temporary.__exit__, None, None, None)
