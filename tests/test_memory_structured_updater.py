@@ -514,6 +514,7 @@ def test_non_ascii_name_relevance_makes_omitted_entry_visible(
         ("CI remains pending.", "CI completed."),
         ("Li owns the release.", "Li finished the work."),
         ("Jos\u00e9 owns the release.", "Jose\u0301 finished the work."),
+        ("CI remains pending.", "So, CI completed. My bad. Ok. No. If not."),
     ],
 )
 def test_short_and_unicode_equivalent_names_make_omitted_entry_visible(
@@ -524,7 +525,7 @@ def test_short_and_unicode_equivalent_names_make_omitted_entry_visible(
         registry,
         project_id,
         ("backlog", stored),
-        filler_text="The user message content is now text",
+        filler_text="So my ok no if filler remains pending",
     )
 
     request = _prepare_request(
