@@ -191,6 +191,33 @@ async def test_oversized_hook_payload_is_bounded_with_metadata(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_close_releases_finished_hook_tasks_before_callback_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = HookManager((), session_id="session-1")
+    task = asyncio.create_task(asyncio.sleep(0))
+    await task
+    manager._tasks.add(task)
+    gather_calls = 0
+
+    async def gather_once(*tasks: object, **kwargs: object) -> tuple[()]:
+        nonlocal gather_calls
+        del kwargs
+        gather_calls += 1
+        if gather_calls > 1:
+            raise RuntimeError("completed hook task was gathered twice")
+        assert tasks == (task,)
+        return ()
+
+    monkeypatch.setattr(asyncio, "gather", gather_once)
+
+    await manager.close()
+
+    assert gather_calls == 1
+    assert manager._tasks == set()
+
+
+@pytest.mark.asyncio
 async def test_nonblocking_hook_does_not_delay_turn(tmp_path: Path) -> None:
     marker = tmp_path / "marker"
     command = _python_command(
