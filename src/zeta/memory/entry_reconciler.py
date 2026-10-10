@@ -11,6 +11,7 @@ import asyncio
 import inspect
 import json
 import re
+import unicodedata
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -207,6 +208,7 @@ def _relevance_terms(
     if len(text) > max_chars:
         half = max_chars // 2
         text = text[:half] + text[-half:]
+    text = unicodedata.normalize("NFC", text)
     opaque: set[str] = set()
     for match in _RELEVANCE_OPAQUE.finditer(text):
         opaque.add(match.group().rstrip(".,;:!?)]}").casefold())
@@ -214,10 +216,12 @@ def _relevance_terms(
             return frozenset(opaque), frozenset()
     words: set[str] = set()
     for match in _RELEVANCE_WORD.finditer(text):
-        word = match.group().casefold()
+        raw = match.group()
+        word = raw.casefold()
         if word.isdecimal() or word in _RELEVANCE_STOPWORDS:
             continue
-        if len(word) < (3 if word.isascii() else 2):
+        # Short capitalized tokens are names or acronyms (CI, Li), not filler.
+        if len(word) < (3 if word.isascii() else 2) and not raw[:1].isupper():
             continue
         words.add(word)
         if len(opaque) + len(words) >= max_tokens:

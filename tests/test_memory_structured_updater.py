@@ -508,6 +508,34 @@ def test_non_ascii_name_relevance_makes_omitted_entry_visible(
     assert target in request.visible_entry_ids
 
 
+@pytest.mark.parametrize(
+    ("stored", "mentioned"),
+    [
+        ("CI remains pending.", "CI completed."),
+        ("Li owns the release.", "Li finished the work."),
+        ("Jos\u00e9 owns the release.", "Jose\u0301 finished the work."),
+    ],
+)
+def test_short_and_unicode_equivalent_names_make_omitted_entry_visible(
+    tmp_path: Path, stored: str, mentioned: str
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, (target,) = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", stored),
+        filler_text="The user message content is now text",
+    )
+
+    request = _prepare_request(
+        _transcript(_row(1, mentioned)),
+        state,
+        as_of=date(2026, 10, 9),
+    )
+
+    assert target in request.visible_entry_ids
+
+
 def test_relevance_selection_is_stable_and_preserves_no_overlap_order(
     tmp_path: Path,
 ) -> None:
