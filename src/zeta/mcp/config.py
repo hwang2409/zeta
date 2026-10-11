@@ -385,9 +385,13 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
         for key, item in authorization_params.items()
     ):
         raise ValueError("auth.authorization_params must be an object of strings")
-    reserved_params = RESERVED_AUTHORIZATION_PARAMS.intersection(authorization_params)
+    reserved_params = sorted(
+        key
+        for key in authorization_params
+        if key.casefold() in RESERVED_AUTHORIZATION_PARAMS
+    )
     if reserved_params:
-        names = ", ".join(sorted(reserved_params))
+        names = ", ".join(reserved_params)
         raise ValueError(
             f"auth.authorization_params must not override reserved parameters: {names}"
         )

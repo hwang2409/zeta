@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 OAUTH_LISTEN_TIMEOUT_SECONDS = 300.0
 DEFAULT_CLIENT_NAME = "zeta"
 DEFAULT_REDIRECT_PATH = "/callback"
+_MAX_SERVER_TEXT_LENGTH = 256
 
 
 class MCPOAuthError(RuntimeError):
@@ -159,7 +160,9 @@ async def discover_auth_server(
     _validate_oauth_url(authorization_server_url, "authorization server URL")
     parsed = urlparse(authorization_server_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    metadata_url = urljoin(base, "/.well-known/oauth-authorization-server")
+    metadata_url = (
+        f"{base}/.well-known/oauth-authorization-server{parsed.path}"
+    )
     try:
         response = await http_client.get(metadata_url, timeout=10.0)
     except httpx.HTTPError as exc:
@@ -312,9 +315,13 @@ def build_authorization_url(
     if scope:
         params["scope"] = scope
     if authorization_params:
-        reserved = RESERVED_AUTHORIZATION_PARAMS.intersection(authorization_params)
+        reserved = sorted(
+            key
+            for key in authorization_params
+            if key.casefold() in RESERVED_AUTHORIZATION_PARAMS
+        )
         if reserved:
-            names = ", ".join(sorted(reserved))
+            names = ", ".join(reserved)
             raise MCPOAuthError(
                 f"MCP OAuth: authorization parameters cannot override reserved parameters: {names}"
             )
@@ -406,7 +413,7 @@ async def start_redirect_listener(
         message = (
             "Authorization received. You can close this tab and return to zeta."
             if error is None
-            else f"Authorization failed: {error}"
+            else f"Authorization failed: {_terminal_safe_server_text(error)}"
         )
         _write_response(writer, 200, message)
         await _drain_and_close(writer)
@@ -465,11 +472,25 @@ def _validate_callback_url(
         description = _single_callback_param(
             params, "error_description", required=False
         )
-        detail = f": {description}" if description else ""
-        raise MCPOAuthError(f"MCP OAuth: authorization denied: {error}{detail}")
+        safe_error = _terminal_safe_server_text(error)
+        safe_description = (
+            _terminal_safe_server_text(description) if description else ""
+        )
+        detail = f": {safe_description}" if safe_description else ""
+        raise MCPOAuthError(
+            f"MCP OAuth: authorization denied: {safe_error}{detail}"
+        )
     code = _single_callback_param(params, "code")
     assert code is not None
     return code
+
+
+def _terminal_safe_server_text(value: str) -> str:
+    return "".join(
+        character
+        for character in value
+        if ord(character) >= 32 and not 127 <= ord(character) <= 159
+    )[:_MAX_SERVER_TEXT_LENGTH]
 
 
 def _single_callback_param(

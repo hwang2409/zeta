@@ -9,7 +9,7 @@ import stat
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 import pytest
@@ -396,6 +396,8 @@ async def test_preregistered_client_uses_fixed_callback_scopes_and_extra_params(
         "code_challenge_method",
         "scope",
         "resource",
+        "State",
+        "REDIRECT_URI",
     ],
 )
 def test_config_rejects_reserved_authorization_params(
@@ -422,8 +424,10 @@ def test_config_rejects_reserved_authorization_params(
     config = load_mcp_config(path)
 
     assert "bad" in config.malformed_servers
-    assert reserved in config.malformed_servers["bad"].malformed_reason
-    assert "reserved" in config.malformed_servers["bad"].malformed_reason
+    assert config.malformed_servers["bad"].malformed_reason == (
+        "auth.authorization_params must not override reserved parameters: "
+        f"{reserved}"
+    )
 
 
 @pytest.mark.asyncio
@@ -472,6 +476,37 @@ async def test_discovery_overrides_replace_default_probes() -> None:
         "https://metadata.test/protected",
         "https://login.test/.well-known/oauth-authorization-server",
     ]
+
+
+@pytest.mark.asyncio
+async def test_authorization_server_path_is_appended_to_well_known_url() -> None:
+    requested_url = ""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requested_url
+        requested_url = str(request.url)
+        return httpx.Response(
+            200,
+            json={
+                "issuer": "https://login.example/oauth",
+                "authorization_endpoint": "https://login.example/oauth/authorize",
+                "token_endpoint": "https://login.example/oauth/token",
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        metadata = await discover_auth_server(
+            "https://login.example/oauth", http_client=client
+        )
+    finally:
+        await client.aclose()
+
+    assert requested_url == (
+        "https://login.example/.well-known/oauth-authorization-server/oauth"
+    )
+    assert metadata.issuer == "https://login.example/oauth"
 
 
 @pytest.mark.asyncio
@@ -545,7 +580,10 @@ async def test_discovery_rejects_inconsistent_override_metadata(
         await client.aclose()
 
 
-def test_authorization_url_defensively_rejects_reserved_params() -> None:
+@pytest.mark.parametrize("reserved", ["state", "State", "REDIRECT_URI"])
+def test_authorization_url_defensively_rejects_reserved_params(
+    reserved: str,
+) -> None:
     metadata = AuthServerMetadata(
         issuer="https://auth.test",
         authorization_endpoint="https://auth.test/authorize",
@@ -553,7 +591,7 @@ def test_authorization_url_defensively_rejects_reserved_params() -> None:
         registration_endpoint=None,
         scopes_supported=(),
     )
-    with pytest.raises(MCPOAuthError, match="reserved parameters: state"):
+    with pytest.raises(MCPOAuthError) as exc_info:
         build_authorization_url(
             metadata,
             client_id="client",
@@ -561,8 +599,12 @@ def test_authorization_url_defensively_rejects_reserved_params() -> None:
             state="expected",
             code_challenge="challenge",
             resource="https://mcp.test",
-            authorization_params={"state": "attacker"},
+            authorization_params={reserved: "attacker"},
         )
+    assert str(exc_info.value) == (
+        "MCP OAuth: authorization parameters cannot override reserved parameters: "
+        f"{reserved}"
+    )
 
 
 @pytest.mark.asyncio
@@ -701,6 +743,37 @@ async def test_headless_callback_validation(
             )
         assert auth.token_requests == []
     await http_client.aclose()
+
+
+def test_callback_error_is_safe_for_terminal() -> None:
+    from zeta.mcp import oauth as oauth_module
+
+    unsafe_error = "bad\x1b[2J\r\n" + "x" * 300
+    unsafe_description = "user\x00denied\x85" + "y" * 300
+    callback_url = "http://127.0.0.1:8888/callback?" + urlencode(
+        {
+            "error": unsafe_error,
+            "error_description": unsafe_description,
+            "state": "expected",
+        }
+    )
+
+    with pytest.raises(MCPOAuthError) as exc_info:
+        oauth_module._validate_callback_url(
+            callback_url,
+            redirect_uri="http://127.0.0.1:8888/callback",
+            expected_state="expected",
+        )
+
+    safe_error = ("bad[2J" + "x" * 300)[:256]
+    safe_description = ("userdenied" + "y" * 300)[:256]
+    assert str(exc_info.value) == (
+        f"MCP OAuth: authorization denied: {safe_error}: {safe_description}"
+    )
+    assert not any(
+        ord(character) < 32 or 127 <= ord(character) <= 159
+        for character in str(exc_info.value)
+    )
 
 
 @pytest.mark.asyncio
