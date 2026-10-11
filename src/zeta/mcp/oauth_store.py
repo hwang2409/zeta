@@ -129,7 +129,9 @@ def save_token(
         prefix=".mcp-token.", suffix=".json.tmp", dir=str(directory)
     )
     tmp_path = Path(tmp_name)
-    payload = json.dumps(asdict(token), indent=2, sort_keys=True) + "\n"
+    values = asdict(token)
+    values.pop("client_secret", None)
+    payload = json.dumps(values, indent=2, sort_keys=True) + "\n"
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

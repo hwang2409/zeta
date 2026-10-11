@@ -17,6 +17,7 @@ import hmac
 import http
 import logging
 import secrets
+import sys
 import time
 import webbrowser
 from collections.abc import Callable
@@ -230,6 +231,7 @@ def build_authorization_url(
     code_challenge: str,
     resource: str,
     scope: str | None = None,
+    authorization_params: dict[str, str] | None = None,
 ) -> str:
     """Build the authorization request URL with PKCE + resource params."""
 
@@ -244,6 +246,8 @@ def build_authorization_url(
     }
     if scope:
         params["scope"] = scope
+    if authorization_params:
+        params.update(authorization_params)
     separator = "&" if "?" in metadata.authorization_endpoint else "?"
     return f"{metadata.authorization_endpoint}{separator}{urlencode(params)}"
 
@@ -521,6 +525,9 @@ async def authorize(
     callback_port: int = 0,
     scopes: tuple[str, ...] | None = None,
     resource_metadata_url: str | None = None,
+    authorization_server_url: str | None = None,
+    authorization_params: dict[str, str] | None = None,
+    no_browser: bool = False,
     http_client: httpx.AsyncClient | None = None,
     browser_opener: BrowserOpener | None = None,
     listen_timeout: float = OAUTH_LISTEN_TIMEOUT_SECONDS,
@@ -537,7 +544,7 @@ async def authorize(
             http_client=http_client,
             resource_metadata_url=resource_metadata_url,
         )
-        auth_server = resource_meta.authorization_server or server_url
+        auth_server = authorization_server_url or resource_meta.authorization_server or server_url
         metadata = await discover_auth_server(auth_server, http_client=http_client)
         (
             listener,
@@ -561,16 +568,31 @@ async def authorize(
             code_challenge=challenge,
             resource=resource_meta.resource,
             scope=scope,
+            authorization_params=authorization_params,
         )
-        opener = browser_opener or _default_browser_opener
-        try:
-            opener(url)
-        except Exception as exc:  # noqa: BLE001 - defensive: report but keep waiting
-            logger.warning("MCP OAuth: browser opener failed for %s: %s", server_name, exc)
-        outcome = await wait_for_redirect(
-            listener, payload, signal, timeout=listen_timeout
-        )
-        listener = None
+        if no_browser:
+            print(f"Open this URL to authorize {server_name}:\n{url}", file=sys.stderr)
+            callback = await asyncio.to_thread(input, "Paste the full callback URL: ")
+            parsed_callback = urlparse(callback.strip())
+            values = parse_qs(parsed_callback.query)
+            outcome = _RedirectPayload(
+                code=_first_param(values, "code"),
+                state=_first_param(values, "state"),
+                error=_first_param(values, "error"),
+            )
+            listener.close()
+            await listener.wait_closed()
+            listener = None
+        else:
+            opener = browser_opener or _default_browser_opener
+            try:
+                opener(url)
+            except Exception as exc:  # noqa: BLE001 - defensive: report but keep waiting
+                logger.warning("MCP OAuth: browser opener failed for %s: %s", server_name, exc)
+            outcome = await wait_for_redirect(
+                listener, payload, signal, timeout=listen_timeout
+            )
+            listener = None
         if outcome.error:
             raise MCPOAuthError(f"MCP OAuth: authorization denied: {outcome.error}")
         if outcome.state is None or not hmac.compare_digest(outcome.state, state):

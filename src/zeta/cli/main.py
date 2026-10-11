@@ -309,6 +309,8 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--scope", choices=("user", "project", "effective"), default="effective"
         )
+        if action == "login":
+            sub.add_argument("--no-browser", action="store_true")
     serve_parser = commands.add_parser(
         "serve", help="serve zeta to one local frontend client"
     )
@@ -498,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             result = (
                 asyncio.run(service.test(args.name, scope=args.scope))
                 if args.mcp_action == "test"
-                else asyncio.run(service.login(args.name, scope=args.scope))
+                else asyncio.run(service.login(args.name, scope=args.scope, no_browser=getattr(args, "no_browser", False)))
             )
             if result is not None:
                 print(json.dumps(result, sort_keys=True))

@@ -18,6 +18,7 @@ zeta mcp test filesystem
 zeta mcp trust filesystem
 zeta mcp untrust filesystem
 zeta mcp login linear
+zeta mcp login linear --no-browser
 zeta mcp logout linear
 zeta mcp remove filesystem --scope project
 ```
@@ -25,7 +26,29 @@ zeta mcp remove filesystem --scope project
 `list` and `show` are strictly offline. `test` initializes a temporary
 connection and lists tools; it never invokes a tool, trusts a project server,
 or changes its enabled state. Login and logout delegate to the existing OAuth
-flow and token store. Logout removes credentials, not the server definition.
+flow and token store. Logout removes credentials, not the server definition. Use
+`--no-browser` to print the authorization URL and paste the full callback URL
+from another device.
+
+OAuth options are configured under `auth`. RFC discovery is used by default;
+`authorization_server_url` and `resource_metadata_url` override its two
+well-known lookups. Both must use `https`, except loopback `http`. `scopes` is
+an explicit scope list, and `authorization_params` adds provider-neutral query
+parameters such as `{"access_type": "offline"}`:
+
+```json
+{
+  "transport": "streamable-http",
+  "url": "https://mcp.example",
+  "auth": {
+    "type": "oauth",
+    "authorization_server_url": "https://login.example/oauth",
+    "resource_metadata_url": "https://mcp.example/.well-known/resource",
+    "scopes": ["openid", "offline_access"],
+    "authorization_params": {"access_type": "offline"}
+  }
+}
+```
 
 ## TUI
 
