@@ -87,16 +87,6 @@ def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -
     session.store.close()
 
 
-def test_project_tool_is_builtin_and_updates_only_standard_memory(
-    tmp_path: Path,
-) -> None:
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    assert "project" in registry.registered_names
-    definition = registry.definitions_by_name["project"]
-    assert definition.requires_approval is False
-    assert "standard filename-to-text" in definition.description
-
-
 def test_resume_replaces_only_current_project_memory(tmp_path: Path) -> None:
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
@@ -126,23 +116,10 @@ def test_resume_replaces_only_current_project_memory(tmp_path: Path) -> None:
     assert "# Current state\\n" not in resumed or "new state" in resumed
 
 
-def test_duplicate_roots_and_update_tool_boundary(tmp_path: Path) -> None:
-    root = tmp_path / "projects"
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    registry = ProjectRegistry(root)
-    registry.create_project("one", "scope", repository)
-    with pytest.raises(ProjectRegistryError, match="canonical integration root"):
-        registry.create_project("two", "scope", repository)
-    tools = ToolRegistry(repository, skill_catalog=SkillCatalog.empty())
-    assert tools.definitions_by_name["project_update"].requires_approval
-    assert (
-        tools.definitions_by_name["project_update"].parameters["additionalProperties"]
-        is False
-    )
-    assert tools.definitions_by_name["project_update"].parameters["properties"]["name"][
-        "enum"
-    ] == ["brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md"]
+def test_project_tool_is_read_only_and_available(tmp_path: Path) -> None:
+    tools = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    assert "project" in tools.registered_names
+    assert "project_update" not in tools.registered_names
 
 
 def test_project_memory_is_bounded_and_rejects_symlinks(tmp_path: Path) -> None:
@@ -411,76 +388,6 @@ async def test_child_lineage_reconciled_after_registry_failure(
     # A second open must not double-publish any link.
     second = sorted(_link_ids(SessionManager(home)))
     assert second == first
-
-
-@pytest.mark.asyncio
-async def test_project_tools_use_session_manager_home_not_ambient_zeta_home(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from zeta.core.approval import ApprovalDecision, ApprovalPolicy
-
-    home_a = tmp_path / "home_a"
-    home_b = tmp_path / "home_b"
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    registry_a = ProjectRegistry(home_a / "projects")
-    project = registry_a.create_project("demo", "scope", repository)
-    registry_a.initialize_memory(project.project_id)
-
-    manager = SessionManager(home_a)
-    opened = manager.create(provider="codex", model="fake", cwd=repository)
-
-    # The ambient environment points at a different home; the tools must ignore
-    # it and use the registry bound to the SessionManager's home instead.
-    monkeypatch.setenv("ZETA_HOME", str(home_b))
-
-    turns = [
-        ScriptedTurn(
-            tool_calls=[
-                ToolCall("root-inspect", "project", {"action": "inspect"}),
-                ToolCall(
-                    "root-update",
-                    "project_update",
-                    {"name": "state.md", "content": "ROOT-EDIT"},
-                ),
-            ]
-        ),
-        ScriptedTurn(tool_calls=[_agent_call("child-call", "child work")]),
-        ScriptedTurn(
-            tool_calls=[
-                ToolCall("child-inspect", "project", {"action": "inspect"}),
-                ToolCall(
-                    "child-update",
-                    "project_update",
-                    {"name": "backlog.md", "content": "CHILD-EDIT"},
-                ),
-            ]
-        ),
-        ScriptedTurn([TextContent("child done")]),
-    ]
-    policy = ApprovalPolicy(store=opened.store, default=ApprovalDecision.ALLOW)
-    loop = AgentLoop(
-        FakeBackend(turns),
-        opened.store,
-        approval_policy=policy,
-        max_turns=2,
-        skill_catalog=SkillCatalog.empty(),
-        skip_mcp_mount=True,
-        root_project_id=opened.metadata.project_id,
-        project_registry=manager.project_registry,
-    )
-    try:
-        async for _ in loop.run_turn("start", origin=MessageOrigin.USER):
-            pass
-    finally:
-        await loop.close()
-    opened.store.close()
-
-    memory = dict(registry_a.load_memory(project.project_id))
-    assert memory["state.md"] == "ROOT-EDIT"
-    assert memory["backlog.md"] == "CHILD-EDIT"
-    # The ambient ZETA_HOME must never be created or written by the tools.
-    assert not (home_b / "projects").exists()
 
 
 _VALID_LINK = (

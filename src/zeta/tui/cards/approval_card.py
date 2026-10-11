@@ -20,7 +20,6 @@ def render_approval_card(
     key: str | None = None,
     shortcut: bool = True,
     trusted_display: MacroDisplay | None = None,
-    project_display: tuple[str | None, str | None, str, int, str] | None = None,
     execution_display: tuple[str | None, str | None] | None = None,
 ) -> Panel:
     """Render an inline permission-request card styled like Claude/Codex.
@@ -54,22 +53,6 @@ def render_approval_card(
                 body_parts.append(
                     Text(f"  [{index}] {value}", style=theme.DIM, overflow="fold")
                 )
-    elif tool_name == "project_update":
-        # This is a harness-owned view of the validated bounded update, never
-        # an instruction interpreted from the proposed memory text.
-        if project_display is not None:
-            project_id, project_name, name, byte_count, preview = project_display
-            project_label = (
-                " ".join(value for value in (project_id, project_name) if value)
-                or "bound project"
-            )
-            body_parts.append(
-                Text(f"project {project_label} memory: {name}", style=theme.DIM)
-            )
-            body_parts.append(Text(f"UTF-8 size: {byte_count} bytes", style=theme.DIM))
-            body_parts.append(
-                Text(f"preview: {preview}", style=theme.DIM, overflow="ellipsis")
-            )
     else:
         arg_line = _arguments(arguments)
         if arg_line:
