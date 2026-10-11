@@ -3,7 +3,6 @@ from __future__ import annotations
 import fcntl
 import multiprocessing
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -25,11 +24,12 @@ def _unexpected_history_scan(*_args: object, **_kwargs: object) -> object:
     raise AssertionError("hot state query scanned conversation history")
 
 
-def _hold_append_lock(lock_path: Path, ready: object, duration: float) -> None:
+def _hold_append_lock(lock_path: Path, ready: object, release: object) -> None:
     with lock_path.open("r+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         ready.set()  # type: ignore[attr-defined]
-        time.sleep(duration)
+        if not release.wait(timeout=30):  # type: ignore[attr-defined]
+            raise TimeoutError("append lock release was not signaled")
 
 
 def _append_approval_while_holding_lock(
@@ -99,17 +99,19 @@ def test_pending_approvals_does_not_wait_for_held_lock_when_unchanged(
     reader = ConversationStore(root, session_id="shared")
     context = multiprocessing.get_context("fork")
     ready = context.Event()
+    release = context.Event()
     process = context.Process(
         target=_hold_append_lock,
-        args=(reader.lock_path, ready, 0.25),
+        args=(reader.lock_path, ready, release),
     )
     process.start()
-    assert ready.wait(timeout=2)
-
-    reader._append_lock = _unexpected_history_scan  # type: ignore[method-assign]
-    assert reader.pending_approvals() == []
-
-    process.join(timeout=2)
+    try:
+        assert ready.wait(timeout=2)
+        reader._append_lock = _unexpected_history_scan  # type: ignore[method-assign]
+        assert reader.pending_approvals() == []
+    finally:
+        release.set()
+        process.join(timeout=2)
     assert process.exitcode == 0
 
 

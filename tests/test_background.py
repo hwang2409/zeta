@@ -767,19 +767,23 @@ async def test_task_output_reads_immediately_and_rejects_wait_argument(
         )
     )
     task_id = started["structuredContent"]["task_id"]
-    immediate = await registry.execute(
-        ToolCall("immediate", "task_output", {"task_id": task_id})
-    )
-    assert immediate["structuredContent"]["running"] is True
-    await registry.execute(
-        ToolCall("release", "task_input", {"task_id": task_id, "eof": True})
-    )
-    invalid = await registry.execute(
-        ToolCall("invalid", "task_output", {"task_id": task_id, "wait_seconds": 1})
-    )
-    assert invalid["isError"] is True
-    assert "unexpected properties: wait_seconds" in invalid["content"][0]["text"]
-    await registry.close()
+    try:
+        immediate = await registry.execute(
+            ToolCall("immediate", "task_output", {"task_id": task_id})
+        )
+        assert immediate["structuredContent"]["running"] is True
+        invalid = await registry.execute(
+            ToolCall("invalid", "task_output", {"task_id": task_id, "wait_seconds": 1})
+        )
+        assert invalid["isError"] is True
+        assert "unexpected properties: wait_seconds" in invalid["content"][0]["text"]
+    finally:
+        try:
+            await registry.execute(
+                ToolCall("release", "task_input", {"task_id": task_id, "eof": True})
+            )
+        finally:
+            await registry.close()
 
 
 def test_task_output_old_transcript_arguments_replay(tmp_path: Path) -> None:
