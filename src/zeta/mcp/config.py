@@ -11,11 +11,24 @@ from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from ..core.session import env_home
 
 logger = logging.getLogger(__name__)
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+RESERVED_AUTHORIZATION_PARAMS = frozenset(
+    {
+        "response_type",
+        "client_id",
+        "redirect_uri",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+        "scope",
+        "resource",
+    }
+)
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -55,6 +68,9 @@ class MCPServerConfig:
     client_secret: str | None = None
     callback_port: int = 0
     scopes: tuple[str, ...] | None = None
+    authorization_server_url: str | None = None
+    resource_metadata_url: str | None = None
+    authorization_params: dict[str, str] = field(default_factory=dict)
     approval_subjects: dict[str, str] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
@@ -363,6 +379,39 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
     scopes = raw_auth.get("scopes")
     if scopes is not None and (type(scopes) is not list or any(type(item) is not str or not item for item in scopes)):
         raise ValueError("auth.scopes must be an array of nonempty strings")
+    authorization_params = raw_auth.get("authorization_params", {})
+    if type(authorization_params) is not dict or any(
+        type(key) is not str or not key or type(item) is not str
+        for key, item in authorization_params.items()
+    ):
+        raise ValueError("auth.authorization_params must be an object of strings")
+    reserved_params = sorted(
+        key
+        for key in authorization_params
+        if key.casefold() in RESERVED_AUTHORIZATION_PARAMS
+    )
+    if reserved_params:
+        names = ", ".join(reserved_params)
+        raise ValueError(
+            f"auth.authorization_params must not override reserved parameters: {names}"
+        )
+    urls = {}
+    for key in ("authorization_server_url", "resource_metadata_url"):
+        item = raw_auth.get(key)
+        if item is not None:
+            if type(item) is not str or not item:
+                raise ValueError(f"auth.{key} must be a URL")
+            parsed = urlparse(item)
+            if parsed.hostname is None or parsed.username is not None or parsed.password is not None:
+                raise ValueError(f"auth.{key} must be a complete URL without credentials")
+            if parsed.fragment:
+                raise ValueError(f"auth.{key} must not contain a fragment")
+            if parsed.scheme != "https" and not (
+                parsed.scheme == "http"
+                and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+            ):
+                raise ValueError(f"auth.{key} must use https (except loopback)")
+            urls[key] = item
     subjects = value.get("approval_subjects", {})
     raw_headers = value.get("headers", {})
     if type(raw_headers) is not dict or any(type(k) is not str or type(v) is not str for k, v in raw_headers.items()):
@@ -406,6 +455,9 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
         client_secret=client_secret,
         callback_port=callback_port,
         scopes=None if scopes is None else tuple(scopes),
+        authorization_server_url=urls.get("authorization_server_url"),
+        resource_metadata_url=urls.get("resource_metadata_url"),
+        authorization_params=dict(authorization_params),
         approval_subjects=dict(subjects),
         headers=dict(raw_headers),
         enabled=enabled,
@@ -484,6 +536,12 @@ def server_to_json(config: MCPServerConfig) -> dict[str, object]:
             auth["callback_port"] = config.callback_port
         if config.scopes is not None:
             auth["scopes"] = list(config.scopes)
+        if config.authorization_server_url is not None:
+            auth["authorization_server_url"] = config.authorization_server_url
+        if config.resource_metadata_url is not None:
+            auth["resource_metadata_url"] = config.resource_metadata_url
+        if config.authorization_params:
+            auth["authorization_params"] = dict(config.authorization_params)
         payload["auth"] = auth
     if config.headers:
         payload["headers"] = dict(config.headers)

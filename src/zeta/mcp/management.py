@@ -473,7 +473,7 @@ class MCPManagementService:
         finally:
             await client.close()
 
-    async def login(self, name: str, *, scope: Scope = "effective") -> None:
+    async def login(self, name: str, *, scope: Scope = "effective", no_browser: bool = False) -> None:
         from .oauth import authorize
 
         item = self.show(name, scope=scope)
@@ -492,6 +492,10 @@ class MCPManagementService:
             client_secret=config.client_secret,
             callback_port=config.callback_port,
             scopes=config.scopes,
+            authorization_server_url=config.authorization_server_url,
+            resource_metadata_url=config.resource_metadata_url,
+            authorization_params=config.authorization_params,
+            no_browser=no_browser,
         )
 
     def logout(self, name: str, *, scope: Scope = "effective") -> None:

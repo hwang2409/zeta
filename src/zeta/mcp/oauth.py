@@ -17,6 +17,7 @@ import hmac
 import http
 import logging
 import secrets
+import sys
 import time
 import webbrowser
 from collections.abc import Callable
@@ -25,6 +26,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import httpx
 
+from .config import RESERVED_AUTHORIZATION_PARAMS
 from .oauth_store import MCPOAuthToken, save_token
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,8 @@ logger = logging.getLogger(__name__)
 OAUTH_LISTEN_TIMEOUT_SECONDS = 300.0
 DEFAULT_CLIENT_NAME = "zeta"
 DEFAULT_REDIRECT_PATH = "/callback"
+_MAX_SERVER_TEXT_LENGTH = 256
+_MAX_OAUTH_URL_LENGTH = 2048
 
 
 class MCPOAuthError(RuntimeError):
@@ -64,6 +68,44 @@ class ProtectedResourceMetadata:
     authorization_server: str | None
 
 
+def _terminal_safe_server_text(value: str) -> str:
+    return "".join(
+        character
+        for character in value
+        if ord(character) >= 32 and not 127 <= ord(character) <= 159
+    )[:_MAX_SERVER_TEXT_LENGTH]
+
+
+def _validate_oauth_url(value: str, label: str) -> None:
+    if len(value) > _MAX_OAUTH_URL_LENGTH:
+        raise MCPOAuthError(
+            f"MCP OAuth: {label} must be at most {_MAX_OAUTH_URL_LENGTH} characters"
+        )
+    if any(
+        character.isspace()
+        or ord(character) < 32
+        or 127 <= ord(character) <= 159
+        for character in value
+    ):
+        raise MCPOAuthError(
+            f"MCP OAuth: {label} must not contain control or whitespace characters"
+        )
+    parsed = urlparse(value)
+    if parsed.hostname is None or parsed.username is not None or parsed.password is not None:
+        raise MCPOAuthError(
+            f"MCP OAuth: {label} must be a complete URL without credentials"
+        )
+    if parsed.fragment:
+        raise MCPOAuthError(f"MCP OAuth: {label} must not contain a fragment")
+    if parsed.scheme != "https" and not (
+        parsed.scheme == "http"
+        and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    ):
+        raise MCPOAuthError(
+            f"MCP OAuth: {label} must use https (except loopback)"
+        )
+
+
 async def discover_protected_resource(
     server_url: str,
     *,
@@ -81,23 +123,53 @@ async def discover_protected_resource(
     try:
         response = await http_client.get(metadata_url, timeout=10.0)
     except httpx.HTTPError as exc:
+        if resource_metadata_url is not None:
+            raise MCPOAuthError(
+                f"MCP OAuth: could not reach protected-resource metadata: {exc}"
+            ) from exc
         logger.debug("MCP OAuth: protected-resource probe failed: %s", exc)
         return ProtectedResourceMetadata(server_url, None)
     if response.status_code >= 400:
+        if resource_metadata_url is not None:
+            raise MCPOAuthError(
+                "MCP OAuth: protected-resource metadata returned HTTP "
+                f"{response.status_code}"
+            )
         return ProtectedResourceMetadata(server_url, None)
     try:
         data = response.json()
-    except ValueError:
+    except ValueError as exc:
+        if resource_metadata_url is not None:
+            raise MCPOAuthError(
+                "MCP OAuth: protected-resource metadata was not JSON"
+            ) from exc
         return ProtectedResourceMetadata(server_url, None)
     if type(data) is not dict:
+        if resource_metadata_url is not None:
+            raise MCPOAuthError(
+                "MCP OAuth: protected-resource metadata was not an object"
+            )
         return ProtectedResourceMetadata(server_url, None)
-    resource_value = data.get("resource")
-    resource = resource_value if type(resource_value) is str else server_url
+    resource = data.get("resource")
+    if type(resource) is not str or not resource:
+        if resource_metadata_url is not None:
+            raise MCPOAuthError(
+                "MCP OAuth: protected-resource metadata missing resource"
+            )
+        return ProtectedResourceMetadata(server_url, None)
+    _validate_oauth_url(resource, "resource")
+    if resource != server_url:
+        safe_resource = _terminal_safe_server_text(resource)
+        raise MCPOAuthError(
+            "MCP OAuth: protected-resource metadata resource does not match "
+            f"the MCP server URL ({safe_resource!r} != {server_url!r})"
+        )
     servers = data.get("authorization_servers")
     server: str | None = None
     if type(servers) is list and servers:
         first = servers[0]
         if type(first) is str:
+            _validate_oauth_url(first, "authorization server")
             server = first
     return ProtectedResourceMetadata(resource, server)
 
@@ -109,9 +181,12 @@ async def discover_auth_server(
 ) -> AuthServerMetadata:
     """Fetch RFC 8414 authorization-server metadata."""
 
+    _validate_oauth_url(authorization_server_url, "authorization server URL")
     parsed = urlparse(authorization_server_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    metadata_url = urljoin(base, "/.well-known/oauth-authorization-server")
+    metadata_url = (
+        f"{base}/.well-known/oauth-authorization-server{parsed.path}"
+    )
     try:
         response = await http_client.get(metadata_url, timeout=10.0)
     except httpx.HTTPError as exc:
@@ -136,17 +211,36 @@ async def discover_auth_server(
     issuer = data.get("issuer")
     auth_endpoint = data.get("authorization_endpoint")
     token_endpoint = data.get("token_endpoint")
-    if type(issuer) is not str or type(auth_endpoint) is not str or type(token_endpoint) is not str:
+    if (
+        type(issuer) is not str
+        or type(auth_endpoint) is not str
+        or type(token_endpoint) is not str
+    ):
         raise MCPOAuthError(
             "MCP OAuth: metadata missing issuer, authorization_endpoint, "
             "or token_endpoint"
         )
+    _validate_oauth_url(issuer, "issuer")
+    if issuer != authorization_server_url:
+        safe_issuer = _terminal_safe_server_text(issuer)
+        raise MCPOAuthError(
+            "MCP OAuth: authorization-server metadata issuer does not match "
+            f"the authorization server URL ({safe_issuer!r} != {authorization_server_url!r})"
+        )
+    _validate_oauth_url(auth_endpoint, "authorization_endpoint")
+    _validate_oauth_url(token_endpoint, "token_endpoint")
     methods = data.get("code_challenge_methods_supported")
     if type(methods) is list and "S256" not in methods:
         raise MCPOAuthError(
             "MCP OAuth: authorization server does not advertise PKCE S256"
         )
     registration = data.get("registration_endpoint")
+    if registration is not None:
+        if type(registration) is not str:
+            raise MCPOAuthError(
+                "MCP OAuth: registration_endpoint must be a URL"
+            )
+        _validate_oauth_url(registration, "registration_endpoint")
     scopes = data.get("scopes_supported") or ()
     scope_tuple: tuple[str, ...] = ()
     if type(scopes) is list:
@@ -230,6 +324,7 @@ def build_authorization_url(
     code_challenge: str,
     resource: str,
     scope: str | None = None,
+    authorization_params: dict[str, str] | None = None,
 ) -> str:
     """Build the authorization request URL with PKCE + resource params."""
 
@@ -244,15 +339,25 @@ def build_authorization_url(
     }
     if scope:
         params["scope"] = scope
+    if authorization_params:
+        reserved = sorted(
+            key
+            for key in authorization_params
+            if key.casefold() in RESERVED_AUTHORIZATION_PARAMS
+        )
+        if reserved:
+            names = ", ".join(reserved)
+            raise MCPOAuthError(
+                f"MCP OAuth: authorization parameters cannot override reserved parameters: {names}"
+            )
+        params.update(authorization_params)
     separator = "&" if "?" in metadata.authorization_endpoint else "?"
     return f"{metadata.authorization_endpoint}{separator}{urlencode(params)}"
 
 
 @dataclass(slots=True)
 class _RedirectPayload:
-    code: str | None = None
-    state: str | None = None
-    error: str | None = None
+    callback_url: str | None = None
 
 
 async def wait_for_redirect(
@@ -294,6 +399,7 @@ async def start_redirect_listener(
 
     payload = _RedirectPayload()
     signal = asyncio.Event()
+    redirect_uri = ""
 
     async def handle(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -325,14 +431,14 @@ async def start_redirect_listener(
             _write_response(writer, 404, "not found")
             await _drain_and_close(writer)
             return
-        params = parse_qs(parsed.query)
-        payload.code = _first_param(params, "code")
-        payload.state = _first_param(params, "state")
-        payload.error = _first_param(params, "error")
+        payload.callback_url = urljoin(redirect_uri, target)
+        values = parse_qs(parsed.query, keep_blank_values=True)
+        errors = values.get("error", [])
+        error = errors[0] if errors else None
         message = (
             "Authorization received. You can close this tab and return to zeta."
-            if payload.error is None
-            else f"Authorization failed: {payload.error}"
+            if error is None
+            else f"Authorization failed: {_terminal_safe_server_text(error)}"
         )
         _write_response(writer, 200, message)
         await _drain_and_close(writer)
@@ -348,12 +454,74 @@ async def start_redirect_listener(
     return server, redirect_uri, payload, signal
 
 
-def _first_param(params: dict[str, list[str]], key: str) -> str | None:
-    values = params.get(key)
-    if not values:
+def _validate_callback_url(
+    callback_url: str,
+    *,
+    redirect_uri: str,
+    expected_state: str,
+) -> str:
+    try:
+        callback = urlparse(callback_url)
+        redirect = urlparse(redirect_uri)
+        callback_origin = (
+            callback.scheme.lower(),
+            callback.hostname,
+            callback.port,
+            callback.path,
+        )
+        redirect_origin = (
+            redirect.scheme.lower(),
+            redirect.hostname,
+            redirect.port,
+            redirect.path,
+        )
+    except ValueError as exc:
+        raise MCPOAuthError("MCP OAuth: authorization callback URL is invalid") from exc
+    if (
+        callback_origin != redirect_origin
+        or callback.username is not None
+        or callback.password is not None
+        or callback.fragment
+    ):
+        raise MCPOAuthError(
+            "MCP OAuth: authorization callback URL does not match the redirect URI"
+        )
+    params = parse_qs(callback.query, keep_blank_values=True)
+    state = _single_callback_param(params, "state")
+    if not hmac.compare_digest(state, expected_state):
+        raise MCPOAuthStateError(
+            "MCP OAuth: authorization redirect state did not match"
+        )
+    error = _single_callback_param(params, "error", required=False)
+    if error is not None:
+        description = _single_callback_param(
+            params, "error_description", required=False
+        )
+        safe_error = _terminal_safe_server_text(error)
+        safe_description = (
+            _terminal_safe_server_text(description) if description else ""
+        )
+        detail = f": {safe_description}" if safe_description else ""
+        raise MCPOAuthError(
+            f"MCP OAuth: authorization denied: {safe_error}{detail}"
+        )
+    code = _single_callback_param(params, "code")
+    assert code is not None
+    return code
+
+
+def _single_callback_param(
+    params: dict[str, list[str]], key: str, *, required: bool = True
+) -> str | None:
+    values = params.get(key, [])
+    if not values and not required:
         return None
-    value = values[0]
-    return value or None
+    if len(values) != 1 or not values[0]:
+        requirement = "exactly one" if values else "one"
+        raise MCPOAuthError(
+            f"MCP OAuth: authorization callback requires {requirement} {key} parameter"
+        )
+    return values[0]
 
 
 def _write_response(
@@ -521,6 +689,9 @@ async def authorize(
     callback_port: int = 0,
     scopes: tuple[str, ...] | None = None,
     resource_metadata_url: str | None = None,
+    authorization_server_url: str | None = None,
+    authorization_params: dict[str, str] | None = None,
+    no_browser: bool = False,
     http_client: httpx.AsyncClient | None = None,
     browser_opener: BrowserOpener | None = None,
     listen_timeout: float = OAUTH_LISTEN_TIMEOUT_SECONDS,
@@ -537,7 +708,7 @@ async def authorize(
             http_client=http_client,
             resource_metadata_url=resource_metadata_url,
         )
-        auth_server = resource_meta.authorization_server or server_url
+        auth_server = authorization_server_url or resource_meta.authorization_server or server_url
         metadata = await discover_auth_server(auth_server, http_client=http_client)
         (
             listener,
@@ -561,27 +732,37 @@ async def authorize(
             code_challenge=challenge,
             resource=resource_meta.resource,
             scope=scope,
+            authorization_params=authorization_params,
         )
-        opener = browser_opener or _default_browser_opener
-        try:
-            opener(url)
-        except Exception as exc:  # noqa: BLE001 - defensive: report but keep waiting
-            logger.warning("MCP OAuth: browser opener failed for %s: %s", server_name, exc)
-        outcome = await wait_for_redirect(
-            listener, payload, signal, timeout=listen_timeout
-        )
-        listener = None
-        if outcome.error:
-            raise MCPOAuthError(f"MCP OAuth: authorization denied: {outcome.error}")
-        if outcome.state is None or not hmac.compare_digest(outcome.state, state):
-            raise MCPOAuthStateError(
-                "MCP OAuth: authorization redirect state did not match"
+        if no_browser:
+            print(f"Open this URL to authorize {server_name}:\n{url}", file=sys.stderr)
+            callback_url = await asyncio.to_thread(
+                input, "Paste the full callback URL: "
             )
-        if not outcome.code:
-            raise MCPOAuthError("MCP OAuth: authorization redirect missing code")
+            listener.close()
+            await listener.wait_closed()
+            listener = None
+        else:
+            opener = browser_opener or _default_browser_opener
+            try:
+                opener(url)
+            except Exception as exc:  # noqa: BLE001 - defensive: report but keep waiting
+                logger.warning(
+                    "MCP OAuth: browser opener failed for %s: %s", server_name, exc
+                )
+            outcome = await wait_for_redirect(
+                listener, payload, signal, timeout=listen_timeout
+            )
+            listener = None
+            callback_url = outcome.callback_url or ""
+        code = _validate_callback_url(
+            callback_url.strip(),
+            redirect_uri=redirect_uri,
+            expected_state=state,
+        )
         response = await exchange_code_for_token(
             metadata,
-            code=outcome.code,
+            code=code,
             redirect_uri=redirect_uri,
             code_verifier=verifier,
             client_id=client_id,
