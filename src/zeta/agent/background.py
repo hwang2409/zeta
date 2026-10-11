@@ -11,7 +11,9 @@ from typing import Any, Protocol
 
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -26,6 +28,47 @@ from .receipt import (
     build_agent_receipt,
     receipt_tool_result,
 )
+
+
+def finish_gate_message(
+    children: tuple[tuple[str, str], ...], tasks: tuple[tuple[str, str], ...]
+) -> Message:
+    running: list[str] = []
+    if children:
+        child_list = ", ".join(
+            f"{handle}: {description}" for handle, description in children
+        )
+        running.append(
+            f"{len(children)} background sub-agents still running: {child_list}"
+        )
+    if tasks:
+        task_list = ", ".join(
+            f"{task_id}: {headline}" for task_id, headline in tasks
+        )
+        running.append(f"{len(tasks)} background tasks still running: {task_list}")
+    stop_choices = []
+    if children:
+        stop_choices.append("cancel sub-agents with agent_cancel")
+    if tasks:
+        stop_choices.append("stop tasks with task_kill")
+    text = (
+        f"You have {'; '.join(running)}. You cannot finish yet. Choose one: "
+        "(a) wait: reply WAIT and end this turn; completions and task exits "
+        "will wake you, with no polling; (b) "
+        f"{' and '.join(stop_choices)}; "
+        "(c) hand off with agent_handoff, providing the reason and where "
+        "the outputs will appear. Sub-agents continue under the parent, but "
+        "background tasks cannot be adopted and will be killed when this "
+        "agent completes; task output remains in this child session's task archive."
+    )
+    return Message(
+        MessageRole.USER,
+        [TextContent(text)],
+        metadata={
+            "zeta_event": "agent_finish_gate",
+            MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
+        },
+    )
 
 
 class _AgentLoopForRecovery(Protocol):
