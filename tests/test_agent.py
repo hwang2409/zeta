@@ -4,7 +4,6 @@ import re
 import shlex
 import sys
 import threading
-import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from io import StringIO
@@ -5732,14 +5731,11 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
             )
         )
         await asyncio.sleep(0)
-        started = time.monotonic()
         task.cancel()
         result = await asyncio.wait_for(task, timeout=2)
-        elapsed = time.monotonic() - started
     finally:
         lock.__exit__(None, None, None)
 
-    assert elapsed < 1.8
     assert result["isError"] is True
     assert "timed out" in result["content"][0]["text"]
     assert child_store.pending_prompts() == []

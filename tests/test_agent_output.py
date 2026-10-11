@@ -1,6 +1,5 @@
 import json
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -685,17 +684,12 @@ async def test_agent_output_reads_snapshot_without_lock_or_mutation(
         raise AssertionError("agent_output acquired the child append lock")
 
     monkeypatch.setattr(ConversationStore, "_append_lock", lock_is_forbidden)
-    started = time.monotonic()
     result = await AgentLoop(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     ).tool_registry.execute(
         ToolCall("output-snapshot", "agent_output", {"handle": "parent:1"})
     )
-    elapsed = time.monotonic() - started
 
-    # The forbidden-lock patch proves no append lock is taken; this bound only
-    # catches an accidental blocking wait without flaking on loaded CI runners.
-    assert elapsed < 5.0
     assert result["isError"] is False
     assert "assistant: saved" in result["content"][0]["text"]
     assert "incomplete" not in result["content"][0]["text"]

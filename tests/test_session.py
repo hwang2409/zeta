@@ -962,13 +962,12 @@ async def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
-    started = threading.Event()
-    release = threading.Event()
+    input_thread = threading.get_ident()
+    loader_threads: list[int] = []
 
     def load_catalog(provider: str) -> frozenset[str]:
         del provider
-        started.set()
-        release.wait(timeout=1)
+        loader_threads.append(threading.get_ident())
         return frozenset({"claude-opus-4-7"})
 
     app = TUIApp(
@@ -978,21 +977,15 @@ async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
         model_catalog_loader=load_catalog,
     )
 
-    began = time.monotonic()
     first = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-opus-4-7")
-    elapsed = time.monotonic() - began
 
-    try:
-        assert elapsed < 0.25
-        assert first == (
-            "model: claude-opus-4-7 "
-            "(model catalog unavailable for claude — using anyway)"
-        )
-        assert await asyncio.to_thread(started.wait, 1)
-    finally:
-        release.set()
-
+    assert first == (
+        "model: claude-opus-4-7 "
+        "(model catalog unavailable for claude — using anyway)"
+    )
     await wait_until(lambda: app._model_catalog_loaded)
+    assert loader_threads
+    assert input_thread not in loader_threads
     assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-opus-4-7") == (
         "model: claude-opus-4-7"
     )

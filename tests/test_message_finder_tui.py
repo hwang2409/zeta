@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import gc
-import time
-from itertools import pairwise
+import threading
 from typing import Any
 
 import pytest
@@ -14,7 +12,7 @@ from rich.text import Text
 
 from zeta.protocol.types import ToolCall
 from zeta.tui.app import TUIApp
-from zeta.tui.transcript import FinderControl, TranscriptWidget
+from zeta.tui.transcript import FinderControl, TranscriptWidget, transcript_finder
 from zeta.tui.transcript.message_finder import Role
 
 
@@ -232,7 +230,7 @@ async def test_enter_before_candidate_preparation_keeps_finder_usable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_open_does_not_stall_long_session(
+async def test_open_yields_within_the_candidate_work_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     transcript = TranscriptWidget()
@@ -243,49 +241,40 @@ async def test_open_does_not_stall_long_session(
         )
         transcript.mark_user(unit)
     transcript.create_content(100, 40)
+    extracted = 0
+    batch_sizes: list[int] = []
     extract_parts = transcript._finder_source_parts
+    original_sleep = transcript_finder.asyncio.sleep
 
-    def slow_extract_parts(unit: Any) -> tuple[str, ...]:
-        parts = extract_parts(unit)
-        deadline = time.thread_time() + 0.00002
-        while time.thread_time() < deadline:
-            pass
-        return parts
+    def record_extract(unit: Any) -> tuple[str, ...]:
+        nonlocal extracted
+        extracted += 1
+        return extract_parts(unit)
 
-    monkeypatch.setattr(transcript, "_finder_source_parts", slow_extract_parts)
+    async def record_yield(_delay: float) -> None:
+        nonlocal extracted
+        batch_sizes.append(extracted)
+        extracted = 0
+        await original_sleep(0)
+
+    monkeypatch.setattr(transcript, "_finder_source_parts", record_extract)
+    monkeypatch.setattr(transcript_finder.asyncio, "sleep", record_yield)
     app = _app_for_finder(transcript)
-    gc.collect()
-    ticks = [(time.perf_counter(), time.thread_time())]
-    running = True
-
-    async def ticker() -> None:
-        while running:
-            await asyncio.sleep(0.001)
-            ticks.append((time.perf_counter(), time.thread_time()))
-
-    ticker_task = asyncio.create_task(ticker())
-    await asyncio.sleep(0)
     app._finder_open()
     prepare_task = app._finder_prepare_task
     assert prepare_task is not None
     await prepare_task
-    running = False
-    await ticker_task
 
     state = transcript.finder_state()
     assert state is not None and state.rows
-    gaps = [
-        (later_wall - earlier_wall, later_cpu - earlier_cpu)
-        for (earlier_wall, earlier_cpu), (later_wall, later_cpu) in pairwise(ticks)
-    ]
-    # Thread CPU time excludes runner descheduling but includes all work done by
-    # the UI loop between 1 ms ticks. The small per-candidate delay models a slow
-    # runner and makes the old synchronous scan exceed the 40 ms bound.
-    assert gaps and max(cpu_gap for _wall_gap, cpu_gap in gaps) < 0.04, max(gaps)
+    assert batch_sizes
+    assert max(batch_sizes) <= transcript_finder._FINDER_PREPARE_BATCH_SIZE
 
 
 @pytest.mark.asyncio
-async def test_pathological_query_does_not_stall_10ms_ticker() -> None:
+async def test_pathological_query_ranks_off_the_ui_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     transcript = TranscriptWidget()
     for index in range(50):
         transcript.append(Text(f"{index} " + "a" * 2_000))
@@ -295,29 +284,22 @@ async def test_pathological_query_does_not_stall_10ms_ticker() -> None:
     prepare_task = app._finder_prepare_task
     assert prepare_task is not None
     await prepare_task
+    ui_thread = threading.get_ident()
+    ranking_threads: list[int] = []
+    rank = transcript.finder_rank
 
-    ticks = [time.perf_counter()]
-    running = True
+    def record_rank() -> Any:
+        ranking_threads.append(threading.get_ident())
+        return rank()
 
-    async def ticker() -> None:
-        while running:
-            await asyncio.sleep(0.01)
-            ticks.append(time.perf_counter())
-
-    ticker_task = asyncio.create_task(ticker())
-    await asyncio.sleep(0)
-    started = time.perf_counter()
+    monkeypatch.setattr(transcript, "finder_rank", record_rank)
     app._finder_input("a" * 50)
-    keypress_seconds = time.perf_counter() - started
     rank_task = app._finder_rank_task
     assert rank_task is not None
     await rank_task
-    running = False
-    await ticker_task
 
-    gaps = [later - earlier for earlier, later in pairwise(ticks)]
-    assert keypress_seconds < 0.02, keypress_seconds
-    assert gaps and max(gaps) < 0.05, max(gaps)
+    assert ranking_threads
+    assert ui_thread not in ranking_threads
 
 
 def test_accept_resolves_target_after_earlier_unit_is_removed() -> None:

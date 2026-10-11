@@ -105,13 +105,11 @@ def test_pending_approvals_does_not_wait_for_held_lock_when_unchanged(
     process.start()
     assert ready.wait(timeout=2)
 
-    started = time.monotonic()
+    reader._append_lock = _unexpected_history_scan  # type: ignore[method-assign]
     assert reader.pending_approvals() == []
-    elapsed = time.monotonic() - started
 
     process.join(timeout=2)
     assert process.exitcode == 0
-    assert elapsed < 0.05
 
 
 def test_pending_approvals_does_not_block_on_writer_mid_append(
@@ -128,13 +126,11 @@ def test_pending_approvals_does_not_block_on_writer_mid_append(
     process.start()
     assert ready.wait(timeout=2)
 
-    started = time.monotonic()
+    reader._append_lock = _unexpected_history_scan  # type: ignore[method-assign]
     assert reader.pending_approvals() == []
-    elapsed = time.monotonic() - started
 
     process.join(timeout=2)
     assert process.exitcode == 0
-    assert elapsed < 0.05
     request = ToolCall("mid-append", "read", {"path": "README.md"})
     assert reader.pending_approvals() == [(request.id, request)]
 

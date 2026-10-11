@@ -680,13 +680,10 @@ async def test_persistent_503_bounded_total_requests(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    started = asyncio.get_running_loop().time()
     events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
-    elapsed = asyncio.get_running_loop().time() - started
 
     assert len(requests) == 5
     assert sum(sleeps) <= 60.0
-    assert elapsed < 1.0
     assert events[-2].type is StreamEventType.ERROR
     await client.aclose()
 

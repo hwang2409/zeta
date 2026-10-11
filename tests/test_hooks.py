@@ -8,7 +8,6 @@ import os
 import shlex
 import signal
 import sys
-import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -227,12 +226,10 @@ async def test_nonblocking_hook_does_not_delay_turn(tmp_path: Path) -> None:
     manager = load_hooks(tmp_path)
     manager.bind_session("session-1")
 
-    started = time.monotonic()
     manager.session_start()
-    elapsed = time.monotonic() - started
-    await manager.close()
 
-    assert elapsed < 0.05
+    assert not marker.exists()
+    await manager.close()
     assert marker.read_text(encoding="utf-8") == "done"
 
 

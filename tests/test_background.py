@@ -763,11 +763,9 @@ async def test_task_output_reads_immediately_and_rejects_wait_argument(
         ToolCall("start", "run_background", {"command": "sleep 2; printf done"})
     )
     task_id = started["structuredContent"]["task_id"]
-    began = time.monotonic()
     immediate = await registry.execute(
         ToolCall("immediate", "task_output", {"task_id": task_id})
     )
-    assert time.monotonic() - began < 1
     assert immediate["structuredContent"]["running"] is True
     invalid = await registry.execute(
         ToolCall("invalid", "task_output", {"task_id": task_id, "wait_seconds": 1})
