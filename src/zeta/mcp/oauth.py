@@ -35,6 +35,7 @@ OAUTH_LISTEN_TIMEOUT_SECONDS = 300.0
 DEFAULT_CLIENT_NAME = "zeta"
 DEFAULT_REDIRECT_PATH = "/callback"
 _MAX_SERVER_TEXT_LENGTH = 256
+_MAX_OAUTH_URL_LENGTH = 2048
 
 
 class MCPOAuthError(RuntimeError):
@@ -76,6 +77,10 @@ def _terminal_safe_server_text(value: str) -> str:
 
 
 def _validate_oauth_url(value: str, label: str) -> None:
+    if len(value) > _MAX_OAUTH_URL_LENGTH:
+        raise MCPOAuthError(
+            f"MCP OAuth: {label} must be at most {_MAX_OAUTH_URL_LENGTH} characters"
+        )
     if any(
         character.isspace()
         or ord(character) < 32

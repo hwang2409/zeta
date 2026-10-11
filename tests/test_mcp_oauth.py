@@ -641,6 +641,64 @@ async def test_discovery_rejects_unsafe_metadata_urls(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    [
+        "resource",
+        "authorization_server",
+        "issuer",
+        "authorization_endpoint",
+        "token_endpoint",
+        "registration_endpoint",
+    ],
+)
+async def test_discovery_rejects_oversized_metadata_urls(
+    field: str,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    resource_url = "https://mcp.test/rpc"
+    authorization_server_url = "https://login.test"
+    oversized = "https://login.test/" + "x" * 2_100
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "metadata.test":
+            metadata: dict[str, object] = {
+                "resource": resource_url,
+                "authorization_servers": [authorization_server_url],
+            }
+            if field == "resource":
+                metadata["resource"] = oversized
+            elif field == "authorization_server":
+                metadata["authorization_servers"] = [oversized]
+            return httpx.Response(200, json=metadata, request=request)
+        metadata = {
+            "issuer": authorization_server_url,
+            "authorization_endpoint": "https://login.test/authorize",
+            "token_endpoint": "https://login.test/token",
+            "registration_endpoint": "https://login.test/register",
+        }
+        metadata[field] = oversized
+        return httpx.Response(200, json=metadata, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthError) as exc_info:
+            if field in {"resource", "authorization_server"}:
+                await discover_protected_resource(
+                    resource_url,
+                    resource_metadata_url="https://metadata.test/protected",
+                    http_client=client,
+                )
+            else:
+                await discover_auth_server(authorization_server_url, http_client=client)
+
+    label = "authorization server" if field == "authorization_server" else field
+    assert str(exc_info.value) == f"MCP OAuth: {label} must be at most 2048 characters"
+    assert oversized not in capsys.readouterr().err
+    assert oversized not in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["resource", "issuer"])
 async def test_metadata_mismatch_error_bounds_server_value(field: str) -> None:
     server_value = "https://other.test/" + "x" * 1_024
