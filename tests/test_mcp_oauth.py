@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import stat
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -20,13 +22,17 @@ from zeta.mcp import (
     StreamableHTTPMCPClient,
     load_mcp_config,
 )
-from zeta.mcp.client import MCPResource, MCPResourceContent
+from zeta.mcp.client import MCPHTTPError, MCPResource, MCPResourceContent
 from zeta.mcp.commands import parse_add_command
 from zeta.mcp.http import MAX_RESPONSE_BYTES
 from zeta.mcp.oauth import (
+    AuthServerMetadata,
     MCPOAuthError,
     MCPOAuthStateError,
     authorize,
+    build_authorization_url,
+    discover_auth_server,
+    discover_protected_resource,
     generate_pkce,
 )
 from zeta.mcp.oauth_store import (
@@ -85,24 +91,26 @@ class _FakeAuthServer:
         self,
         *,
         server_url: str = "https://mcp.test",
-        resource: str = "https://mcp.test/resource",
+        resource: str | None = None,
         authorization_server: str = "https://auth.test",
         refresh_error_status: int | None = None,
     ) -> None:
         self.server_url = server_url
-        self.resource = resource
+        self.resource = resource or server_url
         self.authorization_server = authorization_server
         self.refresh_error_status = refresh_error_status
         self.registrations: list[dict[str, object]] = []
         self.token_requests: list[dict[str, str]] = []
         self.issued_access_tokens: list[str] = []
         self.rejected_states: list[str] = []
+        self.requests: list[str] = []
         self.next_access_token = "access-token-1"
         self.next_refresh_token = "refresh-token-1"
         self.expected_code_verifier: str | None = None
         self.last_code_challenge: str | None = None
 
     async def handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(str(request.url))
         parsed = urlparse(str(request.url))
         path = parsed.path
         if path == "/.well-known/oauth-protected-resource":
@@ -194,6 +202,29 @@ def _write_token(name: str, home: Path, **overrides: object) -> MCPOAuthToken:
     return token
 
 
+def _write_legacy_token(
+    name: str, home: Path, *, client_secret: str
+) -> MCPOAuthToken:
+    token = MCPOAuthToken(
+        access_token="stale-token",
+        refresh_token="refresh-token-1",
+        expires_at=None,
+        token_type="Bearer",
+        scope="mcp:tools",
+        authorization_server="https://auth.test",
+        token_endpoint="https://auth.test/token",
+        authorization_endpoint="https://auth.test/authorize",
+        client_id="registered-client",
+        client_secret=client_secret,
+        redirect_uri="http://127.0.0.1:8000/callback",
+        resource="https://mcp.test/rpc",
+    )
+    path = token_store_path(name, str(home))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(token)))
+    return token
+
+
 def test_pkce_generates_verifier_and_challenge() -> None:
     verifier, challenge = generate_pkce()
     assert len(verifier) >= 43
@@ -211,6 +242,18 @@ def test_token_store_round_trips_with_secure_permissions(tmp_path: Path) -> None
     assert loaded.access_token == token.access_token
     file_mode = token_store_path("srv", str(home)).stat().st_mode
     assert stat.S_IMODE(file_mode) == 0o600
+
+
+def test_new_token_bundle_does_not_persist_client_secret(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_token("srv", home, client_secret="configured-secret")
+
+    payload = json.loads(token_store_path("srv", str(home)).read_text())
+
+    assert "client_secret" not in payload
+    loaded = load_token("srv", home=str(home))
+    assert loaded is not None
+    assert loaded.client_secret is None
 
 
 def test_delete_token_removes_the_file(tmp_path: Path) -> None:
@@ -288,6 +331,224 @@ async def test_full_browser_flow_round_trip(
 
 
 @pytest.mark.asyncio
+async def test_preregistered_client_uses_fixed_callback_scopes_and_extra_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = _monkey_home(monkeypatch, tmp_path)
+    auth = _FakeAuthServer()
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(auth.handle))
+    with socket.socket() as available:
+        available.bind(("127.0.0.1", 0))
+        callback_port = available.getsockname()[1]
+
+    async def redirect(url: str) -> None:
+        params = parse_qs(urlparse(url).query)
+        assert params["client_id"] == ["registered-client"]
+        assert params["scope"] == ["read calendar"]
+        assert params["access_type"] == ["offline"]
+        assert params["prompt"] == ["consent"]
+        redirect_uri = params["redirect_uri"][0]
+        assert urlparse(redirect_uri).port == callback_port
+        await _fire_redirect(
+            f"{redirect_uri}?code=registered-code&state={params['state'][0]}"
+        )
+
+    def open_browser(url: str) -> None:
+        asyncio.create_task(redirect(url))
+
+    token = await authorize(
+        server_name="live",
+        server_url=auth.server_url,
+        home=str(home),
+        client_id="registered-client",
+        client_secret="configured-secret",
+        callback_port=callback_port,
+        scopes=("read", "calendar"),
+        authorization_params={"access_type": "offline", "prompt": "consent"},
+        http_client=http_client,
+        browser_opener=open_browser,
+    )
+    await http_client.aclose()
+
+    assert not auth.registrations
+    assert token.client_id == "registered-client"
+    assert auth.token_requests == [
+        {
+            "grant_type": "authorization_code",
+            "code": "registered-code",
+            "redirect_uri": f"http://127.0.0.1:{callback_port}/callback",
+            "client_id": "registered-client",
+            "code_verifier": auth.token_requests[0]["code_verifier"],
+            "resource": auth.resource,
+            "client_secret": "configured-secret",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "reserved",
+    [
+        "response_type",
+        "client_id",
+        "redirect_uri",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+        "scope",
+        "resource",
+    ],
+)
+def test_config_rejects_reserved_authorization_params(
+    tmp_path: Path, reserved: str
+) -> None:
+    path = tmp_path / "mcp.json"
+    path.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "bad": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.test",
+                        "auth": {
+                            "type": "oauth",
+                            "authorization_params": {reserved: "override"},
+                        },
+                    }
+                }
+            }
+        )
+    )
+
+    config = load_mcp_config(path)
+
+    assert "bad" in config.malformed_servers
+    assert reserved in config.malformed_servers["bad"].malformed_reason
+    assert "reserved" in config.malformed_servers["bad"].malformed_reason
+
+
+@pytest.mark.asyncio
+async def test_discovery_overrides_replace_default_probes() -> None:
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requests.append(url)
+        if url == "https://metadata.test/protected":
+            return httpx.Response(
+                200,
+                json={
+                    "resource": "https://mcp.test/rpc",
+                    "authorization_servers": ["https://login.test"],
+                },
+                request=request,
+            )
+        if url == "https://login.test/.well-known/oauth-authorization-server":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://login.test",
+                    "authorization_endpoint": "https://login.test/authorize",
+                    "token_endpoint": "https://login.test/token",
+                    "code_challenge_methods_supported": ["S256"],
+                },
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    resource = await discover_protected_resource(
+        "https://mcp.test/rpc",
+        resource_metadata_url="https://metadata.test/protected",
+        http_client=client,
+    )
+    metadata = await discover_auth_server(
+        "https://login.test", http_client=client
+    )
+    await client.aclose()
+
+    assert resource.authorization_server == "https://login.test"
+    assert metadata.issuer == "https://login.test"
+    assert requests == [
+        "https://metadata.test/protected",
+        "https://login.test/.well-known/oauth-authorization-server",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inconsistency", ["resource", "issuer", "endpoint"])
+async def test_discovery_rejects_inconsistent_override_metadata(
+    inconsistency: str,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "metadata.test":
+            resource = (
+                "https://other.test"
+                if inconsistency == "resource"
+                else "https://mcp.test/rpc"
+            )
+            return httpx.Response(
+                200,
+                json={"resource": resource},
+                request=request,
+            )
+        issuer = (
+            "https://other.test"
+            if inconsistency == "issuer"
+            else "https://login.test"
+        )
+        endpoint = (
+            "http://remote.test/token"
+            if inconsistency == "endpoint"
+            else "https://login.test/token"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "issuer": issuer,
+                "authorization_endpoint": "https://login.test/authorize",
+                "token_endpoint": endpoint,
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        if inconsistency == "resource":
+            with pytest.raises(MCPOAuthError, match="resource does not match"):
+                await discover_protected_resource(
+                    "https://mcp.test/rpc",
+                    resource_metadata_url="https://metadata.test/protected",
+                    http_client=client,
+                )
+        else:
+            expected = "issuer does not match" if inconsistency == "issuer" else "must use https"
+            with pytest.raises(MCPOAuthError, match=expected):
+                await discover_auth_server("https://login.test", http_client=client)
+    finally:
+        await client.aclose()
+
+
+def test_authorization_url_defensively_rejects_reserved_params() -> None:
+    metadata = AuthServerMetadata(
+        issuer="https://auth.test",
+        authorization_endpoint="https://auth.test/authorize",
+        token_endpoint="https://auth.test/token",
+        registration_endpoint=None,
+        scopes_supported=(),
+    )
+    with pytest.raises(MCPOAuthError, match="reserved parameters: state"):
+        build_authorization_url(
+            metadata,
+            client_id="client",
+            redirect_uri="http://127.0.0.1:8888/callback",
+            state="expected",
+            code_challenge="challenge",
+            resource="https://mcp.test",
+            authorization_params={"state": "attacker"},
+        )
+
+
+@pytest.mark.asyncio
 async def test_authorize_rejects_mismatched_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -342,6 +603,80 @@ async def test_authorize_surfaces_error_from_redirect(
             http_client=http_client,
             browser_opener=open_browser,
         )
+    await http_client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "error_type", "message"),
+    [
+        ("valid", None, None),
+        ("wrong-state", MCPOAuthStateError, "state did not match"),
+        ("wrong-redirect", MCPOAuthError, "does not match the redirect URI"),
+        ("error", MCPOAuthError, "access_denied: user declined"),
+    ],
+)
+async def test_headless_callback_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response: str,
+    error_type: type[Exception] | None,
+    message: str | None,
+) -> None:
+    from zeta.mcp import oauth as oauth_module
+
+    home = _monkey_home(monkeypatch, tmp_path)
+    auth = _FakeAuthServer()
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(auth.handle))
+    authorization_url = ""
+
+    def capture_print(value: str, *, file: object) -> None:
+        nonlocal authorization_url
+        del file
+        authorization_url = value.split("\n", 1)[1]
+
+    def callback_input(_prompt: str) -> str:
+        params = parse_qs(urlparse(authorization_url).query)
+        redirect_uri = params["redirect_uri"][0]
+        state = params["state"][0]
+        if response == "wrong-state":
+            state = "wrong"
+        if response == "wrong-redirect":
+            redirect_uri = "http://127.0.0.1:9/wrong"
+        if response == "error":
+            return (
+                f"{redirect_uri}?error=access_denied&"
+                f"error_description=user+declined&state={state}"
+            )
+        return f"{redirect_uri}?code=headless-code&state={state}"
+
+    monkeypatch.setattr(oauth_module, "print", capture_print, raising=False)
+    monkeypatch.setattr("builtins.input", callback_input)
+
+    if error_type is None:
+        token = await authorize(
+            server_name="live",
+            server_url=auth.server_url,
+            home=str(home),
+            client_id="registered-client",
+            no_browser=True,
+            http_client=http_client,
+        )
+        assert token.access_token == "access-token-1"
+        assert [request["code"] for request in auth.token_requests] == [
+            "headless-code"
+        ]
+    else:
+        with pytest.raises(error_type, match=message):
+            await authorize(
+                server_name="live",
+                server_url=auth.server_url,
+                home=str(home),
+                client_id="registered-client",
+                no_browser=True,
+                http_client=http_client,
+            )
+        assert auth.token_requests == []
     await http_client.aclose()
 
 
@@ -424,6 +759,98 @@ async def test_http_client_refreshes_on_401_and_retries(
     assert persisted.refresh_token == "refresh-token-2"
     assert persisted.refresh_error is None
     del initial
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_refresh_uses_client_secret_resolved_from_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = _monkey_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("MCP_CLIENT_SECRET", "environment-secret")
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "live": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.test/rpc",
+                        "auth": {
+                            "type": "oauth",
+                            "client_id": "registered-client",
+                            "client_secret": "${MCP_CLIENT_SECRET}",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    config = load_mcp_config(config_path).configured_servers["live"]
+    _write_token(
+        "live",
+        home,
+        access_token="stale-token",
+        client_id="registered-client",
+        resource="https://mcp.test/rpc",
+    )
+    requests: list[dict[str, list[str]]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(parse_qs(request.content.decode()))
+        return httpx.Response(
+            200,
+            json={"access_token": "fresh-token", "token_type": "Bearer"},
+            request=request,
+        )
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(config, client=transport, home=str(home))
+    current = client._current_token
+    assert current is not None
+    assert await client._refresh_token_once(MCPHTTPError(401, "expired"), current)
+
+    assert requests[0]["client_secret"] == ["environment-secret"]
+    assert "client_secret" not in json.loads(
+        token_store_path("live", str(home)).read_text()
+    )
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_stored_secret_refreshes_and_rewrite_removes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = _monkey_home(monkeypatch, tmp_path)
+    token = _write_legacy_token(
+        "live", home, client_secret="legacy-stored-secret"
+    )
+    requests: list[dict[str, list[str]]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(parse_qs(request.content.decode()))
+        return httpx.Response(
+            200,
+            json={"access_token": "fresh-token", "token_type": "Bearer"},
+            request=request,
+        )
+
+    config = MCPServerConfig(
+        "live",
+        "streamable-http",
+        url="https://mcp.test/rpc",
+        auth_type="oauth",
+    )
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(config, client=transport, home=str(home))
+    current = client._current_token
+    assert current == token
+    assert await client._refresh_token_once(MCPHTTPError(401, "expired"), current)
+
+    assert requests[0]["client_secret"] == ["legacy-stored-secret"]
+    assert "client_secret" not in json.loads(
+        token_store_path("live", str(home)).read_text()
+    )
     await client.close()
 
 
@@ -820,15 +1247,47 @@ async def test_slash_mcp_auth_runs_flow_and_persists_token(
 
     recorder = _RecordingAuthorize()
     monkeypatch.setattr(commands_module, "authorize", recorder)
+    (home / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "live": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.example",
+                        "auth": {
+                            "type": "oauth",
+                            "authorization_server_url": "https://login.example",
+                            "resource_metadata_url": "https://mcp.example/metadata",
+                            "authorization_params": {"access_type": "offline"},
+                        },
+                    }
+                }
+            }
+        )
+    )
 
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(project),
+        skill_catalog=SkillCatalog.empty(),
+    )
     loop.set_mcp_scope(home=home, project_dir=project)
-    await loop.slash_mcp("add live --http https://mcp.example --oauth")
 
     output = await loop.slash_mcp("auth live")
     assert "auth: oauth (authorized)" in output
     assert recorder.calls, "authorize must be invoked"
-    assert recorder.calls[0]["server_name"] == "live"
+    assert recorder.calls[0] == {
+        "server_name": "live",
+        "server_url": "https://mcp.example",
+        "home": str(home),
+        "client_id": None,
+        "client_secret": None,
+        "callback_port": 0,
+        "scopes": None,
+        "authorization_server_url": "https://login.example",
+        "resource_metadata_url": "https://mcp.example/metadata",
+        "authorization_params": {"access_type": "offline"},
+    }
     await loop.close()
 
 

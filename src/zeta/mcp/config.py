@@ -17,6 +17,18 @@ from ..core.session import env_home
 
 logger = logging.getLogger(__name__)
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+RESERVED_AUTHORIZATION_PARAMS = frozenset(
+    {
+        "response_type",
+        "client_id",
+        "redirect_uri",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+        "scope",
+        "resource",
+    }
+)
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -369,9 +381,16 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
         raise ValueError("auth.scopes must be an array of nonempty strings")
     authorization_params = raw_auth.get("authorization_params", {})
     if type(authorization_params) is not dict or any(
-        type(key) is not str or not key or type(item) is not str for key, item in authorization_params.items()
+        type(key) is not str or not key or type(item) is not str
+        for key, item in authorization_params.items()
     ):
         raise ValueError("auth.authorization_params must be an object of strings")
+    reserved_params = RESERVED_AUTHORIZATION_PARAMS.intersection(authorization_params)
+    if reserved_params:
+        names = ", ".join(sorted(reserved_params))
+        raise ValueError(
+            f"auth.authorization_params must not override reserved parameters: {names}"
+        )
     urls = {}
     for key in ("authorization_server_url", "resource_metadata_url"):
         item = raw_auth.get(key)
@@ -379,7 +398,14 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
             if type(item) is not str or not item:
                 raise ValueError(f"auth.{key} must be a URL")
             parsed = urlparse(item)
-            if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}):
+            if parsed.hostname is None or parsed.username is not None or parsed.password is not None:
+                raise ValueError(f"auth.{key} must be a complete URL without credentials")
+            if parsed.fragment:
+                raise ValueError(f"auth.{key} must not contain a fragment")
+            if parsed.scheme != "https" and not (
+                parsed.scheme == "http"
+                and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+            ):
                 raise ValueError(f"auth.{key} must use https (except loopback)")
             urls[key] = item
     subjects = value.get("approval_subjects", {})
