@@ -63,9 +63,6 @@ async def _task_output(
 ) -> StructuredToolResult:
     task_id = arguments["task_id"]
     since = arguments.get("since")
-    wait_seconds = arguments.get("wait_seconds", 0)
-    if wait_seconds:
-        await registry.background_tasks.wait(task_id, timeout=wait_seconds)
     output_limit = registry.max_output_chars
     for _ in range(8):
         result = await registry.background_tasks.output(
@@ -158,9 +155,10 @@ def register(registry: ToolRegistry) -> None:
         "task_output",
         _task_output,
         description=(
-            "Read incremental output and status from a background task. "
-            "Set wait_seconds to wait up to 300 seconds for completion. Large output "
-            "uses a task-output://<task-id> location; retrieve it only with repeated "
+            "Read incremental output and status from a background task. Completion "
+            "is announced automatically and wakes the agent; task_output only reads "
+            "output/status using the since cursor. Large output uses a "
+            "task-output://<task-id> location; retrieve it only with repeated "
             "task_output calls using the returned since cursor, not with read."
         ),
         parameters={
@@ -168,7 +166,6 @@ def register(registry: ToolRegistry) -> None:
             "properties": {
                 "task_id": {"type": "string", "minLength": 1},
                 "since": {"type": "integer", "minimum": 0},
-                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 300},
             },
             "required": ["task_id"],
             "additionalProperties": False,
