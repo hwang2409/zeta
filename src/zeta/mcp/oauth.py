@@ -67,7 +67,24 @@ class ProtectedResourceMetadata:
     authorization_server: str | None
 
 
+def _terminal_safe_server_text(value: str) -> str:
+    return "".join(
+        character
+        for character in value
+        if ord(character) >= 32 and not 127 <= ord(character) <= 159
+    )[:_MAX_SERVER_TEXT_LENGTH]
+
+
 def _validate_oauth_url(value: str, label: str) -> None:
+    if any(
+        character.isspace()
+        or ord(character) < 32
+        or 127 <= ord(character) <= 159
+        for character in value
+    ):
+        raise MCPOAuthError(
+            f"MCP OAuth: {label} must not contain control or whitespace characters"
+        )
     parsed = urlparse(value)
     if parsed.hostname is None or parsed.username is not None or parsed.password is not None:
         raise MCPOAuthError(
@@ -135,10 +152,12 @@ async def discover_protected_resource(
                 "MCP OAuth: protected-resource metadata missing resource"
             )
         return ProtectedResourceMetadata(server_url, None)
+    _validate_oauth_url(resource, "resource")
     if resource != server_url:
+        safe_resource = _terminal_safe_server_text(resource)
         raise MCPOAuthError(
             "MCP OAuth: protected-resource metadata resource does not match "
-            f"the MCP server URL ({resource!r} != {server_url!r})"
+            f"the MCP server URL ({safe_resource!r} != {server_url!r})"
         )
     servers = data.get("authorization_servers")
     server: str | None = None
@@ -196,12 +215,13 @@ async def discover_auth_server(
             "MCP OAuth: metadata missing issuer, authorization_endpoint, "
             "or token_endpoint"
         )
+    _validate_oauth_url(issuer, "issuer")
     if issuer != authorization_server_url:
+        safe_issuer = _terminal_safe_server_text(issuer)
         raise MCPOAuthError(
             "MCP OAuth: authorization-server metadata issuer does not match "
-            f"the authorization server URL ({issuer!r} != {authorization_server_url!r})"
+            f"the authorization server URL ({safe_issuer!r} != {authorization_server_url!r})"
         )
-    _validate_oauth_url(issuer, "issuer")
     _validate_oauth_url(auth_endpoint, "authorization_endpoint")
     _validate_oauth_url(token_endpoint, "token_endpoint")
     methods = data.get("code_challenge_methods_supported")
@@ -483,14 +503,6 @@ def _validate_callback_url(
     code = _single_callback_param(params, "code")
     assert code is not None
     return code
-
-
-def _terminal_safe_server_text(value: str) -> str:
-    return "".join(
-        character
-        for character in value
-        if ord(character) >= 32 and not 127 <= ord(character) <= 159
-    )[:_MAX_SERVER_TEXT_LENGTH]
 
 
 def _single_callback_param(

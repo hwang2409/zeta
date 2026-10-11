@@ -580,6 +580,110 @@ async def test_discovery_rejects_inconsistent_override_metadata(
         await client.aclose()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "unsafe_url"),
+    [
+        ("resource", "https://mcp.test/\x1b[2J"),
+        ("authorization_server", "https://login.test/\u0085bad"),
+        ("issuer", "https://login.test/ bad"),
+        ("authorization_endpoint", "https://login.test/\x1b[2Jauthorize"),
+        ("token_endpoint", "https://login.test/\tdtoken"),
+        ("registration_endpoint", "https://login.test/\ndregister"),
+    ],
+)
+async def test_discovery_rejects_unsafe_metadata_urls(
+    field: str,
+    unsafe_url: str,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    resource_url = "https://mcp.test/rpc"
+    authorization_server_url = "https://login.test"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "metadata.test":
+            metadata: dict[str, object] = {
+                "resource": resource_url,
+                "authorization_servers": [authorization_server_url],
+            }
+            if field == "resource":
+                metadata["resource"] = unsafe_url
+            elif field == "authorization_server":
+                metadata["authorization_servers"] = [unsafe_url]
+            return httpx.Response(200, json=metadata, request=request)
+        metadata = {
+            "issuer": authorization_server_url,
+            "authorization_endpoint": "https://login.test/authorize",
+            "token_endpoint": "https://login.test/token",
+            "registration_endpoint": "https://login.test/register",
+        }
+        metadata[field] = unsafe_url
+        return httpx.Response(200, json=metadata, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthError) as exc_info:
+            if field in {"resource", "authorization_server"}:
+                await discover_protected_resource(
+                    resource_url,
+                    resource_metadata_url="https://metadata.test/protected",
+                    http_client=client,
+                )
+            else:
+                await discover_auth_server(authorization_server_url, http_client=client)
+
+    label = "authorization server" if field == "authorization_server" else field
+    assert str(exc_info.value) == (
+        f"MCP OAuth: {label} must not contain control or whitespace characters"
+    )
+    assert unsafe_url not in capsys.readouterr().err
+    assert unsafe_url not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["resource", "issuer"])
+async def test_metadata_mismatch_error_bounds_server_value(field: str) -> None:
+    server_value = "https://other.test/" + "x" * 1_024
+    expected_value = server_value[:256]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if field == "resource":
+            return httpx.Response(
+                200,
+                json={"resource": server_value},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "issuer": server_value,
+                "authorization_endpoint": "https://login.test/authorize",
+                "token_endpoint": "https://login.test/token",
+            },
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthError) as exc_info:
+            if field == "resource":
+                await discover_protected_resource(
+                    "https://mcp.test/rpc",
+                    resource_metadata_url="https://metadata.test/protected",
+                    http_client=client,
+                )
+            else:
+                await discover_auth_server("https://login.test", http_client=client)
+
+    expected = (
+        "MCP OAuth: protected-resource metadata resource does not match "
+        f"the MCP server URL ({expected_value!r} != 'https://mcp.test/rpc')"
+        if field == "resource"
+        else "MCP OAuth: authorization-server metadata issuer does not match "
+        f"the authorization server URL ({expected_value!r} != 'https://login.test')"
+    )
+    assert str(exc_info.value) == expected
+
+
 @pytest.mark.parametrize("reserved", ["state", "State", "REDIRECT_URI"])
 def test_authorization_url_defensively_rejects_reserved_params(
     reserved: str,
@@ -750,10 +854,12 @@ def test_callback_error_is_safe_for_terminal() -> None:
 
     unsafe_error = "bad\x1b[2J\r\n" + "x" * 300
     unsafe_description = "user\x00denied\x85" + "y" * 300
+    unsafe_error_uri = "https://attacker.test/\x1b[2J"
     callback_url = "http://127.0.0.1:8888/callback?" + urlencode(
         {
             "error": unsafe_error,
             "error_description": unsafe_description,
+            "error_uri": unsafe_error_uri,
             "state": "expected",
         }
     )
@@ -770,6 +876,7 @@ def test_callback_error_is_safe_for_terminal() -> None:
     assert str(exc_info.value) == (
         f"MCP OAuth: authorization denied: {safe_error}: {safe_description}"
     )
+    assert unsafe_error_uri not in str(exc_info.value)
     assert not any(
         ord(character) < 32 or 127 <= ord(character) <= 159
         for character in str(exc_info.value)
