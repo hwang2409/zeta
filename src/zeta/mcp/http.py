@@ -249,7 +249,7 @@ class StreamableHTTPMCPClient(MCPClient):
                     token_endpoint=token.token_endpoint,
                     refresh_token=token.refresh_token,
                     client_id=token.client_id,
-                    client_secret=token.client_secret,
+                    client_secret=self.config.client_secret or token.client_secret,
                     resource=token.resource,
                     http_client=self._client,
                 )

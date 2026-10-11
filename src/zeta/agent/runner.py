@@ -22,7 +22,6 @@ from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
-    MESSAGE_ORIGIN_METADATA,
     CompletionBackend,
     Message,
     MessageOrigin,
@@ -40,7 +39,7 @@ from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
 from ..tools.registry import ToolExecutionContext
-from .background import finish_background_child
+from .background import finish_background_child, finish_gate_message
 from .budget import MAX_AGENT_DEPTH
 from .budget import child_depth as next_agent_depth
 from .conversation_channel import has_follow_up_loop
@@ -184,25 +183,11 @@ async def consume_child(
             return ()
         return child_loop._background_owner.owned_running(instance_id)
 
-    def finish_gate_message(children: tuple[tuple[str, str], ...]) -> Message:
-        child_list = ", ".join(
-            f"{handle}: {description}" for handle, description in children
-        )
-        text = (
-            f"You have {len(children)} background sub-agents still running: "
-            f"{child_list}. You cannot finish yet. Choose one: "
-            "(a) wait: reply WAIT and end this turn; completions will wake you, "
-            "with no polling; (b) cancel them with agent_cancel; "
-            "(c) hand them off with agent_handoff, providing the reason and "
-            "where their outputs will appear."
-        )
-        return Message(
-            MessageRole.USER,
-            [TextContent(text)],
-            metadata={
-                "zeta_event": "agent_finish_gate",
-                MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
-            },
+    def owned_tasks() -> tuple[tuple[str, str], ...]:
+        return tuple(
+            (task.task_id, task.headline)
+            for task in child_loop.tool_registry.background_tasks.snapshot()
+            if task.running
         )
 
     try:
@@ -213,7 +198,8 @@ async def consume_child(
         )
         await consume_events(events)
         children = owned_children()
-        if final_message is not None and children:
+        tasks = owned_tasks()
+        if final_message is not None and (children or tasks):
             fallback_message = final_message
             gate_state = _FinishGateState(
                 deadline=(
@@ -226,7 +212,7 @@ async def consume_child(
 
             async def handoff(arguments: dict[str, Any]) -> str:
                 gate_state.handoff = (arguments["reason"], arguments["outputs"])
-                return "background children handed off"
+                return "background work handed off"
 
             async def consume_gate_events(events: AsyncIterator[StreamEvent]) -> bool:
                 try:
@@ -245,8 +231,10 @@ async def consume_child(
                 "agent_handoff",
                 handoff,
                 description=(
-                    "Hand off running background children to the parent. The children "
-                    "continue running and their completion receipts go to the parent."
+                    "Hand off running background work to the parent. Sub-agents "
+                    "continue and report to the parent. Background tasks cannot be "
+                    "adopted and are killed when this agent completes; provide where "
+                    "their output can be found."
                 ),
                 parameters={
                     "type": "object",
@@ -260,7 +248,7 @@ async def consume_child(
                 requires_approval=False,
             )
             try:
-                gate = finish_gate_message(children)
+                gate = finish_gate_message(children, tasks)
                 keep_going = await consume_gate_events(
                     child_loop.run_turn(
                         "",
@@ -272,15 +260,16 @@ async def consume_child(
                     bound_exited = True
                 while keep_going and failure_message is None:
                     children = owned_children()
+                    tasks = owned_tasks()
                     pending_follow_up = bool(child_loop.store.pending_prompts())
                     pending_notification = (
                         child_loop.notification_system_message() is not None
                     )
                     if pending_follow_up:
                         break
-                    if not children and not pending_notification:
+                    if not children and not tasks and not pending_notification:
                         break
-                    if children:
+                    if children or tasks:
                         remaining = (
                             gate_state.deadline - asyncio.get_running_loop().time()
                         )
@@ -308,12 +297,14 @@ async def consume_child(
                     MessageRole.ASSISTANT,
                     [
                         TextContent(
-                            "Handed off running background children.\n"
+                            "Handed off running background work.\n"
                             f"Reason: {reason}\nOutputs: {outputs}"
                         )
                     ],
                 )
-            elif (bound_exited and owned_children()) or final_message is None:
+            elif (
+                bound_exited and (owned_children() or owned_tasks())
+            ) or final_message is None:
                 final_message = fallback_message
     except asyncio.CancelledError:
         raise

@@ -142,7 +142,9 @@ _zeta() {
                         list) _arguments '--scope=[configuration scope]:scope:(user project effective)' '--json[emit JSON]' ;;
                         show) _arguments '--scope=[configuration scope]:scope:(user project effective)' '--json[emit JSON]' '1:name:' ;;
                         remove|enable|disable) _arguments '--scope=[configuration scope]:scope:(user project)' '1:name:' ;;
-                        test|login|logout) _arguments '--scope=[configuration scope]:scope:(user project effective)' '1:name:' ;;
+                        test) _arguments '--scope=[configuration scope]:scope:(user project effective)' '1:name:' ;;
+                        login) _arguments '--scope=[configuration scope]:scope:(user project effective)' '--no-browser[print URL and paste callback]' '1:name:' ;;
+                        logout) _arguments '--scope=[configuration scope]:scope:(user project effective)' '1:name:' ;;
                         trust|untrust) _arguments '1:name:' ;;
                         *) _describe 'verb' mcp_verbs ;;
                     esac
@@ -270,7 +272,8 @@ def bash_script() -> str:
                 case "$verb" in
                     add) COMPREPLY=( $(compgen -W "--scope --url --oauth --env --header" -- "$cur") ) ;;
                     list|show) COMPREPLY=( $(compgen -W "--scope --json" -- "$cur") ) ;;
-                    remove|enable|disable|test|login|logout) COMPREPLY=( $(compgen -W "--scope" -- "$cur") ) ;;
+                    remove|enable|disable|test|logout) COMPREPLY=( $(compgen -W "--scope" -- "$cur") ) ;;
+                    login) COMPREPLY=( $(compgen -W "--scope --no-browser" -- "$cur") ) ;;
                 esac
             fi
             ;;

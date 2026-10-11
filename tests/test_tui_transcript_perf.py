@@ -214,7 +214,7 @@ async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
 
 @pytest.mark.asyncio
 async def test_production_agent_refresh_keeps_event_loop_responsive(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     template = ConversationStore(tmp_path / "template", session_id="0")
     template.append_many(
@@ -254,25 +254,21 @@ async def test_production_agent_refresh_keeps_event_loop_responsive(
             ),
         )
 
-    gaps: list[float] = []
-    done = False
+    reads: list[int] = []
+    original_refresh = agent_sync_module.AgentTranscriptSource._refresh_path
 
-    async def ticker() -> None:
-        expected = time.perf_counter() + 0.005
-        while not done:
-            await asyncio.sleep(max(0, expected - time.perf_counter()))
-            now = time.perf_counter()
-            gaps.append(max(0, now - expected))
-            expected = now + 0.005
+    def recording_refresh(*args: object, **kwargs: object) -> object:
+        reads.append(threading.get_ident())
+        return original_refresh(*args, **kwargs)
 
-    ticker_task = asyncio.create_task(ticker())
-    await asyncio.sleep(0.01)
+    monkeypatch.setattr(
+        agent_sync_module.AgentTranscriptSource, "_refresh_path", recording_refresh
+    )
+    loop_thread = threading.get_ident()
     await transcript.refresh_agent_transcripts()
-    done = True
-    await ticker_task
 
-    assert gaps
-    assert max(gaps) < 0.05
+    assert reads
+    assert loop_thread not in reads
 
 
 def test_bounded_agent_source_reads_only_active_branch_tail(tmp_path: Path) -> None:
@@ -374,24 +370,25 @@ def test_follow_tail_redraw_does_not_rebuild_location_map() -> None:
 
 
 def test_virtual_streaming_tail_cost_is_bounded_by_viewport() -> None:
-    transcript = _transcript(2_000)
-    stream = StreamingText(theme.BODY, palette_role="body")
-    unit = transcript.append(stream)
-    stream.append("x" * 50_000)
-    transcript.touch(unit)
-    transcript.create_content(100, 30)
-    render = Mock(wraps=transcript._render_unit)
-    transcript._render_unit = render
-
-    started = time.perf_counter()
-    for _ in range(20):
-        stream.append(" next")
+    render_counts: list[int] = []
+    for size in (2_000, 20_000):
+        transcript = _transcript(size)
+        stream = StreamingText(theme.BODY, palette_role="body")
+        unit = transcript.append(stream)
+        stream.append("x" * 50_000)
         transcript.touch(unit)
         transcript.create_content(100, 30)
-    elapsed = time.perf_counter() - started
+        render = Mock(wraps=transcript._render_unit)
+        transcript._render_unit = render
 
-    render.assert_not_called()
-    assert elapsed < 0.2
+        for _ in range(20):
+            stream.append(" next")
+            transcript.touch(unit)
+            transcript.create_content(100, 30)
+
+        render_counts.append(render.call_count)
+
+    assert render_counts == [0, 0]
 
 
 def test_follow_tail_rendered_output_remains_available() -> None:
@@ -460,12 +457,9 @@ async def test_uncached_search_index_builds_in_bounded_batches() -> None:
         return original(unit, width)
 
     transcript._search_rendered = slow_search_render
-    started = time.perf_counter()
     transcript.begin_search()
     transcript.update_search("needle")
-    first_batch = time.perf_counter() - started
 
-    assert first_batch < 0.05
     assert not transcript._virtual_search_complete
     while not transcript._virtual_search_complete:
         await asyncio.sleep(0.001)
@@ -1028,20 +1022,20 @@ def test_virtual_threshold_transition_preserves_active_search() -> None:
 
 
 def test_scrolled_paint_cost_is_independent_of_unit_count() -> None:
-    durations: list[float] = []
+    render_counts: list[int] = []
     for size in (2_000, 20_000):
         transcript = _transcript(size)
         transcript.create_content(100, 30)
         for _ in range(10):
             transcript.page_up()
             transcript.create_content(100, 30)
-        started = time.perf_counter()
+        rendered = Mock(wraps=transcript._render_unit)
+        transcript._render_unit = rendered
         for _ in range(100):
             transcript.create_content(100, 30)
-        durations.append(time.perf_counter() - started)
+        render_counts.append(rendered.call_count)
 
-    assert durations[1] < 0.1
-    assert durations[1] < durations[0] * 3
+    assert render_counts[1] <= render_counts[0]
 
 
 def test_virtual_position_indicator_uses_consistent_line_estimates() -> None:

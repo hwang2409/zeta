@@ -174,7 +174,7 @@ async def test_pre_aborted_child_task_output_fails_closed(
     call = ToolCall(
         "aborted-child-task-output",
         "task_output",
-        {"task_id": "task-never-started", "wait_seconds": 5},
+        {"task_id": "task-never-started"},
     )
     registry.abort()
 

@@ -131,6 +131,10 @@ class BackgroundTaskInfo:
     output_bytes: int
     output_lines: int
 
+    @property
+    def headline(self) -> str:
+        return _command_headline(self.command)
+
 
 @dataclass(slots=True)
 class _BackgroundRecord:
