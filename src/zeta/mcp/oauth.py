@@ -116,18 +116,24 @@ async def discover_protected_resource(
     try:
         data = response.json()
     except ValueError as exc:
-        raise MCPOAuthError(
-            "MCP OAuth: protected-resource metadata was not JSON"
-        ) from exc
+        if resource_metadata_url is not None:
+            raise MCPOAuthError(
+                "MCP OAuth: protected-resource metadata was not JSON"
+            ) from exc
+        return ProtectedResourceMetadata(server_url, None)
     if type(data) is not dict:
-        raise MCPOAuthError(
-            "MCP OAuth: protected-resource metadata was not an object"
-        )
+        if resource_metadata_url is not None:
+            raise MCPOAuthError(
+                "MCP OAuth: protected-resource metadata was not an object"
+            )
+        return ProtectedResourceMetadata(server_url, None)
     resource = data.get("resource")
     if type(resource) is not str or not resource:
-        raise MCPOAuthError(
-            "MCP OAuth: protected-resource metadata missing resource"
-        )
+        if resource_metadata_url is not None:
+            raise MCPOAuthError(
+                "MCP OAuth: protected-resource metadata missing resource"
+            )
+        return ProtectedResourceMetadata(server_url, None)
     if resource != server_url:
         raise MCPOAuthError(
             "MCP OAuth: protected-resource metadata resource does not match "

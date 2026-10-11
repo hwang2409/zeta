@@ -475,6 +475,23 @@ async def test_discovery_overrides_replace_default_probes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_default_protected_resource_probe_keeps_invalid_response_fallback() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="not JSON", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        metadata = await discover_protected_resource(
+            "https://mcp.test/rpc", http_client=client
+        )
+    finally:
+        await client.aclose()
+
+    assert metadata.resource == "https://mcp.test/rpc"
+    assert metadata.authorization_server is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("inconsistency", ["resource", "issuer", "endpoint"])
 async def test_discovery_rejects_inconsistent_override_metadata(
     inconsistency: str,
