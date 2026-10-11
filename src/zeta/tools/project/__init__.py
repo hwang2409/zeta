@@ -8,8 +8,6 @@ from ...project_registry import ProjectRegistry, ProjectRegistryError
 from ...protocol.types import StructuredToolResult
 from ..registry import ToolRegistry, _success_result, text_block
 
-_MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
-
 
 def _error(message: str) -> StructuredToolResult:
     return {
