@@ -200,13 +200,6 @@ class ApprovalRequest:
     tool_call: ToolCall
     label: str | None = None
     child_instance_id: str | None = None
-    # Harness-owned, immutable display facts; never read from provider args by
-    # frontends when present.
-    project_id: str | None = None
-    project_name: str | None = None
-    filename: str | None = None
-    content_bytes: int | None = None
-    preview: str | None = None
     effective_cwd: str | None = None
     resolved_path: str | None = None
     action: str | None = None
@@ -222,16 +215,6 @@ class ApprovalRequest:
         """Return immutable presentation facts, never executable authority."""
 
         display: dict[str, object] = {}
-        if self.project_id is not None or self.filename is not None:
-            display.update(
-                {
-                    "project_id": self.project_id,
-                    "project_name": self.project_name,
-                    "filename": self.filename,
-                    "utf8_bytes": self.content_bytes,
-                    "preview": self.preview,
-                }
-            )
         if self.effective_cwd is not None or self.resolved_path is not None:
             display.update(
                 {
@@ -656,16 +639,11 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             ApprovalRequest(
                 request.request_id,
                 request.tool_call,
-                request.label,
-                child_id,
-                request.project_id,
-                request.project_name,
-                request.filename,
-                request.content_bytes,
-                request.preview,
-                request.effective_cwd,
-                request.resolved_path,
-                request.action,
+                label=request.label,
+                child_instance_id=child_id,
+                effective_cwd=request.effective_cwd,
+                resolved_path=request.resolved_path,
+                action=request.action,
             ),
             store,
         )

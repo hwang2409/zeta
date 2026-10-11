@@ -13,9 +13,8 @@ an authoritative update or context read.
 
 Memory is loaded when a session starts or resumes. It does not refresh during a
 running session. Agents can inspect memory, but only the background updater and
-explicit user commands write entry memory. The model-facing `project_update`
-tool remains available for format-1 projects. On a format-2 project it returns:
-`this project uses entry memory; memory is maintained automatically`.
+explicit user commands write entry memory. There is no model-facing memory
+write tool.
 
 ## Profiles
 

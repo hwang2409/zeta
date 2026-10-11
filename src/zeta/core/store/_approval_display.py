@@ -8,10 +8,6 @@ from ...protocol.types import Message, ToolCall, ToolUseContent
 
 _STRING_FIELDS = frozenset(
     {
-        "project_id",
-        "project_name",
-        "filename",
-        "preview",
         "effective_cwd",
         "resolved_path",
     }

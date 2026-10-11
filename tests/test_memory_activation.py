@@ -226,31 +226,3 @@ def test_migrate_rollback_and_finalize_commands_use_real_project_registry(
     assert project_cli.run(_cli_args(project.project_id, "finalize"), stdout=io.StringIO(), stderr=io.StringIO()) == 0
     with pytest.raises(ProjectRegistryError, match="finalized"):
         registry.rollback_memory_migration(project.project_id)
-
-
-@pytest.mark.asyncio
-async def test_project_update_refuses_format_two_project(tmp_path: Path) -> None:
-    from types import SimpleNamespace
-
-    from zeta.tools.project import _update_project
-
-    home = tmp_path / "home"
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    projects = ProjectRegistry(home / "projects")
-    project = projects.create_project("demo", "test", workspace)
-    projects.activate_entry_memory(project.project_id)
-    registry = SimpleNamespace(
-        project_registry=projects,
-        project_id=project.project_id,
-        cwd=workspace,
-    )
-
-    result = await _update_project(
-        registry, {"name": "state.md", "content": "# State\nwrong format"}
-    )
-
-    assert result["isError"] is True
-    assert result["structuredContent"]["error"]["message"] == (
-        "this project uses entry memory; memory is maintained automatically"
-    )

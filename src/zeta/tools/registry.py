@@ -713,32 +713,6 @@ class ToolRegistry:
             self.approval_policy.bind_capability_resolver(
                 self.resolve_tool_call_capability
             )
-            bind_display = getattr(self.approval_policy, "bind_display_resolver", None)
-            if bind_display is not None:
-                bind_display(self._approval_display)
-
-    def _approval_display(self, request: ApprovalRequest) -> ApprovalRequest:
-        if request.tool_call.name != "project_update":
-            return request
-        arguments = request.tool_call.arguments
-        project = None
-        if self.project_registry is not None and self.project_id is not None:
-            try:
-                project = self.project_registry.show_project(self.project_id)
-            except (OSError, ValueError):
-                pass
-        name = arguments.get("name")
-        content = arguments.get("content")
-        if not isinstance(name, str) or not isinstance(content, str):
-            return request
-        return replace(
-            request,
-            project_id=self.project_id,
-            project_name=getattr(project, "name", None),
-            filename=name,
-            content_bytes=len(content.encode("utf-8")),
-            preview=content[:240].replace("\n", "\\n"),
-        )
 
     def approval_display(self, tool_call: ToolCall) -> ApprovalRequest:
         """Resolve the harness-owned display facts for a tool call.
@@ -757,9 +731,7 @@ class ToolRegistry:
                 ).action
             except (KeyError, UnknownToolAction):
                 pass
-        return self._approval_display(
-            ApprovalRequest(tool_call.id, tool_call, action=action)
-        )
+        return ApprovalRequest(tool_call.id, tool_call, action=action)
 
     def bind_session_store(self, store: ConversationStore) -> None:
         self._session_store = store
@@ -880,8 +852,6 @@ class ToolRegistry:
             tool_call,
             capability=capability,
         )
-        if request is not None:
-            request = self._approval_display(request)
         return request
 
     async def execute(

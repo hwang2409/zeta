@@ -3894,6 +3894,8 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
 
     child_tools = {schema["name"] for schema in backend.calls[1][1]}
     grandchild_tools = {schema["name"] for schema in backend.calls[2][1]}
+    assert "project_update" not in child_tools
+    assert "project_update" not in grandchild_tools
     assert child_tools == {
         "agent",
         "agent_output",
@@ -7811,23 +7813,6 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
     assert "CHILD CWD INSTRUCTIONS" in prompt
     assert child_tools.project_id == project_a.project_id
     assert child_tools.project_id != project_b.project_id
-    result = await child_tools.execute(
-        ToolCall(
-            "child-update",
-            "project_update",
-            {"name": "state.md", "content": "UPDATED BY CHILD"},
-        )
-    )
-    assert result["isError"] is True
-    assert result["structuredContent"]["error"]["message"] == (
-        "this project uses entry memory; memory is maintained automatically"
-    )
-    assert "PROJECT A MEMORY" in registry._entry_memory_mirrors(project_a.project_id)[
-        "state"
-    ]
-    assert "PROJECT B MEMORY" in registry._entry_memory_mirrors(project_b.project_id)[
-        "state"
-    ]
     await child_tools.close()
     await parent_tools.close()
     child_store.close()

@@ -1201,7 +1201,7 @@ def _approval_display_fields(request: Any) -> dict[str, object]:
     """The one immutable approval-display object shared with the frontend client.
 
     Returns an ``approval_display`` wire field only when the harness resolved
-    trusted project or execution facts; otherwise nothing is added and the client
+    trusted execution facts; otherwise nothing is added and the client
     keeps its backward-compatible behavior.
     """
     fields: dict[str, object] = {}

@@ -629,16 +629,6 @@ async def test_project_init_rebinds_runtime_child_and_approval(
         app.loop._set_runtime_project(associated_metadata)
         assert app.loop.store._collect_persisted_appends is True
 
-        approval = app.loop.tool_registry.approval_display(
-            ToolCall(
-                "update",
-                "project_update",
-                {"name": "state.md", "content": "new state"},
-            )
-        )
-        assert approval.project_id == project_id
-        assert approval.filename == "state.md"
-
         app.loop.backend = FakeBackend(
             [
                 ScriptedTurn(
