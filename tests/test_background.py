@@ -760,13 +760,20 @@ async def test_task_output_reads_immediately_and_rejects_wait_argument(
         "properties"
     ]
     started = await registry.execute(
-        ToolCall("start", "run_background", {"command": "sleep 2; printf done"})
+        ToolCall(
+            "start",
+            "run_background",
+            {"command": _python("import sys\nsys.stdin.read()\nprint('done', end='')")},
+        )
     )
     task_id = started["structuredContent"]["task_id"]
     immediate = await registry.execute(
         ToolCall("immediate", "task_output", {"task_id": task_id})
     )
     assert immediate["structuredContent"]["running"] is True
+    await registry.execute(
+        ToolCall("release", "task_input", {"task_id": task_id, "eof": True})
+    )
     invalid = await registry.execute(
         ToolCall("invalid", "task_output", {"task_id": task_id, "wait_seconds": 1})
     )

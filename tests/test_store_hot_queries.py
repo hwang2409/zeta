@@ -35,7 +35,7 @@ def _hold_append_lock(lock_path: Path, ready: object, duration: float) -> None:
 def _append_approval_while_holding_lock(
     root: Path,
     ready: object,
-    duration: float,
+    release: object,
 ) -> None:
     writer = ConversationStore(root, session_id="shared")
     request = ToolCall("mid-append", "read", {"path": "README.md"})
@@ -53,7 +53,8 @@ def _append_approval_while_holding_lock(
             },
         )
         ready.set()  # type: ignore[attr-defined]
-        time.sleep(duration)
+        if not release.wait(timeout=30):  # type: ignore[attr-defined]
+            raise TimeoutError("approval append release was not signaled")
 
 
 def test_approval_queries_use_incremental_state_without_replay(tmp_path: Path) -> None:
@@ -119,17 +120,19 @@ def test_pending_approvals_does_not_block_on_writer_mid_append(
     reader = ConversationStore(root, session_id="shared")
     context = multiprocessing.get_context("fork")
     ready = context.Event()
+    release = context.Event()
     process = context.Process(
         target=_append_approval_while_holding_lock,
-        args=(root, ready, 0.25),
+        args=(root, ready, release),
     )
     process.start()
-    assert ready.wait(timeout=2)
-
-    reader._append_lock = _unexpected_history_scan  # type: ignore[method-assign]
-    assert reader.pending_approvals() == []
-
-    process.join(timeout=2)
+    try:
+        assert ready.wait(timeout=2)
+        reader._append_lock = _unexpected_history_scan  # type: ignore[method-assign]
+        assert reader.pending_approvals() == []
+    finally:
+        release.set()
+        process.join(timeout=2)
     assert process.exitcode == 0
     request = ToolCall("mid-append", "read", {"path": "README.md"})
     assert reader.pending_approvals() == [(request.id, request)]

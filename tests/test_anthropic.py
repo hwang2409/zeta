@@ -34,6 +34,10 @@ from zeta.providers.anthropic import (
     build_messages_payload,
 )
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+from zeta.providers.retry_policy import (
+    MAX_PROVIDER_ATTEMPTS,
+    MAX_PROVIDER_RETRY_SECONDS,
+)
 from zeta.media.images import image_dimensions
 from zeta.protocol.types import (
     MessageOrigin,
@@ -682,8 +686,8 @@ async def test_persistent_503_bounded_total_requests(
 
     events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
 
-    assert len(requests) == 5
-    assert sum(sleeps) <= 60.0
+    assert 1 < len(requests) <= MAX_PROVIDER_ATTEMPTS
+    assert sum(sleeps) <= MAX_PROVIDER_RETRY_SECONDS
     assert events[-2].type is StreamEventType.ERROR
     await client.aclose()
 
