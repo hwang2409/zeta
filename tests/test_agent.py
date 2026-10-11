@@ -6343,6 +6343,294 @@ class _TaskOwningChildBackend(CompletionBackend):
         )
 
 
+class _TaskFinishGateBackend(CompletionBackend):
+    def __init__(
+        self, command: str, action: str = "wait", *, mixed_child: bool = False
+    ) -> None:
+        self.command = command
+        self.action = action
+        self.mixed_child = mixed_child
+        self.gate_seen = asyncio.Event()
+        self.gate_text = ""
+        self.grandchild_started = asyncio.Event()
+        self.release_grandchild = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        gate = next(
+            (
+                message
+                for message in reversed(messages)
+                if message.metadata.get("zeta_event") == "agent_finish_gate"
+            ),
+            None,
+        )
+        notification = any(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in messages
+        )
+        started = any(
+            message.tool_result is not None
+            and message.tool_result.tool_call_id == "bg-task"
+            for message in messages
+        )
+        output_read = next(
+            (
+                message.tool_result.content
+                for message in reversed(messages)
+                if message.tool_result is not None
+                and message.tool_result.tool_call_id == "read-task"
+            ),
+            None,
+        )
+        killed = any(
+            message.tool_result is not None
+            and message.tool_result.tool_call_id == "kill-task"
+            for message in messages
+        )
+        if last_user == "grandchild prompt":
+            self.grandchild_started.set()
+            await self.release_grandchild.wait()
+            blocks: list = [TextContent("grandchild evidence")]
+        elif last_user == "start":
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "bg-child",
+                        "agent",
+                        {
+                            "prompt": "own a task",
+                            "description": "task owner",
+                            "background": True,
+                        },
+                    )
+                )
+            ]
+        elif last_user == "own a task" and not started:
+            blocks = [
+                ToolUseContent(
+                    ToolCall("bg-task", "run_background", {"command": self.command})
+                )
+            ]
+            if self.mixed_child:
+                blocks.append(
+                    ToolUseContent(
+                        ToolCall(
+                            "grandchild",
+                            "agent",
+                            {
+                                "prompt": "grandchild prompt",
+                                "description": "collect mixed evidence",
+                                "background": True,
+                            },
+                        )
+                    )
+                )
+        elif gate is not None and output_read is not None:
+            blocks = [TextContent(f"task result: {output_read}")]
+        elif gate is not None and notification and self.action == "wait":
+            task_id = re.search(r"task-[0-9a-f]+", self.gate_text)
+            assert task_id is not None
+            blocks = [
+                ToolUseContent(
+                    ToolCall("read-task", "task_output", {"task_id": task_id.group()})
+                )
+            ]
+        elif gate is not None and notification and killed:
+            blocks = [TextContent("child stopped task and finished")]
+        elif gate is not None:
+            self.gate_text = next(
+                block.text for block in gate.content if isinstance(block, TextContent)
+            )
+            self.gate_seen.set()
+            task_id = re.search(r"task-[0-9a-f]+", self.gate_text)
+            if self.action == "kill":
+                assert task_id is not None
+                blocks = [
+                    ToolUseContent(
+                        ToolCall("kill-task", "task_kill", {"task_id": task_id.group()})
+                    )
+                ]
+                if self.mixed_child:
+                    handle = re.search(
+                        r"([\w-]+(?::\d+)+): collect mixed evidence", self.gate_text
+                    )
+                    assert handle is not None
+                    blocks.append(
+                        ToolUseContent(
+                            ToolCall(
+                                "cancel-grandchild",
+                                "agent_cancel",
+                                {"handle": handle.group(1)},
+                            )
+                        )
+                    )
+            elif self.action == "handoff":
+                blocks = [
+                    ToolUseContent(
+                        ToolCall(
+                            "handoff-task",
+                            "agent_handoff",
+                            {
+                                "reason": "CI can finish outside this worker.",
+                                "outputs": "The task output remains in the child task archive.",
+                            },
+                        )
+                    )
+                ]
+            else:
+                blocks = [TextContent("WAIT")]
+        elif started:
+            blocks = [TextContent("premature child answer")]
+        else:
+            blocks = [TextContent("root complete")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+async def _start_task_gate(
+    tmp_path: Path,
+    backend: CompletionBackend,
+    *,
+    owner: BackgroundAgentOwner | None = None,
+) -> tuple[ConversationStore, AgentLoop, asyncio.Task[list[StreamEvent]]]:
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    run = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    return store, loop, run
+
+
+@pytest.mark.asyncio
+async def test_child_finish_gate_lists_task_and_wakes_on_exit(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    command = (
+        f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
+        "echo task-evidence"
+    )
+    backend = _TaskFinishGateBackend(command)
+    store, loop, run = await _start_task_gate(tmp_path / "session", backend)
+
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    assert "background tasks" in backend.gate_text
+    assert "task-" in backend.gate_text
+    assert "while [ ! -e" in backend.gate_text
+    assert not [
+        entry
+        for entry in store.agent_notifications(pending_only=False)
+        if entry.data.get("status") == "completed"
+    ]
+    release.touch()
+
+    await asyncio.wait_for(run, timeout=5)
+    notification = await _wait_completion(store)
+    assert "task result:" in notification.data["text"]
+    assert "task-evidence" in notification.data["text"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_finish_gate_task_kill_path(tmp_path: Path) -> None:
+    backend = _TaskFinishGateBackend(
+        _python("import time; time.sleep(30)"), action="kill"
+    )
+    store, loop, run = await _start_task_gate(tmp_path, backend)
+
+    await asyncio.wait_for(run, timeout=5)
+    notification = await _wait_completion(store)
+    assert notification.data["text"].startswith("child stopped task and finished")
+    assert notification.data.get("killed_task_ids") is None
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_finish_gate_lists_mixed_child_and_task(tmp_path: Path) -> None:
+    backend = _TaskFinishGateBackend(
+        _python("import time; time.sleep(30)"), action="kill", mixed_child=True
+    )
+    store, loop, run = await _start_task_gate(tmp_path, backend)
+
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
+    await asyncio.wait_for(run, timeout=5)
+    notification = await _wait_completion(store)
+    assert "background sub-agents" in backend.gate_text
+    assert "collect mixed evidence" in backend.gate_text
+    assert "background tasks" in backend.gate_text
+    assert "task-" in backend.gate_text
+    assert notification.data["text"].startswith("child stopped task and finished")
+    assert not store.agent_children()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_finish_gate_task_handoff_kills_task(tmp_path: Path) -> None:
+    backend = _TaskFinishGateBackend(
+        _python("import time; time.sleep(30)"), action="handoff"
+    )
+    store, loop, run = await _start_task_gate(tmp_path, backend)
+
+    await asyncio.wait_for(run, timeout=5)
+    notification = await _wait_completion(store)
+    assert "Handed off running background work" in notification.data["text"]
+    assert "CI can finish outside this worker." in notification.data["text"]
+    assert "background tasks killed on child completion" in notification.data["text"]
+    assert notification.data["killed_task_count"] == 1
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_finish_gate_task_turn_bound_returns_original_answer(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(
+        store, finish_gate_max_turns=1, finish_gate_timeout=60
+    )
+    backend = _TaskFinishGateBackend(_python("import time; time.sleep(30)"))
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await asyncio.wait_for(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=5
+    )
+    notification = await _wait_completion(store)
+    assert backend.gate_seen.is_set()
+    assert "premature child answer" in notification.data["text"]
+    assert "background tasks killed on child completion" in notification.data["text"]
+    await loop.close()
+
+
 @pytest.mark.asyncio
 async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) -> None:
     # S2: a child that still owns a running task when it completes has the task
@@ -6350,7 +6638,16 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
     # folds them into the child's completion receipt (text + data).
     backend = _TaskOwningChildBackend(_python("import time; time.sleep(30)"))
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    owner = BackgroundAgentOwner(
+        store, finish_gate_max_turns=1, finish_gate_timeout=60
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
     events = []
     loop.set_background_event_sink(events.append)
     events.extend(await _collect(loop.run_turn("start", origin=MessageOrigin.USER)))

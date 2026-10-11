@@ -132,12 +132,12 @@ class AgentLoop(
     post_stream_provider_retry = True
 
     def notify_background_persisted(self) -> None:
-        """Wake the root loop after a durable background notification."""
-        # Child-owned notifications stay in the child store and must not wake
-        # the shared root owner.
+        """Wake this loop after a durable background notification."""
         if self.agent_depth > 0:
-            return
-        self._background_owner.notify_wake()
+            if self.agent_instance_id is not None:
+                self._background_owner.conversation_channel.wake(self.agent_instance_id)
+        else:
+            self._background_owner.notify_wake()
         self._schedule_transcript_index()
 
     def __init__(
