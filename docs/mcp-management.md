@@ -34,7 +34,8 @@ OAuth options are configured under `auth`. RFC discovery is used by default;
 `authorization_server_url` and `resource_metadata_url` override its two
 well-known lookups. Both must use `https`, except loopback `http`. `scopes` is
 an explicit scope list, and `authorization_params` adds provider-neutral query
-parameters such as `{"access_type": "offline"}`:
+parameters such as `{"access_type": "offline"}`. It cannot override OAuth flow
+parameters such as `state`, `redirect_uri`, `scope`, or PKCE fields:
 
 ```json
 {

@@ -613,6 +613,7 @@ async def test_authorize_surfaces_error_from_redirect(
         ("valid", None, None),
         ("wrong-state", MCPOAuthStateError, "state did not match"),
         ("wrong-redirect", MCPOAuthError, "does not match the redirect URI"),
+        ("duplicate-code", MCPOAuthError, "exactly one code parameter"),
         ("error", MCPOAuthError, "access_denied: user declined"),
     ],
 )
@@ -648,7 +649,12 @@ async def test_headless_callback_validation(
                 f"{redirect_uri}?error=access_denied&"
                 f"error_description=user+declined&state={state}"
             )
-        return f"{redirect_uri}?code=headless-code&state={state}"
+        code = (
+            "headless-code&code=second-code"
+            if response == "duplicate-code"
+            else "headless-code"
+        )
+        return f"{redirect_uri}?code={code}&state={state}"
 
     monkeypatch.setattr(oauth_module, "print", capture_print, raising=False)
     monkeypatch.setattr("builtins.input", callback_input)
