@@ -32,6 +32,7 @@ from zeta.protocol.types import (
     TextContent,
     ToolCall,
     ToolSchema,
+    ToolUseContent,
     with_message_origin,
 )
 from zeta.runtime.loop import AgentLoop
@@ -751,27 +752,51 @@ async def test_background_stdin_unknown_finished_and_kill_races(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_task_output_waits_without_canceling_background_monitor(tmp_path: Path) -> None:
+async def test_task_output_reads_immediately_and_rejects_wait_argument(
+    tmp_path: Path,
+) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    assert "wait_seconds" not in registry.definitions_by_name["task_output"].parameters[
+        "properties"
+    ]
     started = await registry.execute(
         ToolCall("start", "run_background", {"command": "sleep 2; printf done"})
     )
     task_id = started["structuredContent"]["task_id"]
-    first = await registry.execute(
-        ToolCall("first", "task_output", {"task_id": task_id, "wait_seconds": 1})
+    began = time.monotonic()
+    immediate = await registry.execute(
+        ToolCall("immediate", "task_output", {"task_id": task_id})
     )
-    assert first["structuredContent"]["running"] is True
-    second = await registry.execute(
-        ToolCall("second", "task_output", {"task_id": task_id, "wait_seconds": 3})
-    )
-    assert second["structuredContent"]["running"] is False
-    assert second["structuredContent"]["exit_code"] == 0
-    assert second["structuredContent"]["output"] == "done"
+    assert time.monotonic() - began < 1
+    assert immediate["structuredContent"]["running"] is True
     invalid = await registry.execute(
-        ToolCall("invalid", "task_output", {"task_id": task_id, "wait_seconds": 301})
+        ToolCall("invalid", "task_output", {"task_id": task_id, "wait_seconds": 1})
     )
     assert invalid["isError"] is True
+    assert "unexpected properties: wait_seconds" in invalid["content"][0]["text"]
     await registry.close()
+
+
+def test_task_output_old_transcript_arguments_replay(tmp_path: Path) -> None:
+    store_dir = tmp_path / "sessions"
+    with ConversationStore(store_dir, session_id="old-task-output") as store:
+        store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [
+                    ToolUseContent(
+                        ToolCall(
+                            "old-call",
+                            "task_output",
+                            {"task_id": "task-old", "wait_seconds": 5},
+                        )
+                    )
+                ],
+            )
+        )
+    with ConversationStore(store_dir, session_id="old-task-output") as replayed:
+        call = replayed.messages()[0].content[0].tool_call
+        assert call.arguments["wait_seconds"] == 5
 
 
 @pytest.mark.asyncio

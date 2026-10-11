@@ -7316,7 +7316,7 @@ class ChildRunBackgroundBackend(CompletionBackend):
                         ToolCall(
                             "child-wait",
                             "task_output",
-                            {"task_id": task_id, "wait_seconds": 5},
+                            {"task_id": task_id},
                         )
                     )
                 ]
