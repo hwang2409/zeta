@@ -57,6 +57,7 @@ def test_entrypoint_shutdown_releases_every_lease(
     original_activate = AgentLoop.activate
     original_close = AgentLoop.close
     original_create = create_app
+    original_delete = manager.delete
 
     def record_store(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
@@ -89,11 +90,10 @@ def test_entrypoint_shutdown_releases_every_lease(
     async def prompt(app, session):
         if entry == "tui-new" and len(apps) == 1:
             app._slash_commands.dispatch(app, "/new")
-        elif entry == "tui-new":
-            # The replacement is running. Delete its predecessor immediately.
-            old = apps[0].loop.store
-            manager.delete(old.session_id)
-            assert not old.session_dir.exists()
+
+    def delete_after_shutdown(session_id):
+        assert all(app._closed for app in apps)
+        original_delete(session_id)
 
     async def turn(*args, **kwargs):
         startup()
@@ -101,6 +101,7 @@ def test_entrypoint_shutdown_releases_every_lease(
 
     monkeypatch.setattr(ConversationStore, "__init__", record_store)
     monkeypatch.setattr(AgentLoop, "activate", activate)
+    monkeypatch.setattr(manager, "delete", delete_after_shutdown)
     if failure == "close":
         monkeypatch.setattr(AgentLoop, "close", close)
     monkeypatch.setattr("zeta.cli.main.create_app", build_app)

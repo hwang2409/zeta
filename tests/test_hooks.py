@@ -8,7 +8,6 @@ import os
 import shlex
 import signal
 import sys
-import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -219,20 +218,39 @@ async def test_close_releases_finished_hook_tasks_before_callback_turn(
 
 @pytest.mark.asyncio
 async def test_nonblocking_hook_does_not_delay_turn(tmp_path: Path) -> None:
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
     marker = tmp_path / "marker"
     command = _python_command(
-        f"import pathlib,time; time.sleep(.1); pathlib.Path({str(marker)!r}).write_text('done')"
+        f"""
+import pathlib
+import time
+
+ready = pathlib.Path({str(ready)!r})
+release = pathlib.Path({str(release)!r})
+ready.write_text("ready")
+deadline = time.monotonic() + 30
+while not release.exists():
+    if time.monotonic() >= deadline:
+        raise TimeoutError("hook release was not signaled")
+    time.sleep(0.01)
+pathlib.Path({str(marker)!r}).write_text("done")
+""".strip()
     )
     _write_config(tmp_path, f'[[hook]]\nevent = "session_start"\ncommand = {json.dumps(command)}\n')
     manager = load_hooks(tmp_path)
     manager.bind_session("session-1")
 
-    started = time.monotonic()
     manager.session_start()
-    elapsed = time.monotonic() - started
-    await manager.close()
 
-    assert elapsed < 0.05
+    try:
+        async with asyncio.timeout(10):
+            while not ready.exists():
+                await asyncio.sleep(0.01)
+        assert not marker.exists()
+    finally:
+        release.write_text("release", encoding="utf-8")
+        await manager.close()
     assert marker.read_text(encoding="utf-8") == "done"
 
 
