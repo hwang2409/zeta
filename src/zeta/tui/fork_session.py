@@ -133,17 +133,6 @@ class ForkRuntimeMixin:
                     key=item.handle or str(request.key),
                     shortcut=shortcut,
                     trusted_display=trusted_macro_display(request.tool_call.id),
-                    project_display=(
-                        request.project_id,
-                        request.project_name,
-                        request.filename,
-                        request.content_bytes,
-                        request.preview,
-                    )
-                    if request.filename is not None
-                    and request.content_bytes is not None
-                    and request.preview is not None
-                    else None,
                     execution_display=(request.effective_cwd, request.resolved_path)
                     if request.effective_cwd is not None
                     or request.resolved_path is not None

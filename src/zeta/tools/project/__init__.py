@@ -1,11 +1,10 @@
-"""Bounded project memory inspection and deliberate updates."""
+"""Bounded project memory inspection."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from ...project_registry import ProjectRegistry, ProjectRegistryError
-from ...project_schema import MAX_MEMORY_FILE_SIZE
 from ...protocol.types import StructuredToolResult
 from ..registry import ToolRegistry, _success_result, text_block
 
@@ -65,35 +64,6 @@ async def _inspect_project(
         return _error(str(exc))
 
 
-async def _update_project(
-    registry: ToolRegistry, arguments: dict[str, Any]
-) -> StructuredToolResult:
-    try:
-        projects = registry.project_registry
-        if projects is None:
-            raise ProjectRegistryError("project registry capability is unavailable")
-        project = _project(registry, projects)
-        if projects.memory_format(project.project_id) == 2:
-            raise ProjectRegistryError(
-                "this project uses entry memory; memory is maintained automatically"
-            )
-        projects.update_memory(
-            project.project_id, {arguments["name"]: arguments["content"]}
-        )
-        memory = {
-            name: content for name, content in projects.load_memory(project.project_id)
-        }
-        return _success_result(
-            text_block(f"updated bounded memory for project {project.name}"),
-            structured_content={
-                "project": project.to_dict(),
-                "memory": memory,
-            },
-        )
-    except (ProjectRegistryError, OSError, TypeError, ValueError) as exc:
-        return _error(str(exc))
-
-
 def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "project",
@@ -107,36 +77,4 @@ def register(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         requires_approval=False,
-    )
-    registry.register_session_tool(
-        "project_update",
-        _update_project,
-        approval_subject="name" if registry.project_id is not None else None,
-        description=(
-            "With approval, replace exactly one bounded project memory file. "
-            "The approval preview includes the exact filename and bounded UTF-8 "
-            "content size/preview; no hidden target is used."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "enum": list(_MEMORY_FILES)},
-                "content": {"type": "string", "maxLength": MAX_MEMORY_FILE_SIZE},
-            },
-            "required": ["name", "content"],
-            "additionalProperties": False,
-        },
-        requires_approval=True,
-    )
-    # Rules continue to be declared against the public filename subject, but
-    # their matching value is immutable-session-project-id/filename rather
-    # than a cwd-derived path.  Child registries inherit project_id.
-    registry.set_approval_subject_resolver(
-        "project_update",
-        lambda arguments: (
-            f"{registry.project_id}/{arguments.get('name')}"
-            if registry.project_id is not None
-            and isinstance(arguments.get("name"), str)
-            else None
-        ),
     )
