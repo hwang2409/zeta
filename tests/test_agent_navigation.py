@@ -1688,14 +1688,25 @@ async def test_large_subagent_append_keeps_event_loop_responsive(
     payload = "x" * 2_000
     _append_child_lines(child, (f"line {index} {payload}" for index in range(5_000)))
 
-    # The sync path yields once after each bounded render batch.
+    # The sync path must yield within the bounded render work budget.
     gc.collect()
-    yields: list[float] = []
+    replayed = 0
+    batch_sizes: list[int] = []
+    original_replay = control._replay
+
+    def record_replay(*args: object, **kwargs: object) -> None:
+        nonlocal replayed
+        replayed += 1
+        original_replay(*args, **kwargs)
+
+    monkeypatch.setattr(control, "_replay", record_replay)
     original_sleep = agent_card.asyncio.sleep
 
-    async def record_yield(delay: float) -> None:
-        yields.append(delay)
-        await original_sleep(delay)
+    async def record_yield(_delay: float) -> None:
+        nonlocal replayed
+        batch_sizes.append(replayed)
+        replayed = 0
+        await original_sleep(0)
 
     monkeypatch.setattr(agent_card.asyncio, "sleep", record_yield)
     assert await control.sync(child)
@@ -1704,7 +1715,8 @@ async def test_large_subagent_append_keeps_event_loop_responsive(
     assert control._snapshot is not None
     assert len(control._snapshot.messages) == 5_001
     assert control.transcript._lazy_viewport
-    assert yields == [0.001] * 1_250
+    assert batch_sizes
+    assert max(batch_sizes) <= agent_card.AgentTranscriptControl._RENDER_BATCH_SIZE
 
 
 def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) -> None:

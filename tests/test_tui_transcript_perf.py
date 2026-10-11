@@ -254,17 +254,21 @@ async def test_production_agent_refresh_keeps_event_loop_responsive(
             ),
         )
 
-    offloaded: list[object] = []
-    original_to_thread = asyncio.to_thread
+    reads: list[int] = []
+    original_refresh = agent_sync_module.AgentTranscriptSource._refresh_path
 
-    async def record_to_thread(function: object, /, *args: object, **kwargs: object):
-        offloaded.append(function)
-        return await original_to_thread(function, *args, **kwargs)
+    def recording_refresh(*args: object, **kwargs: object) -> object:
+        reads.append(threading.get_ident())
+        return original_refresh(*args, **kwargs)
 
-    monkeypatch.setattr(asyncio, "to_thread", record_to_thread)
+    monkeypatch.setattr(
+        agent_sync_module.AgentTranscriptSource, "_refresh_path", recording_refresh
+    )
+    loop_thread = threading.get_ident()
     await transcript.refresh_agent_transcripts()
 
-    assert len(offloaded) == 1
+    assert reads
+    assert loop_thread not in reads
 
 
 def test_bounded_agent_source_reads_only_active_branch_tail(tmp_path: Path) -> None:
