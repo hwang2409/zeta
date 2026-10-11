@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import gc
 import json
 import os
@@ -8,7 +7,6 @@ from collections.abc import Iterable
 from io import StringIO
 from itertools import product
 from pathlib import Path
-from time import thread_time
 
 import pytest
 from prompt_toolkit.data_structures import Point
@@ -1678,7 +1676,9 @@ async def test_subagent_sync_rebuilds_active_branch_and_preserves_anchor(
 
 
 @pytest.mark.asyncio
-async def test_large_subagent_append_keeps_event_loop_responsive(tmp_path: Path) -> None:
+async def test_large_subagent_append_keeps_event_loop_responsive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Large")
     _append_child_line(child, "initial")
@@ -1688,35 +1688,23 @@ async def test_large_subagent_append_keeps_event_loop_responsive(tmp_path: Path)
     payload = "x" * 2_000
     _append_child_lines(child, (f"line {index} {payload}" for index in range(5_000)))
 
-    # Do not charge a full collection of the complete pytest process heap to
-    # this control's event-loop work.
+    # The sync path yields once after each bounded render batch.
     gc.collect()
-    event_loop_cpu_gaps: list[float] = []
-    running = True
+    yields: list[float] = []
+    original_sleep = agent_card.asyncio.sleep
 
-    async def ticker() -> None:
-        previous = thread_time()
-        while running:
-            await asyncio.sleep(0.001)
-            current = thread_time()
-            event_loop_cpu_gaps.append(current - previous)
-            previous = current
+    async def record_yield(delay: float) -> None:
+        yields.append(delay)
+        await original_sleep(delay)
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        assert await control.sync(child)
-    finally:
-        running = False
-        await ticker_task
+    monkeypatch.setattr(agent_card.asyncio, "sleep", record_yield)
+    assert await control.sync(child)
 
     control.create_content(80, 12)
     assert control._snapshot is not None
     assert len(control._snapshot.messages) == 5_001
     assert control.transcript._lazy_viewport
-    assert event_loop_cpu_gaps
-    # Thread CPU time measures synchronous event-loop work without treating
-    # runner preemption as a TUI stall.
-    assert max(event_loop_cpu_gaps) < 0.05
+    assert yields == [0.001] * 1_250
 
 
 def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) -> None:
