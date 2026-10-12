@@ -19,7 +19,7 @@ from typing import Any, Literal
 
 from zeta.memory.safety import contains_secret
 from zeta.project_errors import ProjectRegistryError
-from zeta.project_schema import MAX_MEMORY_FILE_SIZE
+from zeta.project_schema import KIND_KEY_PATTERN, MAX_MEMORY_FILE_SIZE
 from zeta.protocol.types import MessageOrigin
 
 MAX_ENTRIES = 1_000
@@ -37,7 +37,6 @@ ReceiptType = Literal[
 _TIMESTAMP = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z"
 )
-KIND_KEY_PATTERN = r"[a-z][a-z0-9_-]{0,31}"
 _KIND_KEY = re.compile(KIND_KEY_PATTERN)
 _ENTRY_ID = re.compile(r"m_[0-9a-f]{32}")
 _OPERATION_ID = re.compile(r"op_[0-9a-f]{32}")
