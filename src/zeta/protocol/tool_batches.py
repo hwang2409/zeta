@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from ..protocol.types import Message, MessageRole, ToolUseContent
+from .types import Message, MessageRole, ToolUseContent
 
 
 def without_incomplete_tool_batches(messages: Sequence[Message]) -> list[Message]:

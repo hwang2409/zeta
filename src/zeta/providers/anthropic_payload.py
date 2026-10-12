@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from ..core.tool_batches import without_incomplete_tool_batches
+from ..protocol.tool_batches import without_incomplete_tool_batches
 from ..media.image_policy import ANTHROPIC_IMAGE_POLICY
 from ..media.images import (
     SUPPORTED_IMAGE_MEDIA_TYPES,

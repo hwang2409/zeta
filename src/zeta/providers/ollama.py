@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from ..core.slash import DEFAULT_OLLAMA_TOKEN_BUDGET
-from ..core.tool_batches import without_incomplete_tool_batches
+from ..protocol.tool_batches import without_incomplete_tool_batches
 from ..protocol.types import (
     CompletionBackend,
     Message,

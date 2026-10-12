@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from ..core.tool_batches import without_incomplete_tool_batches
+from ..protocol.tool_batches import without_incomplete_tool_batches
 from ..media.images import (
     SUPPORTED_IMAGE_MEDIA_TYPES,
     decoded_image_bytes,

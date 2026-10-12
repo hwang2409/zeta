@@ -209,7 +209,7 @@ def test_attention_fork_cuts_before_an_incomplete_tool_batch(tmp_path: Path) -> 
         ToolCall(f"attention-{index}", "request_attention", {"title": str(index)})
         for index in range(2)
     ]
-    anchor = opened.store.append_message(
+    opened.store.append_message(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call) for call in calls])
     )
     first_result = opened.store.append_message(_tool_result(calls[0], "created"))
