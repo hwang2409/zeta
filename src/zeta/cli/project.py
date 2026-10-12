@@ -123,7 +123,14 @@ def run(
             value = _run_index(args, registry)
         elif args.project_verb == "memory":
             if args.project == "accept":
-                if args.remote is None or args.action is not None:
+                if getattr(args, "reason", None) is not None:
+                    raise ProjectRegistryError("--reason is only valid for memory resolve")
+                if (
+                    args.remote is None
+                    or args.action is not None
+                    or getattr(args, "detail", None) is not None
+                    or getattr(args, "entry_ids", [])
+                ):
                     raise ProjectRegistryError("memory accept requires exactly one file")
                 project = registry.find_for_directory(Path.cwd())
                 if project is None:
@@ -144,7 +151,13 @@ def run(
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.remote == "accept":
-                if args.action is None:
+                if getattr(args, "reason", None) is not None:
+                    raise ProjectRegistryError("--reason is only valid for memory resolve")
+                if (
+                    args.action is None
+                    or getattr(args, "detail", None) is not None
+                    or getattr(args, "entry_ids", [])
+                ):
                     raise ProjectRegistryError("memory accept requires exactly one file")
                 project_id = (
                     args.project
@@ -173,7 +186,13 @@ def run(
                 else registry.show_project(name=args.project).project_id
             )
             if args.remote in {"migrate", "rollback", "finalize"}:
-                if args.action is not None or getattr(args, "detail", None) is not None:
+                if getattr(args, "reason", None) is not None:
+                    raise ProjectRegistryError("--reason is only valid for memory resolve")
+                if (
+                    args.action is not None
+                    or getattr(args, "detail", None) is not None
+                    or getattr(args, "entry_ids", [])
+                ):
                     raise ProjectRegistryError(f"memory {args.remote} takes no arguments")
                 print(
                     "warning: memory history is bounded to 128 versions; transcripts "
@@ -230,6 +249,12 @@ def run(
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.remote == "schema":
+                if getattr(args, "reason", None) is not None:
+                    raise ProjectRegistryError("--reason is only valid for memory resolve")
+                if getattr(args, "entry_ids", []):
+                    raise ProjectRegistryError(
+                        "memory schema takes no additional entry IDs"
+                    )
                 if args.action != "set-profile" or not getattr(args, "detail", None):
                     raise ProjectRegistryError(
                         "memory schema requires: set-profile PROFILE"
@@ -430,6 +455,14 @@ def _run_memory_sync(
 
     if args.remote is None:
         print("zeta: project memory push|pull|resolve requires HOST", file=err)
+        return 2
+    if (
+        args.action is not None
+        or getattr(args, "detail", None) is not None
+        or getattr(args, "entry_ids", [])
+        or getattr(args, "reason", None) is not None
+    ):
+        print("zeta: memory sync takes no entry IDs or --reason", file=err)
         return 2
     if args.set or args.from_file:
         print("zeta: memory sync does not accept --set or --from-file", file=err)

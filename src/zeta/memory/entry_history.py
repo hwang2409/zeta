@@ -24,6 +24,7 @@ from zeta.memory.entry_store import (
     accept_entry,
     apply_operations,
     canonical_state_bytes,
+    classify_legacy_expiries,
     compact_inactive_entries,
     empty_state,
     new_operation_id,
@@ -530,8 +531,9 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
+                source_state = classify_legacy_expiries(current.state)
                 target_keys = {kind.key for kind in selected.kinds}
-                source_keys = {kind.key for kind in current.state.schema.kinds}
+                source_keys = {kind.key for kind in source_state.schema.kinds}
                 if set(mappings) - source_keys or set(resolve_kinds) - source_keys:
                     raise ProjectRegistryError("profile change names an unknown source kind")
                 if any(target not in target_keys for target in mappings.values()):
@@ -541,7 +543,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                     raise ProjectRegistryError("profile mapping applies only to removed kinds")
                 populated = {
                     entry.kind
-                    for entry in current.state.entries.values()
+                    for entry in source_state.entries.values()
                     if isinstance(entry, MemoryEntry) and entry.kind in removed
                 }
                 missing = sorted(populated - set(mappings) - set(resolve_kinds))
@@ -553,7 +555,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                 operation_id = new_operation_id()
                 entries = {}
                 touched: list[str] = []
-                for entry_id, entry in current.state.entries.items():
+                for entry_id, entry in source_state.entries.items():
                     if not isinstance(entry, MemoryEntry) or entry.kind not in removed:
                         entries[entry_id] = entry
                     elif entry.kind in mappings:
@@ -566,11 +568,11 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                     elif entry.kind in resolve_kinds:
                         touched.append(entry_id)
                 schema = dataclasses.replace(
-                    selected, version=current.state.schema.version + 1
+                    selected, version=source_state.schema.version + 1
                 )
                 state = dataclasses.replace(
-                    current.state,
-                    generation=current.state.generation + 1,
+                    source_state,
+                    generation=source_state.generation + 1,
                     schema=schema,
                     entries=entries,
                 )
