@@ -3630,6 +3630,77 @@ def _refresh_process(
     asyncio.run(run())
 
 
+def _refresh_lock_probe_process(
+    path: str,
+    results: object,
+    start: object,
+    release: object,
+    hold: bool,
+) -> None:
+    async def run() -> None:
+        store = CodexCredentialStore(path)
+        if hold:
+            async with store._async_refresh_lock_file():
+                results.put("holding")
+                await asyncio.to_thread(release.wait)
+            return
+        await asyncio.to_thread(start.wait)
+        lock = store._async_refresh_lock_file()
+        try:
+            await asyncio.wait_for(lock.__aenter__(), timeout=2)
+        except TimeoutError:
+            results.put("blocked")
+        else:
+            results.put("unexpectedly acquired")
+            await lock.__aexit__(None, None, None)
+        await asyncio.to_thread(release.wait)
+        async with store._async_refresh_lock_file():
+            results.put("acquired")
+
+    asyncio.run(run())
+
+
+def test_codex_refresh_lock_excludes_second_process(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    start = context.Event()
+    release = context.Event()
+    path = tmp_path / "codex.json"
+    processes = [
+        context.Process(
+            target=_refresh_lock_probe_process,
+            args=(str(path), results, start, release, True),
+        ),
+        context.Process(
+            target=_refresh_lock_probe_process,
+            args=(str(path), results, start, release, False),
+        ),
+    ]
+    deadline = time.monotonic() + 60
+    try:
+        for process in processes:
+            process.start()
+        assert results.get(timeout=max(0, deadline - time.monotonic())) == "holding"
+        start.set()
+        assert results.get(timeout=max(0, deadline - time.monotonic())) == "blocked"
+        release.set()
+        assert results.get(timeout=max(0, deadline - time.monotonic())) == "acquired"
+        for process in processes:
+            process.join(timeout=max(0, deadline - time.monotonic()))
+            assert process.exitcode == 0
+    finally:
+        start.set()
+        release.set()
+        for process in processes:
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+        for process in processes:
+            if process.pid is not None and process.is_alive():
+                process.kill()
+            if process.pid is not None:
+                process.join()
+
+
 def test_expired_codex_token_refreshes_once_across_two_processes(tmp_path: Path) -> None:
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self) -> None:
@@ -3695,8 +3766,10 @@ def test_expired_codex_token_refreshes_once_across_two_processes(tmp_path: Path)
                 if process.pid is not None and process.is_alive():
                     process.terminate()
             for process in processes:
+                if process.pid is not None and process.is_alive():
+                    process.kill()
                 if process.pid is not None:
-                    process.join(timeout=5)
+                    process.join()
     finally:
         server.shutdown()
         server.server_close()
