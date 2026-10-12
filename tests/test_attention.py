@@ -128,13 +128,17 @@ def _tool_result(call: ToolCall, content: str) -> Message:
     )
 
 
-def _anthropic_tool_ids(messages: list[Message]) -> tuple[set[str], set[str]]:
-    payload = build_messages_payload(
+def _anthropic_payload(messages: list[Message]) -> dict:
+    return build_messages_payload(
         messages,
         [],
         model="claude-sonnet-4-5",
         max_tokens=10_000,
     )
+
+
+def _anthropic_tool_ids(messages: list[Message]) -> tuple[set[str], set[str]]:
+    payload = _anthropic_payload(messages)
     uses = {
         block["id"]
         for message in payload["messages"]
@@ -175,6 +179,8 @@ def test_parallel_attention_fork_copies_the_complete_tool_batch(tmp_path: Path) 
             entry_seq=entry.seq,
             title=f"Choice {index}",
             why=f"Created by parallel request {index}.",
+            options=("keep it", "change it"),
+            recommendation="keep it",
         )
         for index, entry in enumerate([anchor, *results[:-1]])
     ][1]
@@ -191,10 +197,15 @@ def test_parallel_attention_fork_copies_the_complete_tool_batch(tmp_path: Path) 
             Message.from_dict(branch[5].data["message"]).metadata["kind"]
             == "attention_fork"
         )
-        assert _anthropic_tool_ids(fork.store.messages()) == (
+        messages = fork.store.messages()
+        assert _anthropic_tool_ids(messages) == (
             {call.id for call in calls},
             {call.id for call in calls},
         )
+        payload_text = json.dumps(_anthropic_payload(messages))
+        assert "Created by parallel request 1." in payload_text
+        assert "keep it" in payload_text
+        assert "change it" in payload_text
     finally:
         fork.store.close()
         opened.store.close()
@@ -220,13 +231,20 @@ def test_attention_fork_cuts_before_an_incomplete_tool_batch(tmp_path: Path) -> 
         entry_seq=first_result.seq,
         title="First choice",
         why="The sibling result is not durable yet.",
+        options=("wait", "continue"),
+        recommendation="wait",
     )
 
     fork_id = create_discussion_fork(tmp_path, opened.store.session_id, attention.id)
     fork = SessionManager(tmp_path).open(fork_id, _read_only=True)
     try:
         assert [entry.id for entry in fork.store.replay()[:1]] == [before.id]
-        assert _anthropic_tool_ids(fork.store.messages()) == (set(), set())
+        messages = fork.store.messages()
+        assert _anthropic_tool_ids(messages) == (set(), set())
+        payload_text = json.dumps(_anthropic_payload(messages))
+        assert "The sibling result is not durable yet." in payload_text
+        assert "wait" in payload_text
+        assert "continue" in payload_text
     finally:
         fork.store.close()
         opened.store.close()
