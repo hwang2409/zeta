@@ -1864,7 +1864,6 @@ async def test_five_rapid_user_turns_coalesce_into_one_request(tmp_path: Path) -
         )
         _write_session(runner.session_dir, *rows)
         runner.activity(turn * 2 + 2)
-        await asyncio.sleep(0.01)
     await runner.drain()
     await runner.close()
 

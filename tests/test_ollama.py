@@ -1347,13 +1347,13 @@ async def test_ollama_error_body_stall_retries_and_closes_stream(
             async for event in OllamaBackend(
                 client=client,
                 base_url=tcp_http_server.url,
-                stall_seconds=_STALL_SECONDS,
+                stall_seconds=0.5,
                 stall_retries=1,
             ).complete([], []):
                 events.append(event)
 
         with pytest.raises(OllamaError, match="Ollama HTTP 400: final error"):
-            await asyncio.wait_for(collect(), timeout=_CLIENT_DEADLINE_SECONDS)
+            await asyncio.wait_for(collect(), timeout=3)
         assert tcp_http_server.calls == 2
         assert any(
             event.type is StreamEventType.RETRY and event.data.get("is_stall") is True

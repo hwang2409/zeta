@@ -3997,7 +3997,7 @@ async def test_submitted_revision_does_not_clear_a_rapid_new_draft(
     session.default_buffer.reset()
     session.default_buffer.insert_text("new rapid draft")
 
-    await asyncio.sleep(0.25)
+    await app._draft.flush_pending()
 
     assert app._draft.load() == "new rapid draft"
     if app._active_task is not None:
@@ -7095,7 +7095,7 @@ skill_catalog=SkillCatalog.empty(),
 @pytest.mark.asyncio
 @pytest.mark.parametrize("full_screen", [False, True])
 async def test_run_replays_resumed_transcript_before_prompt(
-    tmp_path: Path, full_screen: bool
+    tmp_path: Path, full_screen: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("remembered user")]), MessageOrigin.USER))
@@ -7120,6 +7120,16 @@ async def test_run_replays_resumed_transcript_before_prompt(
         model="offline",
         console=Console(file=output, force_terminal=True, color_system="truecolor"),
     )
+    replay_done = asyncio.Event()
+    rebuild_transcript = app._rebuild_transcript_async
+
+    async def tracked_rebuild(*, batch_size: int = 1) -> bool:
+        try:
+            return await rebuild_transcript(batch_size=batch_size)
+        finally:
+            replay_done.set()
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", tracked_rebuild)
 
     with create_pipe_input() as pipe:
         if full_screen:
@@ -7135,7 +7145,7 @@ async def test_run_replays_resumed_transcript_before_prompt(
         else:
             session = app_session(app, pipe)
         run_task = asyncio.create_task(app.run(session))
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(replay_done.wait(), timeout=10)
         pipe.send_text("\x04")
         await run_task
 
@@ -10979,7 +10989,7 @@ async def test_undo_keeps_a_draft_typed_during_streaming(tmp_path: Path) -> None
 
     app.undo_sent_turn()
     await asyncio.gather(task, return_exceptions=True)
-    await asyncio.sleep(0.25)
+    await app._draft.flush_pending()
 
     assert session.app.current_buffer.text == "new draft"
     assert app._draft.load() == "new draft"
