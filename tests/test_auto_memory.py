@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
+from zeta.memory.entry_reconciler import EntryReconciliationResult
 from zeta.memory.profiles import memory_profile
 from zeta.memory.reconciler import ReconciliationResponse
 from zeta.memory.user_authorization import MemoryMutationAuthorization
@@ -125,6 +126,56 @@ def _runner(
         **({"retry_clock": retry_clock} if retry_clock is not None else {}),
     )
     return runner, registry, project.project_id, notices
+
+
+@pytest.mark.asyncio
+async def test_rejected_only_entry_update_writes_bounded_diagnostic(tmp_path: Path, monkeypatch) -> None:
+    async def rejected_only(**_kwargs):
+        return EntryReconciliationResult(
+            (),
+            ("group[0]: add duplicates an existing active entry", "group[1]: add duplicates an existing active entry"),
+            {},
+            1,
+            1,
+            "k" * 64,
+        )
+
+    import zeta.memory.auto as auto_module
+
+    monkeypatch.setattr(auto_module, "reconcile_entry_range", rejected_only)
+    runner, _registry, _project_id, notices = _runner(
+        tmp_path, entry_format=True, transcript_count=1, minimum_interval=0
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+    records = [json.loads(line) for line in runner.failure_log_path.read_text().splitlines()]
+    assert records == [{
+        "kind": "rejected_only",
+        "occurred_at": records[0]["occurred_at"],
+        "rejected_groups": 2,
+        "reasons": {"add duplicates an existing active entry": 2},
+        "seq_start": 1,
+        "seq_end": 1,
+    }]
+    assert notices == []
+    assert "proposal" not in runner.failure_log_path.read_text()
+    assert runner.failure_log_path.stat().st_size < 64 * 1024
+
+
+@pytest.mark.asyncio
+async def test_successful_entry_update_writes_no_diagnostic(tmp_path: Path, monkeypatch) -> None:
+    async def successful(**_kwargs):
+        return EntryReconciliationResult((), (), {}, 1, 1, "k" * 64)
+
+    import zeta.memory.auto as auto_module
+
+    monkeypatch.setattr(auto_module, "reconcile_entry_range", successful)
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path, entry_format=True, transcript_count=1, minimum_interval=0
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+    assert not runner.failure_log_path.exists()
 
 
 def test_zeta_completed_user_turn_does_not_schedule_early_update(
