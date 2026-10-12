@@ -455,11 +455,7 @@ async def test_closed_tui_drops_pending_paste_callbacks_without_gc(
     app._paste_from_keybinding(SimpleNamespace(current_buffer=session.default_buffer))
     while not entered.is_set():
         await asyncio.sleep(0)
-    pending = tuple(
-        app._paste_runtime.tasks
-        if hasattr(app, "_paste_runtime")
-        else app._paste_tasks
-    )
+    pending = tuple(app._paste_runtime.tasks)
     closing = asyncio.create_task(app.close())
     await asyncio.sleep(0)
     waited = not closing.done()
