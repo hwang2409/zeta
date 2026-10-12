@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from collections import Counter
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -410,6 +411,84 @@ def test_incremental_request_matches_oracle_for_relevance(tmp_path: Path) -> Non
         _transcript(_row(1, "PR #425 merged; Atlas now uses /srv/atlas-new.")),
         state,
     )
+
+
+def test_incremental_request_matches_oracle_at_byte_boundaries(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id)
+    escaped = _row(1, 'café 雪 contains "quotes", \\slashes, and\nnewlines')
+    empty_list = _row(2, "discarded")
+    empty_list["data"]["message"]["content"] = []
+    _assert_matches_prepare_oracle(_transcript(escaped, empty_list), state)
+
+    kind = state.schema.kinds[0]
+    base_prompt, _, _ = _prepare_request_oracle(
+        _transcript(), state, as_of=date(2026, 10, 9)
+    )
+    exact_padding = 16 * 1024 - len(base_prompt.encode())
+    for added_bytes in (exact_padding, exact_padding + 1):
+        boundary_state = replace(
+            state,
+            schema=replace(
+                state.schema,
+                kinds=(
+                    replace(kind, description=kind.description + "x" * added_bytes),
+                    *state.schema.kinds[1:],
+                ),
+            ),
+        )
+        _assert_matches_prepare_oracle(_transcript(), boundary_state)
+        request = _prepare_request(
+            _transcript(), boundary_state, as_of=date(2026, 10, 9)
+        )
+        expected_size = 16 * 1024 if added_bytes == exact_padding else 16_226
+        assert len(request.prompt.encode()) == expected_size
+
+    empty_state_request = _prepare_request(
+        _transcript(), registry._entry_memory_state(project_id).state,
+        as_of=date(2026, 10, 9),
+    )
+    empty_row_size = len(entry_reconciler._render_transcript_row(SESSION, _row(3, "")).encode())
+    text_bytes = 28 * 1024 - len(empty_state_request.prompt.encode()) - empty_row_size
+    boundary_row = _row(3, "x" * text_bytes)
+    _assert_matches_prepare_oracle(
+        _transcript(boundary_row), registry._entry_memory_state(project_id).state
+    )
+    request = _prepare_request(
+        _transcript(boundary_row), registry._entry_memory_state(project_id).state,
+        as_of=date(2026, 10, 9),
+    )
+    assert len(request.prompt.encode()) == 28 * 1024
+    oversized = _transcript(_row(3, "x" * (text_bytes + 1)))
+    with pytest.raises(ReconciliationError, match="user row exceeds the request limit"):
+        _prepare_request_oracle(
+            oversized, registry._entry_memory_state(project_id).state,
+            as_of=date(2026, 10, 9),
+        )
+    with pytest.raises(ReconciliationError, match="user row exceeds the request limit"):
+        _prepare_request(
+            oversized, registry._entry_memory_state(project_id).state,
+            as_of=date(2026, 10, 9),
+        )
+
+
+def test_excluded_row_does_not_change_entry_relevance(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, target_ids = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "PR #999 must stay visible."),
+        ("state", "Service Atlas uses /srv/atlas-old."),
+    )
+    transcript = _transcript(
+        _row(1, "ordinary " + "x" * 8000),
+        _row(2, "PR #999 " + "y" * 5000),
+    )
+
+    _assert_matches_prepare_oracle(transcript, state)
+    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    assert len(request.transcript.rows) == 1
+    assert target_ids[0] not in request.visible_entry_ids
 
 
 @pytest.mark.parametrize("turn_context", (False, True))

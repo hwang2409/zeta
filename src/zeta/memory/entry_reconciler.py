@@ -392,9 +392,8 @@ Completed transcript rows:
 def _entry_prompt_parts(
     active: Sequence[MemoryEntry],
     components: Mapping[str, tuple[str, dict[str, object], str]],
-    state: MemoryState, *, as_of: date, session_id: str,
-) -> tuple[list[dict[str, object]], list[str], list[str], Counter[str]]:
-    base_size = len(_prompt(Transcript(session_id, ()), state, as_of=as_of).encode())
+    *, base_size: int,
+) -> tuple[list[dict[str, object]], list[str], list[str], Counter[str], int]:
     indexes = [components[entry.id][0] for entry in active]
     index_sizes = [len(item.encode()) for item in indexes]
     projections = [components[entry.id][1] for entry in active]
@@ -410,6 +409,7 @@ def _entry_prompt_parts(
         if not candidate_omitted[entry.kind]:
             del candidate_omitted[entry.kind]
         size = base_size + index_size
+        size += len(str(count)) - 1
         size += len(json.dumps(dict(candidate_omitted), separators=(",", ":")).encode()) - 2
         if size > entry_limit:
             break
@@ -418,15 +418,21 @@ def _entry_prompt_parts(
     omitted_size = len(json.dumps(dict(omitted), separators=(",", ":")).encode()) - 2
     full = full_size = 0
     index_size = sum(index_sizes[:visible]) + max(0, visible - 1)
+    selected_size = base_size + omitted_size + index_size + len(str(visible)) - 1
     for count in range(1, visible + 1):
         full_size += len(rendered[count - 1].encode()) + (count > 1)
         remaining = visible - count
         index_size -= index_sizes[count - 1] + (remaining > 0)
         size = base_size + omitted_size + full_size + index_size
+        size += len(str(count)) + len(str(remaining)) - 2
         if size > entry_limit:
             break
         full = count
-    return projections[:full], rendered[:full], indexes[full:visible], omitted
+        selected_size = size
+    return (
+        projections[:full], rendered[:full], indexes[full:visible], omitted,
+        selected_size,
+    )
 
 
 def _render_transcript_row(session_id: str, row: dict[str, Any]) -> str:
@@ -444,19 +450,21 @@ def _prepare_request(
         projection = _entry_projection(entry)
         rendered = json.dumps(projection, ensure_ascii=False, separators=(",", ":"))
         components[entry.id] = (_entry_index(entry), projection, rendered)
-    preliminary = _entry_prompt_parts(
-        priority, components, state, as_of=as_of, session_id=transcript.session_id
-    )
-    preliminary_prompt = _prompt(
-        empty, state, as_of=as_of, entries=preliminary[0],
-        entry_index=preliminary[2], omitted_entries=preliminary[3],
-        rendered_entries=preliminary[1], rendered_rows=(),
-    )
-    preliminary_size = len(preliminary_prompt.encode())
+    empty_prompt = _prompt(empty, state, as_of=as_of)
+    empty_size = len(empty_prompt.encode())
+
+    def entry_parts(rows: Sequence[dict[str, Any]]):
+        ranked_for = Transcript(transcript.session_id, tuple(rows))
+        active = _active_entries_for_request(state, ranked_for)
+        parts = _entry_prompt_parts(active, components, base_size=empty_size)
+        return active, parts
+
+    _, preliminary = entry_parts(())
+    preliminary_size = preliminary[4]
     safe_rows: list[dict[str, Any]] = []
     rendered_rows: list[str] = []
-    raw_position = 0
     rows_size = 0
+    raw_position = 0
     for raw_position, raw in enumerate(transcript.rows, 1):
         safe = _sanitized(project_transcript_row(raw))
         if not isinstance(safe, dict):
@@ -467,18 +475,9 @@ def _prepare_request(
         rows_size += len(rendered.encode()) + (len(safe_rows) > 1)
         if preliminary_size + rows_size > _MAX_PRIMARY_REQUEST_BYTES:
             break
-    ranked_for = Transcript(transcript.session_id, tuple(safe_rows))
-    active = _active_entries_for_request(state, ranked_for)
-    entries, rendered_entries, indexes, omitted = _entry_prompt_parts(
-        active, components, state, as_of=as_of, session_id=transcript.session_id
-    )
-    base_prompt = _prompt(
-        empty, state, as_of=as_of, entries=entries, entry_index=indexes,
-        omitted_entries=omitted, rendered_entries=rendered_entries, rendered_rows=(),
-    )
-    base_size = len(base_prompt.encode())
-    rows_size = sum(len(item.encode()) for item in rendered_rows)
-    rows_size += max(0, len(rendered_rows) - 1)
+
+    active, parts = entry_parts(safe_rows)
+    base_size = parts[4]
     if base_size + rows_size <= _MAX_PRIMARY_REQUEST_BYTES:
         for raw in transcript.rows[raw_position:]:
             safe = _sanitized(project_transcript_row(raw))
@@ -490,12 +489,25 @@ def _prepare_request(
             rows_size += len(rendered.encode()) + (len(safe_rows) > 1)
             if base_size + rows_size > _MAX_PRIMARY_REQUEST_BYTES:
                 break
-    selected_count = rows_size = 0
-    for count, rendered in enumerate(rendered_rows, 1):
-        rows_size += len(rendered.encode()) + (count > 1)
-        if base_size + rows_size > _MAX_PRIMARY_REQUEST_BYTES:
-            break
-        selected_count = count
+
+    def fitting_rows(size: int, rows: Sequence[str]) -> int:
+        selected = total = 0
+        for count, rendered in enumerate(rows, 1):
+            total += len(rendered.encode()) + (count > 1)
+            if size + total > _MAX_PRIMARY_REQUEST_BYTES:
+                break
+            selected = count
+        return selected
+
+    selected_count = fitting_rows(base_size, rendered_rows)
+    if selected_count and selected_count != len(safe_rows):
+        active, parts = entry_parts(safe_rows[:selected_count])
+        base_size = parts[4]
+        recomputed = fitting_rows(base_size, rendered_rows[:selected_count])
+        if recomputed != selected_count:
+            selected_count = recomputed
+            active, parts = entry_parts(safe_rows[:selected_count])
+    entries, rendered_entries, indexes, omitted, _ = parts
     if safe_rows and not selected_count:
         safe = safe_rows[0]
         if _is_user_authored_row(safe):
@@ -515,17 +527,20 @@ def _prepare_request(
         )
         for text_bytes, list_items in bounds:
             bounded = _bounded_value(safe, text_bytes=text_bytes, list_items=list_items)
+            bounded_transcript = Transcript(transcript.session_id, (bounded,))
+            active = _active_entries_for_request(state, bounded_transcript)
+            parts = _entry_prompt_parts(active, components, base_size=empty_size)
+            entries, rendered_entries, indexes, omitted, base_size = parts
             rendered = _render_transcript_row(transcript.session_id, bounded)
             if base_size + len(rendered.encode()) <= _MAX_PRIMARY_REQUEST_BYTES:
                 prompt = _prompt(
-                    Transcript(transcript.session_id, (bounded,)), state, as_of=as_of,
-                    entries=entries, entry_index=indexes, omitted_entries=omitted,
+                    bounded_transcript, state, as_of=as_of, entries=entries,
+                    entry_index=indexes, omitted_entries=omitted,
                     rendered_entries=rendered_entries, rendered_rows=(rendered,),
                 )
                 visible_count = len(entries) + len(indexes)
                 return _EntryPreparedRequest(
-                    prompt,
-                    Transcript(transcript.session_id, (bounded,)),
+                    prompt, bounded_transcript,
                     frozenset(entry.id for entry in active[:visible_count]),
                 )
         raise ReconciliationError("one transcript row cannot fit request limit")
