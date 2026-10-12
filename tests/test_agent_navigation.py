@@ -5,6 +5,7 @@ import gc
 import json
 import logging
 import os
+import shutil
 import threading
 from collections.abc import Iterable
 from io import StringIO
@@ -545,6 +546,20 @@ def test_todo_child_without_state_yet_shows_no_todos(
     child.joinpath("session_state.json").unlink()
     navigation.refresh(force=True)
     assert navigation.todo_snapshot().unavailable
+    navigation.close()
+    root.close()
+
+
+def test_todo_missing_child_directory_is_unavailable(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="gone")
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    shutil.rmtree(child)
+    navigation.open_selected()
+    navigation.refresh(force=True)
+    snapshot = navigation.todo_snapshot()
+    assert snapshot is not None and snapshot.unavailable
     navigation.close()
     root.close()
 

@@ -37,6 +37,10 @@ _REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
 _LOGGER = logging.getLogger(__name__)
 
 
+class TodoStateNotWritten(Exception):
+    """The child directory exists, but its session_state.json does not yet."""
+
+
 class AgentTodoSource:
     """Own one read-only child store and publish cached todo snapshots."""
 
@@ -69,7 +73,12 @@ class AgentTodoSource:
                 return previous
 
     def _refresh_locked(self) -> TodoSnapshot:
-        before = self._state_signature(self.path)
+        try:
+            before = self._state_signature(self.path)
+        except FileNotFoundError:
+            if self.path.is_dir():
+                raise TodoStateNotWritten() from None
+            raise
         if self._store is None:
             store = ConversationStore(
                 self.path.parent,
@@ -145,7 +154,7 @@ class AgentTodoControl:
             self._source = AgentTodoSource(path, cwd=self._cwd)
         try:
             snapshot = await asyncio.to_thread(self._source.refresh)
-        except FileNotFoundError:
+        except TodoStateNotWritten:
             # A child without state yet has no todos. State that disappears
             # after it was seen is a real failure.
             if self._state_seen:
