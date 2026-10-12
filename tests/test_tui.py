@@ -7585,7 +7585,7 @@ def test_footer_builder_formats_context_usage_and_hints() -> None:
     )
 
     assert footer.plain == (
-        "idle  18.6K (9%)  /status · ctrl+c interrupt · ctrl+d quit · abcdef12"
+        "idle  18.6K (9%)  /status · abcdef12"
     )
     assert "ctrl+u undo" not in footer.plain
 
@@ -7607,7 +7607,6 @@ def test_footer_shows_transcript_navigation_and_search_state() -> None:
         "offline",
         "idle",
         token_count=18,
-        transcript_navigation=True,
         transcript_search="target",
         transcript_match=(2, 5),
         transcript_position="line 14/80",
@@ -7615,7 +7614,7 @@ def test_footer_shows_transcript_navigation_and_search_state() -> None:
 
     assert 'find "target" 2/5' in footer.plain
     assert "line 14/80" in footer.plain
-    assert "ctrl+f find" in footer.plain
+    assert "ctrl+f find" not in footer.plain
     assert "enter/n next" in footer.plain
     assert "N prev" in footer.plain
     assert "esc close" in footer.plain
@@ -7626,7 +7625,6 @@ def test_footer_shows_transcript_navigation_and_search_state() -> None:
         "idle",
         token_count=18,
         width=50,
-        transcript_navigation=True,
         transcript_search="target",
         transcript_match=(2, 5),
         transcript_position="line 14/80",
@@ -7644,7 +7642,6 @@ def test_narrow_footer_search_survives_a_tail_anchored_transcript() -> None:
         "idle",
         token_count=18,
         width=50,
-        transcript_navigation=True,
         transcript_search="target",
         transcript_match=(2, 5),
         transcript_position=None,
@@ -7692,10 +7689,10 @@ def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
     )
 
     assert len(status.plain) <= 120
-    assert "ctrl+c interrupt" in status.plain
     assert "42 (0%)" in status.plain
     assert "/status" in status.plain
-    assert "ctrl+d quit" in status.plain
+    assert "ctrl+c interrupt" not in status.plain
+    assert "ctrl+d quit" not in status.plain
 
 
 def test_status_bar_drops_whole_segments_at_narrow_widths() -> None:
@@ -7730,9 +7727,9 @@ def test_status_bar_fits_segments_and_pulses() -> None:
     ]
 
     assert all(len(status.plain) <= width for status, width in zip(statuses, (80, 120, 200)))
-    assert all("ctrl+c interrupt" in status.plain and "5 (0%)" in status.plain for status in statuses)
+    assert all("5 (0%)" in status.plain for status in statuses)
     assert all(marker in statuses[index].plain for index, marker in enumerate(("·", "•", "●")))
-    assert all(value in statuses[1].plain for value in ("/status", "ctrl+d quit"))
+    assert "/status" in statuses[1].plain
     assert all(value in statuses[2].plain for value in ("abc12345", "/status"))
 
     narrow = format_status(
@@ -7746,7 +7743,6 @@ def test_status_bar_fits_segments_and_pulses() -> None:
         width=80,
     )
     assert len(narrow.plain) <= 80
-    assert "ctrl+c interrupt" in narrow.plain
     assert "5 (0%)" in narrow.plain
 
     cleared = format_status(
@@ -8251,7 +8247,7 @@ async def test_full_screen_steady_state_paint_does_not_clear_screen(
 @pytest.mark.parametrize(
     ("terminal_width", "right_segments"),
     [
-        (120, ("/status", "ctrl+c interrupt", "ctrl+d quit", "abcdef12")),
+        (120, ("/status", "abcdef12")),
         (80, ()),
         (40, ()),
     ],
@@ -8286,10 +8282,7 @@ skill_catalog=SkillCatalog.empty(),
     assert cell_len(footer) <= content_width
     assert all(segment in footer for segment in right_segments)
     if terminal_width == 40:
-        assert all(
-            segment not in footer
-            for segment in ("/status", "ctrl+c interrupt")
-        )
+        assert "/status" not in footer
 
 
 def test_rich_rendering_does_not_paint_terminal_background() -> None:

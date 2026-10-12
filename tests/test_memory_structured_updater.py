@@ -3,17 +3,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections import Counter
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
 import pytest
 
+from zeta.memory import entry_request
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import (
     EntryReconciliationFailure,
-    _prepare_request,
     reconcile_entry_range,
 )
+from zeta.memory.entry_request import _prepare_request
 from zeta.memory.entry_store import (
     AddOperation,
     MemoryEntry,
@@ -229,6 +232,100 @@ def _crowded_priority_state(
     return state, target_ids
 
 
+def _prepare_request_oracle(transcript: Transcript, state, *, as_of: date):
+    def prompt_with_entries(candidate: Transcript):
+        active = entry_request._active_entries_for_request(state, candidate)
+        indexes = [entry_request._entry_index(entry) for entry in active]
+        entry_limit = 28 * 1024 - 12 * 1024
+        visible = []
+        for entry in active:
+            proposed = [*visible, entry]
+            omitted = Counter(item.kind for item in active[len(proposed) :])
+            prompt = entry_request._prompt(
+                _transcript(),
+                state,
+                as_of=as_of,
+                entry_index=indexes[: len(proposed)],
+                omitted_entries=omitted,
+            )
+            if len(prompt.encode()) > entry_limit:
+                break
+            visible = proposed
+        omitted = Counter(item.kind for item in active[len(visible) :])
+        full = []
+        indexed = indexes[: len(visible)]
+        for position, entry in enumerate(visible):
+            proposed = [*full, entry_request._entry_projection(entry)]
+            proposed_index = indexes[position + 1 : len(visible)]
+            prompt = entry_request._prompt(
+                _transcript(),
+                state,
+                as_of=as_of,
+                entries=proposed,
+                entry_index=proposed_index,
+                omitted_entries=omitted,
+            )
+            if len(prompt.encode()) > entry_limit:
+                break
+            full = proposed
+            indexed = proposed_index
+        prompt = entry_request._prompt(
+            candidate,
+            state,
+            as_of=as_of,
+            entries=full,
+            entry_index=indexed,
+            omitted_entries=omitted,
+        )
+        if len(prompt.encode()) > 28 * 1024:
+            raise ReconciliationError("format-2 transcript exceeds the request limit")
+        return prompt, frozenset(entry.id for entry in visible)
+
+    safe_rows = []
+    prompt_with_entries(_transcript())
+    for raw in transcript.rows:
+        safe = entry_request._sanitized(
+            entry_request.project_transcript_row(raw)
+        )
+        if not isinstance(safe, dict):
+            continue
+        candidate = _transcript(*safe_rows, safe)
+        try:
+            prompt_with_entries(candidate)
+        except ReconciliationError:
+            if safe_rows:
+                break
+            if entry_request._is_user_authored_row(safe):
+                raise ReconciliationError("user row exceeds the request limit")
+            data = safe.get("data")
+            message = data.get("message") if isinstance(data, dict) else None
+            if not (
+                (isinstance(message, dict) and message.get("role") == "assistant")
+                or entry_request._is_lossy_generated_row(safe)
+            ):
+                raise ReconciliationError(
+                    "oversized non-generated transcript row requires lossless handling"
+                )
+            for text_bytes, list_items in (
+                (8192, 32), (4096, 16), (2048, 8), (1024, 4),
+                (512, 2), (128, 1), (0, 0),
+            ):
+                bounded = entry_request._bounded_value(
+                    safe, text_bytes=text_bytes, list_items=list_items
+                )
+                selected = _transcript(bounded)
+                try:
+                    prompt, visible_ids = prompt_with_entries(selected)
+                except ReconciliationError:
+                    continue
+                return prompt, selected, visible_ids
+            raise ReconciliationError("one transcript row cannot fit request limit")
+        safe_rows.append(safe)
+    selected = _transcript(*safe_rows)
+    prompt, visible_ids = prompt_with_entries(selected)
+    return prompt, selected, visible_ids
+
+
 def _listed_entry_ids(prompt: str) -> list[str]:
     lines = prompt.splitlines()
     heading = next(
@@ -267,6 +364,222 @@ def _seed_user_entry(
         now=observed_at,
     )
     return next(iter(result.state.entries))
+
+
+def _assert_matches_prepare_oracle(transcript: Transcript, state) -> None:
+    expected_prompt, expected_transcript, expected_ids = _prepare_request_oracle(
+        transcript, state, as_of=date(2026, 10, 9)
+    )
+    actual = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    assert actual.prompt == expected_prompt
+    assert actual.transcript == expected_transcript
+    assert actual.visible_entry_ids == expected_ids
+
+
+@pytest.mark.parametrize("entry_count", (124, 300))
+def test_incremental_request_matches_rendering_oracle(
+    tmp_path: Path, entry_count: int
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id, count=entry_count)
+    rows = [_row(index, f"ordinary row {index}") for index in range(1, 81)]
+    rows[20]["data"]["message"]["metadata"]["turn_context"] = True
+
+    _assert_matches_prepare_oracle(_transcript(*rows), state)
+
+
+def test_incremental_request_matches_oracle_for_oversized_assistant(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id)
+    _assert_matches_prepare_oracle(
+        _transcript(_row(72, "\\" * (10 * 1024), origin="agent", role="assistant")),
+        state,
+    )
+
+
+def test_incremental_request_matches_oracle_for_relevance(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, _ = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "PR #425 needs Linux verification."),
+        ("state", "Service Atlas uses /srv/atlas-old."),
+    )
+    _assert_matches_prepare_oracle(
+        _transcript(_row(1, "PR #425 merged; Atlas now uses /srv/atlas-new.")),
+        state,
+    )
+
+
+def test_incremental_request_matches_oracle_at_byte_boundaries(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id)
+    escaped = _row(1, 'café 雪 contains "quotes", \\slashes, and\nnewlines')
+    empty_list = _row(2, "discarded")
+    empty_list["data"]["message"]["content"] = []
+    _assert_matches_prepare_oracle(_transcript(escaped, empty_list), state)
+
+    kind = state.schema.kinds[0]
+    base_prompt, _, _ = _prepare_request_oracle(
+        _transcript(), state, as_of=date(2026, 10, 9)
+    )
+    exact_padding = 16 * 1024 - len(base_prompt.encode())
+    for added_bytes in (exact_padding, exact_padding + 1):
+        boundary_state = replace(
+            state,
+            schema=replace(
+                state.schema,
+                kinds=(
+                    replace(kind, description=kind.description + "x" * added_bytes),
+                    *state.schema.kinds[1:],
+                ),
+            ),
+        )
+        _assert_matches_prepare_oracle(_transcript(), boundary_state)
+        request = _prepare_request(
+            _transcript(), boundary_state, as_of=date(2026, 10, 9)
+        )
+        expected_size = 16 * 1024 if added_bytes == exact_padding else 16_226
+        assert len(request.prompt.encode()) == expected_size
+
+    empty_state_request = _prepare_request(
+        _transcript(), registry._entry_memory_state(project_id).state,
+        as_of=date(2026, 10, 9),
+    )
+    empty_row_size = len(entry_request._render_transcript_row(SESSION, _row(3, "")).encode())
+    text_bytes = 28 * 1024 - len(empty_state_request.prompt.encode()) - empty_row_size
+    boundary_row = _row(3, "x" * text_bytes)
+    _assert_matches_prepare_oracle(
+        _transcript(boundary_row), registry._entry_memory_state(project_id).state
+    )
+    request = _prepare_request(
+        _transcript(boundary_row), registry._entry_memory_state(project_id).state,
+        as_of=date(2026, 10, 9),
+    )
+    assert len(request.prompt.encode()) == 28 * 1024
+    oversized = _transcript(_row(3, "x" * (text_bytes + 1)))
+    with pytest.raises(ReconciliationError, match="user row exceeds the request limit"):
+        _prepare_request_oracle(
+            oversized, registry._entry_memory_state(project_id).state,
+            as_of=date(2026, 10, 9),
+        )
+    with pytest.raises(ReconciliationError, match="user row exceeds the request limit"):
+        _prepare_request(
+            oversized, registry._entry_memory_state(project_id).state,
+            as_of=date(2026, 10, 9),
+        )
+
+
+def test_excluded_row_does_not_change_entry_relevance(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, target_ids = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "PR #999 must stay visible."),
+        ("state", "Service Atlas uses /srv/atlas-old."),
+    )
+    transcript = _transcript(
+        _row(1, "ordinary " + "x" * 8000),
+        _row(2, "PR #999 " + "y" * 5000),
+    )
+
+    _assert_matches_prepare_oracle(transcript, state)
+    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    assert len(request.transcript.rows) == 1
+    assert target_ids[0] not in request.visible_entry_ids
+
+
+def test_chained_relevance_reranks_until_rows_fit(tmp_path: Path) -> None:
+    # Reviewer reproduction: each re-rank grows the entry section and evicts one
+    # more row (8 -> 7 -> 6 -> 5); stopping after two re-ranks exceeded 28 KiB.
+    import random
+
+    random.seed(68)
+    registry, project_id = _registry(tmp_path)
+    state = registry._entry_memory_state(project_id).state
+    choices = [50, 100, 180, 500, 1000, 1800, 3000]
+    source = (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),)
+    operations = [
+        AddOperation(
+            "state", f"quarkterm{i} " + chr(64 + i) * random.choice(choices), source
+        )
+        for i in range(1, 9)
+    ]
+    operations += [
+        AddOperation(
+            "state",
+            f"filler{i:03d} " + chr(65 + i % 26) * random.choice(choices),
+            source,
+        )
+        for i in range(20)
+    ]
+    entry_ids = iter(f"m_{i:032x}" for i in range(1, len(operations) + 1))
+    operation_ids = iter(f"op_{i:032x}" for i in range(1, len(operations) + 1))
+    state, _ = apply_operations(
+        state,
+        operations,
+        reconciliation_key=_key("68-0"),
+        automatic=True,
+        now=NOW,
+        entry_id_factory=lambda: next(entry_ids),
+        operation_id_factory=lambda: next(operation_ids),
+    )
+    pads = [1611, 2488, 2588, 1175, 2424, 1451, 808, 1525]
+    transcript = _transcript(
+        *(_row(i, f"quarkterm{i} " + "x" * pads[i - 1]) for i in range(1, 9))
+    )
+
+    _assert_matches_prepare_oracle(transcript, state)
+    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    assert len(request.prompt.encode()) <= 28 * 1024
+    assert len(request.transcript.rows) == 5
+
+
+@pytest.mark.parametrize("turn_context", (False, True))
+def test_incremental_request_matches_oracle_errors(
+    tmp_path: Path, turn_context: bool
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id, count=300)
+    if turn_context:
+        row = _row(45, "x" * 15_000, origin="harness", role="system")
+        row["data"]["message"]["metadata"].update(
+            {
+                "zeta_event": "agent_notifications",
+                "notifications": [{"notification_id": "child-1"}],
+                "turn_context": True,
+            }
+        )
+    else:
+        row = _row(45, "x" * 15_000)
+    with pytest.raises(ReconciliationError) as expected:
+        _prepare_request_oracle(_transcript(row), state, as_of=date(2026, 10, 9))
+    with pytest.raises(ReconciliationError, match=str(expected.value)):
+        _prepare_request(_transcript(row), state, as_of=date(2026, 10, 9))
+
+
+def test_request_preparation_renders_prompt_constant_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id, count=300)
+    transcript = _transcript(
+        *[_row(index, f"ordinary row {index}") for index in range(1, 151)]
+    )
+    original = entry_request._prompt
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(entry_request, "_prompt", counted)
+    _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+
+    assert calls <= 5
 
 
 @pytest.mark.parametrize("entry_count", (124, 300))
