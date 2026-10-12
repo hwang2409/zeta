@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import threading
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -52,7 +53,7 @@ RECENT_SESSION_LIMIT = 20
 
 
 class _SessionRecency:
-    """Coalesce session-recency writes onto one ordered background task."""
+    """Coalesce best-effort recency writes onto one daemon worker."""
 
     def __init__(
         self,
@@ -66,22 +67,63 @@ class _SessionRecency:
 
     def refresh(self) -> None:
         self._dirty = True
+        self._start()
+
+    async def flush(self) -> None:
+        running = self._task if self._task is not None and not self._task.done() else None
+        try:
+            async with asyncio.timeout(0.5):
+                self._start()
+                if self._task is not None:
+                    await asyncio.shield(self._task)
+                if running is not None and self._dirty:
+                    self._start()
+                    if self._task is not None:
+                        await asyncio.shield(self._task)
+        except TimeoutError:
+            if self._task is not None:
+                self._task.cancel()
+
+    def _start(self) -> None:
         if self._task is None or self._task.done():
             if self._task is not None:
                 self._task.result()
-            self._task = asyncio.create_task(self._run())
-
-    async def flush(self) -> None:
-        if self._task is not None:
-            await asyncio.shield(self._task)
+            if self._dirty:
+                self._task = asyncio.create_task(self._run())
 
     async def _run(self) -> None:
         while self._dirty:
             self._dirty = False
-            await asyncio.to_thread(
-                self._manager.refresh_recency,
-                self._session_id,
-            )
+            if not await self._attempt():
+                self._dirty = True
+                return
+
+    async def _attempt(self) -> bool:
+        loop = asyncio.get_running_loop()
+        completed: asyncio.Future[bool] = loop.create_future()
+
+        def finish(result: bool | BaseException) -> None:
+            if completed.done():
+                return
+            if isinstance(result, BaseException):
+                completed.set_exception(result)
+            else:
+                completed.set_result(result)
+
+        def run() -> None:
+            try:
+                result: bool | BaseException = self._manager.refresh_recency(
+                    self._session_id
+                )
+            except BaseException as exc:  # noqa: BLE001 - return worker failure
+                result = exc
+            try:
+                loop.call_soon_threadsafe(finish, result)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=run, name="zeta-recency", daemon=True).start()
+        return await completed
 
 
 def background_notice(

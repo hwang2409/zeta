@@ -766,13 +766,23 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         return matches[0]
 
     def touch(self, metadata: SessionMetadata) -> None:
-        current = self.refresh_recency(metadata.session_id)
+        current = self._mutate(metadata.session_id, lambda item: self._touch(item))
         self._copy_metadata(metadata, current)
 
-    def refresh_recency(self, session_id: str) -> SessionMetadata:
-        """Refresh recency from the latest metadata stored for a session."""
+    def refresh_recency(self, session_id: str) -> bool:
+        """Best-effort refresh recency without waiting for metadata writers."""
 
-        return self._mutate(session_id, lambda item: self._touch(item))
+        with self._metadata_lock(session_id, blocking=False) as directory_fd:
+            if directory_fd is None:
+                return False
+            current = self._touch(self._read(session_id, directory_fd=directory_fd))
+            write_session_json(
+                directory_fd,
+                "meta.json",
+                current.to_storage_dict(),
+                sync=False,
+            )
+            return True
 
     def persist_tool_policy(
         self,
@@ -1107,7 +1117,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         write_session_json(directory_fd, "meta.json", metadata.to_storage_dict())
 
     @contextmanager
-    def _metadata_lock(self, session_id: str):
+    def _metadata_lock(self, session_id: str, *, blocking: bool = True):
         self._validate_id(session_id)
         with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
             try:
@@ -1117,7 +1127,12 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             except OSError as exc:
                 raise SessionError("session metadata lock could not be opened") from exc
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(lock_fd, flags)
+                except BlockingIOError:
+                    yield None
+                    return
                 yield directory_fd
             finally:
                 os.close(lock_fd)
