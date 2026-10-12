@@ -48,6 +48,35 @@ def test_malformed_hooks_fail_loudly(tmp_path: Path) -> None:
         load_hooks(tmp_path)
 
 
+def test_invalid_on_error_is_rejected(tmp_path: Path) -> None:
+    _write_config(
+        tmp_path,
+        '[[hook]]\nevent = "pre_tool"\ncommand = "true"\non_error = "stop"\n',
+    )
+
+    with pytest.raises(HookConfigError, match='on_error must be "allow" or "deny"'):
+        load_hooks(tmp_path)
+
+
+def test_on_error_is_rejected_for_nonblocking_hooks(tmp_path: Path) -> None:
+    _write_config(
+        tmp_path,
+        '[[hook]]\nevent = "stop"\ncommand = "true"\non_error = "deny"\n',
+    )
+
+    with pytest.raises(HookConfigError, match="on_error only applies to pre_tool"):
+        load_hooks(tmp_path)
+
+
+def test_hook_on_error_defaults_to_allow_and_is_in_status(tmp_path: Path) -> None:
+    _write_config(tmp_path, '[[hook]]\nevent = "pre_tool"\ncommand = "true"\n')
+
+    manager = load_hooks(tmp_path)
+
+    assert manager.hooks[0].on_error == "allow"
+    assert manager.status_entries == ('pre_tool: true (on_error = "allow")',)
+
+
 def test_empty_tools_filter_is_rejected_for_non_tool_events(tmp_path: Path) -> None:
     hook = _python_command("pass")
     _write_config(
@@ -101,13 +130,73 @@ async def test_pre_hook_allow_deny_and_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("exit 1", "exit 1"),
+        ("command-that-does-not-exist", "exit 127"),
+    ],
+)
+async def test_pre_hook_on_error_deny_blocks_failures(
+    tmp_path: Path, command: str, expected: str
+) -> None:
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n'
+        'on_error = "deny"\n',
+    )
+    notices: list[str] = []
+    manager = load_hooks(tmp_path)
+    manager.notice_sink = notices.append
+
+    result = await manager.pre_tool("bash", {})
+
+    assert result == f'hook pre_tool failed with {expected}; on_error = "deny"'
+    assert notices == [result]
+
+
+@pytest.mark.asyncio
+async def test_pre_hook_on_error_deny_blocks_timeout(tmp_path: Path) -> None:
+    fifo = tmp_path / "hook-input"
+    os.mkfifo(fifo)
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(f"cat < {fifo}")}\n'
+        'timeout_seconds = 0.05\non_error = "deny"\n',
+    )
+    notices: list[str] = []
+    manager = load_hooks(tmp_path)
+    manager.notice_sink = notices.append
+
+    result = await manager.pre_tool("bash", {})
+
+    assert result == 'hook pre_tool timed out; on_error = "deny"'
+    assert notices == [result]
+
+
+@pytest.mark.asyncio
+async def test_pre_hook_on_error_allow_keeps_fail_open(tmp_path: Path) -> None:
+    _write_config(
+        tmp_path,
+        '[[hook]]\nevent = "pre_tool"\ncommand = "exit 1"\non_error = "allow"\n',
+    )
+    notices: list[str] = []
+    manager = load_hooks(tmp_path)
+    manager.notice_sink = notices.append
+
+    assert await manager.pre_tool("bash", {}) is True
+    assert notices == ["hook pre_tool failed with exit 1"]
+
+
+@pytest.mark.asyncio
 async def test_fast_exiting_deny_hook_still_denies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A deny hook can exit and be reaped before its process group is looked up.
     _write_config(
         tmp_path,
-        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps("echo no >&2; exit 2")}\n',
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps("echo no >&2; exit 2")}\n'
+        'on_error = "deny"\n',
     )
 
     def reaped(_pid: int) -> int:

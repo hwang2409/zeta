@@ -56,6 +56,7 @@ class Hook:
     command: str
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     tools: tuple[str, ...] = ()
+    on_error: Literal["allow", "deny"] = "allow"
 
     def matches(self, event: str, tool: str | None = None) -> bool:
         if self.event != event:
@@ -63,7 +64,7 @@ class Hook:
         return tool is None or not self.tools or tool in self.tools
 
     def status_entry(self) -> str:
-        return f"{self.event}: {self.command}"
+        return f"{self.event}: {self.command} (on_error = \"{self.on_error}\")"
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +113,7 @@ def _parse_hooks(document: object, path: Path) -> tuple[Hook, ...]:
     for index, entry in enumerate(entries):
         if type(entry) is not dict:
             raise HookConfigError(f"invalid hook config {path}: hook {index} must be a table")
-        unknown_keys = set(entry) - {"event", "command", "timeout_seconds", "tools"}
+        unknown_keys = set(entry) - {"event", "command", "timeout_seconds", "tools", "on_error"}
         if unknown_keys:
             raise HookConfigError(
                 f"invalid hook config {path}: hook {index} has unknown keys "
@@ -132,6 +133,15 @@ def _parse_hooks(document: object, path: Path) -> tuple[Hook, ...]:
             or timeout <= 0
         ):
             raise HookConfigError(f"invalid hook config {path}: hook {index} timeout is invalid")
+        on_error = entry.get("on_error", "allow")
+        if type(on_error) is not str or on_error not in {"allow", "deny"}:
+            raise HookConfigError(
+                f"invalid hook config {path}: hook {index} on_error must be \"allow\" or \"deny\""
+            )
+        if "on_error" in entry and event != "pre_tool":
+            raise HookConfigError(
+                f"invalid hook config {path}: hook {index} on_error only applies to pre_tool hooks"
+            )
         raw_tools = entry.get("tools", [])
         if type(raw_tools) is not list or any(type(tool) is not str or not tool for tool in raw_tools):
             raise HookConfigError(f"invalid hook config {path}: hook {index} tools is invalid")
@@ -143,6 +153,7 @@ def _parse_hooks(document: object, path: Path) -> tuple[Hook, ...]:
                 command=command,
                 timeout_seconds=min(float(timeout), MAX_TIMEOUT_SECONDS),
                 tools=tuple(raw_tools),
+                on_error=on_error,
             )
         )
     return tuple(hooks)
@@ -182,7 +193,12 @@ class HookManager:
                 reason = result.stderr.strip() or "hook denied tool"
                 self._notice(f"hook denied pre_tool: {reason}")
                 return reason
-            self._notice(self._failure_message("pre_tool", result))
+            failure = self._failure_message("pre_tool", result)
+            if hook.on_error == "deny":
+                reason = f"{failure}; on_error = \"deny\""
+                self._notice(reason)
+                return reason
+            self._notice(failure)
         return True
 
     def user_prompt_submit(self, prompt: str) -> None:
@@ -292,7 +308,8 @@ class HookManager:
         if result.timed_out:
             return f"hook {event} timed out"
         if result.returncode is None:
-            return f"hook {event} failed: {result.stderr}"
+            detail = f": {result.stderr}" if result.stderr else ""
+            return f"hook {event} failed to start{detail}"
         return f"hook {event} failed with exit {result.returncode}"
 
 
