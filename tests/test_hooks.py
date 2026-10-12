@@ -151,7 +151,7 @@ async def test_pre_hook_on_error_deny_blocks_failures(
 
     result = await manager.pre_tool("bash", {})
 
-    assert result == f'hook pre_tool failed with {expected}; on_error = "deny"'
+    assert result == f'hook {command} failed with {expected}; on_error = "deny"'
     assert notices == [result]
 
 
@@ -170,7 +170,7 @@ async def test_pre_hook_on_error_deny_blocks_timeout(tmp_path: Path) -> None:
 
     result = await manager.pre_tool("bash", {})
 
-    assert result == 'hook pre_tool timed out; on_error = "deny"'
+    assert result == f'hook cat < {fifo} timed out; on_error = "deny"'
     assert notices == [result]
 
 

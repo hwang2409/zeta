@@ -195,6 +195,9 @@ class HookManager:
                 return reason
             failure = self._failure_message("pre_tool", result)
             if hook.on_error == "deny":
+                failure = self._failure_message(
+                    self._command_summary(hook.command), result
+                )
                 reason = f"{failure}; on_error = \"deny\""
                 self._notice(reason)
                 return reason
@@ -302,6 +305,11 @@ class HookManager:
     def _notice(self, message: str) -> None:
         if self.notice_sink is not None:
             self.notice_sink(_sanitize_text(message).replace("\n", " ") or "hook failed")
+
+    @staticmethod
+    def _command_summary(command: str) -> str:
+        summary = " ".join(command.split())
+        return summary if len(summary) <= 80 else f"{summary[:77]}..."
 
     @staticmethod
     def _failure_message(event: str, result: _CommandResult) -> str:
