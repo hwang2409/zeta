@@ -1,0 +1,28 @@
+src/zeta/tools/_shared/background_spawn.py
+  s_d9d04f10aab6bf::t_c46f24d64a02a8 57-58,70-73,92-109,129-130,134,136,142,146
+  s_d9d04f10aab6bf::t_380921f5def185 1-56,59-69,74-91,110-128,131-133,135,137-141,143-145
+tests/test_background_start_shutdown.py
+  s_d9d04f10aab6bf::t_dbfb24fb686a24 30-33,53-56,62-63,75-76,120-122,133-136
+  s_d9d04f10aab6bf::t_85444fd4aea51f 1-17,19,21,23-28,34-47,57-61,64-71,73-74,77-81,83-85,87-100,107-110,112-119,123-132
+  s_d9d04f10aab6bf::t_2040a0ee2d9907 18,20,22,29,48-52,72,82,86,101-106,111,137
+  s_d9d04f10aab6bf::t_92222fe27f2894 138
+src/zeta/tools/_shared/process.py
+  s_d9d04f10aab6bf::t_c46f24d64a02a8 34,198,327-329,718-719
+  s_d9d04f10aab6bf::t_380921f5def185 33,35-39,197,315,317-318,331-332,368,372,375-379,617-620
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4551d5eff5c8cc99a5358c6143626af9f303fe33",
+  "prompts": {},
+  "sessions": {
+    "s_d9d04f10aab6bf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12ed3-e7e6-7cd1-9953-246bf98e9a16",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Austin Jian <austin.jian07@gmail.com>"
+    }
+  }
+}
