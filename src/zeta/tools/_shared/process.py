@@ -8,7 +8,6 @@ import logging
 import os
 import shutil
 import signal
-import sys
 import tempfile
 import time
 import uuid
@@ -31,6 +30,13 @@ from ...core.session_files import (
 from ...core.store import ConversationStore
 from .background_log_writer import _OrderedLogWriter
 from .background_output_archive import _BackgroundOutputArchive
+from .background_spawn import (
+    BackgroundSpawnCleanupError,
+    _group_exists,
+    _signal_group,
+    create_subprocess_shell_in_fd,
+    spawn_background,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,30 +59,6 @@ def _lower_child_priority(niceness: int) -> None:
         os.setpriority(os.PRIO_PROCESS, 0, min(19, current + niceness))
     except (AttributeError, OSError):
         pass
-
-
-_FD_SHELL_WRAPPER = (
-    "import os,sys; os.fchdir(int(sys.argv[1])); "
-    "os.execvpe('/bin/sh', ['sh','-c',sys.argv[2]], os.environ)"
-)
-
-
-async def create_subprocess_shell_in_fd(
-    command: str, directory_fd: int, **kwargs: object
-) -> asyncio.subprocess.Process:
-    """Run a shell after fchdir'ing an inherited, identity-verified fd."""
-
-    kwargs.pop("cwd", None)
-    pass_fds = tuple(kwargs.pop("pass_fds", ()))
-    return await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-c",
-        _FD_SHELL_WRAPPER,
-        str(directory_fd),
-        command,
-        pass_fds=(*pass_fds, directory_fd),
-        **kwargs,
-    )
 
 
 BACKGROUND_OUTPUT_LIMIT = 512 * 1024
@@ -212,6 +194,8 @@ class BackgroundTaskRegistry:
         self._closing = False
         self._closed = False
         self._close_done: asyncio.Future[tuple[str, ...]] | None = None
+        self._pending_starts: set[asyncio.Future[None]] = set()
+        self._start_cleanup_error: BackgroundSpawnCleanupError | None = None
         self._shutdown_killed: tuple[str, ...] = ()
         self._closing_for_shutdown = False
         if session_dir is not None:
@@ -328,7 +312,10 @@ class BackgroundTaskRegistry:
     ) -> tuple[str, int]:
         """Start a task, taking ownership of ``cwd_fd`` when one is supplied."""
 
+        pending = asyncio.get_running_loop().create_future()
         try:
+            self._require_open()
+            self._pending_starts.add(pending)
             return await self._start(
                 command,
                 cwd,
@@ -337,7 +324,12 @@ class BackgroundTaskRegistry:
                 notify_on_exit=notify_on_exit,
                 owner=owner,
             )
+        except BackgroundSpawnCleanupError as exc:
+            self._start_cleanup_error = exc
+            raise
         finally:
+            self._pending_starts.discard(pending)
+            pending.set_result(None)
             if cwd_fd is not None:
                 os.close(cwd_fd)
 
@@ -373,13 +365,18 @@ class BackgroundTaskRegistry:
                     "preexec_fn": _child_priority_preexec(self.command_niceness),
                 }
                 if cwd_fd is None:
-                    process = await asyncio.create_subprocess_shell(
+                    spawn = asyncio.create_subprocess_shell(
                         command, cwd=cwd, **spawn_kwargs
                     )
                 else:
-                    process = await create_subprocess_shell_in_fd(
+                    spawn = create_subprocess_shell_in_fd(
                         command, cwd_fd, **spawn_kwargs
                     )
+                process = await spawn_background(
+                    spawn, require_open=self._require_open,
+                    term_grace=self.term_grace,
+                    cleanup_timeout=self.term_grace + self.stdin_drain_timeout,
+                )
             except OSError as exc:
                 # run_background's failed tool result is the canonical receipt;
                 # persisting task_exited would render the same failure twice.
@@ -617,6 +614,10 @@ class BackgroundTaskRegistry:
             return task.result()
 
         try:
+            # Only wait when a spawn is in flight: empty child registries must
+            # not gain a scheduling boundary before completion is persisted.
+            if self._pending_starts:
+                await finish(asyncio.gather(*self._pending_starts))
             entries = [
                 (record, record.process)
                 for record in self._records.values()
@@ -714,6 +715,8 @@ class BackgroundTaskRegistry:
                         ),
                     )
                 )
+            if self._start_cleanup_error is not None:
+                raise self._start_cleanup_error
             self._closing = False
             self._closed = True
             self._shutdown_killed = tuple(killed)
@@ -1188,26 +1191,6 @@ def _utf8_char_chunk(data: bytes, limit: int) -> bytes:
     if characters + len(emitted) > limit:
         return data[:character_start]
     return data
-
-
-def _group_exists(process_id: int) -> bool:
-    try:
-        os.killpg(process_id, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return False
-    return True
-
-
-def _signal_group(process: asyncio.subprocess.Process, signal_number: int) -> None:
-    try:
-        os.killpg(process.pid, signal_number)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        if process.returncode is None:
-            process.kill()
 
 
 async def _kill_and_reap(
