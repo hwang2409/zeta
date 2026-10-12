@@ -315,6 +315,7 @@ class TUIApp(
         )
         self._finder_prepare_task: asyncio.Task[None] | None = None
         self._finder_rank_task: asyncio.Task[None] | None = None
+        self._composer_restore_document: Document | None = None
         self._status_card_open = False
         self._mcp_manager_open = False
         self._init_background_tasks_panel()
@@ -589,6 +590,11 @@ class TUIApp(
         )
         composer_window.style = "class:text-area"
         self._attach_draft(session)
+        if self._composer_restore_document is not None:
+            session.default_buffer.set_document(
+                self._composer_restore_document, bypass_readonly=True
+            )
+            self._composer_restore_document = None
         return session
 
     def _attach_draft(self, session: PromptSession[str]) -> None:
@@ -1165,6 +1171,7 @@ class TUIApp(
                 return self._run_result
             finally:
                 self._input_loop_active = False
+                self._prepare_ui_session_change()
                 if prompt_task is not None:
                     if not prompt_task.done():
                         prompt_task.cancel()

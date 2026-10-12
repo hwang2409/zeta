@@ -114,6 +114,17 @@ class FinderRuntimeMixin:
         self._active_finder = self._transcript
         self._invalidate_prompt()
 
+    def _prepare_ui_session_change(self) -> None:
+        """Close an active finder before its UI session is replaced or removed."""
+
+        finder = getattr(self, "_active_finder", None)
+        if finder is None or not finder.finder_active:
+            return
+        self._finder_cancel()
+        session = self._active_session
+        if session is not None:
+            self._composer_restore_document = session.default_buffer.document
+
     def _finder_toggle_preview(self) -> None:
         self._finder_target().finder_toggle_preview()
         self._invalidate_prompt()
