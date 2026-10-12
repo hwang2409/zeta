@@ -52,8 +52,10 @@ jobs:
 
       # --frozen pins the resolution to uv.lock so a transitive bump cannot
       # turn main red without a lockfile change in the diff.
+      # Bound worker count on both runners and rebalance uneven test durations.
+      # Report slow tests so future bottlenecks are visible in the CI logs.
       - name: Run the suite
-        run: uv run --frozen pytest -q
+        run: uv run --frozen pytest -q -n 4 --dist worksteal --durations=25
 
   lint:
     name: ruff

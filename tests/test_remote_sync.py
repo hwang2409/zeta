@@ -80,7 +80,6 @@ def _install_ssh_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "#!/bin/sh\n"
         "[ \"$1\" = -- ] && shift\n"
         "shift\n"
-        "sleep 2\n"
         "exec /bin/sh -c \"$1\"\n",
         encoding="utf-8",
     )
