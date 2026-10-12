@@ -154,6 +154,12 @@ def test_tui_run_replays_transcript_only_on_initial_start(
         replay_count = 0
         read_count = 0
         watchdog_events: list[tuple[str, str]] = []
+        draft_flushes = 0
+
+        class Draft:
+            async def flush_pending(self) -> None:
+                nonlocal draft_flushes
+                draft_flushes += 1
 
         class Watchdog:
             async def close(self) -> None:
@@ -197,6 +203,8 @@ def test_tui_run_replays_transcript_only_on_initial_start(
         app._session = None
         app._active_session = None
         app._active_task = None
+        app._draft = Draft()
+        app._history = None
         app._fork_controller = None
         app._open_fork_target = None
         app._input_loop_active = False
@@ -218,6 +226,7 @@ def test_tui_run_replays_transcript_only_on_initial_start(
         assert getattr(first_result, "name", None) == "OPEN_CHILD"
         assert getattr(second_result, "name", None) == "EXIT"
         assert replay_count == 1
+        assert draft_flushes == 1
         assert watchdog_events == [
             ("start", "test-session"),
             ("close", "test-session"),
@@ -515,6 +524,7 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app._hooks = None
     app._on_session_close = flush_recency
     app._active_session = app._draft_session = app._session = object()
+    app._history = None
     app.stop_decisions_poll = lambda: cleaned.append("poll")
     app._stop_decisions_refresh = lambda: cleaned.append("refresh")
     app._close_finder_workers = fail_finder
@@ -524,7 +534,10 @@ def test_tui_close_failure_still_runs_later_cleanup(
     )
     app._cancel_mcp_wizard = lambda: async_cleanup("wizard")
     app._submissions = SimpleNamespace(close=lambda: async_cleanup("submissions"))
-    app._draft = SimpleNamespace(detach=lambda: cleaned.append("draft"))
+    app._draft = SimpleNamespace(
+        detach=lambda: cleaned.append("draft"),
+        shutdown_pending=lambda: async_cleanup("draft flush"),
+    )
 
     with pytest.raises(RuntimeError, match="finder close failed"):
         asyncio.run(app.close())
