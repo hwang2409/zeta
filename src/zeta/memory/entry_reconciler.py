@@ -425,6 +425,11 @@ def _entry_prompt_parts(
     return projections[:full], rendered[:full], indexes[full:visible], omitted
 
 
+def _render_transcript_row(session_id: str, row: dict[str, Any]) -> str:
+    rendered = _rendered_transcript_rows(Transcript(session_id, (row,)))[0]
+    return json.dumps(rendered, ensure_ascii=False, separators=(",", ":"))
+
+
 def _prepare_request(
     transcript: Transcript, state: MemoryState, *, as_of: date
 ) -> _EntryPreparedRequest:
@@ -452,10 +457,7 @@ def _prepare_request(
         safe = _sanitized(project_transcript_row(raw))
         if not isinstance(safe, dict):
             continue
-        rendered = json.dumps(
-            _rendered_transcript_rows(Transcript(transcript.session_id, (safe,)))[0],
-            ensure_ascii=False, separators=(",", ":"),
-        )
+        rendered = _render_transcript_row(transcript.session_id, safe)
         safe_rows.append(safe)
         rendered_rows.append(rendered)
         rows_size += len(rendered.encode()) + (len(safe_rows) > 1)
@@ -478,10 +480,7 @@ def _prepare_request(
             safe = _sanitized(project_transcript_row(raw))
             if not isinstance(safe, dict):
                 continue
-            rendered = json.dumps(
-                _rendered_transcript_rows(Transcript(transcript.session_id, (safe,)))[0],
-                ensure_ascii=False, separators=(",", ":"),
-            )
+            rendered = _render_transcript_row(transcript.session_id, safe)
             safe_rows.append(safe)
             rendered_rows.append(rendered)
             rows_size += len(rendered.encode()) + (len(safe_rows) > 1)
@@ -506,14 +505,13 @@ def _prepare_request(
             raise ReconciliationError(
                 "oversized non-generated transcript row requires lossless handling"
             )
-        bounds = ((8192, 32), (4096, 16), (2048, 8), (1024, 4), (512, 2), (128, 1), (0, 0))
+        bounds = (
+            (8192, 32), (4096, 16), (2048, 8), (1024, 4),
+            (512, 2), (128, 1), (0, 0),
+        )
         for text_bytes, list_items in bounds:
             bounded = _bounded_value(safe, text_bytes=text_bytes, list_items=list_items)
-            rendered = json.dumps(
-                _rendered_transcript_rows(Transcript(transcript.session_id, (bounded,)))[0],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            rendered = _render_transcript_row(transcript.session_id, bounded)
             if base_size + len(rendered.encode()) <= _MAX_PRIMARY_REQUEST_BYTES:
                 prompt = _prompt(
                     Transcript(transcript.session_id, (bounded,)), state, as_of=as_of,
