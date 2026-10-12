@@ -57,6 +57,7 @@ class RuntimeCloseMixin:
                 )
             )
             pending_before = pending if isinstance(pending, set) else set()
+            attempt(self._agent_navigation.close)
             attempt(self._agent_navigation.unbind_layout)
             await attempt_async(self._cancel_mcp_wizard)
             await attempt_async(self._submissions.close)
