@@ -2898,7 +2898,7 @@ async def test_agent_returns_child_text_and_persists_child_session(
     assert {schema["name"] for schema in backend.calls[1][1]} == {
         schema["name"]
         for schema in backend.calls[0][1]
-        if schema["name"] != "request_attention"
+        if schema["name"] not in {"request_attention", "resolve_attention"}
     }
 
 
