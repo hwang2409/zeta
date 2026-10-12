@@ -1,0 +1,21 @@
+tests/test_agent.py
+  s_d9d04f10aab6bf::t_c129be791dd1b6 2153,2157,2166-2168,2170-2196
+tests/test_background.py
+  s_d9d04f10aab6bf::t_5393158e4bdff0 1431-1433,1449-1454,1465-1472,1474-1482
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fac5a98de7f638f8b7097e3ffdd83fec27c4d529",
+  "prompts": {},
+  "sessions": {
+    "s_d9d04f10aab6bf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12ed3-e7e6-7cd1-9953-246bf98e9a16",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Austin Jian <austin.jian07@gmail.com>"
+    }
+  }
+}
