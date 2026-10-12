@@ -33,8 +33,8 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
-    with_message_origin,
 )
+from zeta.providers.ollama import _messages as ollama_messages
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.providers.retry_policy import current_retry_budget
 from zeta.providers.transport import retry_provider_completion
@@ -65,6 +65,17 @@ def codex_request_bytes(
         model="codex-test",
     )
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def ollama_request_bytes(
+    messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
+) -> bytes:
+    del tool_schemas
+    return json.dumps(
+        {"messages": ollama_messages(messages)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
 
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
@@ -192,9 +203,10 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
     [
         pytest.param("anthropic", anthropic_request_bytes, id="anthropic"),
         pytest.param("codex", codex_request_bytes, id="codex"),
+        pytest.param("ollama", ollama_request_bytes, id="ollama"),
     ],
 )
-async def test_notification_turn_serializes_notification_as_actionable_input(
+async def test_new_session_inbox_notification_is_actionable_provider_input(
     tmp_path: Path,
     provider: str,
     request_serializer,
@@ -204,15 +216,11 @@ async def test_notification_turn_serializes_notification_as_actionable_input(
         request_serializer=request_serializer,
     )
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
-    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("waiting")]))
-    store.append_agent_notification(
-        "child-1",
-        child_session_path="/tmp/child-1",
-        description="child",
-        status="completed",
-        text="done",
+    notification, appended = store.append_inbox_notification_if_absent(
+        "project-1", ["inbox-message-1"]
     )
+    assert appended
+    assert notification is not None
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await collect(loop.run_notification_turn())
@@ -238,7 +246,7 @@ async def test_notification_turn_serializes_notification_as_actionable_input(
             )
             for block in payload["system"]
         )
-    else:
+    elif provider == "codex":
         notification_text = next(
             part["text"]
             for item in payload["input"]
@@ -249,9 +257,12 @@ async def test_notification_turn_serializes_notification_as_actionable_input(
         )
         assert payload["input"][-1]["role"] == "user"
         assert HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER not in payload["instructions"]
+    else:
+        assert payload["messages"][-1]["role"] == "user"
+        notification_text = payload["messages"][-1]["content"]
     assert notification_text.startswith(expected_prefix)
-    assert "child-1" in notification_text
-    assert "done" in notification_text
+    assert "project_inbox" in notification_text
+    assert "inbox-message-1" in notification_text
     await loop.close()
 
 

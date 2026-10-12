@@ -27,7 +27,10 @@ from ..protocol.types import (
     ToolUseContent,
     flatten_tool_content,
 )
-from .payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+from .payload_common import (
+    HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER,
+    is_harness_notification,
+)
 
 ANTHROPIC_MAX_BASE64_CHARACTERS = ANTHROPIC_IMAGE_POLICY.max_wire_size
 ANTHROPIC_MAX_IMAGE_DIMENSION = ANTHROPIC_IMAGE_POLICY.max_dimension
@@ -182,7 +185,7 @@ def build_messages_payload(
     for message in messages:
         if message.role is MessageRole.SYSTEM:
             content = _wire_content(message.content)
-            if system_at_head:
+            if system_at_head and not is_harness_notification(message):
                 if content and any(
                     block.get("type") != "text" or block.get("text", "").strip()
                     for block in content
@@ -200,6 +203,7 @@ def build_messages_payload(
                     wire_messages[-1]["content"].extend(content)
                 else:
                     wire_messages.append({"role": "user", "content": content})
+                system_at_head = False
             previous_message_was_nudge = False
             continue
         system_at_head = False
