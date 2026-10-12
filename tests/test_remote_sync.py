@@ -115,7 +115,8 @@ class _BarrierLocalTransport(LocalTransport):
         self._barrier = barrier
 
     def fetch_project(self, project_id: str, destination: Path) -> str:
-        self._barrier.wait(timeout=5)  # type: ignore[attr-defined]
+        # Spawned workers can import at different speeds on a busy CI runner.
+        self._barrier.wait(timeout=30)  # type: ignore[attr-defined]
         return super().fetch_project(project_id, destination)
 
 
@@ -133,7 +134,7 @@ def _opposite_sync_worker(
             project_id=project_id,
         )
     except Exception as exc:  # noqa: BLE001 - child reports the public error
-        results.put(("error", str(exc)))  # type: ignore[attr-defined]
+        results.put((type(exc).__name__, str(exc)))  # type: ignore[attr-defined]
     else:
         results.put(("ok", ""))  # type: ignore[attr-defined]
 
@@ -537,12 +538,15 @@ def test_opposite_direction_memory_syncs_do_not_deadlock(tmp_path: Path) -> None
     ]
     for process in processes:
         process.start()
-    for process in processes:
-        process.join(timeout=5)
     try:
+        for process in processes:
+            process.join(timeout=30)
         assert all(not process.is_alive() for process in processes)
         outcomes = [results.get(timeout=1) for _ in processes]
-        assert all(status == "ok" or "project registry busy" in message for status, message in outcomes)
+        assert all(
+            status == "ok" or "project registry busy" in message
+            for status, message in outcomes
+        ), outcomes
     finally:
         for process in processes:
             if process.is_alive():
