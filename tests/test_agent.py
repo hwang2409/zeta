@@ -2150,11 +2150,11 @@ async def test_follow_up_between_gate_turns_is_delivered_once(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_pending_follow_up_is_processed_before_finish_gate_timeout(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = FollowUpFinishGateBackend()
     store = ConversationStore(tmp_path)
-    owner = BackgroundAgentOwner(store, finish_gate_timeout=0.5)
+    owner = BackgroundAgentOwner(store, finish_gate_timeout=60)
     loop = AgentLoop(
         backend,
         store,
@@ -2163,22 +2163,37 @@ async def test_pending_follow_up_is_processed_before_finish_gate_timeout(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.gate_started.wait(), timeout=2)
-    backend.release_gate_turn.set()
-    await asyncio.sleep(0.01)
-    child_handle = next(iter(store.agent_children()))
-    assert send_to_run(
-        store,
-        child_handle,
-        "follow-up before bound",
-        channel=loop._background_owner.conversation_channel,
-    ) is None
+    waiting_for_follow_up = asyncio.Event()
+    channel = owner.conversation_channel
+    original_wait = channel.wait
 
-    await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=0.1)
-    assert backend.follow_up_prompts == ["follow-up before bound"]
-    await _wait_for_notification(store, "completed")
-    await loop.close()
+    async def wait_for_follow_up(instance_id: str) -> None:
+        waiting_for_follow_up.set()
+        await original_wait(instance_id)
+
+    monkeypatch.setattr(channel, "wait", wait_for_follow_up)
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.gate_started.wait(), timeout=10)
+        backend.release_gate_turn.set()
+        # Send only once the child is waiting. Runner speed must not decide
+        # whether the follow-up arrives before an artificially tiny deadline.
+        await asyncio.wait_for(waiting_for_follow_up.wait(), timeout=10)
+        child_handle = next(iter(store.agent_children()))
+        assert send_to_run(
+            store,
+            child_handle,
+            "follow-up before bound",
+            channel=channel,
+        ) is None
+
+        await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=10)
+        assert backend.follow_up_prompts == ["follow-up before bound"]
+        await _wait_for_notification(store, "completed")
+    finally:
+        backend.release_gate_turn.set()
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
