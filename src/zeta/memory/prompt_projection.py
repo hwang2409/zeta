@@ -11,7 +11,7 @@ from html import escape
 
 from .entry_store import MemoryEntry, MemoryKind, MemoryState
 
-MEMORY_PROMPT_BYTE_CAP = 64 * 1024
+MEMORY_PROMPT_BYTE_CAP = 32 * 1024
 _PROJECT_MEMORY_START = "<zeta-project-memory>"
 _PROJECT_MEMORY_END = "</zeta-project-memory>"
 _AUTOMATIC_MEMORY_START = "<zeta-automatic-notes>"
@@ -113,7 +113,9 @@ def _render(
         details = ", ".join(
             f"{key}: {count}" for key, count in omitted.items() if count
         )
-        header.append(f"omitted entries: {omitted_count} ({details})")
+        header.append(
+            f"omitted entries: {omitted_count} ({details}); read them with the read-only `project` tool"
+        )
     body = "\n\n".join(sections)
     return "\n".join(header) + "\n" + (body + "\n" if body else "") + _PROJECT_MEMORY_END
 

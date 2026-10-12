@@ -32,6 +32,9 @@ class MemoryRegistry(Protocol):
     ) -> list[dict[str, object]]: ...
     def _undo_entry_transaction(self, project_id: str, target_id: str | None = None): ...
     def _accept_memory_entry(self, project_id: str, entry_id: str): ...
+    def _resolve_memory_entries(
+        self, project_id: str, entry_ids: tuple[str, ...], *, reason: str = "resolved by user"
+    ): ...
 
 
 def run_memory_command(
@@ -49,7 +52,7 @@ def run_memory_command(
         usage = (
             format_one_usage
             if memory_format == 1
-            else "usage: /memory [log [kind|entry-id]|retry [receipt]|undo [entry-id|version-id]|accept <entry-id>]"
+            else "usage: /memory [log [kind|entry-id]|retry [receipt]|undo [entry-id|version-id]|accept <entry-id>|resolve <entry-id>...]"
         )
         if action == "retry":
             if reconciler is None:
@@ -104,6 +107,16 @@ def run_memory_command(
                 registry.accept_memory(project_id, name)
             return f"memory accepted: {name}"
         if action == "accept":
+            return usage
+        if memory_format == 2 and action.startswith("resolve "):
+            entry_ids = tuple(action.removeprefix("resolve ").split())
+            if not entry_ids:
+                return usage
+            target = ", ".join(entry_ids)
+            _authorize(authorization, "resolve", target)
+            registry._resolve_memory_entries(project_id, entry_ids)
+            return f"memory resolved: {target}"
+        if action == "resolve":
             return usage
         if memory_format == 2 and (action in {"", "log"} or action.startswith("log ")):
             parts = action.split()

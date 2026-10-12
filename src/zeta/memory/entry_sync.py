@@ -122,6 +122,8 @@ def entry_digest(entry: MemoryEntry | MissingEntry | None) -> str:
         state_value = {"id": entry.id, "missing": True}
     else:
         state_value = dataclasses.asdict(entry)
+        if entry.expiry_is_default is None:
+            state_value.pop("expiry_is_default")
     return hashlib.sha256(
         json.dumps(
             state_value,

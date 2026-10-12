@@ -18,7 +18,9 @@ from zeta.memory.entry_store import (
     ResolveOperation,
     SupersedeOperation,
     UpdateOperation,
+    apply_operations,
     canonical_state_bytes,
+    state_digest,
     state_from_bytes,
     state_to_dict,
     validate_state,
@@ -288,6 +290,50 @@ def test_reconciliation_key_deduplicates_entry_transaction(tmp_path: Path) -> No
     assert repeated.version == first.version
     assert repeated.state == first.state
     assert len(repeated.state.entries) == 1
+
+
+def test_old_state_preserves_unknown_expiry_provenance(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    initial = registry._create_entry_memory_for_test(project_id, _schema())
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=initial.digest,
+        operations=(
+            AddOperation(
+                "state",
+                "Legacy state",
+                _source(),
+                expires_at="2026-11-07T12:00:00.000000Z",
+            ),
+        ),
+        reconciliation_key=None,
+        now="2026-10-08T12:00:00Z",
+    )
+    raw = state_to_dict(added.state)
+    entry_raw = next(iter(raw["entries"].values()))  # type: ignore[union-attr]
+    assert isinstance(entry_raw, dict)
+    entry_raw.pop("expiry_is_default", None)
+
+    old_payload = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
+    restored = state_from_bytes(old_payload)
+    original_digest = hashlib.sha256(old_payload).hexdigest()
+    assert canonical_state_bytes(restored) == old_payload
+    assert state_digest(restored) == original_digest
+    entry = next(iter(restored.entries.values()))
+    assert isinstance(entry, MemoryEntry)
+    assert entry.expiry_is_default is None
+
+    updated, _ = apply_operations(
+        restored,
+        (UpdateOperation(entry.id, _source(2)),),
+        reconciliation_key=None,
+        automatic=True,
+        now="2026-10-09T00:00:00Z",
+    )
+    updated_entry = updated.entries[entry.id]
+    assert isinstance(updated_entry, MemoryEntry)
+    assert updated_entry.expires_at == "2026-11-07T12:00:00.000000Z"
+    assert updated_entry.expiry_is_default is None
 
 
 def test_entry_state_is_canonical_bounded_and_uses_shared_secret_safety(

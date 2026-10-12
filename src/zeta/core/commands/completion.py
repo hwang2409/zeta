@@ -111,7 +111,7 @@ _zeta() {
                         create) _arguments '--scope=[project scope]:scope:' '--canonical-integration-root=[directory]:directory:_directories' '--memory-profile=[entry-memory profile]:profile:(zeta messaging)' '1:name:' ;;
                         init) _arguments '--name=[project name]:name:' '--scope=[project scope]:scope:' '--memory-profile=[entry-memory profile]:profile:(zeta messaging)' '1:directory:_directories' ;;
                         discover) _arguments '1:directory:_directories' ;;
-                        memory) _arguments '--project=[project for sync]:project:' '--remote-home=[remote ZETA_HOME]:directory:' '--accept=[conflict side]:side:(local remote)' '--map-kind=[map removed kind]:mapping:' '--resolve-kind=[resolve removed kind]:kind:' '1:project or push/pull/resolve:' '2:remote host or action:(migrate rollback finalize schema)' '--set=[memory file]:file:' '2:content:' '--from-file=[memory file]:file:' '2:path:_files' ;;
+                        memory) _arguments '--project=[project for sync]:project:' '--remote-home=[remote ZETA_HOME]:directory:' '--accept=[conflict side]:side:(local remote)' '--map-kind=[map removed kind]:mapping:' '--resolve-kind=[resolve removed kind]:kind:' '--reason=[resolve reason]:text:' '1:project or push/pull/resolve:' '2:remote host or action:(migrate rollback finalize schema)' '--set=[memory file]:file:' '2:content:' '--from-file=[memory file]:file:' '2:path:_files' ;;
                         index) _arguments '1:project:' '2:action:(status rebuild search)' '--limit=[result limit]:count:' '*:query:' ;;
                         show) _arguments '1:project:' ;;
                         list) _message 'no arguments' ;;
@@ -248,7 +248,7 @@ def bash_script() -> str:
                 case "$verb" in
                     create) COMPREPLY=( $(compgen -W "--scope --canonical-integration-root --memory-profile" -- "$cur") ) ;;
                     init) COMPREPLY=( $(compgen -W "--name --scope --memory-profile" -- "$cur") ) ;;
-                    memory) COMPREPLY=( $(compgen -W "push pull resolve migrate rollback finalize schema --set --from-file --project --remote-home --accept --map-kind --resolve-kind" -- "$cur") ) ;;
+                    memory) COMPREPLY=( $(compgen -W "push pull resolve migrate rollback finalize schema --set --from-file --project --remote-home --accept --map-kind --resolve-kind --reason" -- "$cur") ) ;;
                     index) COMPREPLY=( $(compgen -W "status rebuild search --limit" -- "$cur") ) ;;
                 esac
             fi
