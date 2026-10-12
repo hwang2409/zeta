@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.layout.controls import (
@@ -20,58 +21,48 @@ TODO_PAD_LEFT = 2
 TODO_PAD_BOTTOM = 1
 
 
+@dataclass(frozen=True, slots=True)
+class TodoSnapshot:
+    """Detached todo state safe to consume during TUI rendering."""
+
+    items: tuple[TodoItem, ...]
+    dismissed: bool
+    unavailable: bool = False
+
+
 class TodoWidget(UIControl):
     """Render the current session todo list without owning its state."""
 
     def __init__(
         self,
         store: ConversationStore,
-        selected_store: Callable[[], ConversationStore | None] | None = None,
+        selected_snapshot: Callable[[], TodoSnapshot | None] | None = None,
     ) -> None:
         self.store = store
-        self._selected_store = selected_store or (lambda: store)
-        self._last_store: ConversationStore | None = None
-        self._last_revision = -1
+        self._selected_snapshot = selected_snapshot or self._root_snapshot
 
-    def _current_store(self) -> ConversationStore | None:
-        try:
-            store = self._selected_store()
-        except (OSError, ValueError):
-            return None
-        if store is not self._last_store:
-            self._last_store = store
-            self._last_revision = -1
-        return store
+    def _root_snapshot(self) -> TodoSnapshot:
+        return TodoSnapshot(tuple(self.store.todo_items()), self.store.todo_dismissed)
 
     def turn_boundary(self) -> None:
         """Hide a completed receipt when the next model turn begins."""
 
-        store = self._current_store()
-        if store is None:
-            return
-        self._sync_state(store)
-        if self._is_terminal(store.todo_items()) and not getattr(
-            store, "_read_only", False
-        ):
+        # Turn-boundary dismissal belongs to the root session, not a read-only child.
+        store = self.store
+        if self._is_terminal(store.todo_items()):
             store.dismiss_todo()
 
     @property
     def visible(self) -> bool:
         """Return whether the widget has content to render."""
 
-        store = self._current_store()
-        if store is None:
-            return False
-        self._sync_state(store)
-        return bool(store.todo_items()) and not store.todo_dismissed
-
-    def _sync_state(self, store: ConversationStore) -> None:
-        revision = store.todo_revision
-        if revision != self._last_revision:
-            self._last_revision = revision
+        snapshot = self._selected_snapshot()
+        return snapshot is not None and (
+            snapshot.unavailable or (bool(snapshot.items) and not snapshot.dismissed)
+        )
 
     @staticmethod
-    def _is_terminal(items: list[TodoItem]) -> bool:
+    def _is_terminal(items: Sequence[TodoItem]) -> bool:
         return bool(items) and all(
             item["status"] not in {"pending", "in_progress"} for item in items
         )
@@ -79,13 +70,12 @@ class TodoWidget(UIControl):
     def _render_lines(
         self, width: int, max_height: int | None = None
     ) -> list[StyleAndTextTuples]:
-        store = self._current_store()
-        if store is None:
+        snapshot = self._selected_snapshot()
+        if snapshot is None or snapshot.dismissed:
             return []
-        self._sync_state(store)
-        items = store.todo_items()
-        if store.todo_dismissed:
-            return []
+        if snapshot.unavailable:
+            return [[("fg:" + theme.DIM, "child todos unavailable")], []]
+        items = snapshot.items
         if not items:
             return []
         content_height = None if max_height is None else max_height - TODO_PAD_BOTTOM

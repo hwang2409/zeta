@@ -227,6 +227,34 @@ class ConversationStore(
             self._write_session_state(resolved, self._todo_items)
             self.bash_cwd = resolved
 
+    def refresh_todo_state(self) -> None:
+        """Reload durable TODO state without reparsing the conversation log."""
+        if self._closed:
+            raise ConversationIntegrityError("conversation store is closed")
+        try:
+            value = load_session_json(
+                read_session_file(self.directory_fd, "session_state.json")
+            )
+            if not isinstance(value, dict):
+                raise TypeError
+            bash_cwd = value.get("bash_cwd")
+            todo_items = parse_todo_items(value.get("todo_items", []))
+            todo_dismissed = value.get("todo_dismissed", False)
+            if type(bash_cwd) is not str or not bash_cwd or type(todo_dismissed) is not bool:
+                raise ValueError
+            agent_state = _parse_agent_state(value, self.state_path)
+        except (FileNotFoundError, TypeError, ValueError) as exc:
+            raise ConversationIntegrityError(
+                f"session state is invalid: {self.state_path}"
+            ) from exc
+        self.bash_cwd = bash_cwd
+        self._todo_items = todo_items
+        self._todo_dismissed = todo_dismissed
+        self._agent_counter = agent_state["agent_counter"]
+        self._agent_children = agent_state["agent_children"]
+        self._agent_parent = agent_state["agent_parent"]
+        self._agent_canceled = agent_state["agent_canceled"]
+
     def todo_items(self) -> list[TodoItem]:
         """Return a detached snapshot of the current session todo list."""
 
