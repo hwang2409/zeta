@@ -13,6 +13,10 @@ import os
 import re
 from pathlib import Path
 
+# Memory kind keys (entry_store) and their mirror temporaries (project_publish)
+# share this grammar; it lives here because this module ships to remote peers.
+KIND_KEY_PATTERN = r"[a-z][a-z0-9_-]{0,31}"
+
 SCHEMA_VERSION = 1
 ID_PREFIX = "p_"
 ID_HEX_LENGTH = 32
