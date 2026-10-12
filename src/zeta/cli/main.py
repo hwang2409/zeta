@@ -156,8 +156,8 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "auto-approve every tool call; --no-yolo forces prompts even "
-            "when settings.toml enables yolo"
+            "set default tool approval to allow; --no-yolo sets it to ask; "
+            "explicit approval rules still apply"
         ),
     )
     parser.add_argument(
