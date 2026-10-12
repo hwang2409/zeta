@@ -84,14 +84,21 @@ def _now() -> str:
 
 
 def _validate_text(
-    value: object, field: str, maximum: int, *, nonempty: bool = True
+    value: object,
+    field: str,
+    maximum: int,
+    *,
+    nonempty: bool = True,
+    allow_surrogates: bool = False,
 ) -> str:
     if not isinstance(value, str) or (nonempty and not value) or len(value) > maximum:
         raise ProjectRegistryError(
             f"{field} must be a non-empty string of at most {maximum} characters"
         )
     if "\x00" in value or any(
-        ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF for char in value
+        ord(char) < 32
+        or (not allow_surrogates and 0xD800 <= ord(char) <= 0xDFFF)
+        for char in value
     ):
         raise ProjectRegistryError(f"{field} contains an invalid character")
     return value
@@ -382,17 +389,9 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
 
     @staticmethod
     def _publish(directory_fd: int, name: str, value: dict[str, object]) -> None:
-        try:
-            data = (
-                json.dumps(
-                    value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-                )
-                + "\n"
-            ).encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise ProjectRegistryError(
-                f"project record {name} contains invalid UTF-8 text"
-            ) from exc
+        data = (
+            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
         if len(data) > MAX_RECORD_SIZE:
             raise ProjectRegistryError(f"project record {name} is too large")
         atomic_publish_file(directory_fd, name, data, sync_directory=True)
@@ -748,7 +747,9 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
             "recorded_at",
         }:
             raise ProjectRegistryError("malformed project session reference")
-        _validate_text(value["session_id"], "session_id", 128)
+        _validate_text(
+            value["session_id"], "session_id", 128, allow_surrogates=True
+        )
         path = _validate_text(
             value["transcript_path"], "transcript_path", MAX_SCOPE_LENGTH
         )
@@ -759,7 +760,9 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
             raise ProjectRegistryError("invalid project session role")
         parent = value["parent_session_id"]
         if parent is not None:
-            _validate_text(parent, "parent_session_id", 128)
+            _validate_text(
+                parent, "parent_session_id", 128, allow_surrogates=True
+            )
         recorded = _validate_timestamp(value["recorded_at"], "recorded_at")
         return {
             "session_id": value["session_id"],

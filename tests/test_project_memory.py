@@ -203,27 +203,22 @@ def test_project_record_publish_rejects_oversized_data_without_replacing(
     assert record.read_bytes() == original
 
 
-def test_project_record_publish_rejects_invalid_utf8_without_replacing(
-    tmp_path: Path,
-) -> None:
+def test_project_record_publish_preserves_legacy_surrogate_text(tmp_path: Path) -> None:
     registry = ProjectRegistry(tmp_path / "projects")
     project = registry.create_project("demo", "scope")
     project_dir = registry.root / project.project_id
-    record = project_dir / "project.json"
-    original = record.read_bytes()
     value = registry._encode(project)
-    value["scope"] = "bad" + chr(0xD800)
+    value["scope"] = "legacy" + chr(0xD800)
     directory_fd = os.open(project_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        with pytest.raises(ProjectRegistryError, match="invalid UTF-8"):
-            registry._publish(directory_fd, "project.json", value)
+        registry._publish(directory_fd, "project.json", value)
     finally:
         os.close(directory_fd)
 
-    assert record.read_bytes() == original
+    assert registry.show_project(project.project_id).scope == value["scope"]
 
 
-def test_project_record_rejects_boolean_schema_version(tmp_path: Path) -> None:
+def test_project_record_loads_boolean_schema_version(tmp_path: Path) -> None:
     registry = ProjectRegistry(tmp_path / "projects")
     project = registry.create_project("demo", "scope")
     record = registry.root / project.project_id / "project.json"
@@ -231,8 +226,50 @@ def test_project_record_rejects_boolean_schema_version(tmp_path: Path) -> None:
     value["schema_version"] = True
     record.write_text(json.dumps(value), encoding="utf-8")
 
-    with pytest.raises(ProjectRegistryError, match="invalid project schema"):
-        registry.show_project(project.project_id)
+    assert registry.show_project(project.project_id) == project
+    assert registry.list_projects() == [project]
+
+
+@pytest.mark.parametrize("field", ("name", "scope"))
+def test_project_record_loads_legacy_surrogate_text(
+    tmp_path: Path, field: str
+) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    record = registry.root / project.project_id / "project.json"
+    value = json.loads(record.read_text(encoding="utf-8"))
+    value[field] += chr(0xD800)
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    loaded = registry.show_project(project.project_id)
+    assert getattr(loaded, field) == value[field]
+    assert registry.list_projects() == [loaded]
+
+
+def test_project_session_record_loads_legacy_surrogate_ids() -> None:
+    surrogate = chr(0xD800)
+    value = {
+        "session_id": "session" + surrogate,
+        "transcript_path": "/tmp/transcript",
+        "role": "worker",
+        "parent_session_id": "parent" + surrogate,
+        "recorded_at": "2026-01-01T00:00:00.000000Z",
+    }
+
+    assert ProjectRegistry._decode_session_link(value) == value
+
+
+def test_project_record_loads_project_id_shaped_legacy_name(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    record = registry.root / project.project_id / "project.json"
+    value = json.loads(record.read_text(encoding="utf-8"))
+    value["name"] = "p_" + "a" * 32
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    loaded = registry.show_project(project.project_id)
+    assert loaded.name == value["name"]
+    assert registry.list_projects() == [loaded]
 
 
 def test_project_name_cannot_match_project_id(tmp_path: Path) -> None:
