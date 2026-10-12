@@ -30,7 +30,7 @@ options. Move with `↑/↓` (or `j/k`). For the selected decision:
 
 A quick answer (an option or a typed line) is delivered to the asking
 orchestrator's inbox exactly like a discussion-fork decision, and the item
-closes. Quick answers work for decisions from any live session.
+closes. Quick answers work for decisions from any live session. If you answer an orchestrator's pending decision in the main chat, the orchestrator can call `resolve_attention` with the attention id and answer to close its own item without sending an inbox message.
 
 ## Discussing a decision
 

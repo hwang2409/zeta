@@ -157,3 +157,85 @@ def test_forged_fork_cannot_resolve_unbound_attention(tmp_path: Path) -> None:
     asyncio.run(registry.close())
     forged.store.close()
     original.store.close()
+
+
+def test_orchestrator_can_resolve_own_attention_without_inbox(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "Alpha")
+    original = _project_session(tmp_path, project.project_id)
+    record = AttentionStore(original.store.session_dir).request(
+        session_id=original.store.session_id,
+        project_id=project.project_id,
+        entry_id=None,
+        entry_seq=None,
+        title="Pick one",
+        why="Only the user can choose.",
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=original.store,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=manager.project_registry,
+    )
+    definition = registry.definitions_by_name["resolve_attention"]
+    assert "answered the decision in chat" in definition.description
+    result = asyncio.run(
+        definition.handler({"attention_id": record.id, "decision": "Use SQLite."})
+    )
+    repeated = asyncio.run(
+        definition.handler({"attention_id": record.id, "decision": "Use SQLite."})
+    )
+    resolved = AttentionStore(original.store.session_dir).get(record.id)
+    assert result["structuredContent"]["already_resolved"] is False
+    assert repeated["structuredContent"]["already_resolved"] is True
+    assert resolved.status == "resolved"
+    assert resolved.decision == "Use SQLite."
+    assert ProjectInbox(
+        manager.project_registry, sessions_root=tmp_path / "sessions"
+    ).new_ids(project.project_id, session_id=original.store.session_id) == ()
+    asyncio.run(registry.close())
+    original.store.close()
+
+
+def test_orchestrator_resolve_attention_rejects_unknown_and_foreign_items(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "Alpha")
+    original = _project_session(tmp_path, project.project_id)
+    other = _project_session(tmp_path, project.project_id)
+    record = AttentionStore(other.store.session_dir).request(
+        session_id=other.store.session_id,
+        project_id=project.project_id,
+        entry_id=None,
+        entry_seq=None,
+        title="Pick one",
+        why="Only the user can choose.",
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=original.store,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=manager.project_registry,
+    )
+    own_record = AttentionStore(original.store.session_dir).request(
+        session_id=original.store.session_id,
+        project_id=project.project_id,
+        entry_id=None,
+        entry_seq=None,
+        title="Pick two",
+        why="Only the user can choose.",
+    )
+    handler = registry.definitions_by_name["resolve_attention"].handler
+    with pytest.raises(ValueError, match="does not belong"):
+        asyncio.run(handler({"attention_id": record.id, "decision": "no"}))
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(handler({"attention_id": "0" * 32, "decision": "no"}))
+    with pytest.raises(ValueError, match="nonempty"):
+        asyncio.run(handler({"attention_id": own_record.id, "decision": "   "}))
+    assert "resolve_attention" in registry.registered_names
+    asyncio.run(registry.close())
+    other.store.close()
+    original.store.close()

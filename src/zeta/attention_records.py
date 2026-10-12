@@ -6,7 +6,7 @@ import json
 import os
 import stat
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -155,6 +155,27 @@ class AttentionStore:
         if not isinstance(value, dict):
             raise TypeError("attention record must be a JSON object")
         return AttentionRecord.from_dict(value)
+
+    def resolve(
+        self, attention_id: str, *, session_id: str, decision: str
+    ) -> tuple[AttentionRecord, bool]:
+        """Resolve one record owned by ``session_id`` without relaying it."""
+        decision = decision.strip()
+        if not decision:
+            raise ValueError("decision must be nonempty")
+        current = self.get(attention_id)
+        if current.session_id != session_id:
+            raise ValueError("attention record does not belong to this session")
+        if current.status == "resolved":
+            return current, True
+        resolved = replace(
+            current,
+            status="resolved",
+            resolved_at=_now(),
+            decision=decision,
+        )
+        self.replace(resolved)
+        return resolved, False
 
     def list(self) -> tuple[AttentionRecord, ...]:
         try:
