@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import io
 import json
 from pathlib import Path
@@ -129,6 +130,42 @@ async def test_project_inspect_reads_fixture_format_two_state(tmp_path: Path) ->
     assert memory["entries"][0]["text"] == "Automatic state"
 
 
+def test_resolve_command_is_atomic_and_undo_restores_batch(tmp_path: Path) -> None:
+    _, registry, project_id, state_id, decision_id = _fixture(tmp_path)
+    authorization = MemoryMutationAuthorization.direct_slash()
+    before = registry._entry_memory_state(project_id)
+    unknown_id = "m_" + "f" * 32
+
+    result = run_memory_command(
+        registry,
+        project_id,
+        f"resolve {state_id} {unknown_id}",
+        authorization=authorization,
+    )
+
+    assert "missing entry" in result
+    assert registry._entry_memory_state(project_id).digest == before.digest
+
+    assert run_memory_command(
+        registry,
+        project_id,
+        f"resolve {state_id} {decision_id}",
+        authorization=authorization,
+    ) == f"memory resolved: {state_id}, {decision_id}"
+    resolved = registry._entry_memory_state(project_id)
+    assert resolved.state.entries[state_id].status == "resolved"  # type: ignore[union-attr]
+    assert resolved.state.entries[decision_id].status == "resolved"  # type: ignore[union-attr]
+    operation = registry._entry_memory_log(project_id, limit=1)[0]["operations"][0]
+    assert operation["target_ids"] == [state_id, decision_id]
+
+    assert "memory undo complete" in run_memory_command(
+        registry, project_id, "undo", authorization=authorization
+    )
+    restored = registry._entry_memory_state(project_id).state
+    assert restored.entries[state_id].status == "active"  # type: ignore[union-attr]
+    assert restored.entries[decision_id].status == "active"  # type: ignore[union-attr]
+
+
 def test_entry_commands_parse_targets_and_render_receipts(tmp_path: Path) -> None:
     _, registry, project_id, state_id, _ = _fixture(tmp_path)
     log = run_memory_command(registry, project_id, f"log {state_id}")
@@ -206,6 +243,35 @@ def test_cli_format_two_render_set_and_import_internals(
         entry["text"] == "Imported decision"
         for entry in json.loads(output.getvalue())["entries"]
     )
+
+
+def test_cli_resolve_records_reason_for_one_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_id, state_id, decision_id = _fixture(tmp_path)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setattr(project_cli.sys, "stdin", _TTY("resolve\n"))
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    project_cli.add_subcommand(commands)
+    args = parser.parse_args(
+        [
+            "project",
+            "memory",
+            project_id,
+            "resolve",
+            state_id,
+            decision_id,
+            "--reason",
+            "reviewed cleanup",
+        ]
+    )
+
+    assert project_cli.run(args, stdout=_TTY(), stderr=io.StringIO()) == 0
+    operation = registry._entry_memory_log(project_id, limit=1)[0]["operations"][0]
+    assert operation["type"] == "resolve"
+    assert operation["target_ids"] == [state_id, decision_id]
+    assert operation["reason"] == "reviewed cleanup"
 
 
 def test_entry_accept_confirmation_targets_entry_id(tmp_path: Path) -> None:

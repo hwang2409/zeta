@@ -31,12 +31,12 @@ def _kind(
 
 
 _ZETA = MemorySchema(
-    version=3,
+    version=4,
     profile="zeta",
     kinds=(
         _kind("brief", "Brief", "Stable project purpose, architecture, and invariants.", "always", 100, 100),
         _kind("decisions", "Decisions", "Binding user decisions, validated procedures, and failure lessons.", "always", 90, 100),
-        _kind("state", "Current state", "Current project and active work state, not progress narration. Supersede or resolve progress reports when completion evidence arrives.", "recent", 80, 100, 30),
+        _kind("state", "Current state", "Current project and active work state, not progress narration. Supersede or resolve progress reports when completion evidence arrives.", "recent", 80, 100, 7),
         _kind("backlog", "Backlog", "Open follow-up work that remains actionable. Resolve completed items instead of retaining progress narration.", "recent", 70, 100, 60),
         _kind("changelog", "Changelog", "Completed durable outcomes.", "recent", 40, 100, 180),
     ),

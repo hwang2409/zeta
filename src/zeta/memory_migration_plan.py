@@ -273,6 +273,7 @@ def build_migration_plan(
                 "updated_at": migrated_at,
                 "seen_at": migrated_at,
                 "expires_at": None,
+                "expiry_is_default": False,
                 "valid_from": migrated_at,
                 "valid_until": None,
                 "supersedes": [],

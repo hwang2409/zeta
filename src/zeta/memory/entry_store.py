@@ -108,6 +108,7 @@ class MemoryEntry:
     updated_at: str
     seen_at: str
     expires_at: str | None
+    expiry_is_default: bool | None
     valid_from: str
     valid_until: str | None
     supersedes: tuple[str, ...]
@@ -331,6 +332,8 @@ def _validate_entry(entry: MemoryEntry, state: MemoryState, kinds: set[str]) -> 
         _timestamp(value)
     for value in (entry.expires_at, entry.valid_until, entry.accepted_at):
         _timestamp(value, optional=True)
+    if entry.expiry_is_default is not None and type(entry.expiry_is_default) is not bool:
+        _fail("invalid memory entry expiry provenance")
     if entry.section is not None:
         _safe_text(entry.section, maximum=256, label="entry section")
         if "\n" in entry.section or entry.section.startswith("#"):
@@ -452,7 +455,7 @@ def _source_dict(source: MemorySource) -> dict[str, object]:
 def _entry_dict(entry: MemoryEntry | MissingEntry) -> dict[str, object]:
     if isinstance(entry, MissingEntry):
         return {"id": entry.id, "missing": True}
-    return {
+    value: dict[str, object] = {
         "id": entry.id,
         "project_id": entry.project_id,
         "kind": entry.kind,
@@ -463,6 +466,7 @@ def _entry_dict(entry: MemoryEntry | MissingEntry) -> dict[str, object]:
         "updated_at": entry.updated_at,
         "seen_at": entry.seen_at,
         "expires_at": entry.expires_at,
+        "expiry_is_default": entry.expiry_is_default,
         "valid_from": entry.valid_from,
         "valid_until": entry.valid_until,
         "supersedes": list(entry.supersedes),
@@ -478,6 +482,9 @@ def _entry_dict(entry: MemoryEntry | MissingEntry) -> dict[str, object]:
             None if entry.migration_source is None else dataclasses.asdict(entry.migration_source)
         ),
     }
+    if entry.expiry_is_default is None:
+        value.pop("expiry_is_default")
+    return value
 
 
 def state_to_dict(state: MemoryState) -> dict[str, object]:
@@ -538,13 +545,16 @@ def state_from_bytes(payload: bytes) -> MemoryState:
         "prompt_max_entries", "default_expiry_days",
     }
     kinds = tuple(MemoryKind(**_exact_dict(item, kind_fields, "memory kind")) for item in schema_raw["kinds"])
+    schema = MemorySchema(
+        version=schema_raw["version"], profile=schema_raw["profile"], kinds=kinds
+    )
     if not isinstance(root["entries"], dict):
         _fail("invalid memory entries")
     entries: dict[str, MemoryEntry | MissingEntry] = {}
     entry_fields = {
         "id", "project_id", "kind", "text", "representation", "status",
-        "created_at", "updated_at", "seen_at", "expires_at", "valid_from",
-        "valid_until", "supersedes", "superseded_by", "sources", "automatic",
+        "created_at", "updated_at", "seen_at", "expires_at", "expiry_is_default",
+        "valid_from", "valid_until", "supersedes", "superseded_by", "sources", "automatic",
         "accepted_at", "accepted_by", "last_operation_id", "section",
         "migration_order", "migration_source",
     }
@@ -557,7 +567,11 @@ def state_from_bytes(payload: bytes) -> MemoryState:
             marker = _exact_dict(item, {"id", "missing"}, "missing memory entry")
             entries[entry_id] = MissingEntry(str(marker["id"]))
             continue
-        value = _exact_dict(item, entry_fields, "memory entry")
+        if isinstance(item, dict) and set(item) == entry_fields - {"expiry_is_default"}:
+            value = dict(item)
+            value["expiry_is_default"] = None
+        else:
+            value = _exact_dict(item, entry_fields, "memory entry")
         sources_raw = value["sources"]
         if (
             not isinstance(sources_raw, list)
@@ -599,9 +613,7 @@ def state_from_bytes(payload: bytes) -> MemoryState:
         format=root["format"],
         project_id=root["project_id"],
         generation=root["generation"],
-        schema=MemorySchema(
-            version=schema_raw["version"], profile=schema_raw["profile"], kinds=kinds
-        ),
+        schema=schema,
         entries=entries,
         compacted_through_version=root["compacted_through_version"],
     )
@@ -705,6 +717,30 @@ def _active(entries: Mapping[str, MemoryEntry | MissingEntry], entry_id: str) ->
     return entry
 
 
+def _default_expiry(
+    schema: MemorySchema,
+    kind: object,
+    *,
+    automatic: object,
+    seen_at: object,
+) -> str | None:
+    default_days = next(
+        (
+            item.default_expiry_days
+            for item in schema.kinds
+            if item.key == kind
+        ),
+        None,
+    )
+    if automatic is not True or default_days is None or not isinstance(seen_at, str):
+        return None
+    try:
+        instant = dt.datetime.fromisoformat(seen_at) + dt.timedelta(days=default_days)
+    except ValueError:
+        return None
+    return instant.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 def _new_expiry(
     state: MemoryState,
     kind: str,
@@ -715,31 +751,24 @@ def _new_expiry(
 ) -> str | None:
     if not isinstance(value, _Unset):
         return value
-    default_days = next(
-        (
-            item.default_expiry_days
-            for item in state.schema.kinds
-            if item.key == kind
-        ),
-        None,
+    return _default_expiry(
+        state.schema, kind, automatic=automatic, seen_at=seen_at
     )
-    if not automatic or default_days is None:
-        return None
-    instant = dt.datetime.fromisoformat(seen_at) + dt.timedelta(days=default_days)
-    return instant.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _new_entry(
     *, project_id: str, kind: str, text: str, sources: tuple[MemorySource, ...],
     automatic: bool, now: str, operation_id: str, entry_id: str,
-    expires_at: str | None, valid_from: str | None, valid_until: str | None,
+    expires_at: str | None, expiry_is_default: bool,
+    valid_from: str | None, valid_until: str | None,
     supersedes: tuple[str, ...] = (),
 ) -> MemoryEntry:
     seen_at = max((source.observed_at for source in sources), default=now)
     return MemoryEntry(
         id=entry_id, project_id=project_id, kind=kind, text=text,
         representation="entry", status="active", created_at=now, updated_at=now,
-        seen_at=seen_at, expires_at=expires_at, valid_from=valid_from or now,
+        seen_at=seen_at, expires_at=expires_at,
+        expiry_is_default=expiry_is_default, valid_from=valid_from or now,
         valid_until=valid_until, supersedes=supersedes, superseded_by=(),
         sources=sources, automatic=automatic,
         accepted_at=None if automatic else now,
@@ -795,6 +824,7 @@ def apply_operations(
                         default=now,
                     ),
                 ),
+                expiry_is_default=isinstance(operation.expires_at, _Unset),
                 valid_from=operation.valid_from,
                 valid_until=(
                     None if isinstance(operation.valid_until, _Unset)
@@ -815,30 +845,27 @@ def apply_operations(
             )
             kind = entry.kind if operation.kind is None else operation.kind
             expires_at = operation.expires_at
-            if isinstance(expires_at, _Unset):
-                prior_default = _new_expiry(
-                    state,
-                    entry.kind,
-                    UNSET,
-                    automatic=entry.automatic,
-                    seen_at=entry.seen_at,
-                )
+            expiry_is_default: bool | None = isinstance(expires_at, _Unset)
+            if expiry_is_default:
+                prior_is_default = entry.expiry_is_default
                 expires_at = (
                     _new_expiry(
                         state,
                         kind,
                         UNSET,
-                        automatic=automatic,
+                        automatic=entry.automatic,
                         seen_at=seen_at,
                     )
-                    if entry.expires_at == prior_default
+                    if prior_is_default
                     else entry.expires_at
                 )
+                expiry_is_default = prior_is_default
             entries[entry.id] = replace(
                 entry,
                 text=entry.text if operation.text is None else operation.text,
                 kind=kind,
                 expires_at=expires_at,
+                expiry_is_default=expiry_is_default,
                 valid_from=entry.valid_from if operation.valid_from is None else operation.valid_from,
                 valid_until=(
                     entry.valid_until if isinstance(operation.valid_until, _Unset)
@@ -875,6 +902,7 @@ def apply_operations(
                         default=now,
                     ),
                 ),
+                expiry_is_default=isinstance(operation.expires_at, _Unset),
                 valid_from=operation.valid_from,
                 valid_until=(
                     None if isinstance(operation.valid_until, _Unset)
@@ -952,6 +980,45 @@ def accept_entry(
     result = replace(state, generation=state.generation + 1, entries=entries)
     receipt = OperationReceipt(
         operation_id, "accept", (entry_id,), (entry_id,), "accepted by user", None, False
+    )
+    canonical_state_bytes(result)
+    validate_receipt(receipt)
+    return result, receipt
+
+
+def resolve_entries(
+    state: MemoryState,
+    entry_ids: tuple[str, ...],
+    *,
+    reason: str = "resolved by user",
+    now: str | None = None,
+) -> tuple[MemoryState, OperationReceipt]:
+    """Resolve one user-selected batch as one atomic, undoable operation."""
+    if not entry_ids or len(set(entry_ids)) != len(entry_ids):
+        _fail("invalid memory resolve targets")
+    targets = tuple(_active(state.entries, entry_id) for entry_id in entry_ids)
+    reason = _safe_text(reason, maximum=MAX_REASON_BYTES, label="operation reason")
+    now = now or utc_now()
+    _timestamp(now)
+    operation_id = new_operation_id()
+    entries = dict(state.entries)
+    for entry in targets:
+        entries[entry.id] = replace(
+            entry,
+            status="resolved",
+            updated_at=now,
+            valid_until=now,
+            last_operation_id=operation_id,
+        )
+    result = replace(state, generation=state.generation + 1, entries=entries)
+    receipt = OperationReceipt(
+        operation_id,
+        "resolve",
+        entry_ids,
+        (),
+        reason,
+        None,
+        False,
     )
     canonical_state_bytes(result)
     validate_receipt(receipt)

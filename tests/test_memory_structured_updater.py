@@ -136,6 +136,17 @@ async def _run(
     return result, prompts
 
 
+def test_reconciler_prompt_rejects_transient_progress_narration(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = registry._entry_memory_state(project_id).state
+
+    request = _prepare_request(_transcript(), state, as_of=date(2026, 10, 9))
+
+    assert "Do not record transient progress" in request.prompt
+    assert "same PR, branch, worker, or task" in request.prompt
+    assert "Record outcomes" in request.prompt
+
+
 def _entries(registry: ProjectRegistry, project_id: str) -> list[MemoryEntry]:
     return [
         entry
@@ -179,7 +190,7 @@ def _crowded_priority_state(
         AddOperation(
             kind,
             text,
-            (MemorySource(SESSION, 1, 1, ("user",), "2026-10-01T12:00:00.000000Z", 2),),
+            (MemorySource(SESSION, 1, 1, ("user",), "2026-10-02T12:00:00.000000Z", 2),),
         )
         for kind, text in targets
     )
@@ -188,7 +199,7 @@ def _crowded_priority_state(
         target_operations,
         reconciliation_key=_key("relevance-targets"),
         automatic=True,
-        now="2026-10-01T12:00:00.000000Z",
+        now="2026-10-02T12:00:00.000000Z",
     )
     filler = tuple(
         AddOperation(
@@ -700,7 +711,7 @@ def test_zeta_and_messaging_profiles_apply_distinct_defaults() -> None:
         AutoMemoryConfig(early_trigger_max_wait_seconds=0)
     assert (
         next(kind for kind in zeta.kinds if kind.key == "state").default_expiry_days
-        == 30
+        == 7
     )
     assert (
         next(
@@ -728,7 +739,7 @@ def test_zeta_and_messaging_profiles_apply_distinct_defaults() -> None:
         now=NOW,
     )
     assert next(iter(zeta_state.entries.values())).expires_at == (
-        "2026-11-07T12:00:00.000000Z"
+        "2026-10-15T12:00:00.000000Z"
     )
     assert next(iter(messaging_state.entries.values())).expires_at == (
         "2027-01-06T12:00:00.000000Z"
@@ -766,7 +777,7 @@ def test_default_expiry_uses_seen_at_and_support_extends_only_default() -> None:
     default_entry, explicit_entry = state.entries.values()
     assert isinstance(default_entry, MemoryEntry)
     assert isinstance(explicit_entry, MemoryEntry)
-    assert default_entry.expires_at == "2026-10-31T12:00:00.000000Z"
+    assert default_entry.expires_at == "2026-10-08T12:00:00.000000Z"
 
     support = (
         MemorySource(
@@ -792,7 +803,7 @@ def test_default_expiry_uses_seen_at_and_support_extends_only_default() -> None:
     preserved_explicit = updated.entries[explicit_entry.id]
     assert isinstance(refreshed_default, MemoryEntry)
     assert isinstance(preserved_explicit, MemoryEntry)
-    assert refreshed_default.expires_at == "2026-11-09T12:00:00.000000Z"
+    assert refreshed_default.expires_at == "2026-10-17T12:00:00.000000Z"
     assert preserved_explicit.expires_at == "2026-10-20T12:00:00.000000Z"
 
 
@@ -1236,7 +1247,7 @@ async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> N
     opened = next(
         entry for entry in _entries(registry, project_id) if entry.status == "active"
     )
-    assert opened.expires_at == "2026-11-07T12:00:00.000000Z"
+    assert opened.expires_at == "2026-10-15T12:00:00.000000Z"
 
     supersede = {
         "op": "supersede",

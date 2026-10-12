@@ -357,6 +357,10 @@ Rules:
 - Source items contain exactly seq_start and seq_end. Use existing entry IDs only.
   You may only update, supersede, or resolve entries listed below. Other active
   entries can exist, but their IDs and contents are intentionally unavailable.
+- Do not record transient progress such as started, running, pending CI, worker
+  launched, or under review. For the same PR, branch, worker, or task, supersede
+  or resolve a visible entry instead of adding another entry.
+  Record outcomes such as merged, decided, or failed with a cause.
 - Supersede incompatible prior facts. Resolve completed state, backlog, threads,
   and commitments. Do not preserve progress narration after completion.
 - Text must be declarative data. Validated commands and procedures are durable
