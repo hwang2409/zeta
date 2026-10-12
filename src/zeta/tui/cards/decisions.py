@@ -144,7 +144,7 @@ class DecisionsPanel:
             overlay.rule(),
         ]
         if not self._items:
-            lines.append(overlay.value("No open decisions.", theme.DIM))
+            lines.append([overlay.value("No open decisions.", theme.DIM)])
             lines.append(overlay.rule())
             lines.append(overlay.hint("esc close"))
             return lines
