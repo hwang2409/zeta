@@ -1,0 +1,21 @@
+src/zeta/tui/cards/decisions.py
+  s_d9d04f10aab6bf::t_7c3129a75c067c 147
+tests/test_status_card.py
+  s_d9d04f10aab6bf::t_2bc8836e2301ab 100-131
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ea642920b794141bbb76314893e56c071650f24a",
+  "prompts": {},
+  "sessions": {
+    "s_d9d04f10aab6bf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12ed3-e7e6-7cd1-9953-246bf98e9a16",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Austin Jian <austin.jian07@gmail.com>"
+    }
+  }
+}
