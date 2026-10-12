@@ -306,12 +306,12 @@ class TUIApp(
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._history_finder = HistoryFinder(
-            self._history_path, on_accept=self._clear_pending_attachments
+            self._history_path, on_accept=lambda: app._clear_pending_attachments()
         )
         self._active_finder = self._transcript
         self._status_card = OverlayControl()
         self._finder_control = FinderControl(
-            lambda: self._active_finder.finder_state()
+            lambda: app._active_finder.finder_state()
         )
         self._finder_prepare_task: asyncio.Task[None] | None = None
         self._finder_rank_task: asyncio.Task[None] | None = None
