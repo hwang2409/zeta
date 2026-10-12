@@ -210,7 +210,7 @@ async def test_fetch_decodes_gzip_response_from_raw_stream(
 @pytest.mark.parametrize(
     ("encoding", "compressed", "expected"),
     [
-        ("gzip", gzip.compress(b"gzip response"), "gzip response"),
+        ("gzip", gzip.compress(b"gzip response", mtime=0), "gzip response"),
         ("deflate", zlib.compress(b"zlib response"), "zlib response"),
         (
             "deflate",

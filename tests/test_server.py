@@ -1984,6 +1984,7 @@ async def test_parameterless_new_session_uses_server_defaults_after_override(
 @pytest.mark.asyncio
 async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     parent_call = ToolCall(
         "agent-one",
@@ -2004,6 +2005,16 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
+    assert server._client is not None
+    agent_end_published = asyncio.Event()
+    original_notify = server._client._notify
+
+    async def notify(event: str, *args: object, **kwargs: object) -> None:
+        await original_notify(event, *args, **kwargs)
+        if event == "agent_end":
+            agent_end_published.set()
+
+    monkeypatch.setattr(server._client, "_notify", notify)
     old_session_id = server.runtime.session_id
     assert server.runtime.opened is not None
     for index in range(300):
@@ -2016,6 +2027,7 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
         assert approval["delegated"] is True
         # A child approval and per-provider turn_end do not signal that the
         # parent agent loop is idle. agent_end is the session-swap handoff.
+        await asyncio.wait_for(agent_end_published.wait(), timeout=30)
         await _event(reader, "agent_end")
         swap_frames = await _request(reader, writer, 4, "new_session", {"provider": "codex"})
         new_session_id = swap_frames[-1]["result"]["session"]["session_id"]
