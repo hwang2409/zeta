@@ -1,0 +1,44 @@
+src/zeta/core/approval.py
+  s_d9d04f10aab6bf::t_4635c3f61a55e1 240,293,324,332,335-339
+  s_d9d04f10aab6bf::t_ede11bc8c2068d 340
+docs/safety.md
+  s_d9d04f10aab6bf::t_f249201a479ce2 52
+  s_d9d04f10aab6bf::t_4635c3f61a55e1 43-51,53-66
+src/zeta/tui/cards/approval_card.py
+  s_d9d04f10aab6bf::t_4635c3f61a55e1 72
+  s_d9d04f10aab6bf::t_8ed3e46c67800c 80-82
+tests/test_permissions.py
+  s_d9d04f10aab6bf::t_e50bc934ab3349 27-28,49-50,54-58,62-67,70-71,76-79,103-106,115-123,131-133,135-138,148-150,155-158,161-173,180-190,192-201,211-214,220-230,244-249
+  s_d9d04f10aab6bf::t_f249201a479ce2 21,36-38,43,97-98,110,154,159,216,231,236
+  s_d9d04f10aab6bf::t_cabf5e0cfae88d 1-20,22-26,29-35,39-42,44-48,51-53,59-61,68-69,72-75,80-96,99-102,107-109,111-114,124-130,134,139-147,151-153,160,174-179,191,202-210,215,217-219,232-235,237-243,250-254
+src/zeta/submission/pipeline.py
+  s_d9d04f10aab6bf::t_4635c3f61a55e1 982,990-992
+src/zeta/tui/app.py
+  s_d9d04f10aab6bf::t_e50bc934ab3349 138-139
+  s_d9d04f10aab6bf::t_8ed3e46c67800c 124-125,127,130,132-137,140-141,300
+src/zeta/tui/slash_handlers/__init__.py
+  s_d9d04f10aab6bf::t_4635c3f61a55e1 16,34,51,58-69
+  s_d9d04f10aab6bf::t_4812340ce93677 70
+src/zeta/core/slash.py
+  s_d9d04f10aab6bf::t_8ed3e46c67800c 1142,1234-1235
+  s_d9d04f10aab6bf::t_e50bc934ab3349 1144
+src/zeta/tui/slash_handlers/permissions.py
+  s_d9d04f10aab6bf::t_4635c3f61a55e1 1-48,50-71
+  s_d9d04f10aab6bf::t_f249201a479ce2 49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bc8ed4f4aab3749ecb1c4e234abe09c451f54ed8",
+  "prompts": {},
+  "sessions": {
+    "s_d9d04f10aab6bf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12ed3-e7e6-7cd1-9953-246bf98e9a16",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Austin Jian <austin.jian07@gmail.com>"
+    }
+  }
+}
