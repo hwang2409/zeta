@@ -30,7 +30,6 @@ from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
-from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
@@ -5080,22 +5079,63 @@ async def test_composer_history_search_is_disabled(tmp_path: Path, key: str) -> 
         await task
 
 
-def test_vi_navigation_ctrl_r_binding_does_not_shadow_redo() -> None:
-    bindings = build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None)
-    session = PromptSession(
-        editing_mode=EditingMode.VI,
-        key_bindings=bindings,
-    )
-    with set_app(session.app):
-        session.app.vi_state.input_mode = InputMode.NAVIGATION
-        no_op = [
-            binding
-            for binding in bindings.bindings
-            if Keys.ControlR in binding.keys
-            and binding.handler.__name__ == "disable_emacs_history_search"
-        ]
-        assert no_op
-        assert not no_op[-1].filter()
+@pytest.mark.asyncio
+async def test_vi_navigation_ctrl_r_redoes(tmp_path: Path) -> None:
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text("abc\x1b")
+        await wait_until(lambda: session.default_buffer.text == "abc")
+        pipe.send_text("u")  # vi undo removes the last inserted character
+        await wait_until(lambda: session.default_buffer.text == "ab")
+        pipe.send_text("\x12")  # ctrl+r in navigation mode: redo
+        await wait_until(lambda: session.default_buffer.text == "abc")
+        assert session.app.current_buffer is session.default_buffer
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keys", ["\x12z", "\x13z", "\x1b\x13iz"])
+async def test_vi_ctrl_history_search_is_disabled(tmp_path: Path, keys: str) -> None:
+    # ctrl+r / ctrl+s in vi insert mode, and ctrl+s in vi navigation mode.
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text(keys)
+        await wait_until(lambda: session.default_buffer.text == "z")
+        assert session.app.current_buffer is session.default_buffer
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_vi_insert_mode_inserts_search_characters(tmp_path: Path) -> None:
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text("a/b?")
+        await wait_until(lambda: session.default_buffer.text == "a/b?")
+        session.app.exit()
+        await task
 
 
 @pytest.mark.asyncio

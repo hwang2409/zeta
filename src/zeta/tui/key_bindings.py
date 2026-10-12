@@ -485,8 +485,8 @@ def build_key_bindings(
         )
 
     @Condition
-    def composer_emacs_mode() -> bool:
-        return has_focus(DEFAULT_BUFFER)() and get_app().editing_mode is EditingMode.EMACS
+    def composer_focused() -> bool:
+        return has_focus(DEFAULT_BUFFER)()
 
     @Condition
     def composer_vi_navigation_mode() -> bool:
@@ -497,10 +497,24 @@ def build_key_bindings(
         )
 
     # One key per add(): add("c-r", "c-s") would bind the two-key sequence.
-    @bindings.add("c-r", filter=composer_emacs_mode, eager=True)
-    @bindings.add("c-s", filter=composer_emacs_mode, eager=True)
-    def disable_emacs_history_search(_event: KeyPressEvent) -> None:
+    # prompt_toolkit's search bindings own ctrl+r/ctrl+s in emacs mode and in
+    # both vi modes, so disable them for the whole composer.
+    @bindings.add("c-r", filter=composer_focused & ~composer_vi_navigation_mode, eager=True)
+    @bindings.add("c-s", filter=composer_focused, eager=True)
+    def disable_history_search_keys(_event: KeyPressEvent) -> None:
         pass
+
+    # Vi navigation ctrl+r is redo; keep it once the search binding is gone.
+    # save_before=False: the default undo snapshot would clear the redo stack.
+    @bindings.add(
+        "c-r",
+        filter=composer_vi_navigation_mode,
+        eager=True,
+        save_before=lambda _event: False,
+    )
+    def vi_redo(event: KeyPressEvent) -> None:
+        for _ in range(event.arg):
+            event.current_buffer.redo()
 
     @bindings.add("/", filter=composer_vi_navigation_mode, eager=True)
     @bindings.add("?", filter=composer_vi_navigation_mode, eager=True)
