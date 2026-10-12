@@ -396,6 +396,121 @@ async def test_concurrent_pastes_insert_in_invocation_order(
 
 
 @pytest.mark.asyncio
+async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    buffer = session.default_buffer
+    paths = [
+        store.session_dir / f"clipboard-{name}.png"
+        for name in ("first", "second", "third")
+    ]
+    lock = threading.Lock()
+    all_staged = threading.Event()
+    release = threading.Event()
+    next_path = iter(paths)
+    staged_count = 0
+
+    def stage(*args: object, **kwargs: object) -> Path:
+        nonlocal staged_count
+        del args, kwargs
+        with lock:
+            path = next(next_path)
+            staged_count += 1
+            if staged_count == 3:
+                all_staged.set()
+        path.write_bytes(PNG)
+        release.wait()
+        return path
+
+    monkeypatch.setattr(paste_runtime, "paste_image", stage)
+    tasks = [app._paste_runtime.start(buffer) for _ in range(3)]
+    staged_concurrently = await asyncio.to_thread(all_staged.wait, 1)
+    if not staged_concurrently:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    assert staged_concurrently
+    tasks[1].cancel()
+    release.set()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert isinstance(results[1], asyncio.CancelledError)
+    assert buffer.text == "[Image #1][Image #2]"
+    assert list(app._pending_attachment_tokens.values()) == [paths[0], paths[2]]
+    assert paths[0].exists()
+    assert not paths[1].exists()
+    assert paths[2].exists()
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_paste_completion_file_io_stays_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.tui import _attachments
+
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    paths = iter(
+        [
+            store.session_dir / "clipboard-current.png",
+            store.session_dir / "clipboard-stale.png",
+        ]
+    )
+    loop_thread = threading.get_ident()
+    io_threads: list[int] = []
+    real_fdopen = _attachments.os.fdopen
+    real_unlink = paste_runtime.os.unlink
+    real_b64encode = _attachments.base64.b64encode
+
+    def stage(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        path = next(paths)
+        path.write_bytes(PNG)
+        return path
+
+    def fdopen(*args: object, **kwargs: object) -> object:
+        io_threads.append(threading.get_ident())
+        return real_fdopen(*args, **kwargs)
+
+    def unlink(*args: object, **kwargs: object) -> None:
+        io_threads.append(threading.get_ident())
+        real_unlink(*args, **kwargs)
+
+    def b64encode(data: bytes) -> bytes:
+        io_threads.append(threading.get_ident())
+        return real_b64encode(data)
+
+    monkeypatch.setattr(paste_runtime, "paste_image", stage)
+    monkeypatch.setattr(_attachments.os, "fdopen", fdopen)
+    monkeypatch.setattr(paste_runtime.os, "unlink", unlink)
+    monkeypatch.setattr(_attachments.base64, "b64encode", b64encode)
+
+    assert await app.paste_from_clipboard() == "[Image #1]"
+    old_session = app._make_session()
+    app._active_session = old_session
+    task = app._paste_runtime.start()
+    app._active_session = app._make_session()
+    assert await task == ""
+
+    assert io_threads
+    assert all(thread != loop_thread for thread in io_threads)
+    assert not (store.session_dir / "clipboard-stale.png").exists()
+    await app.close()
+
+
+@pytest.mark.asyncio
 async def test_session_switch_drops_staged_paste(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from prompt_toolkit.buffer import Buffer
 
-from .._attachments import AttachmentError, paste_image
+from ...protocol.types import ImageContent
+from .._attachments import AttachmentError, _read_attachment, paste_image
+
+
+@dataclass(frozen=True, slots=True)
+class StagedImage:
+    path: Path
+    content: ImageContent
 
 
 class PasteRuntime:
@@ -90,29 +98,25 @@ class PasteRuntime:
         cursor_position: int | None,
         notify: bool,
     ) -> str:
-        if previous is not None:
-            await asyncio.gather(previous, return_exceptions=True)
-
         host = self._host
-        session_dir = host.loop.store.session_dir
-        directory_fd = host.loop.store.directory_fd
-        worker = asyncio.create_task(
-            asyncio.to_thread(
-                paste_image,
-                session_dir,
-                directory_fd=directory_fd,
-            )
-        )
-        path: Path | None = None
+        store = host.loop.store
+        session_dir = store.session_dir
+        directory_fd = store.directory_fd
+        worker = asyncio.create_task(asyncio.to_thread(self._stage, store))
+        staged: StagedImage | None = None
         try:
-            path = await asyncio.shield(worker)
+            if previous is not None:
+                await asyncio.gather(asyncio.shield(previous), return_exceptions=True)
+            staged = await asyncio.shield(worker)
         except asyncio.CancelledError:
             try:
-                path = await worker
+                staged = await worker
             except (AttachmentError, OSError):
                 pass
-            if path is not None:
-                self._delete_staged(path, session_dir, directory_fd)
+            if staged is not None:
+                await asyncio.to_thread(
+                    self._delete_staged, staged.path, session_dir, directory_fd
+                )
             raise
         except AttachmentError as exc:
             result = f"paste unavailable: {exc}"
@@ -121,19 +125,30 @@ class PasteRuntime:
             return result
 
         if not self._is_current(generation, buffer_generation, session, buffer):
-            self._delete_staged(path, session_dir, directory_fd)
+            await asyncio.to_thread(
+                self._delete_staged, staged.path, session_dir, directory_fd
+            )
             return ""
 
-        result = host._finish_image_paste(path)
-        if not result.startswith("[Image #"):
-            self._delete_staged(path, session_dir, directory_fd)
-            if notify:
-                self._publish_notice(result)
-            return result
+        result = host._finish_image_paste(staged)
         if buffer is not None and cursor_position is not None:
             self._insert(buffer, cursor_position, result)
             return ""
         return result
+
+    @staticmethod
+    def _stage(store: Any) -> StagedImage:
+        path = paste_image(store.session_dir, directory_fd=store.directory_fd)
+        try:
+            content = _read_attachment(path, store)
+            if not isinstance(content, ImageContent):
+                raise AttachmentError("clipboard image could not be decoded")
+            return StagedImage(path, content)
+        except (AttachmentError, OSError):
+            PasteRuntime._delete_staged(
+                path, store.session_dir, store.directory_fd
+            )
+            raise
 
     def _is_current(
         self,
@@ -184,4 +199,4 @@ class PasteRuntime:
                 pass
 
 
-__all__ = ["PasteRuntime"]
+__all__ = ["PasteRuntime", "StagedImage"]

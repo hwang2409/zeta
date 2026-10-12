@@ -62,6 +62,7 @@ from .key_bindings import (
     VimCursorShapeConfig,
     build_key_bindings,
 )
+from .paste_runtime import StagedImage
 from .render import is_retryable_error, render_event
 from .user import displayed_user_text, user_message
 
@@ -482,19 +483,11 @@ class ComposerAttachmentMixin:
             return value
         return f".../{path.name}"[-80:]
 
-    def _finish_image_paste(self, path: Path) -> str:
-        try:
-            attachment = build_user_message(
-                "paste", self.loop.store.cwd, (path,), session_store=self.loop.store
-            ).content[1]
-        except AttachmentError as exc:
-            return f"paste unavailable: {exc}"
-        if not isinstance(attachment, ImageContent):
-            return "paste unavailable: clipboard image could not be decoded"
+    def _finish_image_paste(self, staged: StagedImage) -> str:
         token = f"[Image #{self._next_image_token}]"
         self._next_image_token += 1
-        self._pending_attachments.append(path)
-        self._pending_attachment_tokens[token] = path
+        self._pending_attachments.append(staged.path)
+        self._pending_attachment_tokens[token] = staged.path
         return token
 
     async def slash_paste(self, args: str) -> str:
