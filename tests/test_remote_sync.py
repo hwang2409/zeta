@@ -45,6 +45,7 @@ from zeta.remote_sync.project_publish import (
     ProjectPublicationError,
     materialize_project_transfer,
     prepare_project_transfer,
+    project_digest,
     transfer_digest,
 )
 from zeta.remote_sync.project_publish import (
@@ -643,6 +644,30 @@ def _legacy_project_digest(root: Path) -> str:
             while chunk := stream.read(1024 * 1024):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def test_project_digest_ignores_live_atomic_temporary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    memory = project / "memory"
+    memory.mkdir(parents=True)
+    (project / "project.json").write_text("record\n", encoding="utf-8")
+    expected = project_digest(project)
+    temporary = memory / ".state.md.writer.tmp"
+    temporary.write_text("in flight\n", encoding="utf-8")
+    real_is_file = Path.is_file
+
+    def rename_before_hash(path: Path) -> bool:
+        result = real_is_file(path)
+        if path == temporary:
+            temporary.unlink()
+        return result
+
+    monkeypatch.setattr(Path, "is_file", rename_before_hash)
+
+    assert project_digest(project) == expected
+    assert temporary.exists()
 
 
 def test_project_tree_digests_frame_file_boundaries(tmp_path: Path) -> None:

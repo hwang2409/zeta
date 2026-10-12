@@ -58,6 +58,8 @@ def prepare_project_transfer(project: Path) -> PreparedTransfer:
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:gz") as archive:
         for path in sorted(project.rglob("*")):
+            if _is_atomic_temporary(path):
+                continue
             info = path.lstat()
             if stat.S_ISDIR(info.st_mode):
                 continue
@@ -290,6 +292,10 @@ def transfer_digest(root: Path) -> str:
     return _tree_digest(root, iter(paths))
 
 
+def _is_atomic_temporary(path: Path) -> bool:
+    return path.name.startswith(".") and path.name.endswith(".tmp")
+
+
 def project_digest(root: Path) -> str:
     if not root.exists():
         return _MISSING
@@ -297,7 +303,8 @@ def project_digest(root: Path) -> str:
     paths = (
         path
         for path in root.rglob("*")
-        if path.is_file()
+        if not _is_atomic_temporary(path)
+        and path.is_file()
         and not path.is_symlink()
         and path.name not in _EXCLUDED_NAMES
         and not (
