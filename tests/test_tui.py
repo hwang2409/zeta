@@ -7681,7 +7681,9 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
-        timeout=5,
+        # Catch the historical infinite loop without treating cold TUI imports
+        # and scheduling on a busy CI worker as a five-second rendering budget.
+        timeout=30,
         check=True,
     )
 
