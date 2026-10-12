@@ -285,8 +285,10 @@ def _prepare_request_oracle(transcript: Transcript, state, *, as_of: date):
                 break
             if entry_reconciler._is_user_authored_row(safe):
                 raise ReconciliationError("user row exceeds the request limit")
+            data = safe.get("data")
+            message = data.get("message") if isinstance(data, dict) else None
             if not (
-                entry_reconciler._is_assistant_row(safe)
+                (isinstance(message, dict) and message.get("role") == "assistant")
                 or entry_reconciler._is_lossy_generated_row(safe)
             ):
                 raise ReconciliationError(

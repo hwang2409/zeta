@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 EntryInvokeResult = str | ReconciliationResponse
 EntryInvoke = Callable[[str], EntryInvokeResult | Awaitable[EntryInvokeResult]]
 ReconciliationKey = str | Callable[[int, int], str]
+
 _MAX_RESPONSE_BYTES = 32 * 1024
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_PRIMARY_REQUEST_BYTES = 28 * 1024
@@ -146,6 +147,7 @@ _DURABLE_LITERAL_CUES = (
     "remember",
 )
 SUPPORTED_MEMORY_FORMATS = frozenset({1, 2})
+
 _HIGHEST_PRIORITY_WORDS = (
     "correction",
     "actually",
@@ -384,18 +386,15 @@ Completed transcript rows:
 
 
 def _entry_prompt_parts(
-    active: Sequence[MemoryEntry], state: MemoryState, *, as_of: date, session_id: str
+    active: Sequence[MemoryEntry],
+    components: Mapping[str, tuple[str, dict[str, object], str]],
+    state: MemoryState, *, as_of: date, session_id: str,
 ) -> tuple[list[dict[str, object]], list[str], list[str], Counter[str]]:
-    empty = Transcript(session_id, ())
-    base_size = len(_prompt(empty, state, as_of=as_of).encode())
-    indexes = [_entry_index(entry) for entry in active]
+    base_size = len(_prompt(Transcript(session_id, ()), state, as_of=as_of).encode())
+    indexes = [components[entry.id][0] for entry in active]
     index_sizes = [len(item.encode()) for item in indexes]
-    projections = [_entry_projection(entry) for entry in active]
-    rendered = [
-        json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-        for item in projections
-    ]
-    rendered_sizes = [len(item.encode()) for item in rendered]
+    projections = [components[entry.id][1] for entry in active]
+    rendered = [components[entry.id][2] for entry in active]
     entry_limit = _MAX_PRIMARY_REQUEST_BYTES - _MIN_TRANSCRIPT_REQUEST_BYTES
     visible = 0
     index_size = 0
@@ -413,11 +412,10 @@ def _entry_prompt_parts(
         visible = count
         omitted = candidate_omitted
     omitted_size = len(json.dumps(dict(omitted), separators=(",", ":")).encode()) - 2
-    full = 0
-    full_size = 0
+    full = full_size = 0
     index_size = sum(index_sizes[:visible]) + max(0, visible - 1)
     for count in range(1, visible + 1):
-        full_size += rendered_sizes[count - 1] + (count > 1)
+        full_size += len(rendered[count - 1].encode()) + (count > 1)
         remaining = visible - count
         index_size -= index_sizes[count - 1] + (remaining > 0)
         size = base_size + omitted_size + full_size + index_size
@@ -426,19 +424,19 @@ def _entry_prompt_parts(
         full = count
     return projections[:full], rendered[:full], indexes[full:visible], omitted
 
-def _is_assistant_row(row: Mapping[str, Any]) -> bool:
-    data = row.get("data")
-    message = data.get("message") if isinstance(data, Mapping) else None
-    return isinstance(message, Mapping) and message.get("role") == "assistant"
-
 
 def _prepare_request(
     transcript: Transcript, state: MemoryState, *, as_of: date
 ) -> _EntryPreparedRequest:
     empty = Transcript(transcript.session_id, ())
     priority = _active_entries_by_priority(state)
+    components = {}
+    for entry in priority:
+        projection = _entry_projection(entry)
+        rendered = json.dumps(projection, ensure_ascii=False, separators=(",", ":"))
+        components[entry.id] = (_entry_index(entry), projection, rendered)
     preliminary = _entry_prompt_parts(
-        priority, state, as_of=as_of, session_id=transcript.session_id
+        priority, components, state, as_of=as_of, session_id=transcript.session_id
     )
     preliminary_prompt = _prompt(
         empty, state, as_of=as_of, entries=preliminary[0],
@@ -466,7 +464,7 @@ def _prepare_request(
     ranked_for = Transcript(transcript.session_id, tuple(safe_rows))
     active = _active_entries_for_request(state, ranked_for)
     entries, rendered_entries, indexes, omitted = _entry_prompt_parts(
-        active, state, as_of=as_of, session_id=transcript.session_id
+        active, components, state, as_of=as_of, session_id=transcript.session_id
     )
     base_prompt = _prompt(
         empty, state, as_of=as_of, entries=entries, entry_index=indexes,
@@ -489,11 +487,9 @@ def _prepare_request(
             rows_size += len(rendered.encode()) + (len(safe_rows) > 1)
             if base_size + rows_size > _MAX_PRIMARY_REQUEST_BYTES:
                 break
-    row_sizes = [len(item.encode()) for item in rendered_rows]
-    selected_count = 0
-    rows_size = 0
-    for count, item_size in enumerate(row_sizes, 1):
-        rows_size += item_size + (count > 1)
+    selected_count = rows_size = 0
+    for count, rendered in enumerate(rendered_rows, 1):
+        rows_size += len(rendered.encode()) + (count > 1)
         if base_size + rows_size > _MAX_PRIMARY_REQUEST_BYTES:
             break
         selected_count = count
@@ -501,14 +497,17 @@ def _prepare_request(
         safe = safe_rows[0]
         if _is_user_authored_row(safe):
             raise ReconciliationError("user row exceeds the request limit")
-        if not (_is_assistant_row(safe) or _is_lossy_generated_row(safe)):
+        data = safe.get("data")
+        message = data.get("message") if isinstance(data, Mapping) else None
+        if not (
+            (isinstance(message, Mapping) and message.get("role") == "assistant")
+            or _is_lossy_generated_row(safe)
+        ):
             raise ReconciliationError(
                 "oversized non-generated transcript row requires lossless handling"
             )
-        for text_bytes, list_items in (
-            (8192, 32), (4096, 16), (2048, 8), (1024, 4),
-            (512, 2), (128, 1), (0, 0),
-        ):
+        bounds = ((8192, 32), (4096, 16), (2048, 8), (1024, 4), (512, 2), (128, 1), (0, 0))
+        for text_bytes, list_items in bounds:
             bounded = _bounded_value(safe, text_bytes=text_bytes, list_items=list_items)
             rendered = json.dumps(
                 _rendered_transcript_rows(Transcript(transcript.session_id, (bounded,)))[0],
