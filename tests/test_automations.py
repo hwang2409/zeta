@@ -912,8 +912,11 @@ skill_catalog=SkillCatalog.empty(),
 async def test_timeout_during_delivery_is_uncertain_and_never_replayed(
     tmp_path: Path,
 ) -> None:
+    started = asyncio.Event()
+
     class SlowDelivery(RecordingDelivery):
         async def send(self, recipient, name, session_id, text):
+            started.set()
             self.sent.append((recipient, name, session_id, text))
             await asyncio.Event().wait()
 
@@ -922,16 +925,22 @@ async def test_timeout_during_delivery_is_uncertain_and_never_replayed(
         due = tick(store, DUE)[0]
         run_id = store.claim(due)
         sender = SlowDelivery()
-        await run_claimed(
-            store,
-            due,
-            run_id,
-            home=tmp_path,
-            backend=FakeBackend([ScriptedTurn(content=[TextContent("message")])]),
-            mount_factory=_empty_mount,
-            delivery=sender,
-            timeout_seconds=0.1,
+        run = asyncio.create_task(
+            run_claimed(
+                store,
+                due,
+                run_id,
+                home=tmp_path,
+                backend=FakeBackend([ScriptedTurn(content=[TextContent("message")])]),
+                mount_factory=_empty_mount,
+                delivery=sender,
+                timeout_seconds=30,
+            )
         )
+        await asyncio.wait_for(started.wait(), timeout=10)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
         assert store.runs("brief")[0].status == "uncertain"
         assert store.runs("brief")[0].delivery == "U123"
         store.recover()
