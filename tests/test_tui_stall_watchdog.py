@@ -4,6 +4,7 @@ import asyncio
 import json
 import multiprocessing
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -65,9 +66,14 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
             release_loop.set()
 
     def block_loop() -> None:
+        # Stay the innermost Python frame (time.sleep is C code): stack
+        # trimming keeps only Zeta, stdlib and innermost frames.
         loop_blocked.set()
-        if not release_loop.wait(timeout=5):
-            raise TimeoutError("loop release was not signaled")
+        deadline = time.monotonic() + 5
+        while not release_loop.is_set():
+            if time.monotonic() > deadline:
+                raise TimeoutError("loop release was not signaled")
+            time.sleep(0.001)
 
     watchdog = TUIStallWatchdog(
         path,
@@ -87,20 +93,26 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
 
     watchdog._append_record = append_and_signal  # type: ignore[method-assign]
     watchdog.start(asyncio.get_running_loop())
-    assert await asyncio.to_thread(probe_ready.wait, 5)
-    asyncio.get_running_loop().call_soon(block_loop)
-    release_probe.set()
-
-    assert await asyncio.to_thread(record_written.wait, 5)
-    await watchdog.close()
+    try:
+        assert await asyncio.to_thread(probe_ready.wait, 5)
+        asyncio.get_running_loop().call_soon(block_loop)
+        release_probe.set()
+        assert await asyncio.to_thread(record_written.wait, 5)
+    finally:
+        release_probe.set()
+        release_loop.set()
+        await watchdog.close()
 
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert len(records) == 1
     assert records[0]["start_time"] == "2026-01-02T03:04:05Z"
     assert records[0]["duration_ms"] >= 50
     assert records[0]["session_id"] == "session-123"
-    assert records[0]["stacks"]
-    assert all(stack["frames"] for stack in records[0]["stacks"])
+    assert any(
+        frame["function"] == "block_loop"
+        for stack in records[0]["stacks"]
+        for frame in stack["frames"]
+    )
 
 
 def test_idle_executor_worker_has_no_busy_samples(tmp_path: Path) -> None:
@@ -300,11 +312,16 @@ def test_concurrent_processes_write_valid_bounded_logs(tmp_path: Path) -> None:
         for result in results
     ]
 
-    for process in processes:
-        process.start()
-    errors = [result.get(timeout=15) for result in results]
-    for process in processes:
-        process.join(15)
+    try:
+        for process in processes:
+            process.start()
+        errors = [result.get(timeout=15) for result in results]
+    finally:
+        for process in processes:
+            process.join(15)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
 
     assert all(process.exitcode == 0 for process in processes)
     assert errors == [[], [], [], []]
