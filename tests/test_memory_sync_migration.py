@@ -291,12 +291,22 @@ def test_entry_sync_propagates_status_and_conflicts_schema(tmp_path: Path) -> No
     remote = remote_registry._entry_memory_state(project_id)
     registry._replace_entry_state_for_test(
         project_id,
-        dataclasses.replace(local.state, schema=dataclasses.replace(local.state.schema, version=4)),
+        dataclasses.replace(
+            local.state,
+            schema=dataclasses.replace(
+                local.state.schema, version=local.state.schema.version + 1
+            ),
+        ),
         expected_digest=local.digest,
     )
     remote_registry._replace_entry_state_for_test(
         project_id,
-        dataclasses.replace(remote.state, schema=dataclasses.replace(remote.state.schema, version=5)),
+        dataclasses.replace(
+            remote.state,
+            schema=dataclasses.replace(
+                remote.state.schema, version=remote.state.schema.version + 2
+            ),
+        ),
         expected_digest=remote.digest,
     )
     result = push_project_memory(first, LocalTransport(second), project_id=project_id)
@@ -1153,7 +1163,10 @@ def _create_schema_conflict_with_incompatible_remote_entry(
     _replace_schema(
         remote,
         project_id,
-        dataclasses.replace(remote_state.state.schema, version=4),
+        dataclasses.replace(
+            remote_state.state.schema,
+            version=remote_state.state.schema.version + 1,
+        ),
     )
     remote_entry_id = _add(remote, project_id, "remote zeta state", 5)
     return local, remote, project_id, remote_entry_id
