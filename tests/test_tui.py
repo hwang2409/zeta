@@ -10222,6 +10222,114 @@ async def test_persisted_history_loads_once_off_loop_for_navigation_and_finder(
 
 
 @pytest.mark.asyncio
+async def test_tui_starts_when_history_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history = history_for(tmp_path / "history")
+    history.append_string("in-memory prompt")
+    await history.flush_pending()
+    reads = 0
+
+    def unreadable() -> list[str]:
+        nonlocal reads
+        reads += 1
+        raise PermissionError("history is unreadable")
+
+    monkeypatch.setattr(history, "load_history_strings", unreadable)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._history = history
+    notices: list[object] = []
+    monkeypatch.setattr(app, "_handle_background_notice", notices.append)
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            history=history,
+            key_bindings=build_key_bindings(
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        run_task = asyncio.create_task(app.run(session))
+        try:
+            await wait_until(lambda: session.default_buffer._load_history_task is not None)
+            assert session.default_buffer._load_history_task is not None
+            await session.default_buffer._load_history_task
+            session.default_buffer.history_backward()
+            assert session.default_buffer.text == "in-memory prompt"
+            session.default_buffer.reset()
+            pipe.send_text("still usable")
+            await wait_until(lambda: session.default_buffer.text == "still usable")
+            assert history.snapshot() == ("in-memory prompt",)
+            assert notices == [
+                "composer history could not be read: history is unreadable"
+            ]
+            assert reads == 1
+        finally:
+            if not run_task.done():
+                pipe.send_text("\x04")
+            await asyncio.wait_for(run_task, 2)
+
+
+@pytest.mark.asyncio
+async def test_tui_accepts_input_while_initial_history_load_is_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "history"
+    history_for(path).store_string("saved prompt")
+    history = history_for(path)
+    started = threading.Event()
+    release = threading.Event()
+    original = history.load_history_strings
+
+    def blocked_loader() -> list[str]:
+        started.set()
+        release.wait()
+        return original()
+
+    monkeypatch.setattr(history, "load_history_strings", blocked_loader)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._history = history
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            history=history,
+            key_bindings=build_key_bindings(
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        run_task = asyncio.create_task(app.run(session))
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            pipe.send_text("typed before history")
+            async with asyncio.timeout(1):
+                while session.default_buffer.text != "typed before history":
+                    await asyncio.sleep(0.01)
+            assert not release.is_set()
+            release.set()
+            assert session.default_buffer._load_history_task is not None
+            await session.default_buffer._load_history_task
+            assert history.snapshot() == ("saved prompt",)
+        finally:
+            release.set()
+            if not run_task.done():
+                pipe.send_text("\x04")
+            await asyncio.wait_for(run_task, 2)
+
+
+@pytest.mark.asyncio
 async def test_submission_during_initial_history_load_is_kept_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

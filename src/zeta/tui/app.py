@@ -1133,9 +1133,9 @@ class TUIApp(
         try:
             if not resume_ui:
                 self._begin_startup_replay()
-            await self.loop.activate()
             if self._history is not None:
-                await asyncio.to_thread(self._history.load_from_disk_once)
+                self._history.set_notice_sink(self._handle_background_notice)
+            await self.loop.activate()
             session = session or self._session or self._make_session()
             self._active_session = session
             self._attach_draft(session)

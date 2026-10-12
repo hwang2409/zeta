@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import threading
 from pathlib import Path
 
@@ -180,6 +182,64 @@ async def test_fresh_finder_loads_persisted_history_once_off_the_event_loop(
     assert loaded_for_prompt == ["saved prompt"]
     assert len(load_threads) == 1
     assert load_threads[0] != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_unreadable_history_is_terminal_and_keeps_in_memory_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    history = _history(tmp_path / "history", "in-memory prompt")
+    await history.flush_pending()
+    notices: list[str] = []
+    reads = 0
+
+    def unreadable() -> list[str]:
+        nonlocal reads
+        reads += 1
+        raise PermissionError("history is unreadable")
+
+    monkeypatch.setattr(history, "load_history_strings", unreadable)
+    history.set_notice_sink(notices.append)
+    with caplog.at_level(logging.WARNING):
+        await asyncio.gather(
+            asyncio.to_thread(history.load_from_disk_once),
+            asyncio.to_thread(history.load_from_disk_once),
+        )
+        loaded_for_prompt = [entry async for entry in history.load()]
+        finder = _finder(history)
+        await _open(finder, Buffer())
+
+    state = finder.finder_state()
+    assert state is not None
+    assert loaded_for_prompt == ["in-memory prompt"]
+    assert [row.candidate.text for row in state.rows] == ["in-memory prompt"]
+    assert reads == 1
+    assert notices == ["composer history could not be read: history is unreadable"]
+    assert [
+        record.message
+        for record in caplog.records
+        if "history is unreadable" in record.message
+    ] == ["composer history could not be read: history is unreadable"]
+
+
+@pytest.mark.asyncio
+async def test_history_does_not_start_loading_after_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history = history_for(tmp_path / "history")
+    reads = 0
+
+    def recording_loader() -> list[str]:
+        nonlocal reads
+        reads += 1
+        return []
+
+    monkeypatch.setattr(history, "load_history_strings", recording_loader)
+    await history.shutdown_pending()
+    await asyncio.to_thread(history.load_from_disk_once)
+    assert [entry async for entry in history.load()] == []
+
+    assert reads == 0
 
 
 @pytest.mark.asyncio

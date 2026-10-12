@@ -177,7 +177,10 @@ class BoundedFileHistory(FileHistory):
         self._snapshot_lock = threading.Lock()
         self._load_complete = threading.Condition(self._snapshot_lock)
         self._disk_loading = False
-        self._disk_loaded = False
+        self._disk_load_complete = False
+        self._shutdown = False
+        self._notice_sink: Callable[[str], None] | None = None
+        self._notice_loop: asyncio.AbstractEventLoop | None = None
         self._revision = 0
         self._applied_revision = 0
         self._pending: list[tuple[int, str]] = []
@@ -186,26 +189,50 @@ class BoundedFileHistory(FileHistory):
     def load_history_strings(self) -> list[str]:
         return list(super().load_history_strings())[: self.limit]
 
+    def set_notice_sink(self, sink: Callable[[str], None] | None) -> None:
+        """Set the optional destination for a history read failure notice."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        with self._snapshot_lock:
+            self._notice_sink = sink
+            self._notice_loop = loop
+
     def load_from_disk_once(self) -> None:
-        """Load persisted entries once and merge submissions made during the read."""
+        """Make one terminal attempt to merge persisted and in-memory entries."""
 
         with self._load_complete:
             while self._disk_loading:
                 self._load_complete.wait()
-            if self._disk_loaded:
+            if self._disk_load_complete or self._shutdown:
                 return
             self._disk_loading = True
+            notice_sink = self._notice_sink
+            notice_loop = self._notice_loop
         try:
             disk_entries = self.load_history_strings()
-        except BaseException:
+        except Exception as exc:  # noqa: BLE001 - history must not stop the TUI
             with self._load_complete:
+                self._disk_load_complete = True
                 self._disk_loading = False
+                self._loaded = True
                 self._load_complete.notify_all()
-            raise
+            message = f"composer history could not be read: {exc}"
+            _LOGGER.warning(message)
+            if notice_sink is not None:
+                try:
+                    if notice_loop is None:
+                        notice_sink(message)
+                    else:
+                        notice_loop.call_soon_threadsafe(notice_sink, message)
+                except Exception:  # a notice must not stop history
+                    _LOGGER.debug("failed to report composer history read error", exc_info=True)
+            return
         with self._load_complete:
             newest = [value for _, value in reversed(self._pending)]
             self._loaded_strings = self._merge_newest(newest, disk_entries)
-            self._disk_loaded = True
+            self._disk_load_complete = True
             self._disk_loading = False
             self._pending = [
                 item for item in self._pending if item[0] > self._applied_revision
@@ -277,6 +304,11 @@ class BoundedFileHistory(FileHistory):
         await self._writer.flush(timeout=PERSISTENCE_FLUSH_TIMEOUT)
 
     async def shutdown_pending(self) -> None:
+        with self._load_complete:
+            self._shutdown = True
+            self._notice_sink = None
+            self._notice_loop = None
+            self._load_complete.notify_all()
         await self._writer.shutdown(timeout=PERSISTENCE_FLUSH_TIMEOUT)
 
     def store_string(self, string: str) -> None:
