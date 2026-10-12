@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import stat
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -157,25 +160,56 @@ class AttentionStore:
         return AttentionRecord.from_dict(value)
 
     def resolve(
-        self, attention_id: str, *, session_id: str, decision: str
+        self,
+        attention_id: str,
+        *,
+        session_id: str,
+        decision: str,
+        before_commit: Callable[[AttentionRecord], None] | None = None,
     ) -> tuple[AttentionRecord, bool]:
-        """Resolve one record owned by ``session_id`` without relaying it."""
+        """Resolve one owned record, running winner-only delivery before its commit."""
         decision = decision.strip()
         if not decision:
             raise ValueError("decision must be nonempty")
-        current = self.get(attention_id)
-        if current.session_id != session_id:
-            raise ValueError("attention record does not belong to this session")
-        if current.status == "resolved":
-            return current, True
-        resolved = replace(
-            current,
-            status="resolved",
-            resolved_at=_now(),
-            decision=decision,
-        )
-        self.replace(resolved)
-        return resolved, False
+        with self._resolution_lock():
+            current = self.get(attention_id)
+            if current.session_id != session_id:
+                raise ValueError("attention record does not belong to this session")
+            if current.status == "resolved":
+                return current, True
+            if before_commit is not None:
+                before_commit(current)
+            resolved = replace(
+                current,
+                status="resolved",
+                resolved_at=_now(),
+                decision=decision,
+            )
+            self.replace(resolved)
+            return resolved, False
+
+    @contextmanager
+    def _resolution_lock(self) -> Iterator[None]:
+        with (
+            session_directory(self.session_dir.parent, self.session_dir.name) as (
+                _,
+                session_fd,
+            ),
+            child_directory(session_fd, "attention") as attention_fd,
+        ):
+            fcntl.flock(attention_fd, fcntl.LOCK_EX)
+            try:
+                lock_fd = open_session_file(
+                    attention_fd, ".resolution.lock", os.O_RDWR | os.O_CREAT
+                )
+            finally:
+                fcntl.flock(attention_fd, fcntl.LOCK_UN)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
 
     def list(self) -> tuple[AttentionRecord, ...]:
         try:

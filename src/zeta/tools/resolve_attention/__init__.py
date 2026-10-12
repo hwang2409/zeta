@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import asyncio
 from typing import TypedDict
 
 from ...attention_forks import (
@@ -39,7 +39,8 @@ async def _resolve_attention(
         current_project_id=metadata.project_id,
         directory_fd=store.directory_fd,
     )
-    message_id, already_resolved = deliver_attention_decision(
+    message_id, record, already_resolved = await asyncio.to_thread(
+        deliver_attention_decision,
         home,
         validated.record,
         arguments["decision"],
@@ -48,38 +49,29 @@ async def _resolve_attention(
     if already_resolved:
         return _success_result(
             text_block(f"Decision was already delivered ({message_id})."),
-            structured_content={"message_id": message_id, "already_resolved": True},
+            structured_content={
+                "message_id": message_id,
+                "already_resolved": True,
+                "decision": record.decision,
+            },
         )
     return _success_result(
         text_block(f"Decision delivered to the original session ({message_id})."),
-        structured_content={"message_id": message_id, "already_resolved": False},
+        structured_content={
+            "message_id": message_id,
+            "already_resolved": False,
+            "decision": record.decision,
+        },
     )
-
-
-def _find_attention_record(home: Path, attention_id: str):
-    for session_dir in (home / "sessions").iterdir():
-        if not session_dir.is_dir():
-            continue
-        try:
-            return AttentionStore(session_dir).get(attention_id)
-        except (FileNotFoundError, NotADirectoryError, PermissionError):
-            continue
-    raise FileNotFoundError(attention_id)
 
 
 async def _close_attention(
     registry: ToolRegistry, arguments: CloseAttentionArguments
 ) -> StructuredToolResult:
     store = registry.session_store
-    home = store.session_dir.parent.parent
-    try:
-        record = AttentionStore(store.session_dir).get(arguments["attention_id"])
-    except FileNotFoundError:
-        record = _find_attention_record(home, arguments["attention_id"])
-    if record.session_id != store.session_id:
-        raise ValueError("attention record does not belong to this session")
-    record, already_resolved = AttentionStore(store.session_dir).resolve(
-        record.id,
+    record, already_resolved = await asyncio.to_thread(
+        AttentionStore(store.session_dir).resolve,
+        arguments["attention_id"],
         session_id=store.session_id,
         decision=arguments["decision"],
     )
@@ -89,11 +81,16 @@ async def _close_attention(
             structured_content={
                 "attention_id": record.id,
                 "already_resolved": True,
+                "decision": record.decision,
             },
         )
     return _success_result(
         text_block(f"Decision resolved ({record.id})."),
-        structured_content={"attention_id": record.id, "already_resolved": False},
+        structured_content={
+            "attention_id": record.id,
+            "already_resolved": False,
+            "decision": record.decision,
+        },
     )
 
 
