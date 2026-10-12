@@ -407,7 +407,11 @@ def _git_metadata(cwd: Path) -> dict[str, str | None]:
     def run(*args: str) -> str | None:
         try:
             value = subprocess.check_output(
-                ["git", *args], cwd=cwd, stderr=subprocess.DEVNULL, text=True
+                ["git", *args],
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
             ).strip()
         except (OSError, subprocess.CalledProcessError):
             return None

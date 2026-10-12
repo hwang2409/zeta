@@ -235,6 +235,7 @@ def paste_image(session_dir: str | Path, *, directory_fd: int | None = None) -> 
         if pngpaste is not None:
             result = subprocess.run(
                 [pngpaste, str(destination)],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 check=False,
                 env=subprocess_env(),
@@ -252,6 +253,7 @@ end run
 """
             result = subprocess.run(
                 ["osascript", "-e", script, str(destination)],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 check=False,
                 env=subprocess_env(),
