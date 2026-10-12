@@ -169,7 +169,9 @@ def _parser_options(parser: argparse.ArgumentParser) -> set[str]:
     }
 
 
-def _read_pty(fd: int, timeout: float = 2.0) -> bytes:
+def _read_pty(
+    fd: int, timeout: float = 2.0, *, until: bytes | None = None
+) -> bytes:
     output = b""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -180,6 +182,10 @@ def _read_pty(fd: int, timeout: float = 2.0) -> bytes:
             output += os.read(fd, 4096)
         except OSError:
             break
+        if until is not None and until in output:
+            return output
+    if until is not None:
+        raise AssertionError(f"PTY did not emit {until!r} within {timeout}s: {output!r}")
     return output
 
 
@@ -188,12 +194,19 @@ def _run_zsh_completion(
 ) -> bytes:
     tmp_path.mkdir()
     zshrc = tmp_path / ".zshrc"
+    # Emit the completed buffer and a marker after the real ZLE widget returns.
     zshrc.write_text(
         "PS1='ZETA_READY> '\n"
         "autoload -Uz compinit\n"
         f"compinit -d {tmp_path / '.zcompdump'}\n"
         f"source {script}\n"
-        "bindkey '^I' expand-or-complete\n",
+        "_zeta_test_complete() {\n"
+        "  zle expand-or-complete\n"
+        "  zle -R\n"
+        "  print -rn -- \"$BUFFER\"$'\\x1eZETA_COMPLETE\\x1f'\n"
+        "}\n"
+        "zle -N _zeta_test_complete\n"
+        "bindkey '^I' _zeta_test_complete\n",
         encoding="utf-8",
     )
     master, slave = pty.openpty()
@@ -209,9 +222,9 @@ def _run_zsh_completion(
         )
         os.close(slave)
         slave = -1
-        _read_pty(master)
+        _read_pty(master, timeout=30, until=b"ZETA_READY> ")
         os.write(master, line + b"\t")
-        output = _read_pty(master)
+        output = _read_pty(master, timeout=30, until=b"\x1eZETA_COMPLETE\x1f")
         process.kill()
         process.wait(timeout=5)
         return output

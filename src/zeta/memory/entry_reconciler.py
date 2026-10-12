@@ -391,6 +391,8 @@ def _prompt_with_visible_entries(
     transcript: Transcript, state: MemoryState, *, as_of: date
 ) -> tuple[str, frozenset[str]]:
     active = _active_entries_for_request(state, transcript)
+    # Sanitize each index once while probing which entries fit the request.
+    entry_indexes = [_entry_index(entry) for entry in active]
     entry_limit = _MAX_PRIMARY_REQUEST_BYTES - _MIN_TRANSCRIPT_REQUEST_BYTES
 
     visible: list[MemoryEntry] = []
@@ -401,7 +403,7 @@ def _prompt_with_visible_entries(
             Transcript(transcript.session_id, ()),
             state,
             as_of=as_of,
-            entry_index=[_entry_index(item) for item in candidate],
+            entry_index=entry_indexes[: len(candidate)],
             omitted_entries=omitted,
         )
         if len(prompt.encode()) > entry_limit:
@@ -410,10 +412,10 @@ def _prompt_with_visible_entries(
 
     omitted = Counter(item.kind for item in active[len(visible) :])
     full: list[dict[str, object]] = []
-    indexed = [_entry_index(entry) for entry in visible]
+    indexed = entry_indexes[: len(visible)]
     for position, entry in enumerate(visible):
         candidate_full = [*full, _entry_projection(entry)]
-        candidate_index = [_entry_index(item) for item in visible[position + 1 :]]
+        candidate_index = entry_indexes[position + 1 : len(visible)]
         candidate = _prompt(
             Transcript(transcript.session_id, ()),
             state,
