@@ -4,6 +4,7 @@ import http.server
 import json
 import multiprocessing
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -3608,7 +3609,16 @@ def test_bootstrap_requires_refresh_when_jwt_expiry_is_missing_or_past(
         assert store.bootstrap().expires_at <= 1
 
 
-def _refresh_process(path: str, token_url: str, results: object) -> None:
+def _refresh_process(
+    path: str,
+    token_url: str,
+    results: object,
+    ready: object,
+    start: object,
+) -> None:
+    ready.put("ready")
+    start.wait()
+
     async def run() -> None:
         client = httpx.AsyncClient()
         try:
@@ -3618,6 +3628,77 @@ def _refresh_process(path: str, token_url: str, results: object) -> None:
             await client.aclose()
 
     asyncio.run(run())
+
+
+def _refresh_lock_probe_process(
+    path: str,
+    results: object,
+    start: object,
+    release: object,
+    hold: bool,
+) -> None:
+    async def run() -> None:
+        store = CodexCredentialStore(path)
+        if hold:
+            async with store._async_refresh_lock_file():
+                results.put("holding")
+                await asyncio.to_thread(release.wait)
+            return
+        await asyncio.to_thread(start.wait)
+        lock = store._async_refresh_lock_file()
+        try:
+            await asyncio.wait_for(lock.__aenter__(), timeout=2)
+        except TimeoutError:
+            results.put("blocked")
+        else:
+            results.put("unexpectedly acquired")
+            await lock.__aexit__(None, None, None)
+        await asyncio.to_thread(release.wait)
+        async with store._async_refresh_lock_file():
+            results.put("acquired")
+
+    asyncio.run(run())
+
+
+def test_codex_refresh_lock_excludes_second_process(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    start = context.Event()
+    release = context.Event()
+    path = tmp_path / "codex.json"
+    processes = [
+        context.Process(
+            target=_refresh_lock_probe_process,
+            args=(str(path), results, start, release, True),
+        ),
+        context.Process(
+            target=_refresh_lock_probe_process,
+            args=(str(path), results, start, release, False),
+        ),
+    ]
+    deadline = time.monotonic() + 60
+    try:
+        for process in processes:
+            process.start()
+        assert results.get(timeout=max(0, deadline - time.monotonic())) == "holding"
+        start.set()
+        assert results.get(timeout=max(0, deadline - time.monotonic())) == "blocked"
+        release.set()
+        assert results.get(timeout=max(0, deadline - time.monotonic())) == "acquired"
+        for process in processes:
+            process.join(timeout=max(0, deadline - time.monotonic()))
+            assert process.exitcode == 0
+    finally:
+        start.set()
+        release.set()
+        for process in processes:
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+        for process in processes:
+            if process.pid is not None and process.is_alive():
+                process.kill()
+            if process.pid is not None:
+                process.join()
 
 
 def test_expired_codex_token_refreshes_once_across_two_processes(tmp_path: Path) -> None:
@@ -3649,23 +3730,46 @@ def test_expired_codex_token_refreshes_once_across_two_processes(tmp_path: Path)
         CodexCredentialStore(path).save(OAuthTokens(access_token(), "refresh", 1))
         context = multiprocessing.get_context("spawn")
         results = context.Queue()
+        ready = context.Queue()
+        start = context.Event()
         processes = [
             context.Process(
                 target=_refresh_process,
-                args=(str(path), f"http://127.0.0.1:{server.server_port}/token", results),
+                args=(
+                    str(path),
+                    f"http://127.0.0.1:{server.server_port}/token",
+                    results,
+                    ready,
+                    start,
+                ),
             )
             for _ in range(2)
         ]
-        for process in processes:
-            process.start()
-        for process in processes:
-            process.join(timeout=5)
-            assert process.exitcode == 0
-        assert [results.get(timeout=1), results.get(timeout=1)] == [
-            access_token("refreshed-account"),
-            access_token("refreshed-account"),
-        ]
-        assert server.refresh_count == 1
+        deadline = time.monotonic() + 60
+        try:
+            for process in processes:
+                process.start()
+            for _ in processes:
+                assert ready.get(timeout=max(0, deadline - time.monotonic())) == "ready"
+            start.set()
+            for process in processes:
+                process.join(timeout=max(0, deadline - time.monotonic()))
+                assert process.exitcode == 0
+            assert [results.get(timeout=1), results.get(timeout=1)] == [
+                access_token("refreshed-account"),
+                access_token("refreshed-account"),
+            ]
+            assert server.refresh_count == 1
+        finally:
+            start.set()
+            for process in processes:
+                if process.pid is not None and process.is_alive():
+                    process.terminate()
+            for process in processes:
+                if process.pid is not None and process.is_alive():
+                    process.kill()
+                if process.pid is not None:
+                    process.join()
     finally:
         server.shutdown()
         server.server_close()
