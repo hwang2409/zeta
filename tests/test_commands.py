@@ -818,6 +818,8 @@ async def test_approval_shortcut_does_not_enter_history(tmp_path: Path) -> None:
     assert not history_path.exists()
 
     await app._handle_prompt_value("/approve missing")
+    assert app._history is not None
+    await app._history.flush_pending()
 
     history = history_path.read_text(encoding="utf-8")
     assert "/approve missing" in history

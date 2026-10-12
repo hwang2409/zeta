@@ -237,7 +237,7 @@ class ApprovalRequest:
         return self.request_id, self.tool_call, self.audit_facts(), self.audit_display()
 
     def always_allow_rule(self) -> ApprovalRule:
-        """Return the narrow persistent grant offered for this request."""
+        """Return the tool/action session grant offered for this request."""
 
         if not self.capability_resolved:
             raise ValueError(
@@ -290,6 +290,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self._rule_resolver: Callable[[str | ApprovalRule], ApprovalRule] | None = None
         self._rule_sources: dict[str, tuple[str | ApprovalRule, ...]] = {}
         self._notices: list[str] = []
+        self._session_allow: set[ApprovalRule] = set()
         self.always_allow = always_allow
         self.always_deny = always_deny
         self.always_ask = always_ask
@@ -320,7 +321,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self._capability_resolver = resolver
 
     def remember_allow(self, request: ApprovalRequest) -> ApprovalRule:
-        """Persist and return the exact resolved capability grant."""
+        """Remember and return a tool/action grant for this running session."""
 
         rule = request.always_allow_rule()
         if self._rule_resolver is not None:
@@ -328,7 +329,14 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self.always_allow = self.always_allow | {rule}
         if rule not in self.always_allow:
             raise ValueError(f"approval rule was not accepted: {rule}")
+        self._session_allow.add(rule)
         return rule
+
+    @property
+    def session_allow(self) -> frozenset[ApprovalRule]:
+        """Currently accepted allow rules added by a session approval."""
+
+        return self.always_allow.intersection(self._session_allow)
 
     # The three rule sets accept rule text or parsed rules and always hold
     # parsed rules, so ``policy.always_ask = frozenset()`` keeps neutralising

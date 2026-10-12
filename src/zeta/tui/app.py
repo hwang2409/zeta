@@ -35,7 +35,6 @@ from ..core.session import (
 )
 from ..core.slash import (
     SlashCommand,
-    SlashCommandRegistry,
     SlashStatus,
     UsageTracker,
     _format_status,
@@ -122,21 +121,24 @@ def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
     ]
 
 
-def _register_tui_slash_commands(registry: SlashCommandRegistry) -> None:
-    """Add commands that require the full-screen terminal UI."""
+def _tui_slash_commands() -> tuple[SlashCommand, ...]:
+    """Commands that require the full-screen terminal UI."""
 
-    registry.register(
+    return (
         SlashCommand(
             "approve", lambda app, args: app.slash_approve(args), "/approve [key]"
-        )
-    )
-    registry.register(
+        ),
         SlashCommand(
-            "always", lambda app, args: app.slash_always(args), "/always [key]"
-        )
-    )
-    registry.register(
-        SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]")
+            "always",
+            lambda app, args: app.slash_always(args),
+            "/always [key] — allow this tool/action for the running session",
+        ),
+        SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]"),
+        SlashCommand(
+            "permissions",
+            lambda app, args: app.slash_permissions(args),
+            "show effective approval rules and session grants",
+        ),
     )
 
 
@@ -262,7 +264,7 @@ class TUIApp(
         self._history_path = (
             Path(history_path) if history_path else env_home() / "history"
         )
-        self._history = None
+        self._history = history_for(self._history_path)
         self._draft = DraftPersistence(
             draft_path or self.loop.store.session_dir / "draft",
             directory_fd=self.loop.store.directory_fd if draft_path is None else None,
@@ -296,8 +298,8 @@ class TUIApp(
             project_dir=repo_root,
             project_eligible=project_eligible,
             skill_catalog=skill_catalog,
+            extra_commands=_tui_slash_commands(),
         )
-        _register_tui_slash_commands(self._slash_commands)
         self.loop.set_mcp_prompt_refresh(
             lambda mount: app._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )
@@ -309,7 +311,9 @@ class TUIApp(
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._history_finder = HistoryFinder(
-            self._history_path, on_accept=lambda: app._clear_pending_attachments()
+            self._history.load_from_disk_once,
+            self._history.snapshot,
+            on_accept=lambda: app._clear_pending_attachments(),
         )
         self._active_finder = self._transcript
         self._status_card = OverlayControl()
@@ -1121,6 +1125,8 @@ class TUIApp(
         try:
             if not resume_ui:
                 self._begin_startup_replay()
+            if self._history is not None:
+                self._history.set_notice_sink(self._handle_background_notice)
             await self.loop.activate()
             session = session or self._session or self._make_session()
             self._active_session = session
@@ -1171,6 +1177,9 @@ class TUIApp(
                 # Suspending for a discussion fork keeps the runtime's work
                 # alive: do not cancel the turn or drop the session reference.
                 if self._suspending_for_fork:
+                    await self._draft.flush_pending()
+                    if self._history is not None:
+                        await self._history.flush_pending()
                     self._session = None
                     if isinstance(session, FullScreenPromptSession):
                         session.restore_terminal()
