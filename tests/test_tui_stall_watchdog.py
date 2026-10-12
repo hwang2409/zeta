@@ -277,15 +277,18 @@ def test_responsive_loop_writes_no_record(tmp_path: Path) -> None:
 async def test_opt_out_starts_no_thread(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("ZETA_STALL_WATCHDOG", "0")
 
-    def unexpected_start(_thread) -> None:
-        raise AssertionError("disabled watchdog started a thread")
+    started = []
 
-    monkeypatch.setattr(threading.Thread, "start", unexpected_start)
+    def record_start(thread) -> None:
+        started.append(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", record_start)
     watchdog = start_tui_stall_watchdog(
         asyncio.get_running_loop(), zeta_home=tmp_path, session_id="disabled"
     )
 
     assert watchdog is None
+    assert started == []
 
 
 def test_concurrent_processes_write_valid_bounded_logs(tmp_path: Path) -> None:
