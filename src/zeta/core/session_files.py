@@ -107,7 +107,9 @@ def read_session_file(directory_fd: int, name: str) -> bytes:
         return handle.read()
 
 
-def write_session_file(directory_fd: int, name: str, data: bytes) -> None:
+def write_session_file(
+    directory_fd: int, name: str, data: bytes, *, sync: bool = True
+) -> None:
     """Publish bytes atomically within a pinned directory."""
     _component(name)
     temporary = f".{name}.{uuid.uuid4().hex}.tmp"
@@ -123,7 +125,8 @@ def write_session_file(directory_fd: int, name: str, data: bytes) -> None:
         with stream as handle:
             handle.write(data)
             handle.flush()
-            os.fsync(handle.fileno())
+            if sync:
+                os.fsync(handle.fileno())
         os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
     finally:
         try:
@@ -132,11 +135,14 @@ def write_session_file(directory_fd: int, name: str, data: bytes) -> None:
             pass
 
 
-def write_session_json(directory_fd: int, name: str, value: object) -> None:
+def write_session_json(
+    directory_fd: int, name: str, value: object, *, sync: bool = True
+) -> None:
     write_session_file(
         directory_fd,
         name,
         (json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n").encode(),
+        sync=sync,
     )
 
 

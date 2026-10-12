@@ -77,6 +77,7 @@ from zeta.tui.app import (
     background_notice,
     build_backend,
 )
+from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
     build_key_bindings,
@@ -4270,6 +4271,28 @@ def test_background_start_event_reaches_presenter_with_depth(tmp_path: Path) -> 
     assert "depth 2" in output.getvalue()
 
 
+def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:
+    child = ConversationStore(tmp_path, session_id="child")
+    child.start_agent_lifecycle(
+        handle="parent:child",
+        started_at="2026-10-12T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="child",
+    )
+    child.update_agent_lifecycle(
+        current_step="turn 2: using read", turns_used=2, tool_calls=1
+    )
+
+    lifecycle = _read_lifecycle(str(child.session_dir))
+
+    assert lifecycle["current_step"] == "turn 2: using read"
+    assert lifecycle["turns_used"] == 2
+    assert lifecycle["tool_calls"] == 1
+    durable = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    assert durable["current_step"] == "starting"
+
+
 def test_typed_agent_cards_and_receipts_show_type() -> None:
     call = ToolCall(
         "typed-agent",
@@ -4882,8 +4905,8 @@ def test_recovered_canceled_agent_card_expands_with_child_tail(tmp_path: Path) -
         call,
         child_session_path=str(child.session_dir),
         description="task research",
+        turns_used=2,
     )
-    store.update_agent_child_turns(call.id, 2)
 
     AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
     result = next(message.tool_result for message in store.messages() if message.tool_result)

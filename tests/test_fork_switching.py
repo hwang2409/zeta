@@ -503,6 +503,9 @@ def test_tui_close_failure_still_runs_later_cleanup(
     async def close_session(*args: object, **kwargs: object) -> None:
         cleaned.append("session")
 
+    async def flush_recency() -> None:
+        cleaned.append("recency")
+
     monkeypatch.setattr("zeta.tui.runtime_close.close_session", close_session)
     app = ClosingApp()
     app._init_runtime_close()
@@ -510,6 +513,7 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app._terminal_restored = False
     app._workspace_snapshot_store = None
     app._hooks = None
+    app._on_session_close = flush_recency
     app._active_session = app._draft_session = app._session = object()
     app.stop_decisions_poll = lambda: cleaned.append("poll")
     app._stop_decisions_refresh = lambda: cleaned.append("refresh")
@@ -527,7 +531,9 @@ def test_tui_close_failure_still_runs_later_cleanup(
 
     assert app._closed is True
     assert "submissions" in cleaned
+    assert "recency" in cleaned
     assert "session" in cleaned
+    assert cleaned.index("recency") < cleaned.index("session")
     assert "task sink" in cleaned
     assert cleaned.index("navigation close") < cleaned.index("navigation unbind")
     assert cleaned.index("navigation unbind") < cleaned.index("wizard")

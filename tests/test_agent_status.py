@@ -11,6 +11,7 @@ import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.receipt import encode_json
 from zeta.core.abort import AbortGenerationRegistry
+from zeta.core.agent_progress import remove_live_agent_lifecycle
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -111,6 +112,13 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     assert background_result.structured_content is not None
     background_handle = background_result.structured_content["child_instance_id"]
     assert type(background_handle) is str
+
+    child_path = background_result.structured_content["child_session_path"]
+    assert type(child_path) is str
+    durable_lifecycle = json.loads(
+        (Path(child_path) / "agent_lifecycle.json").read_text(encoding="utf-8")
+    )
+    assert durable_lifecycle["current_step"] == "starting"
 
     live_status = await _status(loop, background_handle)
     live_child = live_status["structuredContent"]["children"][0]
@@ -271,6 +279,10 @@ def _new_live_child(
         description=f"child {index}",
     )
     child.update_agent_lifecycle(current_step=step)
+    lifecycle = child.agent_lifecycle()
+    assert lifecycle is not None
+    child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+    remove_live_agent_lifecycle(child.agent_lifecycle_path)
     return child, handle
 
 

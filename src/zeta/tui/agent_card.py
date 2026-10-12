@@ -19,6 +19,7 @@ from prompt_toolkit.mouse_events import MouseEvent
 from rich.console import Console
 from rich.text import Text
 
+from ..core.agent_progress import live_agent_lifecycle
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..core.store import ConversationStore
@@ -141,7 +142,8 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _agent_metadata(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
-    lifecycle = _read_json(path / "agent_lifecycle.json")
+    lifecycle_path = path / "agent_lifecycle.json"
+    lifecycle = live_agent_lifecycle(lifecycle_path) or _read_json(lifecycle_path)
     if lifecycle:
         return lifecycle
     state = _read_json(path / "session_state.json")

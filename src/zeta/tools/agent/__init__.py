@@ -25,6 +25,7 @@ from ...agent.receipt import (
     format_agent_stats,
     terminal_state,
 )
+from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -75,6 +76,9 @@ _MISSING = object()
 def _read_agent_lifecycle(path: str) -> dict[str, object]:
     if not path:
         return {}
+    live = live_agent_lifecycle(Path(path) / "agent_lifecycle.json")
+    if live is not None:
+        return live
     try:
         value = load_session_json(Path(path) / "agent_lifecycle.json")
     except ConversationIntegrityError:
@@ -429,12 +433,14 @@ def _project_agent_status(
     *,
     requested_handle: str | None = None,
 ) -> dict[str, StructuredContentValue]:
-    try:
-        lifecycle = load_session_json(
-            _read_child_file(store, child_path, "agent_lifecycle.json")
-        )
-    except (OSError, ValueError) as exc:
-        raise ValueError("could not read child state") from exc
+    lifecycle = live_agent_lifecycle(child_path / "agent_lifecycle.json")
+    if lifecycle is None:
+        try:
+            lifecycle = load_session_json(
+                _read_child_file(store, child_path, "agent_lifecycle.json")
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError("could not read child state") from exc
     if type(lifecycle) is not dict:
         raise ValueError("lifecycle data is not an object")
     if lifecycle.get("handle") != handle:

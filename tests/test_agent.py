@@ -4772,8 +4772,8 @@ def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
         call,
         child_session_path=str(child.session_dir),
         description="task research",
+        turns_used=2,
     )
-    store.update_agent_child_turns(call.id, 2)
 
     AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
@@ -4803,8 +4803,8 @@ def test_resume_preserves_typed_child_receipt(tmp_path: Path) -> None:
         child_session_path=str(child.session_dir),
         description="task research",
         agent_type="explore",
+        turns_used=2,
     )
-    store.update_agent_child_turns(call.id, 2)
 
     AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
 

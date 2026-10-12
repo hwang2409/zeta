@@ -21,6 +21,7 @@ from ...agent.receipt import (
     has_agent_receipt_suffix,
     terminal_state,
 )
+from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import ConversationIntegrityError, load_session_json
 from ...protocol.types import StreamEvent, StreamEventType, ToolCall
 from ...tools.agent import send_to_run
@@ -64,6 +65,9 @@ def _arguments(arguments: dict[str, Any]) -> str:
 def _read_lifecycle(path: str) -> dict[str, Any]:
     if not path:
         return {}
+    live = live_agent_lifecycle(Path(path) / "agent_lifecycle.json")
+    if live is not None:
+        return live
     try:
         value = load_session_json(Path(path) / "agent_lifecycle.json")
     except ConversationIntegrityError:
