@@ -303,6 +303,35 @@ def test_child_turn_progress_does_not_write_parent_state(
     assert store.agent_children()[call.id]["turns_used"] == 4
 
 
+def test_child_transitions_preserve_sibling_live_turns(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    first = ToolCall("agent-1", "agent", {"prompt": "first"})
+    second = ToolCall("agent-2", "agent", {"prompt": "second"})
+    store.register_agent_child(
+        first,
+        child_session_path=str(tmp_path / "agents" / "1"),
+        description="first",
+    )
+    store.update_agent_child_turns(first.id, 3)
+
+    store.register_agent_child(
+        second,
+        child_session_path=str(tmp_path / "agents" / "2"),
+        description="second",
+    )
+
+    assert store.agent_children()[first.id]["turns_used"] == 3
+    durable = json.loads(store.state_path.read_text(encoding="utf-8"))
+    assert durable["agent_children"][first.id]["turns_used"] == 3
+
+    store.update_agent_child_turns(first.id, 4)
+    store.finish_agent_child(second.id)
+
+    assert store.agent_children()[first.id]["turns_used"] == 4
+    durable = json.loads(store.state_path.read_text(encoding="utf-8"))
+    assert durable["agent_children"][first.id]["turns_used"] == 4
+
+
 def test_reopened_running_lifecycle_uses_last_durable_transition(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     _start_agent_lifecycle(store)

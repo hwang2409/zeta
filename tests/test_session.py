@@ -25,7 +25,7 @@ from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
-from zeta.core.session import SessionError, SessionManager
+from zeta.core.session import SessionError, SessionManager, SessionMetadata
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.prompts import load_runtime_guidance
@@ -741,6 +741,90 @@ def test_continue_reopens_the_most_recent_session(
     app = create_app(build_parser().parse_args(["--continue"]))
 
     assert app.loop.store.session_id == newer.store.session_id
+
+
+@pytest.mark.asyncio
+async def test_completed_turn_refreshes_recency_off_loop_and_flushes_on_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    first.loop.store.close()
+    manager = SessionManager(home)
+    first_metadata = manager.read_metadata(session_id)
+    first_metadata.updated_at = "2020-01-01T00:00:00+00:00"
+    manager._write(first_metadata)
+    other = manager.create(
+        provider=first_metadata.provider,
+        model=first_metadata.model,
+        cwd=tmp_path,
+    )
+    other.metadata.updated_at = "2021-01-01T00:00:00+00:00"
+    manager._write(other.metadata)
+    other.store.close()
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
+
+    def build_backend(*args: object, **kwargs: object) -> tuple[FakeBackend, str]:
+        del args, kwargs
+        return backend, first_metadata.model
+
+    write_threads: list[int] = []
+    original_write = SessionManager._write_unlocked
+
+    def record_write(
+        self: SessionManager, metadata: SessionMetadata, *, directory_fd: int
+    ) -> None:
+        write_threads.append(threading.get_ident())
+        original_write(self, metadata, directory_fd=directory_fd)
+
+    monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
+    monkeypatch.setattr(SessionManager, "_write_unlocked", record_write)
+    event_loop_thread = threading.get_ident()
+    app = create_app(_args("--resume", session_id))
+    app._invalidate_prompt = lambda: None
+    write_threads.clear()
+
+    await app._consume_turn("hello")
+    await app.close()
+
+    refreshed = manager.read_metadata(session_id)
+    assert refreshed.updated_at > "2021-01-01T00:00:00+00:00"
+    assert manager.find_most_recent(cwd=tmp_path).session_id == session_id
+    assert write_threads
+    assert all(thread_id != event_loop_thread for thread_id in write_threads)
+
+
+@pytest.mark.asyncio
+async def test_recency_refresh_does_not_overwrite_newer_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    model = first.model
+    first.loop.store.close()
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
+
+    def build_backend(*args: object, **kwargs: object) -> tuple[FakeBackend, str]:
+        del args, kwargs
+        return backend, model
+
+    monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
+    app = create_app(_args("--resume", session_id))
+    app._invalidate_prompt = lambda: None
+
+    await app._consume_turn("hello")
+    manager = SessionManager(home)
+    latest = manager.read_metadata(session_id)
+    manager.record_override(latest, provider=None, model="newer-model")
+    await app.close()
+
+    assert manager.read_metadata(session_id).model == "newer-model"
 
 
 def test_resume_reopens_an_explicit_session(

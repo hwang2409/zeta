@@ -4,6 +4,7 @@ that module under the per-file line cap (see tests/test_module_limits.py)."""
 from __future__ import annotations
 
 import argparse
+import asyncio
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -21,6 +22,7 @@ from ..core.project_context import (
 from ..core.session import (
     SessionError,
     SessionManager,
+    SessionMetadata,
     SessionPreview,
     env_home,
     format_relative_age,
@@ -47,6 +49,39 @@ if TYPE_CHECKING:
     from .app import TUIApp
 
 RECENT_SESSION_LIMIT = 20
+
+
+class _SessionRecency:
+    """Coalesce session-recency writes onto one ordered background task."""
+
+    def __init__(
+        self,
+        manager: SessionManager,
+        metadata: SessionMetadata,
+    ) -> None:
+        self._manager = manager
+        self._session_id = metadata.session_id
+        self._dirty = False
+        self._task: asyncio.Task[None] | None = None
+
+    def refresh(self) -> None:
+        self._dirty = True
+        if self._task is None or self._task.done():
+            if self._task is not None:
+                self._task.result()
+            self._task = asyncio.create_task(self._run())
+
+    async def flush(self) -> None:
+        if self._task is not None:
+            await asyncio.shield(self._task)
+
+    async def _run(self) -> None:
+        while self._dirty:
+            self._dirty = False
+            await asyncio.to_thread(
+                self._manager.refresh_recency,
+                self._session_id,
+            )
 
 
 def background_notice(
@@ -324,6 +359,7 @@ def _create_app_with_root(
             project_id=discovery.project.project_id if discovery.project else None,
             inbox_enabled=config.inbox_enabled,
         )
+    recency: _SessionRecency | None = None
     pending_override = None
     if resuming and mismatches:
         pending_override = (
@@ -340,7 +376,8 @@ def _create_app_with_root(
                 model=pending_override[1],
             )
             pending_override = None
-        # The transcript is durable; do not fsync meta.json only to refresh recency.
+        if recency is not None:
+            recency.refresh()
 
     def model_changed(model_name: str) -> None:
         nonlocal pending_override
@@ -382,6 +419,7 @@ def _create_app_with_root(
         cleanup.enter_context(composition.opened.store)
     opened = composition.opened
     metadata = opened.metadata
+    recency = _SessionRecency(manager, metadata)
     loop = composition.loop
     cleanup.callback(loop.tool_registry.background_tasks.release_directory)
     approval_policy = composition.policy
@@ -440,6 +478,7 @@ def _create_app_with_root(
         project_dir=repo_root,
         project_eligible=discovery.eligible and discovery.primary_root is not None,
         resumed=resuming,
+        on_session_close=recency.flush,
     )
     if composition.memory_reconciler is not None:
         composition.memory_reconciler.notice = app._print_system

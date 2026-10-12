@@ -624,7 +624,22 @@ async def test_agent_output_reads_adopted_background_descendant_notification(
         background=True,
         child_instance_id="parent:1:1",
     )
+    child.update_agent_child_turns("parent:1:1", 4)
+    sibling_call = ToolCall(
+        "sibling-call",
+        "agent",
+        {"prompt": "inspect", "description": "sibling"},
+    )
+    child.register_agent_child(
+        sibling_call,
+        child_session_path=str(child.session_dir / "agents" / "2"),
+        description="sibling",
+        child_instance_id="parent:1:2",
+    )
     adopt_agent_children(child, root)
+    reopened_root = ConversationStore(tmp_path, session_id="parent")
+    assert reopened_root.agent_children()["parent:1:1"]["turns_used"] == 4
+    reopened_root.close()
     root.append_agent_notification(
         "parent:1:1",
         child_session_path=str(grandchild.session_dir),

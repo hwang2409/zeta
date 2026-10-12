@@ -6,7 +6,7 @@ import asyncio
 import time
 import weakref
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from shutil import (
     get_terminal_size,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.get_terminal_size
@@ -203,6 +203,7 @@ class TUIApp(
         project_dir: str | Path | None = None,
         project_eligible: bool | None = None,
         resumed: bool = False,
+        on_session_close: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
@@ -221,6 +222,7 @@ class TUIApp(
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
+        self._on_session_close = on_session_close
         self._init_runtime_close()
         self._init_fork_runtime()
         self._resumed_session = resumed

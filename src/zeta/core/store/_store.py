@@ -292,8 +292,20 @@ class ConversationStore(
                 f"session state todo dismissal is invalid: {self.state_path}"
             )
         self._todo_dismissed = todo_dismissed
+        loaded_children = agent_state["agent_children"]
+        for marker_key, loaded_marker in loaded_children.items():
+            live_marker = self._agent_children.get(marker_key)
+            if (
+                live_marker is not None
+                and live_marker.get("child_session_path")
+                == loaded_marker.get("child_session_path")
+            ):
+                loaded_marker["turns_used"] = max(
+                    loaded_marker.get("turns_used", 0),
+                    live_marker.get("turns_used", 0),
+                )
         self._agent_counter = agent_state["agent_counter"]
-        self._agent_children = agent_state["agent_children"]
+        self._agent_children = loaded_children
         self._agent_parent = agent_state["agent_parent"]
         self._agent_canceled = agent_state["agent_canceled"]
         self._agent_lifecycle = None

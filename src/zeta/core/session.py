@@ -766,8 +766,13 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         return matches[0]
 
     def touch(self, metadata: SessionMetadata) -> None:
-        current = self._mutate(metadata.session_id, lambda item: self._touch(item))
+        current = self.refresh_recency(metadata.session_id)
         self._copy_metadata(metadata, current)
+
+    def refresh_recency(self, session_id: str) -> SessionMetadata:
+        """Refresh recency from the latest metadata stored for a session."""
+
+        return self._mutate(session_id, lambda item: self._touch(item))
 
     def persist_tool_policy(
         self,
