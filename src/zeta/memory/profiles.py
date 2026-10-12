@@ -61,24 +61,24 @@ BUILTIN_PROFILES: MappingProxyType[str, MemorySchema] = MappingProxyType(
     {"zeta": _ZETA, "messaging": _MESSAGING}
 )
 
-_EARLY_UPDATE_DEBOUNCE_SECONDS: MappingProxyType[str, float] = MappingProxyType(
-    {"zeta": 60.0, "messaging": 15.0}
+_EARLY_UPDATE_DEBOUNCE_SECONDS: MappingProxyType[str, float | None] = MappingProxyType(
+    {"zeta": None, "messaging": 15.0}
 )
-_EARLY_UPDATE_MAX_WAIT_SECONDS: MappingProxyType[str, float] = MappingProxyType(
-    {"zeta": 300.0, "messaging": 120.0}
+_EARLY_UPDATE_MAX_WAIT_SECONDS: MappingProxyType[str, float | None] = MappingProxyType(
+    {"zeta": None, "messaging": 120.0}
 )
 
 
-def early_update_debounce_seconds(profile: str) -> float:
-    """Return the completed-turn debounce selected by a memory profile."""
+def early_update_debounce_seconds(profile: str) -> float | None:
+    """Return the completed-turn debounce, or None when the trigger is disabled."""
     try:
         return _EARLY_UPDATE_DEBOUNCE_SECONDS[profile]
     except KeyError as exc:
         raise ValueError(f"unknown memory profile: {profile}") from exc
 
 
-def early_update_max_wait_seconds(profile: str) -> float:
-    """Return the maximum completed-turn coalescing delay for a profile."""
+def early_update_max_wait_seconds(profile: str) -> float | None:
+    """Return the maximum completed-turn delay, or None when disabled."""
     try:
         return _EARLY_UPDATE_MAX_WAIT_SECONDS[profile]
     except KeyError as exc:

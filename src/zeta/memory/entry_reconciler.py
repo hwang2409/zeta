@@ -784,9 +784,9 @@ async def reconcile_entry_range(
             parsed, snapshot.state, key, now, request.visible_entry_ids
         )
         operations = (*_expired_operations(snapshot.state, now), *operations)
-        if not operations and not rejected:
+        if not operations:
             return EntryReconciliationResult(
-                (), (), usage, selected_start, selected_end, key
+                (), rejected, usage, selected_start, selected_end, key
             )
         evidence = (
             transcript.session_id,

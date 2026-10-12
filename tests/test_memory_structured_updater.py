@@ -1016,9 +1016,9 @@ def test_zeta_and_messaging_profiles_apply_distinct_defaults() -> None:
         "threads",
         "commitments",
     )
-    assert early_update_debounce_seconds("zeta") == 60
+    assert early_update_debounce_seconds("zeta") is None
     assert early_update_debounce_seconds("messaging") == 15
-    assert early_update_max_wait_seconds("zeta") == 300
+    assert early_update_max_wait_seconds("zeta") is None
     assert early_update_max_wait_seconds("messaging") == 120
     with pytest.raises(ValueError, match="maximum wait"):
         AutoMemoryConfig(early_trigger_max_wait_seconds=0)
@@ -1800,6 +1800,7 @@ def _auto_runner(
             retry_backoff_seconds=0,
             cas_retries=3,
             early_trigger_debounce_seconds=debounce_seconds,
+            early_trigger_max_wait_seconds=300,
         ),
         **({"clock": clock} if clock is not None else {}),
     )
