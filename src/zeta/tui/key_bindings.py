@@ -13,19 +13,32 @@ from typing import Any, Final
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
+from prompt_toolkit.application import application as prompt_application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
 from prompt_toolkit.enums import DEFAULT_BUFFER, EditingMode
 from prompt_toolkit.filters import (
     Condition,
+    buffer_has_focus,
     has_completions,
     has_focus,
-    is_searching,
     to_filter,
     vi_insert_mode,
 )
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.bindings.basic import load_basic_bindings
+from prompt_toolkit.key_binding.bindings.cpr import load_cpr_bindings
+from prompt_toolkit.key_binding.bindings.emacs import (
+    load_emacs_bindings,
+    load_emacs_shift_selection_bindings,
+)
+from prompt_toolkit.key_binding.bindings.mouse import load_mouse_bindings
 from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
+from prompt_toolkit.key_binding.key_bindings import (
+    ConditionalKeyBindings,
+    KeyBindingsBase,
+    merge_key_bindings,
+)
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import ALL_KEYS, Keys
@@ -229,6 +242,26 @@ def _guard_redraw(application: Application[str]) -> None:
     application._redraw = redraw_or_exit
 
 
+def _load_key_bindings_without_search() -> KeyBindingsBase:
+    """Load prompt-toolkit defaults without composer history-search bindings."""
+
+    all_bindings = merge_key_bindings(
+        [
+            load_basic_bindings(),
+            load_emacs_bindings(),
+            load_emacs_shift_selection_bindings(),
+            load_vi_bindings(),
+        ]
+    )
+    return merge_key_bindings(
+        [
+            ConditionalKeyBindings(all_bindings, buffer_has_focus),
+            load_mouse_bindings(),
+            load_cpr_bindings(),
+        ]
+    )
+
+
 class FullScreenPromptSession(PromptSession[str]):
     """Prompt session that owns the alternate screen for the whole app."""
 
@@ -251,7 +284,12 @@ class FullScreenPromptSession(PromptSession[str]):
     def _create_application(
         self, editing_mode: EditingMode, erase_when_done: bool
     ) -> Application[str]:
-        application = super()._create_application(editing_mode, erase_when_done)
+        original_load_key_bindings = prompt_application.load_key_bindings
+        prompt_application.load_key_bindings = _load_key_bindings_without_search
+        try:
+            application = super()._create_application(editing_mode, erase_when_done)
+        finally:
+            prompt_application.load_key_bindings = original_load_key_bindings
         application.ttimeoutlen, application.timeoutlen, application.cursor = (
             0.02,
             0.5,
@@ -461,7 +499,6 @@ def build_key_bindings(
             and full_screen_mode()
             and finder_active is not None
             and finder_active()
-            and not is_searching()
         )
 
     @Condition
@@ -484,7 +521,6 @@ def build_key_bindings(
             and full_screen_mode()
             and search_active is not None
             and search_active()
-            and not is_searching()
         )
 
     @Condition
@@ -543,13 +579,6 @@ def build_key_bindings(
     @bindings.add(*resolved_keys["insert-newline"], filter=~panel_mode)
     def newline(event: KeyPressEvent) -> None:
         insert_newline(event)
-
-    @bindings.add("enter", filter=is_searching & ~panel_mode, eager=True)
-    def accept_history_search(event: KeyPressEvent) -> None:
-        del event
-        from prompt_toolkit.search import accept_search
-
-        accept_search()
 
     if on_retry is not None:
 
@@ -927,7 +956,7 @@ def build_key_bindings(
 
     if on_finder_open is not None:
 
-        @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~panel_mode & ~transcript_search_mode & ~is_searching, eager=True)
+        @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~panel_mode & ~transcript_search_mode, eager=True)
         def open_message_finder(event: KeyPressEvent) -> None:
             event.current_buffer.cancel_completion()
             finder_buffer.reset()
@@ -1049,9 +1078,8 @@ def build_key_bindings(
                 and not get_app().current_buffer.text
             )
 
-        # Transcript search owns n and N while it is open, and history search
-        # takes the keyboard whole, so the shortcut stands down for both.
-        answering = approval_pending & ~transcript_search_mode & ~is_searching
+        # Transcript search owns n and N while it is open.
+        answering = approval_pending & ~transcript_search_mode
 
         @bindings.add("y", filter=answering & ~panel_mode, eager=True)
         def approve(event: KeyPressEvent) -> None:
@@ -1081,7 +1109,7 @@ def build_key_bindings(
             )
 
         picking = (
-            picker_open & ~transcript_search_mode & ~is_searching & ~has_completions
+            picker_open & ~transcript_search_mode & ~has_completions
         )
 
         @bindings.add("up", filter=picking & ~panel_mode, eager=True)
@@ -1116,7 +1144,7 @@ def build_key_bindings(
         # prompt-toolkit's alias for ``BackTab``.)
         @bindings.add(
             *resolved_keys["plan-mode-toggle"],
-            filter=interactions_enabled & ~has_completions & ~transcript_search_mode & ~is_searching & ~panel_mode,
+            filter=interactions_enabled & ~has_completions & ~transcript_search_mode & ~panel_mode,
             eager=True,
         )
         def toggle_plan_mode(event: KeyPressEvent) -> None:

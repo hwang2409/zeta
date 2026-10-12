@@ -5057,55 +5057,41 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("editing_mode", [EditingMode.EMACS, EditingMode.VI])
-async def test_history_search_acceptance_survives_message_finder(
-    editing_mode: EditingMode,
-    tmp_path: Path,
-) -> None:
+async def test_composer_history_search_is_disabled(tmp_path: Path) -> None:
     history = history_for(tmp_path / "history")
     history.append_string("history target")
-    finder_active = False
-    values: list[str] = []
-
-    def open_finder() -> None:
-        nonlocal finder_active
-        finder_active = True
-
-    def cancel_finder() -> None:
-        nonlocal finder_active
-        finder_active = False
-
     with create_pipe_input() as pipe:
-        session = PromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            editing_mode=editing_mode,
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), editing_mode=EditingMode.EMACS,
             history=history_for(tmp_path / "history"),
-            key_bindings=build_key_bindings(
-                on_interrupt=lambda: None,
-                on_exit=lambda: None,
-                on_finder_open=open_finder,
-                finder_active=lambda: finder_active,
-                on_finder_input=values.append,
-                on_finder_cancel=cancel_finder,
-                search_active=lambda: False,
-                on_search_end=lambda: None,
-            ),
+            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
             multiline=True,
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0.05)
-        session.app.full_screen = True
-        pipe.send_text("\x06query")  # Open the finder and type a query.
-        await wait_until(lambda: values == ["q", "qu", "que", "quer", "query"])
-        pipe.send_text("\x1b")  # Esc closes the finder and releases the keyboard.
-        await wait_until(lambda: not finder_active)
-        pipe.send_text("\x12history")  # Ctrl-R history search still works.
-        await wait_until(lambda: session.search_buffer.text == "history")
-        pipe.send_text("\r")
-        await wait_until(
-            lambda: session.default_buffer.text == "history target"
+        pipe.send_text("\x12")
+        await asyncio.sleep(0.1)
+        assert session.default_buffer.text == ""
+        assert session.app.current_buffer is session.default_buffer
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_history_search_is_disabled(tmp_path: Path) -> None:
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
+            multiline=True,
         )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x1b/")
+        await asyncio.sleep(0.1)
+        assert session.default_buffer.text == ""
+        assert session.app.current_buffer is session.default_buffer
         session.app.exit()
         await task
 
@@ -10226,37 +10212,6 @@ async def test_mcp_prompt_error_restores_draft_and_attachments(
     assert rendered and rendered[-1].style == ERROR
     assert "prompt unavailable" in rendered[-1].plain
     await app.loop.close()
-
-
-@pytest.mark.asyncio
-async def test_ctrl_r_search_uses_cross_session_history(tmp_path: Path) -> None:
-    history = history_for(tmp_path / "history")
-    history.append_string("older session prompt")
-    history.append_string("newer session prompt")
-
-    with create_pipe_input() as pipe:
-        session = PromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            history=history_for(tmp_path / "history"),
-            key_bindings=build_key_bindings(
-                on_interrupt=lambda: None,
-                on_exit=lambda: None,
-                on_retry=lambda: None,
-                retry_available=lambda: True,
-            ),
-            multiline=True,
-        )
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
-        pipe.send_text("\x12older")
-        await wait_until(lambda: session.search_buffer.text == "older")
-        pipe.send_text("\r")
-        await wait_until(
-            lambda: session.default_buffer.text == "older session prompt"
-        )
-        session.app.exit()
-        await task
 
 
 @pytest.mark.asyncio
