@@ -17,6 +17,7 @@ from zeta.project_inbox import ProjectInbox
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.tui.agent_card import AgentNavigation
 from zeta.tui.cards.decisions import DecisionsPanel
+from zeta.tui.overlay import OverlayControl
 from zeta.tui.render import format_status
 
 
@@ -134,6 +135,29 @@ def test_decisions_popup_lists_items_and_offers_options() -> None:
     assert "2. Postgres" in text
     assert panel.pick_option(1) == "SQLite"
     assert panel.pick_option(9) is None
+
+
+def test_decisions_popup_accepts_fragments_with_mouse_handlers() -> None:
+    panel = DecisionsPanel()
+    panel.set_items(
+        [
+            _item(
+                "1" * 32,
+                "Pick DB",
+                "Choose a durable store.",
+                ["SQLite", "Postgres"],
+            )
+        ]
+    )
+    lines = panel.render_lines()
+    style, text = lines[2][0]
+    lines[2][0] = (style, text, lambda mouse_event: None)
+    control = OverlayControl()
+    control.set_lines(lines)
+
+    assert control.preferred_width(120) > 0
+    content = control.create_content(width=72, height=10)
+    assert content.line_count == 10
 
 
 def test_decisions_popup_answer_mode_captures_text() -> None:

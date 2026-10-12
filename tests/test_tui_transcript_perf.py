@@ -1528,6 +1528,32 @@ async def test_oversized_far_branch_clears_existing_agent_tail(tmp_path: Path) -
     store.close()
 
 
+def test_transient_agent_refresh_keeps_previous_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.core.session_files import SessionError
+
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("previous")]))
+    child.close()
+    source = agent_sync_module.AgentTranscriptSource(
+        child.session_dir, message_limit=64
+    )
+    previous = source.refresh(recursive=True)
+
+    def fail_read(path: Path, limit: int):
+        raise SessionError("file replaced")
+
+    monkeypatch.setattr(agent_sync_module, "_read_active_message_tail", fail_read)
+    try:
+        assert agent_sync_module.refresh_agent_transcripts([(source, True)]) == [
+            previous
+        ]
+    finally:
+        source.close()
+
+
 @pytest.mark.asyncio
 async def test_failing_agent_source_does_not_stop_batch_or_spinner(
     tmp_path: Path,

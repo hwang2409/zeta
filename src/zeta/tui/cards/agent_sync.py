@@ -17,7 +17,7 @@ from ...core.checkpoints import (
     ConversationIntegrityError,
     load_session_json,
 )
-from ...core.session_files import open_session_file, session_directory
+from ...core.session_files import SessionError, open_session_file, session_directory
 from ...core.store import ConversationStore
 from ...protocol.types import is_passive_harness_message
 
@@ -85,7 +85,17 @@ class AgentTranscriptSource:
         with _REFRESH_LOCK:
             if self._closed:
                 raise RuntimeError("agent transcript source is closed")
-            return self._refresh_locked(recursive=recursive)
+            previous = self._snapshots.copy()
+            try:
+                snapshot = self._refresh_locked(recursive=recursive)
+            except (SessionError, OSError) as error:
+                if not previous:
+                    raise
+                self._snapshots = previous
+                self._log_refresh_error(error, traceback=False)
+                return self._tree_snapshot()
+            self._refresh_error_logged = False
+            return snapshot
 
     def close(self) -> None:
         """Close owned stores and make this source unusable."""
@@ -171,15 +181,25 @@ class AgentTranscriptSource:
             )
         return AgentTranscriptSnapshot(entry_ids, tuple(messages))
 
+    def _tree_snapshot(self) -> AgentTranscriptTreeSnapshot:
+        return AgentTranscriptTreeSnapshot(
+            self.path,
+            tuple(self._snapshots.items()),
+        )
+
+    def _log_refresh_error(self, error: Exception, *, traceback: bool) -> None:
+        if self._refresh_error_logged:
+            return
+        _LOGGER.warning(
+            "agent transcript refresh failed for %s: %s",
+            self.path,
+            error,
+            exc_info=error if traceback else None,
+        )
+        self._refresh_error_logged = True
+
     def _failed_snapshot(self, error: Exception) -> AgentTranscriptTreeSnapshot:
-        if not self._refresh_error_logged:
-            _LOGGER.warning(
-                "agent transcript refresh failed for %s: %s",
-                self.path,
-                error,
-                exc_info=error,
-            )
-            self._refresh_error_logged = True
+        self._log_refresh_error(error, traceback=True)
         snapshot = AgentTranscriptSnapshot((), (), _REFRESH_UNAVAILABLE)
         self._snapshots[self.path] = snapshot
         return AgentTranscriptTreeSnapshot(self.path, ((self.path, snapshot),))

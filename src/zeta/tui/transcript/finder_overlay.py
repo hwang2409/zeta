@@ -184,7 +184,7 @@ class FinderControl(UIControl):
     def preferred_width(self, max_available_width: int) -> int:
         lines = self._current_lines(min(max_available_width, _MAX_WIDTH) - 2)
         natural = max(
-            (sum(_cells(text) for _style, text in line) for line in lines),
+            (sum(_cells(fragment[1]) for fragment in line) for line in lines),
             default=0,
         )
         return min(_MAX_WIDTH, max(24, natural + 4))

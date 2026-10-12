@@ -438,6 +438,49 @@ def test_json_path_reader_rejects_symlink(tmp_path):
     assert outside.read_text() == '{"secret": "outside"}'
 
 
+def test_read_retries_file_replaced_between_open_and_fstat(tmp_path, monkeypatch):
+    from zeta.core import session_files
+
+    directory = tmp_path / "session"
+    directory.mkdir()
+    target = directory / "state.json"
+    target.write_bytes(b"old")
+    replacement = directory / "replacement"
+    replacement.write_bytes(b"new")
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    real_fstat = session_files.os.fstat
+    replaced = False
+
+    def replace_before_fstat(fd):
+        nonlocal replaced
+        if not replaced and fd != directory_fd:
+            replaced = True
+            replacement.replace(target)
+        return real_fstat(fd)
+
+    monkeypatch.setattr(session_files.os, "fstat", replace_before_fstat)
+    try:
+        assert session_files.read_session_file(directory_fd, target.name) == b"new"
+    finally:
+        os.close(directory_fd)
+
+
+def test_read_rejects_hardlinked_session_file(tmp_path):
+    from zeta.core.session_files import read_session_file
+
+    directory = tmp_path / "session"
+    directory.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"secret")
+    os.link(outside, directory / "state.json")
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(SessionError, match="regular, unshared file"):
+            read_session_file(directory_fd, "state.json")
+    finally:
+        os.close(directory_fd)
+
+
 def test_safe_open_rejects_hardlink_before_truncation(tmp_path):
     from zeta.core.session_files import open_session_file
 
