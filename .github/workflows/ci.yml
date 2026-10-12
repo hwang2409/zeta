@@ -55,7 +55,7 @@ jobs:
       # Bound worker count on both runners and rebalance uneven test durations.
       # Report slow tests so future bottlenecks are visible in the CI logs.
       - name: Run the suite
-        run: uv run --frozen pytest -q -n 4 --dist worksteal --durations=0 -o faulthandler_timeout=240
+        run: uv run --frozen pytest -q -n 4 --dist worksteal --durations=25
 
   lint:
     name: ruff
