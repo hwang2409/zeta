@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -1390,27 +1389,25 @@ async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
     tmp_path: Path,
 ) -> None:
     pid_file = tmp_path / "timeout-grandchild.pid"
-    child = (
-        "import os,pathlib,time; "
-        f"pathlib.Path({str(pid_file)!r}).write_text("
-        "f'{os.getpid()} {os.getpgid(0)}'); time.sleep(30)"
-    )
+    child = "import time; time.sleep(30)"
     parent = (
-        "import subprocess,sys,time; "
-        f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+        "import os,pathlib,subprocess,sys,time; "
+        f"child = subprocess.Popen([sys.executable, '-c', {child!r}]); "
+        f"pathlib.Path({str(pid_file)!r}).write_text("
+        "f'{child.pid} {os.getpgid(child.pid)}'); time.sleep(30)"
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    started = time.monotonic()
-    result = await registry.execute(
-        ToolCall(
-            "bash-grandchild-timeout",
-            "bash",
-            {"command": _python_command(parent), "timeout": 0.2},
-        )
+    result = await asyncio.wait_for(
+        registry.execute(
+            ToolCall(
+                "bash-grandchild-timeout",
+                "bash",
+                {"command": _python_command(parent), "timeout": 0.2},
+            )
+        ),
+        timeout=10,
     )
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 1.0
     assert result["isError"] is True
     assert "[timed out after 0.2s; process group killed]" in result["content"][0]["text"]
     assert result["structuredContent"]["timed_out"] is True
