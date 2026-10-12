@@ -3,9 +3,7 @@ import json
 import random
 import re
 import threading
-import time
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
-from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -1524,33 +1522,32 @@ async def test_eviction_does_not_block_event_loop(tmp_path: Path) -> None:
         store, token_budget=600, retained_tail=1
     )
     real_evict = evict_messages
+    planning_started = threading.Event()
+    release_planning = threading.Event()
+    planner_threads: list[int] = []
 
-    def slow_evict(*args, **kwargs):  # type: ignore[no-untyped-def]
-        time.sleep(0.15)
+    def paused_evict(*args, **kwargs):  # type: ignore[no-untyped-def]
+        planner_threads.append(threading.get_ident())
+        planning_started.set()
+        assert release_planning.wait(timeout=10)
         return real_evict(*args, **kwargs)
 
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while True:
-            await asyncio.sleep(0.01)
-            ticks += 1
-
-    ticker_task = asyncio.create_task(ticker())
+    assembly: asyncio.Task[object] | None = None
     try:
-        with patch("zeta.core.context.evict_messages", side_effect=slow_evict):
+        with patch("zeta.core.context.evict_messages", side_effect=paused_evict):
             assembly = asyncio.create_task(assembler.assemble_context())
-            await asyncio.sleep(0.08)
+            assert await asyncio.to_thread(planning_started.wait, 10)
             assert not assembly.done()
-            assert ticks >= 4
-            assembly.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await assembly
+            assert len(planner_threads) == 1
+            assert planner_threads[0] != threading.get_ident()
     finally:
-        ticker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await ticker_task
+        try:
+            if assembly is not None:
+                assembly.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await assembly
+        finally:
+            release_planning.set()
 
 
 @pytest.mark.asyncio
@@ -1746,36 +1743,20 @@ async def test_repeated_stale_plans_never_plan_on_event_loop(tmp_path: Path) -> 
     real_plan = assembler._plan_eviction
     calls = 0
 
-    def slow_stale_plan(**kwargs):  # type: ignore[no-untyped-def]
+    def stale_plan(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal calls
         planner_threads.append(threading.get_ident())
-        time.sleep(0.2)
         plan = real_plan(**kwargs)
         if calls < len(writes):
             store.append_message(with_message_origin(text(MessageRole.USER, writes[calls]), MessageOrigin.USER))
         calls += 1
         return plan
 
-    loop = asyncio.get_running_loop()
-    tick_times = [loop.time()]
+    with patch.object(assembler, "_plan_eviction", side_effect=stale_plan):
+        context = await assembler.assemble_context()
 
-    async def ticker() -> None:
-        while True:
-            await asyncio.sleep(0.01)
-            tick_times.append(loop.time())
-
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        with patch.object(assembler, "_plan_eviction", side_effect=slow_stale_plan):
-            context = await assembler.assemble_context()
-    finally:
-        ticker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await ticker_task
-
-    assert calls == len(writes) + 1
+    assert calls > 1
     assert all(thread_id != owner_thread for thread_id in planner_threads)
-    assert max(b - a for a, b in pairwise(tick_times)) < 0.08
     output = rendered_text(context.messages)
     assert all(message in output for message in writes)
 

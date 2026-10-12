@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import tarfile
@@ -31,6 +32,9 @@ from ..memory_migration_plan import (
 )
 
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
+# Atomic mirror temporaries written by _publish_mirror_file for any schema kind:
+# ".<kind>.md.<uuid4 hex>.tmp" (kind keys follow entry_store._KIND_KEY).
+_MIRROR_TEMPORARY = re.compile(r"\.[a-z][a-z0-9_-]{0,31}\.md\.[0-9a-f]{32}\.tmp")
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
 _MAX_HISTORY = 128
@@ -290,6 +294,12 @@ def transfer_digest(root: Path) -> str:
     return _tree_digest(root, iter(paths))
 
 
+def _is_memory_mirror_temporary(root: Path, path: Path) -> bool:
+    return path.parent == root / "memory" and bool(
+        _MIRROR_TEMPORARY.fullmatch(path.name)
+    )
+
+
 def project_digest(root: Path) -> str:
     if not root.exists():
         return _MISSING
@@ -298,6 +308,7 @@ def project_digest(root: Path) -> str:
         path
         for path in root.rglob("*")
         if path.is_file()
+        and not _is_memory_mirror_temporary(root, path)
         and not path.is_symlink()
         and path.name not in _EXCLUDED_NAMES
         and not (
