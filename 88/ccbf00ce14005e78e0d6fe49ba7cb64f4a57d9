@@ -1,0 +1,25 @@
+.github/workflows/ci.yml
+  s_d5690eec73de7b::t_aac311f1f89789 55-56,58
+src/zeta/memory/entry_reconciler.py
+  s_d5690eec73de7b::t_aac311f1f89789 390-391,402,411,414
+pyproject.toml
+  s_d5690eec73de7b::t_e622897af07e3e 22
+uv.lock
+  s_d5690eec73de7b::t_f6e3a7758fe228 121-129,375-387,545,566
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "88ccbf00ce14005e78e0d6fe49ba7cb64f4a57d9",
+  "prompts": {},
+  "sessions": {
+    "s_d5690eec73de7b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12ef4-1f87-7a90-ae5e-cdbf0229ee60",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Austin Jian <austin.jian07@gmail.com>"
+    }
+  }
+}
