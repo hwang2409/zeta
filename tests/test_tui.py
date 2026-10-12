@@ -9690,6 +9690,8 @@ async def test_vi_composer_history_down_restores_multiline_entry_cursor(
         await second
         third = asyncio.create_task(session.prompt_async(" ❯ "))
         await asyncio.sleep(0)
+        assert session.default_buffer._load_history_task is not None
+        await session.default_buffer._load_history_task
         pipe.send_text("\x1b[A")
         await wait_until(
             lambda: session.app.current_buffer.text == "other first\nother second"
@@ -9889,6 +9891,8 @@ async def test_composer_submit_writes_file_history_and_up_replays_it(
         )
         second_task = asyncio.create_task(second_session.prompt_async(" ❯ "))
         await asyncio.sleep(0)
+        assert second_session.default_buffer._load_history_task is not None
+        await second_session.default_buffer._load_history_task
         pipe.send_text("\x1b[A\r")
         await second_task
 
@@ -9929,6 +9933,8 @@ async def test_vi_composer_history_up_works_from_insert_mode_on_empty_buffer(
 
         second = asyncio.create_task(session.prompt_async(" ❯ "))
         await asyncio.sleep(0)
+        assert session.default_buffer._load_history_task is not None
+        await session.default_buffer._load_history_task
         pipe.send_text("\x1b[A\r")
         await second
 
@@ -10173,6 +10179,79 @@ async def test_record_prompt_writes_history_off_the_event_loop(
 
     assert write_threads and write_threads[0] != loop_thread
     await app.close()
+
+
+@pytest.mark.asyncio
+async def test_persisted_history_loads_once_off_loop_for_navigation_and_finder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "history"
+    history_for(path).store_string("saved prompt")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        history_path=path,
+    )
+    assert app._history is not None
+    loop_thread = threading.get_ident()
+    load_threads: list[int] = []
+    original = app._history.load_history_strings
+
+    def recording_loader() -> list[str]:
+        load_threads.append(threading.get_ident())
+        return original()
+
+    monkeypatch.setattr(app._history, "load_history_strings", recording_loader)
+    session = app._make_session()
+    with set_app(session.app):
+        session.default_buffer.load_history_if_not_yet_loaded()
+        assert session.default_buffer._load_history_task is not None
+        await session.default_buffer._load_history_task
+    session.default_buffer.history_backward()
+
+    request = app._history_finder.open_finder(session.default_buffer)
+    assert request is not None
+    snapshot = await app._history_finder.build_finder_candidates(request)
+
+    assert session.default_buffer.text == "saved prompt"
+    assert [candidate.text for candidate in snapshot.candidates] == ["saved prompt"]
+    assert len(load_threads) == 1
+    assert load_threads[0] != loop_thread
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_submission_during_initial_history_load_is_kept_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "history"
+    history_for(path).store_string("saved prompt")
+    history = history_for(path)
+    started = threading.Event()
+    release = threading.Event()
+    original = history.load_history_strings
+
+    def blocked_loader() -> list[str]:
+        started.set()
+        release.wait()
+        return original()
+
+    monkeypatch.setattr(history, "load_history_strings", blocked_loader)
+
+    async def load() -> list[str]:
+        return [entry async for entry in history.load()]
+
+    load_task = asyncio.create_task(load())
+    assert await asyncio.to_thread(started.wait, 1)
+    history.append_string("new prompt")
+    release.set()
+    loaded = await load_task
+    await history.flush_pending()
+
+    assert loaded.count("new prompt") == 1
+    assert history.snapshot().count("new prompt") == 1
+    assert set(history.snapshot()) == {"saved prompt", "new prompt"}
 
 
 @pytest.mark.asyncio

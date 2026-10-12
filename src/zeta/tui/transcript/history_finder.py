@@ -68,14 +68,13 @@ class HistoryFinder:
 
     def __init__(
         self,
-        load_history: Callable[[], list[str]],
+        load_history: Callable[[], None],
         history_snapshot: Callable[[], tuple[str, ...]],
         *,
         on_accept: Callable[[], None] | None = None,
     ) -> None:
         self._load_history = load_history
         self._history_snapshot = history_snapshot
-        self._history_loaded = False
         self._on_accept = on_accept
         self._finder: MessageFinder | None = None
         self._generation = 0
@@ -105,9 +104,7 @@ class HistoryFinder:
         return await asyncio.to_thread(self._load_snapshot)
 
     def _load_snapshot(self) -> HistorySnapshot:
-        if not self._history_loaded:
-            self._load_history()
-            self._history_loaded = True
+        self._load_history()
         return build_history_candidates(self._history_snapshot())
 
     def finder_publish_candidates(

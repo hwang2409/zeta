@@ -308,7 +308,7 @@ class TUIApp(
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._history_finder = HistoryFinder(
-            self._history.get_strings,
+            self._history.load_from_disk_once,
             self._history.snapshot,
             on_accept=lambda: app._clear_pending_attachments(),
         )
@@ -1134,6 +1134,8 @@ class TUIApp(
             if not resume_ui:
                 self._begin_startup_replay()
             await self.loop.activate()
+            if self._history is not None:
+                await asyncio.to_thread(self._history.load_from_disk_once)
             session = session or self._session or self._make_session()
             self._active_session = session
             self._attach_draft(session)

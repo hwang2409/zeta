@@ -27,7 +27,7 @@ def _finder(
     history: BoundedFileHistory, *, on_accept=None
 ) -> HistoryFinder:
     return HistoryFinder(
-        history.get_strings,
+        history.load_from_disk_once,
         history.snapshot,
         on_accept=on_accept,
     )
@@ -155,26 +155,31 @@ async def test_open_and_cancel_do_not_write_history(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_initial_history_loading_runs_off_the_event_loop_thread(
-    tmp_path: Path,
+async def test_fresh_finder_loads_persisted_history_once_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "history"
     history_for(path).store_string("saved prompt")
     history = history_for(path)
     loop_thread = threading.get_ident()
-    worker_threads: list[int] = []
+    load_threads: list[int] = []
+    original = history.load_history_strings
 
     def recording_loader() -> list[str]:
-        worker_threads.append(threading.get_ident())
-        return history.get_strings()
+        load_threads.append(threading.get_ident())
+        return original()
 
-    finder = HistoryFinder(recording_loader, history.snapshot)
-    request = finder.open_finder(Buffer())
-    assert request is not None
+    monkeypatch.setattr(history, "load_history_strings", recording_loader)
+    finder = _finder(history)
+    await _open(finder, Buffer())
+    loaded_for_prompt = [entry async for entry in history.load()]
 
-    await finder.build_finder_candidates(request)
-
-    assert worker_threads and worker_threads[0] != loop_thread
+    state = finder.finder_state()
+    assert state is not None
+    assert [row.candidate.text for row in state.rows] == ["saved prompt"]
+    assert loaded_for_prompt == ["saved prompt"]
+    assert len(load_threads) == 1
+    assert load_threads[0] != loop_thread
 
 
 @pytest.mark.asyncio

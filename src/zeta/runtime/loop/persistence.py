@@ -11,7 +11,7 @@ import os
 import queue
 import tempfile
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -175,12 +175,48 @@ class BoundedFileHistory(FileHistory):
         self.limit = limit
         self._writer = _OrderedFileWriter("composer history")
         self._snapshot_lock = threading.Lock()
+        self._load_complete = threading.Condition(self._snapshot_lock)
+        self._disk_loading = False
+        self._disk_loaded = False
         self._revision = 0
+        self._applied_revision = 0
         self._pending: list[tuple[int, str]] = []
         super().__init__(str(filename))
 
     def load_history_strings(self) -> list[str]:
         return list(super().load_history_strings())[: self.limit]
+
+    def load_from_disk_once(self) -> None:
+        """Load persisted entries once and merge submissions made during the read."""
+
+        with self._load_complete:
+            while self._disk_loading:
+                self._load_complete.wait()
+            if self._disk_loaded:
+                return
+            self._disk_loading = True
+        try:
+            disk_entries = self.load_history_strings()
+        except BaseException:
+            with self._load_complete:
+                self._disk_loading = False
+                self._load_complete.notify_all()
+            raise
+        with self._load_complete:
+            newest = [value for _, value in reversed(self._pending)]
+            self._loaded_strings = self._merge_newest(newest, disk_entries)
+            self._disk_loaded = True
+            self._disk_loading = False
+            self._pending = [
+                item for item in self._pending if item[0] > self._applied_revision
+            ]
+            self._loaded = True
+            self._load_complete.notify_all()
+
+    async def load(self) -> AsyncGenerator[str, None]:
+        await asyncio.to_thread(self.load_from_disk_once)
+        for item in reversed(self.snapshot()):
+            yield item
 
     def append_string(self, string: str) -> None:
         with self._snapshot_lock:
@@ -208,14 +244,25 @@ class BoundedFileHistory(FileHistory):
     def _apply_snapshot(self, revision: int, disk_entries: object) -> None:
         assert isinstance(disk_entries, list)
         with self._snapshot_lock:
-            self._pending = [item for item in self._pending if item[0] > revision]
+            self._applied_revision = max(self._applied_revision, revision)
+            if not self._disk_loading:
+                self._pending = [
+                    item for item in self._pending if item[0] > self._applied_revision
+                ]
             newest = [value for _, value in reversed(self._pending)]
-            merged: list[str] = []
-            for value in [*newest, *disk_entries]:
-                if not merged or merged[-1] != value:
-                    merged.append(value)
-            self._loaded_strings = merged[: self.limit]
+            self._loaded_strings = self._merge_newest(newest, disk_entries)
             self._loaded = True
+
+    def _merge_newest(self, newest: list[str], disk_entries: list[str]) -> list[str]:
+        local = [
+            value
+            for index, value in enumerate(newest)
+            if index == 0 or newest[index - 1] != value
+        ]
+        overlap = min(len(local), len(disk_entries))
+        while overlap and local[-overlap:] != disk_entries[:overlap]:
+            overlap -= 1
+        return [*local, *disk_entries[overlap:]][: self.limit]
 
     def get_strings(self) -> list[str]:
         with self._snapshot_lock:
