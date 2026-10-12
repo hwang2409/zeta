@@ -19,6 +19,7 @@ from ...core.checkpoints import (
     load_session_json,
 )
 from ...core.session_files import (
+    SessionError,
     SessionFileReplaced,
     open_session_file,
     session_directory,
@@ -118,6 +119,7 @@ class AgentTodoControl:
         self._pending_path: Path | None = None
         self._refresh_requested = False
         self._closed = False
+        self._refresh_error_logged = False
 
     def snapshot(self, path: Path) -> TodoSnapshot | None:
         return self._snapshot if self._snapshot_path == path else None
@@ -130,16 +132,23 @@ class AgentTodoControl:
             changed = self._snapshot is not None
             self._snapshot = None
             self._snapshot_path = None
+            self._refresh_error_logged = False
             return changed
         if self._source is None or self._source.path != path:
             previous, self._source = self._source, None
+            self._refresh_error_logged = False
             if previous is not None:
                 await asyncio.to_thread(previous.close)
             self._source = AgentTodoSource(path, cwd=self._cwd)
         try:
             snapshot = await asyncio.to_thread(self._source.refresh)
-        except (ConversationIntegrityError, OSError, ValueError):
-            snapshot = None
+        except (SessionError, ConversationIntegrityError, OSError) as error:
+            if not self._refresh_error_logged:
+                _LOGGER.warning("agent todo refresh failed for %s: %s", path, error)
+                self._refresh_error_logged = True
+            snapshot = TodoSnapshot((), False, unavailable=True)
+        else:
+            self._refresh_error_logged = False
         changed = snapshot != self._snapshot or path != self._snapshot_path
         self._snapshot = snapshot
         self._snapshot_path = path

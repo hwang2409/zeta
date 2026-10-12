@@ -27,6 +27,7 @@ class TodoSnapshot:
 
     items: tuple[TodoItem, ...]
     dismissed: bool
+    unavailable: bool = False
 
 
 class TodoWidget(UIControl):
@@ -56,7 +57,9 @@ class TodoWidget(UIControl):
         """Return whether the widget has content to render."""
 
         snapshot = self._selected_snapshot()
-        return snapshot is not None and bool(snapshot.items) and not snapshot.dismissed
+        return snapshot is not None and (
+            snapshot.unavailable or (bool(snapshot.items) and not snapshot.dismissed)
+        )
 
     @staticmethod
     def _is_terminal(items: Sequence[TodoItem]) -> bool:
@@ -70,6 +73,8 @@ class TodoWidget(UIControl):
         snapshot = self._selected_snapshot()
         if snapshot is None or snapshot.dismissed:
             return []
+        if snapshot.unavailable:
+            return [[("fg:" + theme.DIM, "child todos unavailable")], []]
         items = snapshot.items
         if not items:
             return []

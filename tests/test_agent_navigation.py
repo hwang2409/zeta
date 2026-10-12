@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import logging
 import os
 import threading
 from collections.abc import Iterable
@@ -486,8 +487,8 @@ def test_navigation_close_releases_selected_child_todo_lease(tmp_path: Path) -> 
     root.close()
 
 
-def test_todo_child_refresh_and_corruption_fail_closed_and_parent_updates_survive(
-    tmp_path: Path,
+def test_todo_child_refresh_and_corruption_is_visible_and_recovers(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     root = ConversationStore(tmp_path / "sessions", session_id="root")
     root.set_todo_items([{"content": "initial parent", "status": "pending"}])
@@ -500,11 +501,20 @@ def test_todo_child_refresh_and_corruption_fail_closed_and_parent_updates_surviv
     assert "old child" in _todo_text(widget)
 
     navigation.back_to_parent()
-    child.joinpath("session_state.json").write_text("not json\n")
+    state_path = child.joinpath("session_state.json")
+    valid_state = state_path.read_bytes()
+    state_path.write_text("not json\n")
     navigation.selected_index = 1
-    navigation.open_selected()
-    assert not widget.visible
-    assert _todo_text(widget) == ""
+    with caplog.at_level(logging.WARNING):
+        navigation.open_selected()
+        navigation.refresh(force=True)
+    assert widget.visible
+    assert _todo_text(widget) == "child todos unavailable"
+    assert sum("agent todo refresh failed" in record.message for record in caplog.records) == 1
+
+    state_path.write_bytes(valid_state)
+    navigation.refresh(force=True)
+    assert "old child" in _todo_text(widget)
 
     root.set_todo_items([{"content": "updated parent", "status": "in_progress"}])
     navigation.back_to_parent()
