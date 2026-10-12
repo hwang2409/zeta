@@ -12,9 +12,7 @@ import stat
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import AsyncIterator, Sequence
-from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -1430,6 +1428,9 @@ async def test_background_slow_log_writer_does_not_block_loop_and_cursors_stay_e
 ) -> None:
     tasks = BackgroundTaskRegistry(output_limit=4, call_limit=4)
     original_open_log = tasks._open_task_log
+    write_entered = threading.Event()
+    release_write = threading.Event()
+    write_finished = threading.Event()
 
     class SlowLog:
         def __init__(self, handle) -> None:
@@ -1445,8 +1446,12 @@ async def test_background_slow_log_writer_does_not_block_loop_and_cursors_stay_e
             return self._handle.fileno()
 
         def write(self, data: bytes) -> int:
-            time.sleep(0.25)
-            return self._handle.write(data)
+            write_entered.set()
+            try:
+                assert release_write.wait(timeout=10), "event loop could not release log write"
+                return self._handle.write(data)
+            finally:
+                write_finished.set()
 
         def flush(self) -> None:
             self._handle.flush()
@@ -1457,29 +1462,24 @@ async def test_background_slow_log_writer_does_not_block_loop_and_cursors_stay_e
     monkeypatch.setattr(
         tasks, "_open_task_log", lambda task_id: SlowLog(original_open_log(task_id))
     )
-    ticks: list[float] = []
-    stop = asyncio.Event()
+    try:
+        task_id, _ = await tasks.start("printf 0123456789abcdef", tmp_path)
+        assert await asyncio.to_thread(write_entered.wait, 10)
+        # Reaching here while the writer is blocked proves loop progress;
+        # scheduler latency on a loaded CI runner is irrelevant.
+        assert not write_finished.is_set()
+        release_write.set()
+        await _wait_for_exit(tasks, task_id)
 
-    async def ticker() -> None:
-        while not stop.is_set():
-            ticks.append(time.monotonic())
-            await asyncio.sleep(0.01)
-
-    ticker_task = asyncio.create_task(ticker())
-    task_id, _ = await tasks.start("printf 0123456789abcdef", tmp_path)
-    await _wait_for_exit(tasks, task_id)
-    stop.set()
-    await ticker_task
-
-    gaps = [later - earlier for earlier, later in pairwise(ticks)]
-    assert gaps and max(gaps) < 0.1
-    cursor = 0
-    for expected in ("0123", "4567", "89ab", "cdef"):
-        result = await tasks.output(task_id, since=cursor)
-        assert result["output"] == expected
-        cursor = result["cursor"]
-    assert cursor == 16
-    await tasks.close()
+        cursor = 0
+        for expected in ("0123", "4567", "89ab", "cdef"):
+            result = await tasks.output(task_id, since=cursor)
+            assert result["output"] == expected
+            cursor = result["cursor"]
+        assert cursor == 16
+    finally:
+        release_write.set()
+        await tasks.close()
 
 
 @pytest.mark.asyncio
