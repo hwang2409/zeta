@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 import os
 import threading
 import time
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,12 +19,14 @@ from ...core.checkpoints import (
     load_session_json,
 )
 from ...core.session_files import (
+    SessionError,
     SessionFileReplaced,
     open_session_file,
     session_directory,
 )
 from ...core.store import ConversationStore
 from ...protocol.types import is_passive_harness_message
+from ..todo import TodoSnapshot
 
 _REFRESH_LOCK = threading.Lock()
 _REVERSE_READ_BYTES = 64 * 1024
@@ -32,6 +35,192 @@ _MAX_FULL_FALLBACK_BYTES = 16 * 1024 * 1024
 _BOUNDED_UNAVAILABLE = "child transcript unavailable: history exceeds bounded scan"
 _REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
 _LOGGER = logging.getLogger(__name__)
+
+
+class TodoStateNotWritten(Exception):
+    """The child directory exists, but its session_state.json does not yet."""
+
+
+class AgentTodoSource:
+    """Own one read-only child store and publish cached todo snapshots."""
+
+    def __init__(self, path: Path, *, cwd: str) -> None:
+        self.path = path
+        self._cwd = cwd
+        self._store: ConversationStore | None = None
+        self._signature: tuple[int, int, int, int] | None = None
+        self._snapshot: TodoSnapshot | None = None
+        self._closed = False
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _state_signature(path: Path) -> tuple[int, int, int, int]:
+        stat = (path / "session_state.json").stat()
+        return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
+
+    def refresh(self) -> TodoSnapshot:
+        """Refresh changed state while preserving a snapshot across replace races."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("agent todo source is closed")
+            previous = self._snapshot
+            try:
+                return self._refresh_locked()
+            except SessionFileReplaced:
+                if previous is None:
+                    raise
+                return previous
+
+    def _refresh_locked(self) -> TodoSnapshot:
+        try:
+            before = self._state_signature(self.path)
+        except FileNotFoundError:
+            if self.path.is_dir():
+                raise TodoStateNotWritten() from None
+            raise
+        if self._store is None:
+            store = ConversationStore(
+                self.path.parent,
+                session_id=self.path.name,
+                cwd=self._cwd,
+                _read_only=True,
+                _must_exist=True,
+            )
+            after = self._state_signature(self.path)
+            if after != before:
+                store.close()
+                raise SessionFileReplaced("session state changed while opening")
+            self._store = store
+        elif before != self._signature:
+            self._store.refresh_todo_state()
+            after = self._state_signature(self.path)
+            if after != before:
+                raise SessionFileReplaced("session state changed while refreshing")
+        snapshot = TodoSnapshot(
+            tuple(self._store.todo_items()),
+            self._store.todo_dismissed,
+        )
+        self._signature = before
+        self._snapshot = snapshot
+        return snapshot
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._store is not None:
+                self._store.close()
+            self._store = None
+            self._snapshot = None
+
+
+class AgentTodoControl:
+    """Coalesce child todo storage refreshes and publish in-memory snapshots."""
+
+    def __init__(self, *, cwd: str) -> None:
+        self._cwd = cwd
+        self._source: AgentTodoSource | None = None
+        self._snapshot: TodoSnapshot | None = None
+        self._snapshot_path: Path | None = None
+        self._task: asyncio.Task[bool] | None = None
+        self._pending_path: Path | None = None
+        self._refresh_requested = False
+        self._closed = False
+        self._refresh_error_logged = False
+        self._state_seen = False
+
+    def snapshot(self, path: Path) -> TodoSnapshot | None:
+        return self._snapshot if self._snapshot_path == path else None
+
+    async def _refresh(self, path: Path | None) -> bool:
+        if path is None:
+            source, self._source = self._source, None
+            if source is not None:
+                await asyncio.to_thread(source.close)
+            changed = self._snapshot is not None
+            self._snapshot = None
+            self._snapshot_path = None
+            self._refresh_error_logged = False
+            self._state_seen = False
+            return changed
+        if self._source is None or self._source.path != path:
+            previous, self._source = self._source, None
+            self._refresh_error_logged = False
+            self._state_seen = False
+            if previous is not None:
+                await asyncio.to_thread(previous.close)
+            self._source = AgentTodoSource(path, cwd=self._cwd)
+        try:
+            snapshot = await asyncio.to_thread(self._source.refresh)
+        except TodoStateNotWritten:
+            # A child without state yet has no todos. State that disappears
+            # after it was seen is a real failure.
+            if self._state_seen:
+                snapshot = TodoSnapshot((), False, unavailable=True)
+            else:
+                snapshot = TodoSnapshot((), False)
+        except (SessionError, ConversationIntegrityError, OSError) as error:
+            if not self._refresh_error_logged:
+                _LOGGER.warning("agent todo refresh failed for %s: %s", path, error)
+                self._refresh_error_logged = True
+            snapshot = TodoSnapshot((), False, unavailable=True)
+        else:
+            self._refresh_error_logged = False
+            self._state_seen = True
+        changed = snapshot != self._snapshot or path != self._snapshot_path
+        self._snapshot = snapshot
+        self._snapshot_path = path
+        return changed
+
+    def request(
+        self, path: Path | None, invalidate: Callable[[], None] | None = None
+    ) -> bool:
+        """Coalesce refreshes onto one worker-backed task."""
+
+        if self._closed:
+            return False
+        self._pending_path = path
+        self._refresh_requested = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._refresh_requested = False
+            return asyncio.run(self._refresh(path))
+        if self._task is not None and not self._task.done():
+            return False
+
+        async def run_pending() -> bool:
+            changed = False
+            while self._refresh_requested:
+                requested = self._pending_path
+                self._refresh_requested = False
+                changed = await self._refresh(requested) or changed
+            if changed and invalidate is not None:
+                invalidate()
+            return changed
+
+        self._task = loop.create_task(run_pending())
+        return False
+
+    def clear(self, invalidate: Callable[[], None] | None = None) -> None:
+        self._snapshot = None
+        self._snapshot_path = None
+        self.request(None, invalidate)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._refresh_requested = False
+        if self._task is not None:
+            self._task.cancel()
+        if self._source is not None:
+            self._source.close()
+        self._source = None
+        self._snapshot = None
+        self._snapshot_path = None
 
 
 @dataclass(frozen=True, slots=True)

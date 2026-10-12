@@ -335,7 +335,7 @@ class TUIApp(
         self._agent_navigation = AgentNavigation(self.loop.store)
         self._init_fork_view()
         self._todo_widget = TodoWidget(
-            self.loop.store, selected_store=self._agent_navigation.todo_store
+            self.loop.store, selected_snapshot=self._agent_navigation.todo_snapshot
         )
         self._presenter = TranscriptPresenter(
             self._transcript,

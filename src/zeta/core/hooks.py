@@ -246,7 +246,10 @@ class HookManager:
                 )
             )
             process = await asyncio.shield(creation_task)
-            process_group_id = os.getpgid(process.pid)
+            # start_new_session makes the child its own group leader. Asking
+            # getpgid() races a fast exit: a reaped child raises
+            # ProcessLookupError, which turned a deny into a fail-open error.
+            process_group_id = process.pid
             assert process.stderr is not None
             stderr_task = asyncio.create_task(_read_stderr(process.stderr))
             try:
@@ -444,6 +447,10 @@ async def _finish_process(
         assert process.stdin is not None
         process.stdin.write(output)
         await process.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        # The hook exited (or closed stdin) before reading its payload. That
+        # is valid; its exit status still decides, so do not fail open here.
+        pass
     finally:
         if process.stdin is not None:
             process.stdin.close()
