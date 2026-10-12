@@ -496,11 +496,14 @@ def build_key_bindings(
             and get_app().vi_state.input_mode is InputMode.NAVIGATION
         )
 
-    @bindings.add("c-r", "c-s", filter=composer_emacs_mode)
+    # One key per add(): add("c-r", "c-s") would bind the two-key sequence.
+    @bindings.add("c-r", filter=composer_emacs_mode, eager=True)
+    @bindings.add("c-s", filter=composer_emacs_mode, eager=True)
     def disable_emacs_history_search(_event: KeyPressEvent) -> None:
         pass
 
-    @bindings.add("/", "?", filter=composer_vi_navigation_mode)
+    @bindings.add("/", filter=composer_vi_navigation_mode, eager=True)
+    @bindings.add("?", filter=composer_vi_navigation_mode, eager=True)
     def disable_vi_history_search(_event: KeyPressEvent) -> None:
         pass
 

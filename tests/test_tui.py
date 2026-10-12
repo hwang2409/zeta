@@ -5058,7 +5058,8 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
 
 
 @pytest.mark.asyncio
-async def test_composer_history_search_is_disabled(tmp_path: Path) -> None:
+@pytest.mark.parametrize("key", ["\x12", "\x13"])  # ctrl+r, ctrl+s
+async def test_composer_history_search_is_disabled(tmp_path: Path, key: str) -> None:
     history = history_for(tmp_path / "history")
     history.append_string("history target")
     with create_pipe_input() as pipe:
@@ -5070,9 +5071,10 @@ async def test_composer_history_search_is_disabled(tmp_path: Path) -> None:
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0.05)
-        pipe.send_text("\x12")
-        await asyncio.sleep(0.1)
-        assert session.default_buffer.text == ""
+        # A started search would capture the marker in SEARCH_BUFFER; a pending
+        # chord prefix would also resolve to search when the marker arrives.
+        pipe.send_text(key + "z")
+        await wait_until(lambda: session.default_buffer.text == "z")
         assert session.app.current_buffer is session.default_buffer
         session.app.exit()
         await task
@@ -5097,7 +5099,8 @@ def test_vi_navigation_ctrl_r_binding_does_not_shadow_redo() -> None:
 
 
 @pytest.mark.asyncio
-async def test_vi_composer_history_search_is_disabled(tmp_path: Path) -> None:
+@pytest.mark.parametrize("key", ["/", "?"])
+async def test_vi_composer_history_search_is_disabled(tmp_path: Path, key: str) -> None:
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
             input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
@@ -5107,9 +5110,10 @@ async def test_vi_composer_history_search_is_disabled(tmp_path: Path) -> None:
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0.05)
-        pipe.send_text("\x1b/")
-        await asyncio.sleep(0.1)
-        assert session.default_buffer.text == ""
+        # Navigation mode, the search key, then insert a marker. A started
+        # search would capture "iz" in SEARCH_BUFFER.
+        pipe.send_text("\x1b" + key + "iz")
+        await wait_until(lambda: session.default_buffer.text == "z")
         assert session.app.current_buffer is session.default_buffer
         session.app.exit()
         await task
