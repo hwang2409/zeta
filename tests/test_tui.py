@@ -5057,55 +5057,104 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("editing_mode", [EditingMode.EMACS, EditingMode.VI])
-async def test_history_search_acceptance_survives_message_finder(
-    editing_mode: EditingMode,
-    tmp_path: Path,
-) -> None:
+@pytest.mark.parametrize("key", ["\x12", "\x13"])  # ctrl+r, ctrl+s
+async def test_composer_history_search_is_disabled(tmp_path: Path, key: str) -> None:
     history = history_for(tmp_path / "history")
     history.append_string("history target")
-    finder_active = False
-    values: list[str] = []
-
-    def open_finder() -> None:
-        nonlocal finder_active
-        finder_active = True
-
-    def cancel_finder() -> None:
-        nonlocal finder_active
-        finder_active = False
-
     with create_pipe_input() as pipe:
-        session = PromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            editing_mode=editing_mode,
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), editing_mode=EditingMode.EMACS,
             history=history_for(tmp_path / "history"),
-            key_bindings=build_key_bindings(
-                on_interrupt=lambda: None,
-                on_exit=lambda: None,
-                on_finder_open=open_finder,
-                finder_active=lambda: finder_active,
-                on_finder_input=values.append,
-                on_finder_cancel=cancel_finder,
-                search_active=lambda: False,
-                on_search_end=lambda: None,
-            ),
+            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
             multiline=True,
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0.05)
-        session.app.full_screen = True
-        pipe.send_text("\x06query")  # Open the finder and type a query.
-        await wait_until(lambda: values == ["q", "qu", "que", "quer", "query"])
-        pipe.send_text("\x1b")  # Esc closes the finder and releases the keyboard.
-        await wait_until(lambda: not finder_active)
-        pipe.send_text("\x12history")  # Ctrl-R history search still works.
-        await wait_until(lambda: session.search_buffer.text == "history")
-        pipe.send_text("\r")
-        await wait_until(
-            lambda: session.default_buffer.text == "history target"
+        # A started search would capture the marker in SEARCH_BUFFER; a pending
+        # chord prefix would also resolve to search when the marker arrives.
+        pipe.send_text(key + "z")
+        await wait_until(lambda: session.default_buffer.text == "z")
+        assert session.app.current_buffer is session.default_buffer
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_vi_navigation_ctrl_r_redoes(tmp_path: Path) -> None:
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
+            multiline=True,
         )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text("abc\x1b")
+        await wait_until(lambda: session.default_buffer.text == "abc")
+        pipe.send_text("u")  # vi undo removes the last inserted character
+        await wait_until(lambda: session.default_buffer.text == "ab")
+        pipe.send_text("\x12")  # ctrl+r in navigation mode: redo
+        await wait_until(lambda: session.default_buffer.text == "abc")
+        assert session.app.current_buffer is session.default_buffer
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keys", ["\x12z", "\x13z", "\x1b\x13iz"])
+async def test_vi_ctrl_history_search_is_disabled(tmp_path: Path, keys: str) -> None:
+    # ctrl+r / ctrl+s in vi insert mode, and ctrl+s in vi navigation mode.
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text(keys)
+        await wait_until(lambda: session.default_buffer.text == "z")
+        assert session.app.current_buffer is session.default_buffer
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_vi_insert_mode_inserts_search_characters(tmp_path: Path) -> None:
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text("a/b?")
+        await wait_until(lambda: session.default_buffer.text == "a/b?")
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["/", "?"])
+async def test_vi_composer_history_search_is_disabled(tmp_path: Path, key: str) -> None:
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        # Navigation mode, the search key, then insert a marker. A started
+        # search would capture "iz" in SEARCH_BUFFER.
+        pipe.send_text("\x1b" + key + "iz")
+        await wait_until(lambda: session.default_buffer.text == "z")
+        assert session.app.current_buffer is session.default_buffer
         session.app.exit()
         await task
 
@@ -10219,37 +10268,6 @@ async def test_mcp_prompt_error_restores_draft_and_attachments(
     assert rendered and rendered[-1].style == ERROR
     assert "prompt unavailable" in rendered[-1].plain
     await app.loop.close()
-
-
-@pytest.mark.asyncio
-async def test_ctrl_r_search_uses_cross_session_history(tmp_path: Path) -> None:
-    history = history_for(tmp_path / "history")
-    history.append_string("older session prompt")
-    history.append_string("newer session prompt")
-
-    with create_pipe_input() as pipe:
-        session = PromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            history=history_for(tmp_path / "history"),
-            key_bindings=build_key_bindings(
-                on_interrupt=lambda: None,
-                on_exit=lambda: None,
-                on_retry=lambda: None,
-                retry_available=lambda: True,
-            ),
-            multiline=True,
-        )
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
-        pipe.send_text("\x12older")
-        await wait_until(lambda: session.search_buffer.text == "older")
-        pipe.send_text("\r")
-        await wait_until(
-            lambda: session.default_buffer.text == "older session prompt"
-        )
-        session.app.exit()
-        await task
 
 
 @pytest.mark.asyncio

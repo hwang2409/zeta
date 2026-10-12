@@ -20,7 +20,6 @@ from prompt_toolkit.filters import (
     Condition,
     has_completions,
     has_focus,
-    is_searching,
     to_filter,
     vi_insert_mode,
 )
@@ -461,7 +460,6 @@ def build_key_bindings(
             and full_screen_mode()
             and finder_active is not None
             and finder_active()
-            and not is_searching()
         )
 
     @Condition
@@ -484,8 +482,44 @@ def build_key_bindings(
             and full_screen_mode()
             and search_active is not None
             and search_active()
-            and not is_searching()
         )
+
+    @Condition
+    def composer_focused() -> bool:
+        return has_focus(DEFAULT_BUFFER)()
+
+    @Condition
+    def composer_vi_navigation_mode() -> bool:
+        return (
+            has_focus(DEFAULT_BUFFER)()
+            and get_app().editing_mode is EditingMode.VI
+            and get_app().vi_state.input_mode is InputMode.NAVIGATION
+        )
+
+    # One key per add(): add("c-r", "c-s") would bind the two-key sequence.
+    # prompt_toolkit's search bindings own ctrl+r/ctrl+s in emacs mode and in
+    # both vi modes, so disable them for the whole composer.
+    @bindings.add("c-r", filter=composer_focused & ~composer_vi_navigation_mode, eager=True)
+    @bindings.add("c-s", filter=composer_focused, eager=True)
+    def disable_history_search_keys(_event: KeyPressEvent) -> None:
+        pass
+
+    # Vi navigation ctrl+r is redo; keep it once the search binding is gone.
+    # save_before=False: the default undo snapshot would clear the redo stack.
+    @bindings.add(
+        "c-r",
+        filter=composer_vi_navigation_mode,
+        eager=True,
+        save_before=lambda _event: False,
+    )
+    def vi_redo(event: KeyPressEvent) -> None:
+        for _ in range(event.arg):
+            event.current_buffer.redo()
+
+    @bindings.add("/", filter=composer_vi_navigation_mode, eager=True)
+    @bindings.add("?", filter=composer_vi_navigation_mode, eager=True)
+    def disable_vi_history_search(_event: KeyPressEvent) -> None:
+        pass
 
     @Condition
     def transcript_search_navigation_mode() -> bool:
@@ -543,13 +577,6 @@ def build_key_bindings(
     @bindings.add(*resolved_keys["insert-newline"], filter=~panel_mode)
     def newline(event: KeyPressEvent) -> None:
         insert_newline(event)
-
-    @bindings.add("enter", filter=is_searching & ~panel_mode, eager=True)
-    def accept_history_search(event: KeyPressEvent) -> None:
-        del event
-        from prompt_toolkit.search import accept_search
-
-        accept_search()
 
     if on_retry is not None:
 
@@ -927,7 +954,7 @@ def build_key_bindings(
 
     if on_finder_open is not None:
 
-        @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~panel_mode & ~transcript_search_mode & ~is_searching, eager=True)
+        @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~panel_mode & ~transcript_search_mode, eager=True)
         def open_message_finder(event: KeyPressEvent) -> None:
             event.current_buffer.cancel_completion()
             finder_buffer.reset()
@@ -1049,9 +1076,8 @@ def build_key_bindings(
                 and not get_app().current_buffer.text
             )
 
-        # Transcript search owns n and N while it is open, and history search
-        # takes the keyboard whole, so the shortcut stands down for both.
-        answering = approval_pending & ~transcript_search_mode & ~is_searching
+        # Transcript search owns n and N while it is open.
+        answering = approval_pending & ~transcript_search_mode
 
         @bindings.add("y", filter=answering & ~panel_mode, eager=True)
         def approve(event: KeyPressEvent) -> None:
@@ -1081,7 +1107,7 @@ def build_key_bindings(
             )
 
         picking = (
-            picker_open & ~transcript_search_mode & ~is_searching & ~has_completions
+            picker_open & ~transcript_search_mode & ~has_completions
         )
 
         @bindings.add("up", filter=picking & ~panel_mode, eager=True)
@@ -1116,7 +1142,7 @@ def build_key_bindings(
         # prompt-toolkit's alias for ``BackTab``.)
         @bindings.add(
             *resolved_keys["plan-mode-toggle"],
-            filter=interactions_enabled & ~has_completions & ~transcript_search_mode & ~is_searching & ~panel_mode,
+            filter=interactions_enabled & ~has_completions & ~transcript_search_mode & ~panel_mode,
             eager=True,
         )
         def toggle_plan_mode(event: KeyPressEvent) -> None:
