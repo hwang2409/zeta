@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import multiprocessing
 import threading
@@ -71,6 +72,37 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
     )
 
 
+async def test_idle_executor_worker_has_no_busy_samples(tmp_path: Path) -> None:
+    path = tmp_path / "tui-stalls.jsonl"
+    watchdog = TUIStallWatchdog(
+        path,
+        session_id="idle-executor",
+        probe_interval=0.002,
+        stall_threshold=0.01,
+        sample_interval=0.002,
+    )
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="idle-executor",
+    ) as executor:
+        executor.submit(lambda: None).result()
+        watchdog.start(asyncio.get_running_loop())
+        done = asyncio.Event()
+        asyncio.get_running_loop().call_soon(_deliberately_block_loop, done)
+        await done.wait()
+        await watchdog.close()
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    executor_threads = [
+        thread
+        for record in records
+        for thread in record["other_threads"]
+        if thread["name"].startswith("idle-executor")
+    ]
+    assert executor_threads
+    assert all(thread["busy_samples"] == 0 for thread in executor_threads)
+
+
 async def test_cpu_bound_worker_is_recorded_during_loop_starvation(
     tmp_path: Path,
 ) -> None:
@@ -100,15 +132,83 @@ async def test_cpu_bound_worker_is_recorded_during_loop_starvation(
         await watchdog.close()
 
     records = [json.loads(line) for line in path.read_text().splitlines()]
-    assert any(
-        thread["name"] == "reconciliation-worker"
-        and any(
-            frame["function"] == "_spin_until"
-            for stack in thread["stacks"]
-            for frame in stack["frames"]
-        )
+    worker_records = [
+        thread
         for record in records
         for thread in record["other_threads"]
+        if thread["name"] == "reconciliation-worker"
+    ]
+    assert worker_records
+    assert all(thread["busy_samples"] > 0 for thread in worker_records)
+    assert all(
+        record["other_threads"][0]["name"] == "reconciliation-worker"
+        for record in records
+        if any(
+            thread["name"] == "reconciliation-worker"
+            for thread in record["other_threads"]
+        )
+    )
+    assert any(
+        frame["function"] == "_spin_until"
+        for thread in worker_records
+        for stack in thread["stacks"]
+        for frame in stack["frames"]
+    )
+
+
+def test_many_threads_keep_bounded_busy_evidence(tmp_path: Path) -> None:
+    watchdog = TUIStallWatchdog(
+        tmp_path / "tui-stalls.jsonl",
+        session_id="many-threads",
+    )
+    watchdog._loop_thread_id = threading.get_ident()
+    stopped = threading.Event()
+    idle_threads = [
+        threading.Thread(
+            target=stopped.wait,
+            name=f"idle-worker-{index}",
+        )
+        for index in range(100)
+    ]
+    busy_threads = [
+        threading.Thread(
+            target=_spin_until,
+            args=(stopped,),
+            name=f"busy-worker-{index}",
+        )
+        for index in range(3)
+    ]
+    for thread in [*idle_threads, *busy_threads]:
+        thread.start()
+    other_threads = {}
+    observed_thread_count = 0
+    try:
+        for _ in range(3):
+            observed_thread_count = max(
+                observed_thread_count,
+                watchdog._sample_stacks({}, other_threads),
+            )
+    finally:
+        stopped.set()
+        for thread in [*idle_threads, *busy_threads]:
+            thread.join()
+
+    record = watchdog._record(
+        datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+        0.4,
+        {},
+        other_threads,
+        observed_thread_count,
+    )
+    assert len(record["other_threads"]) <= 16
+    assert record["threads_truncated"] >= 87
+    assert {
+        thread["name"]
+        for thread in record["other_threads"][:3]
+    } == {"busy-worker-0", "busy-worker-1", "busy-worker-2"}
+    assert all(
+        thread["busy_samples"] > 0
+        for thread in record["other_threads"][:3]
     )
 
 
@@ -198,6 +298,34 @@ def test_concurrent_processes_write_valid_bounded_logs(tmp_path: Path) -> None:
     for log in files:
         for line in log.read_text().splitlines():
             assert json.loads(line)["session_id"] == "writer"
+
+
+def test_oversized_record_is_reduced_and_written(tmp_path: Path) -> None:
+    path = tmp_path / "tui-stalls.jsonl"
+    watchdog = TUIStallWatchdog(
+        path,
+        session_id="reduced",
+        max_bytes=400,
+    )
+    frames = [
+        {"file": f"/long/path/to/module-{index}.py", "line": index, "function": "work"}
+        for index in range(20)
+    ]
+    record = {
+        "start_time": "2026-01-02T03:04:05Z",
+        "duration_ms": 400,
+        "session_id": "reduced",
+        "stacks": [{"count": 1, "frames": frames} for _ in range(8)],
+        "other_threads": [],
+        "threads_truncated": 0,
+    }
+
+    watchdog._append_record(record)
+
+    assert path.stat().st_size <= 400
+    written = json.loads(path.read_text())
+    assert written["session_id"] == "reduced"
+    assert sum(len(stack["frames"]) for stack in written["stacks"]) < 160
 
 
 def test_log_files_stay_within_size_bound(tmp_path: Path) -> None:

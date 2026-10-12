@@ -25,6 +25,8 @@ STALL_SAMPLE_INTERVAL_SECONDS = 0.1
 STALL_LOG_MAX_BYTES = 5 * 1024 * 1024
 _MAX_DISTINCT_STACKS = 8
 _MAX_FRAMES = 20
+_MAX_SAMPLED_THREADS = 32
+_MAX_RETAINED_THREADS = 16
 _MAX_PATH_CHARS = 240
 _MAX_FUNCTION_CHARS = 120
 _IDLE_FUNCTIONS = frozenset({"get", "join", "poll", "select", "sleep", "wait"})
@@ -110,6 +112,7 @@ class TUIStallWatchdog:
                 tuple[int, str],
                 dict[tuple[tuple[str, int, str], ...], list[int]],
             ] = {}
+            observed_thread_count = 0
             next_sample = started_monotonic + self.stall_threshold
             while not answered.wait(self.probe_interval):
                 if self._stop.is_set():
@@ -117,14 +120,23 @@ class TUIStallWatchdog:
                 now = self._clock()
                 if now < next_sample:
                     continue
-                self._sample_stacks(stacks, other_threads)
+                observed_thread_count = max(
+                    observed_thread_count,
+                    self._sample_stacks(stacks, other_threads),
+                )
                 next_sample = now + self.sample_interval
             ended = self._clock()
             duration = ended - started_monotonic
             if duration >= self.stall_threshold:
                 try:
                     self._append_record(
-                        self._record(started_utc, duration, stacks, other_threads)
+                        self._record(
+                            started_utc,
+                            duration,
+                            stacks,
+                            other_threads,
+                            observed_thread_count,
+                        )
                     )
                 except Exception:
                     if not self._logging_failure_reported:
@@ -140,7 +152,7 @@ class TUIStallWatchdog:
             tuple[int, str],
             dict[tuple[tuple[str, int, str], ...], list[int]],
         ],
-    ) -> None:
+    ) -> int:
         frames = sys._current_frames()
         loop_frame = frames.get(self._loop_thread_id)
         if loop_frame is not None:
@@ -152,16 +164,25 @@ class TUIStallWatchdog:
             if thread.ident is not None
         }
         watchdog_thread_id = threading.get_ident()
-        for thread_id, frame in frames.items():
-            if thread_id in {self._loop_thread_id, watchdog_thread_id}:
-                continue
+        candidates = [
+            (thread_id, names.get(thread_id, "unknown"), frame)
+            for thread_id, frame in frames.items()
+            if thread_id not in {self._loop_thread_id, watchdog_thread_id}
+        ]
+        candidates.sort(
+            key=lambda candidate: (
+                _is_idle_frame(candidate[2]),
+                candidate[1],
+                candidate[0],
+            )
+        )
+        for thread_id, name, frame in candidates[:_MAX_SAMPLED_THREADS]:
             stack = tuple(_trim_stack(frame))
             if not stack:
                 continue
-            samples = other_threads.setdefault(
-                (thread_id, names.get(thread_id, "unknown")), {}
-            )
+            samples = other_threads.setdefault((thread_id, name), {})
             _count_stack(samples, stack)
+        return len(candidates)
 
     def _record(
         self,
@@ -172,6 +193,7 @@ class TUIStallWatchdog:
             tuple[int, str],
             dict[tuple[tuple[str, int, str], ...], list[int]],
         ],
+        observed_thread_count: int,
     ) -> dict[str, Any]:
         ordered = sorted(stacks.items(), key=lambda item: (-item[1][0], item[1][1]))
         threads = []
@@ -208,6 +230,7 @@ class TUIStallWatchdog:
                 thread["thread_id"],
             )
         )
+        retained_threads = threads[:_MAX_RETAINED_THREADS]
         return {
             "start_time": started.astimezone(UTC).isoformat().replace("+00:00", "Z"),
             "duration_ms": round(max(0.0, duration) * 1000, 3),
@@ -219,15 +242,15 @@ class TUIStallWatchdog:
                 }
                 for stack, (count, _order) in ordered
             ],
-            "other_threads": threads,
+            "other_threads": retained_threads,
+            "threads_truncated": max(
+                0,
+                observed_thread_count - len(retained_threads),
+            ),
         }
 
     def _append_record(self, record: dict[str, Any]) -> None:
-        encoded = (
-            json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
-        ).encode("utf-8")
-        if len(encoded) > self.max_bytes:
-            return
+        encoded = _encode_bounded_record(record, self.max_bytes)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.path.parent, 0o700)
         lock_path = self.path.with_suffix(".lock")
@@ -257,6 +280,58 @@ class TUIStallWatchdog:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def _encode_bounded_record(record: dict[str, Any], max_bytes: int) -> bytes:
+    limits = (
+        (_MAX_DISTINCT_STACKS, _MAX_FRAMES, _MAX_RETAINED_THREADS),
+        (4, 12, _MAX_RETAINED_THREADS),
+        (2, 8, 12),
+        (1, 4, 8),
+        (1, 1, 4),
+        (0, 0, 0),
+    )
+    for stack_limit, frame_limit, thread_limit in limits:
+        reduced = _reduce_record(
+            record,
+            stack_limit=stack_limit,
+            frame_limit=frame_limit,
+            thread_limit=thread_limit,
+        )
+        encoded = (
+            json.dumps(reduced, separators=(",", ":"), ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return encoded
+    raise ValueError("TUI stall diagnostic metadata exceeds the log size limit")
+
+
+def _reduce_record(
+    record: dict[str, Any],
+    *,
+    stack_limit: int,
+    frame_limit: int,
+    thread_limit: int,
+) -> dict[str, Any]:
+    reduced = dict(record)
+    reduced["stacks"] = [
+        {**stack, "frames": stack.get("frames", [])[:frame_limit]}
+        for stack in record.get("stacks", [])[:stack_limit]
+    ]
+    threads = record.get("other_threads", [])
+    retained_threads = []
+    for thread in threads[:thread_limit]:
+        retained_thread = dict(thread)
+        retained_thread["stacks"] = [
+            {**stack, "frames": stack.get("frames", [])[:frame_limit]}
+            for stack in thread.get("stacks", [])[:stack_limit]
+        ]
+        retained_threads.append(retained_thread)
+    reduced["other_threads"] = retained_threads
+    reduced["threads_truncated"] = (
+        record.get("threads_truncated", 0) + len(threads) - len(retained_threads)
+    )
+    return reduced
+
+
 def _count_stack(
     samples: dict[tuple[tuple[str, int, str], ...], list[int]],
     stack: tuple[tuple[str, int, str], ...],
@@ -280,7 +355,19 @@ def _frame_records(
 
 
 def _is_idle_stack(stack: tuple[tuple[str, int, str], ...]) -> bool:
-    return bool(stack and stack[0][2] in _IDLE_FUNCTIONS)
+    if not stack:
+        return False
+    file, _line, function = stack[0]
+    return function in _IDLE_FUNCTIONS or (
+        function == "_worker"
+        and file.replace("\\", "/").endswith("/concurrent/futures/thread.py")
+    )
+
+
+def _is_idle_frame(frame: FrameType) -> bool:
+    return _is_idle_stack(
+        ((frame.f_code.co_filename, frame.f_lineno, frame.f_code.co_name),)
+    )
 
 
 def _trim_stack(frame: FrameType) -> list[tuple[str, int, str]]:
