@@ -10153,7 +10153,7 @@ def test_parse_input_rejects_blank_turns(value: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_record_prompt_writes_history_off_the_event_loop(
+async def test_record_prompt_writes_and_applies_history_off_the_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = TUIApp(
@@ -10165,19 +10165,27 @@ async def test_record_prompt_writes_history_off_the_event_loop(
     app._history = history_for(tmp_path / "history")
     loop_thread = threading.get_ident()
     write_threads: list[int] = []
-    original = app._history._write_entries
+    apply_threads: list[int] = []
+    original_write = app._history._write_entries
+    original_apply = app._history._apply_snapshot
 
-    def record_thread(entries: list[str]) -> None:
+    def record_write_thread(entries: list[str]) -> None:
         write_threads.append(threading.get_ident())
-        original(entries)
+        original_write(entries)
 
-    monkeypatch.setattr(app._history, "_write_entries", record_thread)
+    def record_apply_thread(revision: int, entries: object) -> None:
+        apply_threads.append(threading.get_ident())
+        original_apply(revision, entries)
+
+    monkeypatch.setattr(app._history, "_write_entries", record_write_thread)
+    monkeypatch.setattr(app._history, "_apply_snapshot", record_apply_thread)
 
     app._record_prompt("new prompt")
     assert app._history.get_strings()[-1] == "new prompt"
     await app._history.flush_pending()
 
     assert write_threads and write_threads[0] != loop_thread
+    assert apply_threads == write_threads
     await app.close()
 
 

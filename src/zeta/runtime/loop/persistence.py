@@ -33,7 +33,6 @@ class _FileAction:
     watermark: int
     action: Callable[[], object]
     completed: Callable[[object], None] | None
-    loop: asyncio.AbstractEventLoop | None
     stop: bool = False
 
 
@@ -60,9 +59,10 @@ class _OrderedFileWriter:
         stop: bool = False,
     ) -> int:
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
+            wait = False
         except RuntimeError:
-            loop = None
+            wait = True
         with self._lock:
             if not self._accepting:
                 raise RuntimeError(f"{self._label} writer is closed")
@@ -70,7 +70,7 @@ class _OrderedFileWriter:
             watermark = self._submitted
             if stop:
                 self._accepting = False
-            self._queue.put(_FileAction(watermark, action, completed, loop, stop))
+            self._queue.put(_FileAction(watermark, action, completed, stop))
             if self._thread is None:
                 self._thread = threading.Thread(
                     target=self._run,
@@ -78,7 +78,7 @@ class _OrderedFileWriter:
                     daemon=True,
                 )
                 self._thread.start()
-        if loop is None:
+        if wait:
             with self._completed:
                 self._completed.wait_for(lambda: self._applied >= watermark)
         return watermark
@@ -93,13 +93,7 @@ class _OrderedFileWriter:
             except Exception as exc:  # noqa: BLE001 - persistence must not crash the TUI
                 failed = True
                 self._report_failure(exc)
-            if item.loop is None:
-                self._deliver(item, result, failed)
-            else:
-                try:
-                    item.loop.call_soon_threadsafe(self._deliver, item, result, failed)
-                except RuntimeError:
-                    self._mark_applied(item.watermark)
+            self._deliver(item, result, failed)
             with self._lock:
                 if item.stop or self._queue.empty():
                     self._thread = None
