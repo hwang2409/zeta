@@ -37,6 +37,7 @@ from zeta.tui.agent_card import (
     MAX_AGENT_SCAN_BYTES,
     MAX_AGENT_VIEW_LINES,
     AgentNavigation,
+    AgentTranscriptControl,
     read_agent_transcript,
 )
 from zeta.tui.app import FullScreenPromptSession, TUIApp
@@ -1716,7 +1717,7 @@ async def test_large_subagent_append_keeps_event_loop_responsive(
     assert len(control._snapshot.messages) == 5_001
     assert control.transcript._lazy_viewport
     assert batch_sizes
-    assert max(batch_sizes) <= agent_card.AgentTranscriptControl._RENDER_BATCH_SIZE
+    assert max(batch_sizes) <= AgentTranscriptControl._RENDER_BATCH_SIZE
 
 
 def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) -> None:

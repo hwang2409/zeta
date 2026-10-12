@@ -2389,3 +2389,6 @@ def test_replay_of_removed_project_update_call_renders() -> None:
         )
     )
     assert rendered is not None
+    output = Console(record=True, width=120)
+    output.print(rendered)
+    assert "unknown tool: project_update" in output.export_text()
