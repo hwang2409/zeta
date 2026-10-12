@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 from io import StringIO
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from prompt_toolkit.application.current import set_app
@@ -225,6 +226,21 @@ def test_selection_is_dropped_only_when_its_unit_leaves() -> None:
     # A move or release with nothing in flight is not ours to handle.
     assert transcript.mouse_handler(_event(MouseEventType.MOUSE_MOVE, 1, 1)) is NotImplemented
     assert transcript.mouse_handler(_event(MouseEventType.MOUSE_UP, 1, 1)) is NotImplemented
+
+
+def test_virtual_copy_renders_only_units_in_selected_range() -> None:
+    transcript = TranscriptWidget()
+    for index in range(1_000):
+        transcript.append(Text(f"selection line {index}"))
+    transcript.create_content(40, 10)
+    rendered = Mock(wraps=transcript._render_unit)
+    transcript._render_unit = rendered
+    transcript.set_copy_handler(lambda text: "copied")
+
+    _drag(transcript, (0, 2), (5, 4))
+
+    assert transcript.selection_text()
+    assert rendered.call_count <= 9
 
 
 def test_virtual_drag_can_scroll_across_multiple_screens_before_copy() -> None:

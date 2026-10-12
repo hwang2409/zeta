@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,7 +56,16 @@ async def run_ctrl_v(app: TUIApp, value: str) -> list[str]:
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0)
-        pipe.send_text(value + "\r")
+        chunks = value.split("\x16")
+        pipe.send_text(chunks[0])
+        for chunk in chunks[1:]:
+            pipe.send_text("\x16")
+            while not app._paste_tasks:
+                await asyncio.sleep(0)
+            while app._paste_tasks:
+                await asyncio.sleep(0)
+            pipe.send_text(chunk)
+        pipe.send_text("\r")
         await task
     return submitted
 
@@ -282,10 +292,13 @@ async def test_ctrl_v_queues_one_image_and_preserves_composer_text(
     monkeypatch.setattr(composer.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(composer.shutil, "which", lambda _: "/usr/bin/pngpaste")
     real_run = composer.subprocess.run
+    loop_thread = threading.get_ident()
+    helper_threads: list[int] = []
 
     def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
         if command[0] != "/usr/bin/pngpaste":
             return real_run(command, **kwargs)
+        helper_threads.append(threading.get_ident())
         Path(command[1]).write_bytes(PNG)
         return SimpleNamespace(returncode=0)
 
@@ -302,7 +315,43 @@ async def test_ctrl_v_queues_one_image_and_preserves_composer_text(
 
     assert submitted == ["draft[Image #1]more"]
     assert len(app._pending_attachments) == 1
+    assert helper_threads and helper_threads != [loop_thread]
     assert notices == []
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_image_paste_cleans_up_staged_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    staged = store.session_dir / "clipboard-cancelled.png"
+
+    def paste_image(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        entered.set()
+        release.wait()
+        staged.write_bytes(PNG)
+        return staged
+
+    monkeypatch.setattr(composer, "paste_image", paste_image)
+    task = asyncio.create_task(app.paste_from_clipboard())
+    while not entered.is_set():
+        await asyncio.sleep(0)
+    task.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not staged.exists()
+    assert app._pending_attachments == []
     await app.loop.close()
 
 

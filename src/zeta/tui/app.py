@@ -17,7 +17,6 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import get_app
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.styles import DynamicStyle, Style
 from rich.console import Console, RenderableType
 from rich.padding import Padding
@@ -222,6 +221,7 @@ class TUIApp(
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
+        self._paste_tasks: set[asyncio.Task[None]] = set()
         self._on_session_close = on_session_close
         self._init_runtime_close()
         self._init_fork_runtime()
@@ -619,18 +619,6 @@ class TUIApp(
             self._active_session.app.current_buffer.insert_text(token)
         else:
             self._composer_insertions.append(token)
-
-    def _paste_from_keybinding(self, event: KeyPressEvent | None = None) -> None:
-        if self._reject_during_startup_replay("paste"):
-            return
-        result = self.slash_paste("")
-        if result.startswith("[Image #"):
-            if event is None:
-                self._insert_paste_token(result)
-            else:
-                event.current_buffer.insert_text(result)
-        elif result != "paste unavailable: clipboard does not contain an image":
-            self._print_system(result)
 
     def _abort_approval(self, request_id: str | tuple[str, str]) -> None:
         if self._approval_policy is not None:
@@ -1189,6 +1177,9 @@ class TUIApp(
                     if self._active_task is not None and not self._active_task.done():
                         self._active_task.cancel()
                         await asyncio.gather(self._active_task, return_exceptions=True)
+                    for paste_task in self._paste_tasks:
+                        paste_task.cancel()
+                    await asyncio.gather(*self._paste_tasks, return_exceptions=True)
                     if isinstance(session, FullScreenPromptSession):
                         session.restore_terminal()
                         self._active_session = None

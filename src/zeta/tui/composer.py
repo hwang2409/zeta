@@ -482,13 +482,8 @@ class ComposerAttachmentMixin:
             return value
         return f".../{path.name}"[-80:]
 
-    def slash_paste(self, args: str) -> str:
-        if args.strip():
-            return "paste unavailable: /paste does not take arguments"
+    def _finish_image_paste(self, path: Path) -> str:
         try:
-            path = paste_image(
-                self.loop.store.session_dir, directory_fd=self.loop.store.directory_fd
-            )
             attachment = build_user_message(
                 "paste", self.loop.store.cwd, (path,), session_store=self.loop.store
             ).content[1]
@@ -501,6 +496,68 @@ class ComposerAttachmentMixin:
         self._pending_attachments.append(path)
         self._pending_attachment_tokens[token] = path
         return token
+
+    def slash_paste(self, args: str) -> str:
+        if args.strip():
+            return "paste unavailable: /paste does not take arguments"
+        try:
+            path = paste_image(
+                self.loop.store.session_dir, directory_fd=self.loop.store.directory_fd
+            )
+        except AttachmentError as exc:
+            return f"paste unavailable: {exc}"
+        return self._finish_image_paste(path)
+
+    async def paste_from_clipboard(self) -> str:
+        """Stage a clipboard image without blocking the event-loop thread."""
+
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                paste_image,
+                self.loop.store.session_dir,
+                directory_fd=self.loop.store.directory_fd,
+            )
+        )
+        try:
+            path = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                path = await worker
+            except AttachmentError:
+                pass
+            else:
+                self._delete_staged_attachment(path)
+            raise
+        except AttachmentError as exc:
+            return f"paste unavailable: {exc}"
+        return self._finish_image_paste(path)
+
+    async def _paste_from_keybinding_async(
+        self, event: Any | None, cursor_position: int | None
+    ) -> None:
+        result = await self.paste_from_clipboard()
+        if result.startswith("[Image #"):
+            if event is None or cursor_position is None:
+                self._insert_paste_token(result)
+            else:
+                buffer = event.current_buffer
+                current_position = buffer.cursor_position
+                buffer.cursor_position = min(cursor_position, len(buffer.text))
+                buffer.insert_text(result)
+                if current_position >= cursor_position:
+                    buffer.cursor_position = current_position + len(result)
+        elif result != "paste unavailable: clipboard does not contain an image":
+            self._print_system(result)
+
+    def _paste_from_keybinding(self, event: Any | None = None) -> None:
+        if self._reject_during_startup_replay("paste"):
+            return
+        cursor_position = event.current_buffer.cursor_position if event is not None else None
+        task = asyncio.create_task(
+            self._paste_from_keybinding_async(event, cursor_position)
+        )
+        self._paste_tasks.add(task)
+        task.add_done_callback(self._paste_tasks.discard)
 
     def _delete_staged_attachment(self, path: Path) -> None:
         if (
