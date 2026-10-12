@@ -140,14 +140,12 @@ async def test_cpu_bound_worker_is_recorded_during_loop_starvation(
     ]
     assert worker_records
     assert all(thread["busy_samples"] > 0 for thread in worker_records)
-    assert all(
-        record["other_threads"][0]["name"] == "reconciliation-worker"
-        for record in records
-        if any(
-            thread["name"] == "reconciliation-worker"
-            for thread in record["other_threads"]
-        )
-    )
+    # Other harness threads (e.g. pytest-xdist I/O) can also be busy, so assert
+    # the ranking rule instead of a fixed first place: threads are ordered by
+    # busy evidence, so the busy worker never ranks below an idler thread.
+    for record in records:
+        busy = [thread["busy_samples"] for thread in record["other_threads"]]
+        assert busy == sorted(busy, reverse=True)
     assert any(
         frame["function"] == "_spin_until"
         for thread in worker_records
