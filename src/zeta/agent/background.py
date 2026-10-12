@@ -340,9 +340,6 @@ def adopt_agent_children(
 
     for marker_key, marker in child_store.agent_children().items():
         tool_call = ToolCall.from_dict(marker["tool_call"])
-        adopted_key = marker.get("child_instance_id", marker_key)
-        if type(adopted_key) is not str:
-            adopted_key = marker_key
         parent_store.register_agent_child(
             tool_call,
             child_session_path=marker["child_session_path"],
@@ -351,10 +348,12 @@ def adopt_agent_children(
             background=marker.get("background", False),
             child_instance_id=marker.get("child_instance_id"),
             accepts_follow_ups=marker.get("accepts_follow_ups", False) is True,
+            turns_used=(
+                marker.get("turns_used", 0)
+                if type(marker.get("turns_used", 0)) is int
+                else 0
+            ),
         )
-        turns_used = marker.get("turns_used", 0)
-        if turns_used:
-            parent_store.update_agent_child_turns(adopted_key, turns_used)
         child_instance_id = marker.get("child_instance_id")
         if background_owner is not None and type(child_instance_id) is str:
             background_owner.adopt(child_instance_id, parent_store, parent_instance_id)

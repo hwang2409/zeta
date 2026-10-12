@@ -12,6 +12,11 @@ from typing import Any
 
 from ..agent.receipt import valid_killed_task_fields
 from ..protocol.types import ToolCall
+from .agent_progress import (
+    live_agent_lifecycle,
+    publish_live_agent_lifecycle,
+    remove_live_agent_lifecycle,
+)
 from .checkpoints import ConversationIntegrityError, _now
 from .session_files import child_directory, write_session_json
 
@@ -222,11 +227,18 @@ class AgentStateMixin:
         background: bool = False,
         child_instance_id: str | None = None,
         accepts_follow_ups: bool = False,
+        turns_used: int = 0,
     ) -> None:
         """Persist a running child marker before the child starts."""
 
-        if not child_session_path or not description or agent_type == "":
-            raise ValueError("child marker fields must be nonempty")
+        if (
+            not child_session_path
+            or not description
+            or agent_type == ""
+            or type(turns_used) is not int
+            or turns_used < 0
+        ):
+            raise ValueError("child marker fields must be valid")
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -234,7 +246,7 @@ class AgentStateMixin:
                 "tool_call": tool_call.to_dict(),
                 "child_session_path": child_session_path,
                 "description": description,
-                "turns_used": 0,
+                "turns_used": turns_used,
             }
             if background:
                 marker["background"] = True
@@ -253,18 +265,13 @@ class AgentStateMixin:
         return copy.deepcopy(self._agent_children)
 
     def update_agent_child_turns(self, marker_key: str, turns_used: int) -> None:
-        """Persist completed turns for a child marker."""
+        """Update completed turns in the process-local child marker."""
 
         if type(turns_used) is not int or turns_used < 0:
             raise ValueError("child turns must be a nonnegative integer")
-        with self._append_lock():
-            self._load()
-            self._load_session_state()
-            marker = self._agent_children.get(marker_key)
-            if marker is None:
-                return
+        marker = self._agent_children.get(marker_key)
+        if marker is not None:
             marker["turns_used"] = turns_used
-            self._write_session_state(self.bash_cwd, self._todo_items)
 
     def finish_agent_child(self, marker_key: str) -> None:
         """Remove a child marker after its parent result is durable."""
@@ -314,9 +321,14 @@ class AgentStateMixin:
 
         if not parent_tool_call_id:
             raise ValueError("parent tool call id must be nonempty")
+        live_lifecycle = live_agent_lifecycle(self.agent_lifecycle_path)
         with self._append_lock():
             self._load()
             self._load_session_state()
+            if self._agent_lifecycle is not None and live_lifecycle is not None:
+                for field in ("current_step", "turns_used", "tool_calls", "elapsed"):
+                    if field in live_lifecycle:
+                        self._agent_lifecycle[field] = live_lifecycle[field]
             agent_type = self.agent_type()
             self._agent_parent = None
             self._agent_canceled = {
@@ -338,6 +350,7 @@ class AgentStateMixin:
             self._write_session_state(self.bash_cwd, self._todo_items)
             if lifecycle_was_running:
                 self._write_agent_lifecycle()
+                remove_live_agent_lifecycle(self.agent_lifecycle_path)
 
     def agent_type(self) -> str | None:
         """Return the child type from its agent marker."""
@@ -406,6 +419,9 @@ class AgentStateMixin:
                 "cwd": cwd if cwd else self.cwd,
             }
             self._write_agent_lifecycle()
+            publish_live_agent_lifecycle(
+                self.agent_lifecycle_path, self._agent_lifecycle
+            )
 
     def update_agent_lifecycle(
         self,
@@ -414,7 +430,7 @@ class AgentStateMixin:
         turns_used: int | None = None,
         tool_calls: int | None = None,
     ) -> None:
-        """Persist a live child's latest step and turn count."""
+        """Update a live child's process-local progress."""
 
         if current_step is not None and not current_step:
             raise ValueError("agent lifecycle step must be nonempty")
@@ -422,19 +438,16 @@ class AgentStateMixin:
             raise ValueError("agent lifecycle turns must be nonnegative")
         if tool_calls is not None and (type(tool_calls) is not int or tool_calls < 0):
             raise ValueError("agent lifecycle tool calls must be nonnegative")
-        with self._append_lock():
-            self._load()
-            self._load_session_state()
-            if self._agent_lifecycle is None:
-                return
-            if current_step is not None:
-                self._agent_lifecycle["current_step"] = current_step
-            if turns_used is not None:
-                self._agent_lifecycle["turns_used"] = turns_used
-            if tool_calls is not None:
-                self._agent_lifecycle["tool_calls"] = tool_calls
-            self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(self._agent_lifecycle)
-            self._write_agent_lifecycle()
+        if self._agent_lifecycle is None:
+            return
+        if current_step is not None:
+            self._agent_lifecycle["current_step"] = current_step
+        if turns_used is not None:
+            self._agent_lifecycle["turns_used"] = turns_used
+        if tool_calls is not None:
+            self._agent_lifecycle["tool_calls"] = tool_calls
+        self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(self._agent_lifecycle)
+        publish_live_agent_lifecycle(self.agent_lifecycle_path, self._agent_lifecycle)
 
     def finish_agent_lifecycle(
         self,
@@ -460,11 +473,16 @@ class AgentStateMixin:
         }
         if not valid_killed_task_fields(killed_task_fields):
             raise ValueError("invalid killed task fields")
+        live_lifecycle = live_agent_lifecycle(self.agent_lifecycle_path)
         with self._append_lock():
             self._load()
             self._load_session_state()
             if self._agent_lifecycle is None:
                 return
+            if live_lifecycle is not None:
+                for field in ("current_step", "turns_used", "tool_calls", "elapsed"):
+                    if field in live_lifecycle:
+                        self._agent_lifecycle[field] = live_lifecycle[field]
             if self._agent_lifecycle.get("finished_at") is not None:
                 return
             persisted_killed_task_fields = {
@@ -496,6 +514,7 @@ class AgentStateMixin:
                 finished_at=resolved_finished_at,
             )
             self._write_agent_lifecycle()
+            remove_live_agent_lifecycle(self.agent_lifecycle_path)
 
     def update_agent_lifecycle_result(
         self,

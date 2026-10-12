@@ -340,8 +340,7 @@ def _create_app_with_root(
                 model=pending_override[1],
             )
             pending_override = None
-            return
-        manager.touch(metadata)
+        # The transcript is durable; do not fsync meta.json only to refresh recency.
 
     def model_changed(model_name: str) -> None:
         nonlocal pending_override

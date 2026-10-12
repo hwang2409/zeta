@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
+from zeta.core import agent_state
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
     ConversationEntry,
@@ -242,6 +243,116 @@ def _start_agent_lifecycle(store: ConversationStore) -> None:
         agent_type="agent",
         description="child",
     )
+
+
+def test_live_lifecycle_updates_do_not_write_and_finish_persists_final_stats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    _start_agent_lifecycle(store)
+    writes: list[str] = []
+    write_session_json = agent_state.write_session_json
+
+    def record_write(directory_fd: int, name: str, value: object) -> None:
+        writes.append(name)
+        write_session_json(directory_fd, name, value)
+
+    monkeypatch.setattr(agent_state, "write_session_json", record_write)
+
+    store.update_agent_lifecycle(current_step="turn 2: running")
+    store.update_agent_lifecycle(turns_used=2)
+    store.update_agent_lifecycle(tool_calls=3)
+
+    assert writes == []
+    durable_running = json.loads(
+        store.agent_lifecycle_path.read_text(encoding="utf-8")
+    )
+    assert durable_running["current_step"] == "starting"
+    assert durable_running["turns_used"] == 0
+    assert durable_running["tool_calls"] == 0
+
+    store.finish_agent_lifecycle("completed", final_result="done")
+
+    assert writes == ["agent_lifecycle.json"]
+    durable_finished = json.loads(
+        store.agent_lifecycle_path.read_text(encoding="utf-8")
+    )
+    assert durable_finished["state"] == "completed"
+    assert durable_finished["turns_used"] == 2
+    assert durable_finished["tool_calls"] == 3
+
+
+def test_child_turn_progress_does_not_write_parent_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    call = ToolCall("agent-1", "agent", {"prompt": "work"})
+    store.register_agent_child(
+        call,
+        child_session_path=str(tmp_path / "agents" / "1"),
+        description="work",
+    )
+
+    def fail_write(*args: object, **kwargs: object) -> None:
+        raise AssertionError("progress must not write session_state.json")
+
+    monkeypatch.setattr(store, "_write_session_state", fail_write)
+
+    store.update_agent_child_turns(call.id, 4)
+
+    assert store.agent_children()[call.id]["turns_used"] == 4
+
+
+def test_reopened_running_lifecycle_uses_last_durable_transition(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    _start_agent_lifecycle(store)
+    store.update_agent_lifecycle(
+        current_step="turn 4: running", turns_used=4, tool_calls=2
+    )
+
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    lifecycle = reopened.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["state"] == "running"
+    assert lifecycle["current_step"] == "starting"
+    assert lifecycle["turns_used"] == 0
+    assert lifecycle["tool_calls"] == 0
+
+
+def test_cancel_transition_persists_live_counters(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.mark_agent_parent("call-1", agent_type="general")
+    _start_agent_lifecycle(store)
+    store.update_agent_lifecycle(turns_used=2, tool_calls=3)
+
+    store.mark_agent_canceled("call-1")
+
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+    lifecycle = reopened.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["state"] == "canceled"
+    assert lifecycle["turns_used"] == 2
+    assert lifecycle["tool_calls"] == 3
+    assert reopened.agent_canceled() is not None
+
+
+@pytest.mark.parametrize("state", ["failed", "canceled"])
+def test_terminal_lifecycle_transitions_persist_live_counters(
+    tmp_path: Path, state: str
+) -> None:
+    store = ConversationStore(tmp_path)
+    _start_agent_lifecycle(store)
+    store.update_agent_lifecycle(turns_used=2, tool_calls=3)
+
+    store.finish_agent_lifecycle(state, final_result=state)
+
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+    lifecycle = reopened.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["state"] == state
+    assert lifecycle["turns_used"] == 2
+    assert lifecycle["tool_calls"] == 3
 
 
 def test_lifecycle_accepts_legacy_record_without_killed_task_fields(
