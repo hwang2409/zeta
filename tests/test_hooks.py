@@ -72,12 +72,14 @@ def test_hook_event_mapping_keys_are_bounded_with_metadata() -> None:
 
 @pytest.mark.asyncio
 async def test_pre_hook_allow_deny_and_error(tmp_path: Path) -> None:
-    deny = _python_command("import sys; sys.stderr.write('not safe\\n'); sys.exit(2)")
-    error = _python_command("import sys; sys.exit(1)")
+    deny = "printf 'not safe\\n' >&2; exit 2"
+    error = "exit 1"
     _write_config(
         tmp_path,
-        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(deny)}\n\n'
-        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(error)}\n',
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(deny)}\n'
+        "timeout_seconds = 60\n\n"
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(error)}\n'
+        "timeout_seconds = 60\n",
     )
     notices: list[str] = []
     manager = load_hooks(tmp_path)
@@ -99,9 +101,53 @@ async def test_pre_hook_allow_deny_and_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fast_exiting_deny_hook_still_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A deny hook can exit and be reaped before its process group is looked up.
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps("echo no >&2; exit 2")}\n',
+    )
+
+    def reaped(_pid: int) -> int:
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(os, "getpgid", reaped)
+    manager = load_hooks(tmp_path)
+    manager.bind_session("session-1")
+
+    assert await manager.pre_tool("bash", {"command": "rm"}) == "no"
+
+
+@pytest.mark.asyncio
+async def test_deny_hook_that_exits_before_reading_stdin_still_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Writing the payload to a hook that already exited raises BrokenPipeError.
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps("echo no >&2; exit 2")}\n',
+    )
+
+    async def broken_pipe(_self: asyncio.StreamWriter) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(asyncio.StreamWriter, "drain", broken_pipe)
+    manager = load_hooks(tmp_path)
+    manager.bind_session("session-1")
+
+    assert await manager.pre_tool("bash", {"command": "rm"}) == "no"
+
+
+@pytest.mark.asyncio
 async def test_pre_hook_deny_reason_reaches_tool_result(tmp_path: Path) -> None:
     deny = _python_command("import sys; sys.stderr.write('blocked by policy'); sys.exit(2)")
-    _write_config(tmp_path, f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(deny)}\n')
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(deny)}\n'
+        "timeout_seconds = 60\n",
+    )
     manager = load_hooks(tmp_path)
     manager.bind_session("session-1")
     registry = ToolRegistry(tmp_path, pre_execute_hook=manager.pre_tool, register_builtin=False, skill_catalog=SkillCatalog.empty())
@@ -121,7 +167,8 @@ async def test_hook_output_is_bounded_and_sanitized(tmp_path: Path) -> None:
     )
     _write_config(
         tmp_path,
-        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n',
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n'
+        "timeout_seconds = 60\n",
     )
     notices: list[str] = []
     manager = load_hooks(tmp_path)
@@ -145,7 +192,8 @@ async def test_hook_event_payload_is_bounded_with_metadata(tmp_path: Path) -> No
     )
     _write_config(
         tmp_path,
-        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n',
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n'
+        "timeout_seconds = 60\n",
     )
     manager = load_hooks(tmp_path)
 
@@ -171,7 +219,8 @@ async def test_oversized_hook_payload_is_bounded_with_metadata(tmp_path: Path) -
     )
     _write_config(
         tmp_path,
-        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n',
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n'
+        "timeout_seconds = 60\n",
     )
     manager = load_hooks(tmp_path)
     args = {
@@ -237,7 +286,11 @@ while not release.exists():
 pathlib.Path({str(marker)!r}).write_text("done")
 """.strip()
     )
-    _write_config(tmp_path, f'[[hook]]\nevent = "session_start"\ncommand = {json.dumps(command)}\n')
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "session_start"\ncommand = {json.dumps(command)}\n'
+        "timeout_seconds = 60\n",
+    )
     manager = load_hooks(tmp_path)
     manager.bind_session("session-1")
 
@@ -273,7 +326,7 @@ async def test_hook_subprocess_scrubs_credentials_and_keeps_session_env(
     )
 
     result = await HookManager((), session_id="session-1")._run(
-        Hook("session_start", command), {}
+        Hook("session_start", command, timeout_seconds=60), {}
     )
     environment = json.loads(result.stderr)
 
@@ -293,7 +346,8 @@ async def test_tool_filter_and_event_payload(tmp_path: Path) -> None:
     )
     _write_config(
         tmp_path,
-        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\ntools = ["bash"]\n',
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n'
+        'timeout_seconds = 60\ntools = ["bash"]\n',
     )
     manager = load_hooks(tmp_path)
     manager.bind_session("session-1")
@@ -409,7 +463,8 @@ async def test_hook_subprocess_disables_nested_hook_loading(tmp_path: Path) -> N
     )
     _write_config(
         tmp_path,
-        f'[[hook]]\nevent = "session_start"\ncommand = {json.dumps(command)}\n',
+        f'[[hook]]\nevent = "session_start"\ncommand = {json.dumps(command)}\n'
+        "timeout_seconds = 60\n",
     )
     manager = load_hooks(tmp_path)
 

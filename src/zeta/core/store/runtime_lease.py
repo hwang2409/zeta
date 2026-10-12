@@ -5,11 +5,34 @@ from __future__ import annotations
 import fcntl
 import os
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 
+from ..checkpoints import ConversationIntegrityError
 from ..session_files import open_session_file
 
 RUNTIME_LEASE_NAME = "runtime.lease"
+
+
+class StoreRuntimeLeaseMixin:
+    """Expose runtime lease operations through a conversation store."""
+
+    _runtime_lease: SessionRuntimeLease | None
+
+    def activate_runtime_lease(self) -> None:
+        """Mark a newly created session as owned by this runtime."""
+
+        if self._runtime_lease is None:
+            raise ConversationIntegrityError("read-only store has no runtime lease")
+        self._runtime_lease.activate()
+
+    @contextmanager
+    def prompt_resume_lease(self) -> Iterator[bool]:
+        """Coordinate prompt resume and retain this runtime's shared lease."""
+
+        if self._runtime_lease is None:
+            raise ConversationIntegrityError("read-only store has no runtime lease")
+        with self._runtime_lease.resume() as compose:
+            yield compose
 
 
 class SessionRuntimeLease:
@@ -68,3 +91,11 @@ class SessionRuntimeLease:
             fd, self._fd = self._fd, -1
             self._shared = False
             os.close(fd)
+
+
+def close_store_leases(
+    runtime_lease: SessionRuntimeLease | None, directory_lease: ExitStack
+) -> None:
+    if runtime_lease is not None:
+        runtime_lease.close()
+    directory_lease.close()

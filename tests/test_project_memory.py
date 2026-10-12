@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta import project_registry as registry_module
+from zeta.core import session_files
 from zeta.core.loop import AgentLoop
 from zeta.core.project_context import load_project_context, refresh_project_memory
 from zeta.core.session import SessionManager
@@ -139,6 +141,197 @@ def test_project_memory_is_bounded_and_rejects_symlinks(tmp_path: Path) -> None:
     (memory / "state.md").symlink_to(memory / "brief.md")
     with pytest.raises(ProjectRegistryError):
         registry.load_memory(project.project_id)
+
+
+def test_project_record_retries_when_open_file_was_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    project_dir = registry.root / project.project_id
+    record = project_dir / "project.json"
+    replacement = project_dir / "replacement.json"
+    replacement.write_bytes(record.read_bytes())
+    replacement.chmod(0o600)
+    real_open = registry_module.os.open
+    replaced = False
+
+    def replace_after_open(
+        path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        nonlocal replaced
+        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "project.json" and dir_fd is not None and not replaced:
+            replaced = True
+            replacement.replace(record)
+        return fd
+
+    monkeypatch.setattr(registry_module.os, "open", replace_after_open)
+
+    assert registry.show_project(project.project_id) == project
+    assert replaced
+
+
+def test_oversized_json_number_is_reported_as_malformed_registry_data(
+    tmp_path: Path,
+) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    record = registry.root / project.project_id / "project.json"
+    record.write_bytes(b'{"schema_version":' + b"9" * 5000 + b"}")
+
+    with pytest.raises(ProjectRegistryError, match="malformed project record"):
+        registry.show_project(project.project_id)
+
+
+def test_project_record_publish_rejects_oversized_data_without_replacing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    project_dir = registry.root / project.project_id
+    record = project_dir / "project.json"
+    original = record.read_bytes()
+    monkeypatch.setattr(registry_module, "MAX_RECORD_SIZE", len(original) - 1)
+    directory_fd = os.open(project_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(ProjectRegistryError, match="too large"):
+            registry._publish(directory_fd, "project.json", registry._encode(project))
+    finally:
+        os.close(directory_fd)
+
+    assert record.read_bytes() == original
+
+
+def test_project_record_publish_preserves_legacy_surrogate_text(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    project_dir = registry.root / project.project_id
+    value = registry._encode(project)
+    value["scope"] = "legacy" + chr(0xD800)
+    directory_fd = os.open(project_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        registry._publish(directory_fd, "project.json", value)
+    finally:
+        os.close(directory_fd)
+
+    assert registry.show_project(project.project_id).scope == value["scope"]
+
+
+def test_project_record_loads_boolean_schema_version(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    record = registry.root / project.project_id / "project.json"
+    value = json.loads(record.read_text(encoding="utf-8"))
+    value["schema_version"] = True
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    assert registry.show_project(project.project_id) == project
+    assert registry.list_projects() == [project]
+
+
+@pytest.mark.parametrize("field", ("name", "scope"))
+def test_project_record_loads_legacy_surrogate_text(
+    tmp_path: Path, field: str
+) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    record = registry.root / project.project_id / "project.json"
+    value = json.loads(record.read_text(encoding="utf-8"))
+    value[field] += chr(0xD800)
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    loaded = registry.show_project(project.project_id)
+    assert getattr(loaded, field) == value[field]
+    assert registry.list_projects() == [loaded]
+
+
+def test_project_session_record_loads_legacy_surrogate_ids() -> None:
+    surrogate = chr(0xD800)
+    value = {
+        "session_id": "session" + surrogate,
+        "transcript_path": "/tmp/transcript",
+        "role": "worker",
+        "parent_session_id": "parent" + surrogate,
+        "recorded_at": "2026-01-01T00:00:00.000000Z",
+    }
+
+    assert ProjectRegistry._decode_session_link(value) == value
+
+
+def test_project_record_loads_project_id_shaped_legacy_name(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    record = registry.root / project.project_id / "project.json"
+    value = json.loads(record.read_text(encoding="utf-8"))
+    value["name"] = "p_" + "a" * 32
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    loaded = registry.show_project(project.project_id)
+    assert loaded.name == value["name"]
+    assert registry.list_projects() == [loaded]
+
+
+def test_project_name_cannot_match_project_id(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+
+    with pytest.raises(ProjectRegistryError, match="name cannot match a project ID"):
+        registry.create_project("p_" + "a" * 32, "scope")
+
+
+def test_project_text_rejects_unicode_surrogates(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+
+    with pytest.raises(ProjectRegistryError, match="invalid character"):
+        registry.create_project("bad" + chr(0xD800), "scope")
+
+
+def test_project_record_read_closes_descriptor_when_fdopen_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    directory_fd = os.open(
+        registry.root / project.project_id, os.O_RDONLY | os.O_DIRECTORY
+    )
+    opened: list[int] = []
+
+    def fail_fdopen(fd: int, *_args: object, **_kwargs: object) -> object:
+        opened.append(fd)
+        raise RuntimeError("injected fdopen failure")
+
+    monkeypatch.setattr(registry_module.os, "fdopen", fail_fdopen)
+    try:
+        with pytest.raises(RuntimeError, match="injected fdopen failure"):
+            registry._read_fd(directory_fd, "project.json")
+    finally:
+        os.close(directory_fd)
+
+    assert opened
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+def test_project_record_publish_closes_descriptor_when_fdopen_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    opened: list[int] = []
+
+    def fail_fdopen(fd: int, *_args: object, **_kwargs: object) -> object:
+        opened.append(fd)
+        raise RuntimeError("injected fdopen failure")
+
+    monkeypatch.setattr(session_files.os, "fdopen", fail_fdopen)
+    try:
+        with pytest.raises(RuntimeError, match="injected fdopen failure"):
+            session_files.atomic_publish_file(directory_fd, "record", b"data")
+    finally:
+        os.close(directory_fd)
+
+    assert opened
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
 
 
 def test_project_registry_serializes_concurrent_creates_and_rejects_hardlinks(

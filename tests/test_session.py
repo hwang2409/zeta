@@ -743,6 +743,165 @@ def test_continue_reopens_the_most_recent_session(
     assert app.loop.store.session_id == newer.store.session_id
 
 
+@pytest.mark.asyncio
+async def test_completed_turn_refreshes_recency_off_loop_and_flushes_on_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    first.loop.store.close()
+    manager = SessionManager(home)
+    first_metadata = manager.read_metadata(session_id)
+    first_metadata.updated_at = "2020-01-01T00:00:00+00:00"
+    manager._write(first_metadata)
+    other = manager.create(
+        provider=first_metadata.provider,
+        model=first_metadata.model,
+        cwd=tmp_path,
+    )
+    other.metadata.updated_at = "2021-01-01T00:00:00+00:00"
+    manager._write(other.metadata)
+    other.store.close()
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
+
+    def build_backend(*args: object, **kwargs: object) -> tuple[FakeBackend, str]:
+        del args, kwargs
+        return backend, first_metadata.model
+
+    write_threads: list[int] = []
+    original_refresh = SessionManager.refresh_recency
+
+    def record_refresh(self: SessionManager, target_session_id: str) -> bool:
+        write_threads.append(threading.get_ident())
+        return original_refresh(self, target_session_id)
+
+    monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
+    monkeypatch.setattr(SessionManager, "refresh_recency", record_refresh)
+    event_loop_thread = threading.get_ident()
+    app = create_app(_args("--resume", session_id))
+    app._invalidate_prompt = lambda: None
+    write_threads.clear()
+
+    await app._consume_turn("hello")
+    await app.close()
+
+    refreshed = manager.read_metadata(session_id)
+    assert refreshed.updated_at > "2021-01-01T00:00:00+00:00"
+    assert manager.find_most_recent(cwd=tmp_path).session_id == session_id
+    assert write_threads
+    assert all(thread_id != event_loop_thread for thread_id in write_threads)
+
+
+def test_recency_refresh_skips_busy_lock_and_later_succeeds(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    original_updated_at = manager.read_metadata(session_id).updated_at
+    completed = threading.Event()
+
+    with manager._metadata_lock(session_id):
+        worker = threading.Thread(
+            target=lambda: (
+                manager.refresh_recency(session_id),
+                completed.set(),
+            )
+        )
+        worker.start()
+        returned_promptly = completed.wait(timeout=0.2)
+
+    worker.join(timeout=1)
+    assert returned_promptly
+    assert manager.read_metadata(session_id).updated_at == original_updated_at
+    assert manager.refresh_recency(session_id)
+    assert manager.read_metadata(session_id).updated_at > original_updated_at
+
+
+def test_recency_refresh_does_not_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+
+    def fail_fsync(fd: int) -> None:
+        del fd
+        raise AssertionError("recency refresh must not fsync")
+
+    monkeypatch.setattr("zeta.core.session_files.os.fsync", fail_fsync)
+
+    assert manager.refresh_recency(session_id)
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_wait_for_busy_recency_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    model = first.model
+    first.loop.store.close()
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
+
+    def build_backend(*args: object, **kwargs: object) -> tuple[FakeBackend, str]:
+        del args, kwargs
+        return backend, model
+
+    monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
+    app = create_app(_args("--resume", session_id))
+    app._invalidate_prompt = lambda: None
+    manager = SessionManager(home)
+    timed_out = False
+
+    with manager._metadata_lock(session_id):
+        await app._consume_turn("hello")
+        try:
+            await asyncio.wait_for(app.close(), timeout=0.5)
+        except TimeoutError:
+            timed_out = True
+
+    await app.close()
+    assert not timed_out
+    assert app._closed
+
+
+@pytest.mark.asyncio
+async def test_recency_refresh_does_not_overwrite_newer_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    model = first.model
+    first.loop.store.close()
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
+
+    def build_backend(*args: object, **kwargs: object) -> tuple[FakeBackend, str]:
+        del args, kwargs
+        return backend, model
+
+    monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
+    app = create_app(_args("--resume", session_id))
+    app._invalidate_prompt = lambda: None
+
+    await app._consume_turn("hello")
+    manager = SessionManager(home)
+    latest = manager.read_metadata(session_id)
+    manager.record_override(latest, provider=None, model="newer-model")
+    await app.close()
+
+    assert manager.read_metadata(session_id).model == "newer-model"
+
+
 def test_resume_reopens_an_explicit_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

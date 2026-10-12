@@ -26,23 +26,24 @@ from pathlib import Path
 from typing import TypeVar
 
 from . import project_schema
-from .core.session_files import atomic_publish_file
+from .core.session_files import SessionError, atomic_publish_file, open_session_file
 from .project_errors import ProjectNotFoundError, ProjectRegistryError
 from .project_memory_history import ProjectMemoryHistoryMixin
 from .project_schema import (
     ID_HEX_LENGTH,
     ID_PREFIX,
     MAX_MEMORY_FILE_SIZE,
-    MAX_NAME_LENGTH,
     MAX_RECORD_SIZE,
     MAX_SCOPE_LENGTH,
     SCHEMA_VERSION,
     decode_legacy_memory,
+    validate_project_name,
     validate_project_record,
     validate_project_root,
     validate_project_text,
 )
 
+MAX_NAME_LENGTH = project_schema.MAX_NAME_LENGTH
 MAX_PROJECTS = 10_000
 MAX_SESSION_REFERENCE_SIZE = 4096
 MAX_SESSION_REFERENCES = 10_000
@@ -83,14 +84,23 @@ def _now() -> str:
 
 
 def _validate_text(
-    value: object, field: str, maximum: int, *, nonempty: bool = True
+    value: object,
+    field: str,
+    maximum: int,
+    *,
+    nonempty: bool = True,
+    allow_surrogates: bool = False,
 ) -> str:
     if not isinstance(value, str) or (nonempty and not value) or len(value) > maximum:
         raise ProjectRegistryError(
             f"{field} must be a non-empty string of at most {maximum} characters"
         )
-    if "\x00" in value or any(ord(char) < 32 for char in value):
-        raise ProjectRegistryError(f"{field} contains a control character")
+    if "\x00" in value or any(
+        ord(char) < 32
+        or (not allow_surrogates and 0xD800 <= ord(char) <= 0xDFFF)
+        for char in value
+    ):
+        raise ProjectRegistryError(f"{field} contains an invalid character")
     return value
 
 
@@ -334,57 +344,56 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
     @staticmethod
     def _read_fd(directory_fd: int, name: str) -> dict[str, object]:
         try:
-            fd = os.open(
-                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
-            )
-        except OSError as exc:
+            fd = open_session_file(directory_fd, name, os.O_RDONLY)
+        except (OSError, SessionError) as exc:
             raise ProjectRegistryError(f"cannot read project record {name}") from exc
         try:
             info = os.fstat(fd)
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_nlink != 1
-                or stat.S_IMODE(info.st_mode) & 0o077
-            ):
+            if stat.S_IMODE(info.st_mode) & 0o077:
                 raise ProjectRegistryError(
                     f"project record {name} is not a private regular file"
                 )
-            try:
-                with os.fdopen(os.dup(fd), "rb") as stream:
-                    data = stream.read(MAX_RECORD_SIZE + 1)
-                    if len(data) > MAX_RECORD_SIZE or stream.read(1):
-                        raise ProjectRegistryError(
-                            f"project record {name} is too large"
-                        )
-                    decoder = json.JSONDecoder(
-                        object_pairs_hook=lambda pairs: ProjectRegistry._unique_object(
-                            pairs
-                        )
-                    )
-                    text = data.decode("utf-8")
-                    value, end = decoder.raw_decode(text)
-                    if text[end:].strip():
-                        raise ProjectRegistryError(f"malformed project record {name}")
-            except ProjectRegistryError:
-                raise
-            except (
-                OSError,
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-                RecursionError,
-            ) as exc:
-                raise ProjectRegistryError(f"malformed project record {name}") from exc
-            if not isinstance(value, dict):
-                raise ProjectRegistryError(f"malformed project record {name}")
-            return value
-        finally:
+        except BaseException:
             os.close(fd)
+            raise
+        try:
+            stream = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        try:
+            with stream:
+                data = stream.read(MAX_RECORD_SIZE + 1)
+                if len(data) > MAX_RECORD_SIZE or stream.read(1):
+                    raise ProjectRegistryError(f"project record {name} is too large")
+                decoder = json.JSONDecoder(
+                    object_pairs_hook=lambda pairs: ProjectRegistry._unique_object(pairs)
+                )
+                text = data.decode("utf-8")
+                value, end = decoder.raw_decode(text)
+                if text[end:].strip():
+                    raise ProjectRegistryError(f"malformed project record {name}")
+        except ProjectRegistryError:
+            raise
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+        ) as exc:
+            raise ProjectRegistryError(f"malformed project record {name}") from exc
+        if not isinstance(value, dict):
+            raise ProjectRegistryError(f"malformed project record {name}")
+        return value
 
     @staticmethod
     def _publish(directory_fd: int, name: str, value: dict[str, object]) -> None:
         data = (
             json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode()
+        if len(data) > MAX_RECORD_SIZE:
+            raise ProjectRegistryError(f"project record {name} is too large")
         atomic_publish_file(directory_fd, name, data, sync_directory=True)
 
     @staticmethod
@@ -438,7 +447,7 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
         memory_profile: str | None = None,
     ) -> Project:
         try:
-            name = validate_project_text(name, "name", MAX_NAME_LENGTH)
+            name = validate_project_name(name)
             scope = validate_project_text(scope, "scope", MAX_SCOPE_LENGTH)
         except ValueError as exc:
             raise ProjectRegistryError(str(exc)) from exc
@@ -738,7 +747,9 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
             "recorded_at",
         }:
             raise ProjectRegistryError("malformed project session reference")
-        _validate_text(value["session_id"], "session_id", 128)
+        _validate_text(
+            value["session_id"], "session_id", 128, allow_surrogates=True
+        )
         path = _validate_text(
             value["transcript_path"], "transcript_path", MAX_SCOPE_LENGTH
         )
@@ -749,7 +760,9 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
             raise ProjectRegistryError("invalid project session role")
         parent = value["parent_session_id"]
         if parent is not None:
-            _validate_text(parent, "parent_session_id", 128)
+            _validate_text(
+                parent, "parent_session_id", 128, allow_surrogates=True
+            )
         recorded = _validate_timestamp(value["recorded_at"], "recorded_at")
         return {
             "session_id": value["session_id"],

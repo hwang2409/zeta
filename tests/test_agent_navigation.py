@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import gc
 import json
+import logging
 import os
+import shutil
+import threading
 from collections.abc import Iterable
 from io import StringIO
 from itertools import product
@@ -41,6 +45,7 @@ from zeta.tui.agent_card import (
     read_agent_transcript,
 )
 from zeta.tui.app import FullScreenPromptSession, TUIApp
+from zeta.tui.cards.agent_sync import AgentTodoSource
 from zeta.tui.checkpoints import render_replayed_message
 from zeta.tui.todo import TodoWidget
 
@@ -318,7 +323,7 @@ def test_todo_follows_selected_session_without_inheritance_or_stale_siblings(
     _write_todos(sibling, [{"content": "sibling work", "status": "pending"}])
 
     navigation = AgentNavigation(root)
-    widget = TodoWidget(root, selected_store=navigation.todo_store)
+    widget = TodoWidget(root, selected_snapshot=navigation.todo_snapshot)
 
     assert widget.visible
     assert "root work" in _todo_text(widget)
@@ -353,8 +358,138 @@ def test_todo_follows_selected_session_without_inheritance_or_stale_siblings(
     root.close()
 
 
-def test_todo_child_refresh_and_corruption_fail_closed_and_parent_updates_survive(
+def test_turn_boundary_dismisses_root_todos_while_child_is_selected(
     tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    root.set_todo_items([{"content": "done", "status": "completed"}])
+    _child(root, 1, description="live")
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    widget = TodoWidget(root, selected_snapshot=navigation.todo_snapshot)
+
+    widget.turn_boundary()
+
+    assert root.todo_dismissed
+    root.close()
+
+
+def test_selected_child_todo_render_performs_no_file_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="live")
+    _write_todos(child, [{"content": "child work", "status": "pending"}])
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    widget = TodoWidget(root, selected_snapshot=navigation.todo_snapshot)
+    render_thread = threading.get_ident()
+    stat_threads: list[int] = []
+    original_stat = Path.stat
+
+    def record_stat(path: Path, *args: object, **kwargs: object):
+        stat_threads.append(threading.get_ident())
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", record_stat)
+    widget.create_content(80, 20)
+    widget.create_content(80, 20)
+
+    assert render_thread not in stat_threads
+    root.close()
+
+
+def test_child_todo_refresh_detects_same_size_same_mtime_atomic_replacement(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="live")
+    _write_todos(child, [{"content": "old child", "status": "pending"}])
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    widget = TodoWidget(root, selected_snapshot=navigation.todo_snapshot)
+    assert "old child" in _todo_text(widget)
+
+    state_path = child / "session_state.json"
+    original_stat = state_path.stat()
+    replacement = child / "replacement.json"
+    replacement.write_bytes(state_path.read_bytes().replace(b"old child", b"new child"))
+    os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    os.replace(replacement, state_path)
+    assert state_path.stat().st_size == original_stat.st_size
+    assert state_path.stat().st_mtime_ns == original_stat.st_mtime_ns
+
+    navigation.refresh(force=True)
+
+    assert "new child" in _todo_text(widget)
+    assert "old child" not in _todo_text(widget)
+    root.close()
+
+
+@pytest.mark.asyncio
+async def test_child_todo_refresh_coalesces_pending_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="live")
+    _write_todos(child, [{"content": "child work", "status": "pending"}])
+    started = threading.Event()
+    release = threading.Event()
+    refreshes = 0
+    original_refresh = AgentTodoSource.refresh
+
+    def blocked_refresh(source: AgentTodoSource):
+        nonlocal refreshes
+        refreshes += 1
+        started.set()
+        assert release.wait(5)
+        return original_refresh(source)
+
+    monkeypatch.setattr(AgentTodoSource, "refresh", blocked_refresh)
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    for _ in range(100):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+    task = navigation._todo_control._task
+    assert task is not None
+
+    for _ in range(20):
+        navigation._todo_control.request(child)
+    assert navigation._todo_control._task is task
+    release.set()
+    await task
+
+    assert refreshes == 2
+    root.close()
+
+
+def test_navigation_close_releases_selected_child_todo_lease(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    _child(root, 1, description="live")
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    source = navigation._todo_control._source
+    assert source is not None
+    child_store = source._store
+    assert child_store is not None
+
+    navigation.close()
+    navigation.close()
+
+    assert child_store._closed
+    root.close()
+
+
+def test_todo_child_refresh_and_corruption_is_visible_and_recovers(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     root = ConversationStore(tmp_path / "sessions", session_id="root")
     root.set_todo_items([{"content": "initial parent", "status": "pending"}])
@@ -363,20 +498,69 @@ def test_todo_child_refresh_and_corruption_fail_closed_and_parent_updates_surviv
     navigation = AgentNavigation(root)
     navigation.selected_index = 1
     navigation.open_selected()
-    widget = TodoWidget(root, selected_store=navigation.todo_store)
+    widget = TodoWidget(root, selected_snapshot=navigation.todo_snapshot)
     assert "old child" in _todo_text(widget)
 
     navigation.back_to_parent()
-    child.joinpath("session_state.json").write_text("not json\n")
+    state_path = child.joinpath("session_state.json")
+    valid_state = state_path.read_bytes()
+    state_path.write_text("not json\n")
     navigation.selected_index = 1
-    navigation.open_selected()
-    assert not widget.visible
-    assert _todo_text(widget) == ""
+    with caplog.at_level(logging.WARNING):
+        navigation.open_selected()
+        navigation.refresh(force=True)
+    assert widget.visible
+    assert _todo_text(widget) == "child todos unavailable"
+    assert sum("agent todo refresh failed" in record.message for record in caplog.records) == 1
+
+    state_path.write_bytes(valid_state)
+    navigation.refresh(force=True)
+    assert "old child" in _todo_text(widget)
 
     root.set_todo_items([{"content": "updated parent", "status": "in_progress"}])
     navigation.back_to_parent()
     assert "updated parent" in _todo_text(widget)
     assert "old child" not in _todo_text(widget)
+    root.close()
+
+
+def test_todo_child_without_state_yet_shows_no_todos(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="new")
+    child.joinpath("session_state.json").unlink(missing_ok=True)
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    with caplog.at_level(logging.WARNING):
+        navigation.open_selected()
+        navigation.refresh(force=True)
+    snapshot = navigation.todo_snapshot()
+    assert snapshot is None or not snapshot.unavailable
+    assert not any("agent todo refresh failed" in r.message for r in caplog.records)
+
+    # Once state was seen, a disappeared state file is a failure.
+    _write_todos(child, [{"content": "child task", "status": "pending"}])
+    navigation.refresh(force=True)
+    assert not navigation.todo_snapshot().unavailable
+    child.joinpath("session_state.json").unlink()
+    navigation.refresh(force=True)
+    assert navigation.todo_snapshot().unavailable
+    navigation.close()
+    root.close()
+
+
+def test_todo_missing_child_directory_is_unavailable(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="gone")
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    shutil.rmtree(child)
+    navigation.open_selected()
+    navigation.refresh(force=True)
+    snapshot = navigation.todo_snapshot()
+    assert snapshot is not None and snapshot.unavailable
+    navigation.close()
     root.close()
 
 

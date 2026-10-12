@@ -27,7 +27,7 @@ from tests.test_automations import (
     _empty_mount,
     _job,
 )
-from tests.test_server import _close, _connect, _request
+from tests.test_server import _close, _connect, _frames_until_event, _request
 from tests.test_steering import SteerToolBackend
 from zeta.automations.runner import _receipt, run_claimed
 from zeta.automations.store import SQLiteStore
@@ -485,13 +485,24 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
     command_dir = project / ".zeta" / "commands"
     command_dir.mkdir(parents=True)
     (command_dir / "custom.md").write_text("expanded $ARGUMENTS", encoding="utf-8")
-    turns = [ScriptedTurn([TextContent("done")]), ScriptedTurn([TextContent("done")])]
+    if path == "serve steer":
+        steer_target = project / "steer-target.txt"
+        steer_target.write_text("target", encoding="utf-8")
+        backend: SteerToolBackend | FakeBackend = SteerToolBackend(
+            ToolCall("serve-steer", "read", {"path": str(steer_target)})
+        )
+    else:
+        backend = FakeBackend(
+            [ScriptedTurn([TextContent("done")]), ScriptedTurn([TextContent("done")])]
+        )
     server = ZetaServer(
         home=tmp_path / "home",
         cwd=project,
         port=0,
         provider="codex",
-        backend_factory=lambda *_args, **_kwargs: (FakeBackend(turns), "offline"),
+        tools="read",
+        cli_yolo=True,
+        backend_factory=lambda *_args, **_kwargs: (backend, "offline"),
     )
     reader, writer = await _connect(server)
     try:
@@ -544,12 +555,21 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
                 },
             )
         elif path == "serve steer":
-            await _request(reader, writer, 3, "send", {"text": "start"})
-            await _request(reader, writer, 4, "steer", {"text": "serve steer input"})
+            assert isinstance(backend, SteerToolBackend)
+            async with asyncio.timeout(30):
+                await _request(reader, writer, 3, "send", {"text": "start"})
+                await backend.turn1_streaming.wait()
+                steer = await _request(
+                    reader, writer, 4, "steer", {"text": "serve steer input"}
+                )
+                assert steer[-1]["result"] == {"accepted": True}
+                backend.release_turn1.set()
+                await _frames_until_event(reader, "agent_end")
         else:
             raise AssertionError(path)
-        assert server._client is not None and server._client._turn_task is not None
-        await server._client._turn_task
+        if path != "serve steer":
+            assert server._client is not None and server._client._turn_task is not None
+            await server._client._turn_task
         if input_id is not None:
             reused = await _request(reader, writer, 5, "send", {"input_id": input_id})
             assert reused[-1]["error"]["code"] == -32602
@@ -559,7 +579,14 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
             if entry.type == "message"
             and entry.data["message"]["role"] == MessageRole.USER.value
         ]
-        return messages[-1] if path == "serve steer" else messages[0]
+        if path == "serve steer":
+            return next(
+                message
+                for message in messages
+                if message["data"]["message"]["content"][0]["text"]
+                == "serve steer input"
+            )
+        return messages[0]
     finally:
         await _close(server, writer)
 

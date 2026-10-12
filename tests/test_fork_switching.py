@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from prompt_toolkit.document import Document
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
@@ -55,6 +56,40 @@ def test_request_return_to_main_does_not_abort() -> None:
     assert getattr(app, "_run_result", None).name == "RETURN_TO_PARENT"
     assert app._exit_requested is True
     assert aborts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finder_kind", ["history", "transcript"])
+async def test_fork_switch_cancels_finder_and_restores_composer(
+    tmp_path: Path, finder_kind: str
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+        ),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    draft = Document("draft before switch", cursor_position=6)
+    session.default_buffer.set_document(draft)
+    app._active_session = session
+
+    if finder_kind == "history":
+        app._history_finder_open(session.default_buffer)
+    else:
+        app._finder_open()
+    assert app._active_finder.finder_active
+    app.request_open_fork("fork-123")
+    app._prepare_ui_session_change()
+    resumed = app._make_session()
+
+    assert not app._active_finder.finder_active
+    assert resumed.default_buffer.document == draft
+    await app._close_finder_workers()
 
 
 # -- return arming (review minor #2) ----------------------------------------
@@ -477,6 +512,9 @@ def test_tui_close_failure_still_runs_later_cleanup(
     async def close_session(*args: object, **kwargs: object) -> None:
         cleaned.append("session")
 
+    async def flush_recency() -> None:
+        cleaned.append("recency")
+
     monkeypatch.setattr("zeta.tui.runtime_close.close_session", close_session)
     app = ClosingApp()
     app._init_runtime_close()
@@ -484,13 +522,15 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app._terminal_restored = False
     app._workspace_snapshot_store = None
     app._hooks = None
+    app._on_session_close = flush_recency
     app._active_session = app._draft_session = app._session = object()
     app._history = None
     app.stop_decisions_poll = lambda: cleaned.append("poll")
     app._stop_decisions_refresh = lambda: cleaned.append("refresh")
     app._close_finder_workers = fail_finder
     app._agent_navigation = SimpleNamespace(
-        unbind_layout=lambda: cleaned.append("navigation")
+        close=lambda: cleaned.append("navigation close"),
+        unbind_layout=lambda: cleaned.append("navigation unbind"),
     )
     app._cancel_mcp_wizard = lambda: async_cleanup("wizard")
     app._submissions = SimpleNamespace(close=lambda: async_cleanup("submissions"))
@@ -504,5 +544,9 @@ def test_tui_close_failure_still_runs_later_cleanup(
 
     assert app._closed is True
     assert "submissions" in cleaned
+    assert "recency" in cleaned
     assert "session" in cleaned
+    assert cleaned.index("recency") < cleaned.index("session")
     assert "task sink" in cleaned
+    assert cleaned.index("navigation close") < cleaned.index("navigation unbind")
+    assert cleaned.index("navigation unbind") < cleaned.index("wizard")

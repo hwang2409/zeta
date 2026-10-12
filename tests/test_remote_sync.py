@@ -1340,6 +1340,20 @@ def test_ssh_pull_rejects_semantically_invalid_initial_format_two_snapshot(
     assert not list(local_projects.glob(f".{project_id}.incoming-*"))
 
 
+def test_legacy_project_id_shaped_name_is_accepted_for_transfer(
+    tmp_path: Path,
+) -> None:
+    snapshot, _project_id = _pointerless_project_snapshot(tmp_path)
+    record = snapshot / "project.json"
+    value = json.loads(record.read_text(encoding="utf-8"))
+    value["name"] = "p_" + "a" * 32
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    prepared = prepare_project_transfer(snapshot)
+
+    assert prepared.archive_bytes
+
+
 @pytest.mark.parametrize("kind", ("local", "ssh"))
 def test_initial_pointerless_project_snapshot_is_validated_and_published(
     tmp_path: Path,

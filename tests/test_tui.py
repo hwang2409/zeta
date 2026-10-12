@@ -22,11 +22,13 @@ from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
 from typing import Literal
+from unittest.mock import Mock
 
 import httpx
 import pytest
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
@@ -77,6 +79,7 @@ from zeta.tui.app import (
     background_notice,
     build_backend,
 )
+from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
     build_key_bindings,
@@ -107,6 +110,7 @@ from zeta.protocol.types import (
 )
 from zeta.tui import theme
 from zeta.tui.bootstrap import surface_shutdown_notifications
+from zeta.tui.cards import markdown as markdown_module
 from zeta.tui.cards.base import compact_tool_card, failure_status
 from zeta.tui.layout import composer_content_width, content_width, full_screen_content
 from zeta.tui.render import (
@@ -4269,6 +4273,28 @@ def test_background_start_event_reaches_presenter_with_depth(tmp_path: Path) -> 
     assert "depth 2" in output.getvalue()
 
 
+def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:
+    child = ConversationStore(tmp_path, session_id="child")
+    child.start_agent_lifecycle(
+        handle="parent:child",
+        started_at="2026-10-12T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="child",
+    )
+    child.update_agent_lifecycle(
+        current_step="turn 2: using read", turns_used=2, tool_calls=1
+    )
+
+    lifecycle = _read_lifecycle(str(child.session_dir))
+
+    assert lifecycle["current_step"] == "turn 2: using read"
+    assert lifecycle["turns_used"] == 2
+    assert lifecycle["tool_calls"] == 1
+    durable = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    assert durable["current_step"] == "starting"
+
+
 def test_typed_agent_cards_and_receipts_show_type() -> None:
     call = ToolCall(
         "typed-agent",
@@ -4881,8 +4907,8 @@ def test_recovered_canceled_agent_card_expands_with_child_tail(tmp_path: Path) -
         call,
         child_session_path=str(child.session_dir),
         description="task research",
+        turns_used=2,
     )
-    store.update_agent_child_turns(call.id, 2)
 
     AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
     result = next(message.tool_result for message in store.messages() if message.tool_result)
@@ -5059,8 +5085,47 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("key", ["\x12", "\x13"])  # ctrl+r, ctrl+s
-async def test_composer_history_search_is_disabled(tmp_path: Path, key: str) -> None:
+@pytest.mark.parametrize("editing_mode", [EditingMode.EMACS, EditingMode.VI])
+async def test_ctrl_r_opens_history_finder_with_draft_query(
+    tmp_path: Path, editing_mode: EditingMode
+) -> None:
+    active = False
+    opened_with: list[tuple[str, int]] = []
+
+    def open_history(buffer: Buffer) -> None:
+        nonlocal active
+        active = True
+        opened_with.append((buffer.text, buffer.cursor_position))
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=editing_mode,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_history_finder_open=open_history,
+                finder_active=lambda: active,
+                history_finder_active=lambda: active,
+                on_finder_input=lambda _query: None,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text("draft\x12")
+        await wait_until(lambda: active)
+        assert opened_with == [("draft", 5)]
+        active = False
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_composer_forward_history_search_is_disabled(tmp_path: Path) -> None:
+    key = "\x13"  # ctrl+s
     history = history_for(tmp_path / "history")
     history.append_string("history target")
     with create_pipe_input() as pipe:
@@ -5104,9 +5169,9 @@ async def test_vi_navigation_ctrl_r_redoes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("keys", ["\x12z", "\x13z", "\x1b\x13iz"])
-async def test_vi_ctrl_history_search_is_disabled(tmp_path: Path, keys: str) -> None:
-    # ctrl+r / ctrl+s in vi insert mode, and ctrl+s in vi navigation mode.
+@pytest.mark.parametrize("keys", ["\x13z", "\x1b\x13iz"])
+async def test_vi_ctrl_s_history_search_is_disabled(tmp_path: Path, keys: str) -> None:
+    # ctrl+s stays disabled in vi insert and navigation modes.
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
             input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
@@ -6387,7 +6452,9 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
     assert "\x1b[1;" in before_line
 
 
-def test_hostile_markdown_is_bounded_and_falls_back_or_renders() -> None:
+def test_hostile_markdown_falls_back_after_parse_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source = "\n".join(
         [
             "*" * 10000,
@@ -6396,18 +6463,25 @@ def test_hostile_markdown_is_bounded_and_falls_back_or_renders() -> None:
             ">" * 500 + " tail",
         ]
     )
-    started = time.monotonic()
+    parse = Mock(wraps=markdown_module._MARKDOWN.parse)
+    monkeypatch.setattr(markdown_module._MARKDOWN, "parse", parse)
+    monkeypatch.setattr(markdown_module, "_MAX_MARKDOWN_SECONDS", -1)
+
     document = render_markdown(source)
     output = StringIO()
     _test_console(output, width=80).print(document)
-    assert time.monotonic() - started < 5
+
+    assert document.nodes is None
+    parse.assert_called_once_with(source)
 
 
-def test_large_markdown_table_falls_back_within_render_budget() -> None:
+def test_large_markdown_table_falls_back_within_render_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(markdown_module, "_MAX_MARKDOWN_SECONDS", float("inf"))
     source = "| name | value |\n| --- | --- |\n" + "\n".join(
         f"| row-{index} | value |" for index in range(10_000)
     )
-    started = time.monotonic()
     output = StringIO()
     _test_console(output).print(render_markdown(source))
 
@@ -6417,10 +6491,6 @@ def test_large_markdown_table_falls_back_within_render_budget() -> None:
     # fallback engaged instead of walking every cell.
     plain = Text.from_ansi(output.getvalue()).plain
     assert "| row-9999 | value |" in plain
-    # The literal-row assertion catches loss of fallback. This ceiling
-    # rejects stalls of a minute or more while allowing loaded runners
-    # time to parse and print the source.
-    assert time.monotonic() - started < 60
 
 
 def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:

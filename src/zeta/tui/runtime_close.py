@@ -57,6 +57,7 @@ class RuntimeCloseMixin:
                 )
             )
             pending_before = pending if isinstance(pending, set) else set()
+            attempt(self._agent_navigation.close)
             attempt(self._agent_navigation.unbind_layout)
             await attempt_async(self._cancel_mcp_wizard)
             await attempt_async(self._submissions.close)
@@ -64,6 +65,8 @@ class RuntimeCloseMixin:
             await attempt_async(self._draft.shutdown_pending)
             if self._history is not None:
                 await attempt_async(self._history.shutdown_pending)
+            if self._on_session_close is not None:
+                await attempt_async(self._on_session_close)
             await attempt_async(
                 lambda: close_session(
                     self.loop,

@@ -39,6 +39,8 @@ class FinderState:
     preview_visible: bool
     total: int
     complete: bool
+    title: str | None = None
+    empty_text: str = "no messages"
 
 
 def _role_style(role: Role) -> str:
@@ -142,6 +144,8 @@ class FinderControl(UIControl):
     def _build(self, state: FinderState, width: int) -> list[list[tuple[str, str]]]:
         content_width = max(1, width - 2)
         lines: list[list[tuple[str, str]]] = []
+        if state.title is not None:
+            lines.append([(f"bold {theme.ACCENT}", state.title)])
         # Query line.
         lines.append(
             [
@@ -153,7 +157,7 @@ class FinderControl(UIControl):
         lines.append([(theme.DIM, "─" * content_width)])
         # Result rows.
         if not state.rows:
-            empty = "no messages" if not state.query else "no matches"
+            empty = state.empty_text if not state.query else "no matches"
             lines.append([(theme.DIM, empty)])
         else:
             window = _list_window(state.selected, len(state.rows), _VISIBLE_ROWS)
@@ -171,6 +175,11 @@ class FinderControl(UIControl):
             lines.append([(theme.DIM, "─" * content_width)])
             for preview_line in state.preview[:_PREVIEW_ROWS]:
                 lines.append([(theme.DIM, _truncate(preview_line, content_width))])
+        if state.title == "history":
+            lines.append([(theme.DIM, "─" * content_width)])
+            lines.append(
+                [(theme.DIM, "enter insert · esc cancel · ctrl+n/p move · ctrl+r older")]
+            )
         return lines
 
     # -- UIControl ---------------------------------------------------------
