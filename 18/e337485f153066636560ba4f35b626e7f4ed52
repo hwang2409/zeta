@@ -1,0 +1,21 @@
+tests/test_automations.py
+  s_d9d04f10aab6bf::t_cce68a2446b661 1285-1286,1289
+tests/test_tui.py
+  s_d9d04f10aab6bf::t_cce68a2446b661 7684-7686
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "18e337485f153066636560ba4f35b626e7f4ed52",
+  "prompts": {},
+  "sessions": {
+    "s_d9d04f10aab6bf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12ed3-e7e6-7cd1-9953-246bf98e9a16",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Austin Jian <austin.jian07@gmail.com>"
+    }
+  }
+}
