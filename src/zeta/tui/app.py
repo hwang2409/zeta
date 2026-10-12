@@ -36,7 +36,6 @@ from ..core.session import (
 )
 from ..core.slash import (
     SlashCommand,
-    SlashCommandRegistry,
     SlashStatus,
     UsageTracker,
     _format_status,
@@ -122,21 +121,24 @@ def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
     ]
 
 
-def _register_tui_slash_commands(registry: SlashCommandRegistry) -> None:
-    """Add commands that require the full-screen terminal UI."""
+def _tui_slash_commands() -> tuple[SlashCommand, ...]:
+    """Commands that require the full-screen terminal UI."""
 
-    registry.register(
+    return (
         SlashCommand(
             "approve", lambda app, args: app.slash_approve(args), "/approve [key]"
-        )
-    )
-    registry.register(
+        ),
         SlashCommand(
-            "always", lambda app, args: app.slash_always(args), "/always [key]"
-        )
-    )
-    registry.register(
-        SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]")
+            "always",
+            lambda app, args: app.slash_always(args),
+            "/always [key] — allow this tool/action for the running session",
+        ),
+        SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]"),
+        SlashCommand(
+            "permissions",
+            lambda app, args: app.slash_permissions(args),
+            "show effective approval rules and session grants",
+        ),
     )
 
 
@@ -295,8 +297,8 @@ class TUIApp(
             project_dir=repo_root,
             project_eligible=project_eligible,
             skill_catalog=skill_catalog,
+            extra_commands=_tui_slash_commands(),
         )
-        _register_tui_slash_commands(self._slash_commands)
         self.loop.set_mcp_prompt_refresh(
             lambda mount: app._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )

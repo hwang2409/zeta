@@ -69,7 +69,7 @@ def render_approval_card(
                 Text(f"{name}={value}", style=theme.DIM, overflow="fold")
             )
     if shortcut:
-        affordance = "y approve · n deny · /always to remember"
+        affordance = "y approve · n deny · /always grants tool/action for this session"
     else:
         affordance = (
             f"/approve {key} · /always {key} · /deny {key}"
@@ -77,6 +77,9 @@ def render_approval_card(
             else "/approve · /always · /deny"
         )
     body_parts.append(Text(affordance, style=theme.AFFORDANCE))
+    body_parts.append(
+        Text("/always covers any arguments · /permissions shows rules", style=theme.DIM)
+    )
     return Panel(
         Group(*body_parts),
         border_style=theme.WARNING,

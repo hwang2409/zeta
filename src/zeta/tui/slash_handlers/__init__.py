@@ -13,7 +13,7 @@ from prompt_toolkit.enums import EditingMode
 
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
-from ...core.session import SessionError, normalize_session_name
+from ...core.session import SessionError, env_home, normalize_session_name
 from ...core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashStatus,
@@ -31,6 +31,7 @@ from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
 from .model_picker import ModelPicker
+from .permissions import format_permissions
 
 
 def _validate_model_name(provider: str, model: str) -> None:
@@ -47,12 +48,25 @@ class SlashHandlerMixin:
         return ""
 
     async def slash_always(self, args: str) -> str:
-        """Approve and remember this action for the current session."""
+        """Allow this tool/action, with any arguments, for the running session."""
 
         await self._resolve_approval(
             ApprovalDecision.ALLOW, args.strip() or None, always=True
         )
         return ""
+
+    def slash_permissions(self, args: str) -> str:
+        """Inspect the active policy without changing permissions."""
+
+        if args.strip():
+            return "usage: /permissions (read-only; takes no arguments)"
+        registry = self.loop.tool_registry
+        return format_permissions(
+            registry.approval_policy,
+            registry.tool_policy,
+            settings_path=(self._zeta_home or env_home()) / "settings.toml",
+            plan_mode=self.loop.plan_mode,
+        )
 
     async def slash_deny(self, args: str) -> str:
         """Deny the first pending request, or the request with this key."""

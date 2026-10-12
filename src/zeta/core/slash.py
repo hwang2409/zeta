@@ -1139,8 +1139,9 @@ def create_slash_registry(
     project_dir: str | Path | None = None,
     project_eligible: bool | None = None,
     skill_catalog: SkillCatalog,
+    extra_commands: Sequence[SlashCommand] = (),
 ) -> SlashCommandRegistry:
-    """Create the built-in registry."""
+    """Register built-ins and frontend commands before custom commands and skills."""
 
     effective_home = zeta_home or os.environ.get("ZETA_HOME")
     registry = SlashCommandRegistry()
@@ -1230,6 +1231,8 @@ def create_slash_registry(
     registry.register(
         SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")
     )
+    for command in extra_commands:
+        registry.register(command)
     result = load_custom_commands(
         home=effective_home,
         project_dir=project_dir or Path.cwd(),
