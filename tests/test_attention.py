@@ -171,12 +171,12 @@ def test_parallel_attention_fork_copies_the_complete_tool_batch(tmp_path: Path) 
         attention_store.request(
             session_id=opened.store.session_id,
             project_id=None,
-            entry_id=anchor.id,
-            entry_seq=anchor.seq,
+            entry_id=entry.id,
+            entry_seq=entry.seq,
             title=f"Choice {index}",
             why=f"Created by parallel request {index}.",
         )
-        for index in range(4)
+        for index, entry in enumerate([anchor, *results[:-1]])
     ][1]
 
     fork_id = create_discussion_fork(tmp_path, opened.store.session_id, attention.id)
@@ -212,12 +212,12 @@ def test_attention_fork_cuts_before_an_incomplete_tool_batch(tmp_path: Path) -> 
     anchor = opened.store.append_message(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call) for call in calls])
     )
-    opened.store.append_message(_tool_result(calls[0], "created"))
+    first_result = opened.store.append_message(_tool_result(calls[0], "created"))
     attention = AttentionStore(opened.store.session_dir).request(
         session_id=opened.store.session_id,
         project_id=None,
-        entry_id=anchor.id,
-        entry_seq=anchor.seq,
+        entry_id=first_result.id,
+        entry_seq=first_result.seq,
         title="First choice",
         why="The sibling result is not durable yet.",
     )
@@ -242,8 +242,8 @@ def test_single_attention_call_fork_cut_is_unchanged(tmp_path: Path) -> None:
     attention = AttentionStore(opened.store.session_dir).request(
         session_id=opened.store.session_id,
         project_id=None,
-        entry_id=anchor.id,
-        entry_seq=anchor.seq,
+        entry_id=result.id,
+        entry_seq=result.seq,
         title="One choice",
         why="One request.",
     )
