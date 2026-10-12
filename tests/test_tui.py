@@ -30,6 +30,7 @@ from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
+from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
@@ -5075,6 +5076,24 @@ async def test_composer_history_search_is_disabled(tmp_path: Path) -> None:
         assert session.app.current_buffer is session.default_buffer
         session.app.exit()
         await task
+
+
+def test_vi_navigation_ctrl_r_binding_does_not_shadow_redo() -> None:
+    bindings = build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None)
+    session = PromptSession(
+        editing_mode=EditingMode.VI,
+        key_bindings=bindings,
+    )
+    with set_app(session.app):
+        session.app.vi_state.input_mode = InputMode.NAVIGATION
+        no_op = [
+            binding
+            for binding in bindings.bindings
+            if Keys.ControlR in binding.keys
+            and binding.handler.__name__ == "disable_emacs_history_search"
+        ]
+        assert no_op
+        assert not no_op[-1].filter()
 
 
 @pytest.mark.asyncio

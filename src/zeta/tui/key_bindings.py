@@ -13,32 +13,18 @@ from typing import Any, Final
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
-from prompt_toolkit.application import application as prompt_application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
 from prompt_toolkit.enums import DEFAULT_BUFFER, EditingMode
 from prompt_toolkit.filters import (
     Condition,
-    buffer_has_focus,
     has_completions,
     has_focus,
     to_filter,
     vi_insert_mode,
 )
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.key_binding.bindings.basic import load_basic_bindings
-from prompt_toolkit.key_binding.bindings.cpr import load_cpr_bindings
-from prompt_toolkit.key_binding.bindings.emacs import (
-    load_emacs_bindings,
-    load_emacs_shift_selection_bindings,
-)
-from prompt_toolkit.key_binding.bindings.mouse import load_mouse_bindings
 from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
-from prompt_toolkit.key_binding.key_bindings import (
-    ConditionalKeyBindings,
-    KeyBindingsBase,
-    merge_key_bindings,
-)
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import ALL_KEYS, Keys
@@ -242,26 +228,6 @@ def _guard_redraw(application: Application[str]) -> None:
     application._redraw = redraw_or_exit
 
 
-def _load_key_bindings_without_search() -> KeyBindingsBase:
-    """Load prompt-toolkit defaults without composer history-search bindings."""
-
-    all_bindings = merge_key_bindings(
-        [
-            load_basic_bindings(),
-            load_emacs_bindings(),
-            load_emacs_shift_selection_bindings(),
-            load_vi_bindings(),
-        ]
-    )
-    return merge_key_bindings(
-        [
-            ConditionalKeyBindings(all_bindings, buffer_has_focus),
-            load_mouse_bindings(),
-            load_cpr_bindings(),
-        ]
-    )
-
-
 class FullScreenPromptSession(PromptSession[str]):
     """Prompt session that owns the alternate screen for the whole app."""
 
@@ -284,12 +250,7 @@ class FullScreenPromptSession(PromptSession[str]):
     def _create_application(
         self, editing_mode: EditingMode, erase_when_done: bool
     ) -> Application[str]:
-        original_load_key_bindings = prompt_application.load_key_bindings
-        prompt_application.load_key_bindings = _load_key_bindings_without_search
-        try:
-            application = super()._create_application(editing_mode, erase_when_done)
-        finally:
-            prompt_application.load_key_bindings = original_load_key_bindings
+        application = super()._create_application(editing_mode, erase_when_done)
         application.ttimeoutlen, application.timeoutlen, application.cursor = (
             0.02,
             0.5,
@@ -522,6 +483,26 @@ def build_key_bindings(
             and search_active is not None
             and search_active()
         )
+
+    @Condition
+    def composer_emacs_mode() -> bool:
+        return has_focus(DEFAULT_BUFFER)() and get_app().editing_mode is EditingMode.EMACS
+
+    @Condition
+    def composer_vi_navigation_mode() -> bool:
+        return (
+            has_focus(DEFAULT_BUFFER)()
+            and get_app().editing_mode is EditingMode.VI
+            and get_app().vi_state.input_mode is InputMode.NAVIGATION
+        )
+
+    @bindings.add("c-r", "c-s", filter=composer_emacs_mode)
+    def disable_emacs_history_search(_event: KeyPressEvent) -> None:
+        pass
+
+    @bindings.add("/", "?", filter=composer_vi_navigation_mode)
+    def disable_vi_history_search(_event: KeyPressEvent) -> None:
+        pass
 
     @Condition
     def transcript_search_navigation_mode() -> bool:
