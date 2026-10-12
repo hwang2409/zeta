@@ -768,6 +768,8 @@ class AutoMemoryReconciler:
         max_wait = self.config.early_trigger_max_wait_seconds
         if max_wait is None:
             max_wait = early_update_max_wait_seconds(profile)
+        if debounce is None or max_wait is None:
+            return None
         path = self.session_dir / "conversation.jsonl"
         try:
             with path.open("rb") as handle:

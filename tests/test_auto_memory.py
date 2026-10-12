@@ -35,6 +35,10 @@ def _write_transcript(session_dir: Path, count: int = 4) -> None:
     )
 
 
+def _no_op_proposal(_prompt: str) -> str:
+    return json.dumps({"changes": []})
+
+
 def _proposal(prompt: str) -> str:
     marker = 'Completed transcript rows:'
     assert marker in prompt
@@ -111,6 +115,56 @@ def _runner(tmp_path: Path, invoke=_proposal, *, transcript_count: int = 4, **co
         **({"retry_clock": retry_clock} if retry_clock is not None else {}),
     )
     return runner, registry, project.project_id, notices
+
+
+def test_zeta_completed_user_turn_does_not_schedule_early_update(
+    tmp_path: Path,
+) -> None:
+    runner, _registry, _project_id, _ = _runner(tmp_path, transcript_count=0)
+    rows = [
+        {
+            "seq": 1,
+            "type": "message",
+            "data": {
+                "message": {
+                    "role": "user",
+                    "tool_result": None,
+                    "metadata": {"zeta.origin": "user"},
+                }
+            },
+        },
+        {
+            "seq": 2,
+            "type": "message",
+            "data": {
+                "message": {
+                    "role": "assistant",
+                    "metadata": {"response_state": "completed"},
+                }
+            },
+        },
+    ]
+    (runner.session_dir / "conversation.jsonl").write_text(
+        "".join(json.dumps(row) + "\\n" for row in rows), encoding="utf-8"
+    )
+
+    assert runner._completed_direct_user_turn(2) is None
+    assert runner.state.early_trigger_seq == 0
+
+
+@pytest.mark.asyncio
+async def test_no_op_reconciliation_advances_cursor_without_publishing_or_retrying(
+    tmp_path: Path,
+) -> None:
+    runner, registry, project_id, _ = _runner(tmp_path, _no_op_proposal)
+    runner.before_eviction(1, 2)
+    await runner.drain()
+
+    assert runner.last_reconciled_seq == 2
+    assert registry.memory_log(project_id) == []
+    runner.activity(2)
+    await runner.drain()
+    assert registry.memory_log(project_id) == []
 
 
 @pytest.mark.asyncio
