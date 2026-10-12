@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
+import queue
 import threading
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -53,7 +53,7 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
     probe_ready = threading.Event()
     release_probe = threading.Event()
     loop_blocked = threading.Event()
-    release_loop = threading.Event()
+    release_loop: queue.SimpleQueue[None] = queue.SimpleQueue()
     record_written = threading.Event()
 
     def before_probe() -> None:
@@ -63,17 +63,16 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
 
     def after_sample() -> None:
         if loop_blocked.is_set():
-            release_loop.set()
+            release_loop.put(None)
 
     def block_loop() -> None:
-        # Stay the innermost Python frame (time.sleep is C code): stack
-        # trimming keeps only Zeta, stdlib and innermost frames.
+        # SimpleQueue.get waits in C, so block_loop stays the innermost Python
+        # frame; stack trimming keeps only Zeta, stdlib and innermost frames.
         loop_blocked.set()
-        deadline = time.monotonic() + 5
-        while not release_loop.is_set():
-            if time.monotonic() > deadline:
-                raise TimeoutError("loop release was not signaled")
-            time.sleep(0.001)
+        try:
+            release_loop.get(timeout=5)
+        except queue.Empty:
+            raise TimeoutError("loop release was not signaled") from None
 
     watchdog = TUIStallWatchdog(
         path,
@@ -100,7 +99,7 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
         assert await asyncio.to_thread(record_written.wait, 5)
     finally:
         release_probe.set()
-        release_loop.set()
+        release_loop.put(None)
         await watchdog.close()
 
     records = [json.loads(line) for line in path.read_text().splitlines()]
