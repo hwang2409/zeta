@@ -31,7 +31,7 @@ from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
 from .model_picker import ModelPicker
-from .permissions import format_permissions
+from .permissions import format_permissions, revoke_permissions
 
 
 def _validate_model_name(provider: str, model: str) -> None:
@@ -56,11 +56,11 @@ class SlashHandlerMixin:
         return ""
 
     def slash_permissions(self, args: str) -> str:
-        """Inspect the active policy without changing permissions."""
+        """Inspect the active policy or explicitly revoke session grants."""
 
-        if args.strip():
-            return "usage: /permissions (read-only; takes no arguments)"
         registry = self.loop.tool_registry
+        if args.strip():
+            return revoke_permissions(registry.approval_policy, args)
         return format_permissions(
             registry.approval_policy,
             registry.tool_policy,
