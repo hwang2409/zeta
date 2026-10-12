@@ -37,7 +37,8 @@ ReceiptType = Literal[
 _TIMESTAMP = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z"
 )
-_KIND_KEY = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+KIND_KEY_PATTERN = r"[a-z][a-z0-9_-]{0,31}"
+_KIND_KEY = re.compile(KIND_KEY_PATTERN)
 _ENTRY_ID = re.compile(r"m_[0-9a-f]{32}")
 _OPERATION_ID = re.compile(r"op_[0-9a-f]{32}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
