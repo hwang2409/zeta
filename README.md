@@ -76,6 +76,21 @@ global settings file; `0` disables it and the valid range is `0` through `19`:
 command_niceness = 10
 ```
 
+## TUI stall diagnostics
+
+The TUI records event-loop stalls of at least 250 ms in
+`$ZETA_HOME/logs/tui-stalls.jsonl` (normally
+`~/.zeta/logs/tui-stalls.jsonl`). The log is bounded and contains stack frames,
+not terminal or conversation content. Disable it with
+`ZETA_STALL_WATCHDOG=0`. There is no debug command, so inspect recent records
+with:
+
+```sh
+jq -r '"\(.start_time)  \(.duration_ms) ms  \(.session_id)\n" +
+  (.stacks[0].frames[:5] | map("  \(.file):\(.line) in \(.function)") | join("\n"))' \
+  "${ZETA_HOME:-$HOME/.zeta}/logs/tui-stalls.jsonl"
+```
+
 ## Docs
 
 - [Agents and orchestration](docs/agents.md)

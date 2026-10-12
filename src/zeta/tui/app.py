@@ -42,6 +42,7 @@ from ..core.slash import (
     _format_status,
     create_slash_registry,
 )
+from ..diagnostics.tui_stalls import start_tui_stall_watchdog
 from ..mcp.management import MCPManagementService
 from ..protocol.types import (
     Message,
@@ -1105,6 +1106,11 @@ class TUIApp(
         self._exit_requested = False
         self._run_result = RuntimeResult.EXIT
         self._decisions_switching = False
+        watchdog = start_tui_stall_watchdog(
+            asyncio.get_running_loop(),
+            zeta_home=self._zeta_home or env_home(),
+            session_id=self.loop.store.session_id,
+        )
         try:
             if not resume_ui:
                 self._begin_startup_replay()
@@ -1170,6 +1176,8 @@ class TUIApp(
                         self._active_session = None
                         self._terminal_restored = True
         finally:
+            if watchdog is not None:
+                await watchdog.close()
             if not self._suspending_for_fork:
                 await self.close()
 
