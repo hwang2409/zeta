@@ -485,7 +485,7 @@ class SshTransport:
         try:
             result = subprocess.run(
                 command,
-                stdin=stdin,
+                stdin=stdin if stdin is not None else subprocess.DEVNULL,
                 capture_output=True,
                 check=False,
             )
@@ -507,6 +507,7 @@ class SshTransport:
         try:
             process = subprocess.Popen(
                 self._command(script, arguments),
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )

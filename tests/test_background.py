@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import json
 import os
+import pty
 import shlex
 import signal
 import stat
@@ -605,6 +606,34 @@ async def test_background_start_poll_and_kill_round_trip(tmp_path: Path) -> None
     )
     assert killed["structuredContent"]["running"] is False
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_background_stdin_is_owned_pipe_when_parent_stdin_is_a_tty(
+    tmp_path: Path,
+) -> None:
+    tasks = BackgroundTaskRegistry()
+    saved_stdin = os.dup(0)
+    master_fd, slave_fd = pty.openpty()
+    try:
+        os.dup2(slave_fd, 0)
+        task_id, _ = await tasks.start(
+            _python(
+                "import os, sys; print(os.isatty(0)); "
+                "print(sys.stdin.buffer.read() == b'')"
+            ),
+            tmp_path,
+        )
+    finally:
+        os.dup2(saved_stdin, 0)
+        os.close(saved_stdin)
+        os.close(master_fd)
+        os.close(slave_fd)
+
+    await tasks.input(task_id, eof=True)
+    await _wait_for_exit(tasks, task_id)
+    assert (await tasks.output(task_id))["output"] == "False\nTrue\n"
+    await tasks.close()
 
 
 @pytest.mark.asyncio

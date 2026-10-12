@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import math
 import os
+import pty
 import shlex
 import shutil
 import subprocess
@@ -186,6 +187,42 @@ async def test_bash_captures_stdout_stderr_and_exit_code(tmp_path: Path) -> None
     assert structured["error"]["kind"] == "exit_nonzero"
     assert structured["error"]["hint"]
     assert "stdout:\nout\nstderr:\nerr" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_bash_stdin_is_devnull_when_parent_stdin_is_a_tty(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    saved_stdin = os.dup(0)
+    master_fd, slave_fd = pty.openpty()
+    try:
+        os.dup2(slave_fd, 0)
+        result = await registry.execute(
+            ToolCall(
+                "stdin",
+                "bash",
+                {
+                    "command": (
+                        "test ! -t 0 && echo not-tty; "
+                        "cat >/dev/null && echo eof; "
+                        "printf 'git-prompt=%s\\n' \"$GIT_TERMINAL_PROMPT\"; "
+                        "if : </dev/tty 2>/dev/null; then echo tty-open; "
+                        "else echo no-controlling-tty; fi"
+                    ),
+                    "timeout": 1,
+                },
+            )
+        )
+    finally:
+        os.dup2(saved_stdin, 0)
+        os.close(saved_stdin)
+        os.close(master_fd)
+        os.close(slave_fd)
+        await registry.close()
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["stdout"] == (
+        "not-tty\neof\ngit-prompt=0\nno-controlling-tty\n"
+    )
 
 
 @pytest.mark.asyncio
@@ -2021,6 +2058,8 @@ def test_tool_subprocess_env_blocks_credentials_and_preserves_rest(
     from zeta.tools._shared.process import tool_subprocess_env
 
     _seed_env(monkeypatch)
+    for name in ("GIT_TERMINAL_PROMPT", "DEBIAN_FRONTEND", "PAGER", "GIT_PAGER"):
+        monkeypatch.delenv(name, raising=False)
 
     env = tool_subprocess_env()
 
@@ -2031,6 +2070,27 @@ def test_tool_subprocess_env_blocks_credentials_and_preserves_rest(
     assert env["PATH"] == os.environ["PATH"]
     assert env["HOME"] == os.environ["HOME"]
     assert env["ZETA_HOME"] == "/tmp/zeta-private-home"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["DEBIAN_FRONTEND"] == "noninteractive"
+    assert env["PAGER"] == "cat"
+    assert env["GIT_PAGER"] == "cat"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("GIT_TERMINAL_PROMPT", "1"),
+        ("DEBIAN_FRONTEND", "dialog"),
+        ("PAGER", "less"),
+        ("GIT_PAGER", "delta"),
+    ],
+)
+def test_tool_subprocess_env_preserves_user_noninteractive_settings(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    assert subprocess_env()[name] == value
 
 
 def test_subprocess_env_applies_explicit_overrides_after_scrubbing(
