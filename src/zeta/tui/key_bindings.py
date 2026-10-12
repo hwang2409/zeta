@@ -15,6 +15,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
+from prompt_toolkit.document import Document
 from prompt_toolkit.enums import DEFAULT_BUFFER, EditingMode
 from prompt_toolkit.filters import (
     Condition,
@@ -54,6 +55,7 @@ DEFAULTS: Final[Mapping[str, tuple[str, ...]]] = {
     "page-up": ("pageup",),
     "page-down": ("pagedown",),
     "search-start": ("c-f",),
+    "history-search": ("c-r",),
     "transcript-previous-user": ("c-up",),
     "transcript-next-user": ("c-down",),
     "toggle-agent": ("c-x", "c-o"),
@@ -330,7 +332,9 @@ def build_key_bindings(
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_finder_open: Callable[[], None] | None = None,
+    on_history_finder_open: Callable[[Buffer], None] | None = None,
     finder_active: Callable[[], bool] | None = None,
+    history_finder_active: Callable[[], bool] | None = None,
     on_finder_input: Callable[[str], None] | None = None,
     on_finder_move: Callable[[int], None] | None = None,
     on_finder_accept: Callable[[], None] | None = None,
@@ -463,6 +467,14 @@ def build_key_bindings(
         )
 
     @Condition
+    def history_finder_mode() -> bool:
+        return (
+            finder_mode()
+            and history_finder_active is not None
+            and history_finder_active()
+        )
+
+    @Condition
     def panel_mode() -> bool:
         # Any transient overlay that owns the keyboard. Composer keys stay
         # suppressed for all of them; each overlay then adds its own bindings.
@@ -496,13 +508,35 @@ def build_key_bindings(
             and get_app().vi_state.input_mode is InputMode.NAVIGATION
         )
 
-    # One key per add(): add("c-r", "c-s") would bind the two-key sequence.
-    # prompt_toolkit's search bindings own ctrl+r/ctrl+s in emacs mode and in
-    # both vi modes, so disable them for the whole composer.
-    @bindings.add("c-r", filter=composer_focused & ~composer_vi_navigation_mode, eager=True)
+    # prompt_toolkit's built-in search remains disabled; Zeta owns history
+    # search in Emacs and vi insert modes through the remappable action below.
     @bindings.add("c-s", filter=composer_focused, eager=True)
-    def disable_history_search_keys(_event: KeyPressEvent) -> None:
+    def disable_forward_history_search(_event: KeyPressEvent) -> None:
         pass
+
+    if resolved_keys["history-search"] != ("c-r",):
+
+        @bindings.add(
+            "c-r",
+            filter=composer_focused & ~composer_vi_navigation_mode,
+            eager=True,
+        )
+        def disable_default_history_search(_event: KeyPressEvent) -> None:
+            pass
+
+    @bindings.add(
+        *resolved_keys["history-search"],
+        filter=composer_focused & ~composer_vi_navigation_mode & ~panel_mode,
+        eager=True,
+    )
+    def open_history_finder(event: KeyPressEvent) -> None:
+        event.current_buffer.cancel_completion()
+        finder_buffer.set_document(
+            Document(event.current_buffer.text, len(event.current_buffer.text)),
+            bypass_readonly=True,
+        )
+        if on_history_finder_open is not None and get_app().full_screen:
+            on_history_finder_open(event.current_buffer)
 
     # Vi navigation ctrl+r is redo; keep it once the search binding is gone.
     # save_before=False: the default undo snapshot would clear the redo stack.
@@ -959,6 +993,17 @@ def build_key_bindings(
             event.current_buffer.cancel_completion()
             finder_buffer.reset()
             on_finder_open()
+
+    if on_finder_move is not None:
+
+        @bindings.add(
+            *resolved_keys["history-search"],
+            filter=history_finder_mode,
+            eager=True,
+        )
+        def history_finder_older(event: KeyPressEvent) -> None:
+            del event
+            on_finder_move(1)
 
     if on_finder_input is not None:
 

@@ -1124,6 +1124,15 @@ def _run_theme(session: SlashSession, args: str) -> str:
     return session.slash_theme(args)
 
 
+def _run_keys(_session: SlashSession, _args: str) -> str:
+    return """ctrl+r search prompt history
+ctrl+f find transcript messages
+ctrl+up/down jump between user messages
+pageup/pagedown scroll transcript
+enter submit · ctrl+j insert newline
+esc cancel popup · tab toggle finder preview"""
+
+
 def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
@@ -1144,6 +1153,7 @@ def create_slash_registry(
             else discover_project_root(Path.cwd())
         )
     registry.register(SlashCommand("status", _run_status, "show session status"))
+    registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
     registry.register(
         SlashCommand(

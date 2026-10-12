@@ -140,6 +140,18 @@ def test_completer_shows_description_and_source_badge(tmp_path: Path) -> None:
     assert completions[0].display_meta[0][1] == "[project] review the change"
 
 
+def test_keys_help_describes_prompt_history_search(tmp_path: Path) -> None:
+    registry = create_slash_registry(
+        zeta_home=tmp_path / "home",
+        project_dir=tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    command = next(command for command in registry.builtin_commands if command.name == "keys")
+
+    assert "/keys — show keyboard shortcuts" in registry.help_text()
+    assert "ctrl+r search prompt history" in command.run(None, "")
+
+
 def test_init_is_in_help_and_completion(tmp_path: Path) -> None:
     registry = create_slash_registry(
         zeta_home=tmp_path / "home",
