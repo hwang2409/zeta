@@ -429,7 +429,6 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
             and app.active
             and app._loop_state in {"streaming", "compacting", "tool-running", "approval"}
         ),
-        transcript_navigation=app._full_screen_active(),
         transcript_search=(
             app._transcript.search_query if app._transcript.search_active else None
         ),

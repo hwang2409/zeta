@@ -695,7 +695,6 @@ def format_status(
     decisions_count: int = 0,
     main_active: bool = False,
     undo_available: bool = False,
-    transcript_navigation: bool = False,
     transcript_search: str | None = None,
     transcript_match: tuple[int, int] | None = None,
     transcript_position: str | None = None,
@@ -790,11 +789,9 @@ def format_status(
     if transcript_search is not None:
         current, total = transcript_match or (0, 0)
         left = f'find "{transcript_search}" {current}/{total}  {left}'
-    right_segments = ["/status", "ctrl+c interrupt", "ctrl+d quit"]
+    right_segments = ["/status"]
     if background_count > 0:
-        right_segments.insert(1, "/tasks")
-    if transcript_navigation:
-        right_segments.extend(("ctrl+f find", "ctrl+up/down users"))
+        right_segments.append("/tasks")
     if transcript_search is not None:
         right_segments.extend(("enter/n next", "N prev", "esc close"))
     if undo_available:
