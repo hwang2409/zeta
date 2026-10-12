@@ -97,6 +97,38 @@ async def _render_status(session, width: int, height: int) -> Screen:
     return screen
 
 
+@pytest.mark.asyncio
+async def test_empty_decisions_popup_renders_and_closes(tmp_path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    try:
+        session = app._make_session()
+        app._active_session = session
+        app._install_full_screen_layout(session)
+        app.open_decisions_panel()
+
+        screen = await _render_status(session, 80, 24)
+        text = "\n".join(
+            "".join(screen.data_buffer[y][x].char for x in range(80))
+            for y in range(24)
+        )
+        assert "No open decisions." in text
+        assert "esc close" in text
+
+        app.close_decisions_panel()
+        # Closed floats are still measured during redraws.
+        await _render_status(session, 80, 24)
+        assert not app.decisions_panel_active
+        assert session.layout.has_focus(session.default_buffer)
+    finally:
+        await app.close()
+
+
 def _card_bounds(screen: Screen, width: int, height: int) -> tuple[int, int, int, int]:
     cells = [
         (x, y)
