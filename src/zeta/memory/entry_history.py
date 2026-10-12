@@ -29,6 +29,7 @@ from zeta.memory.entry_store import (
     new_operation_id,
     receipt_from_dict,
     receipt_to_dict,
+    resolve_entries,
     state_digest,
     state_from_bytes,
     utc_now,
@@ -956,6 +957,37 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                     state=state,
                     before=current.state,
                     kind="entry-accept",
+                    receipts=(receipt,),
+                )
+                return EntryCASResult(
+                    published.state,
+                    published.digest,
+                    published.version,
+                    True,
+                    (receipt,),
+                )
+            finally:
+                os.close(directory_fd)
+
+    def _resolve_memory_entries(
+        self,
+        project_id: str,
+        entry_ids: tuple[str, ...],
+        *,
+        reason: str = "resolved by user",
+    ) -> EntryCASResult:
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                current = self._entry_snapshot_locked(directory_fd)
+                state, receipt = resolve_entries(
+                    current.state, entry_ids, reason=reason
+                )
+                published = self._publish_entry_version(
+                    directory_fd,
+                    state=state,
+                    before=current.state,
+                    kind="entry-resolve",
                     receipts=(receipt,),
                 )
                 return EntryCASResult(

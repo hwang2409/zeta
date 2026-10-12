@@ -32,6 +32,46 @@ def _entry_project(tmp_path: Path, profile: str = "zeta") -> tuple[ProjectRegist
     return registry, project.project_id
 
 
+def test_zeta_profile_update_changes_only_new_state_expiry(tmp_path: Path) -> None:
+    registry, project_id = _entry_project(tmp_path)
+    current = registry._entry_memory_state(project_id)
+    legacy_kinds = tuple(
+        dataclasses.replace(kind, default_expiry_days=30)
+        if kind.key == "state"
+        else kind
+        for kind in current.state.schema.kinds
+    )
+    legacy_state = dataclasses.replace(
+        current.state,
+        schema=dataclasses.replace(current.state.schema, version=3, kinds=legacy_kinds),
+    )
+    current = registry._replace_entry_state_for_test(
+        project_id, legacy_state, expected_digest=current.digest
+    )
+    existing = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=current.digest,
+        operations=(AddOperation("state", "Existing state.", _source()),),
+        reconciliation_key=None,
+        now="2026-10-09T00:00:00Z",
+    )
+    existing_id = existing.receipts[0].result_ids[0]
+
+    updated = registry.set_memory_profile(project_id, "zeta")
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=updated.digest,
+        operations=(AddOperation("state", "New state.", _source()),),
+        reconciliation_key=None,
+        now="2026-10-09T00:00:00Z",
+    )
+    new_id = added.receipts[0].result_ids[0]
+
+    assert added.state.schema.version == 4
+    assert added.state.entries[existing_id].expires_at == "2026-11-08T00:00:00.000000Z"  # type: ignore[union-attr]
+    assert added.state.entries[new_id].expires_at == "2026-10-16T00:00:00.000000Z"  # type: ignore[union-attr]
+
+
 def test_zeta_and_messaging_profiles_apply_distinct_defaults(tmp_path: Path) -> None:
     registry = ProjectRegistry(tmp_path / "projects")
     first = registry.create_project("zeta", "test", tmp_path / "zeta")

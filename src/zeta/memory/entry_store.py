@@ -958,6 +958,45 @@ def accept_entry(
     return result, receipt
 
 
+def resolve_entries(
+    state: MemoryState,
+    entry_ids: tuple[str, ...],
+    *,
+    reason: str = "resolved by user",
+    now: str | None = None,
+) -> tuple[MemoryState, OperationReceipt]:
+    """Resolve one user-selected batch as one atomic, undoable operation."""
+    if not entry_ids or len(set(entry_ids)) != len(entry_ids):
+        _fail("invalid memory resolve targets")
+    targets = tuple(_active(state.entries, entry_id) for entry_id in entry_ids)
+    reason = _safe_text(reason, maximum=MAX_REASON_BYTES, label="operation reason")
+    now = now or utc_now()
+    _timestamp(now)
+    operation_id = new_operation_id()
+    entries = dict(state.entries)
+    for entry in targets:
+        entries[entry.id] = replace(
+            entry,
+            status="resolved",
+            updated_at=now,
+            valid_until=now,
+            last_operation_id=operation_id,
+        )
+    result = replace(state, generation=state.generation + 1, entries=entries)
+    receipt = OperationReceipt(
+        operation_id,
+        "resolve",
+        entry_ids,
+        (),
+        reason,
+        None,
+        False,
+    )
+    canonical_state_bytes(result)
+    validate_receipt(receipt)
+    return result, receipt
+
+
 def compact_inactive_entries(
     state: MemoryState,
     *, retained_operation_ids: set[str],

@@ -52,6 +52,8 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
     memory.add_argument("remote", nargs="?", help="remote alias or explicit SSH host")
     memory.add_argument("action", nargs="?", help="memory action file")
     memory.add_argument("detail", nargs="?", help="memory action value")
+    memory.add_argument("entry_ids", nargs="*", help="additional memory entry IDs")
+    memory.add_argument("--reason", help="reason for resolving memory entries")
     memory.add_argument("--project", dest="sync_project", help="project ID or exact name")
     memory.add_argument("--remote-home", help="remote ZETA_HOME (default: ~/.zeta)")
     memory.add_argument(
@@ -195,6 +197,38 @@ def run(
                 )
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
+            if args.remote == "resolve":
+                entry_ids = tuple(
+                    item
+                    for item in (
+                        args.action,
+                        getattr(args, "detail", None),
+                        *getattr(args, "entry_ids", []),
+                    )
+                    if item is not None
+                )
+                if not entry_ids:
+                    raise ProjectRegistryError(
+                        "memory resolve requires at least one entry ID"
+                    )
+                if registry.memory_format(project_id) != 2:
+                    raise ProjectRegistryError("memory resolve requires format-2 memory")
+                target = ", ".join(entry_ids)
+                MemoryMutationAuthorization.terminal(
+                    stdin=sys.stdin, stdout=out
+                ).authorize(
+                    action="resolve",
+                    target=target,
+                    noun="entries",
+                )
+                registry._resolve_memory_entries(
+                    project_id,
+                    entry_ids,
+                    reason=getattr(args, "reason", None) or "resolved by user",
+                )
+                value = registry._entry_memory_view(project_id)
+                print(json.dumps(value, indent=2, sort_keys=True), file=out)
+                return 0
             if args.remote == "schema":
                 if args.action != "set-profile" or not getattr(args, "detail", None):
                     raise ProjectRegistryError(
@@ -224,6 +258,8 @@ def run(
                 or getattr(args, "detail", None) is not None
                 or getattr(args, "map_kind", [])
                 or getattr(args, "resolve_kind", [])
+                or getattr(args, "entry_ids", [])
+                or getattr(args, "reason", None) is not None
             ):
                 raise ProjectRegistryError(
                     "remote arguments require: project memory push|pull|resolve HOST"
