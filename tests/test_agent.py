@@ -3910,6 +3910,10 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
     grandchild_tools = {schema["name"] for schema in backend.calls[2][1]}
     assert "project_update" not in child_tools
     assert "project_update" not in grandchild_tools
+    assert all(
+        "project_update" not in {schema["name"] for schema in schemas}
+        for _, schemas in backend.calls
+    )
     assert child_tools == {
         "agent",
         "agent_output",
@@ -7267,8 +7271,8 @@ async def test_agent_cwd_applies_to_read_and_edit(tmp_path: Path) -> None:
 class ChildRunBackgroundBackend(CompletionBackend):
     """Drive a child that starts a run_background task, then waits for it.
 
-    Waiting via task_output before the child finishes keeps the assertion off
-    the child-teardown race: the file exists by the time the child replies.
+    Using task_output before the child finishes keeps the assertion off the
+    child-teardown race: the file exists by the time the child replies.
     """
 
     def __init__(
