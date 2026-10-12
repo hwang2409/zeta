@@ -22,6 +22,10 @@ from ..protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
+from .payload_common import (
+    HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER,
+    is_harness_notification,
+)
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
@@ -76,7 +80,12 @@ def _messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
     prior_calls: dict[str, ToolCall] = {}
     for message in messages:
         if message.role is MessageRole.SYSTEM:
-            result.append({"role": "system", "content": _content(message)})
+            content = _content(message)
+            if is_harness_notification(message):
+                content = f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{content}"
+                result.append({"role": "user", "content": content})
+            else:
+                result.append({"role": "system", "content": content})
         elif message.role is MessageRole.TOOL_RESULT:
             if message.tool_result is None:
                 raise OllamaError("tool result message is missing its result")
