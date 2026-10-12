@@ -19,8 +19,15 @@ class SessionNotFoundError(SessionError):
     """Raised when the requested session does not exist."""
 
 
+class SessionFileReplaced(SessionError):
+    """Raised when read retries keep opening an unlinked session file."""
+
+
 class SessionInUseError(SessionError):
     """Raised when an open store or metadata operation prevents deletion."""
+
+
+_READ_RETRIES = 3
 
 
 @contextmanager
@@ -140,22 +147,35 @@ def atomic_publish_file(
 def open_session_file(directory_fd: int, name: str, flags: int) -> int:
     """Open one regular, unshared file without following a link or blocking on a FIFO."""
     _component(name)
-    fd = os.open(
-        name,
-        (flags & ~os.O_TRUNC) | os.O_NOFOLLOW | os.O_NONBLOCK,
-        0o600,
-        dir_fd=directory_fd,
-    )
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise SessionError(f"session file must be a regular, unshared file: {name}")
-        if flags & os.O_TRUNC:
-            os.ftruncate(fd, 0)
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
+    for attempt in range(_READ_RETRIES):
+        fd = os.open(
+            name,
+            (flags & ~os.O_TRUNC) | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+                raise SessionError(
+                    f"session file must be a regular, unshared file: {name}"
+                )
+            if info.st_nlink == 0:
+                read_only = flags & os.O_ACCMODE == os.O_RDONLY
+                if read_only and attempt + 1 < _READ_RETRIES:
+                    os.close(fd)
+                    continue
+                error = f"session file was replaced while opening: {name}"
+                if read_only:
+                    raise SessionFileReplaced(error)
+                raise SessionError(error)
+            if flags & os.O_TRUNC:
+                os.ftruncate(fd, 0)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+    raise AssertionError("unreachable")
 
 
 def copy_session_tree(source_fd: int, destination_fd: int) -> None:
