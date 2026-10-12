@@ -1163,6 +1163,9 @@ class TUIApp(
                 # Suspending for a discussion fork keeps the runtime's work
                 # alive: do not cancel the turn or drop the session reference.
                 if self._suspending_for_fork:
+                    await self._draft.flush_pending()
+                    if self._history is not None:
+                        await self._history.flush_pending()
                     self._session = None
                     if isinstance(session, FullScreenPromptSession):
                         session.restore_terminal()

@@ -476,6 +476,7 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app._workspace_snapshot_store = None
     app._hooks = None
     app._active_session = app._draft_session = app._session = object()
+    app._history = None
     app.stop_decisions_poll = lambda: cleaned.append("poll")
     app._stop_decisions_refresh = lambda: cleaned.append("refresh")
     app._close_finder_workers = fail_finder
@@ -484,7 +485,10 @@ def test_tui_close_failure_still_runs_later_cleanup(
     )
     app._cancel_mcp_wizard = lambda: async_cleanup("wizard")
     app._submissions = SimpleNamespace(close=lambda: async_cleanup("submissions"))
-    app._draft = SimpleNamespace(detach=lambda: cleaned.append("draft"))
+    app._draft = SimpleNamespace(
+        detach=lambda: cleaned.append("draft"),
+        flush_pending=lambda: async_cleanup("draft flush"),
+    )
 
     with pytest.raises(RuntimeError, match="finder close failed"):
         asyncio.run(app.close())

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -58,6 +59,7 @@ from zeta.providers.anthropic import (
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.loop import persistence as persistence_module
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
@@ -9795,6 +9797,7 @@ async def test_composer_submit_writes_file_history_and_up_replays_it(
         await asyncio.sleep(0)
         pipe.send_text("remember me\r")
         await first_task
+        await history.flush_pending()
 
         second_session: PromptSession[str] | None = None
 
@@ -10074,13 +10077,175 @@ def test_parse_input_rejects_blank_turns(value: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_record_prompt_writes_history_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        history_path=tmp_path / "history",
+    )
+    app._history = history_for(tmp_path / "history")
+    loop_thread = threading.get_ident()
+    write_threads: list[int] = []
+    original = app._history._write_entries
+
+    def record_thread(entries: list[str]) -> None:
+        write_threads.append(threading.get_ident())
+        original(entries)
+
+    monkeypatch.setattr(app._history, "_write_entries", record_thread)
+
+    app._record_prompt("new prompt")
+    assert app._history.get_strings()[-1] == "new prompt"
+    await app._history.flush_pending()
+
+    assert write_threads and write_threads[0] != loop_thread
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_recorded_prompt_is_immediately_available_to_history_navigation(
+    tmp_path: Path,
+) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        history_path=tmp_path / "history",
+    )
+    session = app._make_session()
+    assert app._history is not None
+    app._record_prompt("just submitted")
+    session.default_buffer.reset()
+    with set_app(session.app):
+        session.default_buffer.load_history_if_not_yet_loaded()
+        assert session.default_buffer._load_history_task is not None
+        await session.default_buffer._load_history_task
+
+    session.default_buffer.history_backward()
+
+    assert session.default_buffer.text == "just submitted"
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_rapid_history_appends_persist_in_order(tmp_path: Path) -> None:
+    path = tmp_path / "history"
+    history = history_for(path)
+
+    for value in ("first", "second", "second", "third"):
+        history.append_string(value)
+    await history.flush_pending()
+
+    reopened = history_for(path)
+    assert list(reopened.load_history_strings())[:3] == ["third", "second", "first"]
+
+
+@pytest.mark.asyncio
+async def test_tui_close_flushes_pending_history_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        history_path=tmp_path / "history",
+    )
+    app._history = history_for(tmp_path / "history")
+    release = threading.Event()
+    started = threading.Event()
+    original = app._history._append_to_file
+
+    def blocked_write(value: str) -> None:
+        started.set()
+        release.wait()
+        original(value)
+
+    monkeypatch.setattr(app._history, "_append_to_file", blocked_write)
+    app._record_prompt("flush me")
+    await asyncio.to_thread(started.wait)
+    close_task = asyncio.create_task(app.close())
+    await asyncio.sleep(0)
+    assert not close_task.done()
+
+    release.set()
+    await close_task
+
+    assert next(iter(history_for(tmp_path / "history").load_history_strings())) == "flush me"
+
+
+@pytest.mark.asyncio
+async def test_history_write_failure_is_reported_once_without_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    history = history_for(tmp_path / "history")
+
+    def fail(_entries: list[str]) -> None:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(history, "_write_entries", fail)
+    history.append_string("first")
+    history.append_string("second")
+    await history.flush_pending()
+
+    assert history.get_strings() == ["first", "second"]
+    assert caplog.messages.count("failed to persist composer history: disk unavailable") == 1
+
+
+@pytest.mark.asyncio
+async def test_draft_write_runs_off_loop_and_flushes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persistence = DraftPersistence(tmp_path / "draft", delay=0)
+    loop_thread = threading.get_ident()
+    write_threads: list[int] = []
+    original = persistence_module.write_session_json
+
+    def record_thread(*args, **kwargs) -> None:
+        write_threads.append(threading.get_ident())
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(persistence_module, "write_session_json", record_thread)
+    persistence.schedule("draft")
+    await asyncio.sleep(0.01)
+
+    assert write_threads and write_threads[0] != loop_thread
+    await persistence.flush_pending()
+    assert persistence.load() == "draft"
+
+
+@pytest.mark.asyncio
+async def test_draft_write_failure_is_reported_once_without_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    persistence = DraftPersistence(tmp_path / "draft", delay=0)
+
+    def fail(*_args, **_kwargs) -> None:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail)
+    persistence.schedule("first")
+    await persistence.flush_pending()
+    persistence.schedule("second")
+    await persistence.flush_pending()
+
+    assert caplog.messages.count("failed to persist composer draft: disk unavailable") == 1
+
+
+@pytest.mark.asyncio
 async def test_composer_history_is_bounded_and_keeps_multiline_entries(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "history"
     history = history_for(path)
-    for index in range(1001):
-        history.append_string(f"prompt {index}\nline two")
+
+    def append_entries() -> None:
+        for index in range(1001):
+            history.append_string(f"prompt {index}\nline two")
+
+    await asyncio.to_thread(append_entries)
 
     assert len(history.get_strings()) == 1000
     assert history.get_strings()[0] == "prompt 1\nline two"
@@ -10106,6 +10271,7 @@ async def test_composer_history_merges_updates_from_active_instances(
 
     first.append_string("first session prompt")
     second.append_string("second session prompt")
+    await asyncio.gather(first.flush_pending(), second.flush_pending())
 
     reopened = history_for(path)
     async for _entry in reopened.load():
@@ -10122,9 +10288,11 @@ async def test_draft_persistence_round_trip_and_clear(tmp_path: Path) -> None:
     persistence = DraftPersistence(tmp_path / "draft", delay=0.01)
     persistence.schedule("line one\nline two")
     await asyncio.sleep(0.02)
+    await persistence.flush_pending()
     assert persistence.load() == "line one\nline two"
 
     persistence.clear()
+    await persistence.flush_pending()
     assert not (tmp_path / "draft").exists()
 
 
@@ -10296,6 +10464,7 @@ async def test_app_draft_round_trip_and_send_clear(tmp_path: Path) -> None:
     assert second_session.default_buffer.text == "unsent draft"
 
     second._record_prompt("sent prompt")
+    await second._draft.flush_pending()
     assert not (store.session_dir / "draft").exists()
 
 

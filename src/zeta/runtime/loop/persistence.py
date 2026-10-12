@@ -6,8 +6,10 @@ import asyncio
 from contextlib import contextmanager, nullcontext
 import fcntl
 import json
+import logging
 import os
 import tempfile
+import weakref
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +23,67 @@ from ...core.session_files import read_session_file, session_root, write_session
 
 HISTORY_LIMIT = 1000
 DRAFT_WRITE_DELAY = 0.2
+PERSISTENCE_FLUSH_TIMEOUT = 2.0
+_LOGGER = logging.getLogger(__name__)
+
+
+class _OrderedFileWriter:
+    """Run file mutations in order without blocking the event loop."""
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+        self._task: asyncio.Task[None] | None = None
+        self._reported_failure = False
+
+    def submit(self, action: Callable[[], None]) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._run(action)
+            return
+        previous = self._task
+
+        async def write() -> None:
+            if previous is not None:
+                await previous
+            await asyncio.to_thread(self._run, action)
+
+        self._task = loop.create_task(write())
+
+    def _run(self, action: Callable[[], None]) -> None:
+        try:
+            action()
+        except Exception as exc:  # noqa: BLE001 - persistence must not crash the TUI
+            self._report_failure(exc)
+
+    async def flush(self, *, timeout: float = PERSISTENCE_FLUSH_TIMEOUT) -> None:
+        task = self._task
+        if task is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout)
+        except TimeoutError as exc:
+            self._report_failure(exc)
+
+    def _report_failure(self, exc: BaseException) -> None:
+        if self._reported_failure:
+            return
+        self._reported_failure = True
+        _LOGGER.warning("failed to persist %s: %s", self._label, exc)
+
+
+_HISTORY_WRITERS: weakref.WeakValueDictionary[str, _OrderedFileWriter] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _history_writer(filename: str | Path) -> _OrderedFileWriter:
+    key = str(Path(filename).resolve())
+    writer = _HISTORY_WRITERS.get(key)
+    if writer is None:
+        writer = _OrderedFileWriter("composer history")
+        _HISTORY_WRITERS[key] = writer
+    return writer
 
 
 class BoundedFileHistory(FileHistory):
@@ -30,23 +93,30 @@ class BoundedFileHistory(FileHistory):
         if limit < 1:
             raise ValueError("history limit must be positive")
         self.limit = limit
+        self._writer = _history_writer(filename)
         super().__init__(str(filename))
 
     def load_history_strings(self) -> list[str]:
         return list(super().load_history_strings())[: self.limit]
 
     def append_string(self, string: str) -> None:
+        if not self._loaded_strings or self._loaded_strings[0] != string:
+            self._loaded_strings.insert(0, string)
+            del self._loaded_strings[self.limit :]
+        self._loaded = True
+        self._writer.submit(lambda: self._append_to_file(string))
+
+    def _append_to_file(self, string: str) -> None:
         with self._locked():
             entries = list(self.load_history_strings())
             if entries and entries[0] == string:
-                self._loaded_strings = entries
-                self._loaded = True
                 return
             entries.insert(0, string)
             del entries[self.limit :]
             self._write_entries(entries[::-1])
-        self._loaded_strings = entries
-        self._loaded = True
+
+    async def flush_pending(self) -> None:
+        await self._writer.flush()
 
     def store_string(self, string: str) -> None:
         """Keep direct history writes bounded as well."""
@@ -113,6 +183,7 @@ class DraftPersistence:
         self._changed: Callable[[Buffer], None] | None = None
         self._pending_attachment_tokens: tuple[tuple[str, str], ...] = ()
         self._pending_next_image_token = 1
+        self._writer = _OrderedFileWriter("composer draft")
 
     def load(self) -> str:
         return self.load_state().text
@@ -189,9 +260,24 @@ class DraftPersistence:
         self._pending_next_image_token = 1
         if text is None:
             return
+        self._persisted_revision = revision
+        self._writer.submit(
+            lambda: self._persist(
+                text,
+                attachment_tokens=attachment_tokens,
+                next_image_token=next_image_token,
+            )
+        )
+
+    def _persist(
+        self,
+        text: str,
+        *,
+        attachment_tokens: tuple[tuple[str, str], ...],
+        next_image_token: int,
+    ) -> None:
         if not text:
             self._unlink()
-            self._persisted_revision = revision
             return
         with self._directory(create=True) as directory_fd:
             write_session_json(directory_fd, self.path.name, {
@@ -199,7 +285,10 @@ class DraftPersistence:
                 "attachment_tokens": dict(attachment_tokens),
                 "next_image_token": next_image_token,
             })
-        self._persisted_revision = revision
+
+    async def flush_pending(self) -> None:
+        self.flush()
+        await self._writer.flush()
 
     def _directory(self, *, create: bool = False):
         # The app lends its store descriptor for the full composer lifetime.
@@ -222,7 +311,7 @@ class DraftPersistence:
         if self._scheduled is not None:
             self._scheduled.cancel()
             self._scheduled = None
-        self._unlink()
+        self._writer.submit(self._unlink)
         self._persisted_revision = None
 
     def mark_submitted(self) -> int:
@@ -246,7 +335,7 @@ class DraftPersistence:
             self._persisted_revision is not None
             and self._persisted_revision <= submitted_revision
         ):
-            self._unlink()
+            self._writer.submit(self._unlink)
             self._persisted_revision = None
         return True
 
