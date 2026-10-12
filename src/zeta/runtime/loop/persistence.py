@@ -100,8 +100,10 @@ class _OrderedFileWriter:
                     item.loop.call_soon_threadsafe(self._deliver, item, result, failed)
                 except RuntimeError:
                     self._mark_applied(item.watermark)
-            if item.stop:
-                return
+            with self._lock:
+                if item.stop or self._queue.empty():
+                    self._thread = None
+                    return
 
     def _deliver(self, item: _FileAction, result: object | None, failed: bool) -> None:
         try:

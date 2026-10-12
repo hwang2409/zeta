@@ -10145,6 +10145,69 @@ async def test_rapid_history_appends_persist_in_order(tmp_path: Path) -> None:
     assert list(reopened.load_history_strings())[:3] == list(reversed(expected))
 
 
+@pytest.mark.asyncio
+async def test_history_writer_retires_after_flush_without_shutdown(tmp_path: Path) -> None:
+    history = history_for(tmp_path / "history")
+    history.append_string("prompt")
+    thread = history._writer._thread
+    assert thread is not None
+
+    await history.flush_pending()
+    await asyncio.to_thread(thread.join, 1)
+
+    assert not thread.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_writer_processes_submission_racing_retirement_once_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = persistence_module._OrderedFileWriter("retirement race")
+    deciding = threading.Event()
+    release = threading.Event()
+    submitted = threading.Event()
+    processed: list[str] = []
+    original_empty = writer._queue.empty
+
+    def gated_empty() -> bool:
+        deciding.set()
+        assert release.wait(1)
+        return original_empty()
+
+    monkeypatch.setattr(writer._queue, "empty", gated_empty)
+    writer.submit(lambda: processed.append("first"))
+    assert await asyncio.to_thread(deciding.wait, 1)
+
+    def submit_second() -> None:
+        writer.submit(lambda: processed.append("second"))
+        submitted.set()
+
+    submitter = threading.Thread(target=submit_second)
+    submitter.start()
+    release.set()
+    await asyncio.to_thread(submitter.join, 1)
+
+    assert submitted.is_set()
+    await writer.flush(timeout=1)
+    assert processed == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_many_flushed_writers_leave_no_live_threads() -> None:
+    threads: list[threading.Thread] = []
+    for index in range(20):
+        writer = persistence_module._OrderedFileWriter(f"retiring writer {index}")
+        writer.submit(lambda: None)
+        thread = writer._thread
+        assert thread is not None
+        await writer.flush(timeout=1)
+        threads.append(thread)
+
+    for thread in threads:
+        await asyncio.to_thread(thread.join, 1)
+    assert not [thread for thread in threads if thread.is_alive()]
+
+
 def test_history_flush_timeout_does_not_extend_asyncio_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
