@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import uuid
 from pathlib import Path
 
 import pytest
@@ -646,15 +647,16 @@ def _legacy_project_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+@pytest.mark.parametrize("kind", ["state", "people", "custom_kind-2"])
 def test_project_digest_ignores_disappearing_memory_mirror_temporary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
     project = tmp_path / "project"
     memory = project / "memory"
     memory.mkdir(parents=True)
     (project / "project.json").write_text("record\n", encoding="utf-8")
     expected = project_digest(project)
-    temporary = memory / ".state.md.0123456789abcdef0123456789abcdef.tmp"
+    temporary = memory / f".{kind}.md.{uuid.uuid4().hex}.tmp"
     temporary.write_text("in flight\n", encoding="utf-8")
     real_is_file = Path.is_file
 
@@ -668,6 +670,27 @@ def test_project_digest_ignores_disappearing_memory_mirror_temporary(
 
     assert project_digest(project) == expected
     assert not temporary.exists()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".user-notes.tmp",
+        ".people.md.not-a-uuid.tmp",
+        ".People.md.0123456789abcdef0123456789abcdef.tmp",
+        ".people.txt.0123456789abcdef0123456789abcdef.tmp",
+    ],
+)
+def test_project_digest_counts_memory_files_that_are_not_mirror_temporaries(
+    tmp_path: Path, name: str
+) -> None:
+    project = tmp_path / "project"
+    memory = project / "memory"
+    memory.mkdir(parents=True)
+    (project / "project.json").write_text("record\n", encoding="utf-8")
+    before = project_digest(project)
+    (memory / name).write_text("user data\n", encoding="utf-8")
+    assert project_digest(project) != before
 
 
 def test_project_digest_includes_user_dot_temporary(tmp_path: Path) -> None:
