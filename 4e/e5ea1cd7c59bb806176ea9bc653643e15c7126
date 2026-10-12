@@ -1,0 +1,20 @@
+tests/test_remote_sync.py
+  s_d5690eec73de7b::t_2d24c3d5f70aa4 118-119,542-543,546-549
+  s_d5690eec73de7b::t_83974dab5e9304 137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4ee5ea1cd7c59bb806176ea9bc653643e15c7126",
+  "prompts": {},
+  "sessions": {
+    "s_d5690eec73de7b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12ef4-1f87-7a90-ae5e-cdbf0229ee60",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Austin Jian <austin.jian07@gmail.com>"
+    }
+  }
+}
