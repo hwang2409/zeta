@@ -18,13 +18,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from prompt_toolkit.data_structures import Point
+from prompt_toolkit.formatted_text import OneStyleAndTextTuple
 from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.utils import get_cwidth
 
 from . import theme
 
-Fragment = tuple[str, str]
+Fragment = OneStyleAndTextTuple
 FragmentLine = list[Fragment]
 
 OVERLAY_MAX_WIDTH = 96
@@ -44,7 +45,7 @@ def _cells(text: str) -> int:
 
 
 def _line_cells(line: FragmentLine) -> int:
-    return sum(_cells(text) for _style, text in line)
+    return sum(_cells(fragment[1]) for fragment in line)
 
 
 def _is_rule(line: FragmentLine) -> bool:
@@ -93,7 +94,7 @@ def field(name: str, text: str, *, width: int, value_style: str | None = None) -
 
 
 def row(
-    fragments: Sequence[tuple[str, str]], *, selected: bool
+    fragments: Sequence[Fragment], *, selected: bool
 ) -> FragmentLine:
     """A selectable list row: accent ``❯`` gutter and a selection background.
 
@@ -105,8 +106,12 @@ def row(
     suffix = f" on {theme.MENU_BG}" if selected else ""
     gutter_style = f"bold {theme.ACCENT}" if selected else theme.DIM
     out: FragmentLine = [(_s(gutter_style + suffix), "❯ " if selected else "  ")]
-    for style, text in fragments:
-        out.append((_s(style + suffix), text))
+    for fragment in fragments:
+        style, text = fragment[:2]
+        if len(fragment) == 3:
+            out.append((_s(style + suffix), text, fragment[2]))
+        else:
+            out.append((_s(style + suffix), text))
     return out
 
 
@@ -118,9 +123,10 @@ def _truncate(line: FragmentLine, width: int) -> tuple[FragmentLine, int]:
 
     kept: FragmentLine = []
     cells = 0
-    for style, text in line:
+    for fragment in line:
         if cells >= width:
             break
+        style, text = fragment[:2]
         piece: list[str] = []
         for character in text:
             step = max(0, get_cwidth(character))
@@ -129,7 +135,11 @@ def _truncate(line: FragmentLine, width: int) -> tuple[FragmentLine, int]:
             piece.append(character)
             cells += step
         if piece:
-            kept.append((style, "".join(piece)))
+            clipped_text = "".join(piece)
+            if len(fragment) == 3:
+                kept.append((style, clipped_text, fragment[2]))
+            else:
+                kept.append((style, clipped_text))
     return kept, cells
 
 
