@@ -46,6 +46,15 @@ deny > ask > allow > default. The view reads the running policy, including CLI
 overrides, without changing permissions. It also shows tool availability
 restrictions separately.
 
+Use `/permissions revoke bash` or `/permissions revoke inbox(send)` to remove
+the exact session grant shown in the view. `/permissions clear` removes all
+session grants. These commands preserve configured rules (including identical
+allow rules), deny/ask rules, tool restrictions, and settings files. Future
+calls use the remaining policy; revoking a grant does not add a deny rule, so
+another allow rule or a default of `allow` can still permit the call. Pending
+approvals and already authorized calls are unchanged. Bare `/permissions`
+remains read-only.
+
 `/approve [key]` allows one pending request; `/deny [key]` denies it.
 `/always [key]` allows the whole tool or the request's resolved action for the
 running session, with **any arguments**. For example, a grant for `bash` covers
