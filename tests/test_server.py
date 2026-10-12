@@ -2315,8 +2315,14 @@ import sys
 from zeta.server import ZetaServer, run_server
 
 
+class ReadyServer(ZetaServer):
+    async def start(self) -> None:
+        await super().start()
+        print("ready", flush=True)
+
+
 async def main() -> None:
-    server = ZetaServer(
+    server = ReadyServer(
         home=sys.argv[1], socket_path=sys.argv[2], provider="codex"
     )
     await run_server(server)
@@ -2333,12 +2339,12 @@ asyncio.run(main())
         str(tmp_path),
         str(socket_path),
         env=environment,
+        stdout=asyncio.subprocess.PIPE,
     )
     try:
-        for _ in range(100):
-            if socket_path.exists():
-                break
-            await asyncio.sleep(0.01)
+        assert process.stdout is not None
+        ready = await asyncio.wait_for(process.stdout.readline(), timeout=10)
+        assert ready == b"ready\n"
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})

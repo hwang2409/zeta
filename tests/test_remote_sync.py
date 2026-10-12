@@ -19,6 +19,7 @@ import pytest
 
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
+from zeta.memory.entry_store import _KIND_KEY
 from zeta.memory.profiles import memory_profile
 from zeta.project_registry import MAX_MEMORY_FILE_SIZE, ProjectRegistry
 from zeta.protocol.types import (
@@ -42,6 +43,7 @@ from zeta.remote_sync import memory as memory_module
 from zeta.remote_sync import ssh as ssh_module
 from zeta.remote_sync.memory import _machine_id
 from zeta.remote_sync.project_publish import (
+    _MIRROR_TEMPORARY,
     PreparedTransfer,
     ProjectPublicationError,
     materialize_project_transfer,
@@ -57,6 +59,17 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools import session_push as session_push_tool
 from zeta.tools.session_push import register as register_session_push
+
+
+def test_mirror_temporary_kind_keys_match_entry_store() -> None:
+    valid = ("a", "a" * 32, "a1_b-c" + "x" * 26)
+    invalid = ("", "a" * 33, "A", "a.", "a/", "1a")
+    for kind in valid:
+        assert _KIND_KEY.fullmatch(kind)
+        assert _MIRROR_TEMPORARY.fullmatch(f".{kind}.md.{'0' * 32}.tmp")
+    for kind in invalid:
+        assert _KIND_KEY.fullmatch(kind) is None
+        assert _MIRROR_TEMPORARY.fullmatch(f".{kind}.md.{'0' * 32}.tmp") is None
 
 
 def _git_repo(path: Path) -> None:

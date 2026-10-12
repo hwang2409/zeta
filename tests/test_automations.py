@@ -72,6 +72,7 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.automations import commands
+from zeta.automations import runner as automation_runner
 from zeta.automations.authoring import import_jobs, listing, resolve_job
 from zeta.automations.daemon import daemon_lock, serve
 from zeta.automations.delivery import SlackDelivery
@@ -909,11 +910,14 @@ skill_catalog=SkillCatalog.empty(),
         await registry.close()
 
 
-async def test_timeout_during_delivery_is_uncertain_and_never_replayed(
+async def test_cancel_during_delivery_is_uncertain_and_never_replayed(
     tmp_path: Path,
 ) -> None:
+    started = asyncio.Event()
+
     class SlowDelivery(RecordingDelivery):
         async def send(self, recipient, name, session_id, text):
+            started.set()
             self.sent.append((recipient, name, session_id, text))
             await asyncio.Event().wait()
 
@@ -922,16 +926,71 @@ async def test_timeout_during_delivery_is_uncertain_and_never_replayed(
         due = tick(store, DUE)[0]
         run_id = store.claim(due)
         sender = SlowDelivery()
-        await run_claimed(
-            store,
-            due,
-            run_id,
-            home=tmp_path,
-            backend=FakeBackend([ScriptedTurn(content=[TextContent("message")])]),
-            mount_factory=_empty_mount,
-            delivery=sender,
-            timeout_seconds=0.1,
+        run = asyncio.create_task(
+            run_claimed(
+                store,
+                due,
+                run_id,
+                home=tmp_path,
+                backend=FakeBackend([ScriptedTurn(content=[TextContent("message")])]),
+                mount_factory=_empty_mount,
+                delivery=sender,
+                timeout_seconds=30,
+            )
         )
+        await asyncio.wait_for(started.wait(), timeout=10)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        assert store.runs("brief")[0].status == "uncertain"
+        assert store.runs("brief")[0].delivery == "U123"
+        store.recover()
+        assert not tick(store, DUE)
+        assert len(sender.sent) == 1
+
+
+async def test_timeout_during_delivery_is_uncertain_and_never_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Real asyncio.timeout expiry, fired only after send() started: capture the
+    # runner's Timeout object and reschedule its deadline to "now".
+    started = asyncio.Event()
+    timeouts: list[asyncio.Timeout] = []
+    real_timeout = asyncio.timeout
+
+    def controlled_timeout(_delay: float | None) -> asyncio.Timeout:
+        timeout = real_timeout(None)
+        timeouts.append(timeout)
+        return timeout
+
+    monkeypatch.setattr(automation_runner.asyncio, "timeout", controlled_timeout)
+
+    class SlowDelivery(RecordingDelivery):
+        async def send(self, recipient, name, session_id, text):
+            started.set()
+            self.sent.append((recipient, name, session_id, text))
+            await asyncio.Event().wait()
+
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        due = tick(store, DUE)[0]
+        run_id = store.claim(due)
+        sender = SlowDelivery()
+        run = asyncio.create_task(
+            run_claimed(
+                store,
+                due,
+                run_id,
+                home=tmp_path,
+                backend=FakeBackend([ScriptedTurn(content=[TextContent("message")])]),
+                mount_factory=_empty_mount,
+                delivery=sender,
+                timeout_seconds=30,
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=10)
+        timeouts[-1].reschedule(asyncio.get_running_loop().time())
+        await asyncio.wait_for(run, timeout=10)
         assert store.runs("brief")[0].status == "uncertain"
         assert store.runs("brief")[0].delivery == "U123"
         store.recover()

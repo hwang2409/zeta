@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -523,6 +524,26 @@ class AutoMemoryReconciler:
                         selected_end = entry_result.seq_end
                         usage = dict(entry_result.usage)
                         changed = entry_result.changed_entry_ids
+                        if entry_result.rejected_groups and not changed:
+                            reasons = Counter(
+                                group.split(": ", 1)[1][:240]
+                                if ": " in group
+                                else group[:240]
+                                for group in entry_result.rejected_groups
+                            )
+                            await asyncio.to_thread(
+                                self._append_diagnostic_record,
+                                {
+                                    "kind": "rejected_only",
+                                    "occurred_at": datetime.now(UTC).isoformat(
+                                        timespec="seconds"
+                                    ),
+                                    "seq_start": selected_start,
+                                    "seq_end": selected_end,
+                                    "rejected_groups": len(entry_result.rejected_groups),
+                                    "reasons": dict(sorted(reasons.items())),
+                                },
+                            )
                         break
                     request = prepare_request(
                         raw_transcript,
@@ -714,27 +735,29 @@ class AutoMemoryReconciler:
             self.notice(f"memory update failed: {self.last_failure.status_line()}")
 
     def _append_failure_log(self, failure: ReconciliationFailure) -> None:
-        self.session_dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(
+        self._append_diagnostic_record(
             {
                 "occurred_at": failure.occurred_at,
                 "message": failure.message,
                 "seq_start": failure.seq_start,
                 "seq_end": failure.seq_end,
                 "terminal": failure.terminal,
-            },
-            sort_keys=True,
-        ).encode() + b"\n"
+            }
+        )
+
+    def _append_diagnostic_record(self, record: dict[str, object]) -> None:
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, sort_keys=True).encode() + b"\n"
         try:
             previous = self.failure_log_path.read_bytes()
         except FileNotFoundError:
             previous = b""
         records = (previous + line).splitlines(keepends=True)
         payload = b""
-        for record in reversed(records):
-            if payload and len(record) + len(payload) > _MAX_FAILURE_LOG_BYTES:
+        for line_record in reversed(records):
+            if payload and len(line_record) + len(payload) > _MAX_FAILURE_LOG_BYTES:
                 break
-            payload = record + payload
+            payload = line_record + payload
         fd, temporary = tempfile.mkstemp(
             prefix=".memory-reconcile-errors-", dir=self.session_dir
         )
