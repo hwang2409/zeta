@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
 import pytest
 
+from zeta.memory import entry_reconciler
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import (
     EntryReconciliationFailure,
@@ -218,6 +220,98 @@ def _crowded_priority_state(
     return state, target_ids
 
 
+def _prepare_request_oracle(transcript: Transcript, state, *, as_of: date):
+    def prompt_with_entries(candidate: Transcript):
+        active = entry_reconciler._active_entries_for_request(state, candidate)
+        indexes = [entry_reconciler._entry_index(entry) for entry in active]
+        entry_limit = 28 * 1024 - 12 * 1024
+        visible = []
+        for entry in active:
+            proposed = [*visible, entry]
+            omitted = Counter(item.kind for item in active[len(proposed) :])
+            prompt = entry_reconciler._prompt(
+                _transcript(),
+                state,
+                as_of=as_of,
+                entry_index=indexes[: len(proposed)],
+                omitted_entries=omitted,
+            )
+            if len(prompt.encode()) > entry_limit:
+                break
+            visible = proposed
+        omitted = Counter(item.kind for item in active[len(visible) :])
+        full = []
+        indexed = indexes[: len(visible)]
+        for position, entry in enumerate(visible):
+            proposed = [*full, entry_reconciler._entry_projection(entry)]
+            proposed_index = indexes[position + 1 : len(visible)]
+            prompt = entry_reconciler._prompt(
+                _transcript(),
+                state,
+                as_of=as_of,
+                entries=proposed,
+                entry_index=proposed_index,
+                omitted_entries=omitted,
+            )
+            if len(prompt.encode()) > entry_limit:
+                break
+            full = proposed
+            indexed = proposed_index
+        prompt = entry_reconciler._prompt(
+            candidate,
+            state,
+            as_of=as_of,
+            entries=full,
+            entry_index=indexed,
+            omitted_entries=omitted,
+        )
+        if len(prompt.encode()) > 28 * 1024:
+            raise ReconciliationError("format-2 transcript exceeds the request limit")
+        return prompt, frozenset(entry.id for entry in visible)
+
+    safe_rows = []
+    prompt_with_entries(_transcript())
+    for raw in transcript.rows:
+        safe = entry_reconciler._sanitized(
+            entry_reconciler.project_transcript_row(raw)
+        )
+        if not isinstance(safe, dict):
+            continue
+        candidate = _transcript(*safe_rows, safe)
+        try:
+            prompt_with_entries(candidate)
+        except ReconciliationError:
+            if safe_rows:
+                break
+            if entry_reconciler._is_user_authored_row(safe):
+                raise ReconciliationError("user row exceeds the request limit")
+            if not (
+                entry_reconciler._is_assistant_row(safe)
+                or entry_reconciler._is_lossy_generated_row(safe)
+            ):
+                raise ReconciliationError(
+                    "oversized non-generated transcript row requires lossless handling"
+                )
+            for text_bytes, list_items in (
+                (8192, 32), (4096, 16), (2048, 8), (1024, 4),
+                (512, 2), (128, 1), (0, 0),
+            ):
+                bounded = entry_reconciler._bounded_value(
+                    safe, text_bytes=text_bytes, list_items=list_items
+                )
+                selected = _transcript(bounded)
+                try:
+                    prompt, visible_ids = prompt_with_entries(selected)
+                except ReconciliationError:
+                    continue
+                return prompt, selected, visible_ids
+            raise ReconciliationError("one transcript row cannot fit request limit")
+        safe_rows.append(safe)
+    selected = _transcript(*safe_rows)
+    prompt, visible_ids = prompt_with_entries(selected)
+    return prompt, selected, visible_ids
+
+
 def _listed_entry_ids(prompt: str) -> list[str]:
     lines = prompt.splitlines()
     heading = next(
@@ -256,6 +350,98 @@ def _seed_user_entry(
         now=observed_at,
     )
     return next(iter(result.state.entries))
+
+
+def _assert_matches_prepare_oracle(transcript: Transcript, state) -> None:
+    expected_prompt, expected_transcript, expected_ids = _prepare_request_oracle(
+        transcript, state, as_of=date(2026, 10, 9)
+    )
+    actual = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    assert actual.prompt == expected_prompt
+    assert actual.transcript == expected_transcript
+    assert actual.visible_entry_ids == expected_ids
+
+
+@pytest.mark.parametrize("entry_count", (124, 300))
+def test_incremental_request_matches_rendering_oracle(
+    tmp_path: Path, entry_count: int
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id, count=entry_count)
+    rows = [_row(index, f"ordinary row {index}") for index in range(1, 81)]
+    rows[20]["data"]["message"]["metadata"]["turn_context"] = True
+
+    _assert_matches_prepare_oracle(_transcript(*rows), state)
+
+
+def test_incremental_request_matches_oracle_for_oversized_assistant(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id)
+    _assert_matches_prepare_oracle(
+        _transcript(_row(72, "\\" * (10 * 1024), origin="agent", role="assistant")),
+        state,
+    )
+
+
+def test_incremental_request_matches_oracle_for_relevance(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, _ = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "PR #425 needs Linux verification."),
+        ("state", "Service Atlas uses /srv/atlas-old."),
+    )
+    _assert_matches_prepare_oracle(
+        _transcript(_row(1, "PR #425 merged; Atlas now uses /srv/atlas-new.")),
+        state,
+    )
+
+
+@pytest.mark.parametrize("turn_context", (False, True))
+def test_incremental_request_matches_oracle_errors(
+    tmp_path: Path, turn_context: bool
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id, count=300)
+    if turn_context:
+        row = _row(45, "x" * 15_000, origin="harness", role="system")
+        row["data"]["message"]["metadata"].update(
+            {
+                "zeta_event": "agent_notifications",
+                "notifications": [{"notification_id": "child-1"}],
+                "turn_context": True,
+            }
+        )
+    else:
+        row = _row(45, "x" * 15_000)
+    with pytest.raises(ReconciliationError) as expected:
+        _prepare_request_oracle(_transcript(row), state, as_of=date(2026, 10, 9))
+    with pytest.raises(ReconciliationError, match=str(expected.value)):
+        _prepare_request(_transcript(row), state, as_of=date(2026, 10, 9))
+
+
+def test_request_preparation_renders_prompt_constant_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id, count=300)
+    transcript = _transcript(
+        *[_row(index, f"ordinary row {index}") for index in range(1, 151)]
+    )
+    original = entry_reconciler._prompt
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(entry_reconciler, "_prompt", counted)
+    _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+
+    assert calls <= 5
 
 
 @pytest.mark.parametrize("entry_count", (124, 300))

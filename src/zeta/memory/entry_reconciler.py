@@ -59,7 +59,6 @@ if TYPE_CHECKING:
 EntryInvokeResult = str | ReconciliationResponse
 EntryInvoke = Callable[[str], EntryInvokeResult | Awaitable[EntryInvokeResult]]
 ReconciliationKey = str | Callable[[int, int], str]
-
 _MAX_RESPONSE_BYTES = 32 * 1024
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_PRIMARY_REQUEST_BYTES = 28 * 1024
@@ -147,7 +146,6 @@ _DURABLE_LITERAL_CUES = (
     "remember",
 )
 SUPPORTED_MEMORY_FORMATS = frozenset({1, 2})
-
 _HIGHEST_PRIORITY_WORDS = (
     "correction",
     "actually",
@@ -332,6 +330,8 @@ def _prompt(
     entries: Sequence[Mapping[str, object]] = (),
     entry_index: Sequence[str] = (),
     omitted_entries: Mapping[str, int] | None = None,
+    rendered_entries: Sequence[str] | None = None,
+    rendered_rows: Sequence[str] | None = None,
 ) -> str:
     kinds = [
         {
@@ -374,69 +374,57 @@ Kind schema:
 {json.dumps(kinds, ensure_ascii=False, separators=(",", ":"))}
 
 Current entries (full={len(entries)}, indexed={len(entry_index)}):
-{json.dumps(list(entries), ensure_ascii=False, separators=(",", ":"))}
+{"[" + ",".join(rendered_entries) + "]" if rendered_entries is not None else json.dumps(list(entries), ensure_ascii=False, separators=(",", ":"))}
 {chr(10).join(entry_index)}
 Entries omitted from this request: {json.dumps(dict(omitted_entries or {}), ensure_ascii=False, separators=(",", ":"))}
 
 Completed transcript rows:
-{json.dumps(_rendered_transcript_rows(transcript), ensure_ascii=False, separators=(",", ":"))}
+{"[" + ",".join(rendered_rows) + "]" if rendered_rows is not None else json.dumps(_rendered_transcript_rows(transcript), ensure_ascii=False, separators=(",", ":"))}
 """
 
 
-def _prompt_with_visible_entries(
-    transcript: Transcript, state: MemoryState, *, as_of: date
-) -> tuple[str, frozenset[str]]:
-    active = _active_entries_for_request(state, transcript)
-    # Sanitize each index once while probing which entries fit the request.
-    entry_indexes = [_entry_index(entry) for entry in active]
+def _entry_prompt_parts(
+    active: Sequence[MemoryEntry], state: MemoryState, *, as_of: date, session_id: str
+) -> tuple[list[dict[str, object]], list[str], list[str], Counter[str]]:
+    empty = Transcript(session_id, ())
+    base_size = len(_prompt(empty, state, as_of=as_of).encode())
+    indexes = [_entry_index(entry) for entry in active]
+    index_sizes = [len(item.encode()) for item in indexes]
+    projections = [_entry_projection(entry) for entry in active]
+    rendered = [
+        json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        for item in projections
+    ]
+    rendered_sizes = [len(item.encode()) for item in rendered]
     entry_limit = _MAX_PRIMARY_REQUEST_BYTES - _MIN_TRANSCRIPT_REQUEST_BYTES
-
-    visible: list[MemoryEntry] = []
-    for entry in active:
-        candidate = [*visible, entry]
-        omitted = Counter(item.kind for item in active[len(candidate) :])
-        prompt = _prompt(
-            Transcript(transcript.session_id, ()),
-            state,
-            as_of=as_of,
-            entry_index=entry_indexes[: len(candidate)],
-            omitted_entries=omitted,
-        )
-        if len(prompt.encode()) > entry_limit:
+    visible = 0
+    index_size = 0
+    omitted = Counter(item.kind for item in active)
+    for count, (entry, item_size) in enumerate(zip(active, index_sizes), 1):
+        index_size += item_size + (count > 1)
+        candidate_omitted = omitted.copy()
+        candidate_omitted[entry.kind] -= 1
+        if not candidate_omitted[entry.kind]:
+            del candidate_omitted[entry.kind]
+        size = base_size + index_size
+        size += len(json.dumps(dict(candidate_omitted), separators=(",", ":")).encode()) - 2
+        if size > entry_limit:
             break
-        visible = candidate
-
-    omitted = Counter(item.kind for item in active[len(visible) :])
-    full: list[dict[str, object]] = []
-    indexed = entry_indexes[: len(visible)]
-    for position, entry in enumerate(visible):
-        candidate_full = [*full, _entry_projection(entry)]
-        candidate_index = entry_indexes[position + 1 : len(visible)]
-        candidate = _prompt(
-            Transcript(transcript.session_id, ()),
-            state,
-            as_of=as_of,
-            entries=candidate_full,
-            entry_index=candidate_index,
-            omitted_entries=omitted,
-        )
-        if len(candidate.encode()) > entry_limit:
+        visible = count
+        omitted = candidate_omitted
+    omitted_size = len(json.dumps(dict(omitted), separators=(",", ":")).encode()) - 2
+    full = 0
+    full_size = 0
+    index_size = sum(index_sizes[:visible]) + max(0, visible - 1)
+    for count in range(1, visible + 1):
+        full_size += rendered_sizes[count - 1] + (count > 1)
+        remaining = visible - count
+        index_size -= index_sizes[count - 1] + (remaining > 0)
+        size = base_size + omitted_size + full_size + index_size
+        if size > entry_limit:
             break
-        full = candidate_full
-        indexed = candidate_index
-
-    prompt = _prompt(
-        transcript,
-        state,
-        as_of=as_of,
-        entries=full,
-        entry_index=indexed,
-        omitted_entries=omitted,
-    )
-    if len(prompt.encode()) > _MAX_PRIMARY_REQUEST_BYTES:
-        raise ReconciliationError("format-2 transcript exceeds the request limit")
-    return prompt, frozenset(entry.id for entry in visible)
-
+        full = count
+    return projections[:full], rendered[:full], indexes[full:visible], omitted
 
 def _is_assistant_row(row: Mapping[str, Any]) -> bool:
     data = row.get("data")
@@ -447,52 +435,109 @@ def _is_assistant_row(row: Mapping[str, Any]) -> bool:
 def _prepare_request(
     transcript: Transcript, state: MemoryState, *, as_of: date
 ) -> _EntryPreparedRequest:
-    safe_rows: list[dict[str, Any]] = []
     empty = Transcript(transcript.session_id, ())
-    _prompt_with_visible_entries(empty, state, as_of=as_of)
-    for raw in transcript.rows:
+    priority = _active_entries_by_priority(state)
+    preliminary = _entry_prompt_parts(
+        priority, state, as_of=as_of, session_id=transcript.session_id
+    )
+    preliminary_prompt = _prompt(
+        empty, state, as_of=as_of, entries=preliminary[0],
+        entry_index=preliminary[2], omitted_entries=preliminary[3],
+        rendered_entries=preliminary[1], rendered_rows=(),
+    )
+    preliminary_size = len(preliminary_prompt.encode())
+    safe_rows: list[dict[str, Any]] = []
+    rendered_rows: list[str] = []
+    raw_position = 0
+    rows_size = 0
+    for raw_position, raw in enumerate(transcript.rows, 1):
         safe = _sanitized(project_transcript_row(raw))
         if not isinstance(safe, dict):
             continue
-        candidate = Transcript(transcript.session_id, (*safe_rows, safe))
-        try:
-            _prompt_with_visible_entries(candidate, state, as_of=as_of)
-        except ReconciliationError:
-            if safe_rows:
-                break
-            if _is_user_authored_row(safe):
-                raise ReconciliationError("user row exceeds the request limit")
-            if not (_is_assistant_row(safe) or _is_lossy_generated_row(safe)):
-                raise ReconciliationError(
-                    "oversized non-generated transcript row requires lossless handling"
-                )
-            for text_bytes, list_items in (
-                (8192, 32),
-                (4096, 16),
-                (2048, 8),
-                (1024, 4),
-                (512, 2),
-                (128, 1),
-                (0, 0),
-            ):
-                bounded = _bounded_value(
-                    safe, text_bytes=text_bytes, list_items=list_items
-                )
-                selected = Transcript(transcript.session_id, (bounded,))
-                try:
-                    bounded_prompt, visible_ids = _prompt_with_visible_entries(
-                        selected, state, as_of=as_of
-                    )
-                except ReconciliationError:
-                    continue
-                return _EntryPreparedRequest(bounded_prompt, selected, visible_ids)
-            raise ReconciliationError("one transcript row cannot fit request limit")
+        rendered = json.dumps(
+            _rendered_transcript_rows(Transcript(transcript.session_id, (safe,)))[0],
+            ensure_ascii=False, separators=(",", ":"),
+        )
         safe_rows.append(safe)
-    selected = Transcript(transcript.session_id, tuple(safe_rows))
-    prompt, visible_ids = _prompt_with_visible_entries(
-        selected, state, as_of=as_of
+        rendered_rows.append(rendered)
+        rows_size += len(rendered.encode()) + (len(safe_rows) > 1)
+        if preliminary_size + rows_size > _MAX_PRIMARY_REQUEST_BYTES:
+            break
+    ranked_for = Transcript(transcript.session_id, tuple(safe_rows))
+    active = _active_entries_for_request(state, ranked_for)
+    entries, rendered_entries, indexes, omitted = _entry_prompt_parts(
+        active, state, as_of=as_of, session_id=transcript.session_id
     )
-    return _EntryPreparedRequest(prompt, selected, visible_ids)
+    base_prompt = _prompt(
+        empty, state, as_of=as_of, entries=entries, entry_index=indexes,
+        omitted_entries=omitted, rendered_entries=rendered_entries, rendered_rows=(),
+    )
+    base_size = len(base_prompt.encode())
+    rows_size = sum(len(item.encode()) for item in rendered_rows)
+    rows_size += max(0, len(rendered_rows) - 1)
+    if base_size + rows_size <= _MAX_PRIMARY_REQUEST_BYTES:
+        for raw in transcript.rows[raw_position:]:
+            safe = _sanitized(project_transcript_row(raw))
+            if not isinstance(safe, dict):
+                continue
+            rendered = json.dumps(
+                _rendered_transcript_rows(Transcript(transcript.session_id, (safe,)))[0],
+                ensure_ascii=False, separators=(",", ":"),
+            )
+            safe_rows.append(safe)
+            rendered_rows.append(rendered)
+            rows_size += len(rendered.encode()) + (len(safe_rows) > 1)
+            if base_size + rows_size > _MAX_PRIMARY_REQUEST_BYTES:
+                break
+    row_sizes = [len(item.encode()) for item in rendered_rows]
+    selected_count = 0
+    rows_size = 0
+    for count, item_size in enumerate(row_sizes, 1):
+        rows_size += item_size + (count > 1)
+        if base_size + rows_size > _MAX_PRIMARY_REQUEST_BYTES:
+            break
+        selected_count = count
+    if safe_rows and not selected_count:
+        safe = safe_rows[0]
+        if _is_user_authored_row(safe):
+            raise ReconciliationError("user row exceeds the request limit")
+        if not (_is_assistant_row(safe) or _is_lossy_generated_row(safe)):
+            raise ReconciliationError(
+                "oversized non-generated transcript row requires lossless handling"
+            )
+        for text_bytes, list_items in (
+            (8192, 32), (4096, 16), (2048, 8), (1024, 4),
+            (512, 2), (128, 1), (0, 0),
+        ):
+            bounded = _bounded_value(safe, text_bytes=text_bytes, list_items=list_items)
+            rendered = json.dumps(
+                _rendered_transcript_rows(Transcript(transcript.session_id, (bounded,)))[0],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            if base_size + len(rendered.encode()) <= _MAX_PRIMARY_REQUEST_BYTES:
+                prompt = _prompt(
+                    Transcript(transcript.session_id, (bounded,)), state, as_of=as_of,
+                    entries=entries, entry_index=indexes, omitted_entries=omitted,
+                    rendered_entries=rendered_entries, rendered_rows=(rendered,),
+                )
+                visible_count = len(entries) + len(indexes)
+                return _EntryPreparedRequest(
+                    prompt,
+                    Transcript(transcript.session_id, (bounded,)),
+                    frozenset(entry.id for entry in active[:visible_count]),
+                )
+        raise ReconciliationError("one transcript row cannot fit request limit")
+    selected = Transcript(transcript.session_id, tuple(safe_rows[:selected_count]))
+    prompt = _prompt(
+        selected, state, as_of=as_of, entries=entries, entry_index=indexes,
+        omitted_entries=omitted, rendered_entries=rendered_entries,
+        rendered_rows=rendered_rows[:selected_count],
+    )
+    visible_count = len(entries) + len(indexes)
+    return _EntryPreparedRequest(
+        prompt, selected, frozenset(entry.id for entry in active[:visible_count])
+    )
 
 
 def _exact(
