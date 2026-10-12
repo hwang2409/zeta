@@ -48,6 +48,10 @@ class TUIStallWatchdog:
         max_bytes: int = STALL_LOG_MAX_BYTES,
         clock: Callable[[], float] = time.monotonic,
         utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        frames: Callable[[], dict[int, FrameType]] = sys._current_frames,
+        thread_names: Callable[[], dict[int, str]] | None = None,
+        before_probe: Callable[[], None] | None = None,
+        after_sample: Callable[[], None] | None = None,
     ) -> None:
         if min(probe_interval, stall_threshold, sample_interval, max_bytes) <= 0:
             raise ValueError("watchdog timing and size limits must be positive")
@@ -59,6 +63,10 @@ class TUIStallWatchdog:
         self.max_bytes = max_bytes
         self._clock = clock
         self._utc_now = utc_now
+        self._frames = frames
+        self._thread_names = thread_names or _current_thread_names
+        self._before_probe = before_probe
+        self._after_sample = after_sample
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread_id: int | None = None
         self._stop = threading.Event()
@@ -86,9 +94,7 @@ class TUIStallWatchdog:
         thread = self._thread
         if thread is not None:
             try:
-                await asyncio.to_thread(
-                    thread.join, max(0.2, self.probe_interval * 4)
-                )
+                await asyncio.to_thread(thread.join, max(0.2, self.probe_interval * 4))
             except Exception:  # noqa: BLE001, S110 - diagnostics cannot affect shutdown
                 pass
 
@@ -106,6 +112,8 @@ class TUIStallWatchdog:
             answered = threading.Event()
             started_monotonic = self._clock()
             started_utc = self._utc_now()
+            if self._before_probe is not None:
+                self._before_probe()
             loop.call_soon_threadsafe(answered.set)
             stacks: dict[tuple[tuple[str, int, str], ...], list[int]] = {}
             other_threads: dict[
@@ -125,25 +133,44 @@ class TUIStallWatchdog:
                     self._sample_stacks(stacks, other_threads),
                 )
                 next_sample = now + self.sample_interval
-            ended = self._clock()
-            duration = ended - started_monotonic
-            if duration >= self.stall_threshold:
-                try:
-                    self._append_record(
-                        self._record(
-                            started_utc,
-                            duration,
-                            stacks,
-                            other_threads,
-                            observed_thread_count,
-                        )
-                    )
-                except Exception:
-                    if not self._logging_failure_reported:
-                        logger.exception("failed to write TUI stall diagnostic")
-                        self._logging_failure_reported = True
+            self._finish_probe(
+                started_monotonic,
+                started_utc,
+                stacks,
+                other_threads,
+                observed_thread_count,
+            )
             if self._stop.wait(self.probe_interval):
                 return
+
+    def _finish_probe(
+        self,
+        started_monotonic: float,
+        started_utc: datetime,
+        stacks: dict[tuple[tuple[str, int, str], ...], list[int]],
+        other_threads: dict[
+            tuple[int, str],
+            dict[tuple[tuple[str, int, str], ...], list[int]],
+        ],
+        observed_thread_count: int,
+    ) -> None:
+        duration = self._clock() - started_monotonic
+        if duration < self.stall_threshold:
+            return
+        try:
+            self._append_record(
+                self._record(
+                    started_utc,
+                    duration,
+                    stacks,
+                    other_threads,
+                    observed_thread_count,
+                )
+            )
+        except Exception:
+            if not self._logging_failure_reported:
+                logger.exception("failed to write TUI stall diagnostic")
+                self._logging_failure_reported = True
 
     def _sample_stacks(
         self,
@@ -153,16 +180,12 @@ class TUIStallWatchdog:
             dict[tuple[tuple[str, int, str], ...], list[int]],
         ],
     ) -> int:
-        frames = sys._current_frames()
+        frames = self._frames()
         loop_frame = frames.get(self._loop_thread_id)
         if loop_frame is not None:
             _count_stack(stacks, tuple(_trim_stack(loop_frame)))
 
-        names = {
-            thread.ident: thread.name
-            for thread in threading.enumerate()
-            if thread.ident is not None
-        }
+        names = self._thread_names()
         watchdog_thread_id = threading.get_ident()
         candidates = [
             (thread_id, names.get(thread_id, "unknown"), frame)
@@ -182,6 +205,8 @@ class TUIStallWatchdog:
                 continue
             samples = other_threads.setdefault((thread_id, name), {})
             _count_stack(samples, stack)
+        if self._after_sample is not None:
+            self._after_sample()
         return len(candidates)
 
     def _record(
@@ -352,6 +377,14 @@ def _frame_records(
         {"file": file, "line": line, "function": function}
         for file, line, function in stack
     ]
+
+
+def _current_thread_names() -> dict[int, str]:
+    return {
+        thread.ident: thread.name
+        for thread in threading.enumerate()
+        if thread.ident is not None
+    }
 
 
 def _is_idle_stack(stack: tuple[tuple[str, int, str], ...]) -> bool:
