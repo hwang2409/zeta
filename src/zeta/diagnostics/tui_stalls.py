@@ -77,9 +77,12 @@ class TUIStallWatchdog:
         self._stop.set()
         thread = self._thread
         if thread is not None:
-            await asyncio.to_thread(
-                thread.join, max(0.2, self.probe_interval * 4)
-            )
+            try:
+                await asyncio.to_thread(
+                    thread.join, max(0.2, self.probe_interval * 4)
+                )
+            except Exception:  # noqa: BLE001, S110 - diagnostics cannot affect shutdown
+                pass
 
     def _watch_safely(self) -> None:
         try:
