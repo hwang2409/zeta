@@ -545,11 +545,16 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
             )
         elif path == "serve steer":
             await _request(reader, writer, 3, "send", {"text": "start"})
+            client = server._client
+            assert client is not None and client._turn_task is not None
+            turn_task = client._turn_task
             await _request(reader, writer, 4, "steer", {"text": "serve steer input"})
+            await turn_task
         else:
             raise AssertionError(path)
-        assert server._client is not None and server._client._turn_task is not None
-        await server._client._turn_task
+        if path != "serve steer":
+            assert server._client is not None and server._client._turn_task is not None
+            await server._client._turn_task
         if input_id is not None:
             reused = await _request(reader, writer, 5, "send", {"input_id": input_id})
             assert reused[-1]["error"]["code"] == -32602
