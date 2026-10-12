@@ -4,6 +4,7 @@ import http.server
 import json
 import multiprocessing
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -3608,7 +3609,16 @@ def test_bootstrap_requires_refresh_when_jwt_expiry_is_missing_or_past(
         assert store.bootstrap().expires_at <= 1
 
 
-def _refresh_process(path: str, token_url: str, results: object) -> None:
+def _refresh_process(
+    path: str,
+    token_url: str,
+    results: object,
+    ready: object,
+    start: object,
+) -> None:
+    ready.put("ready")
+    start.wait()
+
     async def run() -> None:
         client = httpx.AsyncClient()
         try:
@@ -3649,23 +3659,44 @@ def test_expired_codex_token_refreshes_once_across_two_processes(tmp_path: Path)
         CodexCredentialStore(path).save(OAuthTokens(access_token(), "refresh", 1))
         context = multiprocessing.get_context("spawn")
         results = context.Queue()
+        ready = context.Queue()
+        start = context.Event()
         processes = [
             context.Process(
                 target=_refresh_process,
-                args=(str(path), f"http://127.0.0.1:{server.server_port}/token", results),
+                args=(
+                    str(path),
+                    f"http://127.0.0.1:{server.server_port}/token",
+                    results,
+                    ready,
+                    start,
+                ),
             )
             for _ in range(2)
         ]
-        for process in processes:
-            process.start()
-        for process in processes:
-            process.join(timeout=5)
-            assert process.exitcode == 0
-        assert [results.get(timeout=1), results.get(timeout=1)] == [
-            access_token("refreshed-account"),
-            access_token("refreshed-account"),
-        ]
-        assert server.refresh_count == 1
+        deadline = time.monotonic() + 60
+        try:
+            for process in processes:
+                process.start()
+            for _ in processes:
+                assert ready.get(timeout=max(0, deadline - time.monotonic())) == "ready"
+            start.set()
+            for process in processes:
+                process.join(timeout=max(0, deadline - time.monotonic()))
+                assert process.exitcode == 0
+            assert [results.get(timeout=1), results.get(timeout=1)] == [
+                access_token("refreshed-account"),
+                access_token("refreshed-account"),
+            ]
+            assert server.refresh_count == 1
+        finally:
+            start.set()
+            for process in processes:
+                if process.pid is not None and process.is_alive():
+                    process.terminate()
+            for process in processes:
+                if process.pid is not None:
+                    process.join(timeout=5)
     finally:
         server.shutdown()
         server.server_close()
