@@ -40,6 +40,30 @@ explicit approval rules still apply. `--no-yolo` sets the default to ask; it doe
 not force every call to prompt. In headless mode, calls that need approval are
 denied unless `--yolo` is set.
 
+In the terminal UI, `/permissions` shows the active default, deny/ask/allow
+rules, and grants from `/always`. Rules take precedence in that order:
+deny > ask > allow > default. The view reads the running policy, including CLI
+overrides, without changing permissions. It also shows tool availability
+restrictions separately.
+
+`/approve [key]` allows one pending request; `/deny [key]` denies it.
+`/always [key]` allows the whole tool or the request's resolved action for the
+running session, with **any arguments**. For example, a grant for `bash` covers
+any command, while `inbox(send)` covers any recipient project but no other inbox
+action. Explicit deny/ask rules still win. These grants reset when the session
+is reopened and do not edit settings. For persistent, narrower grants, edit
+`[approval]` in `~/.zeta/settings.toml` (or `$ZETA_HOME/settings.toml`):
+
+```toml
+[approval]
+allow = ["bash(git status*)"]
+ask = ["bash(git push*)"]
+deny = ["bash(rm *)"]
+```
+
+Project settings cannot set approval rules. Start a new Zeta process to load
+changes to the global settings file.
+
 Availability and approval are independent. A tool must first pass the tool
 policy; approval cannot enable a tool that is unavailable. Conversely, an
 advertised tool can still stop for approval. Child agents inherit the parent's
