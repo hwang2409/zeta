@@ -36,9 +36,9 @@ zeta project memory ween schema set-profile messaging \
 A profile is copied into the project state. It is not a live reference to a
 global default. Run `schema set-profile` again to copy a newer built-in profile
 into an existing project. A profile change preserves entries in kinds with the
-same key. It also preserves every explicit expiry. A new default expiry applies
-only to later entries or later `seen_at` updates. The zeta profile gives new
-`state` entries a seven-day default expiry; the messaging profile is unchanged.
+same key. Existing entries keep their stored expiry. The new default applies to
+entries created after the profile update. The zeta profile gives new `state`
+entries a seven-day default expiry; the messaging profile is unchanged.
 
 A removed populated kind requires one explicit action. Use `--map-kind OLD=NEW`
 to retain its entries under a target kind, or `--resolve-kind KIND` to remove its

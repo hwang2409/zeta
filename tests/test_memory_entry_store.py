@@ -20,6 +20,7 @@ from zeta.memory.entry_store import (
     UpdateOperation,
     apply_operations,
     canonical_state_bytes,
+    state_digest,
     state_from_bytes,
     state_to_dict,
     validate_state,
@@ -291,29 +292,20 @@ def test_reconciliation_key_deduplicates_entry_transaction(tmp_path: Path) -> No
     assert len(repeated.state.entries) == 1
 
 
-@pytest.mark.parametrize(
-    ("expires_at", "expected_default"),
-    (
-        (None, True),
-        ("2027-01-01T00:00:00Z", False),
-    ),
-)
-def test_old_state_loads_and_classifies_expiry_provenance(
-    tmp_path: Path,
-    expires_at: str | None,
-    expected_default: bool,
-) -> None:
+def test_old_state_preserves_unknown_expiry_provenance(tmp_path: Path) -> None:
     registry, project_id = _registry(tmp_path)
     initial = registry._create_entry_memory_for_test(project_id, _schema())
-    operation = (
-        AddOperation("state", "Legacy state", _source())
-        if expires_at is None
-        else AddOperation("state", "Legacy state", _source(), expires_at=expires_at)
-    )
     added = registry._compare_and_swap_entries(
         project_id,
         expected_digest=initial.digest,
-        operations=(operation,),
+        operations=(
+            AddOperation(
+                "state",
+                "Legacy state",
+                _source(),
+                expires_at="2026-11-07T12:00:00.000000Z",
+            ),
+        ),
         reconciliation_key=None,
         now="2026-10-08T12:00:00Z",
     )
@@ -324,7 +316,9 @@ def test_old_state_loads_and_classifies_expiry_provenance(
 
     old_payload = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
     restored = state_from_bytes(old_payload)
+    original_digest = hashlib.sha256(old_payload).hexdigest()
     assert canonical_state_bytes(restored) == old_payload
+    assert state_digest(restored) == original_digest
     entry = next(iter(restored.entries.values()))
     assert isinstance(entry, MemoryEntry)
     assert entry.expiry_is_default is None
@@ -338,7 +332,8 @@ def test_old_state_loads_and_classifies_expiry_provenance(
     )
     updated_entry = updated.entries[entry.id]
     assert isinstance(updated_entry, MemoryEntry)
-    assert updated_entry.expiry_is_default is expected_default
+    assert updated_entry.expires_at == "2026-11-07T12:00:00.000000Z"
+    assert updated_entry.expiry_is_default is None
 
 
 def test_entry_state_is_canonical_bounded_and_uses_shared_secret_safety(

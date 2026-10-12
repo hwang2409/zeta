@@ -741,33 +741,6 @@ def _default_expiry(
     return instant.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _entry_expiry_is_default(entry: MemoryEntry, schema: MemorySchema) -> bool:
-    if entry.expiry_is_default is not None:
-        return entry.expiry_is_default
-    return entry.expires_at == _default_expiry(
-        schema,
-        entry.kind,
-        automatic=entry.automatic,
-        seen_at=entry.seen_at,
-    )
-
-
-def classify_legacy_expiries(state: MemoryState) -> MemoryState:
-    """Persist expiry provenance before replacing the schema that defines it."""
-    entries = {
-        entry_id: (
-            replace(
-                entry,
-                expiry_is_default=_entry_expiry_is_default(entry, state.schema),
-            )
-            if isinstance(entry, MemoryEntry) and entry.expiry_is_default is None
-            else entry
-        )
-        for entry_id, entry in state.entries.items()
-    }
-    return replace(state, entries=entries)
-
-
 def _new_expiry(
     state: MemoryState,
     kind: str,
@@ -872,9 +845,9 @@ def apply_operations(
             )
             kind = entry.kind if operation.kind is None else operation.kind
             expires_at = operation.expires_at
-            expiry_is_default = isinstance(expires_at, _Unset)
+            expiry_is_default: bool | None = isinstance(expires_at, _Unset)
             if expiry_is_default:
-                prior_is_default = _entry_expiry_is_default(entry, state.schema)
+                prior_is_default = entry.expiry_is_default
                 expires_at = (
                     _new_expiry(
                         state,

@@ -75,7 +75,67 @@ def test_zeta_profile_update_changes_only_new_state_expiry(tmp_path: Path) -> No
     assert added.state.entries[new_id].expires_at == "2026-10-16T00:00:00.000000Z"  # type: ignore[union-attr]
 
 
-def test_default_expiry_uses_new_profile_after_later_observation(tmp_path: Path) -> None:
+def test_new_default_expiry_uses_new_profile_after_later_observation(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _entry_project(tmp_path)
+    current = registry._entry_memory_state(project_id)
+    legacy_kinds = tuple(
+        dataclasses.replace(kind, default_expiry_days=30)
+        if kind.key == "state"
+        else kind
+        for kind in current.state.schema.kinds
+    )
+    legacy_state = dataclasses.replace(
+        current.state,
+        schema=dataclasses.replace(current.state.schema, version=3, kinds=legacy_kinds),
+    )
+    registry._replace_entry_state_for_test(
+        project_id, legacy_state, expected_digest=current.digest
+    )
+
+    changed = registry.set_memory_profile(project_id, "zeta")
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=changed.digest,
+        operations=(AddOperation("state", "New state.", _source()),),
+        reconciliation_key=None,
+        now="2026-10-09T00:00:00Z",
+    )
+    entry_id = added.receipts[0].result_ids[0]
+    entry = added.state.entries[entry_id]
+    assert isinstance(entry, MemoryEntry)
+    assert entry.expires_at == "2026-10-16T00:00:00.000000Z"
+    assert entry.expiry_is_default is True
+
+    observed = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=added.digest,
+        operations=(
+            UpdateOperation(
+                entry_id,
+                (
+                    MemorySource(
+                        "session", 2, 2, ("user",), "2026-10-20T00:00:00Z", 6
+                    ),
+                ),
+            ),
+        ),
+        reconciliation_key=None,
+        now="2026-10-20T00:00:00Z",
+    )
+
+    entry = observed.state.entries[entry_id]
+    assert isinstance(entry, MemoryEntry)
+    assert entry.expires_at == "2026-10-27T00:00:00.000000Z"
+    assert entry.expiry_is_default is True
+
+
+@pytest.mark.parametrize("originally_default", (False, True))
+def test_legacy_expiry_survives_profile_change_and_later_observation(
+    tmp_path: Path,
+    originally_default: bool,
+) -> None:
     registry, project_id = _entry_project(tmp_path)
     current = registry._entry_memory_state(project_id)
     legacy_kinds = tuple(
@@ -91,17 +151,22 @@ def test_default_expiry_uses_new_profile_after_later_observation(tmp_path: Path)
     current = registry._replace_entry_state_for_test(
         project_id, legacy_state, expected_digest=current.digest
     )
+    operation = AddOperation("state", "Legacy expiry.", _source())
+    if not originally_default:
+        operation = AddOperation(
+            "state",
+            "Legacy expiry.",
+            _source(),
+            expires_at="2026-11-08T00:00:00.000000Z",
+        )
     added = registry._compare_and_swap_entries(
         project_id,
         expected_digest=current.digest,
-        operations=(AddOperation("state", "Existing state.", _source()),),
+        operations=(operation,),
         reconciliation_key=None,
         now="2026-10-09T00:00:00Z",
     )
     entry_id = added.receipts[0].result_ids[0]
-    new_entry = added.state.entries[entry_id]
-    assert isinstance(new_entry, MemoryEntry)
-    assert new_entry.expiry_is_default is True
     raw = json.loads(canonical_state_bytes(added.state))
     raw["entries"][entry_id].pop("expiry_is_default")
     legacy_state = state_from_bytes(
@@ -131,7 +196,8 @@ def test_default_expiry_uses_new_profile_after_later_observation(tmp_path: Path)
 
     entry = observed.state.entries[entry_id]
     assert isinstance(entry, MemoryEntry)
-    assert entry.expires_at == "2026-10-27T00:00:00.000000Z"
+    assert entry.expires_at == "2026-11-08T00:00:00.000000Z"
+    assert entry.expiry_is_default is None
 
 
 def test_explicit_expiry_survives_profile_change_and_later_observation(

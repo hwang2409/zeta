@@ -24,7 +24,6 @@ from zeta.memory.entry_store import (
     accept_entry,
     apply_operations,
     canonical_state_bytes,
-    classify_legacy_expiries,
     compact_inactive_entries,
     empty_state,
     new_operation_id,
@@ -531,7 +530,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
-                source_state = classify_legacy_expiries(current.state)
+                source_state = current.state
                 target_keys = {kind.key for kind in selected.kinds}
                 source_keys = {kind.key for kind in source_state.schema.kinds}
                 if set(mappings) - source_keys or set(resolve_kinds) - source_keys:
