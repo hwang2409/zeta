@@ -109,15 +109,32 @@ def test_resolved_item_returns_immediately() -> None:
 # -- resuming a suspended TUI does not replay its transcript -----------------
 
 
-def test_tui_run_replays_transcript_only_on_initial_start() -> None:
+def test_tui_run_replays_transcript_only_on_initial_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import asyncio
 
     async def driver() -> None:
         app = object.__new__(TUIApp)
         replay_count = 0
         read_count = 0
+        watchdog_events: list[tuple[str, str]] = []
+
+        class Watchdog:
+            async def close(self) -> None:
+                watchdog_events.append(("close", "test-session"))
+
+        def start_watchdog(
+            loop: object, *, zeta_home: Path, session_id: str
+        ) -> Watchdog:
+            watchdog_events.append(("start", session_id))
+            return Watchdog()
+
+        monkeypatch.setattr("zeta.tui.app.start_tui_stall_watchdog", start_watchdog)
 
         class Loop:
+            store = SimpleNamespace(session_id="test-session")
+
             async def activate(self) -> None:
                 pass
 
@@ -139,6 +156,7 @@ def test_tui_run_replays_transcript_only_on_initial_start() -> None:
             pass
 
         app.loop = Loop()
+        app._zeta_home = None
         app._exit_requested = False
         app._decisions_switching = False
         app._session = None
@@ -165,6 +183,12 @@ def test_tui_run_replays_transcript_only_on_initial_start() -> None:
         assert getattr(first_result, "name", None) == "OPEN_CHILD"
         assert getattr(second_result, "name", None) == "EXIT"
         assert replay_count == 1
+        assert watchdog_events == [
+            ("start", "test-session"),
+            ("close", "test-session"),
+            ("start", "test-session"),
+            ("close", "test-session"),
+        ]
 
     asyncio.run(driver())
 
