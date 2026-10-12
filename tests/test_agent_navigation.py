@@ -43,6 +43,7 @@ from zeta.tui.agent_card import (
     read_agent_transcript,
 )
 from zeta.tui.app import FullScreenPromptSession, TUIApp
+from zeta.tui.cards.agent_sync import AgentTodoSource
 from zeta.tui.checkpoints import render_replayed_message
 from zeta.tui.todo import TodoWidget
 
@@ -436,16 +437,16 @@ async def test_child_todo_refresh_coalesces_pending_requests(
     started = threading.Event()
     release = threading.Event()
     refreshes = 0
-    original_refresh = agent_card.AgentTodoSource.refresh
+    original_refresh = AgentTodoSource.refresh
 
-    def blocked_refresh(source: agent_card.AgentTodoSource):
+    def blocked_refresh(source: AgentTodoSource):
         nonlocal refreshes
         refreshes += 1
         started.set()
         assert release.wait(5)
         return original_refresh(source)
 
-    monkeypatch.setattr(agent_card.AgentTodoSource, "refresh", blocked_refresh)
+    monkeypatch.setattr(AgentTodoSource, "refresh", blocked_refresh)
     navigation = AgentNavigation(root)
     navigation.selected_index = 1
     navigation.open_selected()
@@ -454,12 +455,12 @@ async def test_child_todo_refresh_coalesces_pending_requests(
             break
         await asyncio.sleep(0.01)
     assert started.is_set()
-    task = navigation._todo_refresh_task
+    task = navigation._todo_control._task
     assert task is not None
 
     for _ in range(20):
-        navigation._request_todo_refresh(child)
-    assert navigation._todo_refresh_task is task
+        navigation._todo_control.request(child)
+    assert navigation._todo_control._task is task
     release.set()
     await task
 
@@ -473,7 +474,7 @@ def test_navigation_close_releases_selected_child_todo_lease(tmp_path: Path) -> 
     navigation = AgentNavigation(root)
     navigation.selected_index = 1
     navigation.open_selected()
-    source = navigation._todo_source
+    source = navigation._todo_control._source
     assert source is not None
     child_store = source._store
     assert child_store is not None

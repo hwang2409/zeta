@@ -38,7 +38,7 @@ from .cards.agent_list import (
     AgentListControl,
 )
 from .cards.agent_sync import (
-    AgentTodoSource,
+    AgentTodoControl,
     AgentTranscriptSnapshot,
     AgentTranscriptSource,
 )
@@ -778,13 +778,7 @@ class AgentNavigation:
         self._main_transcript: Any = None
         self._main_transcript_parent: Any = None
         self._main_transcript_index: int | None = None
-        self._todo_source: AgentTodoSource | None = None
-        self._todo_snapshot: TodoSnapshot | None = None
-        self._todo_snapshot_path: Path | None = None
-        self._todo_refresh_task: asyncio.Task[bool] | None = None
-        self._pending_todo_path: Path | None = None
-        self._todo_refresh_requested = False
-        self._closed = False
+        self._todo_control = AgentTodoControl(cwd=self.store.cwd)
         self._metadata_cache: dict[Path, tuple[tuple[int, int, int], dict[str, Any]]] = {}
         self._refresh_signature: tuple[object, ...] | None = None
         self._last_refresh_at = float("-inf")
@@ -820,78 +814,10 @@ class AgentNavigation:
 
         if not self.child_view_active:
             return TodoSnapshot(tuple(self.store.todo_items()), self.store.todo_dismissed)
-        if self._todo_snapshot_path != self.current_path:
-            return None
-        return self._todo_snapshot
-
-    async def _refresh_todo(self, path: Path | None) -> bool:
-        if path is None:
-            source, self._todo_source = self._todo_source, None
-            if source is not None:
-                await asyncio.to_thread(source.close)
-            changed = self._todo_snapshot is not None
-            self._todo_snapshot = None
-            self._todo_snapshot_path = None
-            return changed
-        if self._todo_source is None or self._todo_source.path != path:
-            previous, self._todo_source = self._todo_source, None
-            if previous is not None:
-                await asyncio.to_thread(previous.close)
-            self._todo_source = AgentTodoSource(path, cwd=self.store.cwd)
-        try:
-            snapshot = await asyncio.to_thread(self._todo_source.refresh)
-        except (ConversationIntegrityError, OSError, ValueError):
-            snapshot = None
-        changed = snapshot != self._todo_snapshot or path != self._todo_snapshot_path
-        self._todo_snapshot = snapshot
-        self._todo_snapshot_path = path
-        return changed
-
-    def _request_todo_refresh(self, path: Path | None) -> bool:
-        """Coalesce child todo refreshes onto one worker-backed task."""
-
-        if self._closed:
-            return False
-        self._pending_todo_path = path
-        self._todo_refresh_requested = True
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._todo_refresh_requested = False
-            return asyncio.run(self._refresh_todo(path))
-        if self._todo_refresh_task is not None and not self._todo_refresh_task.done():
-            return False
-
-        async def run_pending() -> bool:
-            changed = False
-            while self._todo_refresh_requested:
-                requested = self._pending_todo_path
-                self._todo_refresh_requested = False
-                changed = await self._refresh_todo(requested) or changed
-            if changed and self._invalidate is not None:
-                self._invalidate()
-            return changed
-
-        self._todo_refresh_task = loop.create_task(run_pending())
-        return False
-
-    def _clear_todo_snapshot(self) -> None:
-        self._todo_snapshot = None
-        self._todo_snapshot_path = None
-        self._request_todo_refresh(None)
+        return self._todo_control.snapshot(self.current_path)
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._todo_refresh_requested = False
-        if self._todo_refresh_task is not None:
-            self._todo_refresh_task.cancel()
-        if self._todo_source is not None:
-            self._todo_source.close()
-        self._todo_source = None
-        self._todo_snapshot = None
-        self._todo_snapshot_path = None
+        self._todo_control.close()
 
     def child_view_focused(self) -> bool:
         return self._layout is not None and self._layout.has_focus(self.transcript_window)
@@ -1045,7 +971,7 @@ class AgentNavigation:
             else False
         )
         todo_changed = (
-            self._request_todo_refresh(self.current_path)
+            self._todo_control.request(self.current_path, self._invalidate)
             if self.child_view_active
             else False
         )
@@ -1190,7 +1116,7 @@ class AgentNavigation:
 
     def exit_navigation(self, *, preselect_path: Path | None = None) -> None:
         previous_path = self.current_path
-        self._clear_todo_snapshot()
+        self._todo_control.clear(self._invalidate)
         self.current_path = self.root_path
         self._path_stack[:] = [self.root_path]
         self._breadcrumb_labels[:] = ["main"]
@@ -1239,7 +1165,7 @@ class AgentNavigation:
         if entry.path == self.current_path:
             return
         self.current_path = entry.path
-        self._clear_todo_snapshot()
+        self._todo_control.clear(self._invalidate)
         self._path_stack.append(entry.path)
         self._breadcrumb_labels.append(entry.label)
         self.transcript_control.request_sync(entry.path, self._invalidate)
@@ -1256,7 +1182,7 @@ class AgentNavigation:
 
     def _leave_current_view(self) -> None:
         child_path = self.current_path
-        self._clear_todo_snapshot()
+        self._todo_control.clear(self._invalidate)
         self._path_stack.pop()
         self.current_path = self._path_stack[-1]
         self._breadcrumb_labels.pop()

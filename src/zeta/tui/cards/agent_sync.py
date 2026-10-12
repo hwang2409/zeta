@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 import os
 import threading
 import time
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -103,6 +104,94 @@ class AgentTodoSource:
                 self._store.close()
             self._store = None
             self._snapshot = None
+
+
+class AgentTodoControl:
+    """Coalesce child todo storage refreshes and publish in-memory snapshots."""
+
+    def __init__(self, *, cwd: str) -> None:
+        self._cwd = cwd
+        self._source: AgentTodoSource | None = None
+        self._snapshot: TodoSnapshot | None = None
+        self._snapshot_path: Path | None = None
+        self._task: asyncio.Task[bool] | None = None
+        self._pending_path: Path | None = None
+        self._refresh_requested = False
+        self._closed = False
+
+    def snapshot(self, path: Path) -> TodoSnapshot | None:
+        return self._snapshot if self._snapshot_path == path else None
+
+    async def _refresh(self, path: Path | None) -> bool:
+        if path is None:
+            source, self._source = self._source, None
+            if source is not None:
+                await asyncio.to_thread(source.close)
+            changed = self._snapshot is not None
+            self._snapshot = None
+            self._snapshot_path = None
+            return changed
+        if self._source is None or self._source.path != path:
+            previous, self._source = self._source, None
+            if previous is not None:
+                await asyncio.to_thread(previous.close)
+            self._source = AgentTodoSource(path, cwd=self._cwd)
+        try:
+            snapshot = await asyncio.to_thread(self._source.refresh)
+        except (ConversationIntegrityError, OSError, ValueError):
+            snapshot = None
+        changed = snapshot != self._snapshot or path != self._snapshot_path
+        self._snapshot = snapshot
+        self._snapshot_path = path
+        return changed
+
+    def request(
+        self, path: Path | None, invalidate: Callable[[], None] | None = None
+    ) -> bool:
+        """Coalesce refreshes onto one worker-backed task."""
+
+        if self._closed:
+            return False
+        self._pending_path = path
+        self._refresh_requested = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._refresh_requested = False
+            return asyncio.run(self._refresh(path))
+        if self._task is not None and not self._task.done():
+            return False
+
+        async def run_pending() -> bool:
+            changed = False
+            while self._refresh_requested:
+                requested = self._pending_path
+                self._refresh_requested = False
+                changed = await self._refresh(requested) or changed
+            if changed and invalidate is not None:
+                invalidate()
+            return changed
+
+        self._task = loop.create_task(run_pending())
+        return False
+
+    def clear(self, invalidate: Callable[[], None] | None = None) -> None:
+        self._snapshot = None
+        self._snapshot_path = None
+        self.request(None, invalidate)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._refresh_requested = False
+        if self._task is not None:
+            self._task.cancel()
+        if self._source is not None:
+            self._source.close()
+        self._source = None
+        self._snapshot = None
+        self._snapshot_path = None
 
 
 @dataclass(frozen=True, slots=True)
