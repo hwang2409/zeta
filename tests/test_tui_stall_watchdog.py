@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing
 import threading
 import time
 from datetime import UTC, datetime
@@ -16,6 +17,27 @@ from zeta.diagnostics.tui_stalls import (
 def _deliberately_block_loop(done: asyncio.Event) -> None:
     time.sleep(0.4)
     done.set()
+
+
+def _spin_until(stopped: threading.Event) -> None:
+    while not stopped.is_set():
+        pass
+
+
+def _append_records(path: str, attempts: int, errors) -> None:
+    watchdog = TUIStallWatchdog(Path(path), session_id="writer", max_bytes=2_000)
+    record = {
+        "start_time": "2026-01-02T03:04:05Z",
+        "duration_ms": 400,
+        "session_id": "writer",
+        "stacks": [],
+        "other_threads": [],
+    }
+    for _ in range(attempts):
+        try:
+            watchdog._append_record(record)
+        except Exception as exc:  # noqa: BLE001 - returned to the parent for assertion
+            errors.put(repr(exc))
 
 
 async def test_blocked_loop_writes_one_record_with_blocking_stack(
@@ -49,6 +71,81 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
     )
 
 
+async def test_cpu_bound_worker_is_recorded_during_loop_starvation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tui-stalls.jsonl"
+    watchdog = TUIStallWatchdog(
+        path,
+        session_id="cpu-worker",
+        probe_interval=0.002,
+        stall_threshold=0.01,
+        sample_interval=0.002,
+    )
+    stopped = threading.Event()
+    worker = threading.Thread(
+        target=_spin_until,
+        args=(stopped,),
+        name="reconciliation-worker",
+    )
+    watchdog.start(asyncio.get_running_loop())
+    worker.start()
+    done = asyncio.Event()
+    asyncio.get_running_loop().call_soon(_deliberately_block_loop, done)
+    try:
+        await done.wait()
+    finally:
+        stopped.set()
+        worker.join()
+        await watchdog.close()
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert any(
+        thread["name"] == "reconciliation-worker"
+        and any(
+            frame["function"] == "_spin_until"
+            for stack in thread["stacks"]
+            for frame in stack["frames"]
+        )
+        for record in records
+        for thread in record["other_threads"]
+    )
+
+
+async def test_logging_failure_does_not_stop_watchdog(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "tui-stalls.jsonl"
+    watchdog = TUIStallWatchdog(
+        path,
+        session_id="retry",
+        probe_interval=0.005,
+        stall_threshold=0.02,
+        sample_interval=0.01,
+    )
+    append = watchdog._append_record
+    attempts = 0
+
+    def fail_once(record: dict[str, object]) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("injected write failure")
+        append(record)
+
+    monkeypatch.setattr(watchdog, "_append_record", fail_once)
+    watchdog.start(asyncio.get_running_loop())
+    for _ in range(2):
+        done = asyncio.Event()
+        asyncio.get_running_loop().call_soon(_deliberately_block_loop, done)
+        await done.wait()
+        await asyncio.sleep(0.02)
+    await watchdog.close()
+
+    assert attempts >= 2
+    assert path.exists()
+
+
 async def test_responsive_loop_writes_no_record(tmp_path: Path) -> None:
     path = tmp_path / "tui-stalls.jsonl"
     watchdog = TUIStallWatchdog(
@@ -78,6 +175,29 @@ async def test_opt_out_starts_no_thread(tmp_path: Path, monkeypatch) -> None:
 
     assert watchdog is None
     assert {thread.ident for thread in threading.enumerate()} == before
+
+
+def test_concurrent_processes_write_valid_bounded_logs(tmp_path: Path) -> None:
+    path = tmp_path / "tui-stalls.jsonl"
+    context = multiprocessing.get_context("spawn")
+    errors = context.Queue()
+    processes = [
+        context.Process(target=_append_records, args=(str(path), 100, errors))
+        for _ in range(4)
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(15)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert errors.empty()
+    files = [path, path.with_name("tui-stalls.jsonl.1")]
+    assert all(log.stat().st_size <= 2_000 for log in files)
+    for log in files:
+        for line in log.read_text().splitlines():
+            assert json.loads(line)["session_id"] == "writer"
 
 
 def test_log_files_stay_within_size_bound(tmp_path: Path) -> None:

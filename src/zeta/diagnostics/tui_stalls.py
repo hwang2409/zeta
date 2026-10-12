@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import logging
 import os
 import sys
 import sysconfig
@@ -15,6 +17,8 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 PROBE_INTERVAL_SECONDS = 0.05
 STALL_THRESHOLD_SECONDS = 0.25
 STALL_SAMPLE_INTERVAL_SECONDS = 0.1
@@ -23,6 +27,7 @@ _MAX_DISTINCT_STACKS = 8
 _MAX_FRAMES = 20
 _MAX_PATH_CHARS = 240
 _MAX_FUNCTION_CHARS = 120
+_IDLE_FUNCTIONS = frozenset({"get", "join", "poll", "select", "sleep", "wait"})
 _PACKAGE_ROOT = Path(__file__).parents[1]
 _STDLIB_ROOT = Path(sysconfig.get_paths()["stdlib"])
 
@@ -56,6 +61,7 @@ class TUIStallWatchdog:
         self._loop_thread_id: int | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._logging_failure_reported = False
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start probing. Call this method from the loop thread."""
@@ -100,6 +106,10 @@ class TUIStallWatchdog:
             started_utc = self._utc_now()
             loop.call_soon_threadsafe(answered.set)
             stacks: dict[tuple[tuple[str, int, str], ...], list[int]] = {}
+            other_threads: dict[
+                tuple[int, str],
+                dict[tuple[tuple[str, int, str], ...], list[int]],
+            ] = {}
             next_sample = started_monotonic + self.stall_threshold
             while not answered.wait(self.probe_interval):
                 if self._stop.is_set():
@@ -107,38 +117,97 @@ class TUIStallWatchdog:
                 now = self._clock()
                 if now < next_sample:
                     continue
-                self._sample_stack(stacks)
+                self._sample_stacks(stacks, other_threads)
                 next_sample = now + self.sample_interval
             ended = self._clock()
-            if stacks:
-                self._append_record(
-                    self._record(started_utc, ended - started_monotonic, stacks)
-                )
+            duration = ended - started_monotonic
+            if duration >= self.stall_threshold:
+                try:
+                    self._append_record(
+                        self._record(started_utc, duration, stacks, other_threads)
+                    )
+                except Exception:
+                    if not self._logging_failure_reported:
+                        logger.exception("failed to write TUI stall diagnostic")
+                        self._logging_failure_reported = True
             if self._stop.wait(self.probe_interval):
                 return
 
-    def _sample_stack(
-        self, stacks: dict[tuple[tuple[str, int, str], ...], list[int]]
+    def _sample_stacks(
+        self,
+        stacks: dict[tuple[tuple[str, int, str], ...], list[int]],
+        other_threads: dict[
+            tuple[int, str],
+            dict[tuple[tuple[str, int, str], ...], list[int]],
+        ],
     ) -> None:
-        frame = sys._current_frames().get(self._loop_thread_id)
-        if frame is None:
-            return
-        stack = tuple(_trim_stack(frame))
-        if not stack:
-            return
-        current = stacks.get(stack)
-        if current is not None:
-            current[0] += 1
-        elif len(stacks) < _MAX_DISTINCT_STACKS:
-            stacks[stack] = [1, len(stacks)]
+        frames = sys._current_frames()
+        loop_frame = frames.get(self._loop_thread_id)
+        if loop_frame is not None:
+            _count_stack(stacks, tuple(_trim_stack(loop_frame)))
+
+        names = {
+            thread.ident: thread.name
+            for thread in threading.enumerate()
+            if thread.ident is not None
+        }
+        watchdog_thread_id = threading.get_ident()
+        for thread_id, frame in frames.items():
+            if thread_id in {self._loop_thread_id, watchdog_thread_id}:
+                continue
+            stack = tuple(_trim_stack(frame))
+            if not stack:
+                continue
+            samples = other_threads.setdefault(
+                (thread_id, names.get(thread_id, "unknown")), {}
+            )
+            _count_stack(samples, stack)
 
     def _record(
         self,
         started: datetime,
         duration: float,
         stacks: dict[tuple[tuple[str, int, str], ...], list[int]],
+        other_threads: dict[
+            tuple[int, str],
+            dict[tuple[tuple[str, int, str], ...], list[int]],
+        ],
     ) -> dict[str, Any]:
         ordered = sorted(stacks.items(), key=lambda item: (-item[1][0], item[1][1]))
+        threads = []
+        for (thread_id, name), samples in other_threads.items():
+            ordered_samples = sorted(
+                samples.items(),
+                key=lambda item: (_is_idle_stack(item[0]), -item[1][0], item[1][1]),
+            )
+            busy_samples = sum(
+                count
+                for stack, (count, _order) in ordered_samples
+                if not _is_idle_stack(stack)
+            )
+            threads.append(
+                {
+                    "thread_id": thread_id,
+                    "name": name,
+                    "busy_samples": busy_samples,
+                    "stacks": [
+                        {
+                            "count": count,
+                            "idle": _is_idle_stack(stack),
+                            "frames": _frame_records(stack),
+                        }
+                        for stack, (count, _order) in ordered_samples
+                    ],
+                }
+            )
+        threads.sort(
+            key=lambda thread: (
+                -thread["busy_samples"],
+                -sum(stack["count"] for stack in thread["stacks"]),
+                thread["name"],
+                thread["thread_id"],
+            )
+        )
         return {
             "start_time": started.astimezone(UTC).isoformat().replace("+00:00", "Z"),
             "duration_ms": round(max(0.0, duration) * 1000, 3),
@@ -146,13 +215,11 @@ class TUIStallWatchdog:
             "stacks": [
                 {
                     "count": count,
-                    "frames": [
-                        {"file": file, "line": line, "function": function}
-                        for file, line, function in stack
-                    ],
+                    "frames": _frame_records(stack),
                 }
                 for stack, (count, _order) in ordered
             ],
+            "other_threads": threads,
         }
 
     def _append_record(self, record: dict[str, Any]) -> None:
@@ -163,13 +230,57 @@ class TUIStallWatchdog:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.path.parent, 0o700)
-        if self.path.exists() and self.path.stat().st_size + len(encoded) > self.max_bytes:
-            rotated = self.path.with_name(f"{self.path.name}.1")
-            rotated.unlink(missing_ok=True)
-            self.path.replace(rotated)
-        with self.path.open("ab") as handle:
-            handle.write(encoded)
-        os.chmod(self.path, 0o600)
+        lock_path = self.path.with_suffix(".lock")
+        with lock_path.open("a+b") as lock:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                if (
+                    self.path.exists()
+                    and self.path.stat().st_size + len(encoded) > self.max_bytes
+                ):
+                    rotated = self.path.with_name(f"{self.path.name}.1")
+                    rotated.unlink(missing_ok=True)
+                    self.path.replace(rotated)
+                fd = os.open(
+                    self.path,
+                    os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                    0o600,
+                )
+                try:
+                    if os.write(fd, encoded) != len(encoded):
+                        raise OSError("incomplete TUI stall diagnostic write")
+                finally:
+                    os.close(fd)
+                os.chmod(self.path, 0o600)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _count_stack(
+    samples: dict[tuple[tuple[str, int, str], ...], list[int]],
+    stack: tuple[tuple[str, int, str], ...],
+) -> None:
+    if not stack:
+        return
+    current = samples.get(stack)
+    if current is not None:
+        current[0] += 1
+    elif len(samples) < _MAX_DISTINCT_STACKS:
+        samples[stack] = [1, len(samples)]
+
+
+def _frame_records(
+    stack: tuple[tuple[str, int, str], ...],
+) -> list[dict[str, str | int]]:
+    return [
+        {"file": file, "line": line, "function": function}
+        for file, line, function in stack
+    ]
+
+
+def _is_idle_stack(stack: tuple[tuple[str, int, str], ...]) -> bool:
+    return bool(stack and stack[0][2] in _IDLE_FUNCTIONS)
 
 
 def _trim_stack(frame: FrameType) -> list[tuple[str, int, str]]:
