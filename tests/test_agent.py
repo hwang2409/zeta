@@ -7269,7 +7269,7 @@ async def test_agent_cwd_applies_to_read_and_edit(tmp_path: Path) -> None:
 
 
 class ChildRunBackgroundBackend(CompletionBackend):
-    """Drive a child that starts a run_background task, then waits for it.
+    """Drive a child that starts a run_background task, then reads its output.
 
     Using task_output before the child finishes keeps the assertion off the
     child-teardown race: the file exists by the time the child replies.
