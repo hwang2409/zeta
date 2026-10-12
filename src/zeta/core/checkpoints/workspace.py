@@ -159,6 +159,7 @@ def _ensure_shadow_repo(scratch_dir: Path) -> Path:
             subprocess.run(
                 ["git", "init", "--bare", "--quiet", str(shadow)],
                 check=True,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 env=subprocess_env(),
             )
@@ -234,6 +235,7 @@ def _run_git(
             ["git", *args],
             cwd=str(cwd),
             env=merged_env,
+            stdin=subprocess.DEVNULL if input_text is None else None,
             input=input_text,
             capture_output=True,
             text=True,

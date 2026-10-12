@@ -248,6 +248,7 @@ def _process_rss_bytes(process_id: int) -> int:
         value = subprocess.check_output(
             ["ps", "-o", "rss=", "-p", str(process_id)],
             text=True,
+            stdin=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         ).strip()
         return int(value) * 1024 if value else 0
@@ -321,6 +322,7 @@ async def prepare_image(
                 str(file_size),
                 config,
                 pass_fds=(file_descriptor, output.fileno()),
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )

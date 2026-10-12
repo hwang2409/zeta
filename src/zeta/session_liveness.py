@@ -24,6 +24,7 @@ def _process_started(pid: int) -> str | None:
         completed = subprocess.run(
             ["ps", "-o", "lstart=", "-p", str(pid)],
             check=False,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=1,

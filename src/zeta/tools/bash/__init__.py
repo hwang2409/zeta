@@ -247,6 +247,7 @@ async def _bash(
                 process = await create_subprocess_shell_in_fd(
                     command,
                     cwd_fd,
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
@@ -260,6 +261,7 @@ async def _bash(
             process = await asyncio.create_subprocess_shell(
                 command,
                 cwd=registry.cwd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
