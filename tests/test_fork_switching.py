@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from prompt_toolkit.document import Document
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
@@ -55,6 +56,40 @@ def test_request_return_to_main_does_not_abort() -> None:
     assert getattr(app, "_run_result", None).name == "RETURN_TO_PARENT"
     assert app._exit_requested is True
     assert aborts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finder_kind", ["history", "transcript"])
+async def test_fork_switch_cancels_finder_and_restores_composer(
+    tmp_path: Path, finder_kind: str
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+        ),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    draft = Document("draft before switch", cursor_position=6)
+    session.default_buffer.set_document(draft)
+    app._active_session = session
+
+    if finder_kind == "history":
+        app._history_finder_open(session.default_buffer)
+    else:
+        app._finder_open()
+    assert app._active_finder.finder_active
+    app.request_open_fork("fork-123")
+    app._prepare_ui_session_change()
+    resumed = app._make_session()
+
+    assert not app._active_finder.finder_active
+    assert resumed.default_buffer.document == draft
+    await app._close_finder_workers()
 
 
 # -- return arming (review minor #2) ----------------------------------------

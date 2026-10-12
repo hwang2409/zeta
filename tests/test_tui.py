@@ -26,6 +26,7 @@ import httpx
 import pytest
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
@@ -5057,8 +5058,47 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("key", ["\x12", "\x13"])  # ctrl+r, ctrl+s
-async def test_composer_history_search_is_disabled(tmp_path: Path, key: str) -> None:
+@pytest.mark.parametrize("editing_mode", [EditingMode.EMACS, EditingMode.VI])
+async def test_ctrl_r_opens_history_finder_with_draft_query(
+    tmp_path: Path, editing_mode: EditingMode
+) -> None:
+    active = False
+    opened_with: list[tuple[str, int]] = []
+
+    def open_history(buffer: Buffer) -> None:
+        nonlocal active
+        active = True
+        opened_with.append((buffer.text, buffer.cursor_position))
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=editing_mode,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_history_finder_open=open_history,
+                finder_active=lambda: active,
+                history_finder_active=lambda: active,
+                on_finder_input=lambda _query: None,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text("draft\x12")
+        await wait_until(lambda: active)
+        assert opened_with == [("draft", 5)]
+        active = False
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_composer_forward_history_search_is_disabled(tmp_path: Path) -> None:
+    key = "\x13"  # ctrl+s
     history = history_for(tmp_path / "history")
     history.append_string("history target")
     with create_pipe_input() as pipe:
@@ -5102,9 +5142,9 @@ async def test_vi_navigation_ctrl_r_redoes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("keys", ["\x12z", "\x13z", "\x1b\x13iz"])
-async def test_vi_ctrl_history_search_is_disabled(tmp_path: Path, keys: str) -> None:
-    # ctrl+r / ctrl+s in vi insert mode, and ctrl+s in vi navigation mode.
+@pytest.mark.parametrize("keys", ["\x13z", "\x1b\x13iz"])
+async def test_vi_ctrl_s_history_search_is_disabled(tmp_path: Path, keys: str) -> None:
+    # ctrl+s stays disabled in vi insert and navigation modes.
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
             input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,

@@ -109,6 +109,7 @@ from .transcript import (
     stream_key,
 )
 from .transcript.finder_runtime import FinderRuntimeMixin
+from .transcript.history_finder import HistoryFinder
 
 
 def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
@@ -304,10 +305,17 @@ class TUIApp(
         self._active_session: PromptSession[str] | None = None
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
+        self._history_finder = HistoryFinder(
+            self._history_path, on_accept=lambda: app._clear_pending_attachments()
+        )
+        self._active_finder = self._transcript
         self._status_card = OverlayControl()
-        self._finder_control = FinderControl(self._transcript.finder_state)
+        self._finder_control = FinderControl(
+            lambda: app._active_finder.finder_state()
+        )
         self._finder_prepare_task: asyncio.Task[None] | None = None
         self._finder_rank_task: asyncio.Task[None] | None = None
+        self._composer_restore_document: Document | None = None
         self._status_card_open = False
         self._mcp_manager_open = False
         self._init_background_tasks_panel()
@@ -492,7 +500,9 @@ class TUIApp(
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_finder_open=lambda: app._finder_open(),
-            finder_active=lambda: app._transcript.finder_active,
+            on_history_finder_open=lambda buffer: app._history_finder_open(buffer),
+            finder_active=lambda: app._active_finder.finder_active,
+            history_finder_active=lambda: app._history_finder.finder_active,
             on_finder_input=lambda query: app._finder_input(query),
             on_finder_move=lambda delta: app._finder_move(delta),
             on_finder_accept=lambda: app._finder_accept(),
@@ -580,6 +590,11 @@ class TUIApp(
         )
         composer_window.style = "class:text-area"
         self._attach_draft(session)
+        if self._composer_restore_document is not None:
+            session.default_buffer.set_document(
+                self._composer_restore_document, bypass_readonly=True
+            )
+            self._composer_restore_document = None
         return session
 
     def _attach_draft(self, session: PromptSession[str]) -> None:
@@ -1063,7 +1078,7 @@ class TUIApp(
                 decisions_window=self._decisions_panel_window,
                 decisions_active=lambda: app.decisions_panel_active,
                 finder_window=self._finder_control.window(),
-                finder_active=lambda: app._transcript.finder_active,
+                finder_active=lambda: app._active_finder.finder_active,
             )
         ]
         self._agent_navigation.bind_layout(
@@ -1156,6 +1171,7 @@ class TUIApp(
                 return self._run_result
             finally:
                 self._input_loop_active = False
+                self._prepare_ui_session_change()
                 if prompt_task is not None:
                     if not prompt_task.done():
                         prompt_task.cancel()
