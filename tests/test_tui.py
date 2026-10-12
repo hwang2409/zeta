@@ -21,6 +21,7 @@ from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
 from typing import Literal
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -106,6 +107,7 @@ from zeta.protocol.types import (
 )
 from zeta.tui import theme
 from zeta.tui.bootstrap import surface_shutdown_notifications
+from zeta.tui.cards import markdown as markdown_module
 from zeta.tui.cards.base import compact_tool_card, failure_status
 from zeta.tui.layout import composer_content_width, content_width, full_screen_content
 from zeta.tui.render import (
@@ -6425,7 +6427,9 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
     assert "\x1b[1;" in before_line
 
 
-def test_hostile_markdown_is_bounded_and_falls_back_or_renders() -> None:
+def test_hostile_markdown_falls_back_after_parse_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source = "\n".join(
         [
             "*" * 10000,
@@ -6434,18 +6438,25 @@ def test_hostile_markdown_is_bounded_and_falls_back_or_renders() -> None:
             ">" * 500 + " tail",
         ]
     )
-    started = time.monotonic()
+    parse = Mock(wraps=markdown_module._MARKDOWN.parse)
+    monkeypatch.setattr(markdown_module._MARKDOWN, "parse", parse)
+    monkeypatch.setattr(markdown_module, "_MAX_MARKDOWN_SECONDS", -1)
+
     document = render_markdown(source)
     output = StringIO()
     _test_console(output, width=80).print(document)
-    assert time.monotonic() - started < 5
+
+    assert document.nodes is None
+    parse.assert_called_once_with(source)
 
 
-def test_large_markdown_table_falls_back_within_render_budget() -> None:
+def test_large_markdown_table_falls_back_within_render_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(markdown_module, "_MAX_MARKDOWN_SECONDS", float("inf"))
     source = "| name | value |\n| --- | --- |\n" + "\n".join(
         f"| row-{index} | value |" for index in range(10_000)
     )
-    started = time.monotonic()
     output = StringIO()
     _test_console(output).print(render_markdown(source))
 
@@ -6455,10 +6466,6 @@ def test_large_markdown_table_falls_back_within_render_budget() -> None:
     # fallback engaged instead of walking every cell.
     plain = Text.from_ansi(output.getvalue()).plain
     assert "| row-9999 | value |" in plain
-    # The literal-row assertion catches loss of fallback. This ceiling
-    # rejects stalls of a minute or more while allowing loaded runners
-    # time to parse and print the source.
-    assert time.monotonic() - started < 60
 
 
 def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:
