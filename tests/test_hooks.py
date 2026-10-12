@@ -170,7 +170,10 @@ async def test_pre_hook_on_error_deny_blocks_timeout(tmp_path: Path) -> None:
 
     result = await manager.pre_tool("bash", {})
 
-    assert result == f'hook cat < {fifo} timed out; on_error = "deny"'
+    # The command summary in the reason is bounded, so long paths are shortened.
+    assert isinstance(result, str)
+    assert result.startswith("hook cat < ")
+    assert result.endswith(' timed out; on_error = "deny"')
     assert notices == [result]
 
 
