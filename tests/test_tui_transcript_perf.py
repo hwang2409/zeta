@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import threading
 import time
 from collections import OrderedDict
@@ -1528,11 +1529,11 @@ async def test_oversized_far_branch_clears_existing_agent_tail(tmp_path: Path) -
     store.close()
 
 
-def test_transient_agent_refresh_keeps_previous_snapshot(
+def test_exhausted_replace_race_keeps_previous_agent_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zeta.core.session_files import SessionError
+    from zeta.core import session_files
 
     child = ConversationStore(tmp_path / "agents", session_id="1")
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("previous")]))
@@ -1541,15 +1542,65 @@ def test_transient_agent_refresh_keeps_previous_snapshot(
         child.session_dir, message_limit=64
     )
     previous = source.refresh(recursive=True)
+    real_fstat = session_files.os.fstat
+    replaced_opens = 0
 
-    def fail_read(path: Path, limit: int):
-        raise SessionError("file replaced")
+    def unlinked_regular_file(fd: int) -> os.stat_result:
+        nonlocal replaced_opens
+        info = real_fstat(fd)
+        if stat.S_ISREG(info.st_mode):
+            replaced_opens += 1
+            values = list(info)
+            values[3] = 0
+            return os.stat_result(values)
+        return info
 
-    monkeypatch.setattr(agent_sync_module, "_read_active_message_tail", fail_read)
+    monkeypatch.setattr(session_files.os, "fstat", unlinked_regular_file)
     try:
-        assert agent_sync_module.refresh_agent_transcripts([(source, True)]) == [
-            previous
-        ]
+        assert source.refresh(recursive=True) == previous
+        assert replaced_opens == 3
+    finally:
+        source.close()
+
+
+def test_agent_refresh_surfaces_hardlinked_file_after_snapshot(tmp_path: Path) -> None:
+    from zeta.core.session_files import SessionError
+
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("previous")]))
+    child.close()
+    source = agent_sync_module.AgentTranscriptSource(
+        child.session_dir, message_limit=64
+    )
+    source.refresh(recursive=True)
+    conversation = child.session_dir / "conversation.jsonl"
+    linked = tmp_path / "linked.jsonl"
+    conversation.replace(linked)
+    os.link(linked, conversation)
+
+    try:
+        with pytest.raises(SessionError, match="regular, unshared file"):
+            source.refresh(recursive=True)
+    finally:
+        source.close()
+
+
+def test_agent_refresh_surfaces_symlinked_file_after_snapshot(tmp_path: Path) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("previous")]))
+    child.close()
+    source = agent_sync_module.AgentTranscriptSource(
+        child.session_dir, message_limit=64
+    )
+    source.refresh(recursive=True)
+    conversation = child.session_dir / "conversation.jsonl"
+    target = tmp_path / "target.jsonl"
+    conversation.replace(target)
+    conversation.symlink_to(target)
+
+    try:
+        with pytest.raises(OSError):
+            source.refresh(recursive=True)
     finally:
         source.close()
 

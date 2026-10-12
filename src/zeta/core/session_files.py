@@ -19,6 +19,10 @@ class SessionNotFoundError(SessionError):
     """Raised when the requested session does not exist."""
 
 
+class SessionFileReplaced(SessionError):
+    """Raised when read retries keep opening an unlinked session file."""
+
+
 class SessionInUseError(SessionError):
     """Raised when an open store or metadata operation prevents deletion."""
 
@@ -161,7 +165,10 @@ def open_session_file(directory_fd: int, name: str, flags: int) -> int:
                 if read_only and attempt + 1 < _READ_RETRIES:
                     os.close(fd)
                     continue
-                raise SessionError(f"session file was replaced while opening: {name}")
+                error = f"session file was replaced while opening: {name}"
+                if read_only:
+                    raise SessionFileReplaced(error)
+                raise SessionError(error)
             if flags & os.O_TRUNC:
                 os.ftruncate(fd, 0)
             return fd

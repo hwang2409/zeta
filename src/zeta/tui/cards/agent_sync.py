@@ -17,7 +17,11 @@ from ...core.checkpoints import (
     ConversationIntegrityError,
     load_session_json,
 )
-from ...core.session_files import SessionError, open_session_file, session_directory
+from ...core.session_files import (
+    SessionFileReplaced,
+    open_session_file,
+    session_directory,
+)
 from ...core.store import ConversationStore
 from ...protocol.types import is_passive_harness_message
 
@@ -88,7 +92,7 @@ class AgentTranscriptSource:
             previous = self._snapshots.copy()
             try:
                 snapshot = self._refresh_locked(recursive=recursive)
-            except (SessionError, OSError) as error:
+            except SessionFileReplaced as error:
                 if not previous:
                     raise
                 self._snapshots = previous
