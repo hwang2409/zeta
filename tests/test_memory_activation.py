@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import io
+import json
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,8 @@ from zeta.memory.entry_store import (
     MemoryEntry,
     MemorySource,
     UpdateOperation,
+    canonical_state_bytes,
+    state_from_bytes,
 )
 from zeta.memory.profiles import memory_profile
 from zeta.project_errors import ProjectRegistryError
@@ -30,6 +33,216 @@ def _entry_project(tmp_path: Path, profile: str = "zeta") -> tuple[ProjectRegist
     project = registry.create_project("demo", "test", workspace)
     registry.activate_entry_memory(project.project_id, profile)
     return registry, project.project_id
+
+
+def test_zeta_profile_update_changes_only_new_state_expiry(tmp_path: Path) -> None:
+    registry, project_id = _entry_project(tmp_path)
+    current = registry._entry_memory_state(project_id)
+    legacy_kinds = tuple(
+        dataclasses.replace(kind, default_expiry_days=30)
+        if kind.key == "state"
+        else kind
+        for kind in current.state.schema.kinds
+    )
+    legacy_state = dataclasses.replace(
+        current.state,
+        schema=dataclasses.replace(current.state.schema, version=3, kinds=legacy_kinds),
+    )
+    current = registry._replace_entry_state_for_test(
+        project_id, legacy_state, expected_digest=current.digest
+    )
+    existing = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=current.digest,
+        operations=(AddOperation("state", "Existing state.", _source()),),
+        reconciliation_key=None,
+        now="2026-10-09T00:00:00Z",
+    )
+    existing_id = existing.receipts[0].result_ids[0]
+
+    updated = registry.set_memory_profile(project_id, "zeta")
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=updated.digest,
+        operations=(AddOperation("state", "New state.", _source()),),
+        reconciliation_key=None,
+        now="2026-10-09T00:00:00Z",
+    )
+    new_id = added.receipts[0].result_ids[0]
+
+    assert added.state.schema.version == 4
+    assert added.state.entries[existing_id].expires_at == "2026-11-08T00:00:00.000000Z"  # type: ignore[union-attr]
+    assert added.state.entries[new_id].expires_at == "2026-10-16T00:00:00.000000Z"  # type: ignore[union-attr]
+
+
+def test_new_default_expiry_uses_new_profile_after_later_observation(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _entry_project(tmp_path)
+    current = registry._entry_memory_state(project_id)
+    legacy_kinds = tuple(
+        dataclasses.replace(kind, default_expiry_days=30)
+        if kind.key == "state"
+        else kind
+        for kind in current.state.schema.kinds
+    )
+    legacy_state = dataclasses.replace(
+        current.state,
+        schema=dataclasses.replace(current.state.schema, version=3, kinds=legacy_kinds),
+    )
+    registry._replace_entry_state_for_test(
+        project_id, legacy_state, expected_digest=current.digest
+    )
+
+    changed = registry.set_memory_profile(project_id, "zeta")
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=changed.digest,
+        operations=(AddOperation("state", "New state.", _source()),),
+        reconciliation_key=None,
+        now="2026-10-09T00:00:00Z",
+    )
+    entry_id = added.receipts[0].result_ids[0]
+    entry = added.state.entries[entry_id]
+    assert isinstance(entry, MemoryEntry)
+    assert entry.expires_at == "2026-10-16T00:00:00.000000Z"
+    assert entry.expiry_is_default is True
+
+    observed = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=added.digest,
+        operations=(
+            UpdateOperation(
+                entry_id,
+                (
+                    MemorySource(
+                        "session", 2, 2, ("user",), "2026-10-20T00:00:00Z", 6
+                    ),
+                ),
+            ),
+        ),
+        reconciliation_key=None,
+        now="2026-10-20T00:00:00Z",
+    )
+
+    entry = observed.state.entries[entry_id]
+    assert isinstance(entry, MemoryEntry)
+    assert entry.expires_at == "2026-10-27T00:00:00.000000Z"
+    assert entry.expiry_is_default is True
+
+
+@pytest.mark.parametrize("originally_default", (False, True))
+def test_legacy_expiry_survives_profile_change_and_later_observation(
+    tmp_path: Path,
+    originally_default: bool,
+) -> None:
+    registry, project_id = _entry_project(tmp_path)
+    current = registry._entry_memory_state(project_id)
+    legacy_kinds = tuple(
+        dataclasses.replace(kind, default_expiry_days=30)
+        if kind.key == "state"
+        else kind
+        for kind in current.state.schema.kinds
+    )
+    legacy_state = dataclasses.replace(
+        current.state,
+        schema=dataclasses.replace(current.state.schema, version=3, kinds=legacy_kinds),
+    )
+    current = registry._replace_entry_state_for_test(
+        project_id, legacy_state, expected_digest=current.digest
+    )
+    operation = AddOperation("state", "Legacy expiry.", _source())
+    if not originally_default:
+        operation = AddOperation(
+            "state",
+            "Legacy expiry.",
+            _source(),
+            expires_at="2026-11-08T00:00:00.000000Z",
+        )
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=current.digest,
+        operations=(operation,),
+        reconciliation_key=None,
+        now="2026-10-09T00:00:00Z",
+    )
+    entry_id = added.receipts[0].result_ids[0]
+    raw = json.loads(canonical_state_bytes(added.state))
+    raw["entries"][entry_id].pop("expiry_is_default")
+    legacy_state = state_from_bytes(
+        json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
+    )
+    registry._replace_entry_state_for_test(
+        project_id, legacy_state, expected_digest=added.digest
+    )
+
+    changed = registry.set_memory_profile(project_id, "zeta")
+    observed = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=changed.digest,
+        operations=(
+            UpdateOperation(
+                entry_id,
+                (
+                    MemorySource(
+                        "session", 2, 2, ("user",), "2026-10-20T00:00:00Z", 6
+                    ),
+                ),
+            ),
+        ),
+        reconciliation_key=None,
+        now="2026-10-20T00:00:00Z",
+    )
+
+    entry = observed.state.entries[entry_id]
+    assert isinstance(entry, MemoryEntry)
+    assert entry.expires_at == "2026-11-08T00:00:00.000000Z"
+    assert entry.expiry_is_default is None
+
+
+def test_explicit_expiry_survives_profile_change_and_later_observation(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _entry_project(tmp_path)
+    current = registry._entry_memory_state(project_id)
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=current.digest,
+        operations=(
+            AddOperation(
+                "state",
+                "Explicit expiry.",
+                _source(),
+                expires_at="2027-01-01T00:00:00Z",
+            ),
+        ),
+        reconciliation_key=None,
+        now="2026-10-09T00:00:00Z",
+    )
+    entry_id = added.receipts[0].result_ids[0]
+
+    changed = registry.set_memory_profile(project_id, "zeta")
+    observed = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=changed.digest,
+        operations=(
+            UpdateOperation(
+                entry_id,
+                (
+                    MemorySource(
+                        "session", 2, 2, ("user",), "2026-10-20T00:00:00Z", 6
+                    ),
+                ),
+            ),
+        ),
+        reconciliation_key=None,
+        now="2026-10-20T00:00:00Z",
+    )
+
+    entry = observed.state.entries[entry_id]
+    assert isinstance(entry, MemoryEntry)
+    assert entry.expires_at == "2027-01-01T00:00:00Z"
+    assert entry.expiry_is_default is False
 
 
 def test_zeta_and_messaging_profiles_apply_distinct_defaults(tmp_path: Path) -> None:
@@ -206,6 +419,38 @@ def _cli_args(project_id: str, action: str) -> argparse.Namespace:
         detail=None, sync_project=None, remote_home=None, accept=None, set=[],
         from_file=[], json=False, map_kind=[], resolve_kind=[],
     )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    (
+        (("schema", "set-profile", "zeta", "extra"), "memory schema takes no additional entry IDs"),
+        (("schema", "set-profile", "zeta", "--reason", "ignored"), "--reason is only valid for memory resolve"),
+        (("migrate", "extra"), "memory migrate takes no arguments"),
+        (("migrate", "--reason", "ignored"), "--reason is only valid for memory resolve"),
+        (("accept", "state.md", "extra"), "memory accept requires exactly one file"),
+        (("accept", "state.md", "--reason", "ignored"), "--reason is only valid for memory resolve"),
+    ),
+)
+def test_non_resolve_memory_actions_reject_resolve_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: tuple[str, ...],
+    message: str,
+) -> None:
+    home = tmp_path / "home"
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "test", tmp_path / "workspace")
+    registry.initialize_memory(project.project_id)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    project_cli.add_subcommand(commands)
+    args = parser.parse_args(("project", "memory", project.project_id, *arguments))
+    stderr = io.StringIO()
+
+    assert project_cli.run(args, stdout=io.StringIO(), stderr=stderr) == 1
+    assert stderr.getvalue() == f"zeta: {message}\n"
 
 
 def test_migrate_rollback_and_finalize_commands_use_real_project_registry(

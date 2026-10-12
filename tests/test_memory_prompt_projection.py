@@ -148,6 +148,29 @@ def test_resolve_and_expire_leave_next_composed_prompt(tmp_path: Path) -> None:
     assert "kept item" in projection.block
 
 
+def test_prompt_cap_prioritizes_always_kinds_for_168_entries(tmp_path: Path) -> None:
+    _home, _workspace, registry, project_id = _entry_project(tmp_path)
+    operations = tuple(
+        AddOperation(
+            "decisions" if index < 20 else "state",
+            f"entry-{index:03d}-" + "x" * 300,
+            _source(index + 1),
+        )
+        for index in range(168)
+    )
+    state = registry._entry_memory_state(project_id).state
+    for offset in range(0, len(operations), 50):
+        state = _add(registry, project_id, operations[offset : offset + 50]).state
+
+    projection = render_entry_memory(state, now="2026-10-08T13:00:00Z")
+
+    assert len(projection.block.encode()) <= 32 * 1024
+    assert all(f"entry-{index:03d}-" in projection.block for index in range(20))
+    assert projection.omitted_count > 0
+    assert "state:" in projection.block
+    assert "read-only `project` tool" in projection.block
+
+
 def test_prompt_cap_keeps_complete_entries_and_reports_omissions(tmp_path: Path) -> None:
     _home, _workspace, registry, project_id = _entry_project(tmp_path)
     operations = tuple(

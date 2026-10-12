@@ -52,6 +52,8 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
     memory.add_argument("remote", nargs="?", help="remote alias or explicit SSH host")
     memory.add_argument("action", nargs="?", help="memory action file")
     memory.add_argument("detail", nargs="?", help="memory action value")
+    memory.add_argument("entry_ids", nargs="*", help="additional memory entry IDs")
+    memory.add_argument("--reason", help="reason for resolving memory entries")
     memory.add_argument("--project", dest="sync_project", help="project ID or exact name")
     memory.add_argument("--remote-home", help="remote ZETA_HOME (default: ~/.zeta)")
     memory.add_argument(
@@ -121,7 +123,14 @@ def run(
             value = _run_index(args, registry)
         elif args.project_verb == "memory":
             if args.project == "accept":
-                if args.remote is None or args.action is not None:
+                if getattr(args, "reason", None) is not None:
+                    raise ProjectRegistryError("--reason is only valid for memory resolve")
+                if (
+                    args.remote is None
+                    or args.action is not None
+                    or getattr(args, "detail", None) is not None
+                    or getattr(args, "entry_ids", [])
+                ):
                     raise ProjectRegistryError("memory accept requires exactly one file")
                 project = registry.find_for_directory(Path.cwd())
                 if project is None:
@@ -142,7 +151,13 @@ def run(
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.remote == "accept":
-                if args.action is None:
+                if getattr(args, "reason", None) is not None:
+                    raise ProjectRegistryError("--reason is only valid for memory resolve")
+                if (
+                    args.action is None
+                    or getattr(args, "detail", None) is not None
+                    or getattr(args, "entry_ids", [])
+                ):
                     raise ProjectRegistryError("memory accept requires exactly one file")
                 project_id = (
                     args.project
@@ -171,7 +186,13 @@ def run(
                 else registry.show_project(name=args.project).project_id
             )
             if args.remote in {"migrate", "rollback", "finalize"}:
-                if args.action is not None or getattr(args, "detail", None) is not None:
+                if getattr(args, "reason", None) is not None:
+                    raise ProjectRegistryError("--reason is only valid for memory resolve")
+                if (
+                    args.action is not None
+                    or getattr(args, "detail", None) is not None
+                    or getattr(args, "entry_ids", [])
+                ):
                     raise ProjectRegistryError(f"memory {args.remote} takes no arguments")
                 print(
                     "warning: memory history is bounded to 128 versions; transcripts "
@@ -195,7 +216,45 @@ def run(
                 )
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
+            if args.remote == "resolve":
+                entry_ids = tuple(
+                    item
+                    for item in (
+                        args.action,
+                        getattr(args, "detail", None),
+                        *getattr(args, "entry_ids", []),
+                    )
+                    if item is not None
+                )
+                if not entry_ids:
+                    raise ProjectRegistryError(
+                        "memory resolve requires at least one entry ID"
+                    )
+                if registry.memory_format(project_id) != 2:
+                    raise ProjectRegistryError("memory resolve requires format-2 memory")
+                target = ", ".join(entry_ids)
+                MemoryMutationAuthorization.terminal(
+                    stdin=sys.stdin, stdout=out
+                ).authorize(
+                    action="resolve",
+                    target=target,
+                    noun="entries",
+                )
+                registry._resolve_memory_entries(
+                    project_id,
+                    entry_ids,
+                    reason=getattr(args, "reason", None) or "resolved by user",
+                )
+                value = registry._entry_memory_view(project_id)
+                print(json.dumps(value, indent=2, sort_keys=True), file=out)
+                return 0
             if args.remote == "schema":
+                if getattr(args, "reason", None) is not None:
+                    raise ProjectRegistryError("--reason is only valid for memory resolve")
+                if getattr(args, "entry_ids", []):
+                    raise ProjectRegistryError(
+                        "memory schema takes no additional entry IDs"
+                    )
                 if args.action != "set-profile" or not getattr(args, "detail", None):
                     raise ProjectRegistryError(
                         "memory schema requires: set-profile PROFILE"
@@ -224,6 +283,8 @@ def run(
                 or getattr(args, "detail", None) is not None
                 or getattr(args, "map_kind", [])
                 or getattr(args, "resolve_kind", [])
+                or getattr(args, "entry_ids", [])
+                or getattr(args, "reason", None) is not None
             ):
                 raise ProjectRegistryError(
                     "remote arguments require: project memory push|pull|resolve HOST"
@@ -394,6 +455,14 @@ def _run_memory_sync(
 
     if args.remote is None:
         print("zeta: project memory push|pull|resolve requires HOST", file=err)
+        return 2
+    if (
+        args.action is not None
+        or getattr(args, "detail", None) is not None
+        or getattr(args, "entry_ids", [])
+        or getattr(args, "reason", None) is not None
+    ):
+        print("zeta: memory sync takes no entry IDs or --reason", file=err)
         return 2
     if args.set or args.from_file:
         print("zeta: memory sync does not accept --set or --from-file", file=err)
