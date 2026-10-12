@@ -2014,6 +2014,7 @@ def test_claude_keychain_bootstrap_reads_oauth_json(
         (
             (["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],),
             {
+                "stdin": subprocess.DEVNULL,
                 "capture_output": True,
                 "check": False,
                 "env": {"PATH": anthropic_module.os.defpath},
