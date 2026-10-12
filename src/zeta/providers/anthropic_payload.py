@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ..core.tool_batches import without_incomplete_tool_batches
 from ..media.image_policy import ANTHROPIC_IMAGE_POLICY
 from ..media.images import (
     SUPPORTED_IMAGE_MEDIA_TYPES,
@@ -178,6 +179,7 @@ def build_messages_payload(
     thinking_budget: int = 8_192,
 ) -> dict[str, Any]:
     _validate_thinking_parameters(max_tokens, thinking_budget)
+    messages = without_incomplete_tool_batches(messages)
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
     system_at_head = True

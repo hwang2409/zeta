@@ -29,7 +29,7 @@ from .core.session_files import (
 from .core.store.prompt_composition import clone_prompt_composition
 from .project_inbox import ProjectInbox
 from .project_registry import ProjectRegistry
-from .protocol.types import Message, MessageRole, TextContent
+from .protocol.types import Message, MessageRole, TextContent, ToolUseContent
 
 ATTENTION_FORK_POLICY = ToolPolicy.create(
     (
@@ -217,13 +217,48 @@ def _fork_allocation_lock(attention_store: AttentionStore) -> Iterator[None]:
             os.close(lock_fd)
 
 
+def _fork_cut(branch: list[ConversationEntry], anchor: int) -> int:
+    """Return an exclusive cut that keeps the last assistant tool batch whole."""
+
+    assistant_index = next(
+        (
+            index
+            for index in range(anchor, -1, -1)
+            if branch[index].type == "message"
+            and Message.from_dict(branch[index].data["message"]).role
+            is MessageRole.ASSISTANT
+        ),
+        None,
+    )
+    if assistant_index is None:
+        return anchor + 1
+    assistant = Message.from_dict(branch[assistant_index].data["message"])
+    call_ids = {
+        block.tool_call.id
+        for block in assistant.content
+        if isinstance(block, ToolUseContent)
+    }
+    if not call_ids:
+        return anchor + 1
+
+    result_ids: set[str] = set()
+    following = assistant_index + 1
+    while following < len(branch) and branch[following].type == "message":
+        message = Message.from_dict(branch[following].data["message"])
+        if message.role is not MessageRole.TOOL_RESULT or message.tool_result is None:
+            break
+        result_ids.add(message.tool_result.tool_call_id)
+        following += 1
+    return following if result_ids == call_ids else assistant_index
+
+
 def _create_fork_session(
     *,
     manager: SessionManager,
     source: OpenedSession,
     record: AttentionRecord,
     branch: list[ConversationEntry],
-    anchor: int,
+    cut: int,
 ) -> str:
     metadata = source.metadata
     fork = manager.create(
@@ -273,7 +308,7 @@ def _create_fork_session(
                     json.dumps(entry.to_dict(), sort_keys=True, separators=(",", ":"))
                     + "\n"
                 ).encode()
-                for entry in branch[: anchor + 1]
+                for entry in branch[:cut]
             )
         )
         reopened = manager.open(fork_id)
@@ -331,7 +366,7 @@ def create_discussion_fork(
                 source=source,
                 record=record,
                 branch=branch,
-                anchor=anchor_index,
+                cut=_fork_cut(branch, anchor_index),
             )
             bound_record = AttentionRecord.from_dict(
                 {**record.to_dict(), "fork_session_id": fork_id}

@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ..core.tool_batches import without_incomplete_tool_batches
 from ..media.images import (
     SUPPORTED_IMAGE_MEDIA_TYPES,
     decoded_image_bytes,
@@ -135,6 +136,7 @@ def build_responses_payload(
     Codex receives tool images as a following user image input. The function
     output remains a text receipt because it cannot carry image content here.
     """
+    messages = without_incomplete_tool_batches(messages)
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
     system_at_head = True

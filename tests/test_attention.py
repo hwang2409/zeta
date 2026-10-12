@@ -5,6 +5,7 @@ import hashlib
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,11 @@ from zeta.protocol.types import (
     MessageOrigin,
     MessageRole,
     TextContent,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
 )
+from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
@@ -113,6 +118,212 @@ def test_attention_fork_policy_is_action_aware_and_read_only() -> None:
     assert not ATTENTION_FORK_POLICY.allows("bash")
     assert not ATTENTION_FORK_POLICY.allows("agent")
     assert not ATTENTION_FORK_POLICY.allows("run_background")
+
+
+def _tool_result(call: ToolCall, content: str) -> Message:
+    return Message(
+        MessageRole.TOOL_RESULT,
+        [],
+        tool_result=ToolResult(call.id, content),
+    )
+
+
+def _anthropic_tool_ids(messages: list[Message]) -> tuple[set[str], set[str]]:
+    payload = build_messages_payload(
+        messages,
+        [],
+        model="claude-sonnet-4-5",
+        max_tokens=10_000,
+    )
+    uses = {
+        block["id"]
+        for message in payload["messages"]
+        for block in message["content"]
+        if block["type"] == "tool_use"
+    }
+    results = {
+        block["tool_use_id"]
+        for message in payload["messages"]
+        for block in message["content"]
+        if block["type"] == "tool_result"
+    }
+    return uses, results
+
+
+def test_parallel_attention_fork_copies_the_complete_tool_batch(tmp_path: Path) -> None:
+    opened = _session(tmp_path)
+    calls = [
+        ToolCall(f"attention-{index}", "request_attention", {"title": str(index)})
+        for index in range(4)
+    ]
+    anchor = opened.store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(call) for call in calls],
+        )
+    )
+    results = [
+        opened.store.append_message(_tool_result(call, str(index)))
+        for index, call in enumerate(calls)
+    ]
+    attention_store = AttentionStore(opened.store.session_dir)
+    attention = [
+        attention_store.request(
+            session_id=opened.store.session_id,
+            project_id=None,
+            entry_id=anchor.id,
+            entry_seq=anchor.seq,
+            title=f"Choice {index}",
+            why=f"Created by parallel request {index}.",
+        )
+        for index in range(4)
+    ][1]
+
+    fork_id = create_discussion_fork(tmp_path, opened.store.session_id, attention.id)
+    fork = SessionManager(tmp_path).open(fork_id, _read_only=True)
+    try:
+        branch = fork.store.replay()
+        assert [entry.id for entry in branch[:5]] == [
+            anchor.id,
+            *(result.id for result in results),
+        ]
+        assert (
+            Message.from_dict(branch[5].data["message"]).metadata["kind"]
+            == "attention_fork"
+        )
+        assert _anthropic_tool_ids(fork.store.messages()) == (
+            {call.id for call in calls},
+            {call.id for call in calls},
+        )
+    finally:
+        fork.store.close()
+        opened.store.close()
+
+
+def test_attention_fork_cuts_before_an_incomplete_tool_batch(tmp_path: Path) -> None:
+    opened = _session(tmp_path)
+    before = opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("before")])
+    )
+    calls = [
+        ToolCall(f"attention-{index}", "request_attention", {"title": str(index)})
+        for index in range(2)
+    ]
+    anchor = opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call) for call in calls])
+    )
+    opened.store.append_message(_tool_result(calls[0], "created"))
+    attention = AttentionStore(opened.store.session_dir).request(
+        session_id=opened.store.session_id,
+        project_id=None,
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+        title="First choice",
+        why="The sibling result is not durable yet.",
+    )
+
+    fork_id = create_discussion_fork(tmp_path, opened.store.session_id, attention.id)
+    fork = SessionManager(tmp_path).open(fork_id, _read_only=True)
+    try:
+        assert [entry.id for entry in fork.store.replay()[:1]] == [before.id]
+        assert _anthropic_tool_ids(fork.store.messages()) == (set(), set())
+    finally:
+        fork.store.close()
+        opened.store.close()
+
+
+def test_single_attention_call_fork_cut_is_unchanged(tmp_path: Path) -> None:
+    opened = _session(tmp_path)
+    call = ToolCall("attention-one", "request_attention", {"title": "one"})
+    anchor = opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
+    )
+    result = opened.store.append_message(_tool_result(call, "created"))
+    attention = AttentionStore(opened.store.session_dir).request(
+        session_id=opened.store.session_id,
+        project_id=None,
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+        title="One choice",
+        why="One request.",
+    )
+
+    fork_id = create_discussion_fork(tmp_path, opened.store.session_id, attention.id)
+    fork = SessionManager(tmp_path).open(fork_id, _read_only=True)
+    try:
+        assert [entry.id for entry in fork.store.replay()[:2]] == [anchor.id, result.id]
+        assert _anthropic_tool_ids(fork.store.messages()) == ({call.id}, {call.id})
+    finally:
+        fork.store.close()
+        opened.store.close()
+
+
+def test_reused_fork_with_dangling_parallel_calls_is_safe_on_reopen(
+    tmp_path: Path,
+) -> None:
+    opened = _session(tmp_path)
+    calls = [
+        ToolCall(f"attention-{index}", "request_attention", {"title": str(index)})
+        for index in range(4)
+    ]
+    opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call) for call in calls])
+    )
+    opened.store.append_message(_tool_result(calls[0], "created"))
+    opened.store.append_message(
+        Message(
+            MessageRole.SYSTEM,
+            [TextContent("discussion fork")],
+            metadata={"origin": "harness", "kind": "attention_fork"},
+        )
+    )
+    opened.store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("help me")],
+            metadata={MESSAGE_ORIGIN_METADATA: MessageOrigin.USER.value},
+        )
+    )
+    fork_id = opened.store.session_id
+    opened.store.close()
+
+    source = _session(tmp_path)
+    anchor = source.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("choose")])
+    )
+    attention_store = AttentionStore(source.store.session_dir)
+    attention = attention_store.request(
+        session_id=source.store.session_id,
+        project_id=None,
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+        title="Existing choice",
+        why="Reuse the existing discussion.",
+    )
+    attention_store.replace(replace(attention, fork_session_id=fork_id))
+    assert (
+        create_discussion_fork(tmp_path, source.store.session_id, attention.id)
+        == fork_id
+    )
+    source.store.close()
+
+    reopened = SessionManager(tmp_path).open(fork_id, _read_only=True)
+    try:
+        messages = reopened.store.messages()
+        assert _anthropic_tool_ids(messages) == (set(), set())
+        payload = build_messages_payload(
+            messages,
+            [],
+            model="claude-sonnet-4-5",
+            max_tokens=10_000,
+        )
+        assert any(
+            block.get("text") == "help me"
+            for message in payload["messages"]
+            for block in message["content"]
+        )
+    finally:
+        reopened.store.close()
 
 
 def test_fork_copies_active_branch_through_anchor_without_modifying_source(
