@@ -394,7 +394,6 @@ def _read_bounded_messages(
     byte_omitted = False
     overflow_count = 0
     tool_calls: dict[str, dict[str, Any]] = {}
-
     def append_message(message: dict[str, Any]) -> None:
         nonlocal overflow_count, retained_lines
         message = _bounded_message(message)
@@ -513,7 +512,6 @@ class AgentTranscriptControl(UIControl):
     """Scrollable child transcript synchronized through a read-only store."""
 
     _RENDER_BATCH_SIZE = 4
-
     def __init__(self) -> None:
         from .transcript import TranscriptPresenter, TranscriptWidget
 
@@ -579,7 +577,6 @@ class AgentTranscriptControl(UIControl):
             await self._rebuild(snapshot, path)
         self._snapshot = snapshot
         return True
-
     def request_sync(
         self, path: Path, invalidate: Callable[[], None] | None = None
     ) -> bool:
@@ -606,7 +603,6 @@ class AgentTranscriptControl(UIControl):
 
         self._sync_task = loop.create_task(run_pending())
         return False
-
     def _reset_rendered(self, path: Path) -> None:
         self.presenter.clear()
         self._tool_calls.clear()
@@ -615,7 +611,6 @@ class AgentTranscriptControl(UIControl):
         self._unit_entries.clear()
         self._path = path
         self._snapshot = None
-
     def _replace_source(self, path: Path) -> None:
         previous, self._source = self._source, None
         if previous is not None:
@@ -779,6 +774,7 @@ class AgentNavigation:
         self._main_transcript_index: int | None = None
         self._todo_store: ConversationStore | None = None
         self._todo_store_path: Path | None = None
+        self._todo_state_signature: tuple[int, int] | None = None
         self._metadata_cache: dict[Path, tuple[tuple[int, int, int], dict[str, Any]]] = {}
         self._refresh_signature: tuple[object, ...] | None = None
         self._last_refresh_at = float("-inf")
@@ -829,22 +825,33 @@ class AgentNavigation:
                     _read_only=True,
                     _must_exist=True,
                 )
+                self._todo_state_signature = self._todo_state_file_signature()
             except (ConversationIntegrityError, OSError, ValueError):
                 self._todo_store = None
         if self._todo_store is None:
             return None
         try:
-            self._todo_store.refresh()
+            signature = self._todo_state_file_signature()
+            if signature != self._todo_state_signature:
+                self._todo_store.refresh_todo_state()
+                self._todo_state_signature = signature
         except (ConversationIntegrityError, OSError, ValueError):
             self._close_todo_store()
             return None
         return self._todo_store
 
+    def _todo_state_file_signature(self) -> tuple[int, int]:
+        stat = (self.current_path / "session_state.json").stat()
+        return stat.st_mtime_ns, stat.st_size
     def _close_todo_store(self) -> None:
         if self._todo_store is not None:
             self._todo_store.close()
         self._todo_store = None
         self._todo_store_path = None
+        self._todo_state_signature = None
+
+    def close(self) -> None:
+        self._close_todo_store()
 
     def child_view_focused(self) -> bool:
         return self._layout is not None and self._layout.has_focus(self.transcript_window)

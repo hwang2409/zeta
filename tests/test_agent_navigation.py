@@ -352,6 +352,65 @@ def test_todo_follows_selected_session_without_inheritance_or_stale_siblings(
     root.close()
 
 
+def test_turn_boundary_dismisses_root_todos_while_child_is_selected(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    root.set_todo_items([{"content": "done", "status": "completed"}])
+    _child(root, 1, description="live")
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    widget = TodoWidget(root, selected_store=navigation.todo_store)
+
+    widget.turn_boundary()
+
+    assert root.todo_dismissed
+    root.close()
+
+
+def test_selected_child_todo_render_does_not_reparse_conversation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="live")
+    _write_todos(child, [{"content": "child work", "status": "pending"}])
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    widget = TodoWidget(root, selected_store=navigation.todo_store)
+    reads = 0
+    original_refresh = ConversationStore.refresh
+
+    def counted_refresh(store: ConversationStore) -> None:
+        nonlocal reads
+        reads += 1
+        original_refresh(store)
+
+    monkeypatch.setattr(ConversationStore, "refresh", counted_refresh)
+    widget.create_content(80, 20)
+    widget.create_content(80, 20)
+
+    assert reads == 0
+    root.close()
+
+
+def test_navigation_close_releases_selected_child_todo_lease(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    _child(root, 1, description="live")
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    child_store = navigation.todo_store()
+    assert child_store is not None
+
+    navigation.close()
+    navigation.close()
+
+    assert child_store._closed
+    root.close()
+
+
 def test_todo_child_refresh_and_corruption_fail_closed_and_parent_updates_survive(
     tmp_path: Path,
 ) -> None:

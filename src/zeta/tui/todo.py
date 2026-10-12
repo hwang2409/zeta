@@ -46,13 +46,10 @@ class TodoWidget(UIControl):
     def turn_boundary(self) -> None:
         """Hide a completed receipt when the next model turn begins."""
 
-        store = self._current_store()
-        if store is None:
-            return
+        # Turn-boundary dismissal belongs to the root session, not a read-only child.
+        store = self.store
         self._sync_state(store)
-        if self._is_terminal(store.todo_items()) and not getattr(
-            store, "_read_only", False
-        ):
+        if self._is_terminal(store.todo_items()):
             store.dismiss_todo()
 
     @property
