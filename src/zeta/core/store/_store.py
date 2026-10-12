@@ -64,15 +64,11 @@ from ._validation import (
     TASK_EXITED_NOTIFICATION_KIND,
     validate_agent_notification_data,
 )
-from .runtime_lease import SessionRuntimeLease
-
-
-def _close_store_leases(
-    runtime_lease: SessionRuntimeLease | None, directory_lease: ExitStack
-) -> None:
-    if runtime_lease is not None:
-        runtime_lease.close()
-    directory_lease.close()
+from .runtime_lease import (
+    SessionRuntimeLease,
+    StoreRuntimeLeaseMixin,
+    close_store_leases,
+)
 
 
 class ConversationStore(
@@ -81,6 +77,7 @@ class ConversationStore(
     ConversationLogMixin,
     IncrementalValidationMixin,
     NotificationStateMixin,
+    StoreRuntimeLeaseMixin,
     AgentStateMixin,
     CheckpointForkMixin,
 ):
@@ -175,26 +172,10 @@ class ConversationStore(
                 self._runtime_lease = SessionRuntimeLease(self.directory_fd)
             self._release_lease = weakref.finalize(
                 self,
-                _close_store_leases,
+                close_store_leases,
                 self._runtime_lease,
                 lease.pop_all(),
             )
-
-    def activate_runtime_lease(self) -> None:
-        """Mark a newly created session as owned by this runtime."""
-
-        if self._runtime_lease is None:
-            raise ConversationIntegrityError("read-only store has no runtime lease")
-        self._runtime_lease.activate()
-
-    @contextmanager
-    def prompt_resume_lease(self) -> Iterator[bool]:
-        """Coordinate prompt resume and retain this runtime's shared lease."""
-
-        if self._runtime_lease is None:
-            raise ConversationIntegrityError("read-only store has no runtime lease")
-        with self._runtime_lease.resume() as compose:
-            yield compose
 
     def close(self) -> None:
         """Drain durable writers, then release this store's activity leases."""
