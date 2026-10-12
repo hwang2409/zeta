@@ -196,8 +196,37 @@ def _enable_wheel_reporting(output: Output) -> None:
     output.write_raw("\x1b[?1006h")  # SGR extended coordinates
 
 
+class TerminalRenderError(RuntimeError):
+    """A redraw failed; unwind the TUI before reporting the failure."""
 
 
+def _guard_redraw(application: Application[str]) -> None:
+    """Stop painting after a failure, including prompt-toolkit's final redraw."""
+
+    redraw = application._redraw
+    failed = False
+
+    def redraw_or_exit(render_as_done: bool = False) -> None:
+        nonlocal failed
+        if failed:
+            return
+        try:
+            redraw(render_as_done=render_as_done)
+        except Exception as exc:
+            failed = True
+            error = TerminalRenderError(
+                f"terminal rendering failed: {type(exc).__name__}: {exc}"
+            )
+            error.__cause__ = exc
+            if application.future is not None and not application.future.done():
+                # Resolve run_async instead of entering the event loop's
+                # Enter-to-continue handler, which would redraw the broken UI.
+                application.exit(exception=error)
+            else:
+                # The first failure can also occur during the final repaint.
+                raise error from exc
+
+    application._redraw = redraw_or_exit
 
 
 class FullScreenPromptSession(PromptSession[str]):
@@ -236,6 +265,7 @@ class FullScreenPromptSession(PromptSession[str]):
         application.output.enable_mouse_support = partial(
             _enable_wheel_reporting, application.output
         )
+        _guard_redraw(application)
         return application
 
     def restore_terminal(self) -> None:

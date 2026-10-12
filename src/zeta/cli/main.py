@@ -18,6 +18,7 @@ from ..core.session import SessionError, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..providers.login import build_login_provider, pkce_values
 from ..tui.app import create_app
+from ..tui.key_bindings import TerminalRenderError
 
 
 def _tool_patterns_arg(value: str) -> str:
@@ -588,6 +589,10 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             _print_exit_hint(app)
             return 0
+        except TerminalRenderError as exc:
+            print(f"zeta: {exc}", file=sys.stderr)
+            _print_exit_hint(app)
+            return 1
         finally:
             _cleanup_ephemeral(app)
 

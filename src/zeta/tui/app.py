@@ -1070,6 +1070,27 @@ class TUIApp(
         )
         self._bind_fork_navigation()
 
+    async def _prepare_prompt(self, *, resume_ui: bool) -> bool:
+        if resume_ui:
+            replay_completed = True
+        else:
+            try:
+                replay_completed = await self._rebuild_transcript_async()
+            except BaseException:
+                self._finish_startup_replay(completed=False)
+                raise
+            self._finish_startup_replay(completed=replay_completed is not False)
+        if replay_completed is False or self._exit_requested:
+            return False
+        await self.loop.ensure_mcp_servers()
+        if not self._startup_presented:
+            self._present_startup_output()
+            self._startup_presented = True
+        self._present_pending_approvals()
+        self.start_decisions_poll()
+        self._invalidate_prompt()
+        return True
+
     async def run(
         self,
         session: PromptSession[str] | None = None,
@@ -1096,25 +1117,23 @@ class TUIApp(
                 self._install_full_screen_layout(session)
                 prompt_task = asyncio.create_task(session.app.run_async())
             try:
-                if resume_ui:
-                    replay_completed = True
-                else:
-                    try:
-                        replay_completed = await self._rebuild_transcript_async()
-                    except BaseException:
-                        self._finish_startup_replay(completed=False)
-                        raise
-                    self._finish_startup_replay(completed=replay_completed is not False)
-                if replay_completed is False or self._exit_requested:
-                    return self._run_result
-                await self.loop.ensure_mcp_servers()
-                if not self._startup_presented:
-                    self._present_startup_output()
-                    self._startup_presented = True
-                self._present_pending_approvals()
-                self.start_decisions_poll()
-                # Replay runs after the full-screen application paints its first frame.
-                self._invalidate_prompt()
+                startup_task = asyncio.create_task(self._prepare_prompt(resume_ui=resume_ui))
+                try:
+                    if prompt_task is not None:
+                        done, _ = await asyncio.wait(
+                            (prompt_task, startup_task),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if prompt_task in done:
+                            # A failed first paint must not wait on replay or MCP.
+                            await self._run_full_screen(session, prompt_task)
+                            return self._run_result
+                    if not await startup_task:
+                        return self._run_result
+                finally:
+                    if not startup_task.done():
+                        startup_task.cancel()
+                    await asyncio.gather(startup_task, return_exceptions=True)
                 if isinstance(session, FullScreenPromptSession):
                     await self._run_full_screen(session, prompt_task)
                     return self._run_result
@@ -1131,8 +1150,9 @@ class TUIApp(
                 return self._run_result
             finally:
                 self._input_loop_active = False
-                if prompt_task is not None and not prompt_task.done():
-                    prompt_task.cancel()
+                if prompt_task is not None:
+                    if not prompt_task.done():
+                        prompt_task.cancel()
                     await asyncio.gather(prompt_task, return_exceptions=True)
                 # Suspending for a discussion fork keeps the runtime's work
                 # alive: do not cancel the turn or drop the session reference.
