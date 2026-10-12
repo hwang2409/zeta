@@ -151,7 +151,7 @@ async def test_pre_hook_on_error_deny_blocks_failures(
 
     result = await manager.pre_tool("bash", {})
 
-    assert result == f'hook {command} failed with {expected}; on_error = "deny"'
+    assert result == f'hook pre_tool failed with {expected}; on_error = "deny"'
     assert notices == [result]
 
 
@@ -170,11 +170,28 @@ async def test_pre_hook_on_error_deny_blocks_timeout(tmp_path: Path) -> None:
 
     result = await manager.pre_tool("bash", {})
 
-    # The command summary in the reason is bounded, so long paths are shortened.
-    assert isinstance(result, str)
-    assert result.startswith("hook cat < ")
-    assert result.endswith(' timed out; on_error = "deny"')
+    assert result == 'hook pre_tool timed out; on_error = "deny"'
     assert notices == [result]
+
+
+@pytest.mark.asyncio
+async def test_deny_reason_never_contains_the_hook_command(tmp_path: Path) -> None:
+    # Hook commands can carry secrets; the reason reaches the model and transcript.
+    command = "exit 1 # API_TOKEN=example-secret"
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n'
+        'on_error = "deny"\n',
+    )
+    notices: list[str] = []
+    manager = load_hooks(tmp_path)
+    manager.notice_sink = notices.append
+
+    result = await manager.pre_tool("bash", {})
+
+    assert isinstance(result, str)
+    assert "example-secret" not in result
+    assert not any("example-secret" in notice for notice in notices)
 
 
 @pytest.mark.asyncio
