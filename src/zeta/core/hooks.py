@@ -246,7 +246,10 @@ class HookManager:
                 )
             )
             process = await asyncio.shield(creation_task)
-            process_group_id = os.getpgid(process.pid)
+            # start_new_session makes the child its own group leader. Asking
+            # getpgid() races a fast exit: a reaped child raises
+            # ProcessLookupError, which turned a deny into a fail-open error.
+            process_group_id = process.pid
             assert process.stderr is not None
             stderr_task = asyncio.create_task(_read_stderr(process.stderr))
             try:

@@ -101,6 +101,26 @@ async def test_pre_hook_allow_deny_and_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fast_exiting_deny_hook_still_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A deny hook can exit and be reaped before its process group is looked up.
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps("echo no >&2; exit 2")}\n',
+    )
+
+    def reaped(_pid: int) -> int:
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(os, "getpgid", reaped)
+    manager = load_hooks(tmp_path)
+    manager.bind_session("session-1")
+
+    assert await manager.pre_tool("bash", {"command": "rm"}) == "no"
+
+
+@pytest.mark.asyncio
 async def test_pre_hook_deny_reason_reaches_tool_result(tmp_path: Path) -> None:
     deny = _python_command("import sys; sys.stderr.write('blocked by policy'); sys.exit(2)")
     _write_config(
