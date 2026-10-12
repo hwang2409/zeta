@@ -1476,6 +1476,7 @@ def _auto_runner(
             retry_backoff_seconds=0,
             cas_retries=3,
             early_trigger_debounce_seconds=debounce_seconds,
+            early_trigger_max_wait_seconds=300,
         ),
         **({"clock": clock} if clock is not None else {}),
     )
