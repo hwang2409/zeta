@@ -605,7 +605,7 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
         assert not result.is_error
         draft = DraftPersistence(store.session_dir / "draft", directory_fd=store.directory_fd)
         draft.schedule("draft text")
-        draft.flush()
+        await draft.flush_pending()
         assert draft.load() == "draft text"
         draft.clear()
         message = build_user_message("log", tmp_path, (store.session_dir / "background.log",), session_store=store)

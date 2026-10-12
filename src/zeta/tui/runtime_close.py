@@ -61,9 +61,9 @@ class RuntimeCloseMixin:
             await attempt_async(self._cancel_mcp_wizard)
             await attempt_async(self._submissions.close)
             attempt(self._draft.detach)
-            await attempt_async(self._draft.flush_pending)
+            await attempt_async(self._draft.shutdown_pending)
             if self._history is not None:
-                await attempt_async(self._history.flush_pending)
+                await attempt_async(self._history.shutdown_pending)
             await attempt_async(
                 lambda: close_session(
                     self.loop,

@@ -487,7 +487,7 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app._submissions = SimpleNamespace(close=lambda: async_cleanup("submissions"))
     app._draft = SimpleNamespace(
         detach=lambda: cleaned.append("draft"),
-        flush_pending=lambda: async_cleanup("draft flush"),
+        shutdown_pending=lambda: async_cleanup("draft flush"),
     )
 
     with pytest.raises(RuntimeError, match="finder close failed"):

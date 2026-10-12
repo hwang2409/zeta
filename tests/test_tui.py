@@ -10139,8 +10139,41 @@ async def test_rapid_history_appends_persist_in_order(tmp_path: Path) -> None:
         history.append_string(value)
     await history.flush_pending()
 
+    expected = ["first", "second", "third"]
+    assert history.snapshot() == tuple(expected)
     reopened = history_for(path)
-    assert list(reopened.load_history_strings())[:3] == ["third", "second", "first"]
+    assert list(reopened.load_history_strings())[:3] == list(reversed(expected))
+
+
+def test_history_flush_timeout_does_not_extend_asyncio_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history = history_for(tmp_path / "history")
+    started = threading.Event()
+    release = threading.Event()
+    original_flock = persistence_module.fcntl.flock
+
+    def blocked_flock(fd: int, operation: int) -> None:
+        if operation == persistence_module.fcntl.LOCK_EX:
+            started.set()
+            release.wait(1)
+        original_flock(fd, operation)
+
+    monkeypatch.setattr(persistence_module, "PERSISTENCE_FLUSH_TIMEOUT", 0.05)
+    monkeypatch.setattr(persistence_module.fcntl, "flock", blocked_flock)
+
+    async def submit_and_flush() -> None:
+        history.append_string("blocked")
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        await history.flush_pending()
+
+    before = time.monotonic()
+    asyncio.run(submit_and_flush())
+    elapsed = time.monotonic() - before
+    release.set()
+
+    assert elapsed < 0.5
 
 
 @pytest.mark.asyncio
@@ -10158,10 +10191,10 @@ async def test_tui_close_flushes_pending_history_write(
     started = threading.Event()
     original = app._history._append_to_file
 
-    def blocked_write(value: str) -> None:
+    def blocked_write(value: str) -> list[str]:
         started.set()
         release.wait()
-        original(value)
+        return original(value)
 
     monkeypatch.setattr(app._history, "_append_to_file", blocked_write)
     app._record_prompt("flush me")
@@ -10217,6 +10250,55 @@ async def test_draft_write_runs_off_loop_and_flushes(
 
 
 @pytest.mark.asyncio
+async def test_runtime_close_draft_writer_owns_its_directory_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    started = threading.Event()
+    release = threading.Event()
+    used_fds: list[int] = []
+    original = persistence_module.write_session_json
+
+    def blocked_write(directory_fd: int, *args, **kwargs) -> None:
+        used_fds.append(directory_fd)
+        started.set()
+        release.wait(1)
+        original(directory_fd, *args, **kwargs)
+
+    monkeypatch.setattr(persistence_module, "PERSISTENCE_FLUSH_TIMEOUT", 0.05)
+    monkeypatch.setattr(persistence_module, "write_session_json", blocked_write)
+    borrowed_fd = store.directory_fd
+    app._draft.schedule("safe draft")
+    while not started.is_set():
+        await asyncio.sleep(0.001)
+
+    await app.close()
+    reused_fds: list[int] = []
+    try:
+        for _ in range(64):
+            reused_fds.append(os.open(tmp_path, os.O_RDONLY))
+            if borrowed_fd in reused_fds:
+                break
+        assert borrowed_fd in reused_fds
+        release.set()
+        for _ in range(1000):
+            if app._draft.path.exists():
+                break
+            await asyncio.sleep(0.001)
+        assert used_fds and used_fds[0] != borrowed_fd
+        assert DraftPersistence(app._draft.path).load() == "safe draft"
+    finally:
+        release.set()
+        for reused_fd in reused_fds:
+            os.close(reused_fd)
+
+
+@pytest.mark.asyncio
 async def test_draft_write_failure_is_reported_once_without_raising(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -10258,29 +10340,37 @@ async def test_composer_history_is_bounded_and_keeps_multiline_entries(
 
 
 @pytest.mark.asyncio
+async def test_composer_history_merges_cold_cache_with_disk(tmp_path: Path) -> None:
+    path = tmp_path / "history"
+    history_for(path).store_string("old prompt")
+    active = history_for(path)
+
+    active.append_string("new prompt")
+    await active.flush_pending()
+
+    assert active.get_strings() == ["old prompt", "new prompt"]
+    assert active.snapshot() == ("old prompt", "new prompt")
+
+
+@pytest.mark.asyncio
 async def test_composer_history_merges_updates_from_active_instances(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "history"
-    first = history_for(path)
-    second = history_for(path)
-    async for _entry in first.load():
-        pass
-    async for _entry in second.load():
-        pass
-
-    first.append_string("first session prompt")
-    second.append_string("second session prompt")
-    await asyncio.gather(first.flush_pending(), second.flush_pending())
-
-    reopened = history_for(path)
-    async for _entry in reopened.load():
+    active = history_for(path)
+    other = history_for(path)
+    active.store_string("old prompt")
+    async for _entry in active.load():
         pass
 
-    assert reopened.get_strings() == [
-        "first session prompt",
-        "second session prompt",
-    ]
+    other.append_string("other session prompt")
+    await other.flush_pending()
+    active.append_string("active session prompt")
+    await active.flush_pending()
+
+    expected = ["old prompt", "other session prompt", "active session prompt"]
+    assert active.get_strings() == expected
+    assert active.snapshot() == tuple(expected)
 
 
 @pytest.mark.asyncio

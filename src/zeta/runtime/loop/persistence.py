@@ -8,8 +8,9 @@ import fcntl
 import json
 import logging
 import os
+import queue
 import tempfile
-import weakref
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,63 +28,140 @@ PERSISTENCE_FLUSH_TIMEOUT = 2.0
 _LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class _FileAction:
+    watermark: int
+    action: Callable[[], object]
+    completed: Callable[[object], None] | None
+    loop: asyncio.AbstractEventLoop | None
+    stop: bool = False
+
+
 class _OrderedFileWriter:
-    """Run file mutations in order without blocking the event loop."""
+    """Own one ordered daemon thread and expose bounded completion waits."""
 
     def __init__(self, label: str) -> None:
         self._label = label
-        self._task: asyncio.Task[None] | None = None
+        self._queue: queue.Queue[_FileAction] = queue.Queue()
+        self._lock = threading.Lock()
+        self._completed = threading.Condition(self._lock)
+        self._thread: threading.Thread | None = None
+        self._submitted = 0
+        self._applied = 0
+        self._accepting = True
+        self._waiters: list[tuple[int, asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
         self._reported_failure = False
 
-    def submit(self, action: Callable[[], None]) -> None:
+    def submit(
+        self,
+        action: Callable[[], object],
+        completed: Callable[[object], None] | None = None,
+        *,
+        stop: bool = False,
+    ) -> int:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            self._run(action)
-            return
-        previous = self._task
+            loop = None
+        with self._lock:
+            if not self._accepting:
+                raise RuntimeError(f"{self._label} writer is closed")
+            self._submitted += 1
+            watermark = self._submitted
+            if stop:
+                self._accepting = False
+            self._queue.put(_FileAction(watermark, action, completed, loop, stop))
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name=f"zeta-{self._label.replace(' ', '-')}",
+                    daemon=True,
+                )
+                self._thread.start()
+        if loop is None:
+            with self._completed:
+                self._completed.wait_for(lambda: self._applied >= watermark)
+        return watermark
 
-        async def write() -> None:
-            if previous is not None:
-                await previous
-            await asyncio.to_thread(self._run, action)
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            result: object | None = None
+            failed = False
+            try:
+                result = item.action()
+            except Exception as exc:  # noqa: BLE001 - persistence must not crash the TUI
+                failed = True
+                self._report_failure(exc)
+            if item.loop is None:
+                self._deliver(item, result, failed)
+            else:
+                try:
+                    item.loop.call_soon_threadsafe(self._deliver, item, result, failed)
+                except RuntimeError:
+                    self._mark_applied(item.watermark)
+            if item.stop:
+                return
 
-        self._task = loop.create_task(write())
-
-    def _run(self, action: Callable[[], None]) -> None:
+    def _deliver(self, item: _FileAction, result: object | None, failed: bool) -> None:
         try:
-            action()
-        except Exception as exc:  # noqa: BLE001 - persistence must not crash the TUI
+            if not failed and item.completed is not None:
+                item.completed(result)
+        except Exception as exc:  # noqa: BLE001 - completion must not stop the writer
             self._report_failure(exc)
+        finally:
+            self._mark_applied(item.watermark)
 
-    async def flush(self, *, timeout: float = PERSISTENCE_FLUSH_TIMEOUT) -> None:
-        task = self._task
-        if task is None:
-            return
+    def _mark_applied(self, watermark: int) -> None:
+        with self._completed:
+            self._applied = max(self._applied, watermark)
+            ready = [waiter for waiter in self._waiters if waiter[0] <= self._applied]
+            self._waiters = [waiter for waiter in self._waiters if waiter[0] > self._applied]
+            self._completed.notify_all()
+        for _, loop, future in ready:
+            try:
+                loop.call_soon_threadsafe(self._finish_waiter, future)
+            except RuntimeError:
+                pass
+
+    @staticmethod
+    def _finish_waiter(future: asyncio.Future[None]) -> None:
+        if not future.done():
+            future.set_result(None)
+
+    async def flush(self, *, timeout: float) -> None:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            watermark = self._submitted
+            if self._applied >= watermark:
+                return
+            future = loop.create_future()
+            self._waiters.append((watermark, loop, future))
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout)
+            await asyncio.wait_for(asyncio.shield(future), timeout)
         except TimeoutError as exc:
+            with self._lock:
+                self._waiters = [waiter for waiter in self._waiters if waiter[2] is not future]
             self._report_failure(exc)
+
+    async def shutdown(
+        self,
+        finalizer: Callable[[], object] = lambda: None,
+        *,
+        timeout: float,
+    ) -> None:
+        with self._lock:
+            accepting = self._accepting
+        if accepting:
+            self.submit(finalizer, stop=True)
+        await self.flush(timeout=timeout)
 
     def _report_failure(self, exc: BaseException) -> None:
-        if self._reported_failure:
-            return
-        self._reported_failure = True
+        with self._lock:
+            if self._reported_failure:
+                return
+            self._reported_failure = True
         _LOGGER.warning("failed to persist %s: %s", self._label, exc)
-
-
-_HISTORY_WRITERS: weakref.WeakValueDictionary[str, _OrderedFileWriter] = (
-    weakref.WeakValueDictionary()
-)
-
-
-def _history_writer(filename: str | Path) -> _OrderedFileWriter:
-    key = str(Path(filename).resolve())
-    writer = _HISTORY_WRITERS.get(key)
-    if writer is None:
-        writer = _OrderedFileWriter("composer history")
-        _HISTORY_WRITERS[key] = writer
-    return writer
 
 
 class BoundedFileHistory(FileHistory):
@@ -93,30 +171,64 @@ class BoundedFileHistory(FileHistory):
         if limit < 1:
             raise ValueError("history limit must be positive")
         self.limit = limit
-        self._writer = _history_writer(filename)
+        self._writer = _OrderedFileWriter("composer history")
+        self._snapshot_lock = threading.Lock()
+        self._revision = 0
+        self._pending: list[tuple[int, str]] = []
         super().__init__(str(filename))
 
     def load_history_strings(self) -> list[str]:
         return list(super().load_history_strings())[: self.limit]
 
     def append_string(self, string: str) -> None:
-        if not self._loaded_strings or self._loaded_strings[0] != string:
-            self._loaded_strings.insert(0, string)
-            del self._loaded_strings[self.limit :]
-        self._loaded = True
-        self._writer.submit(lambda: self._append_to_file(string))
+        with self._snapshot_lock:
+            self._revision += 1
+            revision = self._revision
+            self._pending.append((revision, string))
+            if not self._loaded_strings or self._loaded_strings[0] != string:
+                self._loaded_strings.insert(0, string)
+                del self._loaded_strings[self.limit :]
+            self._loaded = True
+        self._writer.submit(
+            lambda: self._append_to_file(string),
+            lambda entries: self._apply_snapshot(revision, entries),
+        )
 
-    def _append_to_file(self, string: str) -> None:
+    def _append_to_file(self, string: str) -> list[str]:
         with self._locked():
             entries = list(self.load_history_strings())
-            if entries and entries[0] == string:
-                return
-            entries.insert(0, string)
-            del entries[self.limit :]
-            self._write_entries(entries[::-1])
+            if not entries or entries[0] != string:
+                entries.insert(0, string)
+                del entries[self.limit :]
+                self._write_entries(entries[::-1])
+        return entries
+
+    def _apply_snapshot(self, revision: int, disk_entries: object) -> None:
+        assert isinstance(disk_entries, list)
+        with self._snapshot_lock:
+            self._pending = [item for item in self._pending if item[0] > revision]
+            newest = [value for _, value in reversed(self._pending)]
+            merged: list[str] = []
+            for value in [*newest, *disk_entries]:
+                if not merged or merged[-1] != value:
+                    merged.append(value)
+            self._loaded_strings = merged[: self.limit]
+            self._loaded = True
+
+    def get_strings(self) -> list[str]:
+        with self._snapshot_lock:
+            return list(reversed(self._loaded_strings))
+
+    def snapshot(self) -> tuple[str, ...]:
+        """Return the current canonical snapshot without file I/O."""
+        with self._snapshot_lock:
+            return tuple(reversed(self._loaded_strings))
 
     async def flush_pending(self) -> None:
-        await self._writer.flush()
+        await self._writer.flush(timeout=PERSISTENCE_FLUSH_TIMEOUT)
+
+    async def shutdown_pending(self) -> None:
+        await self._writer.shutdown(timeout=PERSISTENCE_FLUSH_TIMEOUT)
 
     def store_string(self, string: str) -> None:
         """Keep direct history writes bounded as well."""
@@ -261,13 +373,31 @@ class DraftPersistence:
         if text is None:
             return
         self._persisted_revision = revision
-        self._writer.submit(
-            lambda: self._persist(
+        self._submit(
+            lambda directory_fd: self._persist(
                 text,
                 attachment_tokens=attachment_tokens,
                 next_image_token=next_image_token,
+                directory_fd=directory_fd,
             )
         )
+
+    def _submit(self, action: Callable[[int | None], None]) -> None:
+        owned_fd = os.dup(self.directory_fd) if self.directory_fd is not None else None
+
+        def run() -> None:
+            try:
+                action(owned_fd)
+            finally:
+                if owned_fd is not None:
+                    os.close(owned_fd)
+
+        try:
+            self._writer.submit(run)
+        except Exception:
+            if owned_fd is not None:
+                os.close(owned_fd)
+            raise
 
     def _persist(
         self,
@@ -275,12 +405,13 @@ class DraftPersistence:
         *,
         attachment_tokens: tuple[tuple[str, str], ...],
         next_image_token: int,
+        directory_fd: int | None = None,
     ) -> None:
         if not text:
-            self._unlink()
+            self._unlink(directory_fd)
             return
-        with self._directory(create=True) as directory_fd:
-            write_session_json(directory_fd, self.path.name, {
+        with self._directory(create=True, directory_fd=directory_fd) as active_fd:
+            write_session_json(active_fd, self.path.name, {
                 "text": text,
                 "attachment_tokens": dict(attachment_tokens),
                 "next_image_token": next_image_token,
@@ -288,18 +419,24 @@ class DraftPersistence:
 
     async def flush_pending(self) -> None:
         self.flush()
-        await self._writer.flush()
+        await self._writer.flush(timeout=PERSISTENCE_FLUSH_TIMEOUT)
 
-    def _directory(self, *, create: bool = False):
-        # The app lends its store descriptor for the full composer lifetime.
-        if self.directory_fd is not None:
-            return nullcontext(self.directory_fd)
+    async def shutdown_pending(self) -> None:
+        try:
+            self.flush()
+        finally:
+            await self._writer.shutdown(timeout=PERSISTENCE_FLUSH_TIMEOUT)
+
+    def _directory(self, *, create: bool = False, directory_fd: int | None = None):
+        active_fd = self.directory_fd if directory_fd is None else directory_fd
+        if active_fd is not None:
+            return nullcontext(active_fd)
         return session_root(self.path.parent, create=create)
 
-    def _unlink(self) -> None:
+    def _unlink(self, directory_fd: int | None = None) -> None:
         try:
-            with self._directory() as directory_fd:
-                os.unlink(self.path.name, dir_fd=directory_fd)
+            with self._directory(directory_fd=directory_fd) as active_fd:
+                os.unlink(self.path.name, dir_fd=active_fd)
         except FileNotFoundError:
             pass
 
@@ -311,7 +448,7 @@ class DraftPersistence:
         if self._scheduled is not None:
             self._scheduled.cancel()
             self._scheduled = None
-        self._writer.submit(self._unlink)
+        self._submit(self._unlink)
         self._persisted_revision = None
 
     def mark_submitted(self) -> int:
@@ -335,7 +472,7 @@ class DraftPersistence:
             self._persisted_revision is not None
             and self._persisted_revision <= submitted_revision
         ):
-            self._writer.submit(self._unlink)
+            self._submit(self._unlink)
             self._persisted_revision = None
         return True
 
