@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import threading
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -25,6 +27,7 @@ from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
+from zeta.tui import composer, paste_runtime
 from zeta.tui.app import TUIApp, create_app
 
 
@@ -421,4 +424,56 @@ async def test_closed_tui_drops_callbacks_without_gc(
     await app.close()
     del app
     assert reference() is None
+    SessionManager(tmp_path / "home").delete(loop.store.session_id)
+
+
+@pytest.mark.usefixtures("no_gc")
+async def test_closed_tui_drops_pending_paste_callbacks_without_gc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import weakref
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    loop = app.loop
+    session = app._make_session()
+    app._active_session = session
+    entered = threading.Event()
+    release = threading.Event()
+    staged = loop.store.session_dir / "clipboard-closing.png"
+
+    def stage(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        entered.set()
+        release.wait()
+        staged.write_bytes(b"image")
+        return staged
+
+    monkeypatch.setattr(paste_runtime, "paste_image", stage)
+    monkeypatch.setattr(composer, "paste_image", stage)
+    app._paste_from_keybinding(SimpleNamespace(current_buffer=session.default_buffer))
+    while not entered.is_set():
+        await asyncio.sleep(0)
+    pending = tuple(
+        app._paste_runtime.tasks
+        if hasattr(app, "_paste_runtime")
+        else app._paste_tasks
+    )
+    closing = asyncio.create_task(app.close())
+    await asyncio.sleep(0)
+    waited = not closing.done()
+    if waited:
+        release.set()
+        await closing
+    reference = weakref.ref(app)
+    del app
+
+    try:
+        assert waited
+        assert reference() is None
+    finally:
+        release.set()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await closing
     SessionManager(tmp_path / "home").delete(loop.store.session_id)

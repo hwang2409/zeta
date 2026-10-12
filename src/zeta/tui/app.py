@@ -86,6 +86,7 @@ from .layout import (
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
+from .paste_runtime import PasteRuntime
 from .render import (
     render_markdown,
     render_thought,
@@ -221,7 +222,7 @@ class TUIApp(
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
-        self._paste_tasks: set[asyncio.Task[None]] = set()
+        self._paste_runtime = PasteRuntime(app)
         self._on_session_close = on_session_close
         self._init_runtime_close()
         self._init_fork_runtime()
@@ -650,6 +651,7 @@ class TUIApp(
             return False
         if self._open_overlay_from_submit(value):
             return True
+        self._paste_runtime.advance_buffer_generation()
         super()._submit_input(value, internal=internal)
         return True
 
@@ -1161,7 +1163,7 @@ class TUIApp(
                 return self._run_result
             finally:
                 self._input_loop_active = False
-                self._prepare_ui_session_change()
+                await self._prepare_ui_session_change()
                 if prompt_task is not None:
                     if not prompt_task.done():
                         prompt_task.cancel()
@@ -1177,9 +1179,6 @@ class TUIApp(
                     if self._active_task is not None and not self._active_task.done():
                         self._active_task.cancel()
                         await asyncio.gather(self._active_task, return_exceptions=True)
-                    for paste_task in self._paste_tasks:
-                        paste_task.cancel()
-                    await asyncio.gather(*self._paste_tasks, return_exceptions=True)
                     if isinstance(session, FullScreenPromptSession):
                         session.restore_terminal()
                         self._active_session = None

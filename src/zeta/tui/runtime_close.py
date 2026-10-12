@@ -48,6 +48,11 @@ class RuntimeCloseMixin:
         try:
             attempt(self.stop_decisions_poll)
             attempt(self._stop_decisions_refresh)
+            prepare_ui_session_change = getattr(
+                self, "_prepare_ui_session_change", None
+            )
+            if prepare_ui_session_change is not None:
+                await attempt_async(prepare_ui_session_change)
             await attempt_async(self._close_finder_workers)
             pending = attempt(
                 lambda: (

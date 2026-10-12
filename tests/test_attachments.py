@@ -18,7 +18,7 @@ from zeta.protocol.types import ImageContent, MessageRole, TextContent
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.skills import SkillCatalog
-from zeta.tui import composer
+from zeta.tui import composer, paste_runtime
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (
     ATTACHMENT_MAX_TEXT_BYTES,
@@ -60,9 +60,9 @@ async def run_ctrl_v(app: TUIApp, value: str) -> list[str]:
         pipe.send_text(chunks[0])
         for chunk in chunks[1:]:
             pipe.send_text("\x16")
-            while not app._paste_tasks:
+            while not app._paste_runtime.tasks:
                 await asyncio.sleep(0)
-            while app._paste_tasks:
+            while app._paste_runtime.tasks:
                 await asyncio.sleep(0)
             pipe.send_text(chunk)
         pipe.send_text("\r")
@@ -341,7 +341,7 @@ async def test_cancelled_image_paste_cleans_up_staged_file(
         staged.write_bytes(PNG)
         return staged
 
-    monkeypatch.setattr(composer, "paste_image", paste_image)
+    monkeypatch.setattr(paste_runtime, "paste_image", paste_image)
     task = asyncio.create_task(app.paste_from_clipboard())
     while not entered.is_set():
         await asyncio.sleep(0)
@@ -353,6 +353,135 @@ async def test_cancelled_image_paste_cleans_up_staged_file(
     assert not staged.exists()
     assert app._pending_attachments == []
     await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_pastes_insert_in_invocation_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    buffer = session.default_buffer
+    buffer.text = "ab"
+    buffer.cursor_position = 1
+    paths = iter(
+        [
+            store.session_dir / "clipboard-first.png",
+            store.session_dir / "clipboard-second.png",
+        ]
+    )
+
+    def stage(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        path = next(paths)
+        path.write_bytes(PNG)
+        return path
+
+    monkeypatch.setattr(paste_runtime, "paste_image", stage)
+    monkeypatch.setattr(composer, "paste_image", stage)
+    event = SimpleNamespace(current_buffer=buffer)
+    app._paste_from_keybinding(event)
+    app._paste_from_keybinding(event)
+    await asyncio.gather(*tuple(app._paste_runtime.tasks))
+
+    assert buffer.text == "a[Image #1][Image #2]b"
+    assert list(app._pending_attachment_tokens) == ["[Image #1]", "[Image #2]"]
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_session_switch_drops_staged_paste(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    old_session = app._make_session()
+    old_session.default_buffer.text = "old"
+    app._active_session = old_session
+    entered = threading.Event()
+    release = threading.Event()
+    staged = store.session_dir / "clipboard-stale.png"
+
+    def stage(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        entered.set()
+        release.wait()
+        staged.write_bytes(PNG)
+        return staged
+
+    monkeypatch.setattr(paste_runtime, "paste_image", stage)
+    monkeypatch.setattr(composer, "paste_image", stage)
+    app._paste_from_keybinding(SimpleNamespace(current_buffer=old_session.default_buffer))
+    while not entered.is_set():
+        await asyncio.sleep(0)
+    new_session = app._make_session()
+    new_session.default_buffer.text = "new"
+    app._active_session = new_session
+    async def switch() -> None:
+        await app._prepare_ui_session_change()
+
+    switching = asyncio.create_task(switch())
+    await asyncio.sleep(0)
+    waited = not switching.done()
+    release.set()
+    await asyncio.gather(switching, return_exceptions=True)
+
+    assert waited
+    assert old_session.default_buffer.text == "old"
+    assert new_session.default_buffer.text == "new"
+    assert not staged.exists()
+    assert app._pending_attachment_tokens == {}
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_and_awaits_staging_paste(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    entered = threading.Event()
+    release = threading.Event()
+    staged = store.session_dir / "clipboard-closing.png"
+
+    def stage(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        entered.set()
+        release.wait()
+        staged.write_bytes(PNG)
+        return staged
+
+    monkeypatch.setattr(paste_runtime, "paste_image", stage)
+    monkeypatch.setattr(composer, "paste_image", stage)
+    app._paste_from_keybinding(SimpleNamespace(current_buffer=session.default_buffer))
+    while not entered.is_set():
+        await asyncio.sleep(0)
+    closing = asyncio.create_task(app.close())
+    await asyncio.sleep(0)
+    waited = not closing.done()
+    release.set()
+    await closing
+
+    assert waited
+    assert not staged.exists()
+    assert app._pending_attachment_tokens == {}
+    assert not app._paste_runtime.tasks
 
 
 @pytest.mark.asyncio
@@ -395,10 +524,13 @@ async def test_slash_paste_inserts_the_same_token_without_notice(
     monkeypatch.setattr(composer.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(composer.shutil, "which", lambda _: "/usr/bin/pngpaste")
     real_run = composer.subprocess.run
+    loop_thread = threading.get_ident()
+    helper_threads: list[int] = []
 
     def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
         if command[0] != "/usr/bin/pngpaste":
             return real_run(command, **kwargs)
+        helper_threads.append(threading.get_ident())
         Path(command[1]).write_bytes(PNG)
         return SimpleNamespace(returncode=0)
 
@@ -433,6 +565,7 @@ async def test_slash_paste_inserts_the_same_token_without_notice(
         await run_task
 
     assert app._pending_attachment_tokens == {"[Image #1]": app._pending_attachments[0]}
+    assert helper_threads and helper_threads != [loop_thread]
     assert notices == []
 
 

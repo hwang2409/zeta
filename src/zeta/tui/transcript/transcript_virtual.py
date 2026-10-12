@@ -843,12 +843,6 @@ class TranscriptVirtualMixin:
                 (line, unit.key, offset)
                 for line, offset in zip(rendered_lines, offsets)
             )
-        if first == 0:
-            while raw_lines and not raw_lines[0][0].strip():
-                raw_lines.pop(0)
-        if last == len(self._units) - 1:
-            while raw_lines and not raw_lines[-1][0]:
-                raw_lines.pop()
         keyed = [(key, offset) for _, key, offset in raw_lines]
 
         def local_anchor(anchor: SelectionAnchor) -> SelectionAnchor:
@@ -867,7 +861,22 @@ class TranscriptVirtualMixin:
             local_anchor(anchored.extent),
             anchored.dragging,
         )
-        return local.resolve(keyed), [line for line, _, _ in raw_lines]
+        selection = local.resolve(keyed)
+        leading = 0
+        if first == 0:
+            while raw_lines and not raw_lines[0][0].strip():
+                raw_lines.pop(0)
+                leading += 1
+        if last == len(self._units) - 1:
+            while raw_lines and not raw_lines[-1][0]:
+                raw_lines.pop()
+        if selection is not None and leading:
+            selection = Selection(
+                (selection.anchor[0] - leading, selection.anchor[1]),
+                (selection.extent[0] - leading, selection.extent[1]),
+                selection.dragging,
+            )
+        return selection, [line for line, _, _ in raw_lines]
 
     def _selection_for_copy(
         self, anchored: AnchoredSelection | None = None
