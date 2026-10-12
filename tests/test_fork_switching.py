@@ -480,7 +480,8 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app._stop_decisions_refresh = lambda: cleaned.append("refresh")
     app._close_finder_workers = fail_finder
     app._agent_navigation = SimpleNamespace(
-        unbind_layout=lambda: cleaned.append("navigation")
+        close=lambda: cleaned.append("navigation close"),
+        unbind_layout=lambda: cleaned.append("navigation unbind"),
     )
     app._cancel_mcp_wizard = lambda: async_cleanup("wizard")
     app._submissions = SimpleNamespace(close=lambda: async_cleanup("submissions"))
@@ -493,3 +494,5 @@ def test_tui_close_failure_still_runs_later_cleanup(
     assert "submissions" in cleaned
     assert "session" in cleaned
     assert "task sink" in cleaned
+    assert cleaned.index("navigation close") < cleaned.index("navigation unbind")
+    assert cleaned.index("navigation unbind") < cleaned.index("wizard")

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import gc
 import json
 import os
+import threading
 from collections.abc import Iterable
 from io import StringIO
 from itertools import product
@@ -317,7 +319,7 @@ def test_todo_follows_selected_session_without_inheritance_or_stale_siblings(
     _write_todos(sibling, [{"content": "sibling work", "status": "pending"}])
 
     navigation = AgentNavigation(root)
-    widget = TodoWidget(root, selected_store=navigation.todo_store)
+    widget = TodoWidget(root, selected_snapshot=navigation.todo_snapshot)
 
     assert widget.visible
     assert "root work" in _todo_text(widget)
@@ -361,7 +363,7 @@ def test_turn_boundary_dismisses_root_todos_while_child_is_selected(
     navigation = AgentNavigation(root)
     navigation.selected_index = 1
     navigation.open_selected()
-    widget = TodoWidget(root, selected_store=navigation.todo_store)
+    widget = TodoWidget(root, selected_snapshot=navigation.todo_snapshot)
 
     widget.turn_boundary()
 
@@ -369,7 +371,7 @@ def test_turn_boundary_dismisses_root_todos_while_child_is_selected(
     root.close()
 
 
-def test_selected_child_todo_render_does_not_reparse_conversation(
+def test_selected_child_todo_render_performs_no_file_io(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = ConversationStore(tmp_path / "sessions", session_id="root")
@@ -378,20 +380,89 @@ def test_selected_child_todo_render_does_not_reparse_conversation(
     navigation = AgentNavigation(root)
     navigation.selected_index = 1
     navigation.open_selected()
-    widget = TodoWidget(root, selected_store=navigation.todo_store)
-    reads = 0
-    original_refresh = ConversationStore.refresh
+    widget = TodoWidget(root, selected_snapshot=navigation.todo_snapshot)
+    render_thread = threading.get_ident()
+    stat_threads: list[int] = []
+    original_stat = Path.stat
 
-    def counted_refresh(store: ConversationStore) -> None:
-        nonlocal reads
-        reads += 1
-        original_refresh(store)
+    def record_stat(path: Path, *args: object, **kwargs: object):
+        stat_threads.append(threading.get_ident())
+        return original_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(ConversationStore, "refresh", counted_refresh)
+    monkeypatch.setattr(Path, "stat", record_stat)
     widget.create_content(80, 20)
     widget.create_content(80, 20)
 
-    assert reads == 0
+    assert render_thread not in stat_threads
+    root.close()
+
+
+def test_child_todo_refresh_detects_same_size_same_mtime_atomic_replacement(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="live")
+    _write_todos(child, [{"content": "old child", "status": "pending"}])
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    widget = TodoWidget(root, selected_snapshot=navigation.todo_snapshot)
+    assert "old child" in _todo_text(widget)
+
+    state_path = child / "session_state.json"
+    original_stat = state_path.stat()
+    replacement = child / "replacement.json"
+    replacement.write_bytes(state_path.read_bytes().replace(b"old child", b"new child"))
+    os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    os.replace(replacement, state_path)
+    assert state_path.stat().st_size == original_stat.st_size
+    assert state_path.stat().st_mtime_ns == original_stat.st_mtime_ns
+
+    navigation.refresh(force=True)
+
+    assert "new child" in _todo_text(widget)
+    assert "old child" not in _todo_text(widget)
+    root.close()
+
+
+@pytest.mark.asyncio
+async def test_child_todo_refresh_coalesces_pending_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="live")
+    _write_todos(child, [{"content": "child work", "status": "pending"}])
+    started = threading.Event()
+    release = threading.Event()
+    refreshes = 0
+    original_refresh = agent_card.AgentTodoSource.refresh
+
+    def blocked_refresh(source: agent_card.AgentTodoSource):
+        nonlocal refreshes
+        refreshes += 1
+        started.set()
+        assert release.wait(5)
+        return original_refresh(source)
+
+    monkeypatch.setattr(agent_card.AgentTodoSource, "refresh", blocked_refresh)
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    for _ in range(100):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+    task = navigation._todo_refresh_task
+    assert task is not None
+
+    for _ in range(20):
+        navigation._request_todo_refresh(child)
+    assert navigation._todo_refresh_task is task
+    release.set()
+    await task
+
+    assert refreshes == 2
     root.close()
 
 
@@ -401,7 +472,9 @@ def test_navigation_close_releases_selected_child_todo_lease(tmp_path: Path) -> 
     navigation = AgentNavigation(root)
     navigation.selected_index = 1
     navigation.open_selected()
-    child_store = navigation.todo_store()
+    source = navigation._todo_source
+    assert source is not None
+    child_store = source._store
     assert child_store is not None
 
     navigation.close()
@@ -421,7 +494,7 @@ def test_todo_child_refresh_and_corruption_fail_closed_and_parent_updates_surviv
     navigation = AgentNavigation(root)
     navigation.selected_index = 1
     navigation.open_selected()
-    widget = TodoWidget(root, selected_store=navigation.todo_store)
+    widget = TodoWidget(root, selected_snapshot=navigation.todo_snapshot)
     assert "old child" in _todo_text(widget)
 
     navigation.back_to_parent()

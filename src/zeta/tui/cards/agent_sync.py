@@ -24,6 +24,7 @@ from ...core.session_files import (
 )
 from ...core.store import ConversationStore
 from ...protocol.types import is_passive_harness_message
+from ..todo import TodoSnapshot
 
 _REFRESH_LOCK = threading.Lock()
 _REVERSE_READ_BYTES = 64 * 1024
@@ -32,6 +33,76 @@ _MAX_FULL_FALLBACK_BYTES = 16 * 1024 * 1024
 _BOUNDED_UNAVAILABLE = "child transcript unavailable: history exceeds bounded scan"
 _REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
 _LOGGER = logging.getLogger(__name__)
+
+
+class AgentTodoSource:
+    """Own one read-only child store and publish cached todo snapshots."""
+
+    def __init__(self, path: Path, *, cwd: str) -> None:
+        self.path = path
+        self._cwd = cwd
+        self._store: ConversationStore | None = None
+        self._signature: tuple[int, int, int, int] | None = None
+        self._snapshot: TodoSnapshot | None = None
+        self._closed = False
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _state_signature(path: Path) -> tuple[int, int, int, int]:
+        stat = (path / "session_state.json").stat()
+        return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
+
+    def refresh(self) -> TodoSnapshot:
+        """Refresh changed state while preserving a snapshot across replace races."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("agent todo source is closed")
+            previous = self._snapshot
+            try:
+                return self._refresh_locked()
+            except SessionFileReplaced:
+                if previous is None:
+                    raise
+                return previous
+
+    def _refresh_locked(self) -> TodoSnapshot:
+        before = self._state_signature(self.path)
+        if self._store is None:
+            store = ConversationStore(
+                self.path.parent,
+                session_id=self.path.name,
+                cwd=self._cwd,
+                _read_only=True,
+                _must_exist=True,
+            )
+            after = self._state_signature(self.path)
+            if after != before:
+                store.close()
+                raise SessionFileReplaced("session state changed while opening")
+            self._store = store
+        elif before != self._signature:
+            self._store.refresh_todo_state()
+            after = self._state_signature(self.path)
+            if after != before:
+                raise SessionFileReplaced("session state changed while refreshing")
+        snapshot = TodoSnapshot(
+            tuple(self._store.todo_items()),
+            self._store.todo_dismissed,
+        )
+        self._signature = before
+        self._snapshot = snapshot
+        return snapshot
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._store is not None:
+                self._store.close()
+            self._store = None
+            self._snapshot = None
 
 
 @dataclass(frozen=True, slots=True)
