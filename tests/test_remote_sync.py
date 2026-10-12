@@ -646,7 +646,7 @@ def _legacy_project_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def test_project_digest_ignores_live_atomic_temporary(
+def test_project_digest_ignores_disappearing_memory_mirror_temporary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = tmp_path / "project"
@@ -654,20 +654,39 @@ def test_project_digest_ignores_live_atomic_temporary(
     memory.mkdir(parents=True)
     (project / "project.json").write_text("record\n", encoding="utf-8")
     expected = project_digest(project)
-    temporary = memory / ".state.md.writer.tmp"
+    temporary = memory / ".state.md.0123456789abcdef0123456789abcdef.tmp"
     temporary.write_text("in flight\n", encoding="utf-8")
     real_is_file = Path.is_file
 
-    def rename_before_hash(path: Path) -> bool:
+    def unlink_after_listing(path: Path) -> bool:
         result = real_is_file(path)
         if path == temporary:
             temporary.unlink()
         return result
 
-    monkeypatch.setattr(Path, "is_file", rename_before_hash)
+    monkeypatch.setattr(Path, "is_file", unlink_after_listing)
 
     assert project_digest(project) == expected
-    assert temporary.exists()
+    assert not temporary.exists()
+
+
+def test_project_digest_includes_user_dot_temporary(tmp_path: Path) -> None:
+    snapshot, _project_id = _format_two_project_snapshot(tmp_path)
+    before = project_digest(snapshot)
+
+    (snapshot / ".user-notes.tmp").write_text("keep me\n", encoding="utf-8")
+
+    assert project_digest(snapshot) != before
+
+
+def test_project_transfer_includes_user_dot_temporary(tmp_path: Path) -> None:
+    snapshot, _project_id = _format_two_project_snapshot(tmp_path)
+    (snapshot / ".user-notes.tmp").write_text("keep me\n", encoding="utf-8")
+
+    prepared = prepare_project_transfer(snapshot)
+
+    with tarfile.open(fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz") as archive:
+        assert "payload/.user-notes.tmp" in archive.getnames()
 
 
 def test_project_tree_digests_frame_file_boundaries(tmp_path: Path) -> None:
