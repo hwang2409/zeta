@@ -64,11 +64,30 @@ def test_parse_key_spec_rejects_unknown_keys_loudly() -> None:
 
 
 def test_resolve_keybindings_round_trips_user_remaps() -> None:
-    resolved = resolve_keybindings({"retry": "ctrl-r", "toggle-agent": "f5"})
+    resolved = resolve_keybindings(
+        {"retry": "ctrl-r", "history-search": "f4", "toggle-agent": "f5"}
+    )
     assert resolved["retry"] == ("c-r",)
     assert resolved["toggle-agent"] == ("f5",)
     # Untouched actions keep their defaults.
     assert resolved["interrupt"] == DEFAULTS["interrupt"]
+
+
+def test_history_search_is_a_remappable_action() -> None:
+    assert "history-search" in ACTIONS
+    assert DEFAULTS["history-search"] == ("c-r",)
+    resolved = resolve_keybindings({"history-search": "f4"})
+    assert resolved["history-search"] == ("f4",)
+
+
+def test_history_search_binds_the_remapped_key() -> None:
+    bindings = build_key_bindings(
+        on_interrupt=lambda: None,
+        on_exit=lambda: None,
+        on_history_finder_open=lambda _buffer: None,
+        key_remap={"history-search": "f4"},
+    )
+    assert _binding_keys(bindings, "open_history_finder") == {("f4",)}
 
 
 def test_open_decisions_is_a_remappable_action() -> None:
@@ -161,7 +180,7 @@ def test_build_key_bindings_composes_with_vim_mode() -> None:
         on_interrupt=lambda: None,
         on_exit=lambda: None,
         on_retry=lambda: None,
-        key_remap={"retry": "c-r"},
+        key_remap={"retry": "c-r", "history-search": "f4"},
     )
     escape_bindings = [
         binding for binding in bindings.bindings if binding.keys == (Keys.Escape,)
