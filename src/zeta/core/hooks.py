@@ -447,6 +447,10 @@ async def _finish_process(
         assert process.stdin is not None
         process.stdin.write(output)
         await process.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        # The hook exited (or closed stdin) before reading its payload. That
+        # is valid; its exit status still decides, so do not fail open here.
+        pass
     finally:
         if process.stdin is not None:
             process.stdin.close()

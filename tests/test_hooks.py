@@ -121,6 +121,26 @@ async def test_fast_exiting_deny_hook_still_denies(
 
 
 @pytest.mark.asyncio
+async def test_deny_hook_that_exits_before_reading_stdin_still_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Writing the payload to a hook that already exited raises BrokenPipeError.
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps("echo no >&2; exit 2")}\n',
+    )
+
+    async def broken_pipe(_self: asyncio.StreamWriter) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(asyncio.StreamWriter, "drain", broken_pipe)
+    manager = load_hooks(tmp_path)
+    manager.bind_session("session-1")
+
+    assert await manager.pre_tool("bash", {"command": "rm"}) == "no"
+
+
+@pytest.mark.asyncio
 async def test_pre_hook_deny_reason_reaches_tool_result(tmp_path: Path) -> None:
     deny = _python_command("import sys; sys.stderr.write('blocked by policy'); sys.exit(2)")
     _write_config(
