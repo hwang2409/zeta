@@ -10,13 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from zeta.memory import entry_reconciler
+from zeta.memory import entry_request
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import (
     EntryReconciliationFailure,
-    _prepare_request,
     reconcile_entry_range,
 )
+from zeta.memory.entry_request import _prepare_request
 from zeta.memory.entry_store import (
     AddOperation,
     MemoryEntry,
@@ -234,14 +234,14 @@ def _crowded_priority_state(
 
 def _prepare_request_oracle(transcript: Transcript, state, *, as_of: date):
     def prompt_with_entries(candidate: Transcript):
-        active = entry_reconciler._active_entries_for_request(state, candidate)
-        indexes = [entry_reconciler._entry_index(entry) for entry in active]
+        active = entry_request._active_entries_for_request(state, candidate)
+        indexes = [entry_request._entry_index(entry) for entry in active]
         entry_limit = 28 * 1024 - 12 * 1024
         visible = []
         for entry in active:
             proposed = [*visible, entry]
             omitted = Counter(item.kind for item in active[len(proposed) :])
-            prompt = entry_reconciler._prompt(
+            prompt = entry_request._prompt(
                 _transcript(),
                 state,
                 as_of=as_of,
@@ -255,9 +255,9 @@ def _prepare_request_oracle(transcript: Transcript, state, *, as_of: date):
         full = []
         indexed = indexes[: len(visible)]
         for position, entry in enumerate(visible):
-            proposed = [*full, entry_reconciler._entry_projection(entry)]
+            proposed = [*full, entry_request._entry_projection(entry)]
             proposed_index = indexes[position + 1 : len(visible)]
-            prompt = entry_reconciler._prompt(
+            prompt = entry_request._prompt(
                 _transcript(),
                 state,
                 as_of=as_of,
@@ -269,7 +269,7 @@ def _prepare_request_oracle(transcript: Transcript, state, *, as_of: date):
                 break
             full = proposed
             indexed = proposed_index
-        prompt = entry_reconciler._prompt(
+        prompt = entry_request._prompt(
             candidate,
             state,
             as_of=as_of,
@@ -284,8 +284,8 @@ def _prepare_request_oracle(transcript: Transcript, state, *, as_of: date):
     safe_rows = []
     prompt_with_entries(_transcript())
     for raw in transcript.rows:
-        safe = entry_reconciler._sanitized(
-            entry_reconciler.project_transcript_row(raw)
+        safe = entry_request._sanitized(
+            entry_request.project_transcript_row(raw)
         )
         if not isinstance(safe, dict):
             continue
@@ -295,13 +295,13 @@ def _prepare_request_oracle(transcript: Transcript, state, *, as_of: date):
         except ReconciliationError:
             if safe_rows:
                 break
-            if entry_reconciler._is_user_authored_row(safe):
+            if entry_request._is_user_authored_row(safe):
                 raise ReconciliationError("user row exceeds the request limit")
             data = safe.get("data")
             message = data.get("message") if isinstance(data, dict) else None
             if not (
                 (isinstance(message, dict) and message.get("role") == "assistant")
-                or entry_reconciler._is_lossy_generated_row(safe)
+                or entry_request._is_lossy_generated_row(safe)
             ):
                 raise ReconciliationError(
                     "oversized non-generated transcript row requires lossless handling"
@@ -310,7 +310,7 @@ def _prepare_request_oracle(transcript: Transcript, state, *, as_of: date):
                 (8192, 32), (4096, 16), (2048, 8), (1024, 4),
                 (512, 2), (128, 1), (0, 0),
             ):
-                bounded = entry_reconciler._bounded_value(
+                bounded = entry_request._bounded_value(
                     safe, text_bytes=text_bytes, list_items=list_items
                 )
                 selected = _transcript(bounded)
@@ -448,7 +448,7 @@ def test_incremental_request_matches_oracle_at_byte_boundaries(tmp_path: Path) -
         _transcript(), registry._entry_memory_state(project_id).state,
         as_of=date(2026, 10, 9),
     )
-    empty_row_size = len(entry_reconciler._render_transcript_row(SESSION, _row(3, "")).encode())
+    empty_row_size = len(entry_request._render_transcript_row(SESSION, _row(3, "")).encode())
     text_bytes = 28 * 1024 - len(empty_state_request.prompt.encode()) - empty_row_size
     boundary_row = _row(3, "x" * text_bytes)
     _assert_matches_prepare_oracle(
@@ -491,6 +491,52 @@ def test_excluded_row_does_not_change_entry_relevance(tmp_path: Path) -> None:
     assert target_ids[0] not in request.visible_entry_ids
 
 
+def test_chained_relevance_reranks_until_rows_fit(tmp_path: Path) -> None:
+    # Reviewer reproduction: each re-rank grows the entry section and evicts one
+    # more row (8 -> 7 -> 6 -> 5); stopping after two re-ranks exceeded 28 KiB.
+    import random
+
+    random.seed(68)
+    registry, project_id = _registry(tmp_path)
+    state = registry._entry_memory_state(project_id).state
+    choices = [50, 100, 180, 500, 1000, 1800, 3000]
+    source = (MemorySource(SESSION, 1, 1, ("user",), NOW, 2),)
+    operations = [
+        AddOperation(
+            "state", f"quarkterm{i} " + chr(64 + i) * random.choice(choices), source
+        )
+        for i in range(1, 9)
+    ]
+    operations += [
+        AddOperation(
+            "state",
+            f"filler{i:03d} " + chr(65 + i % 26) * random.choice(choices),
+            source,
+        )
+        for i in range(20)
+    ]
+    entry_ids = iter(f"m_{i:032x}" for i in range(1, len(operations) + 1))
+    operation_ids = iter(f"op_{i:032x}" for i in range(1, len(operations) + 1))
+    state, _ = apply_operations(
+        state,
+        operations,
+        reconciliation_key=_key("68-0"),
+        automatic=True,
+        now=NOW,
+        entry_id_factory=lambda: next(entry_ids),
+        operation_id_factory=lambda: next(operation_ids),
+    )
+    pads = [1611, 2488, 2588, 1175, 2424, 1451, 808, 1525]
+    transcript = _transcript(
+        *(_row(i, f"quarkterm{i} " + "x" * pads[i - 1]) for i in range(1, 9))
+    )
+
+    _assert_matches_prepare_oracle(transcript, state)
+    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    assert len(request.prompt.encode()) <= 28 * 1024
+    assert len(request.transcript.rows) == 5
+
+
 @pytest.mark.parametrize("turn_context", (False, True))
 def test_incremental_request_matches_oracle_errors(
     tmp_path: Path, turn_context: bool
@@ -522,7 +568,7 @@ def test_request_preparation_renders_prompt_constant_times(
     transcript = _transcript(
         *[_row(index, f"ordinary row {index}") for index in range(1, 151)]
     )
-    original = entry_reconciler._prompt
+    original = entry_request._prompt
     calls = 0
 
     def counted(*args, **kwargs):
@@ -530,7 +576,7 @@ def test_request_preparation_renders_prompt_constant_times(
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(entry_reconciler, "_prompt", counted)
+    monkeypatch.setattr(entry_request, "_prompt", counted)
     _prepare_request(transcript, state, as_of=date(2026, 10, 9))
 
     assert calls <= 5
