@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 
-from ...runtime.loop.persistence import HISTORY_LIMIT, BoundedFileHistory
 from .finder_overlay import FinderState
 from .message_finder import Candidate, MessageFinder, RankingResult, Role
 
@@ -26,25 +24,16 @@ class HistoryCandidateRequest:
 
 @dataclass(frozen=True, slots=True)
 class HistorySnapshot:
-    signature: tuple[int, int] | None
     candidates: tuple[Candidate, ...]
     entries: tuple[tuple[int, str], ...]
 
 
-def load_history_candidates(path: str | Path, limit: int = HISTORY_LIMIT) -> HistorySnapshot:
-    """Read and prepare newest unique history entries for the finder."""
+def build_history_candidates(history: Sequence[str]) -> HistorySnapshot:
+    """Prepare newest unique history entries from an oldest-first snapshot."""
 
-    history_path = Path(path)
-    try:
-        stat = history_path.stat()
-        signature = (stat.st_mtime_ns, stat.st_size)
-    except FileNotFoundError:
-        return HistorySnapshot(None, (), ())
-
-    newest = BoundedFileHistory(history_path, limit=limit).load_history_strings()
     unique: list[str] = []
     seen: set[str] = set()
-    for value in newest:
+    for value in reversed(history):
         normalized = value.rstrip()
         if not normalized or normalized in seen:
             continue
@@ -71,7 +60,7 @@ def load_history_candidates(path: str | Path, limit: int = HISTORY_LIMIT) -> His
             )
         )
         entries.append((key, value))
-    return HistorySnapshot(signature, tuple(candidates), tuple(entries))
+    return HistorySnapshot(tuple(candidates), tuple(entries))
 
 
 class HistoryFinder:
@@ -79,20 +68,20 @@ class HistoryFinder:
 
     def __init__(
         self,
-        path: str | Path,
+        load_history: Callable[[], list[str]],
+        history_snapshot: Callable[[], tuple[str, ...]],
         *,
-        limit: int = HISTORY_LIMIT,
         on_accept: Callable[[], None] | None = None,
     ) -> None:
-        self._path = Path(path)
-        self._limit = limit
+        self._load_history = load_history
+        self._history_snapshot = history_snapshot
+        self._history_loaded = False
         self._on_accept = on_accept
         self._finder: MessageFinder | None = None
         self._generation = 0
         self._buffer: Buffer | None = None
         self._draft: Document | None = None
         self._entries: dict[int, str] = {}
-        self._cache: HistorySnapshot | None = None
         self._preview = True
 
     @property
@@ -116,15 +105,10 @@ class HistoryFinder:
         return await asyncio.to_thread(self._load_snapshot)
 
     def _load_snapshot(self) -> HistorySnapshot:
-        try:
-            stat = self._path.stat()
-            signature = (stat.st_mtime_ns, stat.st_size)
-        except FileNotFoundError:
-            signature = None
-        if self._cache is not None and self._cache.signature == signature:
-            return self._cache
-        self._cache = load_history_candidates(self._path, self._limit)
-        return self._cache
+        if not self._history_loaded:
+            self._load_history()
+            self._history_loaded = True
+        return build_history_candidates(self._history_snapshot())
 
     def finder_publish_candidates(
         self, request: HistoryCandidateRequest, snapshot: HistorySnapshot
@@ -199,5 +183,5 @@ __all__ = [
     "HistoryCandidateRequest",
     "HistoryFinder",
     "HistorySnapshot",
-    "load_history_candidates",
+    "build_history_candidates",
 ]

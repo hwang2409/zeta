@@ -8,16 +8,29 @@ from pathlib import Path
 import pytest
 from prompt_toolkit.buffer import Buffer
 
-from zeta.runtime.loop.persistence import history_for
+from zeta.runtime.loop.persistence import BoundedFileHistory, history_for
 from zeta.tui.transcript import FinderControl
-from zeta.tui.transcript import history_finder as history_module
-from zeta.tui.transcript.history_finder import HistoryFinder, load_history_candidates
+from zeta.tui.transcript.history_finder import (
+    HistoryFinder,
+    build_history_candidates,
+)
 
 
-def _write_history(path: Path, *entries: str) -> None:
+def _history(path: Path, *entries: str) -> BoundedFileHistory:
     history = history_for(path)
     for entry in entries:
         history.append_string(entry)
+    return history
+
+
+def _finder(
+    history: BoundedFileHistory, *, on_accept=None
+) -> HistoryFinder:
+    return HistoryFinder(
+        history.get_strings,
+        history.snapshot,
+        on_accept=on_accept,
+    )
 
 
 async def _open(finder: HistoryFinder, buffer: Buffer) -> None:
@@ -31,10 +44,15 @@ async def _open(finder: HistoryFinder, buffer: Buffer) -> None:
 
 
 def test_candidates_are_newest_first_deduplicated_and_multiline(tmp_path: Path) -> None:
-    path = tmp_path / "history"
-    _write_history(path, "older match", "two\nlines", "older match   ", "newest match")
+    history = _history(
+        tmp_path / "history",
+        "older match",
+        "two\nlines",
+        "older match   ",
+        "newest match",
+    )
 
-    snapshot = load_history_candidates(path)
+    snapshot = build_history_candidates(history.snapshot())
 
     assert [candidate.text for candidate in snapshot.candidates] == [
         "newest match",
@@ -45,10 +63,9 @@ def test_candidates_are_newest_first_deduplicated_and_multiline(tmp_path: Path) 
 
 
 def test_matching_text_and_preview_are_bounded(tmp_path: Path) -> None:
-    path = tmp_path / "history"
-    _write_history(path, "x" * 20_000)
+    history = _history(tmp_path / "history", "x" * 20_000)
 
-    candidate = load_history_candidates(path).candidates[0]
+    candidate = build_history_candidates(history.snapshot()).candidates[0]
 
     assert len(candidate.text) == 2_048
     assert sum(map(len, candidate.preview)) <= 12_000
@@ -56,9 +73,10 @@ def test_matching_text_and_preview_are_bounded(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_fuzzy_ranking_prefers_newer_duplicate_free_matches(tmp_path: Path) -> None:
-    path = tmp_path / "history"
-    _write_history(path, "run pytest old", "other", "run pytest newest")
-    finder = HistoryFinder(path)
+    history = _history(
+        tmp_path / "history", "run pytest old", "other", "run pytest newest"
+    )
+    finder = _finder(history)
     await _open(finder, Buffer())
 
     finder.finder_set_query("rpt")
@@ -75,11 +93,10 @@ async def test_fuzzy_ranking_prefers_newer_duplicate_free_matches(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_accept_inserts_without_submitting_and_remains_editable(tmp_path: Path) -> None:
-    path = tmp_path / "history"
-    _write_history(path, "selected prompt")
+    history = _history(tmp_path / "history", "selected prompt")
     buffer = Buffer()
     buffer.text = "draft"
-    finder = HistoryFinder(path)
+    finder = _finder(history)
     await _open(finder, buffer)
     finder.finder_set_query("")
     result = finder.finder_rank()
@@ -96,11 +113,10 @@ async def test_accept_inserts_without_submitting_and_remains_editable(tmp_path: 
 
 @pytest.mark.asyncio
 async def test_attachment_tokens_return_as_plain_text(tmp_path: Path) -> None:
-    path = tmp_path / "history"
-    _write_history(path, "reuse [Image #1]")
+    history = _history(tmp_path / "history", "reuse [Image #1]")
     accepted: list[str] = []
     buffer = Buffer()
-    finder = HistoryFinder(path, on_accept=lambda: accepted.append(buffer.text))
+    finder = _finder(history, on_accept=lambda: accepted.append(buffer.text))
     await _open(finder, buffer)
 
     assert finder.finder_accept()
@@ -110,12 +126,11 @@ async def test_attachment_tokens_return_as_plain_text(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_cancel_restores_draft_and_cursor_exactly(tmp_path: Path) -> None:
-    path = tmp_path / "history"
-    _write_history(path, "selected prompt")
+    history = _history(tmp_path / "history", "selected prompt")
     buffer = Buffer()
     buffer.text = "draft text"
     buffer.cursor_position = 3
-    finder = HistoryFinder(path)
+    finder = _finder(history)
     await _open(finder, buffer)
     buffer.text = "changed while open"
 
@@ -128,9 +143,10 @@ async def test_cancel_restores_draft_and_cursor_exactly(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_open_and_cancel_do_not_write_history(tmp_path: Path) -> None:
     path = tmp_path / "history"
-    _write_history(path, "saved prompt")
+    history = _history(path, "saved prompt")
+    await history.flush_pending()
     before = path.read_bytes()
-    finder = HistoryFinder(path)
+    finder = _finder(history)
     await _open(finder, Buffer())
 
     finder.finder_cancel()
@@ -139,21 +155,20 @@ async def test_open_and_cancel_do_not_write_history(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_history_loading_runs_off_the_event_loop_thread(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_initial_history_loading_runs_off_the_event_loop_thread(
+    tmp_path: Path,
 ) -> None:
     path = tmp_path / "history"
-    _write_history(path, *(f"prompt {index}" for index in range(1_000)))
+    history_for(path).store_string("saved prompt")
+    history = history_for(path)
     loop_thread = threading.get_ident()
     worker_threads: list[int] = []
-    original = history_module.load_history_candidates
 
-    def recording_loader(path: str | Path, limit: int):
+    def recording_loader() -> list[str]:
         worker_threads.append(threading.get_ident())
-        return original(path, limit)
+        return history.get_strings()
 
-    monkeypatch.setattr(history_module, "load_history_candidates", recording_loader)
-    finder = HistoryFinder(path)
+    finder = HistoryFinder(recording_loader, history.snapshot)
     request = finder.open_finder(Buffer())
     assert request is not None
 
@@ -164,7 +179,7 @@ async def test_history_loading_runs_off_the_event_loop_thread(
 
 @pytest.mark.asyncio
 async def test_empty_history_has_empty_state_and_does_not_crash(tmp_path: Path) -> None:
-    finder = HistoryFinder(tmp_path / "missing-history")
+    finder = _finder(history_for(tmp_path / "missing-history"))
     await _open(finder, Buffer())
     state = finder.finder_state()
     assert state is not None and state.rows == ()

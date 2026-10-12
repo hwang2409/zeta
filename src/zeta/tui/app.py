@@ -261,7 +261,7 @@ class TUIApp(
         self._history_path = (
             Path(history_path) if history_path else env_home() / "history"
         )
-        self._history = None
+        self._history = history_for(self._history_path)
         self._draft = DraftPersistence(
             draft_path or self.loop.store.session_dir / "draft",
             directory_fd=self.loop.store.directory_fd if draft_path is None else None,
@@ -308,7 +308,9 @@ class TUIApp(
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._history_finder = HistoryFinder(
-            self._history_path, on_accept=lambda: app._clear_pending_attachments()
+            self._history.get_strings,
+            self._history.snapshot,
+            on_accept=lambda: app._clear_pending_attachments(),
         )
         self._active_finder = self._transcript
         self._status_card = OverlayControl()
