@@ -1274,10 +1274,13 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
 
         await _request(reader, writer, 4, "send", {"text": "run slowly"})
         await _event(reader, "tool_start")
+        foreground_pid: int | None = None
         async with asyncio.timeout(TIMEOUT):
-            while not pid_path.exists():
-                await asyncio.sleep(0)
-        foreground_pid = int(pid_path.read_text())
+            while foreground_pid is None:
+                try:
+                    foreground_pid = int(pid_path.read_text())
+                except (FileNotFoundError, ValueError):
+                    await asyncio.sleep(0)
         frames = await _request(
             reader, writer, 5, "abort", {"scope": "foreground"}
         )
