@@ -1,0 +1,29 @@
+src/zeta/tui/key_bindings.py
+  s_d9d04f10aab6bf::t_1643dadc31298a 199-214,216-227,229,268
+  s_d9d04f10aab6bf::t_a6bb67f9874013 215
+src/zeta/cli/main.py
+  s_d9d04f10aab6bf::t_1643dadc31298a 21,592-595
+src/zeta/tui/app.py
+  s_d9d04f10aab6bf::t_1643dadc31298a 1073-1093,1120-1136
+  s_d9d04f10aab6bf::t_9fc5ad3edb7038 1153-1155
+tests/test_tui_render_failure.py
+  s_d9d04f10aab6bf::t_40742d945926bb 19,46-48
+  s_d9d04f10aab6bf::t_890af78a822384 1-18,20-45,49-150
+  s_d9d04f10aab6bf::t_6fc8c4e22aa66c 151-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b27915323f8879480beb3b646495eaba7becc0e8",
+  "prompts": {},
+  "sessions": {
+    "s_d9d04f10aab6bf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12ed3-e7e6-7cd1-9953-246bf98e9a16",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Austin Jian <austin.jian07@gmail.com>"
+    }
+  }
+}
