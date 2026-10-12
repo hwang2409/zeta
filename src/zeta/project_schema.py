@@ -42,15 +42,16 @@ def validate_project_record(
     """Validate one complete registry record using only the standard library."""
 
     if (
-        not _PROJECT_FIELDS.issubset(value)
+        type(value.get("schema_version")) is not int
+        or value["schema_version"] != SCHEMA_VERSION
+        or not _PROJECT_FIELDS.issubset(value)
         or not set(value).issubset(_PROJECT_FIELDS | {"lanes"})
-        or value.get("schema_version") != SCHEMA_VERSION
     ):
         raise ValueError("unknown or invalid project schema")
     project_id = validate_project_id(value["project_id"])
     if expected_id is not None and project_id != expected_id:
         raise ValueError("project ID does not match its path")
-    name = validate_project_text(value["name"], "name", MAX_NAME_LENGTH)
+    name = validate_project_name(value["name"])
     scope = validate_project_text(value["scope"], "scope", MAX_SCOPE_LENGTH)
     created = _validate_timestamp(value["created_at"], "created_at")
     updated = _validate_timestamp(value["updated_at"], "updated_at")
@@ -64,13 +65,23 @@ def validate_project_id(value: object) -> str:
     return value
 
 
+def validate_project_name(value: object) -> str:
+    name = validate_project_text(value, "name", MAX_NAME_LENGTH)
+    if PROJECT_ID_PATTERN.fullmatch(name):
+        raise ValueError("name cannot match a project ID")
+    return name
+
+
 def validate_project_text(value: object, field: str, maximum: int) -> str:
     if not isinstance(value, str) or not value or len(value) > maximum:
         raise ValueError(
             f"{field} must be a non-empty string of at most {maximum} characters"
         )
-    if "\x00" in value or any(ord(character) < 32 for character in value):
-        raise ValueError(f"{field} contains a control character")
+    if "\x00" in value or any(
+        ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    ):
+        raise ValueError(f"{field} contains an invalid character")
     return value
 
 
