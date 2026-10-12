@@ -190,7 +190,9 @@ class ForkStackController:
         for owner, request in pending:
             key = (self._owner_token(owner), request.key)
             current = self._approval_handles.get(key)
-            if current is None or current[0] is not request:
+            # Policy reads reconstruct requests from the store; equivalent
+            # requests must keep the handle already shown to the user.
+            if current is None or current[0] != request:
                 self._approval_handle_counter += 1
                 handle = f"approval-{self._approval_handle_counter}"
                 self._approval_handles[key] = (request, handle)

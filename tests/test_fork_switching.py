@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
-from zeta.core.approval import ApprovalDecision, ApprovalRequest
-from zeta.protocol.types import ToolCall
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+from zeta.core.loop import AgentLoop
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import TextContent, ToolCall
+from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.fork_session import (
     ForkRuntimeMixin,
@@ -174,6 +181,75 @@ def test_approval_shortcut_submits_owner_qualified_handle() -> None:
     TUIApp._answer_first_pending(app, "approve")
 
     assert submitted == [("/approve approval-7", True)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verb", ["approve", "deny", "always"])
+async def test_live_approval_handle_survives_refresh_and_submission(
+    tmp_path: Path, verb: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executed: list[dict[str, object]] = []
+
+    def checked(arguments: dict[str, object]) -> str:
+        executed.append(arguments)
+        return "done"
+
+    call = ToolCall("pending-call", "checked", {})
+    store = ConversationStore(tmp_path / "sessions")
+    policy = ApprovalPolicy(default="ask", store=store)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn(content=[TextContent("finished")]),
+        ]
+    )
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            store,
+            tools={"checked": checked},
+            approval_policy=policy,
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+        ),
+        provider="codex",
+        model="offline",
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    controller = ForkStackController(app, pytest.fail)
+    app._active_session = app._make_session()
+    ready = asyncio.Event()
+    present = app._present_pending_approvals
+
+    def show_approvals() -> None:
+        present()
+        ready.set()
+
+    monkeypatch.setattr(app, "_present_pending_approvals", show_approvals)
+    submission = asyncio.create_task(app._handle_prompt_value("run the tool"))
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=5)
+        handle = next(iter(app._approval_units))
+        # Real policy reads reconstruct requests; the displayed handle must survive.
+        assert app.first_pending_approval_key == handle
+        controller.approvals_changed()
+        assert tuple(app._approval_units) == (handle,)
+
+        turn = app._submissions.provider_task
+        assert turn is not None
+        app._answer_first_pending(verb)
+        await asyncio.wait_for(turn, timeout=5)
+
+        expected = "deny" if verb == "deny" else "allow"
+        assert store.approval_states()[call.id][1] == expected
+        assert executed == ([] if verb == "deny" else [{}])
+        assert not controller.pending_approvals
+        assert not app._approval_units
+        assert bool(policy.always_allow) == (verb == "always")
+    finally:
+        await app.close()
+        await asyncio.gather(submission, return_exceptions=True)
 
 
 def test_visible_approval_card_is_removed_when_request_ends() -> None:
