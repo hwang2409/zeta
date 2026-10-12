@@ -120,6 +120,7 @@ class AgentTodoControl:
         self._refresh_requested = False
         self._closed = False
         self._refresh_error_logged = False
+        self._state_seen = False
 
     def snapshot(self, path: Path) -> TodoSnapshot | None:
         return self._snapshot if self._snapshot_path == path else None
@@ -133,15 +134,24 @@ class AgentTodoControl:
             self._snapshot = None
             self._snapshot_path = None
             self._refresh_error_logged = False
+            self._state_seen = False
             return changed
         if self._source is None or self._source.path != path:
             previous, self._source = self._source, None
             self._refresh_error_logged = False
+            self._state_seen = False
             if previous is not None:
                 await asyncio.to_thread(previous.close)
             self._source = AgentTodoSource(path, cwd=self._cwd)
         try:
             snapshot = await asyncio.to_thread(self._source.refresh)
+        except FileNotFoundError:
+            # A child without state yet has no todos. State that disappears
+            # after it was seen is a real failure.
+            if self._state_seen:
+                snapshot = TodoSnapshot((), False, unavailable=True)
+            else:
+                snapshot = TodoSnapshot((), False)
         except (SessionError, ConversationIntegrityError, OSError) as error:
             if not self._refresh_error_logged:
                 _LOGGER.warning("agent todo refresh failed for %s: %s", path, error)
@@ -149,6 +159,7 @@ class AgentTodoControl:
             snapshot = TodoSnapshot((), False, unavailable=True)
         else:
             self._refresh_error_logged = False
+            self._state_seen = True
         changed = snapshot != self._snapshot or path != self._snapshot_path
         self._snapshot = snapshot
         self._snapshot_path = path

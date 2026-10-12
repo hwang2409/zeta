@@ -523,6 +523,32 @@ def test_todo_child_refresh_and_corruption_is_visible_and_recovers(
     root.close()
 
 
+def test_todo_child_without_state_yet_shows_no_todos(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="new")
+    child.joinpath("session_state.json").unlink(missing_ok=True)
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    with caplog.at_level(logging.WARNING):
+        navigation.open_selected()
+        navigation.refresh(force=True)
+    snapshot = navigation.todo_snapshot()
+    assert snapshot is None or not snapshot.unavailable
+    assert not any("agent todo refresh failed" in r.message for r in caplog.records)
+
+    # Once state was seen, a disappeared state file is a failure.
+    _write_todos(child, [{"content": "child task", "status": "pending"}])
+    navigation.refresh(force=True)
+    assert not navigation.todo_snapshot().unavailable
+    child.joinpath("session_state.json").unlink()
+    navigation.refresh(force=True)
+    assert navigation.todo_snapshot().unavailable
+    navigation.close()
+    root.close()
+
+
 def test_list_is_quiet_without_children(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
 
