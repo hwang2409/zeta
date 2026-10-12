@@ -119,6 +119,12 @@ def test_tui_run_replays_transcript_only_on_initial_start(
         replay_count = 0
         read_count = 0
         watchdog_events: list[tuple[str, str]] = []
+        draft_flushes = 0
+
+        class Draft:
+            async def flush_pending(self) -> None:
+                nonlocal draft_flushes
+                draft_flushes += 1
 
         class Watchdog:
             async def close(self) -> None:
@@ -162,6 +168,8 @@ def test_tui_run_replays_transcript_only_on_initial_start(
         app._session = None
         app._active_session = None
         app._active_task = None
+        app._draft = Draft()
+        app._history = None
         app._fork_controller = None
         app._open_fork_target = None
         app._input_loop_active = False
@@ -183,6 +191,7 @@ def test_tui_run_replays_transcript_only_on_initial_start(
         assert getattr(first_result, "name", None) == "OPEN_CHILD"
         assert getattr(second_result, "name", None) == "EXIT"
         assert replay_count == 1
+        assert draft_flushes == 1
         assert watchdog_events == [
             ("start", "test-session"),
             ("close", "test-session"),

@@ -10171,7 +10171,7 @@ async def test_writer_processes_submission_racing_retirement_once_in_order(
 
     def gated_empty() -> bool:
         deciding.set()
-        assert release.wait(1)
+        release.wait()
         return original_empty()
 
     monkeypatch.setattr(writer._queue, "empty", gated_empty)
@@ -10185,7 +10185,8 @@ async def test_writer_processes_submission_racing_retirement_once_in_order(
     submitter = threading.Thread(target=submit_second)
     submitter.start()
     release.set()
-    await asyncio.to_thread(submitter.join, 1)
+    assert await asyncio.to_thread(submitted.wait, 1)
+    submitter.join()
 
     assert submitted.is_set()
     await writer.flush(timeout=1)
