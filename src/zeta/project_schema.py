@@ -50,8 +50,8 @@ def validate_project_record(
     project_id = validate_project_id(value["project_id"])
     if expected_id is not None and project_id != expected_id:
         raise ValueError("project ID does not match its path")
-    name = validate_project_text(value["name"], "name", MAX_NAME_LENGTH)
-    scope = validate_project_text(value["scope"], "scope", MAX_SCOPE_LENGTH)
+    name = _validate_stored_project_text(value["name"], "name", MAX_NAME_LENGTH)
+    scope = _validate_stored_project_text(value["scope"], "scope", MAX_SCOPE_LENGTH)
     created = _validate_timestamp(value["created_at"], "created_at")
     updated = _validate_timestamp(value["updated_at"], "updated_at")
     root = validate_project_root(value["canonical_integration_root"])
@@ -64,13 +64,33 @@ def validate_project_id(value: object) -> str:
     return value
 
 
-def validate_project_text(value: object, field: str, maximum: int) -> str:
+def validate_project_name(value: object) -> str:
+    name = validate_project_text(value, "name", MAX_NAME_LENGTH)
+    if PROJECT_ID_PATTERN.fullmatch(name):
+        raise ValueError("name cannot match a project ID")
+    return name
+
+
+def _validate_stored_project_text(value: object, field: str, maximum: int) -> str:
     if not isinstance(value, str) or not value or len(value) > maximum:
         raise ValueError(
             f"{field} must be a non-empty string of at most {maximum} characters"
         )
     if "\x00" in value or any(ord(character) < 32 for character in value):
         raise ValueError(f"{field} contains a control character")
+    return value
+
+
+def validate_project_text(value: object, field: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise ValueError(
+            f"{field} must be a non-empty string of at most {maximum} characters"
+        )
+    if "\x00" in value or any(
+        ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    ):
+        raise ValueError(f"{field} contains an invalid character")
     return value
 
 

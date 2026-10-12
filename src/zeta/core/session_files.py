@@ -115,7 +115,12 @@ def write_session_file(directory_fd: int, name: str, data: bytes) -> None:
         directory_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
     )
     try:
-        with os.fdopen(fd, "wb") as handle:
+        try:
+            stream = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
