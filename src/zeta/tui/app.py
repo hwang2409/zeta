@@ -137,7 +137,7 @@ def _tui_slash_commands() -> tuple[SlashCommand, ...]:
         SlashCommand(
             "permissions",
             lambda app, args: app.slash_permissions(args),
-            "show effective approval rules and session grants",
+            "show rules; revoke a session grant: /permissions revoke <grant>; clear all: /permissions clear",
         ),
     )
 

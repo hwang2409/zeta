@@ -159,6 +159,7 @@ def _keychain_claude_tokens() -> OAuthTokens | None:
                 "Claude Code-credentials",
                 "-w",
             ],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             check=False,
             env={"PATH": os.defpath},

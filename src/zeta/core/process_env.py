@@ -81,6 +81,10 @@ def subprocess_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]
     # Child processes launched by tools are distinguishable from direct user
     # commands. This blocks accidental model authorization through the shell.
     environment["ZETA_TOOL_SUBPROCESS"] = "1"
+    environment.setdefault("GIT_TERMINAL_PROMPT", "0")
+    environment.setdefault("DEBIAN_FRONTEND", "noninteractive")
+    environment.setdefault("PAGER", "cat")
+    environment.setdefault("GIT_PAGER", "cat")
     if overrides is not None:
         environment.update(overrides)
     return environment

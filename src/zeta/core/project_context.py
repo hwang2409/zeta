@@ -121,6 +121,7 @@ def _run_discovery_git(
         return subprocess.run(
             command,
             check=True,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             env=_git_env(),
@@ -316,6 +317,7 @@ def same_git_repository(left: str | Path, right: str | Path) -> bool:
                     "--git-common-dir",
                 ],
                 check=True,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 env=_git_env(),
@@ -350,6 +352,7 @@ def discover_repo_root(cwd: str | Path | None = None) -> Path:
         result = subprocess.run(
             ["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
             check=True,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             env=subprocess_env(),

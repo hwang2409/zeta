@@ -46,6 +46,15 @@ deny > ask > allow > default. The view reads the running policy, including CLI
 overrides, without changing permissions. It also shows tool availability
 restrictions separately.
 
+Use `/permissions revoke bash` or `/permissions revoke inbox(send)` to remove
+the exact session grant shown in the view. `/permissions clear` removes all
+session grants. These commands preserve configured rules (including identical
+allow rules), deny/ask rules, tool restrictions, and settings files. Future
+calls use the remaining policy; revoking a grant does not add a deny rule, so
+another allow rule or a default of `allow` can still permit the call. Pending
+approvals and already authorized calls are unchanged. Bare `/permissions`
+remains read-only.
+
 `/approve [key]` allows one pending request; `/deny [key]` denies it.
 `/always [key]` allows the whole tool or the request's resolved action for the
 running session, with **any arguments**. For example, a grant for `bash` covers
@@ -75,6 +84,22 @@ Command hooks in `~/.zeta/hooks.toml` execute host shell commands. They are
 enabled for unrestricted sessions, but a tool allowlist or denylist disables
 them unless the trusted operator passes `--allow-hooks` or sets global
 `allow_hooks = true`. Project settings cannot enable hooks.
+
+Each hook may set `on_error = "allow"` (the default) or `on_error = "deny"`.
+This setting applies only to `pre_tool` hooks: `deny` blocks the tool when the
+hook times out, cannot start, or exits with an error other than exit 2. Exit 2
+always denies and uses the hook's stderr as the reason. For example, a safety
+hook can fail closed:
+
+```toml
+[[hook]]
+event = "pre_tool"
+command = "my-safety-check"
+on_error = "deny"
+timeout_seconds = 5
+```
+
+Other hook events are non-blocking and reject `on_error` in the configuration.
 
 TUI `!` commands, custom `exec` slash commands, and inline shell spans use the
 registered `bash` tool, so tool policy applies to them. Python modules in

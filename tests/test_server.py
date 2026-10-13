@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import signal
 import socket
 import stat
@@ -1233,10 +1234,18 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
     tmp_path: Path,
 ) -> None:
     marker = tmp_path / "foreground-finished"
-    command = (
-        f"{sys.executable} -c \"import pathlib,time; time.sleep(0.5); "
-        f"pathlib.Path({str(marker)!r}).write_text('done')\""
+    release = tmp_path / "release-foreground"
+    pid_path = tmp_path / "foreground-pid"
+    script = (
+        "import os,pathlib,time\n"
+        f"pid_path = pathlib.Path({str(pid_path)!r})\n"
+        f"release = pathlib.Path({str(release)!r})\n"
+        f"marker = pathlib.Path({str(marker)!r})\n"
+        "pid_path.write_text(str(os.getpid()))\n"
+        "while not release.exists(): time.sleep(0.01)\n"
+        "marker.write_text('done')\n"
     )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
     backend = BackgroundChildAndForegroundToolBackend(command)
     server = ZetaServer(provider="codex",
         home=tmp_path,
@@ -1265,6 +1274,13 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
 
         await _request(reader, writer, 4, "send", {"text": "run slowly"})
         await _event(reader, "tool_start")
+        foreground_pid: int | None = None
+        async with asyncio.timeout(TIMEOUT):
+            while foreground_pid is None:
+                try:
+                    foreground_pid = int(pid_path.read_text())
+                except (FileNotFoundError, ValueError):
+                    await asyncio.sleep(0)
         frames = await _request(
             reader, writer, 5, "abort", {"scope": "foreground"}
         )
@@ -1276,7 +1292,14 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
         completion = await _event(reader, "tool_end")
         assert completion["tool_call"]["id"] == "background-child"
         assert completion["tool_result"]["content"].startswith("child complete")
-        await asyncio.sleep(0.6)
+        async with asyncio.timeout(TIMEOUT):
+            while True:
+                try:
+                    os.kill(foreground_pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.01)
+        release.touch()
         assert not marker.exists()
     finally:
         backend.release_child.set()
@@ -2217,8 +2240,14 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
             await _event(reader, "agent_end")
         assert server.runtime.policy is not None
         assert server.runtime.policy.pending_requests() == []
-        status = await _request(reader, writer, 6, "status")
-        assert status[-1]["result"]["state"] == "idle"
+        request_id = 6
+        async with asyncio.timeout(TIMEOUT):
+            while True:
+                status = await _request(reader, writer, request_id, "status")
+                if status[-1]["result"]["state"] == "idle":
+                    break
+                request_id += 1
+                await asyncio.sleep(0)
         assert terminal_children == {"agent-one", "agent-two"}
     finally:
         await _close(server, writer)
@@ -5189,7 +5218,9 @@ async def test_repeated_resume_does_not_duplicate_notification_turn(tmp_path: Pa
         await _request(reader, writer, 4, "resume", {"session_id": session_id})
         await _frames_until_event(reader, "turn_end")
         await _request(reader, writer, 5, "resume", {"session_id": session_id})
-        await asyncio.sleep(0.05)
+        async with asyncio.timeout(TIMEOUT):
+            while store.agent_notifications():
+                await asyncio.sleep(0)
         assert len(backend.calls) == 1
         assert store.agent_notifications() == []
     finally:

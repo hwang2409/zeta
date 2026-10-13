@@ -157,6 +157,7 @@ class ConversationChannel:
             killed_task_ids=killed_task_ids,
             killed_task_count=killed_task_count,
             killed_task_ids_truncated=killed_task_ids_truncated,
+            display_only=self._root_store is not parent_store,
         )
         if self._root_store is not parent_store:
             parent_store.append_agent_notification(
