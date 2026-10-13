@@ -4619,7 +4619,7 @@ async def test_parent_abort_after_child_turn_reports_completed_turns(
 
 @pytest.mark.asyncio
 async def test_typed_child_type_survives_cancellation_and_reopen(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = FakeBackend(
         [
@@ -4627,10 +4627,18 @@ async def test_typed_child_type_survives_cancellation_and_reopen(
             ScriptedTurn([TextContent("slow")], delay=5),
         ]
     )
+    lifecycle_started = threading.Event()
+    original_start = ConversationStore.start_agent_lifecycle
+
+    def observed_start(self, *args, **kwargs) -> None:
+        original_start(self, *args, **kwargs)
+        lifecycle_started.set()
+
+    monkeypatch.setattr(ConversationStore, "start_agent_lifecycle", observed_start)
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await asyncio.sleep(0.05)
+    assert await asyncio.to_thread(lifecycle_started.wait, 10)
     loop.abort()
 
     await task

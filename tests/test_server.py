@@ -2240,8 +2240,14 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
             await _event(reader, "agent_end")
         assert server.runtime.policy is not None
         assert server.runtime.policy.pending_requests() == []
-        status = await _request(reader, writer, 6, "status")
-        assert status[-1]["result"]["state"] == "idle"
+        request_id = 6
+        async with asyncio.timeout(TIMEOUT):
+            while True:
+                status = await _request(reader, writer, request_id, "status")
+                if status[-1]["result"]["state"] == "idle":
+                    break
+                request_id += 1
+                await asyncio.sleep(0)
         assert terminal_children == {"agent-one", "agent-two"}
     finally:
         await _close(server, writer)
