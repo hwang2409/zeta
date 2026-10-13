@@ -509,6 +509,33 @@ def test_live_and_replay_agent_notification_bytes_match(
     assert replay_bytes == live_bytes
 
 
+def test_display_only_agent_notification_remains_visible_in_tui_replay(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    entry = store.append_agent_notification(
+        "root:1:1",
+        child_session_path="/tmp/grandchild-session",
+        description="grandchild work",
+        status="completed",
+        text="grandchild complete",
+        display_only=True,
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    assert "grandchild work" in app._transcript.render(120)
+    assert store.is_agent_notification_presented_to_tui(entry.id)
+    assert store.agent_notifications() == []
+
+
 def test_padded_agent_notification_keeps_live_and_replay_bytes_equal(
     tmp_path: Path,
 ) -> None:
