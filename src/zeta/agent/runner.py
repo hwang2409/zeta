@@ -814,7 +814,9 @@ async def run_agent_tool(
             token_budget=child_budget,
             retained_tail=loop.context_assembler.retained_tail,
             system_prompt=_compose_child_system_prompt(
-                _child_base_system_prompt(loop, cwd_override, child_registry),
+                await asyncio.to_thread(
+                    _child_base_system_prompt, loop, cwd_override, child_registry
+                ),
                 preset,
             ),
             agent_catalog=child_registry.agent_catalog,

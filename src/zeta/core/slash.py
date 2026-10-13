@@ -558,7 +558,7 @@ class SlashSession(Protocol):
 
     def slash_implement(self, args: str) -> str | ModelInputEnvelope: ...
 
-    def slash_paste(self, args: str) -> str: ...
+    def slash_paste(self, args: str) -> str | Awaitable[str]: ...
 
     async def slash_compact(self) -> str: ...
 
@@ -1055,8 +1055,7 @@ async def _run_compact(session: SlashSession, args: str) -> str:
     return await session.slash_compact()
 
 
-
-def _run_paste(session: SlashSession, args: str) -> str:
+def _run_paste(session: SlashSession, args: str) -> str | Awaitable[str]:
     return session.slash_paste(args)
 
 

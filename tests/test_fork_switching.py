@@ -21,6 +21,7 @@ from zeta.tui.fork_session import (
     ForkStackController,
     OwnedApproval,
 )
+from zeta.tui.paste_runtime import PasteRuntime
 from zeta.tui.runtime_close import RuntimeCloseMixin
 from zeta.tui.slash_handlers.fork_view import ForkContext, ForkViewMixin
 
@@ -84,7 +85,7 @@ async def test_fork_switch_cancels_finder_and_restores_composer(
         app._finder_open()
     assert app._active_finder.finder_active
     app.request_open_fork("fork-123")
-    app._prepare_ui_session_change()
+    await app._prepare_ui_session_change()
     resumed = app._make_session()
 
     assert not app._active_finder.finder_active
@@ -148,9 +149,11 @@ def test_tui_run_replays_transcript_only_on_initial_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import asyncio
+    import weakref
 
     async def driver() -> None:
         app = object.__new__(TUIApp)
+        app._paste_runtime = PasteRuntime(weakref.proxy(app))
         replay_count = 0
         read_count = 0
         watchdog_events: list[tuple[str, str]] = []

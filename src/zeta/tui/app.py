@@ -17,7 +17,6 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import get_app
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.styles import DynamicStyle, Style
 from rich.console import Console, RenderableType
 from rich.padding import Padding
@@ -86,6 +85,7 @@ from .layout import (
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
+from .paste_runtime import PasteRuntime
 from .render import (
     render_markdown,
     render_thought,
@@ -224,6 +224,7 @@ class TUIApp(
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
+        self._paste_runtime = PasteRuntime(app)
         self._on_session_close = on_session_close
         self._init_runtime_close()
         self._init_fork_runtime()
@@ -624,18 +625,6 @@ class TUIApp(
         else:
             self._composer_insertions.append(token)
 
-    def _paste_from_keybinding(self, event: KeyPressEvent | None = None) -> None:
-        if self._reject_during_startup_replay("paste"):
-            return
-        result = self.slash_paste("")
-        if result.startswith("[Image #"):
-            if event is None:
-                self._insert_paste_token(result)
-            else:
-                event.current_buffer.insert_text(result)
-        elif result != "paste unavailable: clipboard does not contain an image":
-            self._print_system(result)
-
     def _abort_approval(self, request_id: str | tuple[str, str]) -> None:
         if self._approval_policy is not None:
             self._approval_policy.abort(request_id)
@@ -666,6 +655,7 @@ class TUIApp(
             return False
         if self._open_overlay_from_submit(value):
             return True
+        self._paste_runtime.advance_buffer_generation()
         super()._submit_input(value, internal=internal)
         return True
 
@@ -1179,7 +1169,7 @@ class TUIApp(
                 return self._run_result
             finally:
                 self._input_loop_active = False
-                self._prepare_ui_session_change()
+                await self._prepare_ui_session_change()
                 if prompt_task is not None:
                     if not prompt_task.done():
                         prompt_task.cancel()

@@ -49,7 +49,7 @@ from ._attachments import (
     _read_attachment,  # noqa: F401 - preserve the composer import
     attachment_refs,  # noqa: F401 - preserve the composer import
     build_user_message,
-    paste_image,
+    paste_image,  # noqa: F401 - preserve the composer import
 )
 from .completion import (
     ComposerCompleter,
@@ -62,6 +62,7 @@ from .key_bindings import (
     VimCursorShapeConfig,
     build_key_bindings,
 )
+from .paste_runtime import StagedImage
 from .render import is_retryable_error, render_event
 from .user import displayed_user_text, user_message
 
@@ -482,25 +483,30 @@ class ComposerAttachmentMixin:
             return value
         return f".../{path.name}"[-80:]
 
-    def slash_paste(self, args: str) -> str:
-        if args.strip():
-            return "paste unavailable: /paste does not take arguments"
-        try:
-            path = paste_image(
-                self.loop.store.session_dir, directory_fd=self.loop.store.directory_fd
-            )
-            attachment = build_user_message(
-                "paste", self.loop.store.cwd, (path,), session_store=self.loop.store
-            ).content[1]
-        except AttachmentError as exc:
-            return f"paste unavailable: {exc}"
-        if not isinstance(attachment, ImageContent):
-            return "paste unavailable: clipboard image could not be decoded"
+    def _finish_image_paste(self, staged: StagedImage) -> str:
         token = f"[Image #{self._next_image_token}]"
         self._next_image_token += 1
-        self._pending_attachments.append(path)
-        self._pending_attachment_tokens[token] = path
+        self._pending_attachments.append(staged.path)
+        self._pending_attachment_tokens[token] = staged.path
         return token
+
+    async def slash_paste(self, args: str) -> str:
+        if args.strip():
+            return "paste unavailable: /paste does not take arguments"
+        session = self._active_session
+        buffer = session.app.current_buffer if session is not None else None
+        return await self._paste_runtime.paste(buffer)
+
+    async def paste_from_clipboard(self) -> str:
+        """Stage and register one clipboard image through the ordered paste module."""
+
+        return await self._paste_runtime.paste()
+
+    def _paste_from_keybinding(self, event: Any | None = None) -> None:
+        if self._reject_during_startup_replay("paste"):
+            return
+        buffer = event.current_buffer if event is not None else None
+        self._paste_runtime.start(buffer)
 
     def _delete_staged_attachment(self, path: Path) -> None:
         if (

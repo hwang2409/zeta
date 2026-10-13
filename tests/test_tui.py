@@ -6819,7 +6819,7 @@ async def test_ctrl_v_paste_waits_for_startup_replay(
         return staged
 
     monkeypatch.setattr(app, "_rebuild_transcript_async", delayed_replay)
-    monkeypatch.setattr("zeta.tui.composer.paste_image", paste_image)
+    monkeypatch.setattr("zeta.tui.paste_runtime.paste_image", paste_image)
     with create_pipe_input() as pipe:
         session = app._make_session()
         session.app.input = pipe
@@ -11065,8 +11065,8 @@ async def test_undo_restores_next_image_token_after_deleted_token(
     app.undo_sent_turn()
     await asyncio.gather(app._active_task, return_exceptions=True)
 
-    monkeypatch.setattr("zeta.tui.composer.paste_image", lambda _, **kwargs: pasted)
-    assert app.slash_paste("") == "[Image #3]"
+    monkeypatch.setattr("zeta.tui.paste_runtime.paste_image", lambda _, **kwargs: pasted)
+    assert await app.slash_paste("") == "[Image #3]"
     assert app._pending_attachment_tokens == {
         "[Image #2]": second,
         "[Image #3]": pasted,

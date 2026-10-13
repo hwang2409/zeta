@@ -819,6 +819,65 @@ class TranscriptVirtualMixin:
             self._selection = None
         return None
 
+    def _virtual_copy_material(
+        self, anchored: AnchoredSelection
+    ) -> tuple[Selection | None, list[str]]:
+        keyed_units = {
+            unit.key: index for index, unit in enumerate(self._units) if unit is not None
+        }
+        selected_indexes = [
+            keyed_units[anchor.unit_key]
+            for anchor in (anchored.anchor, anchored.extent)
+            if anchor.unit_key in keyed_units
+        ]
+        if not selected_indexes:
+            return None, []
+        first, last = min(selected_indexes), max(selected_indexes)
+        raw_lines: list[tuple[str, int | None, int]] = []
+        for unit in self._units[first : last + 1]:
+            if unit is None:
+                raw_lines.append(("", None, 0))
+                continue
+            rendered_lines, offsets = self._unit_locations(unit, self._content_width)
+            raw_lines.extend(
+                (line, unit.key, offset)
+                for line, offset in zip(rendered_lines, offsets)
+            )
+        keyed = [(key, offset) for _, key, offset in raw_lines]
+
+        def local_anchor(anchor: SelectionAnchor) -> SelectionAnchor:
+            candidates = [
+                index
+                for index, location in enumerate(keyed)
+                if location == (anchor.unit_key, anchor.text_offset)
+            ]
+            line = candidates[0] if candidates else 0
+            return SelectionAnchor(
+                anchor.unit_key, anchor.text_offset, line, anchor.column
+            )
+
+        local = AnchoredSelection(
+            local_anchor(anchored.anchor),
+            local_anchor(anchored.extent),
+            anchored.dragging,
+        )
+        selection = local.resolve(keyed)
+        leading = 0
+        if first == 0:
+            while raw_lines and not raw_lines[0][0].strip():
+                raw_lines.pop(0)
+                leading += 1
+        if last == len(self._units) - 1:
+            while raw_lines and not raw_lines[-1][0]:
+                raw_lines.pop()
+        if selection is not None and leading:
+            selection = Selection(
+                (selection.anchor[0] - leading, selection.anchor[1]),
+                (selection.extent[0] - leading, selection.extent[1]),
+                selection.dragging,
+            )
+        return selection, [line for line, _, _ in raw_lines]
+
     def _selection_for_copy(
         self, anchored: AnchoredSelection | None = None
     ) -> Selection | None:
@@ -827,24 +886,27 @@ class TranscriptVirtualMixin:
             return None
         if not self._uses_virtual_history():
             return anchored.resolve(self._keyed_locations())
-        keyed = [
-            (unit.key if unit is not None else None, offset)
-            for unit, offset in self._locations(self._content_width)
-        ]
-        return anchored.resolve(keyed)
+        return self._virtual_copy_material(anchored)[0]
 
     def selection_text(self) -> str:
-        """Materialize virtual history only when the selected text is copied."""
+        """Render only the selected virtual units when text is copied."""
 
-        selection = self._selection_for_copy()
+        if self._selection is None:
+            return ""
+        if self._uses_virtual_history():
+            selection, plain_lines = self._virtual_copy_material(self._selection)
+            lines = plain_lines
+        else:
+            selection = self._selection_for_copy()
+            lines = [
+                "".join(fragment[1] for fragment in line)
+                for line in self._parsed_lines(self._content_width)
+            ]
         if selection is None:
             return ""
-        lines = self._parsed_lines(self._content_width)
 
         def line_text(index: int) -> str | None:
-            if index < 0 or index >= len(lines):
-                return None
-            return "".join(fragment[1] for fragment in lines[index])
+            return lines[index] if 0 <= index < len(lines) else None
 
         return selection.text(line_text)
 

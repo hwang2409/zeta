@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 from io import StringIO
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from prompt_toolkit.application.current import set_app
@@ -26,7 +27,13 @@ from zeta.tui.composer import ClipboardError, clipboard_command, copy_to_clipboa
 from zeta.tui.key_bindings import MOUSE_OFF
 from zeta.tui.render import render_error_card
 from zeta.tui.theme import active_palette
-from zeta.tui.transcript import Selection, TranscriptWidget, highlight_fragments
+from zeta.tui.transcript import (
+    AnchoredSelection,
+    Selection,
+    SelectionAnchor,
+    TranscriptWidget,
+    highlight_fragments,
+)
 
 SELECTION_STYLE = f"bg:{active_palette().search_bg}"
 
@@ -225,6 +232,53 @@ def test_selection_is_dropped_only_when_its_unit_leaves() -> None:
     # A move or release with nothing in flight is not ours to handle.
     assert transcript.mouse_handler(_event(MouseEventType.MOUSE_MOVE, 1, 1)) is NotImplemented
     assert transcript.mouse_handler(_event(MouseEventType.MOUSE_UP, 1, 1)) is NotImplemented
+
+
+@pytest.mark.parametrize(
+    ("values", "start", "end"),
+    [
+        (("alpha\n\n",), (0, 0, 1), (0, 5, 0)),
+        (("alpha", "omega\n\n"), (0, 0, 2), (1, 5, 0)),
+        (("0123456789abcdef", "omega\n\n"), (0, 5, 2), (1, 5, 0)),
+        (("0123456789abcdef",), (0, 5, 1), (0, 10, 2)),
+    ],
+)
+def test_virtual_selection_copy_matches_full_render(
+    values: tuple[str, ...],
+    start: tuple[int, int, int],
+    end: tuple[int, int, int],
+) -> None:
+    def selected_text(*, virtual: bool) -> str:
+        transcript = TranscriptWidget()
+        if virtual:
+            for index in range(128):
+                transcript.append(Text(f"history {index}"))
+        units = [transcript.append(Text(value)) for value in values]
+        transcript.create_content(8, 6)
+
+        def anchor(spec: tuple[int, int, int]) -> SelectionAnchor:
+            unit_index, offset, column = spec
+            return SelectionAnchor(units[unit_index].key, offset, 0, column)
+
+        transcript._selection = AnchoredSelection(anchor(start), anchor(end), False)
+        return transcript.selection_text()
+
+    assert selected_text(virtual=True) == selected_text(virtual=False)
+
+
+def test_virtual_copy_renders_only_units_in_selected_range() -> None:
+    transcript = TranscriptWidget()
+    for index in range(1_000):
+        transcript.append(Text(f"selection line {index}"))
+    transcript.create_content(40, 10)
+    rendered = Mock(wraps=transcript._render_unit)
+    transcript._render_unit = rendered
+    transcript.set_copy_handler(lambda text: "copied")
+
+    _drag(transcript, (0, 2), (5, 4))
+
+    assert transcript.selection_text()
+    assert rendered.call_count <= 9
 
 
 def test_virtual_drag_can_scroll_across_multiple_screens_before_copy() -> None:

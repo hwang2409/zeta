@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
+import zeta.agent.runner as agent_runner_module
 import zeta.runtime.execution as execution_module
 import zeta.runtime.loop.agent as agent_loop_module
 import zeta.tools.agent_send as agent_send_module
@@ -7052,7 +7053,9 @@ async def test_child_cwd_replacement_fails_closed_for_all_tools(
 
 
 @pytest.mark.asyncio
-async def test_agent_cwd_sets_child_bash_session_cwd(tmp_path: Path) -> None:
+async def test_agent_cwd_sets_child_bash_session_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     parent_dir = tmp_path / "primary"
     parent_dir.mkdir()
     worktree = tmp_path / "worktree"
@@ -7069,9 +7072,19 @@ async def test_agent_cwd_sets_child_bash_session_cwd(tmp_path: Path) -> None:
         ),
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop_thread = threading.get_ident()
+    discovery_threads: list[int] = []
+    real_discover = agent_runner_module.discover_repo_root
+
+    def discover_repo_root(cwd: str | Path | None = None) -> Path:
+        discovery_threads.append(threading.get_ident())
+        return real_discover(cwd)
+
+    monkeypatch.setattr(agent_runner_module, "discover_repo_root", discover_repo_root)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
+    assert discovery_threads and discovery_threads != [loop_thread]
     assert (worktree / "bash_marker").exists()
     assert not (parent_dir / "bash_marker").exists()
     await loop.close()
