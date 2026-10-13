@@ -132,6 +132,7 @@ class _Entry:
     acknowledged: asyncio.Future[None] | None = None
     undo_requested: bool = False
     denied: bool = False
+    printed: bool = False
 
 
 class SubmissionPipeline:
@@ -796,7 +797,9 @@ class SubmissionPipeline:
             if getattr(block, "path", None) is None and hasattr(block, "text")
         )
         entry.state = SubmissionState.DISPATCHED
-        self._host._print_user(entry.message)
+        if not entry.printed:
+            self._host._print_user(entry.message)
+            entry.printed = True
         self._host._set_undo_candidate(entry.candidate)
         self._dispatch_provider(
             entry, user_text,
@@ -824,22 +827,12 @@ class SubmissionPipeline:
             user_message=user_message,
             persist_user_message=persist_user_message,
             notification=notification,
-            on_done=lambda submission, task: self._send(
-                _ProviderDone(submission, task)
-            ),
+            on_done=lambda submission, task: self._send(_ProviderDone(submission, task)),
         )
 
     def _dispatch_steer_entries(self) -> None:
-        """Hand READY steer entries to ``loop.steer`` while a turn is active.
-
-        The pipeline still owns lifecycle bookkeeping (undo candidate,
-        transcript print, acknowledgement), so the steer path mirrors the
-        fresh-turn dispatch without invoking ``_start_turn``.
-        """
-
         if self._provider_entry is not None and self._provider_entry.message is None:
             return
-
         ready = sorted(
             (
                 entry
@@ -854,11 +847,10 @@ class SubmissionPipeline:
         for entry in ready:
             entry.state = SubmissionState.DISPATCHED
             self._host._print_user(entry.message)
+            entry.printed = True
             self._host._set_undo_candidate(entry.candidate)
             self._host.loop.steer(entry.message)
-            self._host._release_attachment_paths(
-                entry.submission.attachment_paths
-            )
+            self._host._release_attachment_paths(entry.submission.attachment_paths)
             self._ack_entry(entry)
 
     def _retry_oldest_ready(self) -> None:
@@ -889,16 +881,21 @@ class SubmissionPipeline:
             or self._provider_task is not message.task
         ):
             return
-        # A steer enqueued after the last drain point of a tool-less final
-        # turn has no next provider call to land into. Drop it here (matching
-        # the abort path) so it can't resurface at the top of the next fresh
-        # turn, and tell the user their echoed steer was not delivered.
-        if self._provider_entry.message is not None and self._host.loop.has_pending_steering:
+        pending = self._host.loop.store.pending_client_steering()
+        if self._provider_entry.message is not None and pending is not None:
+            entries = sorted(self._entries.values(), key=lambda item: item.submission.id)
+            late_entries = [
+                entry
+                for entry in entries
+                if entry.state is SubmissionState.DISPATCHED
+                and entry.submission.steer
+                and entry is not self._provider_entry
+            ][-len(pending.messages) :]
             self._host.loop.clear_pending_steering("turn_end")
-            self._host._print_system(
-                "steer arrived after the turn ended; not delivered "
-                "(resend if still wanted)"
-            )
+            for entry in late_entries:
+                entry.submission = replace(entry.submission, steer=False)
+                entry.signal = self._new_signal()
+                entry.state = SubmissionState.READY
         self._ack_entry(self._provider_entry)
         self._provider_entry, self._provider_task = None, None
 
@@ -1181,6 +1178,9 @@ class SubmissionPipeline:
             if (
                 entry is self._provider_entry
                 or entry.state in self._NONTERMINAL
+                or self._provider_entry is not None
+                and entry.state is SubmissionState.DISPATCHED
+                and entry.submission.steer
                 or entry.child_task is not None
                 or entry.completion is not None
                 and not entry.completion.done()

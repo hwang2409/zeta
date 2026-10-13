@@ -383,10 +383,14 @@ class TextOnlyBackend(CompletionBackend):
     but BEFORE MESSAGE_END fires.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, block_turn2: bool = False) -> None:
         self.calls: list[list[Message]] = []
         self.turn1_streaming = asyncio.Event()
         self.release_turn1 = asyncio.Event()
+        self.turn2_streaming = asyncio.Event()
+        self.release_turn2 = asyncio.Event()
+        if not block_turn2:
+            self.release_turn2.set()
 
     async def complete(
         self,
@@ -400,6 +404,9 @@ class TextOnlyBackend(CompletionBackend):
         if index == 0:
             self.turn1_streaming.set()
             await self.release_turn1.wait()
+        elif index == 1:
+            self.turn2_streaming.set()
+            await self.release_turn2.wait()
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [text]),
@@ -408,14 +415,9 @@ class TextOnlyBackend(CompletionBackend):
 
 
 @pytest.mark.asyncio
-async def test_toolless_turn_drops_orphan_steer_and_notifies(
+async def test_toolless_turn_delivers_late_steer_as_next_turn(
     tmp_path: Path,
 ) -> None:
-    """A steer enqueued during a tool-less turn has no next provider call to
-    drain into. The pipeline must clear it on turn end AND print a system
-    notice, so it can never resurface at the top of the next fresh turn.
-    """
-
     backend = TextOnlyBackend()
     store = ConversationStore(tmp_path / "sessions")
     output = StringIO()
@@ -428,39 +430,121 @@ async def test_toolless_turn_drops_orphan_steer_and_notifies(
 
     app._submit_input("prompt")
     await backend.turn1_streaming.wait()
-    app._submit_input("orphan")
+    app._submit_input("late")
     await _wait(lambda: app.loop.has_pending_steering)
     backend.release_turn1.set()
-    await _wait(lambda: not app.loop.has_pending_steering)
-    if app._active_task is not None:
-        await _drive(app._active_task)
+    await _wait(lambda: len(backend.calls) == 2)
+    await _wait(lambda: not app._submissions.active)
 
-    # The queue was cleared on turn end, so no orphan lingers.
-    assert app.loop.has_pending_steering is False
-    # The user was told their echoed steer was not delivered.
-    assert "steer arrived after the turn ended" in output.getvalue()
-
-    # A follow-up fresh prompt reaches the provider WITHOUT the orphan tail —
-    # the fresh user message is the last message the provider saw.
-    app._submit_input("fresh")
-    await _wait(lambda: len(backend.calls) >= 2)
-    if app._active_task is not None:
-        await _drive(app._active_task)
-
-    second_call = backend.calls[1]
-    last_user_texts = [
+    user_texts = [
         block.text
-        for block in second_call[-1].content
+        for message in store.messages()
+        if message.role is MessageRole.USER
+        for block in message.content
         if isinstance(block, TextContent)
     ]
-    assert second_call[-1].role is MessageRole.USER
-    assert last_user_texts == ["fresh"]
-    # And "orphan" never made it into any provider call's context.
-    for call_messages in backend.calls:
-        for message in call_messages:
-            for block in message.content:
-                if isinstance(block, TextContent):
-                    assert block.text != "orphan"
+    assert user_texts == ["prompt", "late"]
+    assert "steer arrived after the turn ended" not in output.getvalue()
+    assert output.getvalue().count("late") == 1
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_steer_submitted_as_provider_finishes_is_delivered_once(
+    tmp_path: Path,
+) -> None:
+    backend = TextOnlyBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, store, max_turns=3, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    app._submit_input("prompt")
+    await backend.turn1_streaming.wait()
+    backend.release_turn1.set()
+    app._submit_input("racing")
+    await _wait(lambda: len(backend.calls) == 2)
+    await _wait(lambda: not app._submissions.active)
+
+    user_texts = [
+        block.text
+        for message in store.messages()
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+    assert user_texts == ["prompt", "racing"]
+    assert output.getvalue().count("racing") == 1
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_toolless_turn_delivers_two_late_steers_in_order(
+    tmp_path: Path,
+) -> None:
+    backend = TextOnlyBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store, max_turns=3, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._submit_input("prompt")
+    await backend.turn1_streaming.wait()
+    app._submit_input("late one")
+    app._submit_input("late two")
+    await _wait(lambda: app.loop.has_pending_steering)
+    backend.release_turn1.set()
+    await _wait(lambda: len(backend.calls) == 3)
+    await _wait(lambda: not app._submissions.active)
+
+    user_texts = [
+        block.text
+        for message in store.messages()
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+    assert user_texts == ["prompt", "late one", "late two"]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_during_late_steer_auto_turn_restores_steer(
+    tmp_path: Path,
+) -> None:
+    backend = TextOnlyBackend(block_turn2=True)
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            max_turns=3,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    session = app._make_session()
+    app._active_session = session
+
+    app._submit_input("prompt")
+    await backend.turn1_streaming.wait()
+    app._submit_input("late")
+    await _wait(lambda: app.loop.has_pending_steering)
+    backend.release_turn1.set()
+    await backend.turn2_streaming.wait()
+
+    app.undo_sent_turn()
+    await _wait(lambda: session.app.current_buffer.text == "late")
+
+    assert session.app.current_buffer.text == "late"
     await app.loop.close()
 
 
