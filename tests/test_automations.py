@@ -1282,10 +1282,11 @@ def test_daemon_reports_bind_failure_and_exits(tmp_path: Path) -> None:
             capture_output=True,
             text=True,
             env={**os.environ, "ZETA_HOME": str(tmp_path)},
-            timeout=5,
+            # Bound a hung daemon, allowing cold CLI imports on busy CI workers.
+            timeout=30,
             check=False,
         )
-    assert process.returncode == 1
+    assert process.returncode == 1, (process.stdout, process.stderr)
     assert (
         f"failed to bind webhook receiver on 127.0.0.1:{port}: "
         in process.stderr

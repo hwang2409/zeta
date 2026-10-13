@@ -2102,24 +2102,35 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
 
 
 @pytest.mark.asyncio
-async def test_follow_up_wakes_worker_waiting_in_finish_gate(tmp_path: Path) -> None:
+async def test_follow_up_wakes_worker_waiting_in_finish_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     backend = FollowUpFinishGateBackend()
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.gate_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.gate_started.wait(), timeout=10)
+    waiting_for_follow_up = asyncio.Event()
+    channel = loop._background_owner.conversation_channel
+    original_wait = channel.wait
+
+    async def wait_for_follow_up(instance_id: str) -> None:
+        waiting_for_follow_up.set()
+        await original_wait(instance_id)
+
+    monkeypatch.setattr(channel, "wait", wait_for_follow_up)
     backend.release_gate_turn.set()
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(waiting_for_follow_up.wait(), timeout=10)
     child_handle = next(iter(store.agent_children()))
     assert send_to_run(
         store,
         child_handle,
         "follow-up while waiting",
-        channel=loop._background_owner.conversation_channel,
+        channel=channel,
     ) is None
 
-    await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=0.1)
+    await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=10)
     assert backend.follow_up_prompts == ["follow-up while waiting"]
     await _wait_for_notification(store, "completed")
     await loop.close()
@@ -2297,9 +2308,9 @@ async def test_child_finish_gate_text_handoff_is_not_control_signal(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=10)
     backend.release_grandchild.set()
-    await asyncio.wait_for(task, timeout=2)
+    await asyncio.wait_for(task, timeout=10)
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     lifecycle = child_store.agent_lifecycle()
@@ -4014,10 +4025,19 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
     loop.set_background_wake_callback(root_woke.set)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await _wait_for_notification(store, "completed")
-    await asyncio.wait_for(root_woke.wait(), timeout=1)
+    for _ in range(100):
+        if store.agent_notifications(pending_only=False):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("missing grandchild notification")
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    root_notifications = store.agent_notifications(pending_only=False)
+    assert len(root_notifications) == 1
+    assert root_notifications[0].data["display_only"] is True
+    assert store.agent_notifications() == []
+    assert not root_woke.is_set()
     nested_result = next(
         message.tool_result for message in child_store.messages() if message.tool_result
     )
@@ -4608,7 +4628,7 @@ async def test_parent_abort_after_child_turn_reports_completed_turns(
 
 @pytest.mark.asyncio
 async def test_typed_child_type_survives_cancellation_and_reopen(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = FakeBackend(
         [
@@ -4616,10 +4636,18 @@ async def test_typed_child_type_survives_cancellation_and_reopen(
             ScriptedTurn([TextContent("slow")], delay=5),
         ]
     )
+    lifecycle_started = threading.Event()
+    original_start = ConversationStore.start_agent_lifecycle
+
+    def observed_start(self, *args, **kwargs) -> None:
+        original_start(self, *args, **kwargs)
+        lifecycle_started.set()
+
+    monkeypatch.setattr(ConversationStore, "start_agent_lifecycle", observed_start)
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await asyncio.sleep(0.05)
+    assert await asyncio.to_thread(lifecycle_started.wait, 10)
     loop.abort()
 
     await task

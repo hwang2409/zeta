@@ -290,7 +290,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self._rule_resolver: Callable[[str | ApprovalRule], ApprovalRule] | None = None
         self._rule_sources: dict[str, tuple[str | ApprovalRule, ...]] = {}
         self._notices: list[str] = []
-        self._session_allow: set[ApprovalRule] = set()
+        self._session_allow: frozenset[ApprovalRule] = frozenset()
         self.always_allow = always_allow
         self.always_deny = always_deny
         self.always_ask = always_ask
@@ -326,17 +326,29 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         rule = request.always_allow_rule()
         if self._rule_resolver is not None:
             rule = self._rule_resolver(rule)
-        self.always_allow = self.always_allow | {rule}
-        if rule not in self.always_allow:
-            raise ValueError(f"approval rule was not accepted: {rule}")
-        self._session_allow.add(rule)
+        self._session_allow = self._session_allow | {rule}
         return rule
 
     @property
     def session_allow(self) -> frozenset[ApprovalRule]:
         """Currently accepted allow rules added by a session approval."""
 
-        return self.always_allow.intersection(self._session_allow)
+        return self._session_allow
+
+    def revoke_session_allow(self, rule: ApprovalRule) -> bool:
+        """Remove one session grant without changing configured rules or decisions."""
+
+        if rule not in self._session_allow:
+            return False
+        self._session_allow = self._session_allow - {rule}
+        return True
+
+    def clear_session_allow(self) -> frozenset[ApprovalRule]:
+        """Remove and return all session grants, preserving configured rules."""
+
+        removed = self._session_allow
+        self._session_allow = frozenset()
+        return removed
 
     # The three rule sets accept rule text or parsed rules and always hold
     # parsed rules, so ``policy.always_ask = frozenset()`` keeps neutralising
@@ -346,11 +358,18 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self, tier: str, rules: Iterable[str | ApprovalRule]
     ) -> None:
         source = tuple(rules)
+        resolved = self._resolve_rules(source)
+        self._rule_sources[tier] = source
+        setattr(self, f"_{tier}", resolved)
+
+    def _resolve_rules(
+        self, source: Iterable[str | ApprovalRule]
+    ) -> frozenset[ApprovalRule]:
+        source = tuple(source)
         parsed = tuple(
             item if isinstance(item, ApprovalRule) else parse_approval_rule(item)
             for item in source
         )
-        self._rule_sources[tier] = source
         resolved: set[ApprovalRule] = set()
         for item, rule in zip(source, parsed, strict=True):
             try:
@@ -362,7 +381,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                     self._notices.append(notice)
                 continue
             resolved.add(rule)
-        setattr(self, f"_{tier}", frozenset(resolved))
+        return frozenset(resolved)
 
     def bind_rule_resolver(
         self, resolver: Callable[[str | ApprovalRule], ApprovalRule]
@@ -372,14 +391,20 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self._rule_resolver = resolver
         for tier in ("always_deny", "always_ask", "always_allow"):
             self._set_rules(tier, self._rule_sources.get(tier, ()))
+        self._session_allow = self._resolve_rules(self._session_allow)
 
     @property
     def always_allow(self) -> frozenset[ApprovalRule]:
-        return self._always_allow
+        """Effective allow rules from configuration and session grants."""
+
+        return self._always_allow | self._session_allow
 
     @always_allow.setter
     def always_allow(self, rules: Iterable[str | ApprovalRule]) -> None:
+        """Replace the complete allow set, discarding previous session grants."""
+
         self._set_rules("always_allow", rules)
+        self._session_allow = frozenset()
 
     @property
     def always_deny(self) -> frozenset[ApprovalRule]:
@@ -410,7 +435,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             return ApprovalDecision.DENY
         if self._matches(self._always_ask, capability, unreadable=True):
             return ApprovalDecision.ASK
-        if self._matches(self._always_allow, capability, unreadable=False):
+        if self._matches(self.always_allow, capability, unreadable=False):
             return ApprovalDecision.ALLOW
         return self.default
 
@@ -469,7 +494,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             tiers = (
                 (self._always_deny, ApprovalDecision.DENY, True),
                 (self._always_ask, ApprovalDecision.ASK, True),
-                (self._always_allow, ApprovalDecision.ALLOW, False),
+                (self.always_allow, ApprovalDecision.ALLOW, False),
             )
             for rules, decision, unreadable in tiers:
                 rule = self._matching_child_path_rule(
@@ -501,7 +526,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             same_cwd = same_physical_path(parent_cwd, child_cwd)
             matching_rules = [
                 rule
-                for rule in self._always_allow
+                for rule in self.always_allow
                 if (rule.tool != capability.tool or rule.pattern is None or same_cwd)
                 and self._matches(
                     frozenset({rule}), capability, unreadable=False

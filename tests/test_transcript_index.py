@@ -734,34 +734,21 @@ async def test_append_runs_off_event_loop(
     (source.session_dir / "meta.json").write_text(
         json.dumps({"project_id": PROJECT_A}), encoding="utf-8"
     )
-    original_init = TranscriptIndex.__init__
+    event_loop_thread = threading.get_ident()
+    refresh_threads: list[int] = []
+    original_refresh = index_module._refresh_sources
 
-    def slow_init(self, *args, **kwargs):
-        import time
+    def observed_refresh(*args) -> None:
+        refresh_threads.append(threading.get_ident())
+        original_refresh(*args)
 
-        time.sleep(0.06)
-        original_init(self, *args, **kwargs)
-
-    monkeypatch.setattr(TranscriptIndex, "__init__", slow_init)
-    gaps: list[float] = []
-
-    async def ticker() -> None:
-        previous = asyncio.get_running_loop().time()
-        for _ in range(15):
-            await asyncio.sleep(0.002)
-            now = asyncio.get_running_loop().time()
-            gaps.append(now - previous)
-            previous = now
-
-    ticker_task = asyncio.create_task(ticker())
-    await asyncio.sleep(0)
-    await asyncio.gather(
-        refresh_transcript_index(
-            tmp_path / "projects", PROJECT_A, source.session_id, source.session_dir
-        ),
-        ticker_task,
+    monkeypatch.setattr(index_module, "_refresh_sources", observed_refresh)
+    await refresh_transcript_index(
+        tmp_path / "projects", PROJECT_A, source.session_id, source.session_dir
     )
-    assert max(gaps) < 0.01
+
+    assert refresh_threads
+    assert event_loop_thread not in refresh_threads
 
 
 def test_mid_file_rewrite_outside_any_window_forces_reread(tmp_path: Path) -> None:

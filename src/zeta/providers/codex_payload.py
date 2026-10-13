@@ -12,6 +12,7 @@ from ..media.images import (
     image_description,
     image_signature_matches,
 )
+from ..protocol.tool_batches import without_incomplete_tool_batches
 from ..protocol.types import (
     ContentBlock,
     ImageContent,
@@ -135,6 +136,7 @@ def build_responses_payload(
     Codex receives tool images as a following user image input. The function
     output remains a text receipt because it cannot carry image content here.
     """
+    messages = without_incomplete_tool_batches(messages)
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
     system_at_head = True

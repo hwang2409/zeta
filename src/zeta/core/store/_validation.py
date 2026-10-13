@@ -44,6 +44,7 @@ def validate_agent_notification_data(data: Mapping[str, Any]) -> None:
         or not data["text"]
         or len(data["text"]) > MAX_AGENT_NOTIFICATION_TEXT
         or ("stats" in data and not valid_agent_stats(data["stats"]))
+        or ("display_only" in data and data["display_only"] is not True)
         or not valid_killed_task_fields(data)
     ):
         raise ValueError("invalid agent notification")
