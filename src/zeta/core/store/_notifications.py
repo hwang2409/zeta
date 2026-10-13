@@ -48,6 +48,7 @@ class NotificationStateMixin:
         killed_task_count: int | None = None,
         killed_task_ids_truncated: bool = False,
         background_metadata: tuple[str, str] | None = None,
+        display_only: bool = False,
     ) -> dict[str, Any]:
         if (
             not child_instance_id
@@ -57,6 +58,7 @@ class NotificationStateMixin:
             or not text
             or type(text) is not str
             or len(text) > MAX_AGENT_NOTIFICATION_TEXT
+            or type(display_only) is not bool
         ):
             raise ValueError("invalid agent notification")
         if stats is not None and not valid_agent_stats(stats):
@@ -86,6 +88,8 @@ class NotificationStateMixin:
             data["killed_task_ids_truncated"] = killed_task_ids_truncated
         if background_metadata is not None:
             data["background_owner"], data["background_phase"] = background_metadata
+        if display_only:
+            data["display_only"] = True
         validate_agent_notification_data(data)
         return data
 
@@ -289,6 +293,7 @@ class NotificationStateMixin:
         killed_task_count: int | None = None,
         killed_task_ids_truncated: bool = False,
         background_metadata: tuple[str, str] | None = None,
+        display_only: bool = False,
     ) -> ConversationEntry:
         """Persist one agent-completion notification (legacy API)."""
         data = self._agent_notification_data(
@@ -302,6 +307,7 @@ class NotificationStateMixin:
             killed_task_count=killed_task_count,
             killed_task_ids_truncated=killed_task_ids_truncated,
             background_metadata=background_metadata,
+            display_only=display_only,
         )
         return self._append_row("notification", data)
 
@@ -422,7 +428,11 @@ class NotificationStateMixin:
         return [
             self._snapshot_entry(entry)
             for notification_id, entry in self._active_notifications.items()
-            if not pending_only or notification_id not in self._active_notification_acks
+            if not pending_only
+            or (
+                notification_id not in self._active_notification_acks
+                and entry.data.get("display_only") is not True
+            )
         ]
 
     def is_agent_notification_presented_to_tui(
