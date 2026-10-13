@@ -58,6 +58,7 @@ class NotificationStateMixin:
             or not text
             or type(text) is not str
             or len(text) > MAX_AGENT_NOTIFICATION_TEXT
+            or type(display_only) is not bool
         ):
             raise ValueError("invalid agent notification")
         if stats is not None and not valid_agent_stats(stats):

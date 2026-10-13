@@ -235,6 +235,42 @@ def test_load_rejects_corrupt_killed_task_fields(
     assert str(raised.value.__cause__) == "invalid agent notification"
 
 
+@pytest.mark.parametrize("value", ["yes", 1, False, {"x": 1}, None])
+def test_load_rejects_malformed_display_only(tmp_path: Path, value: object) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "parent:1",
+        child_session_path="/child",
+        description="child",
+        status="completed",
+        text="done",
+        display_only=True,
+    )
+    rows = [json.loads(line) for line in store.path.read_text().splitlines()]
+    rows[-1]["data"]["display_only"] = value
+    store.path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(
+        ConversationIntegrityError,
+        match="invalid payload for conversation entry",
+    ) as raised:
+        ConversationStore(tmp_path, session_id=store.session_id)
+    assert str(raised.value.__cause__) == "invalid agent notification"
+
+
+@pytest.mark.parametrize("value", ["yes", 1, None])
+def test_append_rejects_non_boolean_display_only(tmp_path: Path, value: object) -> None:
+    store = ConversationStore(tmp_path)
+    with pytest.raises(ValueError, match="invalid agent notification"):
+        store.append_agent_notification(
+            "parent:1",
+            child_session_path="/child",
+            description="child",
+            status="completed",
+            text="done",
+            display_only=value,  # type: ignore[arg-type]
+        )
+
+
 def _start_agent_lifecycle(store: ConversationStore) -> None:
     store.start_agent_lifecycle(
         handle="parent:1",
