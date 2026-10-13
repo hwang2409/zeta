@@ -181,7 +181,7 @@ def test_quick_answer_delivers_to_asking_session_and_closes(tmp_path: Path) -> N
     answerer = _session(tmp_path, project.project_id)
     record = _request(asker, project.project_id, "Pick DB", "Choose one.")
 
-    message_id, already = deliver_attention_decision(
+    message_id, _, already = deliver_attention_decision(
         tmp_path, record, "Use SQLite.", from_session=answerer.store.session_id
     )
     assert already is False
@@ -194,7 +194,7 @@ def test_quick_answer_delivers_to_asking_session_and_closes(tmp_path: Path) -> N
     assert AttentionStore(asker.store.session_dir).get(record.id).status == "resolved"
 
     # A repeat is idempotent and reports the prior delivery.
-    _, again = deliver_attention_decision(
+    _, _, again = deliver_attention_decision(
         tmp_path, record, "Use SQLite.", from_session=answerer.store.session_id
     )
     assert again is True

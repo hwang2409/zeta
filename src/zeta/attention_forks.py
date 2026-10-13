@@ -9,7 +9,6 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from pathlib import Path
 
 from .attention_records import (
@@ -119,51 +118,44 @@ def attention_decision_message_id(attention_id: str) -> str:
 
 def deliver_attention_decision(
     home: Path, record: AttentionRecord, decision: str, *, from_session: str
-) -> tuple[str, bool]:
-    """Send one decision to the asking orchestrator and resolve its record.
-
-    Shared by the ``resolve_attention`` tool (relaying from a discussion fork)
-    and the TUI's quick answer. Returns the deterministic inbox message id and
-    whether the record was already resolved. An already-resolved record is left
-    unchanged so a repeated delivery is idempotent.
-    """
+) -> tuple[str, AttentionRecord, bool]:
+    """Deliver and resolve one decision through the shared resolution seam."""
     decision = decision.strip()
     if not decision:
         raise ValueError("decision must be nonempty")
-    if record.project_id is None:
-        raise ValueError("attention record has no project")
     message_id = attention_decision_message_id(record.id)
     store = AttentionStore(Path(home) / "sessions" / record.session_id)
-    current = store.get(record.id)
-    if current.status == "resolved":
-        return message_id, True
-    body = (
-        f"User decision relayed from session {from_session}. "
-        f"The question was asked at {record.created_at}; check whether the situation "
-        f"has changed before acting.\n\nDecision: {decision}"
-    )
-    ProjectInbox(
+    inbox = ProjectInbox(
         ProjectRegistry(Path(home) / "projects"),
         sessions_root=Path(home) / "sessions",
-    ).send(
-        from_project=record.project_id,
-        from_session=from_session,
-        to_project=record.project_id,
-        to_session=record.session_id,
-        kind="reply",
-        title=f"Decision: {record.title}",
-        body=body,
-        message_id=message_id,
     )
-    store.replace(
-        replace(
-            current,
-            status="resolved",
-            resolved_at=datetime.now(UTC).isoformat(),
-            decision=decision,
+
+    def send(current: AttentionRecord) -> None:
+        if current.project_id is None:
+            raise ValueError("attention record has no project")
+        body = (
+            f"User decision relayed from session {from_session}. "
+            f"The question was asked at {current.created_at}; check whether the "
+            f"situation has changed before acting.\n\nDecision: {decision}"
         )
+        inbox.send(
+            from_project=current.project_id,
+            from_session=from_session,
+            to_project=current.project_id,
+            to_session=current.session_id,
+            kind="reply",
+            title=f"Decision: {current.title}",
+            body=body,
+            message_id=message_id,
+        )
+
+    resolved, already_resolved = store.resolve(
+        record.id,
+        session_id=record.session_id,
+        decision=decision,
+        before_commit=send,
     )
-    return message_id, False
+    return message_id, resolved, already_resolved
 
 
 def release_discussion_fork(home: Path, fork_session_id: str) -> str:
