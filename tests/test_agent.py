@@ -4025,10 +4025,19 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
     loop.set_background_wake_callback(root_woke.set)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await _wait_for_notification(store, "completed")
-    await asyncio.wait_for(root_woke.wait(), timeout=1)
+    for _ in range(100):
+        if store.agent_notifications(pending_only=False):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("missing grandchild notification")
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    root_notifications = store.agent_notifications(pending_only=False)
+    assert len(root_notifications) == 1
+    assert root_notifications[0].data["display_only"] is True
+    assert store.agent_notifications() == []
+    assert not root_woke.is_set()
     nested_result = next(
         message.tool_result for message in child_store.messages() if message.tool_result
     )
