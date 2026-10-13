@@ -1774,9 +1774,18 @@ def _write_session(session_dir: Path, *rows: dict[str, object]) -> None:
 class _MutableClock:
     def __init__(self) -> None:
         self.now = 0.0
+        self.waits = 0
 
     def __call__(self) -> float:
         return self.now
+
+    async def wait(self, wake: asyncio.Event, timeout: float) -> None:
+        self.waits += 1
+        deadline = self.now + timeout
+        while not wake.is_set():
+            if self.now >= deadline:
+                raise TimeoutError
+            await asyncio.sleep(0)
 
 
 def _auto_runner(
@@ -1802,7 +1811,7 @@ def _auto_runner(
             early_trigger_debounce_seconds=debounce_seconds,
             early_trigger_max_wait_seconds=300,
         ),
-        **({"clock": clock} if clock is not None else {}),
+        **({"clock": clock, "idle_wait": clock.wait} if clock is not None else {}),
     )
     return runner, registry, project_id
 
@@ -1853,9 +1862,25 @@ async def test_five_rapid_user_turns_coalesce_into_one_request(tmp_path: Path) -
         calls += 1
         return _proposal()
 
-    runner, _, _ = _auto_runner(tmp_path, invoke, debounce_seconds=0.05)
+    clock = _MutableClock()
+    runner, _, _ = _auto_runner(
+        tmp_path, invoke, clock=clock, debounce_seconds=0.05
+    )
+
+    async def observed(seq: int, previous_waits: int) -> None:
+        while (
+            runner._seen_activity_generation < runner._activity_generation
+            or runner._early_pending_end != seq
+            or clock.waits == previous_waits
+        ):
+            await asyncio.sleep(0)
+
     rows: list[dict[str, object]] = []
     for turn in range(5):
+        # Each turn arrives inside the debounce window of the previous one,
+        # but the five turns together span longer than one window: only a
+        # debounce that restarts on every turn coalesces them.
+        clock.now = turn * 0.04
         rows.extend(
             (
                 _row(turn * 2 + 1, f"Fact {turn}."),
@@ -1863,7 +1888,12 @@ async def test_five_rapid_user_turns_coalesce_into_one_request(tmp_path: Path) -
             )
         )
         _write_session(runner.session_dir, *rows)
-        runner.activity(turn * 2 + 2)
+        completion_seq = turn * 2 + 2
+        previous_waits = clock.waits
+        runner.activity(completion_seq)
+        await asyncio.wait_for(observed(completion_seq, previous_waits), timeout=10)
+        assert calls == 0
+    clock.now = 1
     await runner.drain()
     await runner.close()
 
