@@ -467,6 +467,7 @@ class SubmissionPipeline:
                     self._retry_oldest_ready()
 
     async def _on_submit(self, message: _Submit) -> None:
+        await self._host.loop.refresh_skills()
         entry = _Entry(message.submission)
         entry.acknowledged = message.acknowledged
         self._entries[entry.submission.id] = entry
@@ -1120,8 +1121,7 @@ class SubmissionPipeline:
         if entry is self._provider_entry:
             if self._provider_task is not None and not self._provider_task.done():
                 self._provider_task.cancel()
-            # Steering messages queued into the aborted turn are dropped so
-            # they cannot resurface at the top of the next fresh turn.
+            # Steering queued into an aborted turn cannot reach a fresh turn.
             self._host.loop.clear_pending_steering("turn_end")
         elif entry.child_task is not None and not entry.child_task.done():
             entry.child_task.cancel()

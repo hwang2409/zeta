@@ -300,6 +300,7 @@ class TUIApp(
             skill_catalog=skill_catalog,
             extra_commands=_tui_slash_commands(),
         )
+        self.loop.add_skill_catalog_listener(self._slash_commands.register_skills)
         self.loop.set_mcp_prompt_refresh(
             lambda mount: app._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )

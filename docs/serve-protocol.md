@@ -679,8 +679,12 @@ Usage = object with provider-defined JSON values
 ```
 
 `SessionMetadata` is the session serializer output; a test keeps this block
-equal to it. `skill_catalog` and `agent_catalog` are the session's snapshotted
-catalogs. `project_*` fields
+equal to it. `agent_catalog` is snapshotted at session start. `skill_catalog`
+and `system_prompt` are the snapshot persisted at session start or the last
+resume. A running session refreshes its live skill catalog in memory at turn
+and slash-command boundaries when skill files change; those changes are not
+written back to this metadata, and a later resume rediscovers skills.
+`project_*` fields
 describe the project association and the owned project-memory block in
 `system_prompt`. `parent_session_id` names the parent of a child session.
 `tool_allow` is `null` when no allowlist applies. `tool_allow_layers` appears

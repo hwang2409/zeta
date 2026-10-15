@@ -63,6 +63,8 @@ def build_unattended_loop(
         approval_policy=policy,
         max_turns=25,
         skip_mcp_mount=True,
+        # Approved automation revisions keep their persisted skill snapshot.
+        freeze_skill_catalog=True,
         system_prompt=metadata.system_prompt,
         on_completion_success=lambda: SessionManager(home).touch(metadata),
     )

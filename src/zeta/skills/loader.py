@@ -3,7 +3,9 @@
 from .catalog import (
     SKILL_INDEX_BYTE_LIMIT,
     SkillCatalog,
+    SkillCatalogWatcher,
     SkillMeta,
+    SkillRefresh,
     discover_packaged_skills,
     discover_session_skills,
     discover_skills,
@@ -11,12 +13,15 @@ from .catalog import (
     load_skill,
     load_skill_prompt,
     replace_skill_index,
+    replace_skill_index_metadata,
 )
 
 __all__ = [
     "SKILL_INDEX_BYTE_LIMIT",
     "SkillCatalog",
+    "SkillCatalogWatcher",
     "SkillMeta",
+    "SkillRefresh",
     "discover_packaged_skills",
     "discover_session_skills",
     "discover_skills",
@@ -24,4 +29,5 @@ __all__ = [
     "load_skill",
     "load_skill_prompt",
     "replace_skill_index",
+    "replace_skill_index_metadata",
 ]
