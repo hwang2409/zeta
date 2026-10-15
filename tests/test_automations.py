@@ -87,7 +87,12 @@ from zeta.core.slash import create_slash_registry
 from zeta.mcp.config import load_mcp_config, server_to_json
 from zeta.mcp.mount import MCPMount
 from zeta.prompts import load_identity
-from zeta.protocol.types import ASSISTANT_RESPONSE_SYNTHETIC, TextContent
+from zeta.protocol.types import (
+    ASSISTANT_RESPONSE_SYNTHETIC,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+)
 from zeta.runtime.unattended import build_unattended_loop
 from zeta.skills import discover_session_skills
 
@@ -507,6 +512,49 @@ async def test_unattended_runtime_ignores_global_yolo_hooks_and_project_tools(
     assert loop.hooks is None
     assert loop._mcp_mount_attempted
     await loop.close()
+
+
+async def test_automation_run_keeps_approved_skill_snapshot(
+    tmp_path: Path,
+) -> None:
+    catalog = discover_session_skills(home=tmp_path)
+    session = SessionManager(tmp_path).create(
+        provider="codex",
+        model="fake",
+        cwd=tmp_path,
+        system_prompt=load_identity(catalog=catalog),
+        skill_catalog=catalog,
+    )
+    skill = tmp_path / "skills" / "late.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(
+        "---\nname: late\ndescription: late description\n---\n\nlate body\n",
+        encoding="utf-8",
+    )
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    loop = build_unattended_loop(
+        session, home=tmp_path, allow=("skill",), backend=backend
+    )
+    try:
+        _ = [
+            event
+            async for event in loop.run_turn("run", origin=MessageOrigin.AUTOMATION_PROMPT)
+        ]
+        prompt = "\n".join(
+            block.text
+            for message in backend.calls[0][0]
+            if message.role is MessageRole.SYSTEM
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        loaded = await loop.tool_registry.execute(
+            ToolCall("late", "skill", {"name": "late"})
+        )
+        assert "late description" not in prompt
+        assert loaded["isError"] is True
+        assert "available skills: none" in loaded["content"][0]["text"]
+    finally:
+        await loop.close()
 
 
 async def test_automation_catalog_excludes_project_skills_from_prompt_and_tool(

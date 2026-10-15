@@ -32,12 +32,16 @@ class SkillRefreshMixin:
         catalog: SkillCatalog,
         home: Path | None,
         project_dir: Path | None,
+        frozen: bool,
     ) -> None:
         self._skill_watcher = (
             SkillCatalogWatcher(catalog, home=home, project_dir=project_dir)
-            if home is not None and project_dir is not None
+            if not frozen and home is not None and project_dir is not None
             else None
         )
+        self._skill_refresh_lock = asyncio.Lock()
+        self._skill_refresh_generation = 0
+        self._skill_refresh_notices: list[str] = []
         self._skill_catalog_listeners: list[Callable[[SkillCatalog], None]] = []
         self.tool_registry.set_skill_refresher(self.refresh_skills)
 
@@ -47,13 +51,25 @@ class SkillRefreshMixin:
         self._skill_catalog_listeners.append(listener)
 
     async def refresh_skills(self, force: bool = False) -> None:
-        """Refresh changed skills without filesystem work on the event loop."""
+        """Scan off-thread and commit one ordered catalog snapshot on the loop."""
 
-        if self._skill_watcher is None:
+        watcher = self._skill_watcher
+        if watcher is None:
             return
-        refresh = await asyncio.to_thread(self._skill_watcher.refresh, force=force)
-        if refresh is None:
-            return
+        self._skill_refresh_generation += 1
+        generation = self._skill_refresh_generation
+        async with self._skill_refresh_lock:
+            scan = await asyncio.to_thread(watcher.scan, force=force)
+            if scan is None or generation != self._skill_refresh_generation:
+                return
+            refresh = watcher.commit(scan)
+            if refresh is None:
+                return
+            self._commit_skill_refresh(refresh)
+
+    def _commit_skill_refresh(self, refresh: SkillRefresh) -> None:
+        """Apply all live catalog state synchronously on the event loop."""
+
         self.tool_registry.skill_catalog = refresh.catalog
         active_prompt = self.context_assembler.system_prompt
         prompt = (
@@ -96,8 +112,7 @@ class SkillRefreshMixin:
                 self.context_assembler.system_prompt = prompt
             manager = getattr(self, "manager", None)
             if metadata is not None and manager is not None:
-                await asyncio.to_thread(
-                    manager.record_skill_catalog,
+                manager.record_skill_catalog(
                     metadata,
                     catalog=refresh.catalog,
                     system_prompt=prompt_text,
@@ -107,13 +122,23 @@ class SkillRefreshMixin:
             listener(refresh.catalog)
         notice = self._skill_refresh_notice(refresh)
         if notice:
-            await self._append_turn_message(
-                Message(
-                    MessageRole.USER,
-                    [TextContent(notice)],
-                    metadata={"zeta.origin": MessageOrigin.HARNESS_NUDGE.value},
-                )
+            self._skill_refresh_notices.append(notice)
+
+    async def _flush_skill_refresh_notices(self) -> None:
+        """Persist queued notices only at a new-turn transcript boundary."""
+
+        if not self._skill_refresh_notices:
+            return
+        count = len(self._skill_refresh_notices)
+        notice = "\n".join(self._skill_refresh_notices[:count])
+        await self._append_turn_message(
+            Message(
+                MessageRole.USER,
+                [TextContent(notice)],
+                metadata={"zeta.origin": MessageOrigin.HARNESS_NUDGE.value},
             )
+        )
+        del self._skill_refresh_notices[:count]
 
     @staticmethod
     def _skill_refresh_notice(refresh: SkillRefresh) -> str:

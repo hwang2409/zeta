@@ -157,6 +157,15 @@ class SkillRefresh:
     notices: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class SkillScan:
+    """One immutable filesystem scan awaiting an event-loop commit."""
+
+    signature: SkillRootsSignature
+    catalog: SkillCatalog | None = None
+    failure: str | None = None
+
+
 class SkillCatalogWatcher:
     """Rediscover session skills only when their filesystem signature changes."""
 
@@ -173,16 +182,27 @@ class SkillCatalogWatcher:
         self.signature = skill_roots_signature(
             home=self.home, project_dir=self.project_dir
         )
+        self.failed_signature: SkillRootsSignature | None = None
 
-    def refresh(self, *, force: bool = False) -> SkillRefresh | None:
+    def scan(self, *, force: bool = False) -> SkillScan | None:
+        """Read one changed filesystem snapshot without mutating watcher state."""
+
         signature = skill_roots_signature(
             home=self.home, project_dir=self.project_dir
         )
+        if signature == self.failed_signature:
+            return None
         if not force and signature == self.signature:
             return None
-        discovered = discover_session_skills(
-            home=self.home, project_dir=self.project_dir
-        )
+        try:
+            discovered = discover_session_skills(
+                home=self.home, project_dir=self.project_dir
+            )
+        except (OSError, ValueError) as exc:
+            detail = " ".join(str(exc).split())
+            if len(detail) > 400:
+                detail = f"{detail[:397]}..."
+            return SkillScan(signature, failure=f"skill discovery failed: {detail}")
         current_by_path = {skill.path: skill for skill in self.catalog.skills}
         discovered_paths = {skill.path for skill in discovered.skills}
         retained = tuple(
@@ -190,7 +210,19 @@ class SkillCatalogWatcher:
             for path, skill in current_by_path.items()
             if path not in discovered_paths and _document_path(path).is_file()
         )
-        catalog = SkillCatalog((*discovered.skills, *retained), discovered.notices)
+        return SkillScan(
+            signature,
+            SkillCatalog((*discovered.skills, *retained), discovered.notices),
+        )
+
+    def commit(self, scan: SkillScan) -> SkillRefresh | None:
+        """Commit one scan after the coordinator accepts its generation."""
+
+        if scan.failure is not None:
+            self.failed_signature = scan.signature
+            return SkillRefresh(self.catalog, (), (), (), (scan.failure,))
+        catalog = scan.catalog
+        assert catalog is not None
         old_by_name = {skill.name: skill for skill in self.catalog.skills}
         new_by_name = {skill.name: skill for skill in catalog.skills}
         old_names = set(old_by_name)
@@ -198,7 +230,8 @@ class SkillCatalogWatcher:
         notices = tuple(
             notice for notice in catalog.notices if notice not in self.catalog.notices
         )
-        self.signature = signature
+        self.signature = scan.signature
+        self.failed_signature = None
         changed = catalog.skills != self.catalog.skills or bool(notices)
         self.catalog = catalog
         if not changed:

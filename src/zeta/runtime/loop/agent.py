@@ -173,6 +173,7 @@ class AgentLoop(
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
         skill_home: Path | None = None,
         skill_project_dir: Path | None = None,
+        freeze_skill_catalog: bool = False,
     ) -> None:
         if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
@@ -244,6 +245,7 @@ class AgentLoop(
             catalog=self.tool_registry.skill_catalog,
             home=skill_home,
             project_dir=skill_project_dir,
+            frozen=freeze_skill_catalog,
         )
         if (
             approval_policy is not None
@@ -803,6 +805,7 @@ class AgentLoop(
             )
         if system_message is None and persist_user_message:
             await self._append_turn_message(user_message)
+        await self._flush_skill_refresh_notices()
         setup_error: ErrorInfo | None = None
         try:
             await self._ensure_mcp_servers()
