@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import fcntl
+import hashlib
 import inspect
-import json
 import os
 import threading
 import time
@@ -24,8 +23,9 @@ from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, MessageRole, TextContent
+from zeta.runtime.prompt_resume import resume_prompt
 from zeta.server.server import ZetaServer
-from zeta.skills import SkillCatalog, SkillMeta, SkillRefresh, discover_session_skills
+from zeta.skills import SkillCatalog, discover_session_skills
 from zeta.tui.app import TUIApp
 
 
@@ -85,14 +85,6 @@ def _hold_metadata_lock(manager: SessionManager, session_id: str, seconds: float
     thread.start()
     assert ready.wait(1)
     return release, thread
-
-
-def _catalog(name: str, root: Path) -> SkillCatalog:
-    return SkillCatalog((SkillMeta(name, f"{name} description", [], root / name),))
-
-
-def _refresh(catalog: SkillCatalog) -> SkillRefresh:
-    return SkillRefresh(catalog, (catalog.skills[0].name,), (), (), ())
 
 
 def _install_live_skill(home: Path) -> None:
@@ -235,106 +227,121 @@ async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
 
 
 @pytest.mark.asyncio
-async def test_skill_catalog_persistence_runs_off_loop_after_lock_release(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    loop, manager, home, _ = _session_loop(tmp_path)
-    release, holder = _hold_metadata_lock(manager, loop.session_metadata.session_id)
-    event_thread = threading.get_ident()
-    called: list[int] = []
-    original = manager.record_skill_catalog
-
-    def record(*args: object, **kwargs: object) -> None:
-        called.append(threading.get_ident())
-        original(*args, **kwargs)
-
-    monkeypatch.setattr(manager, "record_skill_catalog", record)
-    _install_live_skill(home)
-    await loop.refresh_skills()
-    for _ in range(10):
-        if called:
-            break
-        await asyncio.sleep(0)
-    assert called and called[0] != event_thread
-
-    release.set()
-    holder.join(1)
-    await loop._flush_skill_catalog_persistence()
-    saved = manager.read_metadata(loop.session_metadata.session_id)
-    assert saved.skill_catalog[0]["name"] == "live"
-    await loop.close()
-    loop.store.close()
-
-
-@pytest.mark.asyncio
-async def test_two_quick_skill_commits_persist_only_newest_generation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    loop, manager, _, project = _session_loop(tmp_path)
-    writes: list[list[str]] = []
-    original = manager.record_skill_catalog
-
-    def record(*args: object, **kwargs: object) -> None:
-        catalog = kwargs["catalog"]
-        assert isinstance(catalog, SkillCatalog)
-        writes.append([skill.name for skill in catalog.skills])
-        original(*args, **kwargs)
-
-    monkeypatch.setattr(manager, "record_skill_catalog", record)
-    loop._commit_skill_refresh(_refresh(_catalog("first", project)), generation=1)
-    loop._commit_skill_refresh(_refresh(_catalog("second", project)), generation=2)
-
-    await loop._flush_skill_catalog_persistence()
-    assert writes == [["second"]]
-    saved = manager.read_metadata(loop.session_metadata.session_id)
-    assert saved.skill_catalog[0]["name"] == "second"
-    await loop.close()
-    loop.store.close()
-
-
-@pytest.mark.asyncio
-async def test_close_does_not_wait_indefinitely_for_skill_metadata_lock(
+async def test_touch_adopts_metadata_without_reverting_live_prompt(
     tmp_path: Path,
 ) -> None:
-    loop, manager, home, _ = _session_loop(tmp_path)
-    release, holder = _hold_metadata_lock(manager, loop.session_metadata.session_id)
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    loop, manager, home, _ = _session_loop(tmp_path, backend)
+    original_prompt = loop.session_metadata.system_prompt
+    original_catalog = loop.session_metadata.skill_catalog
     _install_live_skill(home)
     await loop.refresh_skills()
 
-    started = time.monotonic()
-    await loop.close()
-    elapsed = time.monotonic() - started
+    other = SessionManager(home).open(loop.session_metadata.session_id)
+    try:
+        SessionManager(home).record_override(
+            other.metadata, provider=None, model="new-model"
+        )
+    finally:
+        other.store.close()
+    manager.touch(loop.session_metadata)
 
-    release.set()
-    holder.join(1)
+    assert loop.session_metadata.model == "new-model"
+    assert loop.session_metadata.system_prompt == original_prompt
+    _ = [event async for event in loop.run_turn("next", origin=MessageOrigin.USER)]
+    system_text = "\n".join(
+        block.text
+        for message in backend.calls[0][0]
+        if message.role is MessageRole.SYSTEM
+        for block in message.content
+        if isinstance(block, TextContent)
+    )
+    assert "live description" in system_text
+    saved = manager.read_metadata(loop.session_metadata.session_id)
+    assert saved.system_prompt == original_prompt
+    assert saved.skill_catalog == original_catalog
+    await loop.close()
     loop.store.close()
-    assert elapsed < 0.8
 
 
 @pytest.mark.asyncio
-async def test_skill_catalog_persistence_and_touch_preserve_each_other(
-    tmp_path: Path,
+async def test_resume_replaces_live_skill_index_and_refreshes_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    loop, manager, _, project = _session_loop(tmp_path)
-    original_updated_at = loop.session_metadata.updated_at
-    loop._commit_skill_refresh(_refresh(_catalog("latest", project)), generation=1)
-    manager.touch(loop.session_metadata)
-    assert loop.session_metadata.skill_catalog[0]["name"] == "latest"
-    await loop._flush_skill_catalog_persistence()
-
-    saved = manager.read_metadata(loop.session_metadata.session_id)
-    assert saved.skill_catalog[0]["name"] == "latest"
-    assert saved.updated_at != original_updated_at
-
-    manager.touch(loop.session_metadata)
-    touched_at = loop.session_metadata.updated_at
-    loop._commit_skill_refresh(_refresh(_catalog("newest", project)), generation=2)
-    await loop._flush_skill_catalog_persistence()
-    saved = manager.read_metadata(loop.session_metadata.session_id)
-    assert saved.skill_catalog[0]["name"] == "newest"
-    assert saved.updated_at == touched_at
-    assert json.loads(
-        (manager.sessions_dir / saved.session_id / "meta.json").read_text()
-    )["skill_catalog"][0]["name"] == "newest"
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    catalog = SkillCatalog.empty()
+    memory = "old memory"
+    prompt = f"identity\n\n{catalog.index()}\n\n{memory}\n"
+    memory_offset = prompt.index(memory)
+    memory_digest = hashlib.sha256(memory.encode()).hexdigest()
+    manager = SessionManager(home)
+    opened = manager.create(
+        provider="codex",
+        model="offline",
+        cwd=project,
+        system_prompt=prompt,
+        skill_catalog=catalog,
+        project_memory_offset=memory_offset,
+        project_memory_length=len(memory),
+        project_memory_digest=memory_digest,
+        prompt_recipe="custom",
+        prompt_components={
+            "project_memory": {
+                "offset": memory_offset,
+                "length": len(memory),
+                "digest": memory_digest,
+            }
+        },
+        auto_project=False,
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        skill_catalog=catalog,
+        system_prompt=prompt,
+        skill_home=home,
+        skill_project_dir=project,
+    )
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    _install_live_skill(home)
+    await loop.refresh_skills()
+    assert "live description" in loop.context_assembler.system_prompt.content[0].text
+    assert manager.read_metadata(opened.metadata.session_id).system_prompt == prompt
     await loop.close()
-    loop.store.close()
+    opened.store.close()
+
+    refreshed_memory = "current project memory"
+    monkeypatch.setattr(
+        "zeta.runtime.prompt_resume.refresh_project_memory",
+        lambda value, **kwargs: value.replace(memory, refreshed_memory),
+    )
+    resumed = manager.open(opened.metadata.session_id)
+    try:
+        result = resume_prompt(
+            resumed.metadata,
+            manager=manager,
+            store=resumed.store,
+            home=home,
+            repo_root=project,
+            inbox_enabled=False,
+            context_loader=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError(f"unexpected default rebuild: {kwargs}")
+            ),
+        )
+        component = result.context.prompt_components["project_memory"]
+        offset = int(component["offset"])
+        length = int(component["length"])
+        assert "live description" in result.context.system_prompt
+        assert result.context.system_prompt[offset : offset + length] == refreshed_memory
+        assert component["digest"] == hashlib.sha256(refreshed_memory.encode()).hexdigest()
+        saved = manager.read_metadata(opened.metadata.session_id)
+        assert saved.system_prompt == result.context.system_prompt
+        assert saved.project_memory_offset == offset
+        assert saved.project_memory_length == length
+        assert saved.project_memory_digest == component["digest"]
+        assert saved.skill_catalog[0]["name"] == "live"
+    finally:
+        resumed.store.close()

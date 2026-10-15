@@ -376,6 +376,47 @@ def test_staggered_memory_span_resumes_adopt_live_runtime(
     assert calls == [1]
 
 
+def test_live_runtime_adoption_uses_current_skill_index_in_memory(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    prompt = f"identity\n\n{SkillCatalog.empty().index()}"
+    manager, session_id = _manager_with_prompt(
+        home, tmp_path, system_prompt=prompt, prompt_recipe="custom"
+    )
+    stores: list[object] = []
+
+    def loader(**kwargs: object) -> ProjectContext:
+        raise AssertionError(f"unexpected default rebuild: {kwargs}")
+
+    try:
+        first = _resume(
+            manager,
+            session_id,
+            home,
+            tmp_path,
+            loader,
+            live_stores=stores,
+        )
+        _write_skill(home / "skills" / "new.md")
+        second = _resume(
+            manager,
+            session_id,
+            home,
+            tmp_path,
+            loader,
+            live_stores=stores,
+        )
+
+        assert "newly installed" not in first.context.system_prompt
+        assert "newly installed" in second.context.system_prompt
+        assert second.skill_catalog.skills[0].name == "new-skill"
+        assert manager.read_metadata(session_id).system_prompt == prompt
+    finally:
+        for store in stores:
+            store.close()
+
+
 def test_closed_runtime_allows_next_resume_to_rebuild(tmp_path: Path) -> None:
     manager, session_id = _manager_with_prompt(
         tmp_path / "home", tmp_path, system_prompt="recorded", prompt_recipe="default"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ..core.project_context import (
@@ -15,7 +15,11 @@ from ..core.project_context import (
 from ..core.session import SessionManager, SessionMetadata
 from ..core.store import ConversationStore
 from ..core.store.prompt_composition import PromptComposition
-from ..skills import SkillCatalog, discover_session_skills
+from ..skills import (
+    SkillCatalog,
+    discover_session_skills,
+    replace_skill_index_metadata,
+)
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
 
 ContextLoader = Callable[..., ProjectContext]
@@ -91,6 +95,45 @@ def _conservative_context(metadata: SessionMetadata, *, home: Path) -> ProjectCo
     )
 
 
+def _replace_context_skill_index(
+    context: ProjectContext, catalog: SkillCatalog
+) -> ProjectContext:
+    components = {
+        key: dict(component) for key, component in context.prompt_components.items()
+    }
+    had_memory_component = "project_memory" in components
+    if (
+        not had_memory_component
+        and context.memory_offset is not None
+        and context.memory_length is not None
+        and context.memory_digest is not None
+    ):
+        components["project_memory"] = {
+            "offset": context.memory_offset,
+            "length": context.memory_length,
+            "digest": context.memory_digest,
+        }
+    prompt, components = replace_skill_index_metadata(
+        context.system_prompt, catalog, components
+    )
+    memory = components.get("project_memory")
+    if memory is None:
+        return replace(context, system_prompt=prompt, prompt_components=components)
+    offset = int(memory["offset"])
+    length = int(memory["length"])
+    digest = str(memory["digest"])
+    if not had_memory_component:
+        del components["project_memory"]
+    return replace(
+        context,
+        system_prompt=prompt,
+        memory_offset=offset,
+        memory_length=length,
+        memory_digest=digest,
+        prompt_components=components,
+    )
+
+
 def _adopted_context(metadata: SessionMetadata, notices: tuple[str, ...]) -> ProjectContext:
     return ProjectContext(
         metadata.system_prompt,
@@ -131,6 +174,7 @@ def resume_prompt(
     """
 
     explicit_custom = system_override is not None or system_append is not None
+    skills, agents = _catalogs(home=home, repo_root=repo_root)
 
     def compose(current: SessionMetadata) -> PromptComposition:
         rebuild = (
@@ -138,7 +182,6 @@ def resume_prompt(
             or (current.prompt_recipe is None and not current.system_prompt)
             or explicit_custom
         )
-        skills, agents = _catalogs(home=home, repo_root=repo_root)
         if rebuild:
             context = context_loader(
                 cwd=Path(current.cwd),
@@ -151,7 +194,9 @@ def resume_prompt(
                 inbox_enabled=inbox_enabled,
             )
         else:
-            context = _conservative_context(current, home=home)
+            context = _replace_context_skill_index(
+                _conservative_context(current, home=home), skills
+            )
         return PromptComposition(
             system_prompt=context.system_prompt,
             context_files=tuple(str(path) for path in context.files),
@@ -167,8 +212,10 @@ def resume_prompt(
 
     composition = manager.resume_prompt_composition(metadata, store, compose)
     return ResumedPrompt(
-        _adopted_context(metadata, composition.notices),
-        composition.skill_catalog,
+        _replace_context_skill_index(
+            _adopted_context(metadata, composition.notices), skills
+        ),
+        skills,
         composition.agent_catalog,
     )
 
