@@ -769,6 +769,30 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         current = self._mutate(metadata.session_id, lambda item: self._touch(item))
         self._copy_metadata(metadata, current)
 
+    def record_skill_catalog(
+        self,
+        metadata: SessionMetadata,
+        *,
+        catalog: SkillCatalog,
+        system_prompt: str,
+        prompt_components: dict[str, dict[str, int | str]],
+    ) -> None:
+        """Persist one live skill refresh and its adjusted prompt metadata."""
+
+        def update(item: SessionMetadata) -> SessionMetadata:
+            item.skill_catalog = catalog.to_snapshot()
+            item.system_prompt = system_prompt
+            item.prompt_components = copy.deepcopy(prompt_components)
+            memory = prompt_components.get("project_memory")
+            if memory is not None:
+                item.project_memory_offset = int(memory["offset"])
+                item.project_memory_length = int(memory["length"])
+                item.project_memory_digest = str(memory["digest"])
+            return item
+
+        current = self._mutate(metadata.session_id, update)
+        self._copy_metadata(metadata, current)
+
     def refresh_recency(self, session_id: str) -> bool:
         """Best-effort refresh recency without waiting for metadata writers."""
 

@@ -21,7 +21,6 @@ from ...agent.notifications import AgentNotificationMixin, NotificationWake
 from ...agent.plan_mode import (
     PLAN_MODE_POLICY,
     plan_mode_messages,
-    plan_mode_prompt,
     plan_mode_tool_schemas,
 )
 from ...agent.receipt import (
@@ -117,13 +116,17 @@ from .empty_turn import (
     should_nudge_empty_turn,
 )
 from .mcp_session import MCPSession
+from .plan_mode_runtime import PlanModeRuntimeMixin
 from .project_inbox import ProjectInboxNotificationMixin
+from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
 
 
 class AgentLoop(
+    PlanModeRuntimeMixin,
+    SkillRefreshMixin,
     StoreWriteMixin,
     AgentNotificationMixin,
     ProjectInboxNotificationMixin,
@@ -168,6 +171,8 @@ class AgentLoop(
         project_registry: Any = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
+        skill_home: Path | None = None,
+        skill_project_dir: Path | None = None,
     ) -> None:
         if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
@@ -235,6 +240,11 @@ class AgentLoop(
             self.store, self.notify_background_persisted
         )
         self.agent_catalog = self.tool_registry.agent_catalog
+        self._configure_skill_refresh(
+            catalog=self.tool_registry.skill_catalog,
+            home=skill_home,
+            project_dir=skill_project_dir,
+        )
         if (
             approval_policy is not None
             and self.tool_registry.approval_policy is not None
@@ -269,33 +279,10 @@ class AgentLoop(
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         self._plan_mode = False
         self._plan_mode_policy = PLAN_MODE_POLICY
-        self._plan_mode_prior_prompt: Message | None = None
+        self._plan_mode_prior_prompt: str | Message | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
-    @property
-    def plan_mode(self) -> bool:
-        return self._plan_mode
-    def set_plan_mode(self, enabled: bool) -> None:
-        """Restrict the assistant to read-only tools, or lift the restriction.
-        GPT-5.6 keeps tool schemas stable; other models advertise a subset.
-        """
-        if enabled == self._plan_mode:
-            return
-        assembler = self.context_assembler
-        if enabled:
-            self._plan_mode_prior_prompt = assembler.system_prompt
-            assembler.system_prompt = plan_mode_prompt(assembler.system_prompt)
-        elif self._plan_mode_prior_prompt is not None:
-            assembler.system_prompt = self._plan_mode_prior_prompt
-            self._plan_mode_prior_prompt = None
-        self._plan_mode = enabled
-        if self._on_plan_mode_change is not None:
-            self._on_plan_mode_change(enabled)
-    def plan_mode_allows(self, tool_call: ToolCall) -> bool:
-        """Authorize one registry-resolved capability in the plan-mode layer."""
-        return not self._plan_mode or self.tool_registry.call_allowed_by(
-            tool_call, self._plan_mode_policy
-        )
+
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
         process_work = tuple(
@@ -796,6 +783,7 @@ class AgentLoop(
         on_persisted: Callable[[], None] | None = None,
         notification_turn: bool = False,
     ) -> AsyncIterator[StreamEvent]:
+        await self.refresh_skills()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
         await self._check_project_inbox()

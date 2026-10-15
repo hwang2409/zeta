@@ -538,7 +538,7 @@ class _Client:
         if method == "session_settings":
             return ergonomics.settings(runtime)
         if method == "slash_list":
-            return slash_commands.list_commands(runtime)
+            return await slash_commands.list_commands(runtime)
         await self._require_idle()
         if method == "slash_run":
             register = self._model_inputs.registrar(runtime.session_id, enabled="model_input_ids" in self.features)

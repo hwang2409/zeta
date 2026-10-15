@@ -45,8 +45,9 @@ Use `zeta --help` for the complete list of options and subcommands.
 Inside the TUI, `/help` lists slash commands. Skills can be invoked with
 `/skill-name` or `$skill-name`. Skills and agents are Markdown definitions
 loaded from packaged files, `~/.zeta/skills/` or `~/.zeta/agents/`, and the
-current project's `.zeta/skills/` or `.zeta/agents/`. Custom slash commands are
-loaded from `~/.zeta/commands/` and `.zeta/commands/`.
+current project's `.zeta/skills/` or `.zeta/agents/`. Skills installed, edited,
+or removed while Zeta runs are available on the next turn. Custom slash commands
+are loaded from `~/.zeta/commands/` and `.zeta/commands/`.
 
 ## Safety
 

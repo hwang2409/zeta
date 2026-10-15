@@ -724,9 +724,12 @@ class SlashCommandRegistry:
         self._custom_commands[command.name] = command
 
     def register_skills(self, catalog: SkillCatalog) -> None:
-        """Register skills after built-ins and custom commands."""
+        """Replace skills after built-ins and custom commands."""
 
-        self._notices.extend(catalog.notices)
+        self._skills.clear()
+        self._notices.extend(
+            notice for notice in catalog.notices if notice not in self._notices
+        )
         self._warning_notices.update(catalog.notices)
         for skill in catalog.skills:
             if skill.name in self._commands:

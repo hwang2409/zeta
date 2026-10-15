@@ -323,6 +323,7 @@ class ToolRegistry:
         self._closed = False
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
+        self._skill_refresher: Callable[[bool], Awaitable[None]] | None = None
         if agent_catalog is None:
             from ..skills.agent_catalog import discover_packaged_agents
 
@@ -331,6 +332,17 @@ class ToolRegistry:
         self._register_builtin = register_builtin
         if register_builtin:
             _register_discovered_tools(self)
+
+    def set_skill_refresher(
+        self, refresher: Callable[[bool], Awaitable[None]]
+    ) -> None:
+        """Let tools request one live catalog refresh."""
+
+        self._skill_refresher = refresher
+
+    async def refresh_skills(self, *, force: bool = False) -> None:
+        if self._skill_refresher is not None:
+            await self._skill_refresher(force)
 
     @property
     def tool_allow(self) -> tuple[str, ...] | None:

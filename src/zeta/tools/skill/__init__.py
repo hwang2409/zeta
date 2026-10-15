@@ -6,8 +6,13 @@ from ...skills import load_skill_prompt
 from ..registry import ToolRegistry
 
 
-def _load(registry: ToolRegistry, arguments: dict[str, str]) -> str:
-    meta = registry.skill_catalog.find(arguments["name"])
+async def _load(registry: ToolRegistry, arguments: dict[str, str]) -> str:
+    name = arguments["name"]
+    try:
+        meta = registry.skill_catalog.find(name)
+    except ValueError:
+        await registry.refresh_skills(force=True)
+        meta = registry.skill_catalog.find(name)
     return load_skill_prompt(meta)
 
 

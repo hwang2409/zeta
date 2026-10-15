@@ -340,9 +340,11 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
     )
 
 
-def list_commands(runtime: ServerRuntime) -> dict[str, object]:
+async def list_commands(runtime: ServerRuntime) -> dict[str, object]:
     """Enumerate every command the shared registry knows about."""
 
+    if runtime.loop is not None:
+        await runtime.loop.refresh_skills()
     registry = build_registry(runtime)
     entries = _entries_from_registry(registry)
     return {
@@ -382,6 +384,8 @@ async def run_command(
         # contract at docs/serve-protocol.md. `/model <name>` still
         # dispatches server-side through the shared apply-settings path.
         return {"kind": "client_only", "name": name}
+    if runtime.loop is not None:
+        await runtime.loop.refresh_skills()
     registry = build_registry(runtime)
     if name in CLIENT_ONLY_BUILTINS:
         return {"kind": "client_only", "name": name}

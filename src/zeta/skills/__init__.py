@@ -2,7 +2,9 @@
 
 from .loader import (
     SkillCatalog,
+    SkillCatalogWatcher,
     SkillMeta,
+    SkillRefresh,
     discover_packaged_skills,
     discover_session_skills,
     discover_skills,
@@ -10,11 +12,14 @@ from .loader import (
     load_skill,
     load_skill_prompt,
     replace_skill_index,
+    replace_skill_index_metadata,
 )
 
 __all__ = [
     "SkillCatalog",
+    "SkillCatalogWatcher",
     "SkillMeta",
+    "SkillRefresh",
     "discover_packaged_skills",
     "discover_session_skills",
     "discover_skills",
@@ -22,4 +27,5 @@ __all__ = [
     "load_skill",
     "load_skill_prompt",
     "replace_skill_index",
+    "replace_skill_index_metadata",
 ]

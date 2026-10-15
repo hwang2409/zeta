@@ -188,6 +188,13 @@ def compose_runtime(
             "on_completion_success": completion_callback,
             "on_plan_mode_change": on_plan_mode_change,
             "system_prompt": project_context.system_prompt,
+            "skill_home": home,
+            "skill_project_dir": (
+                project_discovery.primary_root
+                if project_discovery is not None
+                and project_discovery.primary_root is not None
+                else cwd
+            ),
         }
         if max_turns is not None and max_turns > 0:
             loop_kwargs["max_turns"] = max_turns
