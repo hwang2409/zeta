@@ -194,9 +194,9 @@ def resume_prompt(
                 inbox_enabled=inbox_enabled,
             )
         else:
-            context = _replace_context_skill_index(
-                _conservative_context(current, home=home), skills
-            )
+            context = _conservative_context(current, home=home)
+            if current.prompt_recipe is not None:
+                context = _replace_context_skill_index(context, skills)
         return PromptComposition(
             system_prompt=context.system_prompt,
             context_files=tuple(str(path) for path in context.files),
@@ -210,14 +210,12 @@ def resume_prompt(
             notices=context.notices,
         )
 
+    owns_skill_index = metadata.prompt_recipe is not None
     composition = manager.resume_prompt_composition(metadata, store, compose)
-    return ResumedPrompt(
-        _replace_context_skill_index(
-            _adopted_context(metadata, composition.notices), skills
-        ),
-        skills,
-        composition.agent_catalog,
-    )
+    context = _adopted_context(metadata, composition.notices)
+    if owns_skill_index:
+        context = _replace_context_skill_index(context, skills)
+    return ResumedPrompt(context, skills, composition.agent_catalog)
 
 
 __all__ = ["ResumedPrompt", "resume_prompt"]
