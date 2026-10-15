@@ -624,6 +624,7 @@ class AgentLoop(
 
         self._closed = True
         killed: tuple[str, ...] = ()
+        await self._flush_skill_catalog_persistence()
         if self.memory_reconciler is not None:
             await self.memory_reconciler.close()
         if self.agent_depth == 0:

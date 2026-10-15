@@ -767,11 +767,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
 
     def touch(self, metadata: SessionMetadata) -> None:
         current = self._mutate(metadata.session_id, lambda item: self._touch(item))
-        self._copy_metadata(metadata, current)
+        metadata.updated_at = current.updated_at
 
     def record_skill_catalog(
         self,
-        metadata: SessionMetadata,
+        session_id: str,
         *,
         catalog: SkillCatalog,
         system_prompt: str,
@@ -780,18 +780,34 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         """Persist one live skill refresh and its adjusted prompt metadata."""
 
         def update(item: SessionMetadata) -> SessionMetadata:
-            item.skill_catalog = catalog.to_snapshot()
-            item.system_prompt = system_prompt
-            item.prompt_components = copy.deepcopy(prompt_components)
-            memory = prompt_components.get("project_memory")
-            if memory is not None:
-                item.project_memory_offset = int(memory["offset"])
-                item.project_memory_length = int(memory["length"])
-                item.project_memory_digest = str(memory["digest"])
+            self.apply_skill_catalog(
+                item,
+                catalog=catalog,
+                system_prompt=system_prompt,
+                prompt_components=prompt_components,
+            )
             return item
 
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)
+        self._mutate(session_id, update)
+
+    @staticmethod
+    def apply_skill_catalog(
+        metadata: SessionMetadata,
+        *,
+        catalog: SkillCatalog,
+        system_prompt: str,
+        prompt_components: dict[str, dict[str, int | str]],
+    ) -> None:
+        """Adopt one skill refresh into an in-memory metadata snapshot."""
+
+        metadata.skill_catalog = catalog.to_snapshot()
+        metadata.system_prompt = system_prompt
+        metadata.prompt_components = copy.deepcopy(prompt_components)
+        memory = prompt_components.get("project_memory")
+        if memory is not None:
+            metadata.project_memory_offset = int(memory["offset"])
+            metadata.project_memory_length = int(memory["length"])
+            metadata.project_memory_digest = str(memory["digest"])
 
     def refresh_recency(self, session_id: str) -> bool:
         """Best-effort refresh recency without waiting for metadata writers."""
