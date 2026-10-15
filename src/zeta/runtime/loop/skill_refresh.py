@@ -17,6 +17,7 @@ from ...skills import (
     replace_skill_index_metadata,
 )
 
+
 class SkillRefreshMixin:
     """Keep one running loop's catalog, prompt, and listeners synchronized."""
 
