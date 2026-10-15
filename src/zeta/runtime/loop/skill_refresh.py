@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,14 @@ from ...skills import (
     SkillRefresh,
     replace_skill_index_metadata,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimePrompt:
+    """One live prompt and the metadata that locates its owned spans."""
+
+    system_prompt: str | Message
+    prompt_components: dict[str, dict[str, int | str]]
 
 
 class SkillRefreshMixin:
@@ -33,6 +41,7 @@ class SkillRefreshMixin:
         home: Path | None,
         project_dir: Path | None,
         frozen: bool,
+        runtime_prompt: RuntimePrompt | None,
     ) -> None:
         self._skill_watcher = (
             SkillCatalogWatcher(catalog, home=home, project_dir=project_dir)
@@ -43,8 +52,25 @@ class SkillRefreshMixin:
         self._skill_refresh_generation = 0
         self._skill_refresh_notices: list[str] = []
         self._skill_catalog_listeners: list[Callable[[SkillCatalog], None]] = []
-        self._skill_prompt_components: dict[str, dict[str, int | str]] | None = None
+        self._runtime_prompt = (
+            RuntimePrompt(
+                self.context_assembler.system_prompt,
+                {
+                    key: dict(component)
+                    for key, component in runtime_prompt.prompt_components.items()
+                },
+            )
+            if runtime_prompt is not None
+            else None
+        )
+        self._legacy_skill_prompt_components: (
+            dict[str, dict[str, int | str]] | None
+        ) = None
         self.tool_registry.set_skill_refresher(self.refresh_skills)
+
+    def _set_runtime_prompt(self, runtime_prompt: RuntimePrompt) -> None:
+        self._runtime_prompt = runtime_prompt
+        self.context_assembler.system_prompt = runtime_prompt.system_prompt
 
     def add_skill_catalog_listener(
         self, listener: Callable[[SkillCatalog], None]
@@ -72,19 +98,21 @@ class SkillRefreshMixin:
         """Apply all live catalog state synchronously on the event loop."""
 
         self.tool_registry.skill_catalog = refresh.catalog
-        active_prompt = self.context_assembler.system_prompt
-        prompt = (
-            self._plan_mode_prior_prompt
-            if self._plan_mode and self._plan_mode_prior_prompt is not None
-            else active_prompt
-        )
-        if isinstance(prompt, Message):
-            prompt_text = "".join(
-                block.text
-                for block in prompt.content
-                if isinstance(block, TextContent)
+        if self._runtime_prompt is not None:
+            runtime_prompt = (
+                self._plan_mode_prior_prompt
+                if self._plan_mode and self._plan_mode_prior_prompt is not None
+                else self._runtime_prompt
             )
-            if self._skill_prompt_components is None:
+            prompt = runtime_prompt.system_prompt
+            components = runtime_prompt.prompt_components
+        else:
+            prompt = (
+                self._plan_mode_prior_prompt
+                if self._plan_mode and self._plan_mode_prior_prompt is not None
+                else self.context_assembler.system_prompt
+            )
+            if self._legacy_skill_prompt_components is None:
                 metadata = getattr(self, "session_metadata", None)
                 components = (
                     {
@@ -107,16 +135,35 @@ class SkillRefreshMixin:
                         "digest": metadata.project_memory_digest,
                     }
             else:
-                components = self._skill_prompt_components
-            prompt_text, self._skill_prompt_components = replace_skill_index_metadata(
+                components = self._legacy_skill_prompt_components
+        if isinstance(prompt, Message):
+            prompt_text = "".join(
+                block.text
+                for block in prompt.content
+                if isinstance(block, TextContent)
+            )
+            prompt_text, components = replace_skill_index_metadata(
                 prompt_text, refresh.catalog, components
             )
             prompt = replace(prompt, content=[TextContent(prompt_text)])
-            if self._plan_mode:
-                self._plan_mode_prior_prompt = prompt
-                self.context_assembler.system_prompt = plan_mode_prompt(prompt)
+            if self._runtime_prompt is not None:
+                runtime_prompt = RuntimePrompt(prompt, components)
+                if self._plan_mode:
+                    self._plan_mode_prior_prompt = runtime_prompt
+                    self._set_runtime_prompt(
+                        RuntimePrompt(
+                            plan_mode_prompt(prompt), runtime_prompt.prompt_components
+                        )
+                    )
+                else:
+                    self._set_runtime_prompt(runtime_prompt)
             else:
-                self.context_assembler.system_prompt = prompt
+                self._legacy_skill_prompt_components = components
+                if self._plan_mode:
+                    self._plan_mode_prior_prompt = prompt
+                    self.context_assembler.system_prompt = plan_mode_prompt(prompt)
+                else:
+                    self.context_assembler.system_prompt = prompt
         for listener in self._skill_catalog_listeners:
             listener(refresh.catalog)
         notice = self._skill_refresh_notice(refresh)
@@ -153,4 +200,4 @@ class SkillRefreshMixin:
         return "\n".join(messages)
 
 
-__all__ = ["SkillRefreshMixin"]
+__all__ = ["RuntimePrompt", "SkillRefreshMixin"]

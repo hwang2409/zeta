@@ -118,7 +118,7 @@ from .empty_turn import (
 from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
 from .project_inbox import ProjectInboxNotificationMixin
-from .skill_refresh import SkillRefreshMixin
+from .skill_refresh import RuntimePrompt, SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
@@ -157,6 +157,7 @@ class AgentLoop(
         max_turns: int | None = 150,
         context_assembler: ContextAssembler | None = None,
         system_prompt: str | Message | None = None,
+        runtime_prompt: RuntimePrompt | None = None,
         token_budget: int = 200_000,
         retained_tail: int = 8,
         on_completion_success: Callable[[], None] | None = None,
@@ -241,12 +242,10 @@ class AgentLoop(
             self.store, self.notify_background_persisted
         )
         self.agent_catalog = self.tool_registry.agent_catalog
-        self._configure_skill_refresh(
-            catalog=self.tool_registry.skill_catalog,
-            home=skill_home,
-            project_dir=skill_project_dir,
-            frozen=freeze_skill_catalog,
-        )
+        if system_prompt is not None and runtime_prompt is not None:
+            raise ValueError("pass only one system prompt")
+        if runtime_prompt is not None:
+            system_prompt = runtime_prompt.system_prompt
         if (
             approval_policy is not None
             and self.tool_registry.approval_policy is not None
@@ -271,6 +270,13 @@ class AgentLoop(
             backend=backend,
             on_completion_success=on_completion_success,
             usage_sink=usage_sink,
+        )
+        self._configure_skill_refresh(
+            catalog=self.tool_registry.skill_catalog,
+            home=skill_home,
+            project_dir=skill_project_dir,
+            frozen=freeze_skill_catalog,
+            runtime_prompt=runtime_prompt,
         )
         self.on_completion_success = on_completion_success
         self._on_plan_mode_change = on_plan_mode_change

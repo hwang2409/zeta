@@ -19,10 +19,12 @@ from tests.test_server import (
     _request,
     _seed_slash_fixtures,
 )
+from zeta.config.settings import load_settings, resolve
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, MessageRole, TextContent
+from zeta.runtime.composition import compose_runtime
 from zeta.runtime.prompt_resume import resume_prompt
 from zeta.server.server import ZetaServer
 from zeta.skills import SkillCatalog, discover_session_skills
@@ -87,11 +89,13 @@ def _hold_metadata_lock(manager: SessionManager, session_id: str, seconds: float
     return release, thread
 
 
-def _install_live_skill(home: Path) -> None:
-    skill = home / "skills" / "live.md"
+def _install_live_skill(
+    home: Path, name: str = "live", description: str = "live description"
+) -> None:
+    skill = home / "skills" / f"{name}.md"
     skill.parent.mkdir(parents=True, exist_ok=True)
     skill.write_text(
-        "---\nname: live\ndescription: live description\n---\n\nlive body\n",
+        f"---\nname: {name}\ndescription: {description}\n---\n\n{name} body\n",
         encoding="utf-8",
     )
 
@@ -262,6 +266,140 @@ async def test_touch_adopts_metadata_without_reverting_live_prompt(
     assert saved.skill_catalog == original_catalog
     await loop.close()
     loop.store.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_prompt_does_not_read_session_prompt_components(
+    tmp_path: Path,
+) -> None:
+    from zeta.runtime.loop import RuntimePrompt
+
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    catalog = SkillCatalog.empty()
+    prompt = f"identity\n\n{catalog.index()}"
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "sessions", cwd=project),
+        skill_catalog=catalog,
+        runtime_prompt=RuntimePrompt(prompt, {}),
+        skill_home=home,
+        skill_project_dir=project,
+    )
+
+    class StaleSessionMetadata:
+        @property
+        def prompt_components(self) -> object:
+            raise AssertionError("live prompt read persisted prompt components")
+
+    loop.session_metadata = StaleSessionMetadata()
+    loop.set_plan_mode(True)
+    _install_live_skill(home)
+    try:
+        await loop.refresh_skills()
+        loop.set_plan_mode(False)
+    finally:
+        await loop.close()
+        loop.store.close()
+
+    assert "live description" in loop.context_assembler.system_prompt.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_concurrent_resume_keeps_live_prompt_components_with_skill_refresh(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    catalog = SkillCatalog.empty()
+    memory = "project memory"
+    prompt = f"identity\n\n{catalog.index()}\n\n{memory}"
+    memory_offset = prompt.index(memory)
+    memory_digest = hashlib.sha256(memory.encode()).hexdigest()
+    manager = SessionManager(home)
+    first = manager.create(
+        provider="codex",
+        model="offline",
+        cwd=project,
+        system_prompt=prompt,
+        skill_catalog=catalog,
+        project_memory_offset=memory_offset,
+        project_memory_length=len(memory),
+        project_memory_digest=memory_digest,
+        prompt_recipe="custom",
+        prompt_components={
+            "project_memory": {
+                "offset": memory_offset,
+                "length": len(memory),
+                "digest": memory_digest,
+            }
+        },
+        auto_project=False,
+    )
+    _install_live_skill(home, "first", "first description")
+    second = manager.open(first.metadata.session_id)
+    resumed = resume_prompt(
+        second.metadata,
+        manager=manager,
+        store=second.store,
+        home=home,
+        repo_root=project,
+        inbox_enabled=False,
+        context_loader=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError(f"unexpected default rebuild: {kwargs}")
+        ),
+    )
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    config = resolve(
+        load_settings(home=home).settings,
+        cli_provider="codex",
+        cli_model="offline",
+        cli_yolo=None,
+        cli_token_budget=None,
+        cli_auto_memory=False,
+    )
+    runtime = compose_runtime(
+        home=home,
+        cwd=project,
+        manager=manager,
+        config=config,
+        provider="codex",
+        model="offline",
+        project_context=resumed.context,
+        backend_builder=lambda *_args, **_kwargs: (backend, "offline"),
+        opened=first,
+        skill_catalog=resumed.skill_catalog,
+        agent_catalog=resumed.agent_catalog,
+        auto_project=False,
+    )
+    second.store.close()
+    _install_live_skill(home, "second", "second description")
+    try:
+        _ = [
+            event
+            async for event in runtime.loop.run_turn(
+                "use both", origin=MessageOrigin.USER
+            )
+        ]
+        system_text = "\n".join(
+            block.text
+            for message in backend.calls[0][0]
+            if message.role is MessageRole.SYSTEM
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        component = runtime.loop._runtime_prompt.prompt_components["project_memory"]
+        offset = int(component["offset"])
+        length = int(component["length"])
+        assert "first description" in system_text
+        assert "second description" in system_text
+        assert system_text[offset : offset + length] == memory
+        assert component["digest"] == hashlib.sha256(memory.encode()).hexdigest()
+    finally:
+        await runtime.loop.close()
+        first.store.close()
 
 
 @pytest.mark.asyncio

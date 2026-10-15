@@ -7,6 +7,7 @@ from typing import Any
 
 from ...agent.plan_mode import plan_mode_prompt
 from ...protocol.types import ToolCall
+from .skill_refresh import RuntimePrompt
 
 
 class PlanModeRuntimeMixin:
@@ -32,11 +33,24 @@ class PlanModeRuntimeMixin:
         if enabled == self._plan_mode:
             return
         assembler = self.context_assembler
+        runtime_prompt = getattr(self, "_runtime_prompt", None)
         if enabled:
-            self._plan_mode_prior_prompt = assembler.system_prompt
-            assembler.system_prompt = plan_mode_prompt(assembler.system_prompt)
+            if runtime_prompt is not None:
+                self._plan_mode_prior_prompt = runtime_prompt
+                self._set_runtime_prompt(
+                    RuntimePrompt(
+                        plan_mode_prompt(runtime_prompt.system_prompt),
+                        runtime_prompt.prompt_components,
+                    )
+                )
+            else:
+                self._plan_mode_prior_prompt = assembler.system_prompt
+                assembler.system_prompt = plan_mode_prompt(assembler.system_prompt)
         elif self._plan_mode_prior_prompt is not None:
-            assembler.system_prompt = self._plan_mode_prior_prompt
+            if runtime_prompt is not None:
+                self._set_runtime_prompt(self._plan_mode_prior_prompt)
+            else:
+                assembler.system_prompt = self._plan_mode_prior_prompt
             self._plan_mode_prior_prompt = None
         self._plan_mode = enabled
         if self._on_plan_mode_change is not None:

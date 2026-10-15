@@ -26,9 +26,28 @@ from ..skills.agent_catalog import AgentCatalog
 from ..tools._shared.user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from .loop import AgentLoop
+from .loop.skill_refresh import RuntimePrompt
 
 BackendBuilder = Callable[..., tuple[CompletionBackend, str]]
 BackgroundEventSink = Callable[[StreamEvent], None]
+
+
+def _runtime_prompt(context: ProjectContext) -> RuntimePrompt:
+    components = {
+        key: dict(component) for key, component in context.prompt_components.items()
+    }
+    if (
+        "project_memory" not in components
+        and context.memory_offset is not None
+        and context.memory_length is not None
+        and context.memory_digest is not None
+    ):
+        components["project_memory"] = {
+            "offset": context.memory_offset,
+            "length": context.memory_length,
+            "digest": context.memory_digest,
+        }
+    return RuntimePrompt(context.system_prompt, components)
 
 
 @dataclass(slots=True)
@@ -187,7 +206,6 @@ def compose_runtime(
             "retained_tail": metadata.retained_tail,
             "on_completion_success": completion_callback,
             "on_plan_mode_change": on_plan_mode_change,
-            "system_prompt": project_context.system_prompt,
             "skill_home": home,
             "skill_project_dir": (
                 project_discovery.primary_root
@@ -196,6 +214,10 @@ def compose_runtime(
                 else cwd
             ),
         }
+        if project_context.prompt_recipe is None:
+            loop_kwargs["system_prompt"] = project_context.system_prompt
+        else:
+            loop_kwargs["runtime_prompt"] = _runtime_prompt(project_context)
         if max_turns is not None and max_turns > 0:
             loop_kwargs["max_turns"] = max_turns
         registry = ToolRegistry(
