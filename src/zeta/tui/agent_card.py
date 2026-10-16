@@ -811,6 +811,13 @@ class AgentNavigation:
     def child_view_active(self) -> bool:
         return self.current_path != self.root_path
 
+    def child_instance_id(self) -> str | None:
+        if not self.child_view_active:
+            return None
+        metadata = self._cached_agent_metadata(self.current_path)
+        handle = metadata.get("handle")
+        return handle if type(handle) is str and handle else None
+
     def todo_snapshot(self) -> TodoSnapshot | None:
         """Return only cached in-memory state for the selected session."""
 

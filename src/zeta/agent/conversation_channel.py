@@ -104,10 +104,14 @@ class ConversationChannel:
             background=marker.get("background") is True,
         ):
             agent_type = marker.get("agent_type") or "general"
+            reason = (
+                "it is a foreground child"
+                if marker.get("background") is not True
+                else "its profile does not accept follow-ups"
+            )
             return (
                 f"agent_send rejected for {agent_type} child {child_instance_id!r}: "
-                "it does not accept follow-ups; reviewers are one-shot; start a "
-                "fresh reviewer"
+                f"{reason}"
             )
         deadline = time.monotonic() + commit_timeout
         try:
