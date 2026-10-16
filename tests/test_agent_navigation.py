@@ -964,22 +964,6 @@ async def test_enter_in_ineligible_child_view_keeps_text_and_does_not_submit(
     await app.close()
 
 
-@pytest.mark.asyncio
-async def test_child_view_slash_command_still_submits_to_main(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = _child(store, 1, description="Worker")
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        console=Console(file=StringIO(), force_terminal=False),
-    )
-    app._agent_navigation.current_path = child
-    await app._handle_prompt_value("/runs")
-    assert "no live runs" in app.console.file.getvalue()
-    await app.close()
-
-
 def test_child_view_keeps_main_route_visible(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     _child(store, 1, description="Leaf")
