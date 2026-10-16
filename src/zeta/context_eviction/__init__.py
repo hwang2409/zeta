@@ -932,6 +932,53 @@ def _strictly_smaller(original_tokens: int, candidate_tokens: int) -> bool:
     return candidate_tokens < original_tokens
 
 
+def _pair_eviction_messages(
+    records: Sequence[tuple[int, Message]],
+    messages: list[Message],
+    changed: set[int],
+) -> None:
+    """Keep the durable eviction view from containing half a tool exchange."""
+
+    call_ids = {
+        block.tool_call.id
+        for message in messages
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    }
+    result_ids = {
+        result.tool_call_id
+        for message in messages
+        if (result := message.tool_result) is not None
+    }
+    collapsed_into = next(
+        (
+            fields["collapsed_into_seq"]
+            for message in messages
+            if isinstance(fields := message.metadata.get("eviction_receipt_fields"), Mapping)
+            and type(fields.get("collapsed_into_seq")) is int
+            and type(fields.get("older_read")) is bool
+        ),
+        None,
+    )
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        if (
+            collapsed_into is not None
+            and any(
+                isinstance(block, ToolUseContent)
+                and block.tool_call.id not in result_ids
+                for block in message.content
+            )
+        ):
+            messages[index] = _collapsed_assistant_receipt(
+                seq, collapsed_into, older_read=True
+            )
+            changed.add(seq)
+        elif message.tool_result is not None and message.tool_result.tool_call_id not in call_ids:
+            messages[index] = _assistant_receipt(seq, "orphan tool result")
+            changed.add(seq)
+
+
 def _result(
     records: Sequence[tuple[int, Message]],
     messages: list[Message],
@@ -940,6 +987,7 @@ def _result(
     after: int,
     reached: bool,
 ) -> EvictionResult:
+    _pair_eviction_messages(records, messages, changed)
     return EvictionResult(
         messages,
         len(changed),

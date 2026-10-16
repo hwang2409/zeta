@@ -24,6 +24,7 @@ from zeta.core.context import CompactionPolicy, ContextAssembler
 from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
+from zeta.protocol.tool_batches import without_incomplete_tool_batches
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
@@ -145,6 +146,63 @@ def persisted_tool_result(
             "metadata": {"display_only": body},
         }
     )
+
+
+def test_eviction_collapse_and_reemission_keeps_tool_pairs() -> None:
+    first_call, first_result = tool_pair("read", "read-1", "same content" * 100)
+    second_call, second_result = tool_pair("read", "read-2", "same content" * 100)
+    records = [(1, first_call), (2, first_result), (3, second_call), (4, second_result)]
+
+    evicted = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        source_messages=dict(records),
+    )
+
+    call_ids = {
+        block.tool_call.id
+        for message in evicted.messages
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    }
+    result_ids = {
+        message.tool_result.tool_call_id
+        for message in evicted.messages
+        if message.tool_result is not None
+    }
+    assert result_ids <= call_ids
+    assert call_ids <= result_ids
+
+
+def test_provider_payload_drops_stored_eviction_orphan_result(caplog: pytest.LogCaptureFixture) -> None:
+    orphan_id = "call_58933243977a4c54920bab020e5035d7"
+    messages = [
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("[older duplicate read collapsed into seq 60]")],
+            metadata={
+                "collapsed_into_seq": 60,
+                "older_read": True,
+                "source_seq": 57,
+            },
+        ),
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(
+                orphan_id,
+                "",
+                structured_content={"path": "RULES.md", "line_count": 1, "sha256": "x"},
+            ),
+        ),
+    ]
+
+    with caplog.at_level("WARNING"):
+        payload = build_responses_payload(messages, [], model="gpt-5")
+
+    assert not any(item.get("type") == "function_call_output" for item in payload["input"])
+    assert "orphan tool result" in caplog.text
+    assert len(without_incomplete_tool_batches(messages)) == 1
 
 
 def test_tool_result_accounting_counts_every_provider_bound_field() -> None:

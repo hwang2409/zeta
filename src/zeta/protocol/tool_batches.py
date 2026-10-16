@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 
 from .types import Message, MessageRole, ToolUseContent
+
+logger = logging.getLogger(__name__)
 
 
 def without_incomplete_tool_batches(messages: Sequence[Message]) -> list[Message]:
     """Remove incomplete tool batches before later conversation messages."""
 
     result: list[Message] = []
+    orphan_results = 0
     index = 0
     while index < len(messages):
         message = messages[index]
+        if message.role is MessageRole.TOOL_RESULT:
+            orphan_results += 1
+            index += 1
+            continue
         call_ids = [
             block.tool_call.id
             for block in message.content
@@ -43,4 +51,8 @@ def without_incomplete_tool_batches(messages: Sequence[Message]) -> list[Message
             result.append(message)
             result.extend(batch_results)
         index = following
+    if orphan_results:
+        logger.warning(
+            "dropped %d orphan tool result(s) from provider payload", orphan_results
+        )
     return result
