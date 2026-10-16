@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import gc
 import json
 import logging
@@ -957,6 +958,90 @@ async def test_child_send_exception_preserves_text_and_shows_notice(
     assert any("send failed" in notice for notice in notices)
     assert store.messages() == []
     await app.close()
+
+
+@pytest.mark.asyncio
+async def test_child_send_success_keeps_same_text_typed_after_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, store, child, session, _notices = _child_send_app(tmp_path)
+    started = asyncio.Event()
+    release = threading.Event()
+    real_send = agent_runtime.send_to_run
+
+    def send(*args: object, **kwargs: object) -> str | None:
+        started.set()
+        release.wait(5)
+        return real_send(*args, **kwargs)
+
+    monkeypatch.setattr(agent_runtime, "send_to_run", send)
+    buffer = session.default_buffer
+    buffer.text = "same"
+    assert app._submit_input(buffer.text) is False
+    await asyncio.wait_for(started.wait(), 1)
+    buffer.text = "something else"
+    buffer.text = "same"
+    release.set()
+    for _ in range(100):
+        if child.pending_prompts():
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    assert [entry.data["text"] for entry in child.pending_prompts()] == ["same"]
+    assert buffer.text == "same"
+    assert store.messages() == []
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_wait_forever_for_a_stuck_child_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _store, _child, session, _notices = _child_send_app(tmp_path)
+    started = asyncio.Event()
+    release = threading.Event()
+
+    def stuck(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        started.set()
+        release.wait(10)
+
+    monkeypatch.setattr(agent_runtime, "send_to_run", stuck)
+    monkeypatch.setattr(agent_runtime, "CHILD_SEND_CLOSE_SECONDS", 0.1)
+    session.default_buffer.text = "stuck"
+    assert app._submit_input(session.default_buffer.text) is False
+    await asyncio.wait_for(started.wait(), 1)
+    try:
+        await asyncio.wait_for(app.close(), 3)
+    finally:
+        release.set()
+
+
+def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Path) -> None:
+    app, store, child, _session, _notices = _child_send_app(tmp_path)
+    root_fd = os.open(child.session_dir.parent, os.O_RDONLY)
+    fcntl.flock(root_fd, fcntl.LOCK_EX)
+    result: list[str | None] = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            agent_runtime.send_to_run(
+                store,
+                "root:worker",
+                "while locked",
+                channel=app.loop._background_owner.conversation_channel,
+            )
+        ),
+        daemon=True,
+    )
+    try:
+        worker.start()
+        worker.join(3)
+        assert not worker.is_alive()
+    finally:
+        fcntl.flock(root_fd, fcntl.LOCK_UN)
+        os.close(root_fd)
+    assert result == [None]
+    assert [entry.data["text"] for entry in child.pending_prompts()] == ["while locked"]
 
 
 @pytest.mark.asyncio

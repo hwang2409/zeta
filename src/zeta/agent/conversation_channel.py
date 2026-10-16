@@ -121,6 +121,7 @@ class ConversationChannel:
                 session_id=child_path.name,
                 cwd=parent_store.cwd,
                 _lock_deadline=deadline,
+                _must_exist=True,
             ) as child_store:
                 child_store.pending_prompt_queue.append(
                     message,
