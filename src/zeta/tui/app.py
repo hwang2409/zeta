@@ -656,8 +656,8 @@ class TUIApp(
             return False
         if self._open_overlay_from_submit(value):
             return True
-        if self._send_to_child(value):
-            return True
+        if self._agent_navigation.child_view_active and not value.lstrip().startswith("/"):
+            return self._send_to_child(value)
         self._paste_runtime.advance_buffer_generation()
         super()._submit_input(value, internal=internal)
         return True

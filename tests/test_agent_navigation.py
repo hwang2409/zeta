@@ -873,6 +873,113 @@ def test_agent_list_selection_crossing_page_boundary_updates_page(
     assert "page 2/2 · 6 agents" in _list_lines(navigation)[-1]
 
 
+@pytest.mark.asyncio
+async def test_enter_in_eligible_child_view_queues_for_child_not_main(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Worker", agent_type="worker")
+    child.joinpath("agent_lifecycle.json").write_text(
+        json.dumps({"description": "Worker", "agent_type": "worker", "state": "running", "handle": "root:worker"})
+    )
+    call = ToolCall("worker-call", "agent", {"prompt": "work"})
+    store.register_agent_child(
+        call,
+        child_session_path=str(child),
+        description="Worker",
+        agent_type="worker",
+        background=True,
+        accepts_follow_ups=True,
+        child_instance_id="root:worker",
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app.loop.store.register_agent_child(
+        call,
+        child_session_path=str(child),
+        description="Worker",
+        agent_type="worker",
+        background=True,
+        accepts_follow_ups=True,
+        child_instance_id="root:worker",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+    app._agent_navigation.current_path = child
+    app._agent_navigation.child_instance_id = lambda: "root:worker"
+    assert app._agent_navigation.child_view_active
+    assert app._submit_input("follow up") is True
+    await asyncio.sleep(0.1)
+    assert [entry.data["text"] for entry in ConversationStore(child.parent, session_id=child.name).pending_prompts()] == ["follow up"]
+    assert store.messages() == []
+    assert "queued message for root:worker" in notices
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_enter_in_ineligible_child_view_keeps_text_and_does_not_submit(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Foreground")
+    child.joinpath("agent_lifecycle.json").write_text(
+        json.dumps({"description": "Foreground", "state": "running", "handle": "root:foreground"})
+    )
+    call = ToolCall("foreground-call", "agent", {"prompt": "work"})
+    store.register_agent_child(
+        call,
+        child_session_path=str(child),
+        description="Foreground",
+        background=False,
+        child_instance_id="root:foreground",
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app.loop.store.register_agent_child(
+        call,
+        child_session_path=str(child),
+        description="Foreground",
+        background=False,
+        child_instance_id="root:foreground",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+    app._agent_navigation.current_path = child
+    app._agent_navigation.child_instance_id = lambda: "root:foreground"
+    session = app._make_session()
+    app._active_session = session
+    session.default_buffer.text = "keep this"
+    assert app._agent_navigation.child_view_active
+    assert app._submit_input(session.default_buffer.text) is False
+    assert session.default_buffer.text == "keep this"
+    assert ConversationStore(child.parent, session_id=child.name).pending_prompts() == []
+    assert not any(message.role is MessageRole.USER for message in store.messages())
+    assert any("return to main" in notice for notice in notices)
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_child_view_slash_command_still_submits_to_main(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Worker")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._agent_navigation.current_path = child
+    await app._handle_prompt_value("/runs")
+    assert "no live runs" in app.console.file.getvalue()
+    await app.close()
+
+
 def test_child_view_keeps_main_route_visible(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     _child(store, 1, description="Leaf")
