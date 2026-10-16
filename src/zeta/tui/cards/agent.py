@@ -24,6 +24,7 @@ from ...agent.receipt import (
 from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import ConversationIntegrityError, load_session_json
 from ...protocol.types import StreamEvent, StreamEventType, ToolCall
+from ...agent.conversation_channel import has_follow_up_loop
 from ...tools.agent import send_to_run
 from .. import theme
 from .agent_sync import (
@@ -729,13 +730,55 @@ class AgentRunCommandMixin:
     reaches a run through the same seam the agent_send tool uses.
     """
 
+    def _send_to_child(self, value: str) -> bool:
+        if (
+            not value.strip()
+            or not self._agent_navigation.child_view_active
+            or value.lstrip().startswith("/")
+        ):
+            return False
+        child_id = self._agent_navigation.child_instance_id()
+        marker = self.loop.store.agent_children().get(child_id) if child_id else None
+        eligible = marker is not None and has_follow_up_loop(
+            accepts_follow_ups=marker.get("accepts_follow_ups") is True,
+            background=marker.get("background") is True,
+        )
+        if not eligible:
+            self._print_system(
+                "agent does not accept messages; press h to return to main"
+            )
+            return False
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                send_to_run,
+                self.loop.store,
+                child_id,
+                value,
+                channel=self.loop._background_owner.conversation_channel,
+            )
+        )
+
+        def finished(done: asyncio.Task[str | None]) -> None:
+            error = done.result()
+            self._print_system(
+                f"could not queue message for {child_id}: {error}"
+                if error is not None
+                else f"queued message for {child_id}"
+            )
+
+        task.add_done_callback(finished)
+        return True
+
     def slash_runs(self, args: str) -> str:
         del args
         children = self.loop.store.agent_children()
         runs = [
             (marker_key, marker)
             for marker_key, marker in children.items()
-            if marker.get("background") and marker.get("agent_type") == "run"
+            if has_follow_up_loop(
+                accepts_follow_ups=marker.get("accepts_follow_ups") is True,
+                background=marker.get("background") is True,
+            )
         ]
         if not runs:
             return "no live runs"
@@ -743,7 +786,8 @@ class AgentRunCommandMixin:
         for marker_key, marker in sorted(runs):
             turns = marker.get("turns_used", 0)
             lines.append(
-                f"{marker_key}  {marker['description']}  ({turns} turns)"
+                f"{marker_key}  {marker['description']}  "
+                f"[{marker.get('agent_type', 'general')}]  ({turns} turns)"
             )
         return "\n".join(lines)
 
