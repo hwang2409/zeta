@@ -748,6 +748,13 @@ class AgentRunCommandMixin:
                 "agent does not accept messages; press h to return to main"
             )
             return False
+        sends = getattr(self, "_child_send_tasks", None)
+        if sends is None:
+            sends = self._child_send_tasks = {}
+        if child_id in sends:
+            return False
+        session = self._active_session
+        buffer = session.default_buffer if session is not None else None
         task = asyncio.create_task(
             asyncio.to_thread(
                 send_to_run,
@@ -757,17 +764,31 @@ class AgentRunCommandMixin:
                 channel=self.loop._background_owner.conversation_channel,
             )
         )
+        sends[child_id] = (task, value, buffer)
 
         def finished(done: asyncio.Task[str | None]) -> None:
-            error = done.result()
-            self._print_system(
-                f"could not queue message for {child_id}: {error}"
-                if error is not None
-                else f"queued message for {child_id}"
-            )
+            sends.pop(child_id, None)
+            try:
+                error = done.result()
+            except BaseException as exc:  # noqa: BLE001 - surface send failures
+                error = str(exc) or exc.__class__.__name__
+            if error is None:
+                if buffer is not None and buffer.text == value:
+                    buffer.reset()
+                self._print_system(f"queued message for {child_id}")
+            else:
+                self._print_system(f"could not queue message for {child_id}: {error}")
 
         task.add_done_callback(finished)
-        return True
+        return False
+
+    async def _close_child_sends(self) -> None:
+        sends = getattr(self, "_child_send_tasks", {})
+        if sends:
+            await asyncio.gather(
+                *(asyncio.shield(entry[0]) for entry in sends.values()),
+                return_exceptions=True,
+            )
 
     def slash_runs(self, args: str) -> str:
         del args
