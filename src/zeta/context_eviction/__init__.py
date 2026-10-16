@@ -327,6 +327,24 @@ def evict_messages(
         if running_total <= target_tokens:
             return _result(records, messages, changed, before, running_total, True)
 
+    if source_messages is not None:
+        # Normal per-row eviction can finish a group that persisted regeneration
+        # intentionally retained; give the range pass the updated receipt rows.
+        records = list(zip((seq for seq, _ in records), messages, strict=True))
+        range_candidate = range_receipt_candidate(
+            records,
+            allows=eligibility.allows,
+            is_smaller=lambda originals, candidates: _strictly_smaller(
+                sum(token_counter(message) for _, message in originals),
+                sum(map(token_counter, candidates)),
+            ),
+        )
+        if range_candidate.coalesced_source_seqs:
+            records = range_candidate.records
+            messages = [message for _, message in records]
+            changed.update(range_candidate.coalesced_source_seqs)
+            running_total = fixed_tokens + sum(map(token_counter, messages))
+
     return _result(
         records,
         messages,
@@ -364,34 +382,82 @@ def _evict_persisted_records(
         unconsumed_source_seqs=protected,
     )
     generated_by_seq = dict(zip(generated.source_seqs, generated.messages, strict=True))
-    output: list[tuple[int, Message]] = []
+    output = list(records)
     regenerated: set[int] = set()
-    for seq, message in records:
+    result_indexes: dict[str, list[int]] = defaultdict(list)
+    for index, (_, message) in enumerate(records):
+        if message.tool_result is not None:
+            result_indexes[message.tool_result.tool_call_id].append(index)
+
+    def is_current(index: int) -> bool:
+        seq, message = records[index]
         marker = message.metadata.get(RECEIPT_KIND_METADATA)
         result = message.tool_result
         tool_name = None
         if result is not None and (call := source_calls.get(result.tool_call_id)):
             tool_name = call.name
-        current = (
+        return (
             isinstance(marker, str)
             and marker != "range"
             and _is_receipt_kind(message, seq, marker, tool_name=tool_name)
         )
+
+    def can_regenerate(index: int) -> bool:
+        seq, message = records[index]
         replacement = generated_by_seq.get(seq)
-        if (
+        return (
             eligibility.allows(seq)
             and not message.metadata.get("eviction_view_invalid")
-            and not current
+            and not is_current(index)
             and replacement is not None
             and replacement.metadata.get(RECEIPT_KIND_METADATA)
-            and _strictly_smaller(
-                token_counter(message), token_counter(replacement)
+        )
+
+    blocked: set[int] = set()
+    for call_index, (seq, message) in enumerate(records):
+        call_ids = [
+            block.tool_call.id
+            for block in message.content
+            if isinstance(block, ToolUseContent)
+        ]
+        if not call_ids:
+            continue
+        indexes = [call_index]
+        for call_id in call_ids:
+            indexes.extend(result_indexes.get(call_id, ()))
+        # Keep every member out of the per-row fallback. An exchange is one
+        # unit: source regeneration is allowed only when every member is stale
+        # and can be regenerated from the active source rows.
+        blocked.update(indexes)
+        if not all(can_regenerate(index) for index in indexes):
+            continue
+        original_tokens = sum(token_counter(records[index][1]) for index in indexes)
+        replacement_tokens = sum(
+            token_counter(
+                generated_by_seq[records[index][0]]
+                if can_regenerate(index)
+                else records[index][1]
             )
-        ):
-            output.append((seq, replacement))
-            regenerated.add(seq)
-        else:
-            output.append((seq, message))
+            for index in indexes
+        )
+        if _strictly_smaller(original_tokens, replacement_tokens):
+            for index in indexes:
+                if not can_regenerate(index):
+                    continue
+                source_seq = records[index][0]
+                output[index] = (source_seq, generated_by_seq[source_seq])
+                regenerated.add(source_seq)
+
+    for index, (seq, message) in enumerate(records):
+        if index in blocked:
+            continue
+        if can_regenerate(index):
+            replacement = generated_by_seq[seq]
+            if _strictly_smaller(
+                token_counter(message), token_counter(replacement)
+            ):
+                output[index] = (seq, replacement)
+                regenerated.add(seq)
     return output, regenerated
 
 
