@@ -364,34 +364,82 @@ def _evict_persisted_records(
         unconsumed_source_seqs=protected,
     )
     generated_by_seq = dict(zip(generated.source_seqs, generated.messages, strict=True))
-    output: list[tuple[int, Message]] = []
+    output = list(records)
     regenerated: set[int] = set()
-    for seq, message in records:
+    result_indexes: dict[str, list[int]] = defaultdict(list)
+    for index, (_, message) in enumerate(records):
+        if message.tool_result is not None:
+            result_indexes[message.tool_result.tool_call_id].append(index)
+
+    def is_current(index: int) -> bool:
+        seq, message = records[index]
         marker = message.metadata.get(RECEIPT_KIND_METADATA)
         result = message.tool_result
         tool_name = None
         if result is not None and (call := source_calls.get(result.tool_call_id)):
             tool_name = call.name
-        current = (
+        return (
             isinstance(marker, str)
             and marker != "range"
             and _is_receipt_kind(message, seq, marker, tool_name=tool_name)
         )
+
+    def can_regenerate(index: int) -> bool:
+        seq, message = records[index]
         replacement = generated_by_seq.get(seq)
-        if (
+        return (
             eligibility.allows(seq)
             and not message.metadata.get("eviction_view_invalid")
-            and not current
+            and not is_current(index)
             and replacement is not None
             and replacement.metadata.get(RECEIPT_KIND_METADATA)
-            and _strictly_smaller(
-                token_counter(message), token_counter(replacement)
-            )
+        )
+
+    blocked: set[int] = set()
+    for call_index, (seq, message) in enumerate(records):
+        call_ids = [
+            block.tool_call.id
+            for block in message.content
+            if isinstance(block, ToolUseContent)
+        ]
+        if not call_ids:
+            continue
+        indexes = [call_index]
+        for call_id in call_ids:
+            indexes.extend(result_indexes.get(call_id, ()))
+        if can_regenerate(call_index):
+            blocked.update(indexes)
+        if not can_regenerate(call_index) or not all(
+            can_regenerate(index) or is_current(index) for index in indexes[1:]
         ):
-            output.append((seq, replacement))
-            regenerated.add(seq)
-        else:
-            output.append((seq, message))
+            continue
+        original_tokens = sum(token_counter(records[index][1]) for index in indexes)
+        replacement_tokens = sum(
+            token_counter(
+                generated_by_seq[records[index][0]]
+                if can_regenerate(index)
+                else records[index][1]
+            )
+            for index in indexes
+        )
+        if _strictly_smaller(original_tokens, replacement_tokens):
+            for index in indexes:
+                if not can_regenerate(index):
+                    continue
+                source_seq = records[index][0]
+                output[index] = (source_seq, generated_by_seq[source_seq])
+                regenerated.add(source_seq)
+
+    for index, (seq, message) in enumerate(records):
+        if index in blocked:
+            continue
+        if can_regenerate(index):
+            replacement = generated_by_seq[seq]
+            if _strictly_smaller(
+                token_counter(message), token_counter(replacement)
+            ):
+                output[index] = (seq, replacement)
+                regenerated.add(seq)
     return output, regenerated
 
 
@@ -932,57 +980,6 @@ def _strictly_smaller(original_tokens: int, candidate_tokens: int) -> bool:
     return candidate_tokens < original_tokens
 
 
-def _pair_eviction_messages(
-    records: Sequence[tuple[int, Message]],
-    messages: list[Message],
-    changed: set[int],
-) -> None:
-    """Keep the durable eviction view from containing half a tool exchange."""
-
-    call_ids = {
-        block.tool_call.id
-        for message in messages
-        for block in message.content
-        if isinstance(block, ToolUseContent)
-    }
-    result_ids = {
-        result.tool_call_id
-        for message in messages
-        if (result := message.tool_result) is not None
-    }
-    collapsed_into = next(
-        (
-            fields["collapsed_into_seq"]
-            for message in messages
-            if isinstance(fields := message.metadata.get("eviction_receipt_fields"), Mapping)
-            and type(fields.get("collapsed_into_seq")) is int
-            and type(fields.get("older_read")) is bool
-        ),
-        None,
-    )
-    for index, (seq, _) in enumerate(records):
-        message = messages[index]
-        if (
-            collapsed_into is not None
-            and any(
-                isinstance(block, ToolUseContent)
-                and block.tool_call.id not in result_ids
-                for block in message.content
-            )
-        ):
-            messages[index] = _collapsed_assistant_receipt(
-                seq, collapsed_into, older_read=True
-            )
-            changed.add(seq)
-        elif (
-            collapsed_into is not None
-            and message.tool_result is not None
-            and message.tool_result.tool_call_id not in call_ids
-        ):
-            messages[index] = _assistant_receipt(seq, "orphan tool result")
-            changed.add(seq)
-
-
 def _result(
     records: Sequence[tuple[int, Message]],
     messages: list[Message],
@@ -991,7 +988,6 @@ def _result(
     after: int,
     reached: bool,
 ) -> EvictionResult:
-    _pair_eviction_messages(records, messages, changed)
     return EvictionResult(
         messages,
         len(changed),

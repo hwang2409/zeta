@@ -175,6 +175,77 @@ def test_eviction_collapse_and_reemission_keeps_tool_pairs() -> None:
     assert call_ids <= result_ids
 
 
+def test_eviction_rejects_tool_pair_when_combined_regeneration_is_not_smaller() -> None:
+    call, result = tool_pair(
+        "read",
+        "read-atomic",
+        "large output " * 1_000,
+        arguments={"path": "RULES.md", "prompt": "large arguments " * 1_000},
+    )
+    source_records = [(1, call), (2, result)]
+    records = [
+        (1, Message(call.role, call.content, metadata={"display_only": True})),
+        (
+            2,
+            Message(
+                result.role,
+                tool_result=result.tool_result,
+                metadata={"display_only": True},
+            ),
+        ),
+    ]
+
+    def token_count(message: Message) -> int:
+        if message.metadata.get("context_evicted"):
+            return 20 if message.tool_result is not None else 5
+        return 10
+
+    regenerated, changed = eviction_module._evict_persisted_records(
+        records,
+        dict(source_records),
+        token_count,
+        eviction_module._EvictionEligibility(frozenset({1, 2})),
+    )
+
+    assert regenerated == records
+    assert changed == set()
+
+
+def test_eviction_does_not_pair_unrelated_incomplete_agent_call() -> None:
+    first_call, first_result = tool_pair("read", "read-1", "same content" * 100)
+    second_call, second_result = tool_pair("read", "read-2", "same content" * 100)
+    agent_call, _ = tool_pair(
+        "agent",
+        "agent-live",
+        "unused",
+        arguments={"prompt": "LIVE_AGENT_PROMPT " * 100},
+    )
+    records = [
+        (1, first_call),
+        (2, first_result),
+        (3, second_call),
+        (4, second_result),
+        (5, agent_call),
+    ]
+
+    evicted = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        source_messages=dict(records),
+        unconsumed_source_seqs={5},
+    )
+
+    live_call = next(
+        block.tool_call
+        for message in evicted.messages
+        for block in message.content
+        if isinstance(block, ToolUseContent) and block.tool_call.id == "agent-live"
+    )
+    assert live_call.arguments["prompt"] == "LIVE_AGENT_PROMPT " * 100
+    assert "collapsed into" not in rendered_text(evicted.messages)
+
+
 def test_provider_payload_drops_stored_eviction_orphan_result(caplog: pytest.LogCaptureFixture) -> None:
     orphan_id = "call_58933243977a4c54920bab020e5035d7"
     messages = [
