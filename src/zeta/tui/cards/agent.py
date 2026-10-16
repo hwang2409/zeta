@@ -14,6 +14,7 @@ from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
 
+from ...agent.conversation_channel import has_follow_up_loop
 from ...agent.presets import GENERAL_PRESET, get_agent_preset
 from ...agent.receipt import (
     agent_stats,
@@ -24,7 +25,6 @@ from ...agent.receipt import (
 from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import ConversationIntegrityError, load_session_json
 from ...protocol.types import StreamEvent, StreamEventType, ToolCall
-from ...agent.conversation_channel import has_follow_up_loop
 from ...tools.agent import send_to_run
 from .. import theme
 from .agent_sync import (
