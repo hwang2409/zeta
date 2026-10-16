@@ -343,6 +343,7 @@ def evict_messages(
             records = range_candidate.records
             messages = [message for _, message in records]
             changed.update(range_candidate.coalesced_source_seqs)
+            running_total = fixed_tokens + sum(map(token_counter, messages))
 
     return _result(
         records,

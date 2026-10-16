@@ -260,6 +260,42 @@ def test_two_pass_eviction_keeps_current_call_and_raw_result_paired() -> None:
         source_messages=source,
     )
     _assert_tool_pairs(second.messages)
+    assert second.tokens_after == sum(map(token_count, second.messages))
+    assert second.reached_target is (second.tokens_after <= 0)
+
+
+def test_final_range_pass_reports_coalesced_token_total() -> None:
+    def token_count(message: Message) -> int:
+        if message.metadata.get("eviction_range"):
+            return 1
+        return 10 if message.metadata.get("context_evicted") else 100
+
+    source: dict[int, Message] = {}
+    mixed_records: list[tuple[int, Message]] = []
+    for first_seq, call_id in ((1, "range-a"), (3, "range-b")):
+        call, result = tool_pair("read", call_id, "output " * 100)
+        pair = {first_seq: call, first_seq + 1: result}
+        source.update(pair)
+        first = evict_messages(
+            list(pair.items()),
+            fixed_tokens=0,
+            target_tokens=150,
+            token_counter=token_count,
+        )
+        assert first.messages[1].tool_result is not None
+        mixed_records.extend(zip(first.source_seqs, first.messages, strict=True))
+
+    second = evict_messages(
+        mixed_records,
+        fixed_tokens=0,
+        target_tokens=5,
+        token_counter=token_count,
+        source_messages=source,
+    )
+
+    _assert_tool_pairs(second.messages)
+    assert second.tokens_after == sum(map(token_count, second.messages))
+    assert second.reached_target is (second.tokens_after <= 5)
 
 
 def test_two_pass_eviction_keeps_raw_call_and_current_result_paired() -> None:
@@ -297,6 +333,8 @@ def test_two_pass_eviction_keeps_raw_call_and_current_result_paired() -> None:
         source_messages=source,
     )
     _assert_tool_pairs(second.messages)
+    assert second.tokens_after == sum(map(token_count, second.messages))
+    assert second.reached_target is (second.tokens_after <= 0)
 
 
 def test_eviction_does_not_pair_unrelated_incomplete_agent_call() -> None:
