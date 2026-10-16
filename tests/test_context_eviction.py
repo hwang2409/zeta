@@ -211,6 +211,94 @@ def test_eviction_rejects_tool_pair_when_combined_regeneration_is_not_smaller() 
     assert changed == set()
 
 
+def _assert_tool_pairs(messages: Sequence[Message]) -> None:
+    call_ids = {
+        block.tool_call.id
+        for message in messages
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    }
+    result_ids = {
+        message.tool_result.tool_call_id
+        for message in messages
+        if message.tool_result is not None
+    }
+    assert result_ids == call_ids
+
+
+def test_two_pass_eviction_keeps_current_call_and_raw_result_paired() -> None:
+    call, result = tool_pair("read", "mixed-call", "output " * 100)
+    source = {1: call, 2: result}
+
+    def token_count(message: Message) -> int:
+        return 1 if message.metadata.get("context_evicted") else 100
+
+    first = evict_messages(
+        list(source.items()),
+        fixed_tokens=0,
+        target_tokens=150,
+        token_counter=token_count,
+    )
+    assert first.messages[0].metadata.get("eviction_receipt") == "tool_call"
+    assert first.messages[1].tool_result is not None
+
+    mixed_records = list(zip(first.source_seqs, first.messages, strict=True))
+    persisted, changed = eviction_module._evict_persisted_records(
+        mixed_records,
+        source,
+        token_count,
+        eviction_module._EvictionEligibility(frozenset({1, 2})),
+    )
+    assert persisted == mixed_records
+    assert changed == set()
+
+    second = evict_messages(
+        mixed_records,
+        fixed_tokens=0,
+        target_tokens=0,
+        token_counter=token_count,
+        source_messages=source,
+    )
+    _assert_tool_pairs(second.messages)
+
+
+def test_two_pass_eviction_keeps_raw_call_and_current_result_paired() -> None:
+    call, result = tool_pair("read", "mixed-result", "output " * 100)
+    source = {1: call, 2: result}
+
+    def token_count(message: Message) -> int:
+        return 1 if message.metadata.get("context_evicted") else 100
+
+    first = evict_messages(
+        list(source.items()),
+        fixed_tokens=0,
+        target_tokens=150,
+        token_counter=token_count,
+        unconsumed_source_seqs={1},
+    )
+    assert first.messages[0].metadata.get("eviction_receipt") is None
+    assert first.messages[1].metadata.get("context_evicted")
+
+    mixed_records = list(zip(first.source_seqs, first.messages, strict=True))
+    persisted, changed = eviction_module._evict_persisted_records(
+        mixed_records,
+        source,
+        token_count,
+        eviction_module._EvictionEligibility(frozenset({1, 2})),
+    )
+    assert persisted == mixed_records
+    assert changed == set()
+
+    second = evict_messages(
+        mixed_records,
+        fixed_tokens=0,
+        target_tokens=0,
+        token_counter=token_count,
+        source_messages=source,
+    )
+    _assert_tool_pairs(second.messages)
+
+
 def test_eviction_does_not_pair_unrelated_incomplete_agent_call() -> None:
     first_call, first_result = tool_pair("read", "read-1", "same content" * 100)
     second_call, second_result = tool_pair("read", "read-2", "same content" * 100)

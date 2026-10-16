@@ -327,6 +327,23 @@ def evict_messages(
         if running_total <= target_tokens:
             return _result(records, messages, changed, before, running_total, True)
 
+    if source_messages is not None:
+        # Normal per-row eviction can finish a group that persisted regeneration
+        # intentionally retained; give the range pass the updated receipt rows.
+        records = list(zip((seq for seq, _ in records), messages, strict=True))
+        range_candidate = range_receipt_candidate(
+            records,
+            allows=eligibility.allows,
+            is_smaller=lambda originals, candidates: _strictly_smaller(
+                sum(token_counter(message) for _, message in originals),
+                sum(map(token_counter, candidates)),
+            ),
+        )
+        if range_candidate.coalesced_source_seqs:
+            records = range_candidate.records
+            messages = [message for _, message in records]
+            changed.update(range_candidate.coalesced_source_seqs)
+
     return _result(
         records,
         messages,
@@ -407,11 +424,11 @@ def _evict_persisted_records(
         indexes = [call_index]
         for call_id in call_ids:
             indexes.extend(result_indexes.get(call_id, ()))
-        if can_regenerate(call_index):
-            blocked.update(indexes)
-        if not can_regenerate(call_index) or not all(
-            can_regenerate(index) or is_current(index) for index in indexes[1:]
-        ):
+        # Keep every member out of the per-row fallback. An exchange is one
+        # unit: source regeneration is allowed only when every member is stale
+        # and can be regenerated from the active source rows.
+        blocked.update(indexes)
+        if not all(can_regenerate(index) for index in indexes):
             continue
         original_tokens = sum(token_counter(records[index][1]) for index in indexes)
         replacement_tokens = sum(
