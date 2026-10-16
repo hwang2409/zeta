@@ -974,7 +974,11 @@ def _pair_eviction_messages(
                 seq, collapsed_into, older_read=True
             )
             changed.add(seq)
-        elif message.tool_result is not None and message.tool_result.tool_call_id not in call_ids:
+        elif (
+            collapsed_into is not None
+            and message.tool_result is not None
+            and message.tool_result.tool_call_id not in call_ids
+        ):
             messages[index] = _assistant_receipt(seq, "orphan tool result")
             changed.add(seq)
 
