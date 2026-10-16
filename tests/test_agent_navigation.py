@@ -994,40 +994,47 @@ async def test_child_send_success_keeps_same_text_typed_after_edit(
 
 
 @pytest.mark.asyncio
-async def test_close_does_not_wait_forever_for_a_stuck_child_send(
+async def test_close_waits_for_in_flight_child_send_outcome(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, _store, _child, session, _notices = _child_send_app(tmp_path)
+    app, store, child, session, notices = _child_send_app(tmp_path)
     started = asyncio.Event()
     release = threading.Event()
+    real_send = agent_runtime.send_to_run
 
-    def stuck(*args: object, **kwargs: object) -> None:
-        del args, kwargs
+    def send(*args: object, **kwargs: object) -> str | None:
         started.set()
-        release.wait(10)
+        release.wait(5)
+        return real_send(*args, **kwargs)
 
-    monkeypatch.setattr(agent_runtime, "send_to_run", stuck)
-    monkeypatch.setattr(agent_runtime, "CHILD_SEND_CLOSE_SECONDS", 0.1)
-    session.default_buffer.text = "stuck"
+    monkeypatch.setattr(agent_runtime, "send_to_run", send)
+    session.default_buffer.text = "at exit"
     assert app._submit_input(session.default_buffer.text) is False
     await asyncio.wait_for(started.wait(), 1)
-    try:
-        await asyncio.wait_for(app.close(), 3)
-    finally:
-        release.set()
+    closing = asyncio.create_task(app.close())
+    await asyncio.sleep(0.05)
+    assert not closing.done()
+    notices_before_release = list(notices)
+    release.set()
+    await asyncio.wait_for(closing, 5)
+    assert [entry.data["text"] for entry in child.pending_prompts()] == ["at exit"]
+    assert store.messages() == []
+    assert notices == notices_before_release
 
 
-def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Path) -> None:
+def test_send_to_run_ends_within_its_deadline_when_the_append_lock_is_held(
+    tmp_path: Path,
+) -> None:
     app, store, child, _session, _notices = _child_send_app(tmp_path)
-    root_fd = os.open(child.session_dir.parent, os.O_RDONLY)
-    fcntl.flock(root_fd, fcntl.LOCK_EX)
+    lock_fd = os.open(child.session_dir / ".lock", os.O_RDWR)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
     result: list[str | None] = []
     worker = threading.Thread(
         target=lambda: result.append(
             agent_runtime.send_to_run(
                 store,
                 "root:worker",
-                "while locked",
+                "blocked",
                 channel=app.loop._background_owner.conversation_channel,
             )
         ),
@@ -1035,13 +1042,30 @@ def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Path) ->
     )
     try:
         worker.start()
-        worker.join(3)
+        worker.join(5)
         assert not worker.is_alive()
     finally:
-        fcntl.flock(root_fd, fcntl.LOCK_UN)
-        os.close(root_fd)
-    assert result == [None]
-    assert [entry.data["text"] for entry in child.pending_prompts()] == ["while locked"]
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    assert result and result[0] is not None and "timed out" in result[0]
+    assert child.pending_prompts() == []
+
+
+@pytest.mark.parametrize("missing", ["conversation", "session"])
+def test_send_to_run_rejects_a_missing_child_cleanly(tmp_path: Path, missing: str) -> None:
+    app, store, child, _session, _notices = _child_send_app(tmp_path)
+    child.close()
+    if missing == "conversation":
+        (child.session_dir / "conversation.jsonl").unlink()
+    else:
+        shutil.rmtree(child.session_dir)
+    result = agent_runtime.send_to_run(
+        store,
+        "root:worker",
+        "anyone there",
+        channel=app.loop._background_owner.conversation_channel,
+    )
+    assert result is not None and "no live run/child" in result
 
 
 @pytest.mark.asyncio

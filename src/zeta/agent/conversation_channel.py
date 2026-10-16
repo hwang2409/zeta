@@ -8,7 +8,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..core.checkpoints import ConversationEntry
+from ..core.checkpoints import ConversationEntry, ConversationIntegrityError
+from ..core.session_files import SessionNotFoundError
 from ..core.store import (
     ConversationStore,
     PendingPromptCommitTimeoutError,
@@ -130,7 +131,11 @@ class ConversationChannel:
                 )
         except PendingPromptCommitTimeoutError:
             return "pending prompt commit timed out before the queue could be changed"
-        except PendingPromptsClosedError:
+        except (PendingPromptsClosedError, SessionNotFoundError):
+            return no_live_run
+        except ConversationIntegrityError:
+            if (child_path / "conversation.jsonl").exists():
+                raise
             return no_live_run
         self.wake(child_instance_id)
         return None

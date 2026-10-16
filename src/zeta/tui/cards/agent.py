@@ -37,9 +37,6 @@ MAX_ARGUMENTS = 140
 MAX_RESULT = 180
 MAX_TAIL_LINES = 20
 
-# Exit waits at most this long for an in-flight child send to commit.
-CHILD_SEND_CLOSE_SECONDS = 2.0
-
 
 def _truncate(value: str, limit: int) -> str:
     if len(value) <= limit:
@@ -781,6 +778,8 @@ class AgentRunCommandMixin:
             sends.pop(child_id, None)
             if buffer is not None:
                 buffer.on_text_changed -= mark_edited
+            if getattr(self, "_child_sends_closing", False):
+                return
             try:
                 error = done.result()
             except BaseException as exc:  # noqa: BLE001 - surface send failures
@@ -797,12 +796,16 @@ class AgentRunCommandMixin:
 
     async def _close_child_sends(self) -> None:
         sends = getattr(self, "_child_send_tasks", {})
+        # From here on a finishing send only records its outcome; the UI is
+        # being torn down, so it must not reset the composer or print.
+        self._child_sends_closing = True
         if sends:
-            # Bounded: the send's own commit deadline covers the child lock; a
-            # stuck worker thread must not hold up exit.
-            await asyncio.wait(
-                [asyncio.shield(entry[0]) for entry in sends.values()],
-                timeout=CHILD_SEND_CLOSE_SECONDS,
+            # send_to_run takes only the child's append lock, under its commit
+            # deadline, so each send ends within that deadline; wait for every
+            # outcome before teardown instead of abandoning a worker thread.
+            await asyncio.gather(
+                *(asyncio.shield(entry[0]) for entry in sends.values()),
+                return_exceptions=True,
             )
 
     def slash_runs(self, args: str) -> str:
