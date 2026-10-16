@@ -17,7 +17,26 @@ def without_incomplete_tool_batches(messages: Sequence[Message]) -> list[Message
     while index < len(messages):
         message = messages[index]
         if message.role is MessageRole.TOOL_RESULT:
-            orphan_results += 1
+            previous = messages[index - 1] if index else None
+            fields = (
+                previous.metadata.get("eviction_receipt_fields")
+                if previous is not None
+                else None
+            )
+            is_eviction_orphan = (
+                isinstance(fields, dict)
+                and type(fields.get("collapsed_into_seq")) is int
+                and type(fields.get("older_read")) is bool
+            ) or (
+                previous is not None
+                and type(previous.metadata.get("collapsed_into_seq")) is int
+                and type(previous.metadata.get("older_read")) is bool
+            )
+            if is_eviction_orphan:
+                orphan_results += 1
+                index += 1
+                continue
+            result.append(message)
             index += 1
             continue
         call_ids = [
