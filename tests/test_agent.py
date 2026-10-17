@@ -1988,9 +1988,16 @@ async def test_parent_abort_cancels_background_grandchild(
     grandchild_store = ConversationStore(
         child_store.session_dir / "agents", session_id="1"
     )
-    assert child_store.agent_notifications(pending_only=False)[0].data["status"] == (
-        "canceled"
-    )
+    # The root's notification for the child can land before the child's own
+    # record of its grandchild; both are written by different tasks.
+    for _ in range(500):
+        child_store.refresh()
+        grandchild_store.refresh()
+        child_notifications = child_store.agent_notifications(pending_only=False)
+        if child_notifications and grandchild_store.agent_canceled() is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert child_notifications[0].data["status"] == "canceled"
     assert grandchild_store.agent_canceled() == {
         "tool_call_id": "grandchild",
         "content": "tool execution canceled",
