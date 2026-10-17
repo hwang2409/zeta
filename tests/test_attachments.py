@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -415,14 +416,16 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
     lock = threading.Lock()
     all_staged = threading.Event()
     release = threading.Event()
-    next_path = iter(paths)
     staged_count = 0
+    # Each paste's staging thread inherits the context of the start() call, so
+    # task i stages paths[i] whatever order the threads run in.
+    paste_index: contextvars.ContextVar[int] = contextvars.ContextVar("paste_index")
 
     def stage(*args: object, **kwargs: object) -> Path:
         nonlocal staged_count
         del args, kwargs
+        path = paths[paste_index.get()]
         with lock:
-            path = next(next_path)
             staged_count += 1
             if staged_count == 3:
                 all_staged.set()
@@ -431,7 +434,10 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
         return path
 
     monkeypatch.setattr(paste_runtime, "paste_image", stage)
-    tasks = [app._paste_runtime.start(buffer) for _ in range(3)]
+    tasks = []
+    for index in range(3):
+        paste_index.set(index)
+        tasks.append(app._paste_runtime.start(buffer))
     staged_concurrently = await asyncio.to_thread(all_staged.wait, 1)
     if not staged_concurrently:
         release.set()
