@@ -62,6 +62,9 @@ class RuntimeCloseMixin:
                 )
             )
             pending_before = pending if isinstance(pending, set) else set()
+            close_child_sends = getattr(self, "_close_child_sends", None)
+            if close_child_sends is not None:
+                await attempt_async(close_child_sends)
             attempt(self._agent_navigation.close)
             attempt(self._agent_navigation.unbind_layout)
             await attempt_async(self._cancel_mcp_wizard)

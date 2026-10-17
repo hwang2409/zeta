@@ -656,6 +656,8 @@ class TUIApp(
             return False
         if self._open_overlay_from_submit(value):
             return True
+        if self._agent_navigation.child_view_active and not value.lstrip().startswith("/"):
+            return self._send_to_child(value)
         self._paste_runtime.advance_buffer_generation()
         super()._submit_input(value, internal=internal)
         return True
@@ -1183,6 +1185,7 @@ class TUIApp(
                         await self._history.flush_pending()
                     self._session = None
                     if isinstance(session, FullScreenPromptSession):
+                        self._release_ui_ownership()
                         session.restore_terminal()
                         self._terminal_restored = True
                 else:
@@ -1190,6 +1193,7 @@ class TUIApp(
                         self._active_task.cancel()
                         await asyncio.gather(self._active_task, return_exceptions=True)
                     if isinstance(session, FullScreenPromptSession):
+                        self._release_ui_ownership()
                         session.restore_terminal()
                         self._active_session = None
                         self._terminal_restored = True

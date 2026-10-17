@@ -8,7 +8,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..core.checkpoints import ConversationEntry
+from ..core.checkpoints import ConversationEntry, ConversationIntegrityError
+from ..core.session_files import SessionNotFoundError
 from ..core.store import (
     ConversationStore,
     PendingPromptCommitTimeoutError,
@@ -104,10 +105,14 @@ class ConversationChannel:
             background=marker.get("background") is True,
         ):
             agent_type = marker.get("agent_type") or "general"
+            reason = (
+                "it is a foreground child"
+                if marker.get("background") is not True
+                else "its profile does not accept follow-ups"
+            )
             return (
                 f"agent_send rejected for {agent_type} child {child_instance_id!r}: "
-                "it does not accept follow-ups; reviewers are one-shot; start a "
-                "fresh reviewer"
+                f"{reason}"
             )
         deadline = time.monotonic() + commit_timeout
         try:
@@ -117,6 +122,7 @@ class ConversationChannel:
                 session_id=child_path.name,
                 cwd=parent_store.cwd,
                 _lock_deadline=deadline,
+                _must_exist=True,
             ) as child_store:
                 child_store.pending_prompt_queue.append(
                     message,
@@ -125,7 +131,11 @@ class ConversationChannel:
                 )
         except PendingPromptCommitTimeoutError:
             return "pending prompt commit timed out before the queue could be changed"
-        except PendingPromptsClosedError:
+        except (PendingPromptsClosedError, SessionNotFoundError):
+            return no_live_run
+        except ConversationIntegrityError:
+            if (child_path / "conversation.jsonl").exists():
+                raise
             return no_live_run
         self.wake(child_instance_id)
         return None

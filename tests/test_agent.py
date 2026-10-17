@@ -5979,6 +5979,8 @@ def test_send_to_run_rejects_non_run_children(tmp_path: Path) -> None:
     )
     assert error is not None
     assert "explore" in error and "agent_send" in error
+    assert "reviewers are one-shot" not in error
+    assert "profile does not accept follow-ups" in error
 
 
 @pytest.mark.asyncio
@@ -6002,13 +6004,29 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
         child_instance_id="sess:explore",
     )
 
-    assert commands.slash_runs("") == "no live runs"
+    worker_call = ToolCall(
+        "worker-1",
+        "agent",
+        {"prompt": "work", "description": "worker", "agent_type": "worker"},
+    )
+    store.register_agent_child(
+        worker_call,
+        child_session_path=str(tmp_path / "agents" / "worker"),
+        description="worker",
+        agent_type="worker",
+        background=True,
+        accepts_follow_ups=True,
+        child_instance_id="sess:worker",
+    )
+
+    assert "worker" in commands.slash_runs("")
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
 
     listing = commands.slash_runs("")
     assert "long horizon run" in listing
+    assert "[run]" in listing
     assert "explore" not in listing
     handle = _run_handle_from_receipt(store)
     # /runs shows the model-facing handle, not the opaque provider tool_call.id.

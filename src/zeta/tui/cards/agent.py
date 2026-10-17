@@ -14,6 +14,7 @@ from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
 
+from ...agent.conversation_channel import has_follow_up_loop
 from ...agent.presets import GENERAL_PRESET, get_agent_preset
 from ...agent.receipt import (
     agent_stats,
@@ -729,13 +730,106 @@ class AgentRunCommandMixin:
     reaches a run through the same seam the agent_send tool uses.
     """
 
+    def _send_to_child(self, value: str) -> bool:
+        if (
+            not value.strip()
+            or not self._agent_navigation.child_view_active
+            or value.lstrip().startswith("/")
+        ):
+            return False
+        child_id = self._agent_navigation.child_instance_id()
+        marker = self.loop.store.agent_children().get(child_id) if child_id else None
+        eligible = marker is not None and has_follow_up_loop(
+            accepts_follow_ups=marker.get("accepts_follow_ups") is True,
+            background=marker.get("background") is True,
+        )
+        if not eligible:
+            self._print_system(
+                "agent does not accept messages; press h to return to main"
+            )
+            return False
+        sends = getattr(self, "_child_send_tasks", None)
+        if sends is None:
+            sends = self._child_send_tasks = {}
+        if child_id in sends:
+            return False
+        session = self._active_session
+        buffer = session.default_buffer if session is not None else None
+        ui_generation = getattr(self, "_ui_generation", 0)
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                send_to_run,
+                self.loop.store,
+                child_id,
+                value,
+                channel=self.loop._background_owner.conversation_channel,
+            )
+        )
+        sends[child_id] = (task, value, buffer)
+        edited = False
+
+        def mark_edited(_buffer: object) -> None:
+            nonlocal edited
+            edited = True
+
+        if buffer is not None:
+            buffer.on_text_changed += mark_edited
+
+        def finished(done: asyncio.Task[str | None]) -> None:
+            sends.pop(child_id, None)
+            if buffer is not None:
+                buffer.on_text_changed -= mark_edited
+            # The UI that started this send released the terminal (exit, fork,
+            # or close); the message is queued or not either way.
+            if getattr(self, "_ui_generation", 0) != ui_generation:
+                return
+            try:
+                error = done.result()
+            except BaseException as exc:  # noqa: BLE001 - surface send failures
+                error = str(exc) or exc.__class__.__name__
+            if error is None:
+                if buffer is not None and not edited:
+                    buffer.reset()
+                self._print_system(f"queued message for {child_id}")
+            else:
+                self._print_system(f"could not queue message for {child_id}: {error}")
+
+        task.add_done_callback(finished)
+        return False
+
+    def _release_ui_ownership(self) -> None:
+        """Invalidate UI effects of in-flight child sends.
+
+        Called before the terminal is handed away (exit, fork suspension) and
+        at close. ``_active_session`` stays the rendering context of a
+        suspended runtime; this token only decides who may touch the UI.
+        """
+        self._ui_generation = getattr(self, "_ui_generation", 0) + 1
+
+    async def _close_child_sends(self) -> None:
+        sends = getattr(self, "_child_send_tasks", {})
+        self._release_ui_ownership()
+        if sends:
+            # send_to_run takes only the child's append lock, under its commit
+            # deadline, so lock waits end within that deadline; wait for every
+            # outcome before teardown instead of abandoning a worker thread.
+            # Filesystem I/O (read, write, fsync) is not bounded, the same as
+            # the session's own shutdown flush, so a stalled disk delays exit.
+            await asyncio.gather(
+                *(asyncio.shield(entry[0]) for entry in sends.values()),
+                return_exceptions=True,
+            )
+
     def slash_runs(self, args: str) -> str:
         del args
         children = self.loop.store.agent_children()
         runs = [
             (marker_key, marker)
             for marker_key, marker in children.items()
-            if marker.get("background") and marker.get("agent_type") == "run"
+            if has_follow_up_loop(
+                accepts_follow_ups=marker.get("accepts_follow_ups") is True,
+                background=marker.get("background") is True,
+            )
         ]
         if not runs:
             return "no live runs"
@@ -743,7 +837,8 @@ class AgentRunCommandMixin:
         for marker_key, marker in sorted(runs):
             turns = marker.get("turns_used", 0)
             lines.append(
-                f"{marker_key}  {marker['description']}  ({turns} turns)"
+                f"{marker_key}  {marker['description']}  "
+                f"[{marker.get('agent_type', 'general')}]  ({turns} turns)"
             )
         return "\n".join(lines)
 

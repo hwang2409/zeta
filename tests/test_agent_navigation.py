@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import gc
 import json
 import logging
@@ -45,6 +46,7 @@ from zeta.tui.agent_card import (
     read_agent_transcript,
 )
 from zeta.tui.app import FullScreenPromptSession, TUIApp
+from zeta.tui.cards import agent as agent_runtime
 from zeta.tui.cards.agent_sync import AgentTodoSource
 from zeta.tui.checkpoints import render_replayed_message
 from zeta.tui.todo import TodoWidget
@@ -871,6 +873,387 @@ def test_agent_list_selection_crossing_page_boundary_updates_page(
 
     assert navigation.page_index == 1
     assert "page 2/2 · 6 agents" in _list_lines(navigation)[-1]
+
+
+def _child_send_app(tmp_path: Path) -> tuple[TUIApp, ConversationStore, ConversationStore, object, list[str]]:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child_path = _child(store, 1, description="Worker", agent_type="worker")
+    call = ToolCall("worker-call", "agent", {"prompt": "work"})
+    store.register_agent_child(
+        call,
+        child_session_path=str(child_path),
+        description="Worker",
+        agent_type="worker",
+        background=True,
+        accepts_follow_ups=True,
+        child_instance_id="root:worker",
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app.loop.store.register_agent_child(
+        call,
+        child_session_path=str(child_path),
+        description="Worker",
+        agent_type="worker",
+        background=True,
+        accepts_follow_ups=True,
+        child_instance_id="root:worker",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+    app._agent_navigation.current_path = child_path
+    app._agent_navigation.child_instance_id = lambda: "root:worker"
+    session = app._make_session()
+    app._active_session = session
+    return app, store, ConversationStore(child_path.parent, session_id=child_path.name), session, notices
+
+
+@pytest.mark.asyncio
+async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, store, child, session, notices = _child_send_app(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    def reject(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        started.set()
+        while not release.is_set():
+            threading.Event().wait(0.001)
+        return "child finished"
+
+    monkeypatch.setattr(agent_runtime, "send_to_run", reject)
+    session.default_buffer.text = "keep me"
+    assert app._submit_input(session.default_buffer.text) is False
+    await asyncio.wait_for(started.wait(), 1)
+    release.set()
+    await asyncio.sleep(0.05)
+    assert session.default_buffer.text == "keep me"
+    assert any("child finished" in notice for notice in notices)
+    assert child.pending_prompts() == []
+    assert store.messages() == []
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_child_send_exception_preserves_text_and_shows_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, store, _child, session, notices = _child_send_app(tmp_path)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("send failed")
+
+    monkeypatch.setattr(agent_runtime, "send_to_run", fail)
+    session.default_buffer.text = "keep me"
+    assert app._submit_input(session.default_buffer.text) is False
+    await asyncio.sleep(0.05)
+    assert session.default_buffer.text == "keep me"
+    assert any("send failed" in notice for notice in notices)
+    assert store.messages() == []
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_child_send_success_keeps_same_text_typed_after_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, store, child, session, _notices = _child_send_app(tmp_path)
+    started = asyncio.Event()
+    release = threading.Event()
+    real_send = agent_runtime.send_to_run
+
+    def send(*args: object, **kwargs: object) -> str | None:
+        started.set()
+        release.wait(5)
+        return real_send(*args, **kwargs)
+
+    monkeypatch.setattr(agent_runtime, "send_to_run", send)
+    buffer = session.default_buffer
+    buffer.text = "same"
+    assert app._submit_input(buffer.text) is False
+    await asyncio.wait_for(started.wait(), 1)
+    buffer.text = "something else"
+    buffer.text = "same"
+    release.set()
+    for _ in range(100):
+        if child.pending_prompts():
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    assert [entry.data["text"] for entry in child.pending_prompts()] == ["same"]
+    assert buffer.text == "same"
+    assert store.messages() == []
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_in_flight_child_send_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, store, child, session, notices = _child_send_app(tmp_path)
+    started = asyncio.Event()
+    release = threading.Event()
+    real_send = agent_runtime.send_to_run
+
+    def send(*args: object, **kwargs: object) -> str | None:
+        started.set()
+        release.wait(5)
+        return real_send(*args, **kwargs)
+
+    monkeypatch.setattr(agent_runtime, "send_to_run", send)
+    session.default_buffer.text = "at exit"
+    assert app._submit_input(session.default_buffer.text) is False
+    await asyncio.wait_for(started.wait(), 1)
+    closing = asyncio.create_task(app.close())
+    await asyncio.sleep(0.05)
+    assert not closing.done()
+    notices_before_release = list(notices)
+    release.set()
+    await asyncio.wait_for(closing, 5)
+    assert [entry.data["text"] for entry in child.pending_prompts()] == ["at exit"]
+    assert store.messages() == []
+    assert notices == notices_before_release
+
+
+def test_send_to_run_ends_within_its_deadline_when_the_append_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    app, store, child, _session, _notices = _child_send_app(tmp_path)
+    lock_fd = os.open(child.session_dir / ".lock", os.O_RDWR)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    result: list[str | None] = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            agent_runtime.send_to_run(
+                store,
+                "root:worker",
+                "blocked",
+                channel=app.loop._background_owner.conversation_channel,
+            )
+        ),
+        daemon=True,
+    )
+    try:
+        worker.start()
+        worker.join(5)
+        assert not worker.is_alive()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    assert result and result[0] is not None and "timed out" in result[0]
+    assert child.pending_prompts() == []
+
+
+@pytest.mark.parametrize("missing", ["conversation", "session"])
+def test_send_to_run_rejects_a_missing_child_cleanly(tmp_path: Path, missing: str) -> None:
+    app, store, child, _session, _notices = _child_send_app(tmp_path)
+    child.close()
+    if missing == "conversation":
+        (child.session_dir / "conversation.jsonl").unlink()
+    else:
+        shutil.rmtree(child.session_dir)
+    result = agent_runtime.send_to_run(
+        store,
+        "root:worker",
+        "anyone there",
+        channel=app.loop._background_owner.conversation_channel,
+    )
+    assert result is not None and "no live run/child" in result
+
+
+def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Path) -> None:
+    app, store, child, _session, _notices = _child_send_app(tmp_path)
+    root_fd = os.open(child.session_dir.parent, os.O_RDONLY)
+    fcntl.flock(root_fd, fcntl.LOCK_EX)
+    result: list[str | None] = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            agent_runtime.send_to_run(
+                store,
+                "root:worker",
+                "while locked",
+                channel=app.loop._background_owner.conversation_channel,
+            )
+        ),
+        daemon=True,
+    )
+    try:
+        worker.start()
+        worker.join(3)
+        assert not worker.is_alive()
+    finally:
+        fcntl.flock(root_fd, fcntl.LOCK_UN)
+        os.close(root_fd)
+    assert result == [None]
+    assert [entry.data["text"] for entry in child.pending_prompts()] == ["while locked"]
+
+
+@pytest.mark.asyncio
+async def test_child_send_finishing_after_its_session_left_does_not_touch_ui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, store, child, session, notices = _child_send_app(tmp_path)
+    started = asyncio.Event()
+    release = threading.Event()
+    real_send = agent_runtime.send_to_run
+
+    def send(*args: object, **kwargs: object) -> str | None:
+        started.set()
+        release.wait(5)
+        return real_send(*args, **kwargs)
+
+    monkeypatch.setattr(agent_runtime, "send_to_run", send)
+    session.default_buffer.text = "during exit"
+    assert app._submit_input(session.default_buffer.text) is False
+    await asyncio.wait_for(started.wait(), 1)
+    # run() releases UI ownership right before it restores the terminal; the
+    # session stays the rendering context during a fork suspension.
+    app._release_ui_ownership()
+    notices_before = list(notices)
+    release.set()
+    for _ in range(100):
+        if child.pending_prompts() and not app._child_send_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert [entry.data["text"] for entry in child.pending_prompts()] == ["during exit"]
+    assert session.default_buffer.text == "during exit"
+    assert notices == notices_before
+    assert store.messages() == []
+    assert app._active_session is session
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_child_send_double_enter_queues_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, store, child, session, _notices = _child_send_app(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    real_send = agent_runtime.send_to_run
+
+    def send(*args: object, **kwargs: object) -> str | None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        while not release.is_set():
+            threading.Event().wait(0.001)
+        return real_send(*args, **kwargs)
+
+    monkeypatch.setattr(agent_runtime, "send_to_run", send)
+    session.default_buffer.text = "once"
+    assert app._submit_input(session.default_buffer.text) is False
+    assert app._submit_input(session.default_buffer.text) is False
+    await asyncio.wait_for(started.wait(), 1)
+    release.set()
+    await asyncio.sleep(0.05)
+    assert calls == 1
+    assert len(child.pending_prompts()) == 1
+    assert store.messages() == []
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_enter_in_eligible_child_view_queues_for_child_not_main(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Worker", agent_type="worker")
+    child.joinpath("agent_lifecycle.json").write_text(
+        json.dumps({"description": "Worker", "agent_type": "worker", "state": "running", "handle": "root:worker"})
+    )
+    call = ToolCall("worker-call", "agent", {"prompt": "work"})
+    store.register_agent_child(
+        call,
+        child_session_path=str(child),
+        description="Worker",
+        agent_type="worker",
+        background=True,
+        accepts_follow_ups=True,
+        child_instance_id="root:worker",
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app.loop.store.register_agent_child(
+        call,
+        child_session_path=str(child),
+        description="Worker",
+        agent_type="worker",
+        background=True,
+        accepts_follow_ups=True,
+        child_instance_id="root:worker",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+    app._agent_navigation.current_path = child
+    app._agent_navigation.child_instance_id = lambda: "root:worker"
+    assert app._agent_navigation.child_view_active
+    session = app._make_session()
+    app._active_session = session
+    session.default_buffer.text = "follow up"
+    assert app._submit_input(session.default_buffer.text) is False
+    await asyncio.sleep(0.1)
+    assert session.default_buffer.text == ""
+    assert [entry.data["text"] for entry in ConversationStore(child.parent, session_id=child.name).pending_prompts()] == ["follow up"]
+    assert store.messages() == []
+    assert "queued message for root:worker" in notices
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_enter_in_ineligible_child_view_keeps_text_and_does_not_submit(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Foreground")
+    child.joinpath("agent_lifecycle.json").write_text(
+        json.dumps({"description": "Foreground", "state": "running", "handle": "root:foreground"})
+    )
+    call = ToolCall("foreground-call", "agent", {"prompt": "work"})
+    store.register_agent_child(
+        call,
+        child_session_path=str(child),
+        description="Foreground",
+        background=False,
+        child_instance_id="root:foreground",
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app.loop.store.register_agent_child(
+        call,
+        child_session_path=str(child),
+        description="Foreground",
+        background=False,
+        child_instance_id="root:foreground",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+    app._agent_navigation.current_path = child
+    app._agent_navigation.child_instance_id = lambda: "root:foreground"
+    session = app._make_session()
+    app._active_session = session
+    session.default_buffer.text = "keep this"
+    assert app._agent_navigation.child_view_active
+    assert app._submit_input(session.default_buffer.text) is False
+    assert session.default_buffer.text == "keep this"
+    assert ConversationStore(child.parent, session_id=child.name).pending_prompts() == []
+    assert not any(message.role is MessageRole.USER for message in store.messages())
+    assert any("return to main" in notice for notice in notices)
+    await app.close()
 
 
 def test_child_view_keeps_main_route_visible(tmp_path: Path) -> None:
