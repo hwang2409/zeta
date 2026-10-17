@@ -1068,6 +1068,67 @@ def test_send_to_run_rejects_a_missing_child_cleanly(tmp_path: Path, missing: st
     assert result is not None and "no live run/child" in result
 
 
+def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Path) -> None:
+    app, store, child, _session, _notices = _child_send_app(tmp_path)
+    root_fd = os.open(child.session_dir.parent, os.O_RDONLY)
+    fcntl.flock(root_fd, fcntl.LOCK_EX)
+    result: list[str | None] = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            agent_runtime.send_to_run(
+                store,
+                "root:worker",
+                "while locked",
+                channel=app.loop._background_owner.conversation_channel,
+            )
+        ),
+        daemon=True,
+    )
+    try:
+        worker.start()
+        worker.join(3)
+        assert not worker.is_alive()
+    finally:
+        fcntl.flock(root_fd, fcntl.LOCK_UN)
+        os.close(root_fd)
+    assert result == [None]
+    assert [entry.data["text"] for entry in child.pending_prompts()] == ["while locked"]
+
+
+@pytest.mark.asyncio
+async def test_child_send_finishing_after_its_session_left_does_not_touch_ui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, store, child, session, notices = _child_send_app(tmp_path)
+    started = asyncio.Event()
+    release = threading.Event()
+    real_send = agent_runtime.send_to_run
+
+    def send(*args: object, **kwargs: object) -> str | None:
+        started.set()
+        release.wait(5)
+        return real_send(*args, **kwargs)
+
+    monkeypatch.setattr(agent_runtime, "send_to_run", send)
+    session.default_buffer.text = "during exit"
+    assert app._submit_input(session.default_buffer.text) is False
+    await asyncio.wait_for(started.wait(), 1)
+    # run() clears the active session right before it restores the terminal.
+    app._active_session = None
+    notices_before = list(notices)
+    release.set()
+    for _ in range(100):
+        if child.pending_prompts() and not app._child_send_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert [entry.data["text"] for entry in child.pending_prompts()] == ["during exit"]
+    assert session.default_buffer.text == "during exit"
+    assert notices == notices_before
+    assert store.messages() == []
+    app._active_session = session
+    await app.close()
+
+
 @pytest.mark.asyncio
 async def test_child_send_double_enter_queues_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -240,6 +240,78 @@ def test_tui_run_replays_transcript_only_on_initial_start(
     asyncio.run(driver())
 
 
+@pytest.mark.parametrize("fork", [False, True])
+def test_tui_run_clears_active_session_before_restoring_terminal(
+    monkeypatch: pytest.MonkeyPatch, fork: bool
+) -> None:
+    import weakref
+
+    from zeta.tui.key_bindings import FullScreenPromptSession
+
+    async def driver() -> None:
+        app = object.__new__(TUIApp)
+        app._paste_runtime = PasteRuntime(weakref.proxy(app))
+        active_at_restore: list[object] = []
+
+        class Watchdog:
+            async def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(
+            "zeta.tui.app.start_tui_stall_watchdog", lambda *a, **k: Watchdog()
+        )
+
+        class Loop:
+            store = SimpleNamespace(session_id="test-session")
+
+            async def activate(self) -> None:
+                pass
+
+        class Draft:
+            async def flush_pending(self) -> None:
+                pass
+
+        async def nothing(*args: object, **kwargs: object) -> None:
+            return None
+
+        async def prepare_prompt(*, resume_ui: bool) -> bool:
+            del resume_ui
+            await asyncio.sleep(10)
+            return True
+
+        session = object.__new__(FullScreenPromptSession)
+        session.app = SimpleNamespace(run_async=nothing, is_running=False)
+        session.restore_terminal = lambda: active_at_restore.append(
+            app._active_session
+        )
+
+        app.loop = Loop()
+        app._zeta_home = None
+        app._session = None
+        app._active_session = None
+        app._active_task = None
+        app._draft = Draft()
+        app._history = None
+        app._fork_controller = None
+        app._open_fork_target = "fork-1" if fork else None
+        app._input_loop_active = False
+        app._terminal_restored = False
+        app._begin_startup_replay = lambda: None
+        app._attach_draft = lambda session: None
+        app._install_full_screen_layout = lambda session: None
+        app._prepare_prompt = prepare_prompt
+        app._run_full_screen = nothing
+        app._prepare_ui_session_change = nothing
+        app.close = nothing
+
+        await TUIApp.run(app, session)
+
+        assert active_at_restore == [None]
+        assert app._terminal_restored is True
+
+    asyncio.run(driver())
+
+
 def test_approval_shortcut_submits_owner_qualified_handle() -> None:
     submitted: list[tuple[str, bool]] = []
     app = object.__new__(TUIApp)

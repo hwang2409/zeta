@@ -778,7 +778,12 @@ class AgentRunCommandMixin:
             sends.pop(child_id, None)
             if buffer is not None:
                 buffer.on_text_changed -= mark_edited
-            if getattr(self, "_child_sends_closing", False):
+            # The UI that started this send is gone (exit, fork, or close):
+            # the message is queued or not either way; do not touch the UI.
+            if (
+                getattr(self, "_child_sends_closing", False)
+                or self._active_session is not session
+            ):
                 return
             try:
                 error = done.result()
@@ -801,8 +806,10 @@ class AgentRunCommandMixin:
         self._child_sends_closing = True
         if sends:
             # send_to_run takes only the child's append lock, under its commit
-            # deadline, so each send ends within that deadline; wait for every
+            # deadline, so lock waits end within that deadline; wait for every
             # outcome before teardown instead of abandoning a worker thread.
+            # Filesystem I/O (read, write, fsync) is not bounded, the same as
+            # the session's own shutdown flush, so a stalled disk delays exit.
             await asyncio.gather(
                 *(asyncio.shield(entry[0]) for entry in sends.values()),
                 return_exceptions=True,
