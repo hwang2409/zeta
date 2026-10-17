@@ -241,7 +241,7 @@ def test_tui_run_replays_transcript_only_on_initial_start(
 
 
 @pytest.mark.parametrize("fork", [False, True])
-def test_tui_run_clears_active_session_before_restoring_terminal(
+def test_tui_run_releases_ui_ownership_before_restoring_terminal(
     monkeypatch: pytest.MonkeyPatch, fork: bool
 ) -> None:
     import weakref
@@ -251,7 +251,7 @@ def test_tui_run_clears_active_session_before_restoring_terminal(
     async def driver() -> None:
         app = object.__new__(TUIApp)
         app._paste_runtime = PasteRuntime(weakref.proxy(app))
-        active_at_restore: list[object] = []
+        at_restore: list[tuple[object, int]] = []
 
         class Watchdog:
             async def close(self) -> None:
@@ -281,8 +281,8 @@ def test_tui_run_clears_active_session_before_restoring_terminal(
 
         session = object.__new__(FullScreenPromptSession)
         session.app = SimpleNamespace(run_async=nothing, is_running=False)
-        session.restore_terminal = lambda: active_at_restore.append(
-            app._active_session
+        session.restore_terminal = lambda: at_restore.append(
+            (app._active_session, app._ui_generation)
         )
 
         app.loop = Loop()
@@ -296,6 +296,7 @@ def test_tui_run_clears_active_session_before_restoring_terminal(
         app._open_fork_target = "fork-1" if fork else None
         app._input_loop_active = False
         app._terminal_restored = False
+        app._ui_generation = 0
         app._begin_startup_replay = lambda: None
         app._attach_draft = lambda session: None
         app._install_full_screen_layout = lambda session: None
@@ -306,7 +307,10 @@ def test_tui_run_clears_active_session_before_restoring_terminal(
 
         await TUIApp.run(app, session)
 
-        assert active_at_restore == [None]
+        # Ownership is released before the terminal is handed away, while the
+        # session stays the rendering context (fork) until normal exit.
+        assert at_restore == [(session, 1)]
+        assert app._active_session is (session if fork else None)
         assert app._terminal_restored is True
 
     asyncio.run(driver())

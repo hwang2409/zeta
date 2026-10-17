@@ -755,6 +755,7 @@ class AgentRunCommandMixin:
             return False
         session = self._active_session
         buffer = session.default_buffer if session is not None else None
+        ui_generation = getattr(self, "_ui_generation", 0)
         task = asyncio.create_task(
             asyncio.to_thread(
                 send_to_run,
@@ -778,12 +779,9 @@ class AgentRunCommandMixin:
             sends.pop(child_id, None)
             if buffer is not None:
                 buffer.on_text_changed -= mark_edited
-            # The UI that started this send is gone (exit, fork, or close):
-            # the message is queued or not either way; do not touch the UI.
-            if (
-                getattr(self, "_child_sends_closing", False)
-                or self._active_session is not session
-            ):
+            # The UI that started this send released the terminal (exit, fork,
+            # or close); the message is queued or not either way.
+            if getattr(self, "_ui_generation", 0) != ui_generation:
                 return
             try:
                 error = done.result()
@@ -799,11 +797,18 @@ class AgentRunCommandMixin:
         task.add_done_callback(finished)
         return False
 
+    def _release_ui_ownership(self) -> None:
+        """Invalidate UI effects of in-flight child sends.
+
+        Called before the terminal is handed away (exit, fork suspension) and
+        at close. ``_active_session`` stays the rendering context of a
+        suspended runtime; this token only decides who may touch the UI.
+        """
+        self._ui_generation = getattr(self, "_ui_generation", 0) + 1
+
     async def _close_child_sends(self) -> None:
         sends = getattr(self, "_child_send_tasks", {})
-        # From here on a finishing send only records its outcome; the UI is
-        # being torn down, so it must not reset the composer or print.
-        self._child_sends_closing = True
+        self._release_ui_ownership()
         if sends:
             # send_to_run takes only the child's append lock, under its commit
             # deadline, so lock waits end within that deadline; wait for every

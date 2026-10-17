@@ -1113,8 +1113,9 @@ async def test_child_send_finishing_after_its_session_left_does_not_touch_ui(
     session.default_buffer.text = "during exit"
     assert app._submit_input(session.default_buffer.text) is False
     await asyncio.wait_for(started.wait(), 1)
-    # run() clears the active session right before it restores the terminal.
-    app._active_session = None
+    # run() releases UI ownership right before it restores the terminal; the
+    # session stays the rendering context during a fork suspension.
+    app._release_ui_ownership()
     notices_before = list(notices)
     release.set()
     for _ in range(100):
@@ -1125,7 +1126,7 @@ async def test_child_send_finishing_after_its_session_left_does_not_touch_ui(
     assert session.default_buffer.text == "during exit"
     assert notices == notices_before
     assert store.messages() == []
-    app._active_session = session
+    assert app._active_session is session
     await app.close()
 
 
