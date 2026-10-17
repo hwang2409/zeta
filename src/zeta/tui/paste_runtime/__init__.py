@@ -117,6 +117,10 @@ class PasteRuntime:
                 await asyncio.to_thread(
                     self._delete_staged, staged.path, session_dir, directory_fd
                 )
+            # Successors wait on this task to keep FIFO order, so it must not
+            # finish before its own predecessor, even when it is canceled.
+            if previous is not None:
+                await asyncio.wait({previous})
             raise
         except AttachmentError as exc:
             result = f"paste unavailable: {exc}"

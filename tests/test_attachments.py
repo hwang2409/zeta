@@ -415,7 +415,8 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
     ]
     lock = threading.Lock()
     all_staged = threading.Event()
-    release = threading.Event()
+    gates = [threading.Event() for _ in paths]
+    returned = [threading.Event() for _ in paths]
     staged_count = 0
     # Each paste's staging thread inherits the context of the start() call, so
     # task i stages paths[i] whatever order the threads run in.
@@ -424,27 +425,43 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
     def stage(*args: object, **kwargs: object) -> Path:
         nonlocal staged_count
         del args, kwargs
-        path = paths[paste_index.get()]
+        index = paste_index.get()
         with lock:
             staged_count += 1
-            if staged_count == 3:
+            if staged_count == len(paths):
                 all_staged.set()
-        path.write_bytes(PNG)
-        release.wait()
-        return path
+        paths[index].write_bytes(PNG)
+        gates[index].wait()
+        returned[index].set()
+        return paths[index]
 
     monkeypatch.setattr(paste_runtime, "paste_image", stage)
     tasks = []
     for index in range(3):
         paste_index.set(index)
         tasks.append(app._paste_runtime.start(buffer))
-    staged_concurrently = await asyncio.to_thread(all_staged.wait, 1)
+    staged_concurrently = await asyncio.to_thread(all_staged.wait, 5)
     if not staged_concurrently:
-        release.set()
+        for gate in gates:
+            gate.set()
         await asyncio.gather(*tasks, return_exceptions=True)
     assert staged_concurrently
-    tasks[1].cancel()
-    release.set()
+
+    try:
+        # Adverse order: cancel the middle paste and let both later stagings
+        # finish while the first paste is still staging.
+        tasks[1].cancel()
+        gates[1].set()
+        gates[2].set()
+        assert await asyncio.to_thread(returned[2].wait, 5)
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+        assert not tasks[2].done()
+        assert buffer.text == ""
+    finally:
+        # Never leave a staging thread blocked, even when an assertion fails.
+        for gate in gates:
+            gate.set()
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     assert isinstance(results[1], asyncio.CancelledError)
