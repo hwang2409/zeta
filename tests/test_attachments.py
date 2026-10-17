@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextvars
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -397,8 +398,9 @@ async def test_concurrent_pastes_insert_in_invocation_order(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("second_cancel", [None, "staging", "barrier"])
 async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, second_cancel: str | None
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
@@ -435,27 +437,40 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
         returned[index].set()
         return paths[index]
 
+    async def until(check: Callable[[], bool]) -> None:
+        for _ in range(500):
+            if check():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("condition did not become true")
+
     monkeypatch.setattr(paste_runtime, "paste_image", stage)
     tasks = []
     for index in range(3):
         paste_index.set(index)
         tasks.append(app._paste_runtime.start(buffer))
-    staged_concurrently = await asyncio.to_thread(all_staged.wait, 5)
-    if not staged_concurrently:
-        for gate in gates:
-            gate.set()
-        await asyncio.gather(*tasks, return_exceptions=True)
-    assert staged_concurrently
-
     try:
+        assert await asyncio.to_thread(all_staged.wait, 5)
         # Adverse order: cancel the middle paste and let both later stagings
         # finish while the first paste is still staging.
         tasks[1].cancel()
+        if second_cancel == "staging":
+            # Let the first cancellation reach the wait on the staging thread.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            tasks[1].cancel()
         gates[1].set()
         gates[2].set()
+        assert await asyncio.to_thread(returned[1].wait, 5)
         assert await asyncio.to_thread(returned[2].wait, 5)
+        # The middle paste deleted its file, so its cleanup reached the point
+        # where only the predecessor barrier keeps it from finishing.
+        await until(lambda: not paths[1].exists())
+        if second_cancel == "barrier":
+            tasks[1].cancel()
         for _ in range(20):
             await asyncio.sleep(0.01)
+        assert not tasks[1].done()
         assert not tasks[2].done()
         assert buffer.text == ""
     finally:

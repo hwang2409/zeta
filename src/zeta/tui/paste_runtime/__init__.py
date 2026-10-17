@@ -109,18 +109,17 @@ class PasteRuntime:
                 await asyncio.gather(asyncio.shield(previous), return_exceptions=True)
             staged = await asyncio.shield(worker)
         except asyncio.CancelledError:
-            try:
-                staged = await worker
-            except (AttachmentError, OSError):
-                pass
-            if staged is not None:
-                await asyncio.to_thread(
-                    self._delete_staged, staged.path, session_dir, directory_fd
-                )
-            # Successors wait on this task to keep FIFO order, so it must not
-            # finish before its own predecessor, even when it is canceled.
-            if previous is not None:
-                await asyncio.wait({previous})
+            # Started before any await, and awaited past further cancellation:
+            # a repeated cancel must neither leak the staged file nor let a
+            # successor publish before this task's predecessor.
+            cleanup = asyncio.create_task(
+                self._cleanup_canceled(worker, previous, session_dir, directory_fd)
+            )
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
             raise
         except AttachmentError as exc:
             result = f"paste unavailable: {exc}"
@@ -139,6 +138,28 @@ class PasteRuntime:
             self._insert(buffer, cursor_position, result)
             return ""
         return result
+
+    async def _cleanup_canceled(
+        self,
+        worker: asyncio.Task[StagedImage],
+        previous: asyncio.Task[str] | None,
+        session_dir: Path,
+        directory_fd: int | None,
+    ) -> None:
+        try:
+            try:
+                staged = await worker
+            except (AttachmentError, OSError):
+                staged = None
+            if staged is not None:
+                await asyncio.to_thread(
+                    self._delete_staged, staged.path, session_dir, directory_fd
+                )
+        finally:
+            # Successors wait on this task to keep FIFO order, so it must not
+            # finish before its own predecessor.
+            if previous is not None:
+                await asyncio.wait({previous})
 
     @staticmethod
     def _stage(store: Any) -> StagedImage:
