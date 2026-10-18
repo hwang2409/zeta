@@ -112,7 +112,9 @@ def _coarse_candidate(
     receipt = _range_receipt(start, end, units)
     if not is_smaller(flattened, [receipt]):
         return RangeCandidate(list(records), frozenset())
-    output = [record for index, record in enumerate(records) if index not in unit_indexes]
+    output = [
+        record for index, record in enumerate(records) if index not in unit_indexes
+    ]
     output.append((start, receipt))
     output.sort(key=lambda record: record[0])
     return RangeCandidate(

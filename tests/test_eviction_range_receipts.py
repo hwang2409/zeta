@@ -685,9 +685,7 @@ def test_coarse_fold_keeps_transitive_range_bounds() -> None:
         source_messages=dict(replay),
     )
     ranges = [
-        message
-        for message in result.messages
-        if message.metadata.get("eviction_range")
+        message for message in result.messages if message.metadata.get("eviction_range")
     ]
     assert len(ranges) == 1
     assert ranges[0].metadata["source_seq"] == 1
