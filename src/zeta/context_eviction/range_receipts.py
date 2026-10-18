@@ -104,7 +104,7 @@ def _coarse_candidate(
             unit_indexes.update(range(index, next_index))
         index = next_index
 
-    if len(units) < 2:
+    if len(units) < 2 or not any(unit.kind != "user" for unit in units):
         return RangeCandidate(list(records), frozenset())
     flattened = [record for unit in units for record in unit.records]
     start = min(_unit_start(unit) for unit in units)
