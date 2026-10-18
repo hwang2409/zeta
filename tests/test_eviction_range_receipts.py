@@ -634,7 +634,12 @@ async def test_range_receipt_recall_returns_exact_originals(tmp_path: Path) -> N
     records = [
         (entry.seq, message) for entry, message in zip(entries, originals, strict=True)
     ]
-    result = evict_messages(records, fixed_tokens=0, target_tokens=1)
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        source_messages=dict(records),
+    )
     assert (
         sum(bool(message.metadata.get("eviction_range")) for message in result.messages)
         == 1
@@ -689,6 +694,89 @@ def test_range_receipts_are_stable_as_history_grows() -> None:
     ]
     assert ranges[0] == first_range
     assert len(ranges) == 2
+
+
+def test_coarse_fold_keeps_receipt_floor_bounded_across_passes() -> None:
+    records: list[tuple[int, Message]] = []
+    for group in range(12):
+        seq = group * 3 + 1
+        records.extend(
+            (
+                (seq, _assistant_receipt(seq)),
+                (seq + 1, Message(MessageRole.USER, [TextContent("user")])),
+                (seq + 2, _assistant_receipt(seq + 2)),
+            )
+        )
+
+    def counter(message: Message) -> int:
+        if message.metadata.get("eviction_range"):
+            return 5
+        if message.role is MessageRole.USER:
+            return 2
+        return 100
+
+    source = dict(records)
+    first = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=30,
+        token_counter=counter,
+        source_messages=source,
+    )
+    second_records = list(zip(first.source_seqs, first.messages, strict=True))
+    second_records.extend((seq, _assistant_receipt(seq)) for seq in range(100, 112))
+    second = evict_messages(
+        second_records,
+        fixed_tokens=0,
+        target_tokens=30,
+        token_counter=counter,
+        source_messages={**source, **dict(second_records)},
+    )
+
+    assert first.reached_target is True
+    assert second.reached_target is True
+    assert first.tokens_after <= 30
+    assert second.tokens_after <= 30
+    assert second.tokens_after <= first.tokens_after + 24
+    assert (
+        sum(
+            message.metadata.get("eviction_range", False) is True
+            for message in second.messages
+        )
+        == 1
+    )
+
+
+def test_coarse_fold_preserves_tool_pairs_and_order() -> None:
+    records: list[tuple[int, Message]] = []
+    for group in range(5):
+        seq = group * 3 + 1
+        records.extend(_tool_receipt_pair(seq, "read", f"read-{group}"))
+        records.append((seq + 2, Message(MessageRole.USER, [TextContent("user")])))
+
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=10,
+        token_counter=lambda message: (
+            1 if message.metadata.get("eviction_range") else 10
+        ),
+        source_messages=dict(records),
+    )
+    calls = {
+        block.tool_call.id
+        for message in result.messages
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    }
+    results = {
+        message.tool_result.tool_call_id
+        for message in result.messages
+        if message.tool_result is not None
+    }
+    assert calls == results
+    assert list(result.source_seqs) == sorted(set(result.source_seqs))
+    assert sum(message.role is MessageRole.USER for message in result.messages) == 5
 
 
 def test_long_session_eviction_frees_target_with_range_receipts() -> None:
@@ -799,7 +887,9 @@ def test_unmarked_tool_call_with_receipted_results_is_a_range_boundary() -> None
         ),
     )
 
-    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert not any(
+        message.metadata.get("eviction_range") for message in result.messages
+    )
 
 
 def test_persisted_raw_calls_are_evicted_then_coalesced_and_stable() -> None:
@@ -822,7 +912,8 @@ def test_persisted_raw_calls_are_evicted_then_coalesced_and_stable() -> None:
     source_messages = {
         1: raw_calls[0],
         2: Message(
-            MessageRole.TOOL_RESULT, tool_result=ToolResult("read-1", "raw output " * 20)
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult("read-1", "raw output " * 20),
         ),
         3: raw_calls[1],
         4: Message(
@@ -860,7 +951,8 @@ def test_persisted_raw_call_eviction_respects_protection() -> None:
     source_messages = {
         1: raw_call,
         2: Message(
-            MessageRole.TOOL_RESULT, tool_result=ToolResult("read-1", "raw output " * 20)
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult("read-1", "raw output " * 20),
         ),
     }
 
@@ -873,7 +965,9 @@ def test_persisted_raw_call_eviction_respects_protection() -> None:
     )
 
     assert result.messages[0].to_dict() == raw_call.to_dict()
-    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert not any(
+        message.metadata.get("eviction_range") for message in result.messages
+    )
 
 
 def test_persisted_reasoning_eviction_with_raw_text_is_not_replaced() -> None:
@@ -914,7 +1008,8 @@ def test_persisted_raw_call_eviction_respects_size_guard() -> None:
     source_messages = {
         1: raw_call,
         2: Message(
-            MessageRole.TOOL_RESULT, tool_result=ToolResult("read-1", "raw output " * 20)
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult("read-1", "raw output " * 20),
         ),
     }
 
@@ -929,7 +1024,9 @@ def test_persisted_raw_call_eviction_respects_size_guard() -> None:
     )
 
     assert result.messages[0].to_dict() == raw_call.to_dict()
-    assert not any(message.metadata.get("eviction_range") for message in result.messages)
+    assert not any(
+        message.metadata.get("eviction_range") for message in result.messages
+    )
 
 
 def test_legacy_regeneration_respects_unconsumed_and_notification_protection() -> None:

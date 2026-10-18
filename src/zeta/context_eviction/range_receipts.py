@@ -32,15 +32,15 @@ def range_receipt_candidate(
     records: Sequence[tuple[int, Message]],
     *,
     allows: Callable[[int], bool],
-    is_smaller: Callable[
-        [Sequence[tuple[int, Message]], Sequence[Message]], bool
-    ],
+    is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
+    coarse: bool = False,
 ) -> RangeCandidate:
-    """Coalesce smaller maximal runs; existing ranges permanently break runs.
+    """Coalesce smaller maximal runs of receipt exchanges.
 
     A provider tool call and all its receipted results are one unit. This removes
     the complete exchange or leaves it intact, so no provider sees an orphan.
-    Each run is accepted separately through the caller's shared size policy.
+    The coarse pass also permits existing ranges and user separators in one
+    bounded fold; user messages remain visible while the range covers them.
     """
 
     output: list[tuple[int, Message]] = []
@@ -50,12 +50,22 @@ def range_receipt_candidate(
 
     def flush() -> None:
         flattened = [record for unit in run for record in unit.records]
-        if len(run) >= 2:
+        receipt_count = sum(unit.kind != "user" for unit in run)
+        if len(run) >= 2 and (not coarse or receipt_count >= 2):
             start, end = flattened[0][0], flattened[-1][0]
             receipt = _range_receipt(start, end, run)
-            if is_smaller(flattened, [receipt]):
+            retained = [
+                record for record in flattened if record[1].role is MessageRole.USER
+            ]
+            if is_smaller(flattened, [*(message for _, message in retained), receipt]):
+                output.extend(retained)
                 output.append((start, receipt))
-                coalesced.update(seq for seq, _ in flattened)
+                coalesced.update(
+                    seq
+                    for seq, message in flattened
+                    if allows(seq) and message.role is not MessageRole.USER
+                )
+                output.sort(key=lambda record: record[0])
             else:
                 output.extend(flattened)
         else:
@@ -63,18 +73,37 @@ def range_receipt_candidate(
         run.clear()
 
     while index < len(records):
-        unit, next_index = _receipt_unit(records, index, allows)
+        unit, next_index = (
+            _coarse_receipt_unit(records, index, allows)
+            if coarse
+            else _receipt_unit(records, index, allows)
+        )
         if unit is None:
             flush()
             output.append(records[index])
             index += 1
             continue
-        if run and unit.records[0][0] != run[-1].records[-1][0] + 1:
+        if run and not coarse and unit.records[0][0] != run[-1].records[-1][0] + 1:
             flush()
         run.append(unit)
         index = next_index
     flush()
     return RangeCandidate(output, frozenset(coalesced))
+
+
+def _coarse_receipt_unit(
+    records: Sequence[tuple[int, Message]],
+    index: int,
+    allows: Callable[[int], bool],
+) -> tuple[_ReceiptUnit | None, int]:
+    seq, message = records[index]
+    if not allows(seq):
+        return None, index + 1
+    if message.role is MessageRole.USER:
+        return _ReceiptUnit((records[index],), "user"), index + 1
+    if message.metadata.get("eviction_range"):
+        return _ReceiptUnit((records[index],), "range"), index + 1
+    return _receipt_unit(records, index, allows)
 
 
 def _receipt_unit(
