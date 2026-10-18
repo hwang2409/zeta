@@ -720,12 +720,20 @@ def test_range_receipts_are_stable_as_history_grows() -> None:
 def test_coarse_fold_keeps_receipt_floor_bounded_across_passes() -> None:
     records: list[tuple[int, Message]] = []
     for group in range(12):
-        seq = group * 3 + 1
+        seq = group * 4 + 1
         records.extend(
             (
                 (seq, _assistant_receipt(seq)),
                 (seq + 1, Message(MessageRole.USER, [TextContent("user")])),
-                (seq + 2, _assistant_receipt(seq + 2)),
+                (
+                    seq + 2,
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent("kept")],
+                        metadata={"eviction_view_invalid": True},
+                    ),
+                ),
+                (seq + 3, _assistant_receipt(seq + 3)),
             )
         )
 
@@ -734,6 +742,8 @@ def test_coarse_fold_keeps_receipt_floor_bounded_across_passes() -> None:
             return 5
         if message.role is MessageRole.USER:
             return 2
+        if message.metadata.get("eviction_view_invalid"):
+            return 1
         return 100
 
     source = dict(records)
