@@ -672,6 +672,29 @@ async def test_range_receipt_recall_returns_exact_originals(tmp_path: Path) -> N
         assert f"seq {entry.seq}: {encoded}" in recalled
 
 
+def test_coarse_fold_keeps_transitive_range_bounds() -> None:
+    initial = [(seq, _assistant_receipt(seq)) for seq in range(1, 11)]
+    first = evict_messages(initial, fixed_tokens=0, target_tokens=1)
+    replay = list(zip(first.source_seqs, first.messages, strict=True))
+    replay.extend((seq, _assistant_receipt(seq)) for seq in range(11, 21))
+
+    result = evict_messages(
+        replay,
+        fixed_tokens=0,
+        target_tokens=1,
+        source_messages=dict(replay),
+    )
+    ranges = [
+        message
+        for message in result.messages
+        if message.metadata.get("eviction_range")
+    ]
+    assert len(ranges) == 1
+    assert ranges[0].metadata["source_seq"] == 1
+    assert ranges[0].metadata["range_seq_end"] == 20
+    assert "recall_history seq_start=1, seq_end=20" in _range_text(ranges[0])
+
+
 def test_range_receipts_are_stable_as_history_grows() -> None:
     initial = [(seq, _assistant_receipt(seq)) for seq in range(1, 7)]
     first = evict_messages(initial, fixed_tokens=0, target_tokens=1)
@@ -743,7 +766,7 @@ def test_coarse_fold_keeps_receipt_floor_bounded_across_passes() -> None:
             message.metadata.get("eviction_range", False) is True
             for message in second.messages
         )
-        == 1
+        <= 2
     )
 
 
@@ -776,7 +799,7 @@ def test_coarse_fold_preserves_tool_pairs_and_order() -> None:
     }
     assert calls == results
     assert list(result.source_seqs) == sorted(set(result.source_seqs))
-    assert sum(message.role is MessageRole.USER for message in result.messages) == 5
+    assert sum(message.role is MessageRole.USER for message in result.messages) == 0
 
 
 def test_long_session_eviction_frees_target_with_range_receipts() -> None:

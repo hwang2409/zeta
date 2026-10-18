@@ -35,13 +35,10 @@ def range_receipt_candidate(
     is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
     coarse: bool = False,
 ) -> RangeCandidate:
-    """Coalesce smaller maximal runs of receipt exchanges.
+    """Coalesce receipt exchanges, or globally fold eligible old records."""
 
-    A provider tool call and all its receipted results are one unit. This removes
-    the complete exchange or leaves it intact, so no provider sees an orphan.
-    The coarse pass also permits existing ranges and user separators in one
-    bounded fold; user messages remain visible while the range covers them.
-    """
+    if coarse:
+        return _coarse_candidate(records, allows=allows, is_smaller=is_smaller)
 
     output: list[tuple[int, Message]] = []
     coalesced: set[int] = set()
@@ -89,6 +86,53 @@ def range_receipt_candidate(
         index = next_index
     flush()
     return RangeCandidate(output, frozenset(coalesced))
+
+
+def _coarse_candidate(
+    records: Sequence[tuple[int, Message]],
+    *,
+    allows: Callable[[int], bool],
+    is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
+) -> RangeCandidate:
+    units: list[_ReceiptUnit] = []
+    unit_indexes: set[int] = set()
+    index = 0
+    while index < len(records):
+        unit, next_index = _coarse_receipt_unit(records, index, allows)
+        if unit is not None:
+            units.append(unit)
+            unit_indexes.update(range(index, next_index))
+        index = next_index
+
+    if len(units) < 2:
+        return RangeCandidate(list(records), frozenset())
+    flattened = [record for unit in units for record in unit.records]
+    start = min(_unit_start(unit) for unit in units)
+    end = max(_unit_end(unit) for unit in units)
+    receipt = _range_receipt(start, end, units)
+    if not is_smaller(flattened, [receipt]):
+        return RangeCandidate(list(records), frozenset())
+    output = [record for index, record in enumerate(records) if index not in unit_indexes]
+    output.append((start, receipt))
+    output.sort(key=lambda record: record[0])
+    return RangeCandidate(
+        output,
+        frozenset(seq for seq, _ in flattened),
+    )
+
+
+def _unit_start(unit: _ReceiptUnit) -> int:
+    return min(seq for seq, _ in unit.records)
+
+
+def _unit_end(unit: _ReceiptUnit) -> int:
+    end = max(seq for seq, _ in unit.records)
+    for seq, message in unit.records:
+        if message.metadata.get("eviction_range"):
+            range_end = message.metadata.get("range_seq_end")
+            if type(range_end) is int:
+                end = max(end, range_end)
+    return end
 
 
 def _coarse_receipt_unit(

@@ -345,8 +345,7 @@ def evict_messages(
             running_total = fixed_tokens + sum(map(token_counter, messages))
 
     if source_messages is not None and running_total > target_tokens:
-        # Fine ranges cannot cross users or existing ranges; fold the oldest
-        # eligible receipt units into one bounded receipt as a final fallback.
+        # The global fold is only a fallback after ordinary eviction remains over target.
         from .range_receipts import range_receipt_candidate
 
         records = list(zip((seq for seq, _ in records), messages, strict=True))
