@@ -102,7 +102,11 @@ def run(args: argparse.Namespace) -> int:
                 ):
                     raise ValueError("approval token did not match; job remains inert")
                 store.approve(
-                    review.name, review.revision, review.recipient, datetime.now(UTC)
+                    review.name,
+                    review.revision,
+                    review.recipient,
+                    datetime.now(UTC),
+                    review.inbox_target_ids,
                 )
                 print(
                     f"{review.name} r{review.revision} armed"

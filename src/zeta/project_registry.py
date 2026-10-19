@@ -188,6 +188,18 @@ def _rename_without_replacement(root_fd: int, staging: str, final: str) -> None:
         raise OSError(error, os.strerror(error), final)
 
 
+def resolve_project_ref(registry: ProjectRegistry, text: str) -> str | None:
+    """Return the canonical id for one exact project name or id."""
+
+    try:
+        return registry.show_project(project_id=text).project_id
+    except ProjectNotFoundError:
+        try:
+            return registry.show_project(name=text).project_id
+        except ProjectNotFoundError:
+            return None
+
+
 class ProjectRegistry(ProjectMemoryHistoryMixin):
     """A local registry whose root can be overridden for tests."""
 

@@ -223,21 +223,121 @@ async def test_tool_policy_can_deny_whole_inbox_tool(tmp_path: Path) -> None:
         store.close()
 
 
+def _send_capability(registry: ToolRegistry, project: str):
+    return registry.resolve_call(
+        "inbox",
+        {
+            "action": "send",
+            "project": project,
+            "kind": "info",
+            "title": "title",
+            "body": "body",
+        },
+    )
+
+
 def test_approval_subject_includes_action_and_target_project(tmp_path: Path) -> None:
     registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    projects.create_project("beta", "beta")
+    projects.create_project("other", "other")
     try:
         policy = ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny")
         registry.set_approval_policy(policy)
-        assert policy.decide(
-            registry.resolve_call(
-                "inbox", {"action": "send", "project": "beta", "kind": "info", "title": "title", "body": "body"}
+        assert (
+            policy.decide(_send_capability(registry, "beta")) is ApprovalDecision.ALLOW
+        )
+        assert (
+            policy.decide(_send_capability(registry, "other"))
+            is not ApprovalDecision.ALLOW
+        )
+    finally:
+        asyncio.run(registry.close())
+        store.close()
+
+
+def test_inbox_name_rule_allows_send_by_name_and_id(tmp_path: Path) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    try:
+        policy = ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny")
+        registry.set_approval_policy(policy)
+        for project in ("beta", beta.project_id):
+            assert (
+                policy.decide(_send_capability(registry, project))
+                is ApprovalDecision.ALLOW
             )
-        ) is ApprovalDecision.ALLOW
-        assert policy.decide(
-            registry.resolve_call(
-                "inbox", {"action": "send", "project": "other", "kind": "info", "title": "title", "body": "body"}
+    finally:
+        asyncio.run(registry.close())
+        store.close()
+
+
+def test_inbox_id_rule_allows_send_by_name_and_id(tmp_path: Path) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    try:
+        policy = ApprovalPolicy(
+            always_allow={f"inbox(send {beta.project_id})"}, default="deny"
+        )
+        registry.set_approval_policy(policy)
+        for project in ("beta", beta.project_id):
+            assert (
+                policy.decide(_send_capability(registry, project))
+                is ApprovalDecision.ALLOW
             )
-        ) is not ApprovalDecision.ALLOW
+    finally:
+        asyncio.run(registry.close())
+        store.close()
+
+
+def test_inbox_rule_does_not_allow_other_project(tmp_path: Path) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    projects.create_project("beta", "beta")
+    gamma = projects.create_project("gamma", "gamma")
+    try:
+        policy = ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny")
+        registry.set_approval_policy(policy)
+        for project in ("gamma", gamma.project_id):
+            assert (
+                policy.decide(_send_capability(registry, project))
+                is ApprovalDecision.DENY
+            )
+    finally:
+        asyncio.run(registry.close())
+        store.close()
+
+
+def test_inbox_wildcard_rule_skips_project_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    projects.create_project("beta", "beta")
+    from zeta.tools import inbox as inbox_tool
+
+    resolve = inbox_tool.resolve_project_ref
+    references: list[str] = []
+
+    def recording_resolver(projects: ProjectRegistry, reference: str) -> str | None:
+        references.append(reference)
+        return resolve(projects, reference)
+
+    monkeypatch.setattr(inbox_tool, "resolve_project_ref", recording_resolver)
+    try:
+        policy = ApprovalPolicy(always_allow={"inbox(send *)"}, default="deny")
+        registry.set_approval_policy(policy)
+        assert (
+            policy.decide(_send_capability(registry, "beta")) is ApprovalDecision.ALLOW
+        )
+        assert references == ["beta"]
     finally:
         asyncio.run(registry.close())
         store.close()

@@ -60,7 +60,9 @@ import asyncio
 import json
 import os
 import selectors
+import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -79,7 +81,12 @@ from zeta.automations.daemon import daemon_lock, serve
 from zeta.automations.delivery import SlackDelivery
 from zeta.automations.models import instant, parse_job
 from zeta.automations.runner import _receipt, poll_events, run_claimed
-from zeta.automations.services import mount_services, validate_permissions
+from zeta.automations.services import (
+    configure_inbox,
+    mount_services,
+    resolve_inbox_grants,
+    validate_permissions,
+)
 from zeta.automations.store import SQLiteStore
 from zeta.automations.tick import tick
 from zeta.automations.trigger import Schedule, cron_matches, parse_trigger
@@ -87,6 +94,8 @@ from zeta.core.session import SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.mcp.config import load_mcp_config, server_to_json
 from zeta.mcp.mount import MCPMount
+from zeta.project_inbox import ProjectInbox
+from zeta.project_registry import ProjectRegistry
 from zeta.prompts import load_identity
 from zeta.protocol.types import (
     ASSISTANT_RESPONSE_SYNTHETIC,
@@ -126,6 +135,75 @@ async def test_no_delivery_job_approves_and_runs_without_slack_config(
         run = store.runs(job.name)[0]
         assert run.status == "completed"
         assert run.delivery == ""
+
+
+async def test_no_delivery_job_with_inbox_grant_approves_and_sends_without_slack_config(
+    tmp_path: Path,
+) -> None:
+    projects = ProjectRegistry(tmp_path / "projects")
+    source = projects.create_project("source", "source", tmp_path)
+    target = projects.create_project("target", "target")
+    document = _job(tmp_path).document()
+    document.pop("deliver")
+    document["servers"] = []
+    document["allow"] = ["inbox(send target)"]
+    job = parse_job("inbox-only", document)
+
+    with SQLiteStore(tmp_path) as store:
+        state = store.draft(job)
+        review = await review_job(store, job.name, tmp_path)
+        assert review.recipient is None
+        assert review.inbox_target_ids == (target.project_id,)
+        store.approve(
+            job.name,
+            state.revision,
+            review.recipient,
+            START,
+            review.inbox_target_ids,
+        )
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        assert run_id
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=tmp_path,
+            backend=FakeBackend(
+                [
+                    ScriptedTurn(
+                        tool_calls=[
+                            ToolCall(
+                                "send",
+                                "inbox",
+                                {
+                                    "action": "send",
+                                    "project": "target",
+                                    "kind": "question",
+                                    "title": "title",
+                                    "body": "body",
+                                },
+                            )
+                        ]
+                    ),
+                    ScriptedTurn(content=[TextContent("sent")]),
+                ]
+            ),
+            mount_factory=mount_services,
+        )
+        run = store.runs(job.name)[0]
+        assert run.status == "completed", run.detail
+        assert run.delivery == ""
+
+    messages = ProjectInbox(
+        projects, sessions_root=tmp_path / "sessions"
+    ).list(target.project_id)
+    assert len(messages["new"]) == 1
+    message = messages["new"][0]
+    assert message["from"] == {
+        "project": source.project_id,
+        "session": run.session_id,
+    }
 
 
 def test_approve_rejects_recipient_delivery_mismatch(tmp_path: Path) -> None:
@@ -218,6 +296,309 @@ def _job(tmp_path: Path, name: str = "brief", *, poll: bool = False):
 def _arm(store: SQLiteStore, job, now: datetime = START) -> None:
     state = store.draft(job)
     store.approve(job.name, state.revision, "U123", now)
+
+
+@pytest.mark.parametrize(
+    ("allow", "message"),
+    [
+        (("inbox",), "inbox\\(send <project>\\)"),
+        (("inbox(*)",), "wildcard"),
+        (("inbox(send missing)",), "unknown inbox target project"),
+    ],
+)
+def test_automation_inbox_rules_require_a_named_project(
+    tmp_path: Path, allow: tuple[str, ...], message: str
+) -> None:
+    home = tmp_path / ".zeta"
+    projects = ProjectRegistry(home / "projects")
+    projects.create_project("source", "source", tmp_path)
+    job = replace(_job(tmp_path), allow=allow)
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=discover_session_skills(home=home),
+        approval_policy=ApprovalPolicy(default=ApprovalDecision.DENY, always_allow=allow),
+        project_registry=projects,
+    )
+    try:
+        with pytest.raises(ValueError, match=message):
+            configure_inbox(job, registry, home)
+    finally:
+        asyncio.run(registry.close())
+
+
+def test_automation_without_inbox_rule_has_no_inbox_tool(tmp_path: Path) -> None:
+    home = tmp_path / ".zeta"
+    projects = ProjectRegistry(home / "projects")
+    projects.create_project("source", "source", tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=discover_session_skills(home=home),
+        project_registry=projects,
+    )
+    try:
+        configure_inbox(_job(tmp_path), registry, home)
+        assert "inbox" not in registry.definitions_by_name
+    finally:
+        asyncio.run(registry.close())
+
+
+@pytest.mark.parametrize(
+    "allow",
+    [("inbox",), ("inbox(*)",), ("inbox(send missing)",), ("inbox(send target)",)],
+)
+def test_automation_inbox_draft_validation_applies_to_both_draft_paths(
+    tmp_path: Path, allow: tuple[str, ...]
+) -> None:
+    projects = ProjectRegistry(tmp_path / "projects")
+    if allow != ("inbox(send target)",):
+        projects.create_project("source", "source", tmp_path)
+    projects.create_project("target", "target")
+    bad = replace(_job(tmp_path), allow=allow)
+    path = tmp_path / "jobs.json"
+    path.write_text(json.dumps({"bad": bad.document()}))
+    with SQLiteStore(tmp_path) as store:
+        assert "invalid" in import_jobs(store, path, cwd=str(tmp_path), home=tmp_path)
+        assert "bad" not in {state.job.name for state in store.jobs()}
+    session = SessionManager(tmp_path).create(provider="codex", model="fake", cwd=tmp_path)
+    registry = ToolRegistry(tmp_path, session_store=session.store, skill_catalog=SkillCatalog.empty())
+    try:
+        result = asyncio.run(registry.execute(ToolCall(
+            "draft", "automation", {"action": "draft", "name": "bad", "job": bad.document()}
+        )))
+        assert result["isError"]
+        with SQLiteStore(tmp_path) as store, pytest.raises(ValueError):
+            store.get("bad")
+    finally:
+        asyncio.run(registry.close())
+
+
+def test_automation_inbox_registers_send_only_for_an_approved_target(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".zeta"
+    projects = ProjectRegistry(home / "projects")
+    projects.create_project("source", "source", tmp_path)
+    projects.create_project("target", "target")
+    allow = ("inbox(send target)",)
+    job = replace(_job(tmp_path), allow=allow)
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=discover_session_skills(home=home),
+        approval_policy=ApprovalPolicy(default=ApprovalDecision.DENY, always_allow=allow),
+        project_registry=projects,
+    )
+    try:
+        configure_inbox(job, registry, home)
+        assert registry.definitions_by_name["inbox"].actions.keys() == {"send"}
+        validate_permissions(job, registry)
+    finally:
+        asyncio.run(registry.close())
+
+
+async def _run_inbox_send(
+    tmp_path: Path,
+    target: str,
+    allow: tuple[str, ...],
+    action: str = "send",
+    *,
+    grant_by_id: bool = False,
+    send_by_id: bool = False,
+):
+    home = tmp_path
+    projects = ProjectRegistry(home / "projects")
+    source = projects.create_project("source", "source", tmp_path)
+    target_project = projects.create_project("target", "target")
+    if grant_by_id:
+        allow = (f"inbox(send {target_project.project_id})",)
+    if send_by_id:
+        target = target_project.project_id
+    job = replace(_job(tmp_path), allow=allow)
+    grants = resolve_inbox_grants(job, projects)
+    assert grants is not None
+    with SQLiteStore(tmp_path) as store:
+        state = store.draft(job)
+        store.approve(job.name, state.revision, "U123", START, grants.target_ids)
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        assert run_id
+        async def mount_factory(job, registry, home, runtime_grants):
+            configure_inbox(job, registry, home, runtime_grants)
+            return MCPMount(registry, {})
+        arguments = {"action": action}
+        if action == "send":
+            arguments.update(project=target, kind="question", title="title", body="body")
+        elif action == "claim":
+            arguments["id"] = "missing"
+        backend = FakeBackend([
+            ScriptedTurn(tool_calls=[ToolCall("call", "inbox", arguments)]),
+            ScriptedTurn(content=[TextContent("sent")]),
+        ])
+        await run_claimed(store, occurrence, run_id, home=tmp_path, backend=backend,
+                          mount_factory=mount_factory, delivery=RecordingDelivery())
+        messages = ProjectInbox(projects, sessions_root=home / "sessions").list(target_project.project_id)
+        return store.runs(job.name)[0], messages, source.project_id
+
+
+async def test_automation_inbox_send_reaches_target_with_job_identity(tmp_path: Path) -> None:
+    run, messages, source_id = await _run_inbox_send(tmp_path, "target", ("inbox(send target)",))
+    assert run.status == "completed", run.detail
+    assert len(messages["new"]) == 1
+    message = messages["new"][0]
+    assert message["from"]["project"] == source_id
+    assert message["from"]["session"] == run.session_id
+
+
+async def test_automation_inbox_send_to_unlisted_project_is_denied(tmp_path: Path) -> None:
+    run, messages, _ = await _run_inbox_send(tmp_path, "source", ("inbox(send target)",))
+    assert run.status == "failed"
+    assert "approved" in run.detail or "allow-list" in run.detail
+    assert not messages["new"]
+
+
+async def test_inbox_grant_by_name_allows_send_by_id(tmp_path: Path) -> None:
+    run, messages, _ = await _run_inbox_send(
+        tmp_path,
+        "target",
+        ("inbox(send target)",),
+        send_by_id=True,
+    )
+    assert run.status == "completed", run.detail
+    assert len(messages["new"]) == 1
+
+
+async def test_inbox_grant_by_id_allows_send_by_name(tmp_path: Path) -> None:
+    run, messages, _ = await _run_inbox_send(
+        tmp_path,
+        "target",
+        (),
+        grant_by_id=True,
+    )
+    assert run.status == "completed", run.detail
+    assert len(messages["new"]) == 1
+
+
+async def test_inbox_send_to_unknown_project_is_denied_cleanly(tmp_path: Path) -> None:
+    run, messages, _ = await _run_inbox_send(
+        tmp_path,
+        "missing",
+        ("inbox(send target)",),
+    )
+    assert run.status == "failed"
+    assert "unknown inbox target project 'missing'" in run.detail
+    assert not messages["new"]
+
+
+async def test_automation_inbox_list_and_claim_are_rejected(tmp_path: Path) -> None:
+    for action in ("list", "claim"):
+        run, messages, _ = await _run_inbox_send(tmp_path / action, "target", ("inbox(send target)",), action)
+        assert run.status == "failed"
+        assert action in run.detail or "allow-list" in run.detail
+        assert not messages["new"]
+
+
+def _create_pre_inbox_migration_database(home: Path, job) -> None:
+    directory = home / "automations"
+    directory.mkdir(parents=True)
+    database = sqlite3.connect(directory / "automations.sqlite3")
+    try:
+        database.executescript("""
+            CREATE TABLE revisions (
+                name TEXT NOT NULL, revision INTEGER NOT NULL, document TEXT NOT NULL,
+                source TEXT NOT NULL, PRIMARY KEY(name, revision));
+            CREATE TABLE jobs (
+                name TEXT PRIMARY KEY, revision INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
+                approved_at TEXT, recipient TEXT, last_run TEXT, last_check TEXT, last_due TEXT);
+        """)
+        database.execute(
+            "INSERT INTO revisions VALUES (?, 1, ?, 'tool')",
+            (job.name, json.dumps(job.document(), sort_keys=True)),
+        )
+        database.execute(
+            "INSERT INTO jobs VALUES (?, 1, 1, ?, NULL, ?, ?, NULL)",
+            (job.name, START.isoformat(), START.isoformat(), START.isoformat()),
+        )
+        database.commit()
+    finally:
+        database.close()
+
+
+async def test_pre_inbox_migration_approved_job_without_inbox_runs(
+    tmp_path: Path,
+) -> None:
+    job = replace(_job(tmp_path), servers=(), deliver="none")
+    _create_pre_inbox_migration_database(tmp_path, job)
+    with SQLiteStore(tmp_path) as store:
+        assert store.get(job.name).inbox_target_ids == ()
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        assert run_id
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=tmp_path,
+            backend=FakeBackend([ScriptedTurn(content=[TextContent("done")])]),
+            mount_factory=_empty_mount,
+            delivery=RecordingDelivery(),
+        )
+        assert store.runs(job.name)[0].status == "completed"
+
+
+async def test_pre_inbox_migration_approved_job_with_inbox_requires_reapproval(
+    tmp_path: Path,
+) -> None:
+    projects = ProjectRegistry(tmp_path / "projects")
+    projects.create_project("source", "source", tmp_path)
+    projects.create_project("target", "target")
+    job = replace(
+        _job(tmp_path),
+        servers=(),
+        deliver="none",
+        allow=("inbox(send target)",),
+    )
+    _create_pre_inbox_migration_database(tmp_path, job)
+    with SQLiteStore(tmp_path) as store:
+        assert store.get(job.name).inbox_target_ids == ()
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        assert run_id
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=tmp_path,
+            backend=FakeBackend([]),
+            mount_factory=_empty_mount,
+            delivery=RecordingDelivery(),
+        )
+        run = store.runs(job.name)[0]
+        assert run.status == "failed"
+        assert run.detail == "approved inbox targets changed; re-approve the automation"
+
+
+async def test_inbox_grant_pinned_to_approved_project_id(tmp_path: Path) -> None:
+    home = tmp_path
+    projects = ProjectRegistry(home / "projects")
+    projects.create_project("source", "source", tmp_path)
+    target = projects.create_project("target", "target")
+    job = replace(_job(tmp_path), allow=("inbox(send target)",))
+    grants = resolve_inbox_grants(job, projects)
+    assert grants is not None
+    with SQLiteStore(tmp_path) as store:
+        state = store.draft(job)
+        store.approve(job.name, state.revision, "U123", START, grants.target_ids)
+        shutil.rmtree(projects.root / target.project_id)
+        replacement = projects.create_project("target", "replacement")
+        assert replacement.project_id != target.project_id
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        await run_claimed(store, occurrence, run_id, home=tmp_path, backend=FakeBackend([]),
+                          mount_factory=_empty_mount, delivery=RecordingDelivery())
+        assert store.runs(job.name)[0].status == "failed"
+        assert "changed" in store.runs(job.name)[0].detail
 
 
 @pytest.mark.parametrize(
@@ -360,7 +741,9 @@ class RecordingDelivery:
         return '{"ts":"123.456"}'
 
 
-async def _empty_mount(job, registry: ToolRegistry, home: Path) -> MCPMount:
+async def _empty_mount(
+    job, registry: ToolRegistry, home: Path, grants=None
+) -> MCPMount:
     return MCPMount(registry, {})
 
 
@@ -1272,6 +1655,34 @@ def test_cli_does_not_accept_piped_approval(
     assert "interactive terminal" in capsys.readouterr().err
     with SQLiteStore(tmp_path) as store:
         assert not store.get("brief").enabled
+
+
+def test_cli_approval_persists_resolved_inbox_targets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import io
+
+    from zeta.automations import cli
+    from zeta.cli.main import main
+
+    class TTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    with SQLiteStore(tmp_path) as store:
+        store.draft(_job(tmp_path))
+
+    async def review(*args):
+        return commands.Review(
+            "brief", 1, "U123", "token", "reviewed draft", ("target-id",)
+        )
+
+    monkeypatch.setattr(cli, "review_job", review)
+    monkeypatch.setattr(cli.sys, "stdin", TTY("token\n"))
+    assert main(["automation", "approve", "brief"]) == 0
+    with SQLiteStore(tmp_path) as store:
+        assert store.get("brief").inbox_target_ids == ("target-id",)
 
 
 def _start_cli_daemon(
