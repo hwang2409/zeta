@@ -6,7 +6,6 @@ import asyncio
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from enum import StrEnum
 from itertools import count
 from pathlib import Path
 from typing import Any, Protocol
@@ -31,19 +30,14 @@ from ..tools._shared.shell import (
 )
 from ..tui.composer import UndoCandidate, parse_input
 from ..tui.user import USER_DISPLAY_TEXT_METADATA
-from .model import Submission, SubmissionHost, dispatch_provider
-
-
-class SubmissionState(StrEnum):
-    """States owned by the submission consumer."""
-
-    QUEUED = "queued"
-    PREPROCESSING = "preprocessing"
-    AWAITING_APPROVAL = "awaiting-approval"
-    READY = "ready"
-    DISPATCHED = "dispatched"
-    CANCELED = "canceled"
-    DENIED = "denied"
+from .model import (
+    Submission,
+    SubmissionHost,
+    SubmissionState,
+    _Entry,
+    dispatch_provider,
+)
+from .notification_retry import NotificationOutcome, NotificationRetry
 
 
 class _Message(Protocol):
@@ -80,7 +74,7 @@ class _CommandDone:
 @dataclass(frozen=True, slots=True)
 class _ProviderDone:
     submission: Submission
-    task: asyncio.Task[None]
+    task: asyncio.Task[NotificationOutcome]
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,27 +108,6 @@ class _UndoAction:
     pass
 
 
-@dataclass(slots=True)
-class _Entry:
-    submission: Submission
-    state: SubmissionState = SubmissionState.QUEUED
-    parsed: str = ""
-    model_input: ModelInputEnvelope | None = None
-    attachment_value: str | None = None
-    message: Message | None = None
-    candidate: UndoCandidate | None = None
-    signal: AbortSignal | None = None
-    child_task: asyncio.Task[Any] | None = None
-    preprocessing: bool = False
-    persist_user_message: bool = True
-    acknowledge_on_provider_done: bool = False
-    completion: asyncio.Future[None] | None = None
-    acknowledged: asyncio.Future[None] | None = None
-    undo_requested: bool = False
-    denied: bool = False
-    printed: bool = False
-
-
 class SubmissionPipeline:
     """Serialize actions and own every submission transition."""
 
@@ -158,15 +131,28 @@ class SubmissionPipeline:
         self._command_order: deque[int] = deque()
         self._command_results: dict[int, str | None] = {}
         self._provider_entry: _Entry | None = None
-        self._provider_task: asyncio.Task[None] | None = None
-        self._notification_wake_requested = False
+        self._provider_task: asyncio.Task[NotificationOutcome] | None = None
+        self._notification_retry = NotificationRetry(
+            wake=lambda: self._send(None),
+            has_notification=lambda: (
+                self._host.loop.notification_system_message() is not None
+            ),
+            schedule_history=self._host.loop.schedule_notification_history_retry,
+            rollback=self._rollback_provider_dispatch,
+            report_failure=lambda message: self._host._print_system(
+                f"notification failed; retrying automatically: {message}"
+            ),
+            report_stopped=lambda message: self._host._print_system(
+                f"notification failed; automatic retry stopped: {message}"
+            ),
+        )
         self._durable_tasks: dict[str, asyncio.Task[Any]] = {}
         self._control_entry: _Entry | None = None
         self._closed = False
         self._shutting_down = False
 
     @property
-    def provider_task(self) -> asyncio.Task[None] | None:
+    def provider_task(self) -> asyncio.Task[NotificationOutcome] | None:
         return self._provider_task
 
     @property
@@ -356,6 +342,7 @@ class SubmissionPipeline:
             return
         self._closed = True
         self._shutting_down = True
+        self._notification_retry.close()
         for entry in self._entries.values():
             if entry.signal is not None:
                 entry.signal.abort()
@@ -514,13 +501,14 @@ class SubmissionPipeline:
             self._ack_entry(entry)
 
     def _on_wake(self) -> None:
-        self._notification_wake_requested = True
+        self._notification_retry.request_wake()
 
     def start_notification_wake(self) -> None:
-        """Dispatch a queued notification wake through this pipeline."""
-        self._notification_wake_requested = False
-        if self._host.loop.notification_system_message() is None:
-            return
+        """Dispatch the ready notification attempt without blocking the consumer."""
+
+        self._notification_retry.attempt(self._start_notification_provider)
+
+    def _start_notification_provider(self) -> None:
         submission = self._new_submission("", 0, (), None, 1, steer=False)
         entry = self._notification_entry(submission)
         self._dispatch_provider(entry, user_text="", notification=True)
@@ -773,7 +761,8 @@ class SubmissionPipeline:
         if self._provider_entry is not None:
             self._dispatch_steer_entries()
             return
-        if self._notification_wake_requested:
+        retry_kind = self._notification_retry.ready_kind
+        if retry_kind == "wake":
             self.start_notification_wake()
             if self._provider_entry is not None:
                 return
@@ -783,6 +772,8 @@ class SubmissionPipeline:
             if entry.state in self._NONTERMINAL
         ]
         if not nonterminal:
+            if retry_kind == "history":
+                self.start_notification_wake()
             return
         entry = min(nonterminal, key=lambda candidate: candidate.submission.id)
         if (
@@ -807,6 +798,8 @@ class SubmissionPipeline:
             user_message=entry.message,
             persist_user_message=entry.persist_user_message,
         )
+        if self._notification_retry.pending:
+            self._notification_retry.recovered()
         if not entry.acknowledge_on_provider_done:
             self._ack_entry(entry)
 
@@ -828,6 +821,9 @@ class SubmissionPipeline:
             user_message=user_message,
             persist_user_message=persist_user_message,
             notification=notification,
+            suppress_errors=(
+                notification and self._notification_retry.failure_reported
+            ),
             on_done=lambda submission, task: self._send(_ProviderDone(submission, task)),
         )
 
@@ -882,6 +878,9 @@ class SubmissionPipeline:
             or self._provider_task is not message.task
         ):
             return
+        entry = self._provider_entry
+        if entry.message is None:
+            self._notification_retry.provider_finished(message.task)
         pending = self._host.loop.store.pending_client_steering()
         if self._provider_entry.message is not None and pending is not None:
             entries = sorted(self._entries.values(), key=lambda item: item.submission.id)
