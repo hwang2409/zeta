@@ -33,12 +33,13 @@ _PROJECT_FIELDS = {
     "created_at",
     "updated_at",
     "canonical_integration_root",
+    "repo_agents",
 }
 
 
 def validate_project_record(
     value: dict[str, object], expected_id: str | None = None
-) -> tuple[str, str, str, str, str, str | None]:
+) -> tuple[str, str, str, str, str, str | None, str]:
     """Validate one complete registry record using only the standard library."""
 
     if (
@@ -55,7 +56,10 @@ def validate_project_record(
     created = _validate_timestamp(value["created_at"], "created_at")
     updated = _validate_timestamp(value["updated_at"], "updated_at")
     root = validate_project_root(value["canonical_integration_root"])
-    return project_id, name, scope, created, updated, root
+    repo_agents = value.get("repo_agents", "include")
+    if repo_agents not in {"include", "ignore"}:
+        raise ValueError("repo_agents must be include or ignore")
+    return project_id, name, scope, created, updated, root, repo_agents
 
 
 def validate_project_id(value: object) -> str:

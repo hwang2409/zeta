@@ -39,7 +39,7 @@ from .commands.custom_commands import (
     render_custom_input,
     resolve_custom_input,
 )
-from .project_context import discover_project_root
+from .project_context import discover_project_root, project_instructions_path
 from .store import ConversationEntry
 
 
@@ -50,7 +50,6 @@ class UsageCounterSource(Protocol):
     output_tokens_this_session: int
     cache_read_input_tokens_this_session: int
     cache_creation_input_tokens_this_session: int
-
 
 @dataclass(frozen=True, slots=True)
 class UsageSnapshot:
@@ -1175,6 +1174,11 @@ def create_slash_registry(
     registry.register(
         SlashCommand("implement", _run_implement, "implement the proposed plan")
     )
+    registry.register(SlashCommand(
+        "project-instructions",
+        lambda _session, args: project_instructions_path(args, project_root, Path(effective_home).expanduser().resolve() if effective_home else None),
+        "open or create private project instructions",
+    ))
     registry.register(
         SlashCommand(
             "init",

@@ -63,6 +63,7 @@ class Project:
     created_at: str
     updated_at: str
     canonical_integration_root: str | None
+    repo_agents: str = "include"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -72,6 +73,7 @@ class Project:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "canonical_integration_root": self.canonical_integration_root,
+            "repo_agents": self.repo_agents,
         }
 
 

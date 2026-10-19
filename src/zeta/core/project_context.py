@@ -567,6 +567,26 @@ def _walk_up_agents_files(cwd: Path, stop_at: Path) -> list[Path]:
     return files
 
 
+def project_instructions_path(
+    args: str, project_root: Path | None, zeta_home: Path | None
+) -> str:
+    """Create the private project instructions file and return its path."""
+    if args.strip():
+        return "project instructions unchanged: command does not accept arguments"
+    if project_root is None or zeta_home is None:
+        return "project instructions error: not inside a project"
+    project = ProjectRegistry(zeta_home / "projects").find_for_directory(project_root)
+    if project is None:
+        return "project instructions error: project is not registered"
+    path = zeta_home / "projects" / project.project_id / AGENTS_FILENAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+    except OSError as exc:
+        return f"project instructions error: {exc}"
+    return f"project instructions: {path}"
+
+
 def load_project_context(
     *,
     cwd: str | Path | None = None,
@@ -644,6 +664,32 @@ def load_project_context(
             seen.add(resolved)
             deduped.append(resolved)
 
+        # A private per-project file is outside the repository and is loaded
+        # after repository instructions, so it wins on conflicts.
+        project_for_context = None
+        try:
+            registry_for_context = ProjectRegistry(home / "projects")
+            if registry_for_context.root.exists():
+                project_for_context = (
+                    registry_for_context.show_project(project_id)
+                    if project_id is not None
+                    else registry_for_context.find_for_directory(working_dir)
+                )
+        except (ProjectRegistryError, OSError) as exc:
+            notices.append(f"context · project settings unavailable: {exc}")
+        if project_for_context is not None and project_for_context.repo_agents == "ignore":
+            repo_candidates = tuple(candidates)
+            candidates = []
+            notices.append(
+                "warning: repository AGENTS.md files were ignored by project settings"
+            )
+        else:
+            repo_candidates = ()
+        if project_for_context is not None:
+            private_agents = home / "projects" / project_for_context.project_id / AGENTS_FILENAME
+            if _present(private_agents):
+                deduped.append(private_agents.resolve())
+
         # Only optional walked instructions and project memory consume this
         # budget.  The home identity and append section are mandatory and are
         # never sliced to make room for optional context.
@@ -651,6 +697,8 @@ def load_project_context(
         instructions_bytes = 0
         skipped: list[Path] = []
         kept: list[tuple[Path, str]] = []
+        if repo_candidates:
+            deduped = [path for path in deduped if path not in repo_candidates]
         for path in reversed(deduped):
             content = path.read_text(encoding="utf-8")
             section = _format_section(path, content)
@@ -675,13 +723,7 @@ def load_project_context(
         # starting; surface it as a startup notice instead.
         try:
             registry = ProjectRegistry(home / "projects")
-            project = None
-            if registry.root.exists():
-                project = (
-                    registry.show_project(project_id)
-                    if project_id is not None
-                    else registry.find_for_directory(working_dir)
-                )
+            project = project_for_context
             if project is not None:
                 manual_memory_sections: list[str] = []
                 automatic_memory_sections: list[str] = []
