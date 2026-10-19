@@ -10,11 +10,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy
+from ..core.session import SessionManager
 from ..skills import discover_session_skills
 from ..tools import ToolRegistry
 from .authoring import import_jobs, listing, show
 from .delivery import SlackDelivery
-from .services import mount_services
+from .services import mount_services, resolve_inbox_grants
 from .store import SQLiteStore
 from .trigger import Webhook
 from .webhook import DEFAULT_WEBHOOK_PORT
@@ -27,6 +28,7 @@ class Review:
     recipient: str
     token: str
     text: str
+    inbox_target_ids: tuple[str, ...] = ()
 
 
 async def review_job(store: SQLiteStore, name: str, home: Path) -> Review:
@@ -40,12 +42,19 @@ async def review_job(store: SQLiteStore, name: str, home: Path) -> Review:
     )
     mount = None
     try:
-        mount = await mount_services(state.job, registry, home)
+        grants = resolve_inbox_grants(state.job, registry.project_registry or SessionManager(home).project_registry)
+        mount = await mount_services(state.job, registry, home, grants)
         recipient = await SlackDelivery(mount).resolve(state.job.deliver)
         if store.get(name).revision != state.revision:
             raise ValueError("draft changed during review; inspect the new revision")
+        targets = grants.target_ids if grants is not None else ()
+        project_registry = registry.project_registry or SessionManager(home).project_registry
+        target_display = ", ".join(
+            f"{project_registry.show_project(project_id=target).name} ({target})"
+            for target in targets
+        )
         payload = json.dumps(
-            [name, state.job.document(), state.revision, recipient], sort_keys=True
+            [name, state.job.document(), state.revision, recipient, targets], sort_keys=True
         )
         token = hashlib.sha256(payload.encode()).hexdigest()[:16]
         return Review(
@@ -54,7 +63,10 @@ async def review_job(store: SQLiteStore, name: str, home: Path) -> Review:
             recipient,
             token,
             show(store, name)
-            + f"\nResolved recipient: {recipient}\nApproval token: {token}",
+            + f"\nResolved recipient: {recipient}"
+            + ("\nResolved inbox targets: " + target_display if targets else "")
+            + f"\nApproval token: {token}",
+            tuple(targets),
         )
     finally:
         if mount is not None:
@@ -79,7 +91,7 @@ async def slash(args: str, *, home: Path, cwd: str) -> str:
                     "review changed or token is invalid; inspect the job again"
                 )
             store.approve(
-                review.name, review.revision, review.recipient, datetime.now(UTC)
+                review.name, review.revision, review.recipient, datetime.now(UTC), review.inbox_target_ids
             )
             return f"{review.name} r{review.revision} armed for {review.recipient}."
         if parts[0] == "disable" and len(parts) == 2:

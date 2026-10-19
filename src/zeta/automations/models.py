@@ -55,6 +55,7 @@ class JobState:
     last_check: datetime | None = None
     last_due: datetime | None = None
     enabled: bool = False
+    inbox_target_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

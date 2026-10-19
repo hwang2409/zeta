@@ -258,6 +258,7 @@ class ToolRegistry:
         # rediscover it through ambient ZETA_HOME.
         self.project_registry = project_registry
         self.inbox_enabled = inbox_enabled
+        self.inbox_target_ids: frozenset[str] | None = None
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
         self._cwd_fd = cwd_fd
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
@@ -711,6 +712,7 @@ class ToolRegistry:
         clone._agent_runner = None
         clone.agent_catalog = self.agent_catalog
         clone.project_id = self.project_id
+        clone.inbox_target_ids = self.inbox_target_ids
         clone.project_registry = self.project_registry
         return clone
 

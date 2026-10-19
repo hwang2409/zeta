@@ -99,7 +99,7 @@ class SQLiteStore:
                 source TEXT NOT NULL, PRIMARY KEY(name, revision));
             CREATE TABLE IF NOT EXISTS jobs (
                 name TEXT PRIMARY KEY, revision INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
-                approved_at TEXT, recipient TEXT, last_run TEXT, last_check TEXT, last_due TEXT);
+                approved_at TEXT, recipient TEXT, inbox_target_ids TEXT NOT NULL DEFAULT '[]', last_run TEXT, last_check TEXT, last_due TEXT);
             CREATE TABLE IF NOT EXISTS runs (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL,
                 due_at TEXT NOT NULL, status TEXT NOT NULL, session_id TEXT,
@@ -118,6 +118,7 @@ class SQLiteStore:
                 status TEXT NOT NULL DEFAULT 'pending', run_id TEXT,
                 UNIQUE(name, event_key));
         """)
+        self._migrate_jobs_schema()
         self._migrate_runs_schema()
         self.db.executescript("""
             CREATE UNIQUE INDEX IF NOT EXISTS runs_scheduled_occurrence
@@ -127,6 +128,12 @@ class SQLiteStore:
             CREATE INDEX IF NOT EXISTS webhook_deliveries_body_dedupe
             ON webhook_deliveries(name, body_hash, accepted_at);
         """)
+
+    def _migrate_jobs_schema(self) -> None:
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
+        if "inbox_target_ids" not in columns:
+            with self.db:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN inbox_target_ids TEXT NOT NULL DEFAULT '[]'")
 
     def _migrate_runs_schema(self) -> None:
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(runs)")}
@@ -205,6 +212,7 @@ class SQLiteStore:
             date("last_check"),
             date("last_due"),
             bool(row["enabled"]),
+            tuple(json.loads(row["inbox_target_ids"])),
         )
 
     def jobs(self) -> tuple[JobState, ...]:
@@ -231,7 +239,7 @@ class SQLiteStore:
             raise ValueError(f"unknown automation: {name}")
         return self._state(row)
 
-    def approve(self, name: str, revision: int, recipient: str, now: datetime) -> None:
+    def approve(self, name: str, revision: int, recipient: str, now: datetime, inbox_target_ids: tuple[str, ...] = ()) -> None:
         if not recipient or recipient[0] not in "CUGD" or not recipient.isalnum():
             raise ValueError(
                 "approval requires a resolved Slack user or conversation ID"
@@ -243,11 +251,12 @@ class SQLiteStore:
             if state.enabled:
                 raise ValueError("automation is already armed")
             self.db.execute(
-                """UPDATE jobs SET enabled=1, approved_at=?, recipient=?,
+                """UPDATE jobs SET enabled=1, approved_at=?, recipient=?, inbox_target_ids=?,
                 last_run=?, last_check=?, last_due=NULL WHERE name=? AND revision=?""",
                 (
                     timestamp(now),
                     recipient,
+                    json.dumps(inbox_target_ids),
                     timestamp(now),
                     timestamp(now),
                     name,

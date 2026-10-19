@@ -156,7 +156,14 @@ async def run_claimed(
                 allow=job.allow,
                 backend=backend,
             )
-            mount = await mount_factory(job, loop.tool_registry, home)
+            from .services import InboxGrants
+
+            grants = InboxGrants(project_id or "", state.inbox_target_ids) if state.inbox_target_ids else None
+            mount = (
+                await mount_factory(job, loop.tool_registry, home, grants)
+                if grants is not None
+                else await mount_factory(job, loop.tool_registry, home)
+            )
             loop.attach_mcp_mount(mount)
             sender = delivery or SlackDelivery(mount)
             loop.session_start()

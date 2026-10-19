@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ...automations.authoring import listing, resolve_job, show
+from ...automations.services import resolve_inbox_grants
 from ...automations.store import SQLiteStore
 from ...core.session import SessionError, SessionManager, env_home
 from ...protocol.types import StructuredToolResult
@@ -40,6 +41,7 @@ async def _automation(
                     provider=provider,
                     model=model,
                 )
+                resolve_inbox_grants(job, SessionManager(home).project_registry)
                 state = store.draft(job)
                 text = (
                     show(store, name)

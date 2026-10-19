@@ -7,9 +7,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfoNotFoundError
 
 from ..config.settings import load_settings
-from ..core.session import env_home
+from ..core.session import SessionManager, env_home
 from ..providers.factory import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
 from .models import Job, parse_job
+from .services import resolve_inbox_grants
 from .store import SQLiteStore
 
 
@@ -51,6 +52,7 @@ def import_jobs(store: SQLiteStore, path: Path, *, cwd: str, home: Path) -> str:
     for name, value in document.items():
         try:
             job = resolve_job(name, value, cwd=cwd, home=home)
+            resolve_inbox_grants(job, SessionManager(home).project_registry)
             state = store.draft(job, source=str(path.resolve()))
             results.append(f"{name} r{state.revision}: draft (not armed)")
         except (ValueError, TypeError, KeyError, ZoneInfoNotFoundError) as exc:
