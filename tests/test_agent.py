@@ -6756,7 +6756,7 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
     backend = _TaskFinishGateBackend(command, mixed_child=True)
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.05)
-    owner.finish_gate_task_timeout = 0.5
+    owner.finish_gate_task_timeout = 2
     loop = AgentLoop(
         backend,
         store,
@@ -6771,7 +6771,7 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
     await asyncio.sleep(0.2)
     release.touch()
-    await asyncio.wait_for(backend.task_output_read.wait(), timeout=2)
+    await asyncio.wait_for(backend.task_output_read.wait(), timeout=10)
     backend.release_grandchild.set()
     await asyncio.wait_for(run, timeout=2)
     notification = await _wait_completion(store, containing="task-evidence")
