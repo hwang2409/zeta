@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import re
 import shutil
 import stat
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -303,17 +305,35 @@ def test_bounded_agent_source_reads_only_active_branch_tail(tmp_path: Path) -> N
 
 
 def _open_fds_under(path: Path) -> list[int]:
-    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
     root = path.resolve()
     open_fds = []
-    for fd in os.listdir(fd_root):
+    for entry in os.listdir("/dev/fd"):
         try:
-            target = Path(os.path.realpath(os.readlink(fd_root / fd)))
-        except OSError:
+            fd = int(entry)
+            if sys.platform == "darwin":
+                target = Path(
+                    bytes(fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024))
+                    .split(b"\0", 1)[0]
+                    .decode()
+                )
+            else:
+                target = Path(os.path.realpath(f"/proc/self/fd/{fd}"))
+        except (OSError, ValueError):
             continue
         if target == root or root in target.parents:
-            open_fds.append(int(fd))
+            open_fds.append(fd)
     return open_fds
+
+
+def test_open_fds_under_sees_and_forgets_a_file(tmp_path: Path) -> None:
+    path = tmp_path / "open.txt"
+    opened = path.open("w")
+    fd = opened.fileno()
+    try:
+        assert fd in _open_fds_under(tmp_path)
+    finally:
+        opened.close()
+    assert fd not in _open_fds_under(tmp_path)
 
 
 @pytest.mark.asyncio
