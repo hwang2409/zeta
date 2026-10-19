@@ -776,7 +776,8 @@ class SubmissionPipeline:
             return
         if self._notification_wake_requested:
             self.start_notification_wake()
-            return
+            if self._provider_entry is not None:
+                return
         nonterminal = [
             entry
             for entry in self._entries.values()
