@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import traceback
 from typing import Any
 
 from prompt_toolkit import PromptSession
 
+from ...core.session import env_home
+from ...diagnostics.tui_stalls import write_tui_diagnostic
 from ...protocol.types import ErrorInfo, StreamEvent, StreamEventType
 from ..render import render_event
 
-_LOGGER = logging.getLogger(__name__)
+_TUI_ERROR_LOG = "tui-errors.jsonl"
 
 
 async def run_prompt_toolkit(
@@ -26,12 +28,15 @@ async def run_prompt_toolkit(
         _loop: asyncio.AbstractEventLoop, context: dict[str, Any]
     ) -> None:
         error = context.get("exception")
+        log_path = env_home() / "logs" / _TUI_ERROR_LOG
         if isinstance(error, BaseException):
             message = str(error).strip() or type(error).__name__
-            _LOGGER.error("unhandled exception in tui event loop", exc_info=error)
+            stack = "".join(traceback.format_exception(error))
         else:
             message = str(context.get("message", "unexpected ui error"))
-            _LOGGER.error("unhandled exception in tui event loop: %s", message)
+            stack = message
+        write_tui_diagnostic(log_path, {"type": "ui_error", "traceback": stack})
+        message = f"{message} (details in {log_path})"
         app._print_unit(
             render_event(
                 StreamEvent(

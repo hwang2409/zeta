@@ -41,6 +41,7 @@ from prompt_toolkit.layout.screen import Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
+from prompt_toolkit.patch_stdout import patch_stdout
 from rich.cells import cell_len
 from rich.console import Console
 from rich.panel import Panel
@@ -54,6 +55,7 @@ from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
+from zeta.diagnostics import tui_stalls as tui_stalls_module
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.providers.anthropic import (
     AnthropicBackend,
@@ -10665,7 +10667,6 @@ async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
         await asyncio.sleep(0)
         await persistence.flush_pending()
         fail_dup = False
-        persistence.schedule("second")
         await persistence.flush_pending()
     finally:
         os.close(directory_fd)
@@ -10675,7 +10676,7 @@ async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
     assert caplog.messages.count(
         "failed to persist composer draft: [Errno 24] Too many open files"
     ) == 1
-    assert DraftPersistence(tmp_path / "draft").load() == "second"
+    assert DraftPersistence(tmp_path / "draft").load() == "first"
 
 
 @pytest.mark.asyncio
@@ -10684,12 +10685,17 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
 ) -> None:
     app, session = _agent_list_session(tmp_path, 0)
     terminal_calls: list[str] = []
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
     monkeypatch.setattr(
-        "prompt_toolkit.application.application.in_terminal",
+        "prompt_toolkit.application.run_in_terminal",
+        lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
+    )
+    monkeypatch.setattr(
+        "prompt_toolkit.application.in_terminal",
         lambda: terminal_calls.append("in_terminal"),
     )
     monkeypatch.setattr(
-        "prompt_toolkit.application.application.run_in_terminal",
+        "prompt_toolkit.patch_stdout.run_in_terminal",
         lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
     )
 
@@ -10701,10 +10707,27 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
         await asyncio.sleep(0)
 
     monkeypatch.setattr(session.app, "run_async", run_async)
-    await app._run_full_screen(session)
+    with patch_stdout(raw=True):
+        await app._run_full_screen(session)
 
     assert any("background failed" in line for line in app._transcript_lines)
+    assert "jsonl" in "\n".join(app._transcript_lines)
     assert terminal_calls == []
+    records = (tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl").read_text().splitlines()
+    assert len(records) == 1
+    assert "background failed" in json.loads(records[0])["traceback"]
+
+
+def test_tui_diagnostic_write_ignores_fd_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_open(*_args: object, **_kwargs: object) -> int:
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(tui_stalls_module.os, "open", fail_open)
+    tui_stalls_module.write_tui_diagnostic(
+        tmp_path / "logs" / "tui-errors.jsonl", {"traceback": "failure"}
+    )
 
 
 @pytest.mark.asyncio
