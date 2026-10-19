@@ -674,9 +674,6 @@ class AutoMemoryReconciler:
                         end_offset=end_offset,
                         end_tokens=end_tokens,
                     )
-                if changed and self.notice is not None:
-                    details = ", ".join(f"{name} (+1)" for name in changed)
-                    self.notice(f"memory updated: {details}")
             cursor = selected_end + 1
 
         if item.key is not None and retry_outcomes:

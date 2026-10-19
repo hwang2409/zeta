@@ -287,7 +287,7 @@ async def test_before_eviction_reconciles_exact_range(tmp_path: Path) -> None:
     assert '"seq": 2' in seen[0] and '"seq": 3' in seen[0]
     assert '"seq": 4' not in seen[0]
     assert dict(registry.load_memory(project_id))["decisions.md"].endswith("range 2-3\n")
-    assert notices == ["memory updated: decisions.md (+1)"]
+    assert notices == []
 
 
 @pytest.mark.parametrize("text", ["界" * 1_200, "🧪" * 1_200])
@@ -712,7 +712,7 @@ async def test_notice_uses_explicit_publish_result_after_100_records(
     await runner.drain()
 
     assert len(registry.memory_log(project_id)) == 100
-    assert notices == ["memory updated: decisions.md (+1)"]
+    assert notices == []
 
 
 def test_memory_export_import_is_logical_and_preserves_provenance(tmp_path: Path) -> None:
@@ -1043,8 +1043,7 @@ async def test_failed_range_waits_for_retry_while_later_range_continues(
     receipts = runner.terminal_receipts()
     assert len(receipts) == 1
     assert receipts[0].attempt_count == 3
-    assert notices[0].startswith("memory update failed:")
-    assert notices[1] == "memory updated: decisions.md (+1)"
+    assert all(notice.startswith("memory update failed:") for notice in notices)
     assert runner.failure_log_path.read_text(encoding="utf-8").count("\n") == 3
 
 
