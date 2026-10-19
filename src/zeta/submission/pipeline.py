@@ -37,7 +37,7 @@ from .model import (
     _Entry,
     dispatch_provider,
 )
-from .notification_retry import NotificationRetry
+from .notification_retry import NotificationOutcome, NotificationRetry
 
 
 class _Message(Protocol):
@@ -74,7 +74,7 @@ class _CommandDone:
 @dataclass(frozen=True, slots=True)
 class _ProviderDone:
     submission: Submission
-    task: asyncio.Task[bool]
+    task: asyncio.Task[NotificationOutcome]
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,7 +131,7 @@ class SubmissionPipeline:
         self._command_order: deque[int] = deque()
         self._command_results: dict[int, str | None] = {}
         self._provider_entry: _Entry | None = None
-        self._provider_task: asyncio.Task[bool] | None = None
+        self._provider_task: asyncio.Task[NotificationOutcome] | None = None
         self._notification_retry = NotificationRetry(
             wake=lambda: self._send(None),
             has_notification=lambda: (
@@ -139,8 +139,11 @@ class SubmissionPipeline:
             ),
             schedule_history=self._host.loop.schedule_notification_history_retry,
             rollback=self._rollback_provider_dispatch,
-            report_failure=lambda exc: self._host._print_system(
-                f"submission failed: {exc}"
+            report_failure=lambda message: self._host._print_system(
+                f"notification failed; retrying automatically: {message}"
+            ),
+            report_stopped=lambda message: self._host._print_system(
+                f"notification failed; automatic retry stopped: {message}"
             ),
         )
         self._durable_tasks: dict[str, asyncio.Task[Any]] = {}
@@ -149,7 +152,7 @@ class SubmissionPipeline:
         self._shutting_down = False
 
     @property
-    def provider_task(self) -> asyncio.Task[bool] | None:
+    def provider_task(self) -> asyncio.Task[NotificationOutcome] | None:
         return self._provider_task
 
     @property

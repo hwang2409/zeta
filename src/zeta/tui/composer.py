@@ -38,6 +38,7 @@ from ..protocol.types import (
     with_message_origin,
 )
 from ..runtime.loop.empty_turn import MAX_TOKENS_THINKING_NOTICE
+from ..submission.notification_retry import NotificationFailure, NotificationOutcome
 from . import theme
 from ._attachments import (
     ATTACHMENT_MAX_TEXT_BYTES,  # noqa: F401 - preserve the composer import
@@ -159,7 +160,7 @@ class TurnConsumerMixin:
         abort_signal: Any | None = None,
         notification: bool = False,
         suppress_errors: bool = False,
-    ) -> bool:
+    ) -> NotificationOutcome:
         if not notification:
             user_text, user_message = self._consume_macro_receipts(
                 user_text, user_message
@@ -192,7 +193,7 @@ class TurnConsumerMixin:
             origin,
         )
         turn_failed = False
-        notification_failed = False
+        notification_failure: NotificationFailure | None = None
         try:
             events = (
                 self.loop.run_notification_turn(abort_signal=turn_abort_signal)
@@ -207,7 +208,18 @@ class TurnConsumerMixin:
             )
             async for event in events:
                 if notification and event.type is StreamEventType.ERROR:
-                    notification_failed = True
+                    notification_failure = NotificationFailure(
+                        event.error or ErrorInfo("backend_error", "notification turn failed"),
+                        event.data,
+                    )
+                elif (
+                    notification
+                    and event.type is StreamEventType.MESSAGE_END
+                    and event.data.get("stop_reason") == "refusal"
+                ):
+                    notification_failure = NotificationFailure(
+                        ErrorInfo("refusal", "provider refused the notification turn")
+                    )
                 self._update_usage(event)
                 self._usage_tracker.record(event.type, self.model)
                 self._prepare_stream_event(event)
@@ -268,7 +280,7 @@ class TurnConsumerMixin:
                             turn_failed |= self._print_special_event(
                                 event,
                                 rendered,
-                                suppress_errors=suppress_errors,
+                                suppress_errors=suppress_errors or notification,
                                 user_text=user_text,
                                 retry_message=retry_message,
                             )
@@ -285,7 +297,8 @@ class TurnConsumerMixin:
             self._print_unit(Text("[aborted]", style=theme.WARNING))
             raise
         except Exception as exc:
-            notification_failed = notification
+            if notification:
+                notification_failure = NotificationFailure(exc)
             self._flush_stream_kind(preserve_inline=True)
             self._presenter.reset_assistant_unit()
             self._reset_stream_state()
@@ -304,7 +317,7 @@ class TurnConsumerMixin:
             spinner_task.cancel()
             await asyncio.gather(spinner_task, return_exceptions=True)
             self._finish_stream_invalidation()
-        return not notification_failed
+        return notification_failure
 
     def _print_special_event(
         self,
@@ -780,7 +793,7 @@ class ComposerAttachmentMixin:
         abort_signal: Any | None = None,
         notification: bool = False,
         suppress_errors: bool = False,
-    ) -> asyncio.Task[bool]:
+    ) -> asyncio.Task[NotificationOutcome]:
         self._loop_state = "streaming"
         self._active_turn_submission_id = submission_id
         task = asyncio.create_task(

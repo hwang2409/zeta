@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from ..protocol.types import Message, StreamEvent
     from ..runtime.loop import AgentLoop
     from ..tui.composer import UndoCandidate
+    from .notification_retry import NotificationOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +103,7 @@ class SubmissionHost(Protocol):
         persist_user_message: bool = True,
         notification: bool = False,
         suppress_errors: bool = False,
-    ) -> asyncio.Task[bool]: ...
+    ) -> asyncio.Task[NotificationOutcome]: ...
     def _set_pipeline_task(self, task: asyncio.Task[object]) -> None: ...
     async def _run_macro_submission(
         self,
@@ -127,13 +128,13 @@ def dispatch_provider(
     entry: ProviderEntry,
     *,
     user_text: str,
-    on_done: Callable[[Submission, asyncio.Task[bool]], None],
+    on_done: Callable[[Submission, asyncio.Task[NotificationOutcome]], None],
     abort_signal: AbortSignal,
     user_message: Message | None = None,
     persist_user_message: bool = True,
     notification: bool = False,
     suppress_errors: bool = False,
-) -> asyncio.Task[bool]:
+) -> asyncio.Task[NotificationOutcome]:
     task = host._start_turn(
         user_text,
         user_message=user_message,

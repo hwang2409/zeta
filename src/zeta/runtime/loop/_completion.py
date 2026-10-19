@@ -86,11 +86,16 @@ def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorI
             code = "timeout"
         elif isinstance(error, (ConnectionError, httpx.TransportError)):
             code = "transport_error"
+        elif isinstance(error, OSError):
+            code = "os_error"
         else:
             cause = error.__cause__
             while cause is not None:
                 if isinstance(cause, (ConnectionError, TimeoutError, httpx.TransportError)):
                     code = "transport_error"
+                    break
+                if isinstance(cause, OSError):
+                    code = "os_error"
                     break
                 cause = cause.__cause__
             else:
