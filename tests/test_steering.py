@@ -450,6 +450,42 @@ async def test_toolless_turn_delivers_late_steer_as_next_turn(
 
 
 @pytest.mark.asyncio
+async def test_queued_message_dispatches_after_stale_notification_wake(
+    tmp_path: Path,
+) -> None:
+    backend = TextOnlyBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store, max_turns=3, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._submit_input("prompt")
+    await backend.turn1_streaming.wait()
+    app._submit_input("queued")
+    await _wait(lambda: app.loop.has_pending_steering)
+    app._submissions.wake()
+    backend.release_turn1.set()
+    await _wait(
+        lambda: app._submissions.provider_task is None
+        and app._submissions._consumer is None
+    )
+
+    assert len(backend.calls) == 2
+    assert any(
+        message.role is MessageRole.USER
+        and any(
+            isinstance(block, TextContent) and block.text == "queued"
+            for block in message.content
+        )
+        for message in backend.calls[1]
+    )
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_steer_submitted_as_provider_finishes_is_delivered_once(
     tmp_path: Path,
 ) -> None:
