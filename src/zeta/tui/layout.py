@@ -35,6 +35,7 @@ from .agent_card import AgentNavigation
 from .composer import status_formatted_text, vim_state_label
 from .render import format_status
 from .todo import TODO_PAD_BOTTOM, VISIBLE_ROWS, TodoWidget
+from .user import USER_BAND_CLASS
 
 
 CONTENT_MARGIN = 2
@@ -195,9 +196,9 @@ class TranscriptMargins(VSplit):
     """Transcript between side margins; sent-message bands bleed into them.
 
     A sent message is a full-width band like the composer. Rich only sees the
-    content width, so after painting, any row whose two content edges carry
-    the composer fill (the user band's background) is extended across the
-    margins. Other surfaces, tool cards included, keep their inset.
+    content width, so after painting, rows the transcript tagged with
+    ``USER_BAND_CLASS`` are extended across the margins in their edge style.
+    Untagged rows, tool cards included, keep their inset whatever their colour.
     """
 
     def write_to_screen(
@@ -212,19 +213,19 @@ class TranscriptMargins(VSplit):
         super().write_to_screen(
             screen, mouse_handlers, write_position, parent_style, erase_bg, z_index
         )
-        fill = theme.active_palette().composer_fill.lower()
         start = write_position.xpos
         end = start + write_position.width
         left, right = start + CONTENT_MARGIN, end - CONTENT_MARGIN - 1
-        if not fill or right < left:
+        if right < left:
             return
-        band = f"bg:{fill}"
-        margin = Char(" ", band)
         for y in range(write_position.ypos, write_position.ypos + write_position.height):
             row = screen.data_buffer[y]
-            if band in row[left].style and band in row[right].style:
-                for x in (*range(start, left), *range(right + 1, end)):
-                    row[x] = margin
+            if USER_BAND_CLASS in row[left].style and USER_BAND_CLASS in row[right].style:
+                left_margin, right_margin = Char(" ", row[left].style), Char(" ", row[right].style)
+                for x in range(start, left):
+                    row[x] = left_margin
+                for x in range(right + 1, end):
+                    row[x] = right_margin
 
 
 class QueuedPanel(NamedTuple):

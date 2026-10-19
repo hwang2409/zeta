@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from io import StringIO
 
+import pytest
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
@@ -113,7 +115,26 @@ def test_long_sent_message_wraps_inside_the_band() -> None:
     assert all(band in line for line in ansi_lines)
 
 
-def test_sent_message_band_bleeds_into_margins_but_tool_cards_do_not() -> None:
+@pytest.mark.parametrize(
+    ("card_matches_band", "searching"), [(False, False), (True, False), (True, True)]
+)
+def test_sent_message_band_bleeds_into_margins_but_tool_cards_do_not(
+    card_matches_band: bool, searching: bool
+) -> None:
+    # A custom theme may give read cards the composer fill; the card must still
+    # keep its inset because only tagged user rows bleed.
+    previous = theme.active_palette()
+    if card_matches_band:
+        theme.set_active_palette(
+            replace(theme.GRUVBOX_DARK, read_bg=theme.GRUVBOX_DARK.composer_fill)
+        )
+    try:
+        _assert_band_bleeds_and_card_keeps_inset(searching=searching)
+    finally:
+        theme.set_active_palette(previous)
+
+
+def _assert_band_bleeds_and_card_keeps_inset(*, searching: bool) -> None:
     transcript = TranscriptWidget()
     presenter = TranscriptPresenter(
         transcript,
@@ -131,6 +152,9 @@ def test_sent_message_band_bleeds_into_margins_but_tool_cards_do_not() -> None:
         )
     )
     presenter.print_unit(card)
+    if searching:
+        transcript.begin_search()
+        transcript.update_search("main")
     width, height = 30, 12
     lines = transcript.lines(content_width(width))
     margins = TranscriptMargins(
@@ -146,7 +170,7 @@ def test_sent_message_band_bleeds_into_margins_but_tool_cards_do_not() -> None:
             screen, MouseHandlers(), WritePosition(0, 0, width, height), "", True, None
         )
 
-    band = f"bg:{theme.active_palette().composer_fill}"
+    band = f"bg:{theme.active_palette().composer_fill.lower()}"
     top = height - len(lines)
     edges = (0, 1, width - 2, width - 1)
     for y in range(top, top + 3):

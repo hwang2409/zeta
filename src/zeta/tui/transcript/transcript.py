@@ -31,6 +31,7 @@ from ..agent_card import AgentCard
 from ..cards.agent_sync import refresh_agent_cards
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
+from ..user import mark_band, mark_bands
 from .streaming_text import StreamingText
 from .transcript_finder import TranscriptFinderMixin
 from .transcript_virtual import TranscriptVirtualMixin
@@ -752,7 +753,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             if len(updated) != 1:
                 self._parsed_cache.clear()
                 return
-            parsed[line] = updated[0]
+            location = self._locations(self._content_width)[line : line + 1]
+            parsed[line] = mark_bands(updated, location, self._user_units)[0]
 
     def next_search_match(self) -> bool:
         matches = self._search_matches()
@@ -916,6 +918,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         lines = (
             list(split_lines(to_formatted_text(ANSI(rendered)))) if rendered else [[]]
         )
+        if unit in self._user_units:
+            lines = [mark_band(line) for line in lines]
         self._unit_lines_cache[unit.key] = (rendered, lines)
         return lines
 
@@ -952,6 +956,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             # Search highlights restyle matched lines across the whole render.
             fragments = to_formatted_text(ANSI(self.render(width)))
             lines = list(split_lines(fragments)) or [[]]
+            lines = mark_bands(lines, self._locations(width), self._user_units)
         else:
             lines = self._assembled_lines(width)
         self._parsed_cache[width] = lines
