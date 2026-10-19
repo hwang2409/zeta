@@ -468,7 +468,7 @@ async def test_permanent_notification_failure_is_not_retried(
     timers = _capture_notification_timers(monkeypatch)
 
     app._submissions.wake()
-    await _drain_until(
+    await _wait(
         lambda: "automatic retry stopped" in app.console.file.getvalue() or bool(timers)
     )
 
@@ -531,7 +531,7 @@ async def test_transient_notification_failure_is_retried(
     timers = _capture_notification_timers(monkeypatch)
 
     app._submissions.wake()
-    await _drain_until(lambda: len(timers) == 1)
+    await _wait(lambda: len(timers) == 1)
 
     assert timers[0][0] == 1.0
     assert app.console.file.getvalue().count("retrying automatically") == 1
@@ -551,9 +551,7 @@ async def test_new_wake_after_permanent_failure_dispatches_normally(
     timers = _capture_notification_timers(monkeypatch)
 
     app._submissions.wake()
-    await _drain_until(
-        lambda: "automatic retry stopped" in app.console.file.getvalue()
-    )
+    await _wait(lambda: "automatic retry stopped" in app.console.file.getvalue())
     app.loop.store.append_agent_notification(
         "child-2",
         child_session_path="/tmp/child-2",
@@ -562,7 +560,7 @@ async def test_new_wake_after_permanent_failure_dispatches_normally(
         text="done again",
     )
     app._submissions.wake()
-    await _drain_until(lambda: len(backend.calls) == 2 and not app._submissions.active)
+    await _wait(lambda: len(backend.calls) == 2 and not app._submissions.active)
 
     assert timers == []
     assert app.console.file.getvalue().count("automatic retry stopped") == 1
