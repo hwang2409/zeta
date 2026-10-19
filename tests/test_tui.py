@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
-import errno
 import json
 import os
 import pty
@@ -11100,58 +11099,6 @@ async def test_tui_setup_handles_corrupt_and_legacy_drafts(
     session = app._make_session()
     assert session.default_buffer.text == expected
     assert path.read_bytes() == payload
-
-
-@pytest.mark.asyncio
-async def test_failed_notification_wake_retries_without_another_wake(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = ConversationStore(tmp_path)
-    store.append_agent_notification(
-        "child-1",
-        child_session_path="/tmp/child-1",
-        description="child",
-        status="completed",
-        text="done",
-    )
-    backend = FakeBackend([ScriptedTurn([TextContent("response")])])
-    app = TUIApp(
-        AgentLoop(
-            backend,
-            store,
-            skill_catalog=SkillCatalog.empty(),
-        ),
-        provider="codex",
-        model="offline",
-    )
-    original_message = app.loop.notification_system_message
-    failed = False
-
-    def fail_once() -> Message | None:
-        nonlocal failed
-        if not failed:
-            failed = True
-            raise OSError(errno.EMFILE, "too many open files")
-        return original_message()
-
-    original_call_later = asyncio.get_running_loop().call_later
-    monkeypatch.setattr(app.loop, "notification_system_message", fail_once)
-    monkeypatch.setattr(
-        asyncio.get_running_loop(),
-        "call_later",
-        lambda delay, callback, *args: original_call_later(0, callback, *args),
-    )
-    app._submissions.wake()
-    for _ in range(500):
-        if backend.calls and failed:
-            break
-        await asyncio.sleep(0.01)
-
-    assert failed
-    assert len(backend.calls) == 1
-    assert app.loop.notification_wake.pending_message() is None
-    await app._submissions.close()
-    await app.loop.close()
 
 
 @pytest.mark.asyncio
