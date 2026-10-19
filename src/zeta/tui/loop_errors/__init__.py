@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import queue
+import threading
 import traceback
+from pathlib import Path
 from typing import Any
 
 from prompt_toolkit import PromptSession
@@ -14,6 +17,34 @@ from ...protocol.types import ErrorInfo, StreamEvent, StreamEventType
 from ..render import render_event
 
 _TUI_ERROR_LOG = "tui-errors.jsonl"
+_DIAGNOSTIC_QUEUE: queue.Queue[tuple[Path, dict[str, Any]]] = queue.Queue(maxsize=32)
+_DIAGNOSTIC_WORKER_LOCK = threading.Lock()
+_DIAGNOSTIC_WORKER_STARTED = False
+
+
+def _write_diagnostics() -> None:
+    while True:
+        path, record = _DIAGNOSTIC_QUEUE.get()
+        try:
+            write_tui_diagnostic(path, record)
+        except BaseException:  # noqa: BLE001 - diagnostics must never affect the TUI
+            pass
+
+
+def _schedule_diagnostic(path: Path, record: dict[str, Any]) -> None:
+    global _DIAGNOSTIC_WORKER_STARTED
+    try:
+        with _DIAGNOSTIC_WORKER_LOCK:
+            if not _DIAGNOSTIC_WORKER_STARTED:
+                threading.Thread(
+                    target=_write_diagnostics,
+                    name="zeta-tui-diagnostics",
+                    daemon=True,
+                ).start()
+                _DIAGNOSTIC_WORKER_STARTED = True
+        _DIAGNOSTIC_QUEUE.put_nowait((path, record))
+    except BaseException:  # noqa: BLE001 - diagnostics must never affect the TUI
+        return
 
 
 async def run_prompt_toolkit(
@@ -35,7 +66,6 @@ async def run_prompt_toolkit(
         else:
             message = str(context.get("message", "unexpected ui error"))
             stack = message
-        write_tui_diagnostic(log_path, {"type": "ui_error", "traceback": stack})
         message = f"{message} (details in {log_path})"
         app._print_unit(
             render_event(
@@ -46,6 +76,7 @@ async def run_prompt_toolkit(
             )
         )
         app._invalidate_prompt()
+        _schedule_diagnostic(log_path, {"type": "ui_error", "traceback": stack})
 
     loop.set_exception_handler(handle_exception)
     try:

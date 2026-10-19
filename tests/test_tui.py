@@ -4,6 +4,7 @@ import ast
 import asyncio
 import base64
 import errno
+import fcntl
 import json
 import os
 import pty
@@ -10680,6 +10681,47 @@ async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
 
 
 @pytest.mark.asyncio
+async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, session = _agent_list_session(tmp_path, 0)
+    zeta_home = tmp_path / "zeta-home"
+    log_path = zeta_home / "logs" / "tui-errors.jsonl"
+    lock_path = log_path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True)
+    lock = lock_path.open("a+b")
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    monkeypatch.setenv("ZETA_HOME", str(zeta_home))
+
+    async def run_async(**_kwargs: object) -> None:
+        async def fail() -> None:
+            raise RuntimeError("background failed")
+
+        asyncio.create_task(fail())
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(session.app, "run_async", run_async)
+    try:
+        started = time.monotonic()
+        with patch_stdout(raw=True):
+            await app._run_full_screen(session)
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.1
+        assert any("background failed" in line for line in app._transcript_lines)
+        assert not log_path.exists()
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not log_path.exists():
+        await asyncio.sleep(0.01)
+    records = log_path.read_text().splitlines()
+    assert len(records) == 1
+    assert "background failed" in json.loads(records[0])["traceback"]
+
+
+@pytest.mark.asyncio
 async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10713,7 +10755,11 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
     assert any("background failed" in line for line in app._transcript_lines)
     assert "jsonl" in "\n".join(app._transcript_lines)
     assert terminal_calls == []
-    records = (tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl").read_text().splitlines()
+    log_path = tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl"
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not log_path.exists():
+        await asyncio.sleep(0.01)
+    records = log_path.read_text().splitlines()
     assert len(records) == 1
     assert "background failed" in json.loads(records[0])["traceback"]
 
