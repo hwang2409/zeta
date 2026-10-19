@@ -1531,6 +1531,34 @@ def test_cli_does_not_accept_piped_approval(
         assert not store.get("brief").enabled
 
 
+def test_cli_approval_persists_resolved_inbox_targets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import io
+
+    from zeta.automations import cli
+    from zeta.cli.main import main
+
+    class TTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    with SQLiteStore(tmp_path) as store:
+        store.draft(_job(tmp_path))
+
+    async def review(*args):
+        return commands.Review(
+            "brief", 1, "U123", "token", "reviewed draft", ("target-id",)
+        )
+
+    monkeypatch.setattr(cli, "review_job", review)
+    monkeypatch.setattr(cli.sys, "stdin", TTY("token\n"))
+    assert main(["automation", "approve", "brief"]) == 0
+    with SQLiteStore(tmp_path) as store:
+        assert store.get("brief").inbox_target_ids == ("target-id",)
+
+
 def _start_cli_daemon(
     tmp_path: Path, *, port: int = 0
 ) -> tuple[subprocess.Popen[bytes], int, bytes, bytes]:
