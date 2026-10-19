@@ -688,33 +688,6 @@ async def test_worker_coalesces_activity_while_provider_is_running(tmp_path: Pat
     assert runner.last_reconciled_seq == 8
 
 
-@pytest.mark.asyncio
-async def test_notice_uses_explicit_publish_result_after_100_records(
-    tmp_path: Path,
-) -> None:
-    runner, registry, project_id, notices = _runner(tmp_path)
-    for seq in range(1, 101):
-        snapshot = registry.memory_snapshot(project_id)
-        result = registry.compare_and_swap_memory(
-            project_id,
-            expected_digest=snapshot.digest,
-            updates={"decisions.md": f"# Decisions\n\nold {seq}\n"},
-            provenance={
-                "session_id": "history",
-                "seq_start": seq,
-                "seq_end": seq,
-            },
-        )
-        assert result.published is True
-        assert result.version
-
-    runner.before_eviction(1, 2)
-    await runner.drain()
-
-    assert len(registry.memory_log(project_id)) == 100
-    assert notices == []
-
-
 def test_memory_export_import_is_logical_and_preserves_provenance(tmp_path: Path) -> None:
     (tmp_path / "source").mkdir()
     _, source, source_id, _ = _runner(tmp_path / "source")
@@ -1043,7 +1016,9 @@ async def test_failed_range_waits_for_retry_while_later_range_continues(
     receipts = runner.terminal_receipts()
     assert len(receipts) == 1
     assert receipts[0].attempt_count == 3
-    assert all(notice.startswith("memory update failed:") for notice in notices)
+    assert notices and all(
+        notice.startswith("memory update failed:") for notice in notices
+    )
     assert runner.failure_log_path.read_text(encoding="utf-8").count("\n") == 3
 
 

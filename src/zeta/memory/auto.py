@@ -593,7 +593,7 @@ class AutoMemoryReconciler:
                         "usage": usage,
                     }
                     try:
-                        result = await asyncio.to_thread(
+                        await asyncio.to_thread(
                             self.registry.compare_and_swap_memory,
                             self.project_id,
                             expected_digest=proposal.base_digest,
@@ -608,8 +608,6 @@ class AutoMemoryReconciler:
                         raise ReconciliationError(
                             "project memory update failed"
                         ) from exc
-                    if result.published:
-                        changed = tuple(updates)
                     break
                 except _ConcurrentMemoryUpdate:
                     raise
