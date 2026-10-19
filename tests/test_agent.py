@@ -6792,9 +6792,9 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
     await asyncio.sleep(0.2)
     release.touch()
     await asyncio.wait_for(backend.task_output_read.wait(), timeout=10)
+    notification = await _wait_completion(store, containing="task-evidence")
     backend.release_grandchild.set()
     await asyncio.wait_for(run, timeout=2)
-    notification = await _wait_completion(store, containing="task-evidence")
     assert "task-evidence" in notification.data["text"]
     assert notification.data.get("killed_task_ids") is None
     await loop.close()
