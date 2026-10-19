@@ -8609,8 +8609,8 @@ def test_full_screen_pty_keeps_padded_margins_clean(
             capture_output=True,
             text=True,
         ).stdout
-        # The sent band's text sits one cell inside the two-column margin.
-        assert any(line.startswith("   hello") for line in plain)
+        # The sent band's text starts in the transcript's text column.
+        assert any(line.startswith("  hello") for line in plain)
         assert all(
             not line[:2].strip()
             for line in plain
@@ -8624,7 +8624,7 @@ def test_full_screen_pty_keeps_padded_margins_clean(
         assert all(not _contains_background_sgr(line) for line in reply_lines)
         # The sent band starts its filled top row at the terminal's first
         # column; tmux carries that background through the text row.
-        assert re.search(r"\x1b\[48;[0-9;]*m\n   hello\n", escaped)
+        assert re.search(r"\x1b\[48;[0-9;]*m\n  hello\n", escaped)
         assert list((tmp_path / "zeta-home" / "sessions").iterdir())
     finally:
         cleanup()
