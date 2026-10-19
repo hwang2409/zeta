@@ -428,6 +428,28 @@ def test_child_question_notification_renders_question() -> None:
     assert "unavailable" not in rendered.plain
 
 
+def test_child_question_withdrawn_notification_renders_text() -> None:
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.tui.render import render_agent_notification
+
+    rendered = render_agent_notification(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_question_withdrawn",
+                "child_instance_id": "root:208",
+                "question_id": "b2517c6f0fbb448e86dbb8b34fe0fbc0",
+                "description": "child question withdrawn",
+                "status": "withdrawn",
+                "text": "question withdrawn: child finished",
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.plain == "question withdrawn: child finished"
+
+
 def test_tui_renders_task_exit_and_ignores_unknown_kind() -> None:
     # S7: the TUI renders task_exited receipts and tolerates unknown kinds
     # without ever rendering them as agent completions.
