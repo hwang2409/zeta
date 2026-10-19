@@ -662,9 +662,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         {"prompt": "read", "description": "child", "background": True},
     )
     child_call = ToolCall("child-call", "read", {"path": str(target)})
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[agent]), ScriptedTurn(tool_calls=[child_call])]
-    )
+    backend = DelegatedApprovalBackend(agent, child_call, child_prompt="read")
     server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
@@ -679,7 +677,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         assert server.runtime.loop._background_owner.cancel(
             approval["agent_instance_id"]
         )
-        await asyncio.sleep(0.1)
+        await server.runtime.loop._background_owner.wait()
         frames = await _request(reader, writer, 4, "status")
         ends = _named_events(frames, "approval_end")
         assert [event["request_id"] for event in ends] == [approval["request_id"]]

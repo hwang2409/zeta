@@ -820,10 +820,13 @@ class NestedBackgroundBackend(CompletionBackend):
 
 
 class ForegroundNestedBackgroundBackend(CompletionBackend):
-    def __init__(self) -> None:
+    def __init__(self, *, background_child: bool = False) -> None:
+        self.background_child = background_child
         self.child_nested = False
         self.grandchild_started = asyncio.Event()
         self.release_grandchild = asyncio.Event()
+        self.child_notification_started = asyncio.Event()
+        self.release_child_notification = asyncio.Event()
 
     async def complete(
         self,
@@ -841,8 +844,16 @@ class ForegroundNestedBackgroundBackend(CompletionBackend):
             ),
             "",
         )
+        notification = any(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in messages
+        )
         if last_user == "start":
-            child = _agent_call("child")
+            child = (
+                _background_agent_call("child")
+                if self.background_child
+                else _agent_call("child")
+            )
             child.arguments["prompt"] = "child prompt"
             blocks = [ToolUseContent(child)]
         elif last_user == "child prompt" and not self.child_nested:
@@ -855,6 +866,10 @@ class ForegroundNestedBackgroundBackend(CompletionBackend):
             self.grandchild_started.set()
             await self.release_grandchild.wait()
             blocks = [TextContent("grandchild complete")]
+        elif self.background_child and notification:
+            self.child_notification_started.set()
+            await self.release_child_notification.wait()
+            blocks = [TextContent("child complete")]
         else:
             blocks = [TextContent("child complete")]
         yield StreamEvent(StreamEventType.MESSAGE_START)
@@ -2092,7 +2107,7 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
     await asyncio.wait_for(backend.question_published.wait(), timeout=2)
-    child_handle = next(iter(store.agent_children()))
+    child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
     assert send_to_run(
         store,
         child_handle,
@@ -4018,30 +4033,16 @@ def test_legacy_tree_budget_fields_are_tolerated(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) -> None:
-    nested = _agent_call("grandchild")
-    nested.arguments["background"] = True
-    child = _background_agent_call("child")
-    child.arguments["prompt"] = "inspect the task"
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[child]),
-            ScriptedTurn(tool_calls=[nested]),
-            ScriptedTurn([TextContent("child complete")]),
-            ScriptedTurn([TextContent("child finished")]),
-        ]
-    )
+    backend = ForegroundNestedBackgroundBackend(background_child=True)
     store = ConversationStore(tmp_path)
     root_woke = asyncio.Event()
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     loop.set_background_wake_callback(root_woke.set)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    for _ in range(100):
-        if store.agent_notifications(pending_only=False):
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("missing grandchild notification")
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
+    backend.release_grandchild.set()
+    await asyncio.wait_for(backend.child_notification_started.wait(), timeout=2)
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     root_notifications = store.agent_notifications(pending_only=False)
@@ -4062,6 +4063,7 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
         child_store.session_dir / "agents", session_id="1"
     )
     assert grandchild_store.agent_canceled() is None
+    backend.release_child_notification.set()
     await loop.close()
 
 

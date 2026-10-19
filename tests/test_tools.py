@@ -33,6 +33,7 @@ from zeta.protocol.types import (
 )
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
+from zeta.tools._shared import background_spawn
 
 
 def _python_command(source: str) -> str:
@@ -463,9 +464,23 @@ async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_bash_task_cancellation_kills_process_group(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     marker = tmp_path / "child-canceled"
+    spawned = asyncio.Event()
+    release_spawn = asyncio.Event()
+    spawned_process: asyncio.subprocess.Process | None = None
+    create_subprocess_shell = asyncio.create_subprocess_shell
+
+    async def hold_spawn(*args, **kwargs):
+        nonlocal spawned_process
+        process = await create_subprocess_shell(*args, **kwargs)
+        spawned_process = process
+        spawned.set()
+        await release_spawn.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", hold_spawn)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
@@ -473,13 +488,37 @@ async def test_bash_task_cancellation_kills_process_group(
         )
     )
 
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(spawned.wait(), timeout=2)
     task.cancel()
+    release_spawn.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.sleep(0.5)
 
-    assert not marker.exists()
+    assert spawned_process is not None
+    assert spawned_process.returncode is not None
+    with pytest.raises(ProcessLookupError):
+        os.killpg(spawned_process.pid, 0)
+
+
+@pytest.mark.asyncio
+async def test_terminate_unregistered_drains_stdout_and_stderr() -> None:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import os,time; os.write(1, b'ready\\n'); os.write(2, b'ready\\n'); os.write(2, b'x' * 262144); os.write(1, b'x' * 262144); time.sleep(30)",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    assert await process.stdout.readexactly(6) == b"ready\n"
+    assert await process.stderr.readexactly(6) == b"ready\n"
+    await asyncio.wait_for(
+        background_spawn._terminate_unregistered(process, 0.01, 2), timeout=10
+    )
+    assert process.returncode is not None
+    assert await process.stdout.read() == b""
+    assert await process.stderr.read() == b""
 
 
 @pytest.mark.asyncio
