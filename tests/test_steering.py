@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import stat
 from collections.abc import AsyncIterator, Sequence
@@ -22,6 +23,7 @@ from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,
+    ErrorInfo,
     Message,
     MessageOrigin,
     MessageRole,
@@ -255,6 +257,207 @@ async def _wait(check) -> None:
     async with asyncio.timeout(30):
         while not check():
             await asyncio.sleep(0.01)
+
+
+class _CapturedTimer:
+    def __init__(self, callback) -> None:
+        self.callback = callback
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def fire(self) -> None:
+        assert not self.cancelled
+        self.callback()
+
+
+class _NotificationBackend(CompletionBackend):
+    def __init__(self, *, failures: set[int] = frozenset()) -> None:
+        self.failures = failures
+        self.calls: list[list[Message]] = []
+
+    async def complete(self, messages, tool_schemas):
+        del tool_schemas
+        index = len(self.calls)
+        self.calls.append(list(messages))
+        if index in self.failures:
+            yield StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo("backend_error", "provider stopped"),
+            )
+            return
+        content = TextContent("done")
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=content)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [content]),
+        )
+
+
+class _BlockingNotificationBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def complete(self, messages, tool_schemas):
+        del tool_schemas
+        self.calls.append(list(messages))
+        self.started.set()
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        await self.release.wait()
+
+
+def _notification_app(tmp_path: Path, backend: CompletionBackend) -> TUIApp:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    return TUIApp(
+        AgentLoop(backend, store, max_turns=3, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+
+def _capture_notification_timers(monkeypatch, app: TUIApp):
+    timers: list[tuple[float, _CapturedTimer]] = []
+
+    def call_later(delay, callback):
+        timer = _CapturedTimer(callback)
+        timers.append((delay, timer))
+        return timer
+
+    monkeypatch.setattr(app._submissions._notification_retry, "_call_later", call_later)
+    return timers
+
+
+@pytest.mark.asyncio
+async def test_failed_notification_wake_schedules_one_timer_without_busy_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _notification_app(tmp_path, _NotificationBackend())
+    timers = _capture_notification_timers(monkeypatch, app)
+    attempts = 0
+
+    def fail() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError(errno.EMFILE, "too many open files")
+
+    monkeypatch.setattr(app.loop, "notification_system_message", fail)
+    app._submissions.wake()
+    await _wait(lambda: len(timers) == 1)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert attempts == 1
+    assert [delay for delay, _timer in timers] == [1.0]
+    timers[0][1].fire()
+    await _wait(lambda: attempts == 2)
+    assert [delay for delay, _timer in timers] == [1.0, 2.0]
+    assert app.console.file.getvalue().count("submission failed") == 1
+    await app._submissions.close()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_notification_turn_after_persistence_retries_from_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _NotificationBackend(failures={0, 2})
+    app = _notification_app(tmp_path, backend)
+    timers = _capture_notification_timers(monkeypatch, app)
+
+    app._submissions.wake()
+    await _wait(lambda: len(timers) == 1)
+    entries = app.loop.store.entries()
+    assert [entry.type for entry in entries].count("notification_ack") == 1
+    assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
+    assert not any(message.role is MessageRole.ASSISTANT for message in app.loop.store.messages())
+
+    timers[0][1].fire()
+    await _wait(lambda: len(backend.calls) == 2 and not app._submissions.active)
+    assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
+    assert sum(message.role is MessageRole.ASSISTANT for message in app.loop.store.messages()) == 1
+
+    app.loop.store.append_agent_notification(
+        "child-2",
+        child_session_path="/tmp/child-2",
+        description="child",
+        status="completed",
+        text="done again",
+    )
+    app._submissions.wake()
+    await _wait(lambda: len(timers) == 2)
+    assert timers[1][0] == 1.0
+    await app._submissions.close()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_user_message_during_pending_retry_cancels_timer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _NotificationBackend(failures={0})
+    app = _notification_app(tmp_path, backend)
+    timers = _capture_notification_timers(monkeypatch, app)
+
+    app._submissions.wake()
+    await _wait(lambda: len(timers) == 1)
+    app._submit_input("recover")
+    await _wait(lambda: len(backend.calls) == 2 and not app._submissions.active)
+
+    assert timers[0][1].cancelled
+    assert any(
+        message.role is MessageRole.SYSTEM
+        and message.metadata.get("zeta_event") == "agent_notifications"
+        for message in backend.calls[1]
+    )
+    await app._submissions.close()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_aborted_notification_turn_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _BlockingNotificationBackend()
+    app = _notification_app(tmp_path, backend)
+    timers = _capture_notification_timers(monkeypatch, app)
+
+    app._submissions.wake()
+    await backend.started.wait()
+    app._submissions.abort()
+    await _wait(lambda: app._submissions.provider_task is None)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert timers == []
+    assert len(backend.calls) == 1
+    await app._submissions.close()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_timer_cancelled_on_pipeline_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _notification_app(tmp_path, _NotificationBackend(failures={0}))
+    timers = _capture_notification_timers(monkeypatch, app)
+
+    app._submissions.wake()
+    await _wait(lambda: len(timers) == 1)
+    await app._submissions.close()
+
+    assert timers[0][1].cancelled
+    await app.loop.close()
 
 
 @pytest.mark.asyncio
