@@ -17,14 +17,14 @@ async def mount_services(job: Job, registry: ToolRegistry, home: Path) -> MCPMou
     config = load_mcp_config(
         os.environ.get("ZETA_MCP_CONFIG", str(home_config_path(home)))
     )
-    delivery = job.deliver != "none"
+    delivery_tool = "slack__slack_send_message" if job.deliver != "none" else None
     selected = set(job.servers)
-    if delivery:
+    if delivery_tool:
         selected.add("slack")
     missing = selected - config.servers.keys()
     if missing:
         raise ValueError(f"unavailable MCP configuration: {', '.join(sorted(missing))}")
-    if delivery:
+    if delivery_tool:
         slack = config.servers["slack"]
         if slack.url != "https://mcp.slack.com/mcp" or slack.auth_type != "oauth":
             raise ValueError(
@@ -47,8 +47,8 @@ async def mount_services(job: Job, registry: ToolRegistry, home: Path) -> MCPMou
                 f"MCP servers failed to mount: {', '.join(failed)}; check /mcp status and authentication"
             )
         requested = [parse_approval_rule(text).tool for text in job.allow]
-        if delivery:
-            requested.append("slack__slack_send_message")
+        if delivery_tool:
+            requested.append(delivery_tool)
         # Only names owned by a selected MCP catalog (matched by exact server
         # prefix) go through activation; built-ins like ``read`` are already
         # registered and are validated the normal way below. MCP-prefixed
@@ -59,16 +59,16 @@ async def mount_services(job: Job, registry: ToolRegistry, home: Path) -> MCPMou
         ]
         _activated, rejected = mount.activate_tools(registry, catalog_requested)
         if rejected:
-            if delivery and any(
-                item.startswith("slack__slack_send_message") for item in rejected
+            if delivery_tool and any(
+                item.startswith(delivery_tool) for item in rejected
             ):
                 raise ValueError(
                     "delivery to slack needs slack__slack_send_message, which the slack MCP server does not offer (the token may lack chat:write); omit deliver or grant chat:write"
                 )
             raise ValueError("MCP tool activation failed: " + "; ".join(rejected))
         validate_permissions(job, registry)
-        if delivery:
-            sender = registry.definitions_by_name.get("slack__slack_send_message")
+        if delivery_tool:
+            sender = registry.definitions_by_name.get(delivery_tool)
             properties = (
                 sender.parameters.get("properties", {}) if sender is not None else {}
             )
