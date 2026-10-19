@@ -10679,6 +10679,35 @@ async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
 
 
 @pytest.mark.asyncio
+async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, session = _agent_list_session(tmp_path, 0)
+    terminal_calls: list[str] = []
+    monkeypatch.setattr(
+        "prompt_toolkit.application.application.in_terminal",
+        lambda: terminal_calls.append("in_terminal"),
+    )
+    monkeypatch.setattr(
+        "prompt_toolkit.application.application.run_in_terminal",
+        lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
+    )
+
+    async def run_async(**_kwargs: object) -> None:
+        async def fail() -> None:
+            raise RuntimeError("background failed")
+
+        asyncio.create_task(fail())
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(session.app, "run_async", run_async)
+    await app._run_full_screen(session)
+
+    assert any("background failed" in line for line in app._transcript_lines)
+    assert terminal_calls == []
+
+
+@pytest.mark.asyncio
 async def test_draft_write_failure_is_reported_once_without_raising(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
