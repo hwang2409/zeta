@@ -45,6 +45,9 @@ def resolve_approval_rule(definition: Any, parsed: Any) -> Any:
                 f"invalid approval rule {str(parsed)!r}: action {action!r} "
                 "declares no approval subject"
             )
+        pattern = _resolve_exact_subject(
+            definition, pattern, action, metadata.approval_subject
+        )
         return rule_type(parsed.tool, pattern, action)
 
     if parsed.action is not None:
@@ -56,7 +59,34 @@ def resolve_approval_rule(definition: Any, parsed: Any) -> Any:
             f"invalid approval rule {str(parsed)!r}: tool {parsed.tool!r} "
             "declares no approval subject"
         )
+    pattern = _resolve_exact_subject(
+        definition, pattern, None, definition.approval_subject
+    )
     return rule_type(parsed.tool, pattern)
+
+
+def _resolve_exact_subject(
+    definition: Any,
+    pattern: str | None,
+    action: str | None,
+    subject_field: str | None,
+) -> str | None:
+    resolver = definition.approval_subject_resolver
+    if (
+        pattern is None
+        or subject_field is None
+        or any(character in pattern for character in "*?[")
+        or resolver is None
+    ):
+        return pattern
+    arguments = {subject_field: pattern}
+    if action is not None:
+        arguments["action"] = action
+    try:
+        resolved = resolver(arguments)
+    except ValueError:
+        return pattern
+    return pattern if resolved is None else resolved
 
 
 class ApprovalBinding(StrEnum):
