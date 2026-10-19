@@ -538,13 +538,21 @@ def render_agent_notification(event: StreamEvent) -> Text | None:
         question = event.data.get("question")
         if not isinstance(child_instance_id, str) or not isinstance(question, str):
             return Text("background agent notification unavailable", style=theme.ERROR)
-        message = f"? {child_instance_id} asks: {question}"
+        prefix = f"? {child_instance_id} asks: "
+        message = prefix + _compact_notification_text(
+            question, MAX_AGENT_NOTIFICATION_LINE - cell_len(prefix)
+        )
         return Text(message, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
     if kind == "child_question_withdrawn":
         text = event.data.get("text")
         if not isinstance(text, str):
             return Text("background agent notification unavailable", style=theme.ERROR)
-        return Text(text, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
+        return Text(
+            _compact_notification_text(text, MAX_AGENT_NOTIFICATION_LINE),
+            style=theme.NOTICE,
+            overflow="ellipsis",
+            no_wrap=True,
+        )
     if kind == "task_exited":
         task_id = event.data.get("task_id", "?")
         if event.data.get("background_phase") == "session_shutdown":
