@@ -100,6 +100,64 @@ START = datetime(2026, 9, 9, 11, 0, tzinfo=UTC)
 DUE = START + timedelta(hours=1)
 
 
+async def test_no_delivery_runs_without_slack_and_records_run(tmp_path: Path) -> None:
+    document = _job(tmp_path).document()
+    document.pop("deliver")
+    job = parse_job("inbox-only", document)
+    with SQLiteStore(tmp_path) as store:
+        state = store.draft(job)
+        store.approve(job.name, state.revision, None, START)
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=tmp_path,
+            backend=FakeBackend([ScriptedTurn(content=[TextContent("sent")])]),
+            mount_factory=_empty_mount,
+        )
+        run = store.runs(job.name)[0]
+        assert run.status == "completed"
+        assert run.delivery == ""
+
+
+def test_automation_schema_does_not_require_delivery() -> None:
+    registry = ToolRegistry(
+        Path.cwd(), register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    from zeta.tools.automation import register
+
+    register(registry)
+    schema = registry.definitions_by_name["automation"].parameters
+    assert "deliver" not in schema["properties"]["job"]["required"]
+
+
+async def test_runtime_missing_delivery_tool_has_actionable_error(tmp_path: Path) -> None:
+    job = _job(tmp_path)
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, job)
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+
+        async def missing_delivery(*_args):
+            raise ValueError(
+                "delivery to slack needs slack__slack_send_message, which the slack MCP server does not offer (the token may lack chat:write); omit deliver or grant chat:write"
+            )
+
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=tmp_path,
+            backend=FakeBackend([ScriptedTurn(content=[TextContent("sent")])]),
+            mount_factory=missing_delivery,
+        )
+        run = store.runs(job.name)[0]
+        assert run.status == "failed"
+        assert "delivery to slack needs slack__slack_send_message" in run.detail
+
+
 def _job(tmp_path: Path, name: str = "brief", *, poll: bool = False):
     return parse_job(
         name,
@@ -1350,7 +1408,9 @@ def _slack_deferred_config() -> dict[str, object]:
     }
 
 
-def _slack_deferred_client_factory(monkeypatch, *, extra_tools: int = 40):
+def _slack_deferred_client_factory(
+    monkeypatch, *, extra_tools: int = 40, include_send: bool = True
+):
     """Patch the MCP client builder so 'slack' exposes >32 tools (deferred path)."""
     from tests.test_mcp import _FakeClient
     from zeta.mcp import mount as mount_module
@@ -1363,19 +1423,22 @@ def _slack_deferred_client_factory(monkeypatch, *, extra_tools: int = 40):
                     "history",
                     "read channel history",
                     {"type": "object", "properties": {"channel": {"type": "string"}}},
-                ),
-                MCPTool(
-                    "slack_send_message",
-                    "send a message",
-                    {
-                        "type": "object",
-                        "properties": {
-                            "channel_id": {"type": "string"},
-                            "message": {"type": "string"},
-                        },
-                    },
-                ),
+                )
             ]
+            if include_send:
+                tools.append(
+                    MCPTool(
+                        "slack_send_message",
+                        "send a message",
+                        {
+                            "type": "object",
+                            "properties": {
+                                "channel_id": {"type": "string"},
+                                "message": {"type": "string"},
+                            },
+                        },
+                    )
+                )
             tools += [
                 MCPTool(f"tool_{i}", f"filler {i}", {"type": "object"})
                 for i in range(extra_tools)
@@ -1385,6 +1448,21 @@ def _slack_deferred_client_factory(monkeypatch, *, extra_tools: int = 40):
     monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
     monkeypatch.setattr(mount_module, "_build_client", Client)
     return Client
+
+
+async def test_approval_rejects_missing_delivery_tool_with_actionable_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from zeta.automations.services import mount_services
+
+    _slack_deferred_client_factory(monkeypatch, include_send=False)
+    (tmp_path / "mcp.json").write_text(
+        json.dumps({"servers": {"slack": _slack_deferred_config()}})
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    with pytest.raises(ValueError, match="delivery to slack needs slack__slack_send_message"):
+        await mount_services(_job(tmp_path), registry, tmp_path)
+    await registry.close()
 
 
 async def test_deferred_catalog_allows_scoped_rule_and_activates_delivery_tool(

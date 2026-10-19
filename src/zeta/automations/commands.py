@@ -24,7 +24,7 @@ from .webhook import DEFAULT_WEBHOOK_PORT
 class Review:
     name: str
     revision: int
-    recipient: str
+    recipient: str | None
     token: str
     text: str
 
@@ -41,7 +41,11 @@ async def review_job(store: SQLiteStore, name: str, home: Path) -> Review:
     mount = None
     try:
         mount = await mount_services(state.job, registry, home)
-        recipient = await SlackDelivery(mount).resolve(state.job.deliver)
+        recipient = (
+            await SlackDelivery(mount).resolve(state.job.deliver)
+            if state.job.deliver != "none"
+            else None
+        )
         if store.get(name).revision != state.revision:
             raise ValueError("draft changed during review; inspect the new revision")
         payload = json.dumps(
@@ -54,7 +58,12 @@ async def review_job(store: SQLiteStore, name: str, home: Path) -> Review:
             recipient,
             token,
             show(store, name)
-            + f"\nResolved recipient: {recipient}\nApproval token: {token}",
+            + (
+                f"\nResolved recipient: {recipient}\n"
+                if recipient is not None
+                else "\nNo delivery configured.\n"
+            )
+            + f"Approval token: {token}",
         )
     finally:
         if mount is not None:
@@ -81,7 +90,10 @@ async def slash(args: str, *, home: Path, cwd: str) -> str:
             store.approve(
                 review.name, review.revision, review.recipient, datetime.now(UTC)
             )
-            return f"{review.name} r{review.revision} armed for {review.recipient}."
+            return (
+                f"{review.name} r{review.revision} armed"
+                + (f" for {review.recipient}." if review.recipient else ".")
+            )
         if parts[0] == "disable" and len(parts) == 2:
             store.disable(parts[1])
             return f"{parts[1]} disabled."

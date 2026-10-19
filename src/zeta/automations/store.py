@@ -231,8 +231,10 @@ class SQLiteStore:
             raise ValueError(f"unknown automation: {name}")
         return self._state(row)
 
-    def approve(self, name: str, revision: int, recipient: str, now: datetime) -> None:
-        if not recipient or recipient[0] not in "CUGD" or not recipient.isalnum():
+    def approve(self, name: str, revision: int, recipient: str | None, now: datetime) -> None:
+        if recipient is not None and (
+            not recipient or recipient[0] not in "CUGD" or not recipient.isalnum()
+        ):
             raise ValueError(
                 "approval requires a resolved Slack user or conversation ID"
             )

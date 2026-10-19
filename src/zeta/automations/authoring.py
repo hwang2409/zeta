@@ -26,6 +26,7 @@ def resolve_job(
         raise TypeError("job must be an object")
     settings = load_settings(home=home or env_home()).settings
     value = dict(document)
+    value.setdefault("deliver", "none")
     selected_provider = value.setdefault(
         "provider", provider or settings.provider or "claude"
     )
