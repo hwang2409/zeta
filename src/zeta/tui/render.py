@@ -533,6 +533,13 @@ def render_agent_notification(event: StreamEvent) -> Text | None:
         if not isinstance(text, str):
             return Text("project inbox notification unavailable", style=theme.ERROR)
         return Text(text, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
+    if kind == "child_question":
+        child_instance_id = event.data.get("child_instance_id")
+        question = event.data.get("question")
+        if not isinstance(child_instance_id, str) or not isinstance(question, str):
+            return Text("background agent notification unavailable", style=theme.ERROR)
+        message = f"? {child_instance_id} asks: {question}"
+        return Text(message, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
     if kind == "task_exited":
         task_id = event.data.get("task_id", "?")
         if event.data.get("background_phase") == "session_shutdown":
