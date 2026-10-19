@@ -42,7 +42,7 @@ from .background import finish_background_child
 from .budget import MAX_AGENT_DEPTH
 from .budget import child_depth as next_agent_depth
 from .conversation_channel import has_follow_up_loop
-from .finish_gate import FinishGateControl, run_finish_gate
+from .finish_gate import FinishGateControl, FinishGateState, run_finish_gate
 from .presets import (
     GENERAL_PRESET,
     RUN_PRESET,
@@ -78,6 +78,8 @@ async def consume_child(
     error_message: Callable[[BaseException], str],
     record_report: Callable[[str], None] | None = None,
     notification_turn: bool = False,
+    finish_gate_state: FinishGateState | None = None,
+    delivering_prompt_id: str | None = None,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
 
@@ -191,6 +193,8 @@ async def consume_child(
                 tasks,
                 consume_events,
                 lambda: failure_message is not None,
+                finish_gate_state,
+                delivering_prompt_id,
             )
             if gate_result.handoff is not None:
                 reason, outputs = gate_result.handoff
@@ -285,6 +289,7 @@ async def consume_run(
     current_entry = None
     segment_reports: list[str] = []
     kwargs["record_report"] = segment_reports.append
+    kwargs["finish_gate_state"] = FinishGateState()
 
     def finalize(res: dict[str, object]) -> dict[str, object]:
         if segment_reports and receipt_components is not None:
@@ -350,6 +355,7 @@ async def consume_run(
             )
             if pending:
                 current_entry = pending[0]
+                kwargs["delivering_prompt_id"] = current_entry.id
                 result = await consume_child(
                     child_loop,
                     current_entry.data["text"],
@@ -357,6 +363,7 @@ async def consume_run(
                     **kwargs,
                 )
                 continue
+            kwargs["delivering_prompt_id"] = None
             if child_loop.notification_wake.pending_message() is not None:
                 result = await consume_child(
                     child_loop,

@@ -6533,6 +6533,8 @@ class _TaskFinishGateBackend(CompletionBackend):
         self.grandchild_started = asyncio.Event()
         self.release_grandchild = asyncio.Event()
         self.task_output_read = asyncio.Event()
+        self.follow_up_processed = asyncio.Event()
+        self.noise_notification_turns = 0
 
     async def complete(
         self,
@@ -6561,6 +6563,18 @@ class _TaskFinishGateBackend(CompletionBackend):
         notification = any(
             message.metadata.get("zeta_event") == "agent_notifications"
             for message in messages
+        )
+        latest_notification = next(
+            (
+                message
+                for message in reversed(messages)
+                if message.metadata.get("zeta_event") == "agent_notifications"
+            ),
+            None,
+        )
+        noise_notification = latest_notification is not None and all(
+            item.get("kind") != "task_exited"
+            for item in latest_notification.metadata.get("notifications", [])
         )
         started = any(
             message.tool_result is not None
@@ -6619,9 +6633,15 @@ class _TaskFinishGateBackend(CompletionBackend):
                         )
                     )
                 )
+        elif last_user == "follow-up while task runs":
+            self.follow_up_processed.set()
+            blocks = [TextContent("follow-up handled")]
         elif gate is not None and output_read is not None:
             self.task_output_read.set()
             blocks = [TextContent(f"task result: {output_read}")]
+        elif gate is not None and notification and noise_notification:
+            self.noise_notification_turns += 1
+            blocks = [TextContent("WAIT")]
         elif gate is not None and notification and self.action == "wait":
             task_id = re.search(r"task-[0-9a-f]+", self.gate_text)
             assert task_id is not None
@@ -6813,6 +6833,106 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
 
 
 @pytest.mark.asyncio
+async def test_finish_gate_follow_up_keeps_original_task_deadline(
+    tmp_path: Path,
+) -> None:
+    backend = _TaskFinishGateBackend(_python("import time; time.sleep(30)"))
+    store = ConversationStore(tmp_path / "session")
+    owner = BackgroundAgentOwner(
+        store,
+        finish_gate_max_turns=100,
+        finish_gate_timeout=0.05,
+        finish_gate_task_timeout=0.15,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
+
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    owner.finish_gate_task_timeout = 1
+    child_handle = next(iter(store.agent_children()))
+    assert send_to_run(
+        store,
+        child_handle,
+        "follow-up while task runs",
+        channel=owner.conversation_channel,
+    ) is None
+
+    await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=0.1)
+    notification = await asyncio.wait_for(_wait_completion(store), timeout=0.4)
+    assert "finish-gate task safety bound expired" in notification.data["text"]
+    assert notification.data.get("killed_task_ids")
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_turn_cap_does_not_kill_running_task(
+    tmp_path: Path,
+) -> None:
+    release = tmp_path / "release"
+    command = (
+        f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
+        "echo task-evidence"
+    )
+    backend = _TaskFinishGateBackend(command)
+    store = ConversationStore(tmp_path / "session")
+    owner = BackgroundAgentOwner(
+        store,
+        finish_gate_max_turns=2,
+        finish_gate_timeout=0.05,
+        finish_gate_task_timeout=0.8,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    run = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    child_handle, marker = next(iter(store.agent_children().items()))
+    child_path = Path(marker["child_session_path"])
+    child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+    for index in range(3):
+        child_store.append_agent_notification(
+            f"noise-{index}",
+            child_session_path=f"/tmp/noise-{index}",
+            description="noise notification",
+            status="completed",
+            text=f"noise notification {index}",
+        )
+        owner.conversation_channel.wake(child_handle)
+        await asyncio.sleep(0.01)
+        deadline = asyncio.get_running_loop().time() + 0.2
+        while (
+            backend.noise_notification_turns < min(index + 1, 1)
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0)
+        assert not [
+            entry
+            for entry in store.agent_notifications(pending_only=False)
+            if entry.data.get("status") == "completed"
+        ]
+
+    release.touch()
+    await asyncio.wait_for(run, timeout=2)
+    notification = await asyncio.wait_for(_wait_completion(store), timeout=2)
+    assert "task-evidence" in notification.data["text"]
+    assert notification.data.get("killed_task_ids") is None
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_finish_gate_task_without_exit_reports_safety_bound(
     tmp_path: Path,
 ) -> None:
@@ -6918,12 +7038,15 @@ async def test_child_finish_gate_task_handoff_kills_task(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_child_finish_gate_task_turn_bound_returns_original_answer(
+async def test_child_finish_gate_task_turn_bound_defers_to_task_safety(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(
-        store, finish_gate_max_turns=1, finish_gate_timeout=60
+        store,
+        finish_gate_max_turns=1,
+        finish_gate_timeout=60,
+        finish_gate_task_timeout=0.05,
     )
     backend = _TaskFinishGateBackend(_python("import time; time.sleep(30)"))
     loop = AgentLoop(
@@ -6939,7 +7062,7 @@ async def test_child_finish_gate_task_turn_bound_returns_original_answer(
     )
     notification = await _wait_completion(store)
     assert backend.gate_seen.is_set()
-    assert "premature child answer" in notification.data["text"]
+    assert "finish-gate task safety bound expired" in notification.data["text"]
     assert "background tasks killed on child completion" in notification.data["text"]
     await loop.close()
 
@@ -6952,7 +7075,10 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
     backend = _TaskOwningChildBackend(_python("import time; time.sleep(30)"))
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(
-        store, finish_gate_max_turns=1, finish_gate_timeout=60
+        store,
+        finish_gate_max_turns=1,
+        finish_gate_timeout=60,
+        finish_gate_task_timeout=0.05,
     )
     loop = AgentLoop(
         backend,
