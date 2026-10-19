@@ -16,7 +16,11 @@ from zeta.context_eviction import (
     evict_messages,
     eviction_view,
 )
-from zeta.context_eviction.range_receipts import _is_receipt_kind
+from zeta.context_eviction.range_receipts import (
+    _RANGE_LIMIT,
+    _is_receipt_kind,
+    range_receipt_candidate,
+)
 from zeta.context_eviction.receipt_constructors import _tool_call_receipt
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -715,6 +719,66 @@ def test_range_receipts_are_stable_as_history_grows() -> None:
     ]
     assert ranges[0] == first_range
     assert len(ranges) == 2
+
+
+def test_coarse_receipt_keeps_recent_user_request_excerpts() -> None:
+    records = [
+        (
+            1,
+            Message(
+                MessageRole.USER,
+                [TextContent("deploy the billing migration after the backup finishes")],
+            ),
+        ),
+        (2, _assistant_receipt(2)),
+        (
+            3,
+            Message(
+                MessageRole.USER,
+                [TextContent("also notify the finance lead before rollout")],
+            ),
+        ),
+        (4, _assistant_receipt(4)),
+        (5, Message(MessageRole.USER, [TextContent("yes, do that")])),
+    ]
+    result = range_receipt_candidate(
+        records,
+        allows=lambda seq: seq != 5,
+        is_smaller=lambda _records, _messages: True,
+        coarse=True,
+    )
+    text = _range_text(result.records[0][1])
+    assert "2 user requests" in text
+    assert "billing" in text
+    assert "finance" in text
+    assert "yes, do that" not in text
+    assert len(text) <= _RANGE_LIMIT
+
+
+def test_coarse_receipt_excerpts_stay_within_cap() -> None:
+    records = []
+    for seq in range(1, 20, 2):
+        records.extend(
+            [
+                (
+                    seq,
+                    Message(
+                        MessageRole.USER, [TextContent(f"request {seq} " + "x" * 120)]
+                    ),
+                ),
+                (seq + 1, _assistant_receipt(seq + 1)),
+            ]
+        )
+    result = range_receipt_candidate(
+        records,
+        allows=lambda _seq: True,
+        is_smaller=lambda _records, _messages: True,
+        coarse=True,
+    )
+    text = _range_text(result.records[0][1])
+    assert len(text) <= _RANGE_LIMIT
+    assert "request 19" in text
+    assert "request 1 x" not in text
 
 
 def test_coarse_fold_keeps_receipt_floor_bounded_across_passes() -> None:

@@ -47,22 +47,12 @@ def range_receipt_candidate(
 
     def flush() -> None:
         flattened = [record for unit in run for record in unit.records]
-        receipt_count = sum(unit.kind != "user" for unit in run)
-        if len(run) >= 2 and (not coarse or receipt_count >= 2):
+        if len(run) >= 2:
             start, end = flattened[0][0], flattened[-1][0]
             receipt = _range_receipt(start, end, run)
-            retained = [
-                record for record in flattened if record[1].role is MessageRole.USER
-            ]
-            if is_smaller(flattened, [*(message for _, message in retained), receipt]):
-                output.extend(retained)
+            if is_smaller(flattened, [receipt]):
                 output.append((start, receipt))
-                coalesced.update(
-                    seq
-                    for seq, message in flattened
-                    if allows(seq) and message.role is not MessageRole.USER
-                )
-                output.sort(key=lambda record: record[0])
+                coalesced.update(seq for seq, _ in flattened)
             else:
                 output.extend(flattened)
         else:
@@ -70,17 +60,13 @@ def range_receipt_candidate(
         run.clear()
 
     while index < len(records):
-        unit, next_index = (
-            _coarse_receipt_unit(records, index, allows)
-            if coarse
-            else _receipt_unit(records, index, allows)
-        )
+        unit, next_index = _receipt_unit(records, index, allows)
         if unit is None:
             flush()
             output.append(records[index])
             index += 1
             continue
-        if run and not coarse and unit.records[0][0] != run[-1].records[-1][0] + 1:
+        if run and unit.records[0][0] != run[-1].records[-1][0] + 1:
             flush()
         run.append(unit)
         index = next_index
@@ -351,9 +337,37 @@ def _range_receipt(start: int, end: int, units: Sequence[_ReceiptUnit]) -> Messa
     if kinds["assistant"]:
         count = kinds["assistant"]
         parts.append(f"{count} assistant {'note' if count == 1 else 'notes'}")
-    summary = ", ".join(parts)
+    users = [
+        " ".join(block.text.split())
+        for unit in units
+        if unit.kind == "user"
+        for _, message in unit.records
+        for block in message.content
+        if isinstance(block, TextContent) and block.text.strip()
+    ]
+    user_count = sum(unit.kind == "user" for unit in units)
     suffix = f"; recall_history seq_start={start}, seq_end={end} for exact content"
-    text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
+    if user_count:
+        excerpts = [
+            excerpt[:77] + "..." if len(excerpt) > 80 else excerpt for excerpt in users
+        ]
+        while excerpts:
+            user_summary = (
+                f"{user_count} user {'request' if user_count == 1 else 'requests'}: "
+                + "; ".join(excerpts)
+            )
+            summary = ", ".join([*parts, user_summary])
+            text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
+            if len(text) <= _RANGE_LIMIT:
+                break
+            excerpts.pop(0)
+        else:
+            label = "request" if user_count == 1 else "requests"
+            summary = ", ".join([*parts, f"{user_count} user {label}"])
+            text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
+    else:
+        summary = ", ".join(parts)
+        text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
     if len(text) > _RANGE_LIMIT:
         text = f"[evicted range] seq {start}-{end}: {len(units)} receipt items{suffix}"
     return Message(
