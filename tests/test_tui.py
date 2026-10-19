@@ -11102,6 +11102,56 @@ async def test_tui_setup_handles_corrupt_and_legacy_drafts(
 
 
 @pytest.mark.asyncio
+async def test_background_wake_retries_after_dispatch_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn([TextContent("response")])]),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    original = app.loop.notification_system_message
+    failed = False
+
+    def fail_once() -> Message | None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("too many open files")
+        return original()
+
+    monkeypatch.setattr(app.loop, "notification_system_message", fail_once)
+    app._submissions.wake()
+    for _ in range(100):
+        if app._submissions._consumer is None and failed:
+            break
+        await asyncio.sleep(0.01)
+    assert app._submissions._consumer is None
+    app._submissions.wake()
+    for _ in range(100):
+        if not app._submissions.active:
+            break
+        await asyncio.sleep(0.01)
+
+    assert failed
+    assert not app._submissions._notification_wake_requested
+    await app._submissions.close()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_background_wake_and_submission_share_one_provider_consumer(
     tmp_path: Path,
 ) -> None:

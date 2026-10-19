@@ -858,9 +858,10 @@ class SubmissionPipeline:
         while self._messages.empty():
             try:
                 self._dispatch_oldest_ready()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - retry on a later wake
                 self._host._print_system(f"submission failed: {exc}")
                 self._rollback_provider_dispatch()
+                return
             else:
                 return
 
