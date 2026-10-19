@@ -404,6 +404,30 @@ def test_store_replay_accepts_task_and_unknown_notification_kinds(
     assert len(reloaded.agent_notifications(pending_only=False)) == 3
 
 
+def test_child_question_notification_renders_question() -> None:
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.tui.render import render_agent_notification
+
+    rendered = render_agent_notification(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_question",
+                "child_instance_id": "root:208",
+                "question_id": "b2517c6f0fbb448e86dbb8b34fe0fbc0",
+                "question": "should we deploy this change?",
+                "description": "child question",
+                "status": "pending",
+                "text": "child root:208 asks: should we deploy this change?",
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert "should we deploy this change?" in rendered.plain
+    assert "unavailable" not in rendered.plain
+
+
 def test_tui_renders_task_exit_and_ignores_unknown_kind() -> None:
     # S7: the TUI renders task_exited receipts and tolerates unknown kinds
     # without ever rendering them as agent completions.
