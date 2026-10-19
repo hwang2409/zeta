@@ -32,16 +32,13 @@ def range_receipt_candidate(
     records: Sequence[tuple[int, Message]],
     *,
     allows: Callable[[int], bool],
-    is_smaller: Callable[
-        [Sequence[tuple[int, Message]], Sequence[Message]], bool
-    ],
+    is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
+    coarse: bool = False,
 ) -> RangeCandidate:
-    """Coalesce smaller maximal runs; existing ranges permanently break runs.
+    """Coalesce receipt exchanges, or globally fold eligible old records."""
 
-    A provider tool call and all its receipted results are one unit. This removes
-    the complete exchange or leaves it intact, so no provider sees an orphan.
-    Each run is accepted separately through the caller's shared size policy.
-    """
+    if coarse:
+        return _coarse_candidate(records, allows=allows, is_smaller=is_smaller)
 
     output: list[tuple[int, Message]] = []
     coalesced: set[int] = set()
@@ -75,6 +72,70 @@ def range_receipt_candidate(
         index = next_index
     flush()
     return RangeCandidate(output, frozenset(coalesced))
+
+
+def _coarse_candidate(
+    records: Sequence[tuple[int, Message]],
+    *,
+    allows: Callable[[int], bool],
+    is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
+) -> RangeCandidate:
+    units: list[_ReceiptUnit] = []
+    unit_indexes: set[int] = set()
+    index = 0
+    while index < len(records):
+        unit, next_index = _coarse_receipt_unit(records, index, allows)
+        if unit is not None:
+            units.append(unit)
+            unit_indexes.update(range(index, next_index))
+        index = next_index
+
+    if len(units) < 2 or not any(unit.kind != "user" for unit in units):
+        return RangeCandidate(list(records), frozenset())
+    flattened = [record for unit in units for record in unit.records]
+    start = min(_unit_start(unit) for unit in units)
+    end = max(_unit_end(unit) for unit in units)
+    receipt = _range_receipt(start, end, units, include_user_metadata=True)
+    if not is_smaller(flattened, [receipt]):
+        return RangeCandidate(list(records), frozenset())
+    output = [
+        record for index, record in enumerate(records) if index not in unit_indexes
+    ]
+    output.append((start, receipt))
+    output.sort(key=lambda record: record[0])
+    return RangeCandidate(
+        output,
+        frozenset(seq for seq, _ in flattened),
+    )
+
+
+def _unit_start(unit: _ReceiptUnit) -> int:
+    return min(seq for seq, _ in unit.records)
+
+
+def _unit_end(unit: _ReceiptUnit) -> int:
+    end = max(seq for seq, _ in unit.records)
+    for seq, message in unit.records:
+        if message.metadata.get("eviction_range"):
+            range_end = message.metadata.get("range_seq_end")
+            if type(range_end) is int:
+                end = max(end, range_end)
+    return end
+
+
+def _coarse_receipt_unit(
+    records: Sequence[tuple[int, Message]],
+    index: int,
+    allows: Callable[[int], bool],
+) -> tuple[_ReceiptUnit | None, int]:
+    seq, message = records[index]
+    if not allows(seq):
+        return None, index + 1
+    if message.role is MessageRole.USER:
+        return _ReceiptUnit((records[index],), "user"), index + 1
+    if message.metadata.get("eviction_range"):
+        return _ReceiptUnit((records[index],), "range"), index + 1
+    return _receipt_unit(records, index, allows)
 
 
 def _receipt_unit(
@@ -254,7 +315,13 @@ def _base_metadata(message: Message, *extra_owned: str) -> dict[str, object]:
     return {key: value for key, value in message.metadata.items() if key not in owned}
 
 
-def _range_receipt(start: int, end: int, units: Sequence[_ReceiptUnit]) -> Message:
+def _range_receipt(
+    start: int,
+    end: int,
+    units: Sequence[_ReceiptUnit],
+    *,
+    include_user_metadata: bool = False,
+) -> Message:
     kinds = Counter(unit.kind for unit in units)
     tools = Counter(name for unit in units for name in unit.tool_names)
     parts: list[str] = []
@@ -276,19 +343,66 @@ def _range_receipt(start: int, end: int, units: Sequence[_ReceiptUnit]) -> Messa
     if kinds["assistant"]:
         count = kinds["assistant"]
         parts.append(f"{count} assistant {'note' if count == 1 else 'notes'}")
-    summary = ", ".join(parts)
+    user_count = 0
+    users: list[str] = []
+    for unit in units:
+        if unit.kind == "user":
+            user_count += 1
+            users.extend(_user_excerpts(unit.records[0][1]))
+        elif unit.kind == "range":
+            message = unit.records[0][1]
+            count = message.metadata.get("user_count")
+            excerpts = message.metadata.get("user_excerpts")
+            if type(count) is int and count >= 0:
+                user_count += count
+            if isinstance(excerpts, list):
+                users.extend(
+                    excerpt for excerpt in excerpts if isinstance(excerpt, str)
+                )
     suffix = f"; recall_history seq_start={start}, seq_end={end} for exact content"
-    text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
+    if user_count:
+        excerpts = [
+            excerpt[:77] + "..." if len(excerpt) > 80 else excerpt for excerpt in users
+        ]
+        while excerpts:
+            user_summary = (
+                f"{user_count} user {'request' if user_count == 1 else 'requests'}: "
+                + "; ".join(excerpts)
+            )
+            summary = ", ".join([*parts, user_summary])
+            text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
+            if len(text) <= _RANGE_LIMIT:
+                break
+            excerpts.pop(0)
+        else:
+            label = "request" if user_count == 1 else "requests"
+            summary = ", ".join([*parts, f"{user_count} user {label}"])
+            text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
+    else:
+        summary = ", ".join(parts)
+        text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
     if len(text) > _RANGE_LIMIT:
         text = f"[evicted range] seq {start}-{end}: {len(units)} receipt items{suffix}"
-    return Message(
-        MessageRole.ASSISTANT,
-        [TextContent(text)],
-        metadata={
-            "context_evicted": True,
-            RECEIPT_KIND_METADATA: "range",
-            "eviction_range": True,
-            "source_seq": start,
-            "range_seq_end": end,
-        },
-    )
+    metadata = {
+        "context_evicted": True,
+        RECEIPT_KIND_METADATA: "range",
+        "eviction_range": True,
+        "source_seq": start,
+        "range_seq_end": end,
+    }
+    if include_user_metadata:
+        metadata.update(
+            user_count=user_count,
+            user_excerpts=excerpts if user_count else [],
+        )
+    return Message(MessageRole.ASSISTANT, [TextContent(text)], metadata=metadata)
+
+
+def _user_excerpts(message: Message) -> list[str]:
+    return [
+        excerpt[:77] + "..."
+        if len(excerpt := " ".join(block.text.split())) > 80
+        else excerpt
+        for block in message.content
+        if isinstance(block, TextContent) and block.text.strip()
+    ]

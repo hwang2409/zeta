@@ -293,7 +293,6 @@ def evict_messages(
         if running_total <= target_tokens:
             return _result(records, messages, changed, before, running_total, True)
 
-
     for index, (seq, _) in enumerate(records):
         message = messages[index]
         result = message.tool_result
@@ -343,6 +342,26 @@ def evict_messages(
             records = range_candidate.records
             messages = [message for _, message in records]
             changed.update(range_candidate.coalesced_source_seqs)
+            running_total = fixed_tokens + sum(map(token_counter, messages))
+
+    if source_messages is not None and running_total > target_tokens:
+        # The global fold is only a fallback after ordinary eviction remains over target.
+        from .range_receipts import range_receipt_candidate
+
+        records = list(zip((seq for seq, _ in records), messages, strict=True))
+        coarse_candidate = range_receipt_candidate(
+            records,
+            allows=eligibility.allows,
+            coarse=True,
+            is_smaller=lambda originals, candidates: _strictly_smaller(
+                sum(token_counter(message) for _, message in originals),
+                sum(map(token_counter, candidates)),
+            ),
+        )
+        if coarse_candidate.coalesced_source_seqs:
+            records = coarse_candidate.records
+            messages = [message for _, message in records]
+            changed.update(coarse_candidate.coalesced_source_seqs)
             running_total = fixed_tokens + sum(map(token_counter, messages))
 
     return _result(
@@ -453,9 +472,7 @@ def _evict_persisted_records(
             continue
         if can_regenerate(index):
             replacement = generated_by_seq[seq]
-            if _strictly_smaller(
-                token_counter(message), token_counter(replacement)
-            ):
+            if _strictly_smaller(token_counter(message), token_counter(replacement)):
                 output[index] = (seq, replacement)
                 regenerated.add(seq)
     return output, regenerated
@@ -580,9 +597,7 @@ def _eviction_eligibility(
     """Classify all records once so transformations cannot infer consumption."""
 
     protected = {
-        seq
-        for seq, message in records
-        if message.metadata.get("eviction_view_invalid")
+        seq for seq, message in records if message.metadata.get("eviction_view_invalid")
     }
     protected.update(unconsumed_source_seqs)
     unconsumed_result_ids = {
