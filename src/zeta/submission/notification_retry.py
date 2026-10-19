@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -137,6 +138,17 @@ class NotificationRetry:
     @staticmethod
     def _is_transient(failure: NotificationFailure) -> bool:
         error = failure.error
+        status_code = getattr(error, "status_code", None)
+        if (
+            status_code is not None
+            and 400 <= status_code < 500
+            and status_code not in {408, 409, 425, 429}
+        ):
+            return False
+        if isinstance(error, PermissionError) or (
+            isinstance(error, OSError) and error.errno in {errno.EACCES, errno.EPERM}
+        ):
+            return False
         notification_error = isinstance(error, ErrorInfo) and (
             error.code
             in {

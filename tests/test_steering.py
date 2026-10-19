@@ -36,6 +36,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.runtime.loop._completion import _error_info
 from zeta.skills import SkillCatalog
 from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.composer import build_key_bindings, parse_submission
@@ -412,6 +413,17 @@ async def _raise_notification_failure(error: BaseException, **_kwargs):
     raise error
 
 
+def _caused_by(error: BaseException, cause: BaseException) -> BaseException:
+    error.__cause__ = cause
+    return error
+
+
+def test_error_info_classifies_permission_error_in_cause_chain() -> None:
+    error = _caused_by(RuntimeError("backend failed"), PermissionError("denied"))
+
+    assert _error_info(error).code == "permission_error"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
@@ -420,8 +432,13 @@ async def _raise_notification_failure(error: BaseException, **_kwargs):
         ErrorInfo("http_error", "unauthorized", status_code=401),
         ErrorInfo("http_error", "forbidden", status_code=403),
         ErrorInfo("http_error", "not found", status_code=404),
+        ErrorInfo("stream_error", "bad stream request", status_code=400),
+        ErrorInfo("overloaded_error", "bad overload request", status_code=400),
         ErrorInfo("authentication_error", "authentication failed"),
         ErrorInfo("permission_error", "permission denied"),
+        PermissionError("permission denied"),
+        OSError(errno.EACCES, "permission denied"),
+        _caused_by(RuntimeError("backend failed"), PermissionError("permission denied")),
         ErrorInfo("max_turns", "maximum turns reached"),
         ErrorInfo("unknown_error", "unknown failure"),
         "refusal",
@@ -432,8 +449,13 @@ async def _raise_notification_failure(error: BaseException, **_kwargs):
         "401",
         "403",
         "404",
+        "stream-400",
+        "overloaded-400",
         "authentication",
-        "permission",
+        "permission-info",
+        "permission-raw",
+        "eacces",
+        "permission-cause",
         "max-turns",
         "unknown",
         "refusal",
@@ -483,6 +505,7 @@ async def test_permanent_notification_failure_is_not_retried(
         ErrorInfo("http_error", "unavailable", status_code=503),
         ErrorInfo("http_error", "server error", status_code=599),
         ErrorInfo("stream_error", "provider stream interrupted"),
+        ErrorInfo("stream_error", "provider stream interrupted", status_code=503),
         ErrorInfo("overloaded_error", "provider overloaded"),
         ErrorInfo("rate_limit_error", "provider rate limited"),
         ConnectionError("connection reset"),
@@ -497,6 +520,7 @@ async def test_permanent_notification_failure_is_not_retried(
         "503",
         "599",
         "stream-interruption",
+        "stream-503",
         "overloaded",
         "rate-limit",
         "connection-error",

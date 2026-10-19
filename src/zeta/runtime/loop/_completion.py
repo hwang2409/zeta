@@ -8,7 +8,8 @@ state or dispatched a tool.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+import errno
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -77,29 +78,42 @@ async def provider_events(
             await asyncio.gather(producer, return_exceptions=True)
 
 
+def _is_permission_error(error: BaseException) -> bool:
+    return isinstance(error, PermissionError) or (
+        isinstance(error, OSError) and error.errno in {errno.EACCES, errno.EPERM}
+    )
+
+
+def _exception_chain(error: BaseException) -> Iterator[BaseException]:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _classify_error(error: BaseException) -> str:
+    code = getattr(error, "code", None)
+    if type(code) is str and code:
+        return code
+
+    for current in _exception_chain(error):
+        if _is_permission_error(current):
+            return "permission_error"
+        if isinstance(current, TimeoutError):
+            return "timeout" if current is error else "transport_error"
+        if isinstance(current, (ConnectionError, httpx.TransportError)):
+            return "transport_error"
+        if isinstance(current, OSError):
+            return "os_error"
+    return "backend_error"
+
+
 def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
     """Normalize provider and transport failures for the transcript."""
 
-    code = getattr(error, "code", None)
-    if type(code) is not str or not code:
-        if isinstance(error, TimeoutError):
-            code = "timeout"
-        elif isinstance(error, (ConnectionError, httpx.TransportError)):
-            code = "transport_error"
-        elif isinstance(error, OSError):
-            code = "os_error"
-        else:
-            cause = error.__cause__
-            while cause is not None:
-                if isinstance(cause, (ConnectionError, TimeoutError, httpx.TransportError)):
-                    code = "transport_error"
-                    break
-                if isinstance(cause, OSError):
-                    code = "os_error"
-                    break
-                cause = cause.__cause__
-            else:
-                code = "backend_error"
+    code = _classify_error(error)
     try:
         message = str(error).strip()
     except Exception:  # noqa: BLE001 - malformed exception text is recoverable
