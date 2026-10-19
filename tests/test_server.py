@@ -259,6 +259,47 @@ class BlockingThenCaptureBackend:
         )
 
 
+class DelegatedApprovalBackend:
+    def __init__(
+        self,
+        parent_call: ToolCall,
+        child_call: ToolCall,
+        *,
+        child_prompt: str,
+    ) -> None:
+        self.parent = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=[parent_call]),
+                ScriptedTurn([TextContent("done")]),
+            ]
+        )
+        self.child = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=[child_call]),
+                ScriptedTurn([TextContent("done")]),
+            ]
+        )
+        self.child_prompt = child_prompt
+        self.child_started = asyncio.Event()
+
+    async def complete(self, messages, tool_schemas):
+        is_child = any(
+            message.role is MessageRole.USER
+            and any(
+                isinstance(block, TextContent) and block.text == self.child_prompt
+                for block in message.content
+            )
+            for message in messages
+        )
+        backend = self.child if is_child else self.parent
+        if is_child:
+            self.child_started.set()
+        elif self.parent.calls:
+            await self.child_started.wait()
+        async for event in backend.complete(messages, tool_schemas):
+            yield event
+
+
 class BackgroundChildAndForegroundToolBackend:
     def __init__(self, command: str) -> None:
         self.command = command
@@ -656,9 +697,7 @@ async def test_status_pending_delegated_identity_matches_event(tmp_path: Path) -
         {"prompt": "read", "description": "child", "background": True},
     )
     child_call = ToolCall("child-call", "read", {"path": str(target)})
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[agent]), ScriptedTurn(tool_calls=[child_call])]
-    )
+    backend = DelegatedApprovalBackend(agent, child_call, child_prompt="read")
     server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
@@ -2117,13 +2156,10 @@ async def test_delegated_approval_stream_carries_captured_execution_facts(
         "agent",
         {"prompt": "run child tool", "description": "child", "background": True},
     )
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[parent_call]),
-            ScriptedTurn(tool_calls=[child_call]),
-            ScriptedTurn([TextContent("done")]),
-            ScriptedTurn([TextContent("done")]),
-        ]
+    backend = DelegatedApprovalBackend(
+        parent_call,
+        child_call,
+        child_prompt="run child tool",
     )
     server = ZetaServer(provider="codex",
         home=tmp_path / "home",
