@@ -529,6 +529,113 @@ def resolve_child_backend(
     return backend, None
 
 
+async def _build_child_loop(
+    loop: AgentLoop, *, child_backend: CompletionBackend, child_store: ConversationStore,
+    child_instance_id: str, child_depth: int, preset: AgentPreset, model: object,
+    cwd_override: Path | None, follow_up_loop: bool, description: str,
+) -> tuple[AgentLoop, ChildApprovalPolicy | None]:
+    child_registry: ToolRegistry | None = None
+    child_policy: ChildApprovalPolicy | None = None
+    try:
+        excluded_names = {"inbox", "request_attention", "resolve_attention"}
+        if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation:
+            excluded_names.add("agent")
+        if preset.tool_names is not None:
+            allowed_names = set(preset.tool_names)
+            if preset.source == "packaged" and child_depth < MAX_AGENT_DEPTH:
+                allowed_names.add("agent")
+            excluded_names.update(
+                set(loop.tool_registry.definitions_by_name) - allowed_names
+            )
+        child_provider = getattr(child_backend, "provider", None)
+        child_image_policy = (
+            image_policy_for_provider(child_provider)
+            if isinstance(child_provider, str)
+            else loop.tool_registry.image_policy
+        )
+        child_registry = loop.tool_registry.clone_for_session(
+            child_store,
+            exclude_names=excluded_names,
+            cwd=cwd_override,
+            image_policy=child_image_policy,
+        )
+        loop._background_owner.store_leases.callback(
+            child_registry.background_tasks.release_directory
+        )
+        if follow_up_loop:
+            register_ask_parent(
+                child_registry,
+                channel=loop._background_owner.conversation_channel,
+                child_instance_id=child_instance_id,
+            )
+        parent_policy = loop.tool_registry.approval_policy
+        if parent_policy is not None:
+            child_policy = ChildApprovalPolicy(
+                parent_policy,
+                child_store,
+                description,
+                child_instance_id,
+                parent_cwd=loop.tool_registry.cwd,
+                child_cwd=child_registry.cwd,
+            )
+            child_registry.set_approval_policy(child_policy)
+        from ..runtime.loop import AgentLoop
+        child_model = getattr(child_backend, "model", None)
+        if type(child_model) is not str or not child_model:
+            child_model = model if type(model) is str and model else "unknown"
+        child_budget = loop.context_assembler.token_budget
+        if isinstance(child_provider, str):
+            child_budget = effective_budget_for_model(
+                child_provider, child_model, child_budget
+            )
+        def record_child_usage(usage: Mapping[str, Any]) -> None:
+            loop.context_assembler.record_descendant_usage(
+                {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
+            )
+        child_loop = AgentLoop(
+            child_backend,
+            child_store,
+            registry=child_registry,
+            skill_catalog=child_registry.skill_catalog,
+            max_turns=None,
+            token_budget=child_budget,
+            retained_tail=loop.context_assembler.retained_tail,
+            system_prompt=_compose_child_system_prompt(
+                await asyncio.to_thread(
+                    _child_base_system_prompt, loop, cwd_override, child_registry
+                ),
+                preset,
+            ),
+            agent_catalog=child_registry.agent_catalog,
+            skip_mcp_mount=True,
+            agent_depth=child_depth,
+            agent_instance_id=child_instance_id,
+            root_project_id=loop.root_project_id,
+            root_session_dir=loop.root_session_dir,
+            project_registry=loop.project_registry,
+            background_owner=loop._background_owner,
+            usage_sink=record_child_usage,
+        )
+        child_loop.one_shot = getattr(loop, "one_shot", False)
+        loop._background_owner.conversation_channel.register_loop(child_instance_id)
+        if loop.plan_mode:
+            child_loop.set_plan_mode(True)
+        child_loop.set_background_event_sink(loop._publish_background_event)
+        return child_loop, child_policy
+    except asyncio.CancelledError:
+        if child_registry is not None:
+            cleanup = asyncio.create_task(child_registry.close())
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await asyncio.shield(cleanup)
+        raise
+    except BaseException:
+        if child_registry is not None:
+            await child_registry.close()
+        raise
+
+
 async def run_agent_tool(
     loop: AgentLoop,
     tool_call: ToolCall,
@@ -731,7 +838,7 @@ async def run_agent_tool(
         description=description,
         cwd=child_cwd,
     )
-    child_registry = None
+    child_policy: ChildApprovalPolicy | None = None
     try:
         loop._agent_child_stores[tool_call.id] = child_store
         loop._agent_child_turns[tool_call.id] = 0
@@ -741,105 +848,22 @@ async def run_agent_tool(
             publisher.set_metadata(
                 {"child_session_path": child_path, "depth": child_depth}
             )
-        # Project inboxes belong to peer top-level sessions. Children report
-        # through their parent instead of claiming or completing project work.
-        excluded_names = {"inbox", "request_attention", "resolve_attention"}
-        if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation:
-            excluded_names.add("agent")
-        if preset.tool_names is not None:
-            allowed_names = set(preset.tool_names)
-            if preset.source == "packaged" and child_depth < MAX_AGENT_DEPTH:
-                allowed_names.add("agent")
-            excluded_names.update(
-                set(loop.tool_registry.definitions_by_name) - allowed_names
-            )
-        child_provider = getattr(child_backend, "provider", None)
-        child_image_policy = (
-            image_policy_for_provider(child_provider)
-            if isinstance(child_provider, str)
-            else loop.tool_registry.image_policy
+        child_loop, child_policy = await _build_child_loop(
+            loop,
+            child_backend=child_backend,
+            child_store=child_store,
+            child_instance_id=child_instance_id,
+            child_depth=child_depth,
+            preset=preset,
+            model=model,
+            cwd_override=cwd_override,
+            follow_up_loop=follow_up_loop,
+            description=description,
         )
-        child_registry = loop.tool_registry.clone_for_session(
-            child_store,
-            exclude_names=excluded_names,
-            cwd=cwd_override,
-            image_policy=child_image_policy,
-        )
-        loop._background_owner.store_leases.callback(
-            child_registry.background_tasks.release_directory
-        )
-        if follow_up_loop:
-            register_ask_parent(
-                child_registry,
-                channel=loop._background_owner.conversation_channel,
-                child_instance_id=child_instance_id,
-            )
-        parent_policy = loop.tool_registry.approval_policy
-        child_policy: ChildApprovalPolicy | None = None
-        if parent_policy is not None:
-            child_policy = ChildApprovalPolicy(
-                parent_policy,
-                child_store,
-                description,
-                child_instance_id,
-                parent_cwd=loop.tool_registry.cwd,
-                child_cwd=child_registry.cwd,
-            )
-            child_registry.set_approval_policy(child_policy)
-        from ..runtime.loop import AgentLoop
-
-        child_model = getattr(child_backend, "model", None)
-        if type(child_model) is not str or not child_model:
-            child_model = model if type(model) is str and model else "unknown"
-        child_budget = loop.context_assembler.token_budget
-        if isinstance(child_provider, str):
-            child_budget = effective_budget_for_model(
-                child_provider, child_model, child_budget
-            )
-
-        def record_child_usage(usage: Mapping[str, Any]) -> None:
-            loop.context_assembler.record_descendant_usage(
-                {
-                    **usage,
-                    "_zeta_model": usage.get("_zeta_model", child_model),
-                }
-            )
-
-        child_loop = AgentLoop(
-            child_backend,
-            child_store,
-            registry=child_registry,
-            skill_catalog=child_registry.skill_catalog,
-            max_turns=None,
-            token_budget=child_budget,
-            retained_tail=loop.context_assembler.retained_tail,
-            system_prompt=_compose_child_system_prompt(
-                await asyncio.to_thread(
-                    _child_base_system_prompt, loop, cwd_override, child_registry
-                ),
-                preset,
-            ),
-            agent_catalog=child_registry.agent_catalog,
-            skip_mcp_mount=True,
-            agent_depth=child_depth,
-            agent_instance_id=child_instance_id,
-            root_project_id=loop.root_project_id,
-            root_session_dir=loop.root_session_dir,
-            project_registry=loop.project_registry,
-            background_owner=loop._background_owner,
-            usage_sink=record_child_usage,
-        )
-        child_loop.one_shot = getattr(loop, "one_shot", False)
-        loop._background_owner.conversation_channel.register_loop(child_instance_id)
-        if loop.plan_mode:
-            child_loop.set_plan_mode(True)
-        child_loop.set_background_event_sink(loop._publish_background_event)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - setup failures become receipts
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
-        if child_registry is not None:
-            child_registry.background_tasks.release_directory()
         failure_text = f"agent error: {error_message(exc)}"
         child_store.finish_agent_lifecycle(
             "failed",

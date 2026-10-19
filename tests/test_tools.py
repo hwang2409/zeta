@@ -60,6 +60,30 @@ async def _collect_loop(loop: AgentLoop) -> list[object]:
 
 
 @pytest.mark.asyncio
+async def test_clone_for_session_close_releases_cwd_descriptor(tmp_path: Path) -> None:
+    parent = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    store = ConversationStore(tmp_path / "session")
+    baseline = len(os.listdir("/dev/fd"))
+    clones = [
+        parent.clone_for_session(store),
+        parent.clone_for_session(store, cwd=tmp_path),
+    ]
+
+    assert len(os.listdir("/dev/fd")) >= baseline + len(clones)
+    for clone in clones:
+        await clone.close()
+    assert len(os.listdir("/dev/fd")) == baseline
+
+    await parent.close()
+    await parent.close()
+    with pytest.raises(RuntimeError, match="closed tool registry"):
+        parent.clone_for_session(store)
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_registry_validates_arguments_before_running_handler(tmp_path: Path) -> None:
     called = False
 

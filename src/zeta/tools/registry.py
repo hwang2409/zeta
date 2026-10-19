@@ -654,6 +654,8 @@ class ToolRegistry:
         cwd: str | Path | None = None,
         image_policy: ImagePolicy | None = None,
     ) -> ToolRegistry:
+        if self._cwd_fd is None:
+            raise RuntimeError("cannot clone a closed tool registry")
         clone = copy.copy(self)
         if image_policy is not None:
             clone.image_policy = image_policy
@@ -789,6 +791,11 @@ class ToolRegistry:
                 killed = await self.background_tasks.close()
             finally:
                 self.spills.close()
+                cwd_fd = self._cwd_fd
+                self._cwd_fd = None
+                if cwd_fd is not None:
+                    self._cwd_finalizer.detach()
+                    os.close(cwd_fd)
                 self._closed = True
                 # Closing is a lifecycle boundary: detach from every MCP owner so a
                 # later reconnect cannot republish stale definitions into this

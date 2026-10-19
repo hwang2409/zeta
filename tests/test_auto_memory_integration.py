@@ -198,10 +198,7 @@ async def test_composed_runtime_reconciles_real_persisted_trigger_and_notices(
             second.seq,
         ]
         assert len(memory_backend.prompts) == 2
-        assert notices == [
-            "memory updated: decisions.md (+1)",
-            "memory updated: decisions.md (+1)",
-        ]
+        assert notices == []
     finally:
         await composition.loop.close()
 
@@ -218,13 +215,13 @@ async def test_serve_memory_event_requires_negotiated_feature() -> None:
         events.append((event, session_id, fields))
 
     client._notify = notify
-    client._publish_memory_notice("session", "memory updated: decisions.md (+1)")
+    client._publish_memory_notice("session", "memory update failed: validation error")
     await asyncio.sleep(0)
     assert events == [
         (
             "memory_updated",
             "session",
-            {"message": "memory updated: decisions.md (+1)"},
+            {"message": "memory update failed: validation error"},
         )
     ]
 

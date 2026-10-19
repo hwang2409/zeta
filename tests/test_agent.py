@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import shlex
 import sys
@@ -2774,8 +2775,10 @@ async def test_parallel_nested_lifecycle_events_survive_large_batch(
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
     )
+    baseline_fds = len(os.listdir("/dev/fd"))
 
     events = await asyncio.wait_for(_collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=30)
+    assert len(os.listdir("/dev/fd")) <= baseline_fds + 5
 
     read_lifecycle = [
         event
@@ -4756,6 +4759,95 @@ async def test_resume_reuses_exact_foreground_terminal_receipt(
     ]
     assert len(recovered) == 1
     assert recovered[0].content == original_receipts[0]
+
+
+@pytest.mark.asyncio
+async def test_child_setup_failure_closes_registry_cwd_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=[_agent_call()])]),
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    original_clone = registry.clone_for_session
+    clone_fds: list[int] = []
+    cwd_fds: list[int] = []
+    retained: list[ToolRegistry] = []
+
+    def capture_clone(*args: object, **kwargs: object) -> ToolRegistry:
+        child = original_clone(*args, **kwargs)
+        retained.append(child)
+        cwd_fds.append(child._cwd_fd)
+        clone_fds.append(len(os.listdir("/dev/fd")))
+        return child
+
+    monkeypatch.setattr(registry, "clone_for_session", capture_clone)
+    original_init = agent_loop_module.AgentLoop.__init__
+
+    def fail_child_init(self, *args: object, **kwargs: object) -> None:
+        if self is not loop:
+            raise RuntimeError("child setup failed")
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(agent_loop_module.AgentLoop, "__init__", fail_child_init)
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    assert clone_fds
+    with pytest.raises(OSError):
+        os.fstat(cwd_fds[0])
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_setup_cancellation_closes_registry_cwd_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=[_agent_call()])]),
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original_prompt = agent_runner_module._child_base_system_prompt
+
+    def block_prompt(*args: object, **kwargs: object) -> str | Message:
+        entered.set()
+        release.wait(5)
+        return original_prompt(*args, **kwargs)
+
+    monkeypatch.setattr(agent_runner_module, "_child_base_system_prompt", block_prompt)
+    original_clone = registry.clone_for_session
+    clone_fds: list[int] = []
+    cwd_fds: list[int] = []
+    retained: list[ToolRegistry] = []
+
+    def capture_clone(*args: object, **kwargs: object) -> ToolRegistry:
+        child = original_clone(*args, **kwargs)
+        retained.append(child)
+        cwd_fds.append(child._cwd_fd)
+        clone_fds.append(len(os.listdir("/dev/fd")))
+        return child
+
+    monkeypatch.setattr(registry, "clone_for_session", capture_clone)
+    task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
+    await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert clone_fds
+    with pytest.raises(OSError):
+        os.fstat(cwd_fds[0])
+    await loop.close()
 
 
 @pytest.mark.asyncio
