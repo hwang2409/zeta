@@ -275,34 +275,41 @@ class TUIStallWatchdog:
         }
 
     def _append_record(self, record: dict[str, Any]) -> None:
-        encoded = _encode_bounded_record(record, self.max_bytes)
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
-        lock_path = self.path.with_suffix(".lock")
-        with lock_path.open("a+b") as lock:
-            os.chmod(lock_path, 0o600)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        _append_bounded_record(self.path, _encode_bounded_record(record, self.max_bytes), self.max_bytes)
+
+
+def write_tui_diagnostic(
+    path: Path, record: dict[str, Any], *, max_bytes: int = STALL_LOG_MAX_BYTES
+) -> None:
+    """Append one bounded TUI diagnostic without affecting normal operation."""
+
+    try:
+        _append_bounded_record(path, _encode_bounded_record(record, max_bytes), max_bytes)
+    except Exception:  # noqa: BLE001 - diagnostics must never affect the TUI
+        return
+
+
+def _append_bounded_record(path: Path, encoded: bytes, max_bytes: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    lock_path = path.with_suffix(".lock")
+    with lock_path.open("a+b") as lock:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            if path.exists() and path.stat().st_size + len(encoded) > max_bytes:
+                rotated = path.with_name(f"{path.name}.1")
+                rotated.unlink(missing_ok=True)
+                path.replace(rotated)
+            fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
             try:
-                if (
-                    self.path.exists()
-                    and self.path.stat().st_size + len(encoded) > self.max_bytes
-                ):
-                    rotated = self.path.with_name(f"{self.path.name}.1")
-                    rotated.unlink(missing_ok=True)
-                    self.path.replace(rotated)
-                fd = os.open(
-                    self.path,
-                    os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-                    0o600,
-                )
-                try:
-                    if os.write(fd, encoded) != len(encoded):
-                        raise OSError("incomplete TUI stall diagnostic write")
-                finally:
-                    os.close(fd)
-                os.chmod(self.path, 0o600)
+                if os.write(fd, encoded) != len(encoded):
+                    raise OSError("incomplete TUI diagnostic write")
             finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                os.close(fd)
+            os.chmod(path, 0o600)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _encode_bounded_record(record: dict[str, Any], max_bytes: int) -> bytes:
@@ -454,4 +461,4 @@ def start_tui_stall_watchdog(
         return None
 
 
-__all__ = ["TUIStallWatchdog", "start_tui_stall_watchdog"]
+__all__ = ["TUIStallWatchdog", "start_tui_stall_watchdog", "write_tui_diagnostic"]

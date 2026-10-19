@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import errno
+import fcntl
 import json
 import os
 import pty
@@ -40,6 +42,7 @@ from prompt_toolkit.layout.screen import Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
+from prompt_toolkit.patch_stdout import patch_stdout
 from rich.cells import cell_len
 from rich.console import Console
 from rich.panel import Panel
@@ -53,6 +56,7 @@ from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
+from zeta.diagnostics import tui_stalls as tui_stalls_module
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.providers.anthropic import (
     AnthropicBackend,
@@ -10637,6 +10641,139 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
         release.set()
         for reused_fd in reused_fds:
             os.close(reused_fd)
+
+
+@pytest.mark.asyncio
+async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY)
+    persistence = DraftPersistence(
+        tmp_path / "draft", directory_fd=directory_fd, delay=0,
+    )
+    original_dup = persistence_module.os.dup
+    fail_dup = True
+
+    def dup(fd: int) -> int:
+        if fail_dup and fd == directory_fd:
+            raise OSError(errno.EMFILE, "Too many open files")
+        return original_dup(fd)
+
+    monkeypatch.setattr(persistence_module.os, "dup", dup)
+    loop = asyncio.get_running_loop()
+    exceptions: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, context: exceptions.append(context))
+    try:
+        persistence.schedule("first")
+        await asyncio.sleep(0)
+        await persistence.flush_pending()
+        fail_dup = False
+        await persistence.flush_pending()
+    finally:
+        os.close(directory_fd)
+        await persistence.shutdown_pending()
+
+    assert exceptions == []
+    assert caplog.messages.count(
+        "failed to persist composer draft: [Errno 24] Too many open files"
+    ) == 1
+    assert DraftPersistence(tmp_path / "draft").load() == "first"
+
+
+@pytest.mark.asyncio
+async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, session = _agent_list_session(tmp_path, 0)
+    zeta_home = tmp_path / "zeta-home"
+    log_path = zeta_home / "logs" / "tui-errors.jsonl"
+    lock_path = log_path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True)
+    lock = lock_path.open("a+b")
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    monkeypatch.setenv("ZETA_HOME", str(zeta_home))
+
+    async def run_async(**_kwargs: object) -> None:
+        async def fail() -> None:
+            raise RuntimeError("background failed")
+
+        asyncio.create_task(fail())
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(session.app, "run_async", run_async)
+    try:
+        started = time.monotonic()
+        with patch_stdout(raw=True):
+            await app._run_full_screen(session)
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.1
+        assert any("background failed" in line for line in app._transcript_lines)
+        assert not log_path.exists()
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not log_path.exists():
+        await asyncio.sleep(0.01)
+    records = log_path.read_text().splitlines()
+    assert len(records) == 1
+    assert "background failed" in json.loads(records[0])["traceback"]
+
+
+@pytest.mark.asyncio
+async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, session = _agent_list_session(tmp_path, 0)
+    terminal_calls: list[str] = []
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
+    monkeypatch.setattr(
+        "prompt_toolkit.application.run_in_terminal",
+        lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
+    )
+    monkeypatch.setattr(
+        "prompt_toolkit.application.in_terminal",
+        lambda: terminal_calls.append("in_terminal"),
+    )
+    monkeypatch.setattr(
+        "prompt_toolkit.patch_stdout.run_in_terminal",
+        lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
+    )
+
+    async def run_async(**_kwargs: object) -> None:
+        async def fail() -> None:
+            raise RuntimeError("background failed")
+
+        asyncio.create_task(fail())
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(session.app, "run_async", run_async)
+    with patch_stdout(raw=True):
+        await app._run_full_screen(session)
+
+    assert any("background failed" in line for line in app._transcript_lines)
+    assert "jsonl" in "\n".join(app._transcript_lines)
+    assert terminal_calls == []
+    log_path = tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl"
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not log_path.exists():
+        await asyncio.sleep(0.01)
+    records = log_path.read_text().splitlines()
+    assert len(records) == 1
+    assert "background failed" in json.loads(records[0])["traceback"]
+
+
+def test_tui_diagnostic_write_ignores_fd_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_open(*_args: object, **_kwargs: object) -> int:
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(tui_stalls_module.os, "open", fail_open)
+    tui_stalls_module.write_tui_diagnostic(
+        tmp_path / "logs" / "tui-errors.jsonl", {"traceback": "failure"}
+    )
 
 
 @pytest.mark.asyncio

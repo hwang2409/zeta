@@ -447,8 +447,7 @@ class DraftPersistence:
         self._pending_next_image_token = 1
         if text is None:
             return
-        self._persisted_revision = revision
-        self._submit(
+        submitted = self._submit(
             lambda directory_fd: self._persist(
                 text,
                 attachment_tokens=attachment_tokens,
@@ -456,9 +455,20 @@ class DraftPersistence:
                 directory_fd=directory_fd,
             )
         )
+        if submitted:
+            self._persisted_revision = revision
+        else:
+            self._pending_text = text
+            self._pending_revision = revision
+            self._pending_attachment_tokens = attachment_tokens
+            self._pending_next_image_token = next_image_token
 
-    def _submit(self, action: Callable[[int | None], None]) -> None:
-        owned_fd = os.dup(self.directory_fd) if self.directory_fd is not None else None
+    def _submit(self, action: Callable[[int | None], None]) -> bool:
+        try:
+            owned_fd = os.dup(self.directory_fd) if self.directory_fd is not None else None
+        except OSError as exc:
+            self._writer._report_failure(exc)
+            return False
 
         def run() -> None:
             try:
@@ -473,6 +483,7 @@ class DraftPersistence:
             if owned_fd is not None:
                 os.close(owned_fd)
             raise
+        return True
 
     def _persist(
         self,

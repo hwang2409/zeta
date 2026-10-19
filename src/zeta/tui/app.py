@@ -82,6 +82,7 @@ from .layout import (
     full_screen_content,
     status_toolbar,
 )
+from .loop_errors import run_prompt_toolkit
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
@@ -1028,12 +1029,8 @@ class TUIApp(
             return None
         return value
 
-    async def _run_full_screen(
-        self,
-        session: FullScreenPromptSession,
-        prompt_task: asyncio.Task[object] | None = None,
-    ) -> None:
-        prompt_task = prompt_task or asyncio.create_task(session.app.run_async())
+    async def _run_full_screen(self, session: FullScreenPromptSession, prompt_task: asyncio.Task[object] | None = None) -> None:
+        prompt_task = prompt_task or asyncio.create_task(run_prompt_toolkit(session, self))
         self._input_loop_active = True
         try:
             while not self._exit_requested:
@@ -1137,7 +1134,7 @@ class TUIApp(
             prompt_task: asyncio.Task[object] | None = None
             if isinstance(session, FullScreenPromptSession):
                 self._install_full_screen_layout(session)
-                prompt_task = asyncio.create_task(session.app.run_async())
+                prompt_task = asyncio.create_task(run_prompt_toolkit(session, self))
             try:
                 startup_task = asyncio.create_task(self._prepare_prompt(resume_ui=resume_ui))
                 try:
