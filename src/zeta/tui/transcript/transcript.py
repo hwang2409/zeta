@@ -31,6 +31,7 @@ from ..agent_card import AgentCard
 from ..cards.agent_sync import refresh_agent_cards
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
+from ..user import mark_band, mark_bands
 from .streaming_text import StreamingText
 from .transcript_finder import TranscriptFinderMixin
 from .transcript_virtual import TranscriptVirtualMixin
@@ -689,7 +690,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             rendered_units.append(self._render_unit(unit, width))
         value = "\n".join(rendered_units).rstrip("\n")
         lines = value.splitlines()
-        while lines and not Text.from_ansi(lines[0]).plain.strip():
+        # Trim rows with no cells; a sent-message band's filled top row stays.
+        while lines and not Text.from_ansi(lines[0]).plain:
             lines.pop(0)
         lines = self._limit_lines(
             lines,
@@ -751,7 +753,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             if len(updated) != 1:
                 self._parsed_cache.clear()
                 return
-            parsed[line] = updated[0]
+            location = self._locations(self._content_width)[line : line + 1]
+            parsed[line] = mark_bands(updated, location, self._user_units)[0]
 
     def next_search_match(self) -> bool:
         matches = self._search_matches()
@@ -915,6 +918,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         lines = (
             list(split_lines(to_formatted_text(ANSI(rendered)))) if rendered else [[]]
         )
+        if unit in self._user_units:
+            lines = [mark_band(line) for line in lines]
         self._unit_lines_cache[unit.key] = (rendered, lines)
         return lines
 
@@ -923,7 +928,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     ) -> list[list[tuple[str, str]]]:
         while lines and not lines[-1]:
             lines.pop()
-        while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
+        while lines and not "".join(fragment[1] for fragment in lines[0]):
             lines.pop(0)
         return self._limit_lines(
             lines or [[]],
@@ -951,6 +956,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             # Search highlights restyle matched lines across the whole render.
             fragments = to_formatted_text(ANSI(self.render(width)))
             lines = list(split_lines(fragments)) or [[]]
+            lines = mark_bands(lines, self._locations(width), self._user_units)
         else:
             lines = self._assembled_lines(width)
         self._parsed_cache[width] = lines
@@ -1021,7 +1027,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             raw_lines.extend(
                 (line, unit, offset) for line, offset in zip(rendered_lines, offsets)
             )
-        while raw_lines and not raw_lines[0][0].strip():
+        while raw_lines and not raw_lines[0][0]:
             raw_lines.pop(0)
         raw_lines = self._limit_lines(
             raw_lines,

@@ -766,7 +766,7 @@ class TranscriptVirtualMixin:
                 reached_start = False
                 break
         if reached_start:
-            while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
+            while lines and not "".join(fragment[1] for fragment in lines[0]):
                 lines.pop(0)
         return lines[-height:] or [[]]
 
@@ -864,7 +864,7 @@ class TranscriptVirtualMixin:
         selection = local.resolve(keyed)
         leading = 0
         if first == 0:
-            while raw_lines and not raw_lines[0][0].strip():
+            while raw_lines and not raw_lines[0][0]:
                 raw_lines.pop(0)
                 leading += 1
         if last == len(self._units) - 1:

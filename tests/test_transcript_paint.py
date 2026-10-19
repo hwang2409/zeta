@@ -25,6 +25,7 @@ from zeta.tui.transcript import (
     _ToolUnit,
     _TranscriptUnit,
 )
+from zeta.tui.user import mark_bands
 
 MARKDOWN = (
     "## Answer\n\nSome **bold** text and `code` here.\n\n"
@@ -113,6 +114,8 @@ def test_assembled_lines_match_the_whole_string_parse() -> None:
 
     for width in (40, 72, 120):
         expected = list(split_lines(to_formatted_text(ANSI(transcript.render(width))))) or [[]]
+        # The whole-string (search) path tags user rows from locations.
+        expected = mark_bands(expected, transcript._locations(width), transcript._user_units)
         assert _without_empty_fragments(transcript._parsed_lines(width)) == (
             _without_empty_fragments(expected)
         )

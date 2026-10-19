@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.enums import DEFAULT_BUFFER
 from prompt_toolkit.filters import Condition, has_focus
+from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.layout import Dimension
 from prompt_toolkit.layout.containers import (
     AnyContainer,
@@ -20,18 +21,21 @@ from prompt_toolkit.layout.containers import (
     Window,
     to_container,
 )
+from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.menus import CompletionsMenu, MultiColumnCompletionsMenu
 from prompt_toolkit.layout.mouse_handlers import MouseHandler, MouseHandlers
-from prompt_toolkit.layout.screen import Screen, WritePosition
+from prompt_toolkit.layout.screen import Char, Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from rich.cells import cell_len
 from ..core.session import _preview_text
 from ..core.slash import context_window
 from ..core.store import ConversationStore
+from . import theme
 from .agent_card import AgentNavigation
 from .composer import status_formatted_text, vim_state_label
 from .render import format_status
 from .todo import TODO_PAD_BOTTOM, VISIBLE_ROWS, TodoWidget
+from .user import USER_BAND_CLASS
 
 
 CONTENT_MARGIN = 2
@@ -41,6 +45,7 @@ COMMAND_MENU_ROWS = 12
 MAX_CHROME_ROWS = 18
 STATUS_CARD_MAX_WIDTH = 72
 STATUS_CARD_MARGIN = 2
+QUEUED_VISIBLE_ROWS = 3
 
 
 def detach_completion_menus(container: Container) -> None:
@@ -185,6 +190,91 @@ class ComposerPadding(Container):
 
     def get_children(self) -> list[Container]:
         return [self.content]
+
+
+class TranscriptMargins(VSplit):
+    """Transcript between side margins; sent-message bands bleed into them.
+
+    A sent message is a full-width band like the composer. Rich only sees the
+    content width, so after painting, rows the transcript tagged with
+    ``USER_BAND_CLASS`` are extended across the margins in their edge style.
+    Untagged rows, tool cards included, keep their inset whatever their colour.
+    """
+
+    def write_to_screen(
+        self,
+        screen: Screen,
+        mouse_handlers: MouseHandlers,
+        write_position: WritePosition,
+        parent_style: str,
+        erase_bg: bool,
+        z_index: int | None,
+    ) -> None:
+        super().write_to_screen(
+            screen, mouse_handlers, write_position, parent_style, erase_bg, z_index
+        )
+        start = write_position.xpos
+        end = start + write_position.width
+        left, right = start + CONTENT_MARGIN, end - CONTENT_MARGIN - 1
+        if right < left:
+            return
+        for y in range(write_position.ypos, write_position.ypos + write_position.height):
+            row = screen.data_buffer[y]
+            if USER_BAND_CLASS in row[left].style and USER_BAND_CLASS in row[right].style:
+                left_margin, right_margin = Char(" ", row[left].style), Char(" ", row[right].style)
+                for x in range(start, left):
+                    row[x] = left_margin
+                for x in range(right + 1, end):
+                    row[x] = right_margin
+
+
+class QueuedPanel(NamedTuple):
+    """Queued messages of the viewed session, plus the main queue size in a child view."""
+
+    label: str
+    messages: Sequence[str]
+    main_waiting: int = 0
+
+
+def queued_panel(
+    navigation: AgentNavigation | None, main: Sequence[str]
+) -> QueuedPanel:
+    """The viewed session's queue; a child view also counts the main queue."""
+
+    child = navigation.child_queued_messages() if navigation is not None else None
+    if child is None:
+        return QueuedPanel("main", main)
+    label, messages = child
+    return QueuedPanel(label, messages, len(main))
+
+
+def queued_lines(panel: QueuedPanel, terminal_width: int) -> StyleAndTextTuples:
+    """Describe messages that are submitted but not yet sent, one row each."""
+
+    indent = " " * CONTENT_MARGIN
+    messages = panel.messages
+    fragments: StyleAndTextTuples = []
+    if messages:
+        fragments.append(
+            (f"fg:{theme.CHROME}", f"{indent}queued · {panel.label} · {len(messages)}")
+        )
+    width = max(1, content_width(terminal_width) - 2)
+    for message in messages[:QUEUED_VISIBLE_ROWS]:
+        fragments += [
+            ("", "\n"),
+            (f"fg:{theme.CHROME}", f"{indent}› "),
+            (f"fg:{theme.DIM}", _preview_text(message, limit=width)),
+        ]
+    hidden = len(messages) - QUEUED_VISIBLE_ROWS
+    if hidden > 0:
+        fragments += [("", "\n"), (f"fg:{theme.CHROME}", f"{indent}  +{hidden} more")]
+    if panel.main_waiting:
+        if fragments:
+            fragments.append(("", "\n"))
+        fragments.append(
+            (f"fg:{theme.CHROME}", f"{indent}main · {panel.main_waiting} queued")
+        )
+    return fragments
 
 
 def command_menu_float(chrome_height: Callable[[], int]) -> Float:
@@ -465,6 +555,7 @@ def full_screen_content(
     decisions_active: Callable[[], bool] | None = None,
     finder_window: AnyContainer | None = None,
     finder_active: Callable[[], bool] | None = None,
+    queued_messages: Callable[[], Sequence[str]] = tuple,
 ) -> FloatContainer:
     """Transcript over composer chrome, with the command menu floating above it."""
 
@@ -515,7 +606,21 @@ def full_screen_content(
     padded_composer_rows = list(composer_rows)
     if padded_composer_rows:
         padded_composer_rows[0] = ComposerPadding(padded_composer_rows[0])
-    bottom_rows = [spacer, todo_panel, *padded_composer_rows]
+    def viewed_queue() -> QueuedPanel:
+        return queued_panel(agent_navigation, queued_messages())
+
+    queued_rows = ConditionalContainer(
+        Window(
+            FormattedTextControl(
+                lambda: queued_lines(
+                    viewed_queue(), get_app().output.get_size().columns
+                )
+            ),
+            dont_extend_height=True,
+        ),
+        Condition(lambda: bool(viewed_queue().messages or viewed_queue().main_waiting)),
+    )
+    bottom_rows = [spacer, todo_panel, queued_rows, *padded_composer_rows]
     if list_panel is not None:
         bottom_rows.append(list_panel)
     bottom_rows.append(footer)
@@ -524,7 +629,7 @@ def full_screen_content(
         on_scroll_up=on_scroll_up,
         on_scroll_down=on_scroll_down,
     )
-    transcript_content = VSplit(
+    transcript_content = TranscriptMargins(
         [
             Window(width=CONTENT_MARGIN, char=" "),
             transcript,
