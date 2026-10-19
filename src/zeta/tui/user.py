@@ -54,9 +54,10 @@ def displayed_user_text(message: Message) -> str:
 def user_message(text: Text) -> RenderableType:
     """Render a sent message as a band shaped like the composer.
 
-    One filled row above and below and a one-cell inset mirror the composer's
-    padding. ``expand=True`` fills the width of the transcript's Rich console;
+    One filled row above and below mirrors the composer's padding; the text has
+    no horizontal inset so it starts in the transcript's text column.
+    ``expand=True`` fills the width of the transcript's Rich console;
     the transcript tags band rows with ``USER_BAND_CLASS`` and the full-screen
     layout extends those rows into its side margins.
     """
-    return Padding(text, (1, 1), style=theme.USER_BG, expand=True)
+    return Padding(text, (1, 0), style=theme.USER_BG, expand=True)

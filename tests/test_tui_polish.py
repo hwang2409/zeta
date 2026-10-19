@@ -35,7 +35,7 @@ from zeta.tui.layout import (
     content_width,
     queued_lines,
 )
-from zeta.tui.render import render_event
+from zeta.tui.render import render_event, render_markdown
 from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
 from zeta.tui.user import user_message
 
@@ -109,7 +109,8 @@ def test_long_sent_message_wraps_inside_the_band() -> None:
     assert len(lines) > 3
     assert lines[0].strip() == "" and lines[-1].strip() == ""
     assert " ".join(" ".join(lines).split()) == "one two three four five six seven"
-    assert all(len(line) == 20 and line.startswith(" ") for line in lines)
+    assert all(len(line) == 20 for line in lines)
+    assert all(line[0] != " " for line in lines[1:-1])  # no inset on wrapped rows
     fill = theme.active_palette().composer_fill.lstrip("#")
     band = "48;2;" + ";".join(str(int(fill[i : i + 2], 16)) for i in (0, 2, 4))
     assert all(band in line for line in ansi_lines)
@@ -178,6 +179,45 @@ def _assert_band_bleeds_and_card_keeps_inset(*, searching: bool) -> None:
     for y in range(top + 3, height):
         assert not any(band in screen.data_buffer[y][x].style for x in edges)
     assert "".join(screen.data_buffer[top + 1][x].char for x in range(width)).strip() == "hello"
+
+
+@pytest.mark.parametrize("width", [80, 160])
+def test_sent_message_text_starts_in_the_assistant_text_column(width: int) -> None:
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        Console(file=StringIO(), force_terminal=False),
+        lambda: True,
+        transcript.append,
+    )
+    sent = " ".join(f"word{index}" for index in range(width // 3))
+    presenter.print_user(user_message(Text(sent, style=theme.BODY)))
+    presenter.print_assistant(render_markdown("assistant reply"))
+    height = 30
+    margins = TranscriptMargins(
+        [
+            Window(width=CONTENT_MARGIN, char=" "),
+            transcript.window(),
+            Window(width=CONTENT_MARGIN, char=" "),
+        ]
+    )
+    screen = Screen()
+    with create_app_session(output=DummyOutput()):
+        margins.write_to_screen(
+            screen, MouseHandlers(), WritePosition(0, 0, width, height), "", True, None
+        )
+    rows = [
+        "".join(screen.data_buffer[y][x].char for x in range(width))
+        for y in range(height)
+    ]
+    sent_rows = [row for row in rows if "word" in row]
+    reply_row = next(row for row in rows if "assistant reply" in row)
+
+    def column(row: str) -> int:
+        return len(row) - len(row.lstrip())
+
+    assert len(sent_rows) >= 2  # the message wraps onto a continuation line
+    assert {column(row) for row in sent_rows} == {column(reply_row)}
 
 
 def test_queued_lines_list_each_message_on_one_truncated_row() -> None:
