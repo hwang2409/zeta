@@ -223,10 +223,18 @@ async def test_tool_policy_can_deny_whole_inbox_tool(tmp_path: Path) -> None:
         store.close()
 
 
-def test_approval_subject_includes_action_and_target_project(tmp_path: Path) -> None:
+def test_approval_subject_includes_action_and_canonical_target_project(
+    tmp_path: Path,
+) -> None:
     registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    projects.create_project("other", "other")
     try:
-        policy = ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny")
+        policy = ApprovalPolicy(
+            always_allow={f"inbox(send {beta.project_id})"}, default="deny"
+        )
         registry.set_approval_policy(policy)
         assert policy.decide(
             registry.resolve_call(

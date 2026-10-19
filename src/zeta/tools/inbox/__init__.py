@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from ...project_inbox import (
@@ -12,7 +13,7 @@ from ...project_inbox import (
     ProjectInbox,
     SentMessageTracker,
 )
-from ...project_registry import ProjectRegistryError
+from ...project_registry import ProjectRegistryError, resolve_project_ref
 from ...protocol.types import StructuredToolResult
 from .._results import _success_result, text_block
 from ..registry import ToolAction, ToolRegistry
@@ -180,18 +181,14 @@ async def _inbox(
             known_projects = inbox.known_projects()
             return _result("projects", project_id, {"projects": known_projects})
         if action == "send":
-            try:
-                target = inbox.registry.show_project(project_id=arguments["project"])
-            except ProjectRegistryError:
-                target = inbox.registry.show_project(name=arguments["project"])
-
+            target_id = arguments["project"]
             allowed = registry.inbox_target_ids
-            if allowed is not None and target.project_id not in allowed:
+            if allowed is not None and target_id not in allowed:
                 raise InboxError("inbox send target is not approved for this automation")
             message_id = inbox.send(
                 from_project=project_id,
                 from_session=session_id,
-                to_project=target.project_id,
+                to_project=target_id,
                 kind=arguments["kind"],
                 title=arguments["title"],
                 body=arguments["body"],
@@ -246,6 +243,16 @@ def register_send_only(registry: ToolRegistry) -> None:
     _register(registry, {"send": _ACTIONS["send"]})
 
 
+def _approval_subject(registry: ToolRegistry, arguments: Mapping[str, object]) -> str | None:
+    project = arguments.get("project")
+    if not isinstance(project, str) or registry.project_registry is None:
+        return None
+    project_id = resolve_project_ref(registry.project_registry, project)
+    if project_id is None:
+        raise ValueError(f"unknown inbox target project {project!r}")
+    return project_id
+
+
 def _register(registry: ToolRegistry, actions: dict[str, ToolAction]) -> None:
     registry.register_session_tool(
         "inbox",
@@ -272,4 +279,5 @@ def _register(registry: ToolRegistry, actions: dict[str, ToolAction]) -> None:
             "additionalProperties": False,
         },
         requires_approval=True,
+        approval_subject_resolver=lambda arguments: _approval_subject(registry, arguments),
     )

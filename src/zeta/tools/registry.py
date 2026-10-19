@@ -858,7 +858,7 @@ class ToolRegistry:
             return None
         try:
             capability = self.resolve_call(tool_call.name, tool_call.arguments)
-        except (KeyError, UnknownToolAction, InvalidActionArguments):
+        except (KeyError, UnknownToolAction, InvalidActionArguments, TypeError, ValueError):
             self.abort_approval(tool_call)
             return None
         if not capability.requires_approval and not self.enforce_approvals:
@@ -958,6 +958,11 @@ class ToolRegistry:
             return await finalize(
                 _error_result(str(exc), kind="invalid_arguments")
             )
+        except (TypeError, ValueError) as exc:
+            self.abort_approval(tool_call)
+            return await finalize(
+                _error_result(str(exc), kind="invalid_arguments")
+            )
         if not self.tool_policy.allows_call(capability):
             self.abort_approval(tool_call)
             capability_name = (
@@ -973,9 +978,9 @@ class ToolRegistry:
             )
         try:
             arguments = (
-                _validate_arguments(tool_call.arguments, definition.parameters)
+                _validate_arguments(dict(capability.arguments), definition.parameters)
                 if definition.validate_arguments
-                else _coerce_arguments(tool_call.arguments)
+                else _coerce_arguments(dict(capability.arguments))
             )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             self.abort_approval(tool_call)

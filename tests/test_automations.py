@@ -62,6 +62,7 @@ import os
 import selectors
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -398,12 +399,22 @@ def test_automation_inbox_registers_send_only_for_an_approved_target(
 
 
 async def _run_inbox_send(
-    tmp_path: Path, target: str, allow: tuple[str, ...], action: str = "send"
+    tmp_path: Path,
+    target: str,
+    allow: tuple[str, ...],
+    action: str = "send",
+    *,
+    grant_by_id: bool = False,
+    send_by_id: bool = False,
 ):
     home = tmp_path
     projects = ProjectRegistry(home / "projects")
     source = projects.create_project("source", "source", tmp_path)
     target_project = projects.create_project("target", "target")
+    if grant_by_id:
+        allow = (f"inbox(send {target_project.project_id})",)
+    if send_by_id:
+        target = target_project.project_id
     job = replace(_job(tmp_path), allow=allow)
     grants = resolve_inbox_grants(job, projects)
     assert grants is not None
@@ -447,12 +458,125 @@ async def test_automation_inbox_send_to_unlisted_project_is_denied(tmp_path: Pat
     assert not messages["new"]
 
 
+async def test_inbox_grant_by_name_allows_send_by_id(tmp_path: Path) -> None:
+    run, messages, _ = await _run_inbox_send(
+        tmp_path,
+        "target",
+        ("inbox(send target)",),
+        send_by_id=True,
+    )
+    assert run.status == "completed", run.detail
+    assert len(messages["new"]) == 1
+
+
+async def test_inbox_grant_by_id_allows_send_by_name(tmp_path: Path) -> None:
+    run, messages, _ = await _run_inbox_send(
+        tmp_path,
+        "target",
+        (),
+        grant_by_id=True,
+    )
+    assert run.status == "completed", run.detail
+    assert len(messages["new"]) == 1
+
+
+async def test_inbox_send_to_unknown_project_is_denied_cleanly(tmp_path: Path) -> None:
+    run, messages, _ = await _run_inbox_send(
+        tmp_path,
+        "missing",
+        ("inbox(send target)",),
+    )
+    assert run.status == "failed"
+    assert "unknown inbox target project 'missing'" in run.detail
+    assert not messages["new"]
+
+
 async def test_automation_inbox_list_and_claim_are_rejected(tmp_path: Path) -> None:
     for action in ("list", "claim"):
         run, messages, _ = await _run_inbox_send(tmp_path / action, "target", ("inbox(send target)",), action)
         assert run.status == "failed"
         assert action in run.detail or "allow-list" in run.detail
         assert not messages["new"]
+
+
+def _create_pre_inbox_migration_database(home: Path, job) -> None:
+    directory = home / "automations"
+    directory.mkdir(parents=True)
+    database = sqlite3.connect(directory / "automations.sqlite3")
+    try:
+        database.executescript("""
+            CREATE TABLE revisions (
+                name TEXT NOT NULL, revision INTEGER NOT NULL, document TEXT NOT NULL,
+                source TEXT NOT NULL, PRIMARY KEY(name, revision));
+            CREATE TABLE jobs (
+                name TEXT PRIMARY KEY, revision INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
+                approved_at TEXT, recipient TEXT, last_run TEXT, last_check TEXT, last_due TEXT);
+        """)
+        database.execute(
+            "INSERT INTO revisions VALUES (?, 1, ?, 'tool')",
+            (job.name, json.dumps(job.document(), sort_keys=True)),
+        )
+        database.execute(
+            "INSERT INTO jobs VALUES (?, 1, 1, ?, NULL, ?, ?, NULL)",
+            (job.name, START.isoformat(), START.isoformat(), START.isoformat()),
+        )
+        database.commit()
+    finally:
+        database.close()
+
+
+async def test_pre_inbox_migration_approved_job_without_inbox_runs(
+    tmp_path: Path,
+) -> None:
+    job = replace(_job(tmp_path), servers=(), deliver="none")
+    _create_pre_inbox_migration_database(tmp_path, job)
+    with SQLiteStore(tmp_path) as store:
+        assert store.get(job.name).inbox_target_ids == ()
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        assert run_id
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=tmp_path,
+            backend=FakeBackend([ScriptedTurn(content=[TextContent("done")])]),
+            mount_factory=_empty_mount,
+            delivery=RecordingDelivery(),
+        )
+        assert store.runs(job.name)[0].status == "completed"
+
+
+async def test_pre_inbox_migration_approved_job_with_inbox_requires_reapproval(
+    tmp_path: Path,
+) -> None:
+    projects = ProjectRegistry(tmp_path / "projects")
+    projects.create_project("source", "source", tmp_path)
+    projects.create_project("target", "target")
+    job = replace(
+        _job(tmp_path),
+        servers=(),
+        deliver="none",
+        allow=("inbox(send target)",),
+    )
+    _create_pre_inbox_migration_database(tmp_path, job)
+    with SQLiteStore(tmp_path) as store:
+        assert store.get(job.name).inbox_target_ids == ()
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        assert run_id
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=tmp_path,
+            backend=FakeBackend([]),
+            mount_factory=_empty_mount,
+            delivery=RecordingDelivery(),
+        )
+        run = store.runs(job.name)[0]
+        assert run.status == "failed"
+        assert run.detail == "approved inbox targets changed; re-approve the automation"
 
 
 async def test_inbox_grant_pinned_to_approved_project_id(tmp_path: Path) -> None:

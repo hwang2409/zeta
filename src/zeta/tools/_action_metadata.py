@@ -196,8 +196,11 @@ def resolve_capability(
     subject_field = (
         definition.approval_subject if metadata is None else metadata.approval_subject
     )
+    resolved_arguments = dict(arguments)
     if definition.approval_subject_resolver is not None:
         subject_value = definition.approval_subject_resolver(arguments)
+        if subject_field is not None and subject_value is not None:
+            resolved_arguments[subject_field] = subject_value
     else:
         subject_value = (
             None if subject_field is None else arguments.get(subject_field)
@@ -221,7 +224,7 @@ def resolve_capability(
         subject_value=subject_value,
         binding=binding,
         capability_class=None if metadata is None else metadata.capability_class,
-        arguments=MappingProxyType(dict(arguments)),
+        arguments=MappingProxyType(resolved_arguments),
     )
 
 

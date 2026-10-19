@@ -30,7 +30,7 @@ from ..skills.agent_catalog import discover_packaged_agents
 from ..tools import ToolRegistry
 from .delivery import Delivery, SlackDelivery
 from .models import DueOccurrence, Job, PollEvent, instant, timestamp
-from .services import mount_services, resolve_inbox_grants
+from .services import configure_runtime_inbox, mount_services
 from .store import AutomationStore
 from .trigger import Poll, Webhook
 from .webhook import MAX_PROMPT_PAYLOAD_BYTES
@@ -155,12 +155,12 @@ async def run_claimed(
                 allow=job.allow,
                 backend=backend,
             )
-            from .services import InboxGrants
-
-            resolved = resolve_inbox_grants(job, manager.project_registry)
-            if resolved is not None and resolved.target_ids != state.inbox_target_ids:
-                raise ValueError("approved inbox targets changed; re-approve the automation")
-            grants = InboxGrants(project_id or "", state.inbox_target_ids) if state.inbox_target_ids else None
+            grants = configure_runtime_inbox(
+                job,
+                state.inbox_target_ids,
+                loop.tool_registry,
+                manager.project_registry,
+            )
             mount = (
                 await mount_factory(job, loop.tool_registry, home, grants)
                 if grants is not None
