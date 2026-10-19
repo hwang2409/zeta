@@ -182,9 +182,6 @@ async def _inbox(
             return _result("projects", project_id, {"projects": known_projects})
         if action == "send":
             target_id = arguments["project"]
-            allowed = registry.inbox_target_ids
-            if allowed is not None and target_id not in allowed:
-                raise InboxError("inbox send target is not approved for this automation")
             message_id = inbox.send(
                 from_project=project_id,
                 from_session=session_id,
