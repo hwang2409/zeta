@@ -8,6 +8,7 @@ from typing import Any
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.enums import DEFAULT_BUFFER
 from prompt_toolkit.filters import Condition, has_focus
+from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.layout import Dimension
 from prompt_toolkit.layout.containers import (
     AnyContainer,
@@ -20,14 +21,16 @@ from prompt_toolkit.layout.containers import (
     Window,
     to_container,
 )
+from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.menus import CompletionsMenu, MultiColumnCompletionsMenu
 from prompt_toolkit.layout.mouse_handlers import MouseHandler, MouseHandlers
-from prompt_toolkit.layout.screen import Screen, WritePosition
+from prompt_toolkit.layout.screen import Char, Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from rich.cells import cell_len
 from ..core.session import _preview_text
 from ..core.slash import context_window
 from ..core.store import ConversationStore
+from . import theme
 from .agent_card import AgentNavigation
 from .composer import status_formatted_text, vim_state_label
 from .render import format_status
@@ -41,6 +44,7 @@ COMMAND_MENU_ROWS = 12
 MAX_CHROME_ROWS = 18
 STATUS_CARD_MAX_WIDTH = 72
 STATUS_CARD_MARGIN = 2
+QUEUED_VISIBLE_ROWS = 3
 
 
 def detach_completion_menus(container: Container) -> None:
@@ -185,6 +189,61 @@ class ComposerPadding(Container):
 
     def get_children(self) -> list[Container]:
         return [self.content]
+
+
+class TranscriptMargins(VSplit):
+    """Transcript between side margins; sent-message bands bleed into them.
+
+    A sent message is a full-width band like the composer. Rich only sees the
+    content width, so after painting, any row whose two content edges carry
+    the composer fill (the user band's background) is extended across the
+    margins. Other surfaces, tool cards included, keep their inset.
+    """
+
+    def write_to_screen(
+        self,
+        screen: Screen,
+        mouse_handlers: MouseHandlers,
+        write_position: WritePosition,
+        parent_style: str,
+        erase_bg: bool,
+        z_index: int | None,
+    ) -> None:
+        super().write_to_screen(
+            screen, mouse_handlers, write_position, parent_style, erase_bg, z_index
+        )
+        fill = theme.active_palette().composer_fill.lower()
+        start = write_position.xpos
+        end = start + write_position.width
+        left, right = start + CONTENT_MARGIN, end - CONTENT_MARGIN - 1
+        if not fill or right < left:
+            return
+        band = f"bg:{fill}"
+        margin = Char(" ", band)
+        for y in range(write_position.ypos, write_position.ypos + write_position.height):
+            row = screen.data_buffer[y]
+            if band in row[left].style and band in row[right].style:
+                for x in (*range(start, left), *range(right + 1, end)):
+                    row[x] = margin
+
+
+def queued_lines(messages: Sequence[str], terminal_width: int) -> StyleAndTextTuples:
+    """Describe messages that are submitted but not yet sent, one row each."""
+
+    indent = " " * CONTENT_MARGIN
+    count = f" · {len(messages)}" if len(messages) > 1 else ""
+    fragments: StyleAndTextTuples = [(f"fg:{theme.CHROME}", f"{indent}queued{count}")]
+    width = max(1, content_width(terminal_width) - 2)
+    for message in messages[:QUEUED_VISIBLE_ROWS]:
+        fragments += [
+            ("", "\n"),
+            (f"fg:{theme.CHROME}", f"{indent}› "),
+            (f"fg:{theme.DIM}", _preview_text(message, limit=width)),
+        ]
+    hidden = len(messages) - QUEUED_VISIBLE_ROWS
+    if hidden > 0:
+        fragments += [("", "\n"), (f"fg:{theme.CHROME}", f"{indent}  +{hidden} more")]
+    return fragments
 
 
 def command_menu_float(chrome_height: Callable[[], int]) -> Float:
@@ -465,6 +524,7 @@ def full_screen_content(
     decisions_active: Callable[[], bool] | None = None,
     finder_window: AnyContainer | None = None,
     finder_active: Callable[[], bool] | None = None,
+    queued_messages: Callable[[], Sequence[str]] = tuple,
 ) -> FloatContainer:
     """Transcript over composer chrome, with the command menu floating above it."""
 
@@ -515,7 +575,18 @@ def full_screen_content(
     padded_composer_rows = list(composer_rows)
     if padded_composer_rows:
         padded_composer_rows[0] = ComposerPadding(padded_composer_rows[0])
-    bottom_rows = [spacer, todo_panel, *padded_composer_rows]
+    queued_panel = ConditionalContainer(
+        Window(
+            FormattedTextControl(
+                lambda: queued_lines(
+                    queued_messages(), get_app().output.get_size().columns
+                )
+            ),
+            dont_extend_height=True,
+        ),
+        Condition(lambda: bool(queued_messages())),
+    )
+    bottom_rows = [spacer, todo_panel, queued_panel, *padded_composer_rows]
     if list_panel is not None:
         bottom_rows.append(list_panel)
     bottom_rows.append(footer)
@@ -524,7 +595,7 @@ def full_screen_content(
         on_scroll_up=on_scroll_up,
         on_scroll_down=on_scroll_down,
     )
-    transcript_content = VSplit(
+    transcript_content = TranscriptMargins(
         [
             Window(width=CONTENT_MARGIN, char=" "),
             transcript,

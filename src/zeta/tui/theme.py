@@ -256,7 +256,8 @@ def set_active_palette(palette: Palette) -> None:
     CODE_THEME = palette.code_theme
     CHROME = DIM
     CARD_BG = f"on {palette.surface}" if palette.surface else ""
-    USER_BG = f"on {palette.tint}" if palette.tint else ""
+    # Sent messages reuse the composer fill so they read as the same surface.
+    USER_BG = f"on {palette.composer_fill}" if palette.composer_fill else ""
     READ_BG = f"on {palette.read_bg}" if palette.read_bg else CARD_BG
     SHELL_BG = f"on {palette.shell_bg}" if palette.shell_bg else CARD_BG
     EDIT_BG = f"on {palette.edit_bg}" if palette.edit_bg else CARD_BG

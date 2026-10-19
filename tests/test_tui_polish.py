@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from io import StringIO
 
+from prompt_toolkit.application import create_app_session
+from prompt_toolkit.layout.containers import Window
+from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+from prompt_toolkit.layout.screen import Screen, WritePosition
+from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
 from rich.text import Text
@@ -21,6 +26,12 @@ from zeta.protocol.types import (
 )
 from zeta.tui import theme
 from zeta.tui.cards.agent import AgentCard
+from zeta.tui.layout import (
+    CONTENT_MARGIN,
+    TranscriptMargins,
+    content_width,
+    queued_lines,
+)
 from zeta.tui.render import render_event
 from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
 from zeta.tui.user import user_message
@@ -40,7 +51,7 @@ def test_gruvbox_fills_user_and_tool_surfaces() -> None:
         console = Console(file=output, width=60, force_terminal=True, color_system="truecolor")
         console.print(user_message(Text("build the maze", style=theme.BODY)))
         user_ansi = output.getvalue()
-        assert "\x1b[48;2;59;54;64m" in user_ansi
+        assert "\x1b[48;2;60;56;54m" in user_ansi
 
         call = ToolCall("read-1", "read", {"path": "maze.c"})
         rendered = render_event(
@@ -56,7 +67,7 @@ def test_gruvbox_fills_user_and_tool_surfaces() -> None:
         theme.set_active_palette(previous)
 
 
-def test_sent_messages_share_one_separator_and_fill_the_transcript_width() -> None:
+def test_sent_messages_are_padded_bands_with_one_separator() -> None:
     previous = theme.active_palette()
     theme.set_active_palette(theme.GRUVBOX_DARK)
     try:
@@ -71,14 +82,89 @@ def test_sent_messages_share_one_separator_and_fill_the_transcript_width() -> No
         presenter.print_user(user_message(Text("second")))
 
         for width in (12, 40):
-            lines = Text.from_ansi(transcript.render(width)).plain.splitlines()
-            assert lines[0].strip() == "first"
-            assert lines[1] == ""
-            assert lines[2].strip() == "second"
-            assert len(lines[0]) == width
-            assert len(lines[2]) == width
+            ansi_lines = transcript.render(width).splitlines()
+            lines = [Text.from_ansi(line).plain for line in ansi_lines]
+            assert [line.strip() for line in lines] == [
+                "", "first", "", "", "", "second", "",
+            ]
+            band_rows = (0, 1, 2, 4, 5, 6)
+            assert all(len(lines[row]) == width for row in band_rows)
+            assert all("\x1b[48;2;60;56;54m" in ansi_lines[row] for row in band_rows)
+            assert lines[3] == ""
     finally:
         theme.set_active_palette(previous)
+
+
+def test_long_sent_message_wraps_inside_the_band() -> None:
+    output = StringIO()
+    Console(file=output, width=20, force_terminal=True, color_system="truecolor").print(
+        user_message(Text("one two three four five six seven", style=theme.BODY))
+    )
+    ansi_lines = output.getvalue().splitlines()
+    lines = [Text.from_ansi(line).plain for line in ansi_lines]
+
+    assert len(lines) > 3
+    assert lines[0].strip() == "" and lines[-1].strip() == ""
+    assert " ".join(" ".join(lines).split()) == "one two three four five six seven"
+    assert all(len(line) == 20 and line.startswith(" ") for line in lines)
+    fill = theme.active_palette().composer_fill.lstrip("#")
+    band = "48;2;" + ";".join(str(int(fill[i : i + 2], 16)) for i in (0, 2, 4))
+    assert all(band in line for line in ansi_lines)
+
+
+def test_sent_message_band_bleeds_into_margins_but_tool_cards_do_not() -> None:
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        Console(file=StringIO(), force_terminal=False),
+        lambda: True,
+        transcript.append,
+    )
+    presenter.print_user(user_message(Text("hello", style=theme.BODY)))
+    call = ToolCall("read-1", "read", {"path": "maze.c"})
+    card = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "int main(void) { return 0; }"),
+        )
+    )
+    presenter.print_unit(card)
+    width, height = 30, 12
+    lines = transcript.lines(content_width(width))
+    margins = TranscriptMargins(
+        [
+            Window(width=CONTENT_MARGIN, char=" "),
+            transcript.window(),
+            Window(width=CONTENT_MARGIN, char=" "),
+        ]
+    )
+    screen = Screen()
+    with create_app_session(output=DummyOutput()):
+        margins.write_to_screen(
+            screen, MouseHandlers(), WritePosition(0, 0, width, height), "", True, None
+        )
+
+    band = f"bg:{theme.active_palette().composer_fill}"
+    top = height - len(lines)
+    edges = (0, 1, width - 2, width - 1)
+    for y in range(top, top + 3):
+        assert all(band in screen.data_buffer[y][x].style for x in edges)
+    for y in range(top + 3, height):
+        assert not any(band in screen.data_buffer[y][x].style for x in edges)
+    assert "".join(screen.data_buffer[top + 1][x].char for x in range(width)).strip() == "hello"
+
+
+def test_queued_lines_list_each_message_on_one_truncated_row() -> None:
+    def rows(messages: tuple[str, ...], width: int = 40) -> list[str]:
+        return "".join(text for _style, text in queued_lines(messages, width)).split("\n")
+
+    assert rows(("fix the\nbuild",)) == ["  queued", "  › fix the build"]
+    many = rows(("a", "b", "c", "a much longer message that cannot fit on one row"))
+    assert many == ["  queued · 4", "  › a", "  › b", "  › c", "    +1 more"]
+    long = rows(("x" * 100,), width=30)[1]
+    assert get_cwidth(long) == 2 + 2 + content_width(30) - 2
+    assert long.endswith("...")
 
 
 def test_bash_card_shows_command_output_and_exit_state() -> None:

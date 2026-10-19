@@ -109,6 +109,7 @@ from .transcript import (
 )
 from .transcript.finder_runtime import FinderRuntimeMixin
 from .transcript.history_finder import HistoryFinder
+from .user import displayed_user_text
 
 
 def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
@@ -390,10 +391,8 @@ class TUIApp(
     @property
     def queued_messages(self) -> tuple[str, ...]:
         return tuple(
-            block.text
+            displayed_user_text(message)
             for message, _candidate in self._submissions.queued
-            for block in message.content[:1]
-            if isinstance(block, TextContent)
         )
 
     @property
@@ -1078,6 +1077,7 @@ class TUIApp(
                 decisions_active=lambda: app.decisions_panel_active,
                 finder_window=self._finder_control.window(),
                 finder_active=lambda: app._active_finder.finder_active,
+                queued_messages=lambda: app.queued_messages,
             )
         ]
         self._agent_navigation.bind_layout(

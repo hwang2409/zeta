@@ -112,7 +112,12 @@ from zeta.tui import theme
 from zeta.tui.bootstrap import surface_shutdown_notifications
 from zeta.tui.cards import markdown as markdown_module
 from zeta.tui.cards.base import compact_tool_card, failure_status
-from zeta.tui.layout import composer_content_width, content_width, full_screen_content
+from zeta.tui.layout import (
+    composer_content_width,
+    content_width,
+    full_screen_content,
+    queued_lines,
+)
 from zeta.tui.render import (
     _render_tool_output,
     format_status,
@@ -6078,8 +6083,12 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
         await backend.started.wait()
         pipe.send_text("\\ second\r")
         await wait_until(lambda: app.queued_messages == ("second",))
+        assert "› second" in "".join(
+            text for _style, text in queued_lines(app.queued_messages, 80)
+        )
         backend.release.set()
         await wait_until(lambda: len(backend.calls) == 2)
+        assert app.queued_messages == ()
         pipe.send_text("\x04")
         await run_task
 
@@ -8100,7 +8109,7 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     content = float_container.content
     assert content.__class__.__name__ == "HSplit"
     transcript = content.children[0]
-    assert transcript.__class__.__name__ == "VSplit"
+    assert transcript.__class__.__name__ == "TranscriptMargins"
     assert transcript.children[0].__class__.__name__ == "Window"
     wheel_router = content.children[1]
     assert wheel_router.__class__.__name__ == "WheelRouter"
@@ -8530,20 +8539,22 @@ def test_full_screen_pty_keeps_padded_margins_clean(
             capture_output=True,
             text=True,
         ).stdout
-        assert any(line.startswith("  hello") for line in plain)
+        # The sent band's text sits one cell inside the two-column margin.
+        assert any(line.startswith("   hello") for line in plain)
         assert all(
             not line[:2].strip()
             for line in plain
             if not line.lstrip().startswith(("›", "INSERT"))
         )
         assert _contains_background_sgr(escaped)
-        transcript_lines = [
-            line
-            for line in escaped.splitlines()
-            if "you said: hello" in line or "hello" in line
+        reply_lines = [
+            line for line in escaped.splitlines() if "you said: hello" in line
         ]
-        assert transcript_lines
-        assert all(not _contains_background_sgr(line) for line in transcript_lines)
+        assert reply_lines
+        assert all(not _contains_background_sgr(line) for line in reply_lines)
+        # The sent band starts its filled top row at the terminal's first
+        # column; tmux carries that background through the text row.
+        assert re.search(r"\x1b\[48;[0-9;]*m\n   hello\n", escaped)
         assert list((tmp_path / "zeta-home" / "sessions").iterdir())
     finally:
         cleanup()
@@ -8889,8 +8900,10 @@ skill_catalog=SkillCatalog.empty(),
 
     await app._consume_turn("prompt")
 
-    assert [Text.from_ansi(line).plain for line in app._transcript.lines(120)] == [
+    assert [Text.from_ansi(line).plain.strip() for line in app._transcript.lines(120)] == [
+        "",
         "prompt",
+        "",
         "",
         "no response",
     ]

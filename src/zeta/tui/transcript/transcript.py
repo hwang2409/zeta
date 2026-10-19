@@ -689,7 +689,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             rendered_units.append(self._render_unit(unit, width))
         value = "\n".join(rendered_units).rstrip("\n")
         lines = value.splitlines()
-        while lines and not Text.from_ansi(lines[0]).plain.strip():
+        # Trim rows with no cells; a sent-message band's filled top row stays.
+        while lines and not Text.from_ansi(lines[0]).plain:
             lines.pop(0)
         lines = self._limit_lines(
             lines,
@@ -923,7 +924,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     ) -> list[list[tuple[str, str]]]:
         while lines and not lines[-1]:
             lines.pop()
-        while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
+        while lines and not "".join(fragment[1] for fragment in lines[0]):
             lines.pop(0)
         return self._limit_lines(
             lines or [[]],
@@ -1021,7 +1022,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             raw_lines.extend(
                 (line, unit, offset) for line, offset in zip(rendered_lines, offsets)
             )
-        while raw_lines and not raw_lines[0][0].strip():
+        while raw_lines and not raw_lines[0][0]:
             raw_lines.pop(0)
         raw_lines = self._limit_lines(
             raw_lines,
