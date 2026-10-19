@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import http
 import logging
+import re
 import secrets
 import sys
 import time
@@ -106,101 +107,99 @@ def _validate_oauth_url(value: str, label: str) -> None:
         )
 
 
+_ENCODED_DOT = re.compile(r"%2e", re.IGNORECASE)
+_ENCODED_SEPARATOR = re.compile(r"%(?:2f|5c)", re.IGNORECASE)
+
+
+@dataclass(frozen=True, slots=True)
+class _UnavailableResourceMetadata:
+    error: MCPOAuthError
+    cause: Exception | None = None
+
+
+def _has_ambiguous_url_parts(value: str) -> bool:
+    parsed = urlparse(value)
+    if parsed.username is not None or "?" in value or "#" in value:
+        return True
+    path = parsed.path
+    if "\\" in path or "//" in path or _ENCODED_SEPARATOR.search(path):
+        return True
+    return any(
+        _ENCODED_DOT.sub(".", segment) in {".", ".."}
+        for segment in path.split("/")
+    )
+
+
 def _resource_covers_server(resource: str, server_url: str) -> bool:
-    resource_parts = urlparse(resource)
-    server_parts = urlparse(server_url)
-    if resource_parts.query or resource_parts.fragment:
+    if "?" in resource or "#" in resource or urlparse(resource).username is not None:
+        return False
+    if resource == server_url:
+        return True
+    if _has_ambiguous_url_parts(resource) or _has_ambiguous_url_parts(server_url):
         return False
     try:
-        resource_port = resource_parts.port
-        server_port = server_parts.port
-    except ValueError:
+        resource_url = httpx.URL(resource)
+        server = httpx.URL(server_url)
+    except (TypeError, ValueError):
         return False
-    default_ports = {"http": 80, "https": 443}
-    if resource_port is None:
-        resource_port = default_ports.get(resource_parts.scheme)
-    if server_port is None:
-        server_port = default_ports.get(server_parts.scheme)
     if (
-        resource_parts.scheme.casefold() != server_parts.scheme.casefold()
-        or resource_parts.hostname.casefold() != server_parts.hostname.casefold()
-        or resource_port != server_port
+        resource_url.scheme != server.scheme
+        or resource_url.raw_host != server.raw_host
+        or resource_url.port != server.port
     ):
         return False
-    resource_path = resource_parts.path.rstrip("/") or "/"
-    server_path = server_parts.path or "/"
+    resource_path = resource_url.path
+    server_path = server.path
     return server_path == resource_path or (
         resource_path == "/" or server_path.startswith(resource_path + "/")
     )
 
 
-async def discover_protected_resource(
-    server_url: str,
-    *,
-    http_client: httpx.AsyncClient,
-    resource_metadata_url: str | None = None,
-) -> ProtectedResourceMetadata:
-    """Probe the MCP server for RFC 9728 protected-resource metadata."""
-
-    parsed = urlparse(server_url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
-    root_url = urljoin(base_url, "/.well-known/oauth-protected-resource")
-    path = parsed.path.lstrip("/")
-    path_url = f"{root_url}/{path}" if path else root_url
-    metadata_urls = (
-        [resource_metadata_url]
-        if resource_metadata_url is not None
-        else [path_url, root_url]
-    )
-    response: httpx.Response | None = None
-    last_error: Exception | None = None
-    for metadata_url in metadata_urls:
-        try:
-            candidate = await http_client.get(metadata_url, timeout=10.0)
-        except httpx.HTTPError as exc:
-            last_error = exc
-            continue
-        if candidate.status_code >= 400:
-            last_error = MCPOAuthError(
+async def _fetch_resource_metadata(
+    metadata_url: str, http_client: httpx.AsyncClient
+) -> dict[str, object] | _UnavailableResourceMetadata:
+    try:
+        response = await http_client.get(
+            metadata_url, timeout=10.0, follow_redirects=False
+        )
+    except httpx.HTTPError as exc:
+        return _UnavailableResourceMetadata(
+            MCPOAuthError(
+                f"MCP OAuth: could not reach protected-resource metadata: {exc}"
+            ),
+            exc,
+        )
+    if response.status_code >= 300:
+        return _UnavailableResourceMetadata(
+            MCPOAuthError(
                 "MCP OAuth: protected-resource metadata returned HTTP "
-                f"{candidate.status_code}"
+                f"{response.status_code}"
             )
-            continue
-        response = candidate
-        break
-    if response is None:
-        if resource_metadata_url is not None:
-            if isinstance(last_error, httpx.HTTPError):
-                raise MCPOAuthError(
-                    f"MCP OAuth: could not reach protected-resource metadata: {last_error}"
-                ) from last_error
-            raise last_error or MCPOAuthError(
-                "MCP OAuth: protected-resource metadata unavailable"
-            )
-        if last_error:
-            logger.debug("MCP OAuth: protected-resource probe failed: %s", last_error)
-        return ProtectedResourceMetadata(server_url, None)
+        )
     try:
         data = response.json()
     except ValueError as exc:
-        if resource_metadata_url is not None:
-            raise MCPOAuthError(
-                "MCP OAuth: protected-resource metadata was not JSON"
-            ) from exc
-        return ProtectedResourceMetadata(server_url, None)
+        return _UnavailableResourceMetadata(
+            MCPOAuthError("MCP OAuth: protected-resource metadata was not JSON"),
+            exc,
+        )
     if type(data) is not dict:
-        if resource_metadata_url is not None:
-            raise MCPOAuthError(
-                "MCP OAuth: protected-resource metadata was not an object"
-            )
-        return ProtectedResourceMetadata(server_url, None)
+        return _UnavailableResourceMetadata(
+            MCPOAuthError("MCP OAuth: protected-resource metadata was not an object")
+        )
     resource = data.get("resource")
     if type(resource) is not str or not resource:
-        if resource_metadata_url is not None:
-            raise MCPOAuthError(
-                "MCP OAuth: protected-resource metadata missing resource"
-            )
-        return ProtectedResourceMetadata(server_url, None)
+        return _UnavailableResourceMetadata(
+            MCPOAuthError("MCP OAuth: protected-resource metadata missing resource")
+        )
+    return data
+
+
+def _parse_resource_metadata(
+    data: dict[str, object], server_url: str
+) -> ProtectedResourceMetadata:
+    resource = data["resource"]
+    assert isinstance(resource, str)
     _validate_oauth_url(resource, "resource")
     if not _resource_covers_server(resource, server_url):
         safe_resource = _terminal_safe_server_text(resource)
@@ -216,6 +215,39 @@ async def discover_protected_resource(
             _validate_oauth_url(first, "authorization server")
             server = first
     return ProtectedResourceMetadata(resource, server)
+
+
+async def discover_protected_resource(
+    server_url: str,
+    *,
+    http_client: httpx.AsyncClient,
+    resource_metadata_url: str | None = None,
+) -> ProtectedResourceMetadata:
+    """Probe the MCP server for RFC 9728 protected-resource metadata."""
+
+    parsed = urlparse(server_url)
+    root_url = urljoin(
+        f"{parsed.scheme}://{parsed.netloc}",
+        "/.well-known/oauth-protected-resource",
+    )
+    path = parsed.path.lstrip("/")
+    path_url = f"{root_url}/{path}" if path else root_url
+    metadata_urls = (
+        (resource_metadata_url,)
+        if resource_metadata_url is not None
+        else dict.fromkeys((path_url, root_url))
+    )
+    for metadata_url in metadata_urls:
+        result = await _fetch_resource_metadata(metadata_url, http_client)
+        if isinstance(result, _UnavailableResourceMetadata):
+            if resource_metadata_url is not None:
+                if result.cause is not None:
+                    raise result.error from result.cause
+                raise result.error
+            logger.debug("MCP OAuth: protected-resource probe failed: %s", result.error)
+            continue
+        return _parse_resource_metadata(result, server_url)
+    return ProtectedResourceMetadata(server_url, None)
 
 
 async def discover_auth_server(
