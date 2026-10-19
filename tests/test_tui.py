@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import errno
 import base64
+import errno
 import json
 import os
 import pty
