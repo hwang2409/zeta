@@ -95,7 +95,7 @@ def _coarse_candidate(
     flattened = [record for unit in units for record in unit.records]
     start = min(_unit_start(unit) for unit in units)
     end = max(_unit_end(unit) for unit in units)
-    receipt = _range_receipt(start, end, units)
+    receipt = _range_receipt(start, end, units, include_user_metadata=True)
     if not is_smaller(flattened, [receipt]):
         return RangeCandidate(list(records), frozenset())
     output = [
@@ -315,7 +315,13 @@ def _base_metadata(message: Message, *extra_owned: str) -> dict[str, object]:
     return {key: value for key, value in message.metadata.items() if key not in owned}
 
 
-def _range_receipt(start: int, end: int, units: Sequence[_ReceiptUnit]) -> Message:
+def _range_receipt(
+    start: int,
+    end: int,
+    units: Sequence[_ReceiptUnit],
+    *,
+    include_user_metadata: bool = False,
+) -> Message:
     kinds = Counter(unit.kind for unit in units)
     tools = Counter(name for unit in units for name in unit.tool_names)
     parts: list[str] = []
@@ -337,15 +343,22 @@ def _range_receipt(start: int, end: int, units: Sequence[_ReceiptUnit]) -> Messa
     if kinds["assistant"]:
         count = kinds["assistant"]
         parts.append(f"{count} assistant {'note' if count == 1 else 'notes'}")
-    users = [
-        " ".join(block.text.split())
-        for unit in units
-        if unit.kind == "user"
-        for _, message in unit.records
-        for block in message.content
-        if isinstance(block, TextContent) and block.text.strip()
-    ]
-    user_count = sum(unit.kind == "user" for unit in units)
+    user_count = 0
+    users: list[str] = []
+    for unit in units:
+        if unit.kind == "user":
+            user_count += 1
+            users.extend(_user_excerpts(unit.records[0][1]))
+        elif unit.kind == "range":
+            message = unit.records[0][1]
+            count = message.metadata.get("user_count")
+            excerpts = message.metadata.get("user_excerpts")
+            if type(count) is int and count >= 0:
+                user_count += count
+            if isinstance(excerpts, list):
+                users.extend(
+                    excerpt for excerpt in excerpts if isinstance(excerpt, str)
+                )
     suffix = f"; recall_history seq_start={start}, seq_end={end} for exact content"
     if user_count:
         excerpts = [
@@ -370,14 +383,26 @@ def _range_receipt(start: int, end: int, units: Sequence[_ReceiptUnit]) -> Messa
         text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
     if len(text) > _RANGE_LIMIT:
         text = f"[evicted range] seq {start}-{end}: {len(units)} receipt items{suffix}"
-    return Message(
-        MessageRole.ASSISTANT,
-        [TextContent(text)],
-        metadata={
-            "context_evicted": True,
-            RECEIPT_KIND_METADATA: "range",
-            "eviction_range": True,
-            "source_seq": start,
-            "range_seq_end": end,
-        },
-    )
+    metadata = {
+        "context_evicted": True,
+        RECEIPT_KIND_METADATA: "range",
+        "eviction_range": True,
+        "source_seq": start,
+        "range_seq_end": end,
+    }
+    if include_user_metadata:
+        metadata.update(
+            user_count=user_count,
+            user_excerpts=excerpts if user_count else [],
+        )
+    return Message(MessageRole.ASSISTANT, [TextContent(text)], metadata=metadata)
+
+
+def _user_excerpts(message: Message) -> list[str]:
+    return [
+        excerpt[:77] + "..."
+        if len(excerpt := " ".join(block.text.split())) > 80
+        else excerpt
+        for block in message.content
+        if isinstance(block, TextContent) and block.text.strip()
+    ]

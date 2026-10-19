@@ -755,6 +755,73 @@ def test_coarse_receipt_keeps_recent_user_request_excerpts() -> None:
     assert len(text) <= _RANGE_LIMIT
 
 
+def test_coarse_receipt_user_summary_is_transitive_across_passes() -> None:
+    first = range_receipt_candidate(
+        [
+            (1, Message(MessageRole.USER, [TextContent("first request")])),
+            (2, _assistant_receipt(2)),
+            (3, Message(MessageRole.USER, [TextContent("second request")])),
+            (4, _assistant_receipt(4)),
+        ],
+        allows=lambda _seq: True,
+        is_smaller=lambda _records, _messages: True,
+        coarse=True,
+    )
+    prior = first.records
+    second = range_receipt_candidate(
+        [
+            *prior,
+            (5, Message(MessageRole.USER, [TextContent("third request")])),
+            (6, _assistant_receipt(6)),
+        ],
+        allows=lambda _seq: True,
+        is_smaller=lambda _records, _messages: True,
+        coarse=True,
+    )
+
+    receipt = second.records[-1][1]
+    assert receipt.metadata["range_seq_end"] == 6
+    assert (
+        "3 user requests: first request; second request; third request"
+        in _range_text(receipt)
+    )
+
+
+def test_transitive_user_excerpts_stay_within_cap() -> None:
+    first = range_receipt_candidate(
+        [
+            (1, Message(MessageRole.USER, [TextContent("first " + "x" * 120)])),
+            (2, _assistant_receipt(2)),
+            (3, Message(MessageRole.USER, [TextContent("second " + "x" * 120)])),
+            (4, _assistant_receipt(4)),
+            (5, Message(MessageRole.USER, [TextContent("third " + "x" * 120)])),
+            (6, _assistant_receipt(6)),
+        ],
+        allows=lambda _seq: True,
+        is_smaller=lambda _records, _messages: True,
+        coarse=True,
+    )
+    second = range_receipt_candidate(
+        [
+            *first.records,
+            (7, Message(MessageRole.USER, [TextContent("fourth " + "x" * 120)])),
+            (8, _assistant_receipt(8)),
+            (9, Message(MessageRole.USER, [TextContent("fifth " + "x" * 120)])),
+            (10, _assistant_receipt(10)),
+        ],
+        allows=lambda _seq: True,
+        is_smaller=lambda _records, _messages: True,
+        coarse=True,
+    )
+
+    receipt = second.records[-1][1]
+    text = _range_text(receipt)
+    assert len(text) <= _RANGE_LIMIT
+    assert receipt.metadata["user_count"] == 5
+    assert "fifth" in text
+    assert "first" not in text
+
+
 def test_coarse_receipt_excerpts_stay_within_cap() -> None:
     records = []
     for seq in range(1, 20, 2):
