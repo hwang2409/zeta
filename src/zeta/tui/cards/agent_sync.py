@@ -230,6 +230,8 @@ class AgentTranscriptSnapshot:
     entry_ids: tuple[str, ...]
     messages: tuple[tuple[str, dict[str, Any]], ...]
     unavailable_reason: str | None = None
+    # Follow-ups sent to this child that its loop has not consumed yet.
+    pending_prompts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,7 +374,19 @@ class AgentTranscriptSource:
             messages.append(
                 (entry.id, retained if retained == message else copy.deepcopy(message))
             )
-        return AgentTranscriptSnapshot(entry_ids, tuple(messages))
+        acknowledged = {
+            entry.data.get("prompt_id")
+            for entry in entries
+            if entry.type == "pending_prompt_ack"
+        }
+        pending_prompts = tuple(
+            str(entry.data.get("text", ""))
+            for entry in entries
+            if entry.type == "pending_prompt" and entry.id not in acknowledged
+        )
+        return AgentTranscriptSnapshot(
+            entry_ids, tuple(messages), pending_prompts=pending_prompts
+        )
 
     def _tree_snapshot(self) -> AgentTranscriptTreeSnapshot:
         return AgentTranscriptTreeSnapshot(

@@ -29,11 +29,13 @@ from zeta.mcp.oauth import (
     AuthServerMetadata,
     MCPOAuthError,
     MCPOAuthStateError,
+    ProtectedResourceMetadata,
     authorize,
     build_authorization_url,
     discover_auth_server,
     discover_protected_resource,
     generate_pkce,
+    refresh_access_token,
 )
 from zeta.mcp.oauth_store import (
     MCPOAuthToken,
@@ -315,6 +317,14 @@ async def test_full_browser_flow_round_trip(
         http_client=http_client,
         browser_opener=open_browser,
     )
+    await refresh_access_token(
+        token_endpoint=token.token_endpoint,
+        refresh_token=token.refresh_token or "",
+        client_id=token.client_id,
+        client_secret=token.client_secret,
+        resource=token.resource,
+        http_client=http_client,
+    )
     await http_client.aclose()
 
     assert token.access_token == "access-token-1"
@@ -328,6 +338,8 @@ async def test_full_browser_flow_round_trip(
     assert token_form["code"] == "auth-code"
     assert token_form["resource"] == auth.resource
     assert token_form["code_verifier"], "PKCE verifier must be present in the token request"
+    assert auth.token_requests[1]["grant_type"] == "refresh_token"
+    assert auth.token_requests[1]["resource"] == auth.resource
 
 
 @pytest.mark.asyncio
@@ -507,6 +519,187 @@ async def test_authorization_server_path_is_appended_to_well_known_url() -> None
         "https://login.example/.well-known/oauth-authorization-server/oauth"
     )
     assert metadata.issuer == "https://login.example/oauth"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource", "server_url"),
+    [
+        ("https://host", "https://host/mcp"),
+        ("https://host/", "https://host/mcp"),
+        ("HTTPS://HOST", "https://host/mcp"),
+        ("https://host:443", "https://host/mcp"),
+        ("https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443/mcp"),
+        ("https://xn--fa-hia.de", "https://faß.de/mcp"),
+        ("https://faß.de", "https://xn--fa-hia.de/mcp"),
+        ("https://host./", "https://host./mcp"),
+    ],
+)
+async def test_protected_resource_accepts_canonical_parent(
+    resource: str, server_url: str
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"resource": resource}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        metadata = await discover_protected_resource(server_url, http_client=client)
+
+    assert metadata.resource == resource
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_url",
+    [
+        "https://host/a/../other",
+        "https://host/%2e%2e/other",
+        "https://host/a%2fb",
+        "https://host/a//b",
+        "https://host/a\\b",
+    ],
+)
+async def test_ambiguous_server_url_keeps_exact_resource_match(
+    server_url: str,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"resource": server_url}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        metadata = await discover_protected_resource(server_url, http_client=client)
+
+    assert metadata.resource == server_url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource", "server_url"),
+    [
+        ("https://fass.de", "https://faß.de/mcp"),
+        ("https://faß.de", "https://fass.de/mcp"),
+        ("https://other", "https://host/mcp"),
+        ("http://host", "https://host/mcp"),
+        ("https://host:8443", "https://host/mcp"),
+        ("https://host/other", "https://host/mcp"),
+        ("https://host/m", "https://host/mcp"),
+        ("https://host/a/../other", "https://host/a/../other/mcp"),
+        ("https://host/a", "https://host/a/../other"),
+        ("https://host/%2e%2e", "https://host/mcp"),
+        ("https://host", "https://host/%2E%2E/mcp"),
+        ("https://host/a%2fb", "https://host/a%2fb/mcp"),
+        ("https://host", "https://host/a%5Cb/mcp"),
+        ("https://host/a\\b", "https://host/a\\b/mcp"),
+        ("https://host", "https://host/a\\b/mcp"),
+        ("https://host/a//b", "https://host/a//b/mcp"),
+        ("https://host", "https://host/a//b/mcp"),
+        ("https://user@host", "https://host/mcp"),
+        ("https://host?query=1", "https://host/mcp"),
+        ("https://host#fragment", "https://host/mcp"),
+        ("https://host.evil", "https://host/mcp"),
+        ("https://evil.host", "https://host/mcp"),
+        ("https://host.", "https://host/mcp"),
+    ],
+)
+async def test_protected_resource_rejects_non_parent_or_ambiguous_url(
+    resource: str, server_url: str
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"resource": resource}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthError):
+            await discover_protected_resource(server_url, http_client=client)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_result", ["404", "html", "missing-resource"])
+async def test_protected_resource_path_probe_falls_back_to_root(
+    path_result: str,
+) -> None:
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        if request.url.path.endswith("/mcp"):
+            if path_result == "404":
+                return httpx.Response(404, request=request)
+            if path_result == "html":
+                return httpx.Response(200, text="<html>", request=request)
+            return httpx.Response(200, json={}, request=request)
+        return httpx.Response(200, json={"resource": "https://host"}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        metadata = await discover_protected_resource("https://host/mcp", http_client=client)
+
+    assert metadata.resource == "https://host"
+    assert requests == [
+        "https://host/.well-known/oauth-protected-resource/mcp",
+        "https://host/.well-known/oauth-protected-resource",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_protected_resource_root_redirect_is_unavailable_and_not_followed() -> None:
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        if request.url.path.endswith("/mcp"):
+            return httpx.Response(404, request=request)
+        return httpx.Response(
+            302, headers={"location": "https://other.test/metadata"}, request=request
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    ) as client:
+        metadata = await discover_protected_resource("https://host/mcp", http_client=client)
+
+    assert metadata == ProtectedResourceMetadata("https://host/mcp", None)
+    assert requests == [
+        "https://host/.well-known/oauth-protected-resource/mcp",
+        "https://host/.well-known/oauth-protected-resource",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_invalid_path_resource_is_strict_and_does_not_fall_back() -> None:
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(200, json={"resource": "https://other"}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthError, match="resource does not match"):
+            await discover_protected_resource("https://host/mcp", http_client=client)
+
+    assert requests == ["https://host/.well-known/oauth-protected-resource/mcp"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (httpx.Response(302), "returned HTTP 302"),
+        (httpx.Response(200, text="html"), "was not JSON"),
+        (httpx.Response(200, json=[]), "was not an object"),
+        (httpx.Response(200, json={}), "missing resource"),
+    ],
+)
+async def test_configured_resource_metadata_url_remains_strict(
+    response: httpx.Response, message: str
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        response.request = request
+        return response
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthError, match=message):
+            await discover_protected_resource(
+                "https://host/mcp",
+                resource_metadata_url="https://metadata.test/resource",
+                http_client=client,
+            )
 
 
 @pytest.mark.asyncio

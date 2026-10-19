@@ -715,6 +715,13 @@ class AgentTranscriptControl(UIControl):
             user_message(Text(displayed_user_text(message), style=theme.BODY))
         )
 
+    def pending_prompts(self, path: Path) -> tuple[str, ...]:
+        """Unconsumed follow-ups in the last applied snapshot of ``path``."""
+
+        if path != self._path or self._snapshot is None:
+            return ()
+        return self._snapshot.pending_prompts
+
     def scroll(self, amount: int) -> None:
         self.transcript.scroll_lines(amount)
 
@@ -817,6 +824,14 @@ class AgentNavigation:
         metadata = self._cached_agent_metadata(self.current_path)
         handle = metadata.get("handle")
         return handle if type(handle) is str and handle else None
+
+    def child_queued_messages(self) -> tuple[str, tuple[str, ...]] | None:
+        """Label and unconsumed follow-ups of the viewed child, or None in main."""
+
+        if not self.child_view_active:
+            return None
+        label = self.child_instance_id() or self.current_path.name
+        return label, self.transcript_control.pending_prompts(self.current_path)
 
     def todo_snapshot(self) -> TodoSnapshot | None:
         """Return only cached in-memory state for the selected session."""

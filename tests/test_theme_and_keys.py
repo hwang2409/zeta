@@ -328,7 +328,7 @@ def test_gruvbox_example_loads_from_user_theme_directory(tmp_path: Path) -> None
     assert notice is None
     assert palette == theme_module.GRUVBOX_DARK
     assert _apply_startup_theme("gruvbox-dark", home) == ()
-    assert theme_module.USER_BG == "on #3b3640"
+    assert theme_module.USER_BG == "on #3c3836"
     assert theme_module.SHELL_BG == "on #3a2d2a"
 
 
