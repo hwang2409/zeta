@@ -518,7 +518,6 @@ class SubmissionPipeline:
 
     def start_notification_wake(self) -> None:
         """Dispatch a queued notification wake through this pipeline."""
-
         self._notification_wake_requested = False
         if self._host.loop.notification_system_message() is None:
             return
