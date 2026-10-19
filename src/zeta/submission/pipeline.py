@@ -159,7 +159,7 @@ class SubmissionPipeline:
         self._provider_entry: _Entry | None = None
         self._provider_task: asyncio.Task[None] | None = None
         self._notification_wake_requested = False
-        self._notification_retry = NotificationWakeRetry(self._send)
+        self._notification_retry = NotificationWakeRetry(lambda: self._send(None))
         self._durable_tasks: dict[str, asyncio.Task[Any]] = {}
         self._control_entry: _Entry | None = None
         self._closed = False
