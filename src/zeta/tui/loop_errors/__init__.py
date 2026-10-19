@@ -27,7 +27,7 @@ def _write_diagnostics() -> None:
         path, record = _DIAGNOSTIC_QUEUE.get()
         try:
             write_tui_diagnostic(path, record)
-        except BaseException:  # noqa: BLE001 - diagnostics must never affect the TUI
+        except Exception:  # noqa: BLE001, S110 - diagnostics must never affect the TUI
             pass
 
 
@@ -43,7 +43,7 @@ def _schedule_diagnostic(path: Path, record: dict[str, Any]) -> None:
                 ).start()
                 _DIAGNOSTIC_WORKER_STARTED = True
         _DIAGNOSTIC_QUEUE.put_nowait((path, record))
-    except BaseException:  # noqa: BLE001 - diagnostics must never affect the TUI
+    except Exception:  # noqa: BLE001 - diagnostics must never affect the TUI
         return
 
 
