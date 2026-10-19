@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta.tools._shared import background_spawn
 import zeta.tools._shared.sandbox as sandbox_module
 import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
@@ -495,7 +496,25 @@ async def test_bash_task_cancellation_kills_process_group(
 
     assert spawned_process is not None
     assert spawned_process.returncode is not None
-    assert not marker.exists()
+    with pytest.raises(ProcessLookupError):
+        os.killpg(spawned_process.pid, 0)
+
+
+@pytest.mark.asyncio
+async def test_terminate_unregistered_drains_stdout_and_stderr() -> None:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import os,time; os.write(1, b'x' * 262144); os.write(2, b'x' * 262144); time.sleep(30)",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    await asyncio.wait_for(
+        background_spawn._terminate_unregistered(process, 0.01, 2), timeout=10
+    )
+    assert process.returncode is not None
 
 
 @pytest.mark.asyncio
