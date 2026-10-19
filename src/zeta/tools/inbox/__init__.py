@@ -229,23 +229,25 @@ async def _inbox(
 def register(registry: ToolRegistry) -> None:
     if not registry.inbox_enabled or registry.project_id is None:
         return
+    _register(registry, _ACTIONS)
+
+
+def register_send_only(registry: ToolRegistry) -> None:
+    if registry.project_id is None:
+        return
+    _register(registry, {"send": _ACTIONS["send"]})
+
+
+def _register(registry: ToolRegistry, actions: dict[str, ToolAction]) -> None:
     registry.register_session_tool(
         "inbox",
         _inbox,
-        actions=_ACTIONS,
-        description=(
-            "Project inbox actions.\n"
-            "send: send work or a message to a project.\n"
-            "list: list this project's messages by status (default new).\n"
-            "sent: read bounded, paged status for messages this project sent.\n"
-            "claim: atomically claim one new message before work.\n"
-            "done: complete a claimed message and optionally reply.\n"
-            "projects: list known project names and IDs."
-        ),
+        actions=actions,
+        description="Project inbox actions: " + ", ".join(actions),
         parameters={
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": list(_ACTIONS)},
+                "action": {"type": "string", "enum": list(actions)},
                 "project": {"type": "string"},
                 "kind": {"type": "string", "enum": sorted(KINDS)},
                 "title": {"type": "string"},

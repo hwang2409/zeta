@@ -5,15 +5,64 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..core.approval import parse_approval_rule
+from ..core.session import SessionManager
 from ..mcp.config import MCPConfig, home_config_path, load_mcp_config, tool_prefix
 from ..mcp.mount import MCPMount, mount_mcp_servers
+from ..project_errors import ProjectNotFoundError
 from ..tools import ToolRegistry
+from ..tools import inbox as inbox_tool
 from .models import Job
+
+
+def configure_inbox(job: Job, registry: ToolRegistry, home: Path) -> None:
+    rules = [parse_approval_rule(text) for text in job.allow]
+    inbox_rules = [rule for rule in rules if rule.tool == "inbox"]
+    if not inbox_rules:
+        return
+    project_registry = registry.project_registry or SessionManager(home).project_registry
+    project = project_registry.find_for_directory(job.cwd)
+    if project is None:
+        raise ValueError(
+            "inbox automation cwd must be inside a registered project"
+        )
+    registry.project_registry = project_registry
+    registry.project_id = project.project_id
+    registry.unregister("inbox")
+    inbox_tool.register_send_only(registry)
+    for rule in inbox_rules:
+        if rule.subject_pattern and any(
+            character in rule.subject_pattern for character in "*?["
+        ):
+            raise ValueError(
+                "inbox automation target must be a project name or id, not a wildcard; "
+                "use inbox(send <project>)"
+            )
+        resolved = registry.resolve_approval_rule(rule)
+        if resolved.action != "send" or resolved.subject_pattern is None:
+            raise ValueError(
+                "inbox automation rules must use scoped inbox(send <project>)"
+            )
+        if any(character in resolved.subject_pattern for character in "*?["):
+            raise ValueError(
+                "inbox automation target must be a project name or id, not a wildcard; "
+                "use inbox(send <project>)"
+            )
+        try:
+            project_registry.show_project(project_id=resolved.subject_pattern)
+        except ProjectNotFoundError:
+            try:
+                project_registry.show_project(name=resolved.subject_pattern)
+            except ProjectNotFoundError as exc:
+                raise ValueError(
+                    f"unknown inbox target project {resolved.subject_pattern!r}; "
+                    "use inbox(send <project>)"
+                ) from exc
 
 
 async def mount_services(job: Job, registry: ToolRegistry, home: Path) -> MCPMount:
     import os
 
+    configure_inbox(job, registry, home)
     config = load_mcp_config(
         os.environ.get("ZETA_MCP_CONFIG", str(home_config_path(home)))
     )

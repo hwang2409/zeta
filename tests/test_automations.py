@@ -78,7 +78,7 @@ from zeta.automations.daemon import daemon_lock, serve
 from zeta.automations.delivery import SlackDelivery
 from zeta.automations.models import instant, parse_job
 from zeta.automations.runner import _receipt, poll_events, run_claimed
-from zeta.automations.services import validate_permissions
+from zeta.automations.services import configure_inbox, validate_permissions
 from zeta.automations.store import SQLiteStore
 from zeta.automations.tick import tick
 from zeta.automations.trigger import Schedule, cron_matches, parse_trigger
@@ -86,6 +86,7 @@ from zeta.core.session import SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.mcp.config import load_mcp_config, server_to_json
 from zeta.mcp.mount import MCPMount
+from zeta.project_registry import ProjectRegistry
 from zeta.prompts import load_identity
 from zeta.protocol.types import (
     ASSISTANT_RESPONSE_SYNTHETIC,
@@ -121,6 +122,59 @@ def _job(tmp_path: Path, name: str = "brief", *, poll: bool = False):
 def _arm(store: SQLiteStore, job, now: datetime = START) -> None:
     state = store.draft(job)
     store.approve(job.name, state.revision, "U123", now)
+
+
+@pytest.mark.parametrize(
+    ("allow", "message"),
+    [
+        (("inbox",), "inbox\\(send <project>\\)"),
+        (("inbox(*)",), "wildcard"),
+        (("inbox(send missing)",), "unknown inbox target project"),
+    ],
+)
+def test_automation_inbox_rules_require_a_named_project(
+    tmp_path: Path, allow: tuple[str, ...], message: str
+) -> None:
+    home = tmp_path / ".zeta"
+    projects = ProjectRegistry(home / "projects")
+    projects.create_project("source", "source", tmp_path)
+    job = replace(_job(tmp_path), allow=allow)
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=discover_session_skills(home=home),
+        approval_policy=ApprovalPolicy(default=ApprovalDecision.DENY, always_allow=allow),
+        project_registry=projects,
+    )
+    try:
+        with pytest.raises(ValueError, match=message):
+            configure_inbox(job, registry, home)
+    finally:
+        asyncio.run(registry.close())
+
+
+def test_automation_inbox_registers_send_only_for_an_approved_target(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".zeta"
+    projects = ProjectRegistry(home / "projects")
+    projects.create_project("source", "source", tmp_path)
+    projects.create_project("target", "target")
+    allow = ("inbox(send target)",)
+    job = replace(_job(tmp_path), allow=allow)
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=discover_session_skills(home=home),
+        approval_policy=ApprovalPolicy(default=ApprovalDecision.DENY, always_allow=allow),
+        project_registry=projects,
+    )
+    try:
+        configure_inbox(job, registry, home)
+        assert registry.definitions_by_name["inbox"].actions.keys() == {"send"}
+        validate_permissions(job, registry)
+    finally:
+        asyncio.run(registry.close())
 
 
 @pytest.mark.parametrize(
