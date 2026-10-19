@@ -463,9 +463,23 @@ async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_bash_task_cancellation_kills_process_group(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     marker = tmp_path / "child-canceled"
+    spawned = asyncio.Event()
+    release_spawn = asyncio.Event()
+    spawned_process: asyncio.subprocess.Process | None = None
+    create_subprocess_shell = asyncio.create_subprocess_shell
+
+    async def hold_spawn(*args, **kwargs):
+        nonlocal spawned_process
+        process = await create_subprocess_shell(*args, **kwargs)
+        spawned_process = process
+        spawned.set()
+        await release_spawn.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", hold_spawn)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
@@ -473,12 +487,14 @@ async def test_bash_task_cancellation_kills_process_group(
         )
     )
 
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(spawned.wait(), timeout=2)
     task.cancel()
+    release_spawn.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.sleep(0.5)
 
+    assert spawned_process is not None
+    assert spawned_process.returncode is not None
     assert not marker.exists()
 
 

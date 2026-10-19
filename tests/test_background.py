@@ -131,6 +131,7 @@ class _GatedFakeBackend(FakeBackend):
     def __init__(self, turns: Sequence[ScriptedTurn], gated_prompt: str) -> None:
         super().__init__(turns)
         self.gated_prompt = gated_prompt
+        self.completion_started = asyncio.Event()
         self.completion_gate = asyncio.Event()
 
     async def complete(
@@ -146,6 +147,7 @@ class _GatedFakeBackend(FakeBackend):
         )
         async for event in super().complete(messages, tool_schemas):
             if gated:
+                self.completion_started.set()
                 await self.completion_gate.wait()
                 gated = False
             yield event
@@ -652,10 +654,7 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
 
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-        for _ in range(100):
-            if len(tracked) == 2:
-                break
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(backend.completion_started.wait(), timeout=5)
         assert len(tracked) == 2
         os.fstat(tracked[0].directory_fd)
 
