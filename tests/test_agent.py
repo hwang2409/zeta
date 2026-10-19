@@ -6693,6 +6693,70 @@ async def _start_task_gate(
 
 
 @pytest.mark.asyncio
+async def test_finish_gate_wait_outlives_default_bound_for_running_task(
+    tmp_path: Path,
+) -> None:
+    release = tmp_path / "release"
+    command = (
+        f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
+        "echo task-evidence"
+    )
+    backend = _TaskFinishGateBackend(command)
+    store = ConversationStore(tmp_path / "session")
+    owner = BackgroundAgentOwner(
+        store, finish_gate_timeout=5, finish_gate_task_timeout=0.5
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    run = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    await asyncio.sleep(0.2)
+    release.touch()
+    await asyncio.wait_for(run, timeout=2)
+    notification = await _wait_completion(store)
+    assert "task-evidence" in notification.data["text"]
+    assert notification.data.get("killed_task_ids") is None
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_task_without_exit_reports_safety_bound(
+    tmp_path: Path,
+) -> None:
+    backend = _TaskFinishGateBackend(_python("import time; time.sleep(30)"))
+    store = ConversationStore(tmp_path / "session")
+    owner = BackgroundAgentOwner(
+        store, finish_gate_timeout=0.02, finish_gate_task_timeout=0.05
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    run = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+
+    await asyncio.wait_for(run, timeout=2)
+    notification = await _wait_completion(store)
+    text = notification.data["text"]
+    assert "finish-gate task safety bound expired" in text
+    assert "background tasks killed on child completion" in text
+    assert notification.data.get("killed_task_ids")
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_child_finish_gate_lists_task_and_wakes_on_exit(tmp_path: Path) -> None:
     release = tmp_path / "release"
     command = (

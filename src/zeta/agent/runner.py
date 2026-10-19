@@ -57,7 +57,6 @@ from .receipt import (
 )
 
 logger = logging.getLogger(__name__)
-
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
 
@@ -65,6 +64,7 @@ if TYPE_CHECKING:
 @dataclass(slots=True)
 class _FinishGateState:
     deadline: float
+    task_deadline: float
     max_turns: int
     turns: int = 0
     handoff: tuple[str, str] | None = None
@@ -201,32 +201,28 @@ async def consume_child(
         tasks = owned_tasks()
         if final_message is not None and (children or tasks):
             fallback_message = final_message
+            now = asyncio.get_running_loop().time()
             gate_state = _FinishGateState(
-                deadline=(
-                    asyncio.get_running_loop().time()
-                    + child_loop._background_owner.finish_gate_timeout
-                ),
+                deadline=now + child_loop._background_owner.finish_gate_timeout,
+                task_deadline=float("inf"),
                 max_turns=child_loop._background_owner.finish_gate_max_turns,
             )
-            bound_exited = False
-
+            bound_exited = False; bound_reason: str | None = None
             async def handoff(arguments: dict[str, Any]) -> str:
                 gate_state.handoff = (arguments["reason"], arguments["outputs"])
                 return "background work handed off"
-
             async def consume_gate_events(events: AsyncIterator[StreamEvent]) -> bool:
                 try:
                     async with asyncio.timeout_at(gate_state.deadline):
                         return await consume_events(events, gate_state)
                 except TimeoutError:
-                    nonlocal bound_exited
-                    bound_exited = True
+                    nonlocal bound_exited, bound_reason
+                    bound_exited = True; bound_reason = "finish-gate bound expired"
                     return False
                 finally:
                     close = getattr(events, "aclose", None)
                     if close is not None:
                         await close()
-
             child_loop.tool_registry.register(
                 "agent_handoff",
                 handoff,
@@ -257,24 +253,21 @@ async def consume_child(
                     )
                 )
                 if gate_state.exhausted and gate_state.handoff is None:
-                    bound_exited = True
+                    bound_exited = True; bound_reason = "finish-gate turn bound expired"
+                gate_state.task_deadline = asyncio.get_running_loop().time() + child_loop._background_owner.finish_gate_task_timeout
                 while keep_going and failure_message is None:
                     children = owned_children()
                     tasks = owned_tasks()
                     pending_follow_up = bool(child_loop.store.pending_prompts())
-                    pending_notification = (
-                        child_loop.notification_system_message() is not None
-                    )
-                    if pending_follow_up:
-                        break
-                    if not children and not tasks and not pending_notification:
-                        break
+                    pending_notification = child_loop.notification_system_message() is not None
+                    if pending_follow_up: break
+                    if not children and not tasks and not pending_notification: break
                     if children or tasks:
-                        remaining = (
-                            gate_state.deadline - asyncio.get_running_loop().time()
-                        )
+                        now = asyncio.get_running_loop().time()
+                        deadlines = ([gate_state.deadline] if children else []) + ([gate_state.task_deadline] if tasks else [])
+                        remaining = min(deadlines) - now
                         if remaining <= 0:
-                            bound_exited = True
+                            bound_exited = True; bound_reason = "finish-gate task safety bound expired" if tasks and not children else "finish-gate bound expired"
                             break
                         try:
                             async with asyncio.timeout(remaining):
@@ -282,10 +275,9 @@ async def consume_child(
                                     child_loop.agent_instance_id or ""
                                 )
                         except TimeoutError:
-                            bound_exited = True
+                            bound_exited = True; bound_reason = "finish-gate task safety bound expired" if tasks and not children else "finish-gate bound expired"
                             break
-                    if child_loop.notification_system_message() is None:
-                        continue
+                    if child_loop.notification_system_message() is None: continue
                     keep_going = await consume_gate_events(
                         child_loop.run_notification_turn()
                     )
@@ -302,9 +294,19 @@ async def consume_child(
                         )
                     ],
                 )
-            elif (
-                bound_exited and (owned_children() or owned_tasks())
-            ) or final_message is None:
+            elif bound_exited and (owned_children() or owned_tasks()):
+                if bound_reason is not None and owned_tasks():
+                    fallback_message = Message(
+                        MessageRole.ASSISTANT,
+                        [
+                            TextContent(
+                                assistant_text(fallback_message)
+                                + f"\n{bound_reason}; running background tasks were killed."
+                            )
+                        ],
+                    )
+                final_message = fallback_message
+            elif final_message is None:
                 final_message = fallback_message
     except asyncio.CancelledError:
         raise

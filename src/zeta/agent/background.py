@@ -59,7 +59,8 @@ def finish_gate_message(
         "(c) hand off with agent_handoff, providing the reason and where "
         "the outputs will appear. Sub-agents continue under the parent, but "
         "background tasks cannot be adopted and will be killed when this "
-        "agent completes; task output remains in this child session's task archive."
+        "agent completes; task output remains in this child session's task archive. "
+        "A finish-gate safety bound applies if a task never exits."
     )
     return Message(
         MessageRole.USER,
@@ -96,6 +97,7 @@ class BackgroundAgentOwner:
         *,
         finish_gate_max_turns: int = 8,
         finish_gate_timeout: float = 600,
+        finish_gate_task_timeout: float = 3600,
     ) -> None:
         if type(finish_gate_max_turns) is not int or finish_gate_max_turns < 1:
             raise ValueError("finish_gate_max_turns must be a positive integer")
@@ -105,9 +107,19 @@ class BackgroundAgentOwner:
             or not finish_gate_timeout > 0
         ):
             raise ValueError("finish_gate_timeout must be positive")
+        if (
+            not isinstance(finish_gate_task_timeout, (int, float))
+            or isinstance(finish_gate_task_timeout, bool)
+            or not finish_gate_task_timeout > 0
+        ):
+            raise ValueError("finish_gate_task_timeout must be positive")
         self.notification_store = notification_store
         self.finish_gate_max_turns = finish_gate_max_turns
         self.finish_gate_timeout = float(finish_gate_timeout)
+        # Tasks may outlive the short model-turn safety bound. This internal
+        # bound is not a user setting; it only prevents an abandoned task from
+        # living forever when it never exits.
+        self.finish_gate_task_timeout = float(finish_gate_task_timeout)
         # Receipts and adopted descendants can outlive their immediate loop.
         # The tree owns child leases until root shutdown joins all watchers.
         self.store_leases = ExitStack()
