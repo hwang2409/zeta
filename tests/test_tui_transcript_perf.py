@@ -302,14 +302,26 @@ def test_bounded_agent_source_reads_only_active_branch_tail(tmp_path: Path) -> N
         source.refresh()
 
 
+def _open_fds_under(path: Path) -> list[int]:
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    root = path.resolve()
+    open_fds = []
+    for fd in os.listdir(fd_root):
+        try:
+            target = Path(os.path.realpath(os.readlink(fd_root / fd)))
+        except OSError:
+            continue
+        if target == root or root in target.parents:
+            open_fds.append(int(fd))
+    return open_fds
+
+
 @pytest.mark.asyncio
 async def test_finished_agent_cards_release_transcript_sources(
     tmp_path: Path,
 ) -> None:
     await asyncio.to_thread(lambda: None)
     baseline_tasks = set(asyncio.all_tasks())
-    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
-    baseline = len(os.listdir(fd_root))
     transcript = TranscriptWidget()
 
     for index in range(100):
@@ -349,7 +361,7 @@ async def test_finished_agent_cards_release_transcript_sources(
     pending = asyncio.all_tasks() - baseline_tasks - {asyncio.current_task()}
     await asyncio.gather(*pending)
 
-    assert len(os.listdir(fd_root)) == baseline
+    assert _open_fds_under(tmp_path) == []
     assert all(
         unit.card.transcript_source is None
         for unit in transcript._card_units.values()
