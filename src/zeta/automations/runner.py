@@ -112,7 +112,6 @@ async def run_claimed(
     if (
         not state.enabled
         or state.revision != occurrence.revision
-        or state.recipient is None
     ):
         status = "skipped" if webhook_body is not None else "canceled"
         detail = (
@@ -233,6 +232,9 @@ async def run_claimed(
             final = await turn(prompt)
             if not final:
                 raise ValueError("automation produced an empty response")
+            if job.deliver == "none":
+                store.finish(run_id, "completed")
+                return
             phase = "sending"
             store.finish(run_id, "sending", delivery=state.recipient)
             _receipt(
