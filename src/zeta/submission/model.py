@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -13,9 +14,11 @@ if TYPE_CHECKING:
     from ..core.approval import ApprovalPolicy
     from ..core.commands.custom_commands import CustomCommand
     from ..core.slash import SlashCommandRegistry
+    from ..model_input import ModelInputEnvelope
     from ..protocol.types import Message, StreamEvent
     from ..runtime.loop import AgentLoop
     from ..tui.composer import UndoCandidate
+    from .notification_retry import NotificationOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +33,39 @@ class Submission:
     next_image_token: int = 1
     steer: bool = True
     internal: bool = False
+
+
+class SubmissionState(StrEnum):
+    """States owned by the submission consumer."""
+
+    QUEUED = "queued"
+    PREPROCESSING = "preprocessing"
+    AWAITING_APPROVAL = "awaiting-approval"
+    READY = "ready"
+    DISPATCHED = "dispatched"
+    CANCELED = "canceled"
+    DENIED = "denied"
+
+
+@dataclass(slots=True)
+class _Entry:
+    submission: Submission
+    state: SubmissionState = SubmissionState.QUEUED
+    parsed: str = ""
+    model_input: ModelInputEnvelope | None = None
+    attachment_value: str | None = None
+    message: Message | None = None
+    candidate: UndoCandidate | None = None
+    signal: AbortSignal | None = None
+    child_task: asyncio.Task[object] | None = None
+    preprocessing: bool = False
+    persist_user_message: bool = True
+    acknowledge_on_provider_done: bool = False
+    completion: asyncio.Future[None] | None = None
+    acknowledged: asyncio.Future[None] | None = None
+    undo_requested: bool = False
+    denied: bool = False
+    printed: bool = False
 
 
 class SubmissionHost(Protocol):
@@ -66,7 +102,8 @@ class SubmissionHost(Protocol):
         abort_signal: AbortSignal,
         persist_user_message: bool = True,
         notification: bool = False,
-    ) -> asyncio.Task[None]: ...
+        suppress_errors: bool = False,
+    ) -> asyncio.Task[NotificationOutcome]: ...
     def _set_pipeline_task(self, task: asyncio.Task[object]) -> None: ...
     async def _run_macro_submission(
         self,
@@ -91,12 +128,13 @@ def dispatch_provider(
     entry: ProviderEntry,
     *,
     user_text: str,
-    on_done: Callable[[Submission, asyncio.Task[None]], None],
+    on_done: Callable[[Submission, asyncio.Task[NotificationOutcome]], None],
     abort_signal: AbortSignal,
     user_message: Message | None = None,
     persist_user_message: bool = True,
     notification: bool = False,
-) -> asyncio.Task[None]:
+    suppress_errors: bool = False,
+) -> asyncio.Task[NotificationOutcome]:
     task = host._start_turn(
         user_text,
         user_message=user_message,
@@ -104,6 +142,7 @@ def dispatch_provider(
         abort_signal=abort_signal,
         persist_user_message=persist_user_message,
         notification=notification,
+        suppress_errors=suppress_errors,
     )
     task.add_done_callback(lambda completed: on_done(entry.submission, completed))
     return task

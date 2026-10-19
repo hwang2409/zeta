@@ -25,7 +25,7 @@ from .webhook import DEFAULT_WEBHOOK_PORT
 class Review:
     name: str
     revision: int
-    recipient: str
+    recipient: str | None
     token: str
     text: str
     inbox_target_ids: tuple[str, ...] = ()
@@ -42,9 +42,16 @@ async def review_job(store: SQLiteStore, name: str, home: Path) -> Review:
     )
     mount = None
     try:
-        grants = resolve_inbox_grants(state.job, registry.project_registry or SessionManager(home).project_registry)
+        grants = resolve_inbox_grants(
+            state.job,
+            registry.project_registry or SessionManager(home).project_registry,
+        )
         mount = await mount_services(state.job, registry, home, grants)
-        recipient = await SlackDelivery(mount).resolve(state.job.deliver)
+        recipient = (
+            await SlackDelivery(mount).resolve(state.job.deliver)
+            if state.job.deliver != "none"
+            else None
+        )
         if store.get(name).revision != state.revision:
             raise ValueError("draft changed during review; inspect the new revision")
         targets = grants.target_ids if grants is not None else ()
@@ -63,7 +70,11 @@ async def review_job(store: SQLiteStore, name: str, home: Path) -> Review:
             recipient,
             token,
             show(store, name)
-            + f"\nResolved recipient: {recipient}"
+            + (
+                f"\nResolved recipient: {recipient}"
+                if recipient is not None
+                else "\nNo delivery configured."
+            )
             + ("\nResolved inbox targets: " + target_display if targets else "")
             + f"\nApproval token: {token}",
             tuple(targets),
@@ -93,7 +104,10 @@ async def slash(args: str, *, home: Path, cwd: str) -> str:
             store.approve(
                 review.name, review.revision, review.recipient, datetime.now(UTC), review.inbox_target_ids
             )
-            return f"{review.name} r{review.revision} armed for {review.recipient}."
+            return (
+                f"{review.name} r{review.revision} armed"
+                + (f" for {review.recipient}." if review.recipient else ".")
+            )
         if parts[0] == "disable" and len(parts) == 2:
             store.disable(parts[1])
             return f"{parts[1]} disabled."

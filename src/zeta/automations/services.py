@@ -21,7 +21,6 @@ class InboxGrants:
     source_id: str
     target_ids: tuple[str, ...]
 
-
 def resolve_inbox_grants(job: Job, project_registry) -> InboxGrants | None:
     rules = [parse_approval_rule(text) for text in job.allow]
     inbox_rules = [rule for rule in rules if rule.tool == "inbox"]
@@ -70,34 +69,69 @@ def configure_inbox(
     inbox_tool.register_send_only(registry)
 
 
-async def mount_services(job: Job, registry: ToolRegistry, home: Path, grants=None) -> MCPMount:
+async def mount_services(
+    job: Job,
+    registry: ToolRegistry,
+    home: Path,
+    grants: InboxGrants | None = None,
+) -> MCPMount:
     configure_inbox(job, registry, home, grants)
-    config = load_mcp_config(os.environ.get("ZETA_MCP_CONFIG", str(home_config_path(home))))
-    selected = set(job.servers) | {"slack"}
+    config = load_mcp_config(
+        os.environ.get("ZETA_MCP_CONFIG", str(home_config_path(home)))
+    )
+    delivery_tool = "slack__slack_send_message" if job.deliver != "none" else None
+    selected = set(job.servers)
+    if delivery_tool:
+        selected.add("slack")
     missing = selected - config.servers.keys()
     if missing:
         raise ValueError(f"unavailable MCP configuration: {', '.join(sorted(missing))}")
-    slack = config.servers["slack"]
-    if slack.url != "https://mcp.slack.com/mcp" or slack.auth_type != "oauth":
-        raise ValueError("slack must use the official https://mcp.slack.com/mcp endpoint with OAuth")
-    subset = MCPConfig(config.path, {name: config.servers[name] for name in sorted(selected)}, sources={name: config.sources[name] for name in selected if name in config.sources})
+    if delivery_tool:
+        slack = config.servers["slack"]
+        if slack.url != "https://mcp.slack.com/mcp" or slack.auth_type != "oauth":
+            raise ValueError(
+                "slack must use the official https://mcp.slack.com/mcp endpoint with OAuth"
+            )
+    subset = MCPConfig(
+        config.path,
+        {name: config.servers[name] for name in sorted(selected)},
+        sources={
+            name: config.sources[name] for name in selected if name in config.sources
+        },
+    )
     mount = await mount_mcp_servers(registry, subset, home=str(home))
     try:
         failed = [name for name, status in mount.statuses.items() if status.state != "mounted"]
         if failed:
             raise ValueError(f"MCP servers failed to mount: {', '.join(failed)}; check /mcp status and authentication")
         requested = [parse_approval_rule(text).tool for text in job.allow]
-        requested.append("slack__slack_send_message")
+        if delivery_tool:
+            requested.append(delivery_tool)
+        # Only names owned by a selected MCP catalog (matched by exact server
+        # prefix) go through activation; built-ins like ``read`` are already
+        # registered and are validated the normal way below. MCP-prefixed
+        # names that collide with foreign definitions still fail activation.
         catalog_prefixes = tuple(tool_prefix(name) for name in selected)
         catalog_requested = [name for name in requested if name.startswith(catalog_prefixes)]
         _activated, rejected = mount.activate_tools(registry, catalog_requested)
         if rejected:
+            if delivery_tool and any(
+                item.startswith(delivery_tool) for item in rejected
+            ):
+                raise ValueError(
+                    "delivery to slack needs slack__slack_send_message, which the slack MCP server does not offer (the token may lack chat:write); omit deliver or grant chat:write"
+                )
             raise ValueError("MCP tool activation failed: " + "; ".join(rejected))
         validate_permissions(job, registry)
-        sender = registry.definitions_by_name.get("slack__slack_send_message")
-        properties = sender.parameters.get("properties", {}) if sender is not None else {}
-        if not {"channel_id", "message"} <= properties.keys():
-            raise ValueError("Slack delivery tool is unavailable or has an incompatible schema; check chat:write scope")
+        if delivery_tool:
+            sender = registry.definitions_by_name.get(delivery_tool)
+            properties = (
+                sender.parameters.get("properties", {}) if sender is not None else {}
+            )
+            if not {"channel_id", "message"} <= properties.keys():
+                raise ValueError(
+                    "delivery to slack needs slack__slack_send_message, which the slack MCP server does not offer (the token may lack chat:write); omit deliver or grant chat:write"
+                )
         return mount
     except BaseException:
         await mount.close()

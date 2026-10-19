@@ -38,6 +38,7 @@ from ..protocol.types import (
     with_message_origin,
 )
 from ..runtime.loop.empty_turn import MAX_TOKENS_THINKING_NOTICE
+from ..submission.notification_retry import NotificationFailure, NotificationOutcome
 from . import theme
 from ._attachments import (
     ATTACHMENT_MAX_TEXT_BYTES,  # noqa: F401 - preserve the composer import
@@ -158,7 +159,8 @@ class TurnConsumerMixin:
         persist_user_message: bool = True,
         abort_signal: Any | None = None,
         notification: bool = False,
-    ) -> None:
+        suppress_errors: bool = False,
+    ) -> NotificationOutcome:
         if not notification:
             user_text, user_message = self._consume_macro_receipts(
                 user_text, user_message
@@ -191,6 +193,7 @@ class TurnConsumerMixin:
             origin,
         )
         turn_failed = False
+        notification_failure: NotificationFailure | None = None
         try:
             events = (
                 self.loop.run_notification_turn(abort_signal=turn_abort_signal)
@@ -204,6 +207,19 @@ class TurnConsumerMixin:
                 )
             )
             async for event in events:
+                if notification and event.type is StreamEventType.ERROR:
+                    notification_failure = NotificationFailure(
+                        event.error or ErrorInfo("backend_error", "notification turn failed"),
+                        event.data,
+                    )
+                elif (
+                    notification
+                    and event.type is StreamEventType.MESSAGE_END
+                    and event.data.get("stop_reason") == "refusal"
+                ):
+                    notification_failure = NotificationFailure(
+                        ErrorInfo("refusal", "provider refused the notification turn")
+                    )
                 self._update_usage(event)
                 self._usage_tracker.record(event.type, self.model)
                 self._prepare_stream_event(event)
@@ -261,19 +277,13 @@ class TurnConsumerMixin:
                             StreamEventType.ERROR,
                             StreamEventType.AGENT_NOTIFICATION,
                         }:
-                            self._print_unit(
+                            turn_failed |= self._print_special_event(
+                                event,
                                 rendered,
-                                blank_before=(
-                                    event.type is StreamEventType.AGENT_NOTIFICATION
-                                ),
+                                suppress_errors=suppress_errors or notification,
+                                user_text=user_text,
+                                retry_message=retry_message,
                             )
-                            if (
-                                event.type is StreamEventType.ERROR
-                                and is_retryable_error(event.error)
-                            ):
-                                turn_failed = True
-                                self._failed_turn = (user_text, retry_message)
-                                self._turn_had_visible_output = True
                         else:
                             self._print(rendered)
                 self._invalidate_prompt()
@@ -287,22 +297,13 @@ class TurnConsumerMixin:
             self._print_unit(Text("[aborted]", style=theme.WARNING))
             raise
         except Exception as exc:
+            if notification:
+                notification_failure = NotificationFailure(exc)
             self._flush_stream_kind(preserve_inline=True)
             self._presenter.reset_assistant_unit()
             self._reset_stream_state()
             self._loop_state = "idle"
-            try:
-                message = str(exc).strip() or type(exc).__name__
-            except Exception:
-                message = "unexpected ui error"
-            self._print_unit(
-                render_event(
-                    StreamEvent(
-                        StreamEventType.ERROR,
-                        error=ErrorInfo("ui_error", message),
-                    )
-                )
-            )
+            self._print_ui_error(exc, suppress=suppress_errors)
         finally:
             self._usage_tracker.record_compaction(self.model)
             self._presenter.clear_active_tool_calls()
@@ -316,6 +317,45 @@ class TurnConsumerMixin:
             spinner_task.cancel()
             await asyncio.gather(spinner_task, return_exceptions=True)
             self._finish_stream_invalidation()
+        return notification_failure
+
+    def _print_special_event(
+        self,
+        event: StreamEvent,
+        rendered: Any,
+        *,
+        suppress_errors: bool,
+        user_text: str,
+        retry_message: Message,
+    ) -> bool:
+        if not (suppress_errors and event.type is StreamEventType.ERROR):
+            self._print_unit(
+                rendered,
+                blank_before=event.type is StreamEventType.AGENT_NOTIFICATION,
+            )
+        if event.type is not StreamEventType.ERROR or not is_retryable_error(
+            event.error
+        ):
+            return False
+        self._failed_turn = (user_text, retry_message)
+        self._turn_had_visible_output = True
+        return True
+
+    def _print_ui_error(self, exc: Exception, *, suppress: bool) -> None:
+        if suppress:
+            return
+        try:
+            message = str(exc).strip() or type(exc).__name__
+        except Exception:
+            message = "unexpected ui error"
+        self._print_unit(
+            render_event(
+                StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo("ui_error", message),
+                )
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -752,7 +792,8 @@ class ComposerAttachmentMixin:
         submission_id: int | None = None,
         abort_signal: Any | None = None,
         notification: bool = False,
-    ) -> asyncio.Task[None]:
+        suppress_errors: bool = False,
+    ) -> asyncio.Task[NotificationOutcome]:
         self._loop_state = "streaming"
         self._active_turn_submission_id = submission_id
         task = asyncio.create_task(
@@ -762,6 +803,7 @@ class ComposerAttachmentMixin:
                 persist_user_message=persist_user_message,
                 abort_signal=abort_signal,
                 notification=notification,
+                suppress_errors=suppress_errors,
             )
         )
         self._active_task = task

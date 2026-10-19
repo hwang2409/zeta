@@ -239,13 +239,26 @@ class SQLiteStore:
             raise ValueError(f"unknown automation: {name}")
         return self._state(row)
 
-    def approve(self, name: str, revision: int, recipient: str, now: datetime, inbox_target_ids: tuple[str, ...] = ()) -> None:
-        if not recipient or recipient[0] not in "CUGD" or not recipient.isalnum():
-            raise ValueError(
-                "approval requires a resolved Slack user or conversation ID"
-            )
+    def approve(
+        self,
+        name: str,
+        revision: int,
+        recipient: str | None,
+        now: datetime,
+        inbox_target_ids: tuple[str, ...] = (),
+    ) -> None:
         with self._transaction():
             state = self.get(name)
+            if (recipient is None) != (state.job.deliver == "none"):
+                raise ValueError(
+                    "approval recipient must match the job delivery configuration"
+                )
+            if recipient is not None and (
+                not recipient or recipient[0] not in "CUGD" or not recipient.isalnum()
+            ):
+                raise ValueError(
+                    "approval requires a resolved Slack user or conversation ID"
+                )
             if state.revision != revision:
                 raise ValueError("draft changed; inspect and approve the new revision")
             if state.enabled:

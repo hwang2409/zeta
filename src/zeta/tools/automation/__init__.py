@@ -75,6 +75,7 @@ def register(registry: ToolRegistry) -> None:
             "inert and cannot run: the human arms an exact revision with "
             "/automations approve, which is where tool permissions and the Slack "
             "recipient are granted. Tell the user to run it after drafting. "
+            "Omit deliver when the job's output is a tool effect such as an inbox send. "
             "Editing a job suspends future runs until it is approved again."
         ),
         parameters={
@@ -98,13 +99,13 @@ def register(registry: ToolRegistry) -> None:
                         },
                         "deliver": {
                             "type": "string",
-                            "description": "slack:@name, slack:#channel, or slack:<Slack ID>",
+                            "description": "omit deliver when the job's output is a tool effect such as an inbox send; otherwise slack:@name, slack:#channel, or slack:<Slack ID>",
                         },
                         "provider": {"type": "string"},
                         "model": {"type": "string"},
                         "cwd": {"type": "string"},
                     },
-                    "required": ["prompt", "trigger", "servers", "allow", "deliver"],
+                    "required": ["prompt", "trigger", "servers", "allow"],
                     "additionalProperties": False,
                 },
             },

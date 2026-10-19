@@ -19,6 +19,7 @@ from .._shared.process import (
     _child_priority_preexec,
     _kill_and_reap,
     create_subprocess_shell_in_fd,
+    spawn_background,
     tool_subprocess_env,
 )
 from .._shared.sandbox import expand_user_path
@@ -244,7 +245,7 @@ async def _bash(
         if approved_cwd is not None:
             cwd_fd = _open_approved_cwd(registry, approved_cwd)
             try:
-                process = await create_subprocess_shell_in_fd(
+                spawn = create_subprocess_shell_in_fd(
                     command,
                     cwd_fd,
                     stdin=asyncio.subprocess.DEVNULL,
@@ -255,10 +256,16 @@ async def _bash(
                     env=tool_subprocess_env(),
                     preexec_fn=_child_priority_preexec(registry.command_niceness),
                 )
+                process = await spawn_background(
+                    spawn,
+                    require_open=lambda: None,
+                    term_grace=0.1,
+                    cleanup_timeout=1.0,
+                )
             finally:
                 os.close(cwd_fd)
         else:
-            process = await asyncio.create_subprocess_shell(
+            spawn = asyncio.create_subprocess_shell(
                 command,
                 cwd=registry.cwd,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -268,6 +275,12 @@ async def _bash(
                 pass_fds=(write_fd,),
                 env=tool_subprocess_env(),
                 preexec_fn=_child_priority_preexec(registry.command_niceness),
+            )
+            process = await spawn_background(
+                spawn,
+                require_open=lambda: None,
+                term_grace=0.1,
+                cleanup_timeout=1.0,
             )
         os.close(write_fd)
         write_fd = -1

@@ -75,12 +75,14 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.automations import commands
 from zeta.automations import runner as automation_runner
 from zeta.automations.authoring import import_jobs, listing, resolve_job
+from zeta.automations.commands import review_job
 from zeta.automations.daemon import daemon_lock, serve
 from zeta.automations.delivery import SlackDelivery
 from zeta.automations.models import instant, parse_job
 from zeta.automations.runner import _receipt, poll_events, run_claimed
 from zeta.automations.services import (
     configure_inbox,
+    mount_services,
     resolve_inbox_grants,
     validate_permissions,
 )
@@ -105,6 +107,171 @@ from zeta.skills import discover_session_skills
 
 START = datetime(2026, 9, 9, 11, 0, tzinfo=UTC)
 DUE = START + timedelta(hours=1)
+
+
+async def test_no_delivery_job_approves_and_runs_without_slack_config(
+    tmp_path: Path,
+) -> None:
+    document = _job(tmp_path).document()
+    document.pop("deliver")
+    document["servers"] = []
+    job = parse_job("inbox-only", document)
+    with SQLiteStore(tmp_path) as store:
+        state = store.draft(job)
+        review = await review_job(store, job.name, tmp_path)
+        assert review.recipient is None
+        store.approve(job.name, state.revision, review.recipient, START)
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=tmp_path,
+            backend=FakeBackend([ScriptedTurn(content=[TextContent("sent")])]),
+            mount_factory=mount_services,
+        )
+        run = store.runs(job.name)[0]
+        assert run.status == "completed"
+        assert run.delivery == ""
+
+
+async def test_no_delivery_job_with_inbox_grant_approves_and_sends_without_slack_config(
+    tmp_path: Path,
+) -> None:
+    projects = ProjectRegistry(tmp_path / "projects")
+    source = projects.create_project("source", "source", tmp_path)
+    target = projects.create_project("target", "target")
+    document = _job(tmp_path).document()
+    document.pop("deliver")
+    document["servers"] = []
+    document["allow"] = ["inbox(send target)"]
+    job = parse_job("inbox-only", document)
+
+    with SQLiteStore(tmp_path) as store:
+        state = store.draft(job)
+        review = await review_job(store, job.name, tmp_path)
+        assert review.recipient is None
+        assert review.inbox_target_ids == (target.project_id,)
+        store.approve(
+            job.name,
+            state.revision,
+            review.recipient,
+            START,
+            review.inbox_target_ids,
+        )
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        assert run_id
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=tmp_path,
+            backend=FakeBackend(
+                [
+                    ScriptedTurn(
+                        tool_calls=[
+                            ToolCall(
+                                "send",
+                                "inbox",
+                                {
+                                    "action": "send",
+                                    "project": "target",
+                                    "kind": "question",
+                                    "title": "title",
+                                    "body": "body",
+                                },
+                            )
+                        ]
+                    ),
+                    ScriptedTurn(content=[TextContent("sent")]),
+                ]
+            ),
+            mount_factory=mount_services,
+        )
+        run = store.runs(job.name)[0]
+        assert run.status == "completed", run.detail
+        assert run.delivery == ""
+
+    messages = ProjectInbox(
+        projects, sessions_root=tmp_path / "sessions"
+    ).list(target.project_id)
+    assert len(messages["new"]) == 1
+    message = messages["new"][0]
+    assert message["from"] == {
+        "project": source.project_id,
+        "session": run.session_id,
+    }
+
+
+def test_approve_rejects_recipient_delivery_mismatch(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        delivery = _job(tmp_path)
+        state = store.draft(delivery)
+        with pytest.raises(ValueError, match="recipient must match"):
+            store.approve(delivery.name, state.revision, None, START)
+        no_delivery = parse_job(
+            "inbox-only",
+            {**delivery.document(), "servers": [], "deliver": "none"},
+        )
+        state = store.draft(no_delivery)
+        with pytest.raises(ValueError, match="recipient must match"):
+            store.approve(no_delivery.name, state.revision, "U123", START)
+
+
+def test_automation_schema_does_not_require_delivery() -> None:
+    registry = ToolRegistry(
+        Path.cwd(), register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    from zeta.tools.automation import register
+
+    register(registry)
+    schema = registry.definitions_by_name["automation"].parameters
+    assert "deliver" not in schema["properties"]["job"]["required"]
+
+
+async def test_runtime_missing_delivery_tool_has_actionable_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from tests.test_mcp import _FakeClient
+    from zeta.mcp import mount as mount_module
+
+    class Client(_FakeClient):
+        async def list_tools(self):
+            return []
+
+    monkeypatch.setattr(mount_module, "_build_client", Client)
+    (tmp_path / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "slack": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.slack.com/mcp",
+                        "auth": {"type": "oauth"},
+                    }
+                }
+            }
+        )
+    )
+    job = _job(tmp_path)
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, job)
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=tmp_path,
+            backend=FakeBackend([ScriptedTurn(content=[TextContent("sent")])]),
+            mount_factory=mount_services,
+        )
+        run = store.runs(job.name)[0]
+        assert run.status == "failed"
+        assert "delivery to slack needs slack__slack_send_message" in run.detail
 
 
 def _job(tmp_path: Path, name: str = "brief", *, poll: bool = False):
@@ -1537,7 +1704,9 @@ def _slack_deferred_config() -> dict[str, object]:
     }
 
 
-def _slack_deferred_client_factory(monkeypatch, *, extra_tools: int = 40):
+def _slack_deferred_client_factory(
+    monkeypatch, *, extra_tools: int = 40, include_send: bool = True
+):
     """Patch the MCP client builder so 'slack' exposes >32 tools (deferred path)."""
     from tests.test_mcp import _FakeClient
     from zeta.mcp import mount as mount_module
@@ -1550,19 +1719,22 @@ def _slack_deferred_client_factory(monkeypatch, *, extra_tools: int = 40):
                     "history",
                     "read channel history",
                     {"type": "object", "properties": {"channel": {"type": "string"}}},
-                ),
-                MCPTool(
-                    "slack_send_message",
-                    "send a message",
-                    {
-                        "type": "object",
-                        "properties": {
-                            "channel_id": {"type": "string"},
-                            "message": {"type": "string"},
-                        },
-                    },
-                ),
+                )
             ]
+            if include_send:
+                tools.append(
+                    MCPTool(
+                        "slack_send_message",
+                        "send a message",
+                        {
+                            "type": "object",
+                            "properties": {
+                                "channel_id": {"type": "string"},
+                                "message": {"type": "string"},
+                            },
+                        },
+                    )
+                )
             tools += [
                 MCPTool(f"tool_{i}", f"filler {i}", {"type": "object"})
                 for i in range(extra_tools)
@@ -1572,6 +1744,21 @@ def _slack_deferred_client_factory(monkeypatch, *, extra_tools: int = 40):
     monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
     monkeypatch.setattr(mount_module, "_build_client", Client)
     return Client
+
+
+async def test_approval_rejects_missing_delivery_tool_with_actionable_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from zeta.automations.services import mount_services
+
+    _slack_deferred_client_factory(monkeypatch, include_send=False)
+    (tmp_path / "mcp.json").write_text(
+        json.dumps({"servers": {"slack": _slack_deferred_config()}})
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    with pytest.raises(ValueError, match="delivery to slack needs slack__slack_send_message"):
+        await mount_services(_job(tmp_path), registry, tmp_path)
+    await registry.close()
 
 
 async def test_deferred_catalog_allows_scoped_rule_and_activates_delivery_tool(

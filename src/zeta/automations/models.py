@@ -110,14 +110,18 @@ def parse_job(name: str, value: object) -> Job:
         "trigger",
         "servers",
         "allow",
-        "deliver",
         "provider",
         "model",
         "cwd",
     }
-    if set(value) != required:
-        raise ValueError(f"job fields must be: {', '.join(sorted(required))}")
-    for field in ("prompt", "deliver", "provider", "model", "cwd"):
+    missing = required - set(value)
+    extra = set(value) - required - {"deliver"}
+    if missing or extra:
+        fields = required | {"deliver"} | set(value)
+        raise ValueError(f"job fields must be: {', '.join(sorted(fields))}")
+    value = dict(value)
+    value.setdefault("deliver", "none")
+    for field in ("prompt", "provider", "model", "cwd"):
         if not isinstance(value[field], str) or not value[field].strip():
             raise ValueError(f"{field} must be a nonempty string")
     for field in ("servers", "allow"):
@@ -130,8 +134,10 @@ def parse_job(name: str, value: object) -> Job:
     validate_provider(value["provider"])
     if not Path(value["cwd"]).is_absolute():
         raise ValueError("cwd must be an absolute path on the daemon host")
-    if not value["deliver"].startswith("slack:") or not value["deliver"][6:].strip():
-        raise ValueError("deliver must be slack:<user or channel>")
+    if value["deliver"] != "none" and (
+        not value["deliver"].startswith("slack:") or not value["deliver"][6:].strip()
+    ):
+        raise ValueError("deliver must be slack:<user or channel> or none")
     for rule_text in value["allow"]:
         rule = parse_approval_rule(rule_text)
         if "__" in rule.tool and rule.tool.split("__", 1)[0] not in value["servers"]:

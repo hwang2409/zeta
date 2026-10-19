@@ -117,12 +117,16 @@ async def _terminate_unregistered(
     if process.stdin is not None:
         process.stdin.close()
 
-    async def drain() -> None:
-        if process.stdout is not None:
-            while await process.stdout.read(65_536):
+    async def drain(reader: asyncio.StreamReader | None) -> None:
+        if reader is not None:
+            while await reader.read(65_536):
                 pass
 
-    reader = asyncio.create_task(drain())
+    readers = [
+        asyncio.create_task(drain(reader))
+        for reader in (process.stdout, process.stderr)
+        if reader is not None
+    ]
     try:
         _signal_group(process, signal.SIGTERM)
         try:
@@ -132,7 +136,7 @@ async def _terminate_unregistered(
         if _group_exists(process.pid):
             _signal_group(process, signal.SIGKILL)
         await asyncio.wait_for(
-            asyncio.gather(process.wait(), reader), timeout=cleanup_timeout,
+            asyncio.gather(process.wait(), *readers), timeout=cleanup_timeout,
         )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + cleanup_timeout
@@ -141,6 +145,7 @@ async def _terminate_unregistered(
                 raise RuntimeError("background process group survived canceled start")
             await asyncio.sleep(0.01)
     finally:
-        if not reader.done():
-            reader.cancel()
-        await asyncio.gather(reader, return_exceptions=True)
+        for reader in readers:
+            if not reader.done():
+                reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
