@@ -371,21 +371,36 @@ async def test_failed_notification_wake_schedules_one_timer_without_busy_loop(
 async def test_failed_notification_turn_after_persistence_retries_from_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    backend = _NotificationBackend(failures={0, 2})
+    backend = _NotificationBackend(failures={0, 1, 3})
     app = _notification_app(tmp_path, backend)
     timers = _capture_notification_timers(monkeypatch, app)
 
     app._submissions.wake()
     await _wait(lambda: len(timers) == 1)
-    entries = app.loop.store.entries()
+    entries = app.loop.store.entries
     assert [entry.type for entry in entries].count("notification_ack") == 1
     assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
-    assert not any(message.role is MessageRole.ASSISTANT for message in app.loop.store.messages())
+    assert not any(
+        message.role is MessageRole.ASSISTANT
+        and not message.metadata.get("turn_failed")
+        for message in app.loop.store.messages()
+    )
 
     timers[0][1].fire()
-    await _wait(lambda: len(backend.calls) == 2 and not app._submissions.active)
+    await _wait(lambda: len(timers) == 2)
+    assert len(backend.calls) == 2
+    assert timers[1][0] == 2.0
+    assert app.console.file.getvalue().count("provider stopped") == 1
     assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
-    assert sum(message.role is MessageRole.ASSISTANT for message in app.loop.store.messages()) == 1
+
+    timers[1][1].fire()
+    await _wait(lambda: len(backend.calls) == 3 and not app._submissions.active)
+    assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
+    assert sum(
+        message.role is MessageRole.ASSISTANT
+        and not message.metadata.get("turn_failed")
+        for message in app.loop.store.messages()
+    ) == 1
 
     app.loop.store.append_agent_notification(
         "child-2",
@@ -395,8 +410,8 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
         text="done again",
     )
     app._submissions.wake()
-    await _wait(lambda: len(timers) == 2)
-    assert timers[1][0] == 1.0
+    await _wait(lambda: len(timers) == 3)
+    assert timers[2][0] == 1.0
     await app._submissions.close()
     await app.loop.close()
 

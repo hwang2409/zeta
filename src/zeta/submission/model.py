@@ -66,7 +66,8 @@ class SubmissionHost(Protocol):
         abort_signal: AbortSignal,
         persist_user_message: bool = True,
         notification: bool = False,
-    ) -> asyncio.Task[None]: ...
+        suppress_errors: bool = False,
+    ) -> asyncio.Task[bool]: ...
     def _set_pipeline_task(self, task: asyncio.Task[object]) -> None: ...
     async def _run_macro_submission(
         self,
@@ -91,12 +92,13 @@ def dispatch_provider(
     entry: ProviderEntry,
     *,
     user_text: str,
-    on_done: Callable[[Submission, asyncio.Task[None]], None],
+    on_done: Callable[[Submission, asyncio.Task[bool]], None],
     abort_signal: AbortSignal,
     user_message: Message | None = None,
     persist_user_message: bool = True,
     notification: bool = False,
-) -> asyncio.Task[None]:
+    suppress_errors: bool = False,
+) -> asyncio.Task[bool]:
     task = host._start_turn(
         user_text,
         user_message=user_message,
@@ -104,6 +106,7 @@ def dispatch_provider(
         abort_signal=abort_signal,
         persist_user_message=persist_user_message,
         notification=notification,
+        suppress_errors=suppress_errors,
     )
     task.add_done_callback(lambda completed: on_done(entry.submission, completed))
     return task

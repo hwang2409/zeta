@@ -123,10 +123,18 @@ class NotificationWake:
             if self.state != "idle":
                 raise RuntimeError("a turn is already running")
             message = None
+            self._plain_retry_pending = False
             self._running_notification_turn = False
             self._running_plain_retry = False
         self.state = "running"
         return message
+
+    def schedule_history_retry(self) -> None:
+        """Schedule a notification turn from already-persisted history."""
+
+        if self.state != "idle":
+            raise RuntimeError("notification retry requires an idle turn")
+        self._plain_retry_pending = True
 
     def retry_after_foreground_abort(self) -> bool:
         """Request one retry for the active or scheduled notification turn."""
@@ -317,6 +325,9 @@ class AgentNotificationMixin:
 
     def schedule_notification_turn(self) -> bool:
         return self.notification_wake.schedule()
+
+    def schedule_notification_history_retry(self) -> None:
+        self.notification_wake.schedule_history_retry()
 
     @property
     def notification_turn_state(self) -> WakeState:

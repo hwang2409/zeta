@@ -32,6 +32,7 @@ from ..tools._shared.shell import (
 from ..tui.composer import UndoCandidate, parse_input
 from ..tui.user import USER_DISPLAY_TEXT_METADATA
 from .model import Submission, SubmissionHost, dispatch_provider
+from .notification_retry import NotificationRetry
 
 
 class SubmissionState(StrEnum):
@@ -80,7 +81,7 @@ class _CommandDone:
 @dataclass(frozen=True, slots=True)
 class _ProviderDone:
     submission: Submission
-    task: asyncio.Task[None]
+    task: asyncio.Task[bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +134,7 @@ class _Entry:
     undo_requested: bool = False
     denied: bool = False
     printed: bool = False
+    notification: bool = False
 
 
 class SubmissionPipeline:
@@ -158,15 +160,15 @@ class SubmissionPipeline:
         self._command_order: deque[int] = deque()
         self._command_results: dict[int, str | None] = {}
         self._provider_entry: _Entry | None = None
-        self._provider_task: asyncio.Task[None] | None = None
-        self._notification_wake_requested = False
+        self._provider_task: asyncio.Task[bool] | None = None
+        self._notification_retry = NotificationRetry(lambda: self._send(None))
         self._durable_tasks: dict[str, asyncio.Task[Any]] = {}
         self._control_entry: _Entry | None = None
         self._closed = False
         self._shutting_down = False
 
     @property
-    def provider_task(self) -> asyncio.Task[None] | None:
+    def provider_task(self) -> asyncio.Task[bool] | None:
         return self._provider_task
 
     @property
@@ -356,6 +358,7 @@ class SubmissionPipeline:
             return
         self._closed = True
         self._shutting_down = True
+        self._notification_retry.close()
         for entry in self._entries.values():
             if entry.signal is not None:
                 entry.signal.abort()
@@ -514,19 +517,36 @@ class SubmissionPipeline:
             self._ack_entry(entry)
 
     def _on_wake(self) -> None:
-        self._notification_wake_requested = True
+        self._notification_retry.request_wake()
 
     def start_notification_wake(self) -> None:
-        """Dispatch a queued notification wake through this pipeline."""
-        self._notification_wake_requested = False
-        if self._host.loop.notification_system_message() is None:
+        """Dispatch the ready notification attempt without blocking the consumer."""
+
+        kind = self._notification_retry.ready_kind
+        if kind is None:
             return
-        submission = self._new_submission("", 0, (), None, 1, steer=False)
-        entry = self._notification_entry(submission)
-        self._dispatch_provider(entry, user_text="", notification=True)
+        try:
+            if kind == "wake":
+                if self._host.loop.notification_system_message() is None:
+                    self._notification_retry.recovered()
+                    return
+            else:
+                self._host.loop.schedule_notification_history_retry()
+            submission = self._new_submission("", 0, (), None, 1, steer=False)
+            entry = self._notification_entry(submission)
+            self._notification_retry.started()
+            self._dispatch_provider(entry, user_text="", notification=True)
+        except Exception as exc:  # noqa: BLE001
+            self._rollback_provider_dispatch()
+            if self._notification_retry.failed(kind):
+                self._host._print_system(f"submission failed: {exc}")
 
     def _notification_entry(self, submission: Submission) -> _Entry:
-        entry = _Entry(submission, state=SubmissionState.DISPATCHED)
+        entry = _Entry(
+            submission,
+            state=SubmissionState.DISPATCHED,
+            notification=True,
+        )
         entry.signal = self._new_signal()
         self._entries[submission.id] = entry
         return entry
@@ -773,7 +793,8 @@ class SubmissionPipeline:
         if self._provider_entry is not None:
             self._dispatch_steer_entries()
             return
-        if self._notification_wake_requested:
+        retry_kind = self._notification_retry.ready_kind
+        if retry_kind == "wake":
             self.start_notification_wake()
             if self._provider_entry is not None:
                 return
@@ -783,6 +804,8 @@ class SubmissionPipeline:
             if entry.state in self._NONTERMINAL
         ]
         if not nonterminal:
+            if retry_kind == "history":
+                self.start_notification_wake()
             return
         entry = min(nonterminal, key=lambda candidate: candidate.submission.id)
         if (
@@ -807,6 +830,8 @@ class SubmissionPipeline:
             user_message=entry.message,
             persist_user_message=entry.persist_user_message,
         )
+        if self._notification_retry.pending:
+            self._notification_retry.recovered()
         if not entry.acknowledge_on_provider_done:
             self._ack_entry(entry)
 
@@ -828,6 +853,9 @@ class SubmissionPipeline:
             user_message=user_message,
             persist_user_message=persist_user_message,
             notification=notification,
+            suppress_errors=(
+                notification and self._notification_retry.failure_reported
+            ),
             on_done=lambda submission, task: self._send(_ProviderDone(submission, task)),
         )
 
@@ -882,6 +910,22 @@ class SubmissionPipeline:
             or self._provider_task is not message.task
         ):
             return
+        entry = self._provider_entry
+        if entry.notification:
+            if message.task.cancelled():
+                self._notification_retry.recovered()
+            else:
+                try:
+                    succeeded = message.task.result() is not False
+                except Exception as exc:  # noqa: BLE001
+                    succeeded = False
+                    if self._notification_retry.failed("history"):
+                        self._host._print_system(f"submission failed: {exc}")
+                if succeeded:
+                    self._notification_retry.recovered()
+                else:
+                    self._host.loop.schedule_notification_history_retry()
+                    self._notification_retry.failed("history")
         pending = self._host.loop.store.pending_client_steering()
         if self._provider_entry.message is not None and pending is not None:
             entries = sorted(self._entries.values(), key=lambda item: item.submission.id)
