@@ -11114,9 +11114,10 @@ async def test_failed_notification_wake_retries_without_another_wake(
         status="completed",
         text="done",
     )
+    backend = FakeBackend([ScriptedTurn([TextContent("response")])])
     app = TUIApp(
         AgentLoop(
-            FakeBackend([ScriptedTurn([TextContent("response")])]),
+            backend,
             store,
             skill_catalog=SkillCatalog.empty(),
         ),
@@ -11141,13 +11142,13 @@ async def test_failed_notification_wake_retries_without_another_wake(
         lambda delay, callback, *args: original_call_later(0, callback, *args),
     )
     app._submissions.wake()
-    for _ in range(100):
-        if not app._submissions.active and failed:
+    for _ in range(500):
+        if backend.calls and failed:
             break
         await asyncio.sleep(0.01)
 
     assert failed
-    assert app._submissions.active is False
+    assert len(backend.calls) == 1
     assert app.loop.notification_wake.pending_message() is None
     await app._submissions.close()
     await app.loop.close()
