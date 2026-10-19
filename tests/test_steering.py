@@ -303,7 +303,14 @@ class _BlockingNotificationBackend(CompletionBackend):
 
     async def complete(self, messages, tool_schemas):
         del tool_schemas
+        index = len(self.calls)
         self.calls.append(list(messages))
+        if index == 0:
+            yield StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo("backend_error", "provider stopped"),
+            )
+            return
         self.started.set()
         yield StreamEvent(StreamEventType.MESSAGE_START)
         await self.release.wait()
@@ -326,16 +333,31 @@ def _notification_app(tmp_path: Path, backend: CompletionBackend) -> TUIApp:
     )
 
 
-def _capture_notification_timers(monkeypatch, app: TUIApp):
+def _capture_notification_timers(monkeypatch):
     timers: list[tuple[float, _CapturedTimer]] = []
+    loop = asyncio.get_running_loop()
+    original_call_later = loop.call_later
 
-    def call_later(delay, callback):
-        timer = _CapturedTimer(callback)
-        timers.append((delay, timer))
-        return timer
+    def call_later(delay, callback, *args, context=None):
+        if (
+            getattr(callback, "__name__", "") == "_fire"
+            and callback.__module__.endswith("notification_retry")
+        ):
+            timer = _CapturedTimer(lambda: callback(*args))
+            timers.append((delay, timer))
+            return timer
+        return original_call_later(delay, callback, *args, context=context)
 
-    monkeypatch.setattr(app._submissions._notification_retry, "_call_later", call_later)
+    monkeypatch.setattr(loop, "call_later", call_later)
     return timers
+
+
+async def _drain_until(check) -> None:
+    for _ in range(1_000):
+        if check():
+            return
+        await asyncio.sleep(0)
+    assert check()
 
 
 @pytest.mark.asyncio
@@ -343,7 +365,7 @@ async def test_failed_notification_wake_schedules_one_timer_without_busy_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = _notification_app(tmp_path, _NotificationBackend())
-    timers = _capture_notification_timers(monkeypatch, app)
+    timers = _capture_notification_timers(monkeypatch)
     attempts = 0
 
     def fail() -> None:
@@ -353,14 +375,14 @@ async def test_failed_notification_wake_schedules_one_timer_without_busy_loop(
 
     monkeypatch.setattr(app.loop, "notification_system_message", fail)
     app._submissions.wake()
-    await _wait(lambda: len(timers) == 1)
+    await _drain_until(lambda: len(timers) == 1)
     for _ in range(5):
         await asyncio.sleep(0)
 
     assert attempts == 1
     assert [delay for delay, _timer in timers] == [1.0]
     timers[0][1].fire()
-    await _wait(lambda: attempts == 2)
+    await _drain_until(lambda: attempts == 2)
     assert [delay for delay, _timer in timers] == [1.0, 2.0]
     assert app.console.file.getvalue().count("submission failed") == 1
     await app._submissions.close()
@@ -373,10 +395,10 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
 ) -> None:
     backend = _NotificationBackend(failures={0, 1, 3})
     app = _notification_app(tmp_path, backend)
-    timers = _capture_notification_timers(monkeypatch, app)
+    timers = _capture_notification_timers(monkeypatch)
 
     app._submissions.wake()
-    await _wait(lambda: len(timers) == 1)
+    await _drain_until(lambda: len(timers) == 1)
     entries = app.loop.store.entries
     assert [entry.type for entry in entries].count("notification_ack") == 1
     assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
@@ -387,14 +409,14 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     )
 
     timers[0][1].fire()
-    await _wait(lambda: len(timers) == 2)
+    await _drain_until(lambda: len(timers) == 2)
     assert len(backend.calls) == 2
     assert timers[1][0] == 2.0
     assert app.console.file.getvalue().count("provider stopped") == 1
     assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
 
     timers[1][1].fire()
-    await _wait(lambda: len(backend.calls) == 3 and not app._submissions.active)
+    await _drain_until(lambda: len(backend.calls) == 3 and not app._submissions.active)
     assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
     assert sum(
         message.role is MessageRole.ASSISTANT
@@ -410,7 +432,7 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
         text="done again",
     )
     app._submissions.wake()
-    await _wait(lambda: len(timers) == 3)
+    await _drain_until(lambda: len(timers) == 3)
     assert timers[2][0] == 1.0
     await app._submissions.close()
     await app.loop.close()
@@ -422,12 +444,12 @@ async def test_user_message_during_pending_retry_cancels_timer(
 ) -> None:
     backend = _NotificationBackend(failures={0})
     app = _notification_app(tmp_path, backend)
-    timers = _capture_notification_timers(monkeypatch, app)
+    timers = _capture_notification_timers(monkeypatch)
 
     app._submissions.wake()
-    await _wait(lambda: len(timers) == 1)
+    await _drain_until(lambda: len(timers) == 1)
     app._submit_input("recover")
-    await _wait(lambda: len(backend.calls) == 2 and not app._submissions.active)
+    await _drain_until(lambda: len(backend.calls) == 2 and not app._submissions.active)
 
     assert timers[0][1].cancelled
     assert any(
@@ -445,17 +467,19 @@ async def test_aborted_notification_turn_is_not_retried(
 ) -> None:
     backend = _BlockingNotificationBackend()
     app = _notification_app(tmp_path, backend)
-    timers = _capture_notification_timers(monkeypatch, app)
+    timers = _capture_notification_timers(monkeypatch)
 
     app._submissions.wake()
+    await _drain_until(lambda: len(timers) == 1)
+    timers[0][1].fire()
     await backend.started.wait()
     app._submissions.abort()
-    await _wait(lambda: app._submissions.provider_task is None)
+    await _drain_until(lambda: app._submissions.provider_task is None)
     for _ in range(5):
         await asyncio.sleep(0)
 
-    assert timers == []
-    assert len(backend.calls) == 1
+    assert len(timers) == 1
+    assert len(backend.calls) == 2
     await app._submissions.close()
     await app.loop.close()
 
@@ -465,10 +489,10 @@ async def test_retry_timer_cancelled_on_pipeline_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = _notification_app(tmp_path, _NotificationBackend(failures={0}))
-    timers = _capture_notification_timers(monkeypatch, app)
+    timers = _capture_notification_timers(monkeypatch)
 
     app._submissions.wake()
-    await _wait(lambda: len(timers) == 1)
+    await _drain_until(lambda: len(timers) == 1)
     await app._submissions.close()
 
     assert timers[0][1].cancelled
