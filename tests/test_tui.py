@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import errno
 import json
 import os
 import pty
@@ -11102,7 +11103,7 @@ async def test_tui_setup_handles_corrupt_and_legacy_drafts(
 
 
 @pytest.mark.asyncio
-async def test_background_wake_retries_after_dispatch_failure(
+async def test_failed_notification_wake_retries_without_another_wake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -11122,31 +11123,32 @@ async def test_background_wake_retries_after_dispatch_failure(
         provider="codex",
         model="offline",
     )
-    original = app.loop.notification_system_message
+    original_message = app.loop.notification_system_message
     failed = False
 
     def fail_once() -> Message | None:
         nonlocal failed
         if not failed:
             failed = True
-            raise OSError("too many open files")
-        return original()
+            raise OSError(errno.EMFILE, "too many open files")
+        return original_message()
 
+    original_call_later = asyncio.get_running_loop().call_later
     monkeypatch.setattr(app.loop, "notification_system_message", fail_once)
+    monkeypatch.setattr(
+        asyncio.get_running_loop(),
+        "call_later",
+        lambda delay, callback, *args: original_call_later(0, callback, *args),
+    )
     app._submissions.wake()
     for _ in range(100):
-        if app._submissions._consumer is None and failed:
-            break
-        await asyncio.sleep(0.01)
-    assert app._submissions._consumer is None
-    app._submissions.wake()
-    for _ in range(100):
-        if not app._submissions.active:
+        if not app._submissions.active and failed:
             break
         await asyncio.sleep(0.01)
 
     assert failed
-    assert not app._submissions._notification_wake_requested
+    assert app._submissions.active is False
+    assert app.loop.notification_wake.pending_message() is None
     await app._submissions.close()
     await app.loop.close()
 

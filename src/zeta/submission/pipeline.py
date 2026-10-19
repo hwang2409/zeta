@@ -1,5 +1,4 @@
 """The single-consumer pipeline for submitted composer values."""
-
 from __future__ import annotations
 
 import asyncio
@@ -32,11 +31,11 @@ from ..tools._shared.shell import (
 from ..tui.composer import UndoCandidate, parse_input
 from ..tui.user import USER_DISPLAY_TEXT_METADATA
 from .model import Submission, SubmissionHost, dispatch_provider
+from .notification_retry import NotificationWakeRetry
 
 
 class SubmissionState(StrEnum):
     """States owned by the submission consumer."""
-
     QUEUED = "queued"
     PREPROCESSING = "preprocessing"
     AWAITING_APPROVAL = "awaiting-approval"
@@ -160,15 +159,14 @@ class SubmissionPipeline:
         self._provider_entry: _Entry | None = None
         self._provider_task: asyncio.Task[None] | None = None
         self._notification_wake_requested = False
+        self._notification_retry = NotificationWakeRetry(self._send)
         self._durable_tasks: dict[str, asyncio.Task[Any]] = {}
         self._control_entry: _Entry | None = None
         self._closed = False
         self._shutting_down = False
-
     @property
     def provider_task(self) -> asyncio.Task[None] | None:
         return self._provider_task
-
     @property
     def active_submission_id(self) -> int | None:
         return (
@@ -176,7 +174,6 @@ class SubmissionPipeline:
             if self._provider_entry is None
             else self._provider_entry.submission.id
         )
-
     @property
     def active(self) -> bool:
         return any(
@@ -192,7 +189,6 @@ class SubmissionPipeline:
                 for message in self._messages._queue
             )
         ) or bool(self._durable_tasks)
-
     @property
     def has_pending(self) -> bool:
         return self.active
@@ -318,7 +314,6 @@ class SubmissionPipeline:
         always: bool = False,
     ) -> None:
         """Resolve an approval command already running inside the pipeline."""
-
         await self._on_approval_action(
             _ApprovalAction(decision, requested_key, always=always)
         )
@@ -351,11 +346,11 @@ class SubmissionPipeline:
 
     async def close(self) -> None:
         """Cancel all children during application shutdown."""
-
         if self._closed:
             return
         self._closed = True
         self._shutting_down = True
+        self._notification_retry.close()
         for entry in self._entries.values():
             if entry.signal is not None:
                 entry.signal.abort()
@@ -518,13 +513,20 @@ class SubmissionPipeline:
 
     def start_notification_wake(self) -> None:
         """Dispatch a queued notification wake through this pipeline."""
-
         self._notification_wake_requested = False
-        if self._host.loop.notification_system_message() is None:
-            return
-        submission = self._new_submission("", 0, (), None, 1, steer=False)
-        entry = self._notification_entry(submission)
-        self._dispatch_provider(entry, user_text="", notification=True)
+        try:
+            if self._host.loop.notification_system_message() is None:
+                self._notification_retry.success()
+                return
+            submission = self._new_submission("", 0, (), None, 1, steer=False)
+            self._dispatch_provider(
+                self._notification_entry(submission), user_text="", notification=True
+            )
+            self._notification_retry.success()
+        except Exception:
+            self._notification_wake_requested = True
+            self._notification_retry.schedule()
+            raise
 
     def _notification_entry(self, submission: Submission) -> _Entry:
         entry = _Entry(submission, state=SubmissionState.DISPATCHED)
@@ -599,7 +601,6 @@ class SubmissionPipeline:
         register_macro_display(
             first_call_id, command="\n".join(commands), argv=()
         )
-
         def lifecycle(kind: str, call: ToolCall) -> None:
             if kind not in {"approval_start", "approval_end"}:
                 return
@@ -621,7 +622,6 @@ class SubmissionPipeline:
                     self._host._present_pending_approvals
                 )
             self._host._invalidate_prompt()
-
         try:
             outputs = await run_inline_shell_batch(
                 self._host.loop.tool_registry,
@@ -858,9 +858,9 @@ class SubmissionPipeline:
         while self._messages.empty():
             try:
                 self._dispatch_oldest_ready()
-            except Exception as exc:  # noqa: BLE001 - retry on a later wake
+            except Exception as exc:  # noqa: BLE001
                 self._host._print_system(f"submission failed: {exc}")
-                return self._rollback_provider_dispatch()
+                self._rollback_provider_dispatch()
             else:
                 return
 

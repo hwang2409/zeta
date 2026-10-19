@@ -835,11 +835,17 @@ async def run_agent_tool(
             child_loop.set_plan_mode(True)
         child_loop.set_background_event_sink(loop._publish_background_event)
     except asyncio.CancelledError:
+        if child_registry is not None:
+            cleanup = asyncio.create_task(child_registry.close())
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await asyncio.shield(cleanup)
         raise
     except Exception as exc:  # noqa: BLE001 - setup failures become receipts
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
         if child_registry is not None:
-            child_registry.background_tasks.release_directory()
+            await child_registry.close()
         failure_text = f"agent error: {error_message(exc)}"
         child_store.finish_agent_lifecycle(
             "failed",
