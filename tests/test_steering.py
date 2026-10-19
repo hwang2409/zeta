@@ -280,15 +280,19 @@ class _NotificationBackend(CompletionBackend):
         *,
         failures: set[int] = frozenset(),
         errors: dict[int, ErrorInfo] | None = None,
+        exceptions: dict[int, BaseException] | None = None,
     ) -> None:
         self.failures = failures
         self.errors = errors or {}
+        self.exceptions = exceptions or {}
         self.calls: list[list[Message]] = []
 
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         index = len(self.calls)
         self.calls.append(list(messages))
+        if error := self.exceptions.get(index):
+            raise error
         if index in self.failures or index in self.errors:
             yield StreamEvent(
                 StreamEventType.ERROR,
@@ -466,14 +470,17 @@ async def test_permanent_notification_failure_is_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: ErrorInfo | str | BaseException
 ) -> None:
     backend: CompletionBackend
+    normalize = isinstance(failure, RuntimeError) and failure.__cause__ is not None
     if failure == "refusal":
         backend = _RefusalNotificationBackend()
     elif isinstance(failure, ErrorInfo):
         backend = _NotificationBackend(errors={0: failure})
+    elif normalize:
+        backend = _NotificationBackend(exceptions={0: failure})
     else:
         backend = _NotificationBackend()
     app = _notification_app(tmp_path, backend)
-    if isinstance(failure, BaseException):
+    if isinstance(failure, BaseException) and not normalize:
         monkeypatch.setattr(
             app.loop,
             "run_notification_turn",
