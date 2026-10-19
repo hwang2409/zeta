@@ -422,10 +422,49 @@ def _caused_by(error: BaseException, cause: BaseException) -> BaseException:
     return error
 
 
+class _StreamError(RuntimeError):
+    code = "stream_error"
+
+
 def test_error_info_classifies_permission_error_in_cause_chain() -> None:
     error = _caused_by(RuntimeError("backend failed"), PermissionError("denied"))
 
     assert _error_info(error).code == "permission_error"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _caused_by(TimeoutError("timed out"), PermissionError("denied")),
+        _caused_by(
+            OSError(errno.EMFILE, "too many open files"), PermissionError("denied")
+        ),
+        _caused_by(_StreamError("stream failed"), PermissionError("denied")),
+    ],
+    ids=["timeout", "os-error", "structured-code"],
+)
+def test_error_info_prefers_explicit_permission_cause(error: BaseException) -> None:
+    assert _error_info(error).code == "permission_error"
+
+
+def test_error_info_ignores_implicit_permission_context_for_active_timeout() -> None:
+    try:
+        raise PermissionError("unrelated")
+    except PermissionError:
+        try:
+            raise TimeoutError("timed out")
+        except TimeoutError as error:
+            assert error.__cause__ is None
+            assert _error_info(error).code == "timeout"
+
+
+def test_error_info_explicit_cause_cycle_terminates() -> None:
+    first = RuntimeError("first")
+    second = RuntimeError("second")
+    first.__cause__ = second
+    second.__cause__ = first
+
+    assert _error_info(first).code == "backend_error"
 
 
 @pytest.mark.asyncio
@@ -443,6 +482,14 @@ def test_error_info_classifies_permission_error_in_cause_chain() -> None:
         PermissionError("permission denied"),
         OSError(errno.EACCES, "permission denied"),
         _caused_by(RuntimeError("backend failed"), PermissionError("permission denied")),
+        _caused_by(TimeoutError("timed out"), PermissionError("permission denied")),
+        _caused_by(
+            OSError(errno.EMFILE, "too many open files"),
+            PermissionError("permission denied"),
+        ),
+        _caused_by(
+            _StreamError("stream failed"), PermissionError("permission denied")
+        ),
         ErrorInfo("max_turns", "maximum turns reached"),
         ErrorInfo("unknown_error", "unknown failure"),
         "refusal",
@@ -460,6 +507,9 @@ def test_error_info_classifies_permission_error_in_cause_chain() -> None:
         "permission-raw",
         "eacces",
         "permission-cause",
+        "permission-timeout-cause",
+        "permission-os-error-cause",
+        "permission-structured-code-cause",
         "max-turns",
         "unknown",
         "refusal",
@@ -470,7 +520,7 @@ async def test_permanent_notification_failure_is_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: ErrorInfo | str | BaseException
 ) -> None:
     backend: CompletionBackend
-    normalize = isinstance(failure, RuntimeError) and failure.__cause__ is not None
+    normalize = isinstance(failure, BaseException) and failure.__cause__ is not None
     if failure == "refusal":
         backend = _RefusalNotificationBackend()
     elif isinstance(failure, ErrorInfo):

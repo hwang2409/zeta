@@ -94,6 +94,14 @@ def _exception_chain(error: BaseException) -> Iterator[BaseException]:
 
 
 def _classify_error(error: BaseException) -> str:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _is_permission_error(current):
+            return "permission_error"
+        current = current.__cause__
+
     code = getattr(error, "code", None)
     if type(code) is str and code:
         return code
