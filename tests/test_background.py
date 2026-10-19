@@ -404,6 +404,103 @@ def test_store_replay_accepts_task_and_unknown_notification_kinds(
     assert len(reloaded.agent_notifications(pending_only=False)) == 3
 
 
+def test_child_question_notification_renders_question() -> None:
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.tui.render import render_agent_notification
+
+    rendered = render_agent_notification(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_question",
+                "child_instance_id": "root:208",
+                "question_id": "b2517c6f0fbb448e86dbb8b34fe0fbc0",
+                "question": "should we deploy this change?",
+                "description": "child question",
+                "status": "pending",
+                "text": "child root:208 asks: should we deploy this change?",
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert "should we deploy this change?" in rendered.plain
+    assert "unavailable" not in rendered.plain
+
+
+def test_child_question_withdrawn_notification_renders_text() -> None:
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.tui.render import render_agent_notification
+
+    rendered = render_agent_notification(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_question_withdrawn",
+                "child_instance_id": "root:208",
+                "question_id": "b2517c6f0fbb448e86dbb8b34fe0fbc0",
+                "description": "child question withdrawn",
+                "status": "withdrawn",
+                "text": "question withdrawn: child finished",
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.plain == "question withdrawn: child finished"
+
+
+def test_child_question_notification_is_one_safe_line() -> None:
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.tui.render import render_agent_notification
+
+    rendered = render_agent_notification(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_question",
+                "child_instance_id": "root:208",
+                "question": "first line\tsecond\x1b[2J\x9b31m\x07 words",
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert "\n" not in rendered.plain
+    assert all(
+        not (ord(character) < 32 or 0x80 <= ord(character) <= 0x9F)
+        for character in rendered.plain
+    )
+    assert "first line" in rendered.plain
+    assert "second" in rendered.plain
+    assert "words" in rendered.plain
+
+
+def test_child_question_withdrawn_notification_is_one_safe_line() -> None:
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.tui.render import render_agent_notification
+
+    rendered = render_agent_notification(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_question_withdrawn",
+                "text": "first line\tsecond\x1b[2J\x9b31m\x07 words",
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert "\n" not in rendered.plain
+    assert all(
+        not (ord(character) < 32 or 0x80 <= ord(character) <= 0x9F)
+        for character in rendered.plain
+    )
+    assert "first line" in rendered.plain
+    assert "second" in rendered.plain
+    assert "words" in rendered.plain
+
+
 def test_tui_renders_task_exit_and_ignores_unknown_kind() -> None:
     # S7: the TUI renders task_exited receipts and tolerates unknown kinds
     # without ever rendering them as agent completions.
