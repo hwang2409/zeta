@@ -32,7 +32,7 @@ from ..tools._shared.shell import (
 from ..tui.composer import UndoCandidate, parse_input
 from ..tui.user import USER_DISPLAY_TEXT_METADATA
 from .model import Submission, SubmissionHost, dispatch_provider
-from .notification_retry import NotificationRetry
+from .notification_retry import NotificationRetry, RetryKind
 
 
 class SubmissionState(StrEnum):
@@ -526,12 +526,9 @@ class SubmissionPipeline:
         if kind is None:
             return
         try:
-            if kind == "wake":
-                if self._host.loop.notification_system_message() is None:
-                    self._notification_retry.recovered()
-                    return
-            else:
-                self._host.loop.schedule_notification_history_retry()
+            if not self._prepare_notification_attempt(kind):
+                self._notification_retry.recovered()
+                return
             submission = self._new_submission("", 0, (), None, 1, steer=False)
             entry = self._notification_entry(submission)
             self._notification_retry.started()
@@ -540,6 +537,12 @@ class SubmissionPipeline:
             self._rollback_provider_dispatch()
             if self._notification_retry.failed(kind):
                 self._host._print_system(f"submission failed: {exc}")
+
+    def _prepare_notification_attempt(self, kind: RetryKind) -> bool:
+        if kind == "history":
+            self._host.loop.schedule_notification_history_retry()
+            return True
+        return self._host.loop.notification_system_message() is not None
 
     def _notification_entry(self, submission: Submission) -> _Entry:
         entry = _Entry(
@@ -912,20 +915,7 @@ class SubmissionPipeline:
             return
         entry = self._provider_entry
         if entry.notification:
-            if message.task.cancelled():
-                self._notification_retry.recovered()
-            else:
-                try:
-                    succeeded = message.task.result() is not False
-                except Exception as exc:  # noqa: BLE001
-                    succeeded = False
-                    if self._notification_retry.failed("history"):
-                        self._host._print_system(f"submission failed: {exc}")
-                if succeeded:
-                    self._notification_retry.recovered()
-                else:
-                    self._host.loop.schedule_notification_history_retry()
-                    self._notification_retry.failed("history")
+            self._finish_notification_provider(message.task)
         pending = self._host.loop.store.pending_client_steering()
         if self._provider_entry.message is not None and pending is not None:
             entries = sorted(self._entries.values(), key=lambda item: item.submission.id)
@@ -943,6 +933,22 @@ class SubmissionPipeline:
                 entry.state = SubmissionState.READY
         self._ack_entry(self._provider_entry)
         self._provider_entry, self._provider_task = None, None
+
+    def _finish_notification_provider(self, task: asyncio.Task[bool]) -> None:
+        if task.cancelled():
+            self._notification_retry.recovered()
+            return
+        try:
+            succeeded = task.result() is not False
+        except Exception as exc:  # noqa: BLE001
+            succeeded = False
+            if self._notification_retry.failed("history"):
+                self._host._print_system(f"submission failed: {exc}")
+        if succeeded:
+            self._notification_retry.recovered()
+            return
+        self._host.loop.schedule_notification_history_retry()
+        self._notification_retry.failed("history")
 
     async def _wait_for_preprocessing(
         self,

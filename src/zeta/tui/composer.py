@@ -265,23 +265,13 @@ class TurnConsumerMixin:
                             StreamEventType.ERROR,
                             StreamEventType.AGENT_NOTIFICATION,
                         }:
-                            if not (
-                                suppress_errors
-                                and event.type is StreamEventType.ERROR
-                            ):
-                                self._print_unit(
-                                    rendered,
-                                    blank_before=(
-                                        event.type is StreamEventType.AGENT_NOTIFICATION
-                                    ),
-                                )
-                            if (
-                                event.type is StreamEventType.ERROR
-                                and is_retryable_error(event.error)
-                            ):
-                                turn_failed = True
-                                self._failed_turn = (user_text, retry_message)
-                                self._turn_had_visible_output = True
+                            turn_failed |= self._print_special_event(
+                                event,
+                                rendered,
+                                suppress_errors=suppress_errors,
+                                user_text=user_text,
+                                retry_message=retry_message,
+                            )
                         else:
                             self._print(rendered)
                 self._invalidate_prompt()
@@ -300,19 +290,7 @@ class TurnConsumerMixin:
             self._presenter.reset_assistant_unit()
             self._reset_stream_state()
             self._loop_state = "idle"
-            try:
-                message = str(exc).strip() or type(exc).__name__
-            except Exception:
-                message = "unexpected ui error"
-            if not suppress_errors:
-                self._print_unit(
-                    render_event(
-                        StreamEvent(
-                            StreamEventType.ERROR,
-                            error=ErrorInfo("ui_error", message),
-                        )
-                    )
-                )
+            self._print_ui_error(exc, suppress=suppress_errors)
         finally:
             self._usage_tracker.record_compaction(self.model)
             self._presenter.clear_active_tool_calls()
@@ -327,6 +305,44 @@ class TurnConsumerMixin:
             await asyncio.gather(spinner_task, return_exceptions=True)
             self._finish_stream_invalidation()
         return not notification_failed
+
+    def _print_special_event(
+        self,
+        event: StreamEvent,
+        rendered: Any,
+        *,
+        suppress_errors: bool,
+        user_text: str,
+        retry_message: Message,
+    ) -> bool:
+        if not (suppress_errors and event.type is StreamEventType.ERROR):
+            self._print_unit(
+                rendered,
+                blank_before=event.type is StreamEventType.AGENT_NOTIFICATION,
+            )
+        if event.type is not StreamEventType.ERROR or not is_retryable_error(
+            event.error
+        ):
+            return False
+        self._failed_turn = (user_text, retry_message)
+        self._turn_had_visible_output = True
+        return True
+
+    def _print_ui_error(self, exc: Exception, *, suppress: bool) -> None:
+        if suppress:
+            return
+        try:
+            message = str(exc).strip() or type(exc).__name__
+        except Exception:
+            message = "unexpected ui error"
+        self._print_unit(
+            render_event(
+                StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo("ui_error", message),
+                )
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
