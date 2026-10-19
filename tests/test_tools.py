@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pytest
 
-from zeta.tools._shared import background_spawn
 import zeta.tools._shared.sandbox as sandbox_module
 import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
@@ -34,6 +33,7 @@ from zeta.protocol.types import (
 )
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
+from zeta.tools._shared import background_spawn
 
 
 def _python_command(source: str) -> str:
@@ -505,16 +505,20 @@ async def test_terminate_unregistered_drains_stdout_and_stderr() -> None:
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
-        "import os,time; os.write(1, b'x' * 262144); os.write(2, b'x' * 262144); time.sleep(30)",
+        "import os,time; os.write(1, b'ready\\n'); os.write(2, b'ready\\n'); os.write(2, b'x' * 262144); os.write(1, b'x' * 262144); time.sleep(30)",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
 
+    assert await process.stdout.readexactly(6) == b"ready\n"
+    assert await process.stderr.readexactly(6) == b"ready\n"
     await asyncio.wait_for(
         background_spawn._terminate_unregistered(process, 0.01, 2), timeout=10
     )
     assert process.returncode is not None
+    assert await process.stdout.read() == b""
+    assert await process.stderr.read() == b""
 
 
 @pytest.mark.asyncio
