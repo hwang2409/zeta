@@ -30,12 +30,14 @@ from ..skills.agent_catalog import discover_packaged_agents
 from ..tools import ToolRegistry
 from .delivery import Delivery, SlackDelivery
 from .models import DueOccurrence, Job, PollEvent, instant, timestamp
-from .services import configure_runtime_inbox, mount_services
+from .services import InboxGrants, configure_runtime_inbox, mount_services
 from .store import AutomationStore
 from .trigger import Poll, Webhook
 from .webhook import MAX_PROMPT_PAYLOAD_BYTES
 
-MountFactory = Callable[[Job, ToolRegistry, Path], Awaitable[MCPMount]]
+MountFactory = Callable[
+    [Job, ToolRegistry, Path, InboxGrants | None], Awaitable[MCPMount]
+]
 
 
 def poll_events(text: str, lower: datetime, upper: datetime) -> tuple[PollEvent, ...]:
@@ -161,11 +163,7 @@ async def run_claimed(
                 loop.tool_registry,
                 manager.project_registry,
             )
-            mount = (
-                await mount_factory(job, loop.tool_registry, home, grants)
-                if grants is not None
-                else await mount_factory(job, loop.tool_registry, home)
-            )
+            mount = await mount_factory(job, loop.tool_registry, home, grants)
             loop.attach_mcp_mount(mount)
             sender = delivery or SlackDelivery(mount)
             loop.session_start()

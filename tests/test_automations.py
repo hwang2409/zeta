@@ -741,7 +741,9 @@ class RecordingDelivery:
         return '{"ts":"123.456"}'
 
 
-async def _empty_mount(job, registry: ToolRegistry, home: Path) -> MCPMount:
+async def _empty_mount(
+    job, registry: ToolRegistry, home: Path, grants=None
+) -> MCPMount:
     return MCPMount(registry, {})
 
 
