@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import errno
 import base64
 import json
 import os
@@ -10637,6 +10638,44 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
         release.set()
         for reused_fd in reused_fds:
             os.close(reused_fd)
+
+
+@pytest.mark.asyncio
+async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY)
+    persistence = DraftPersistence(
+        tmp_path / "draft", directory_fd=directory_fd, delay=0,
+    )
+    original_dup = persistence_module.os.dup
+    fail_dup = True
+
+    def dup(fd: int) -> int:
+        if fail_dup and fd == directory_fd:
+            raise OSError(errno.EMFILE, "Too many open files")
+        return original_dup(fd)
+
+    monkeypatch.setattr(persistence_module.os, "dup", dup)
+    loop = asyncio.get_running_loop()
+    exceptions: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, context: exceptions.append(context))
+    try:
+        persistence.schedule("first")
+        await asyncio.sleep(0)
+        await persistence.flush_pending()
+        fail_dup = False
+        persistence.schedule("second")
+        await persistence.flush_pending()
+    finally:
+        os.close(directory_fd)
+        await persistence.shutdown_pending()
+
+    assert exceptions == []
+    assert caplog.messages.count(
+        "failed to persist composer draft: [Errno 24] Too many open files"
+    ) == 1
+    assert DraftPersistence(tmp_path / "draft").load() == "second"
 
 
 @pytest.mark.asyncio
