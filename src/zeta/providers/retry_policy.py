@@ -21,7 +21,6 @@ _RETRYABLE_ERROR_CODES = {
     "rate_limit_error",
     "server_is_overloaded",
     "slow_down",
-    "stream_error",
     "timeout",
     "transport_error",
 }

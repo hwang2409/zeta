@@ -140,7 +140,7 @@ class NotificationRetry:
         return (
             isinstance(error, OSError)
             or isinstance(error, ErrorInfo)
-            and error.code == "os_error"
+            and error.code in {"os_error", "stream_error"}
             or retryable_provider_error(error, failure.event_data)
         )
 
