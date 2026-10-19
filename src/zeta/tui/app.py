@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 import weakref
 from collections import deque
@@ -44,7 +43,6 @@ from ..core.slash import (
 from ..diagnostics.tui_stalls import start_tui_stall_watchdog
 from ..mcp.management import MCPManagementService
 from ..protocol.types import (
-    ErrorInfo,
     Message,
     StreamEvent,
     StreamEventType,
@@ -84,12 +82,12 @@ from .layout import (
     full_screen_content,
     status_toolbar,
 )
+from .loop_errors import run_prompt_toolkit
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
 from .paste_runtime import PasteRuntime
 from .render import (
-    render_event,
     render_markdown,
     render_thought,
     render_thought_live_delta,
@@ -112,8 +110,6 @@ from .transcript import (
 )
 from .transcript.finder_runtime import FinderRuntimeMixin
 from .transcript.history_finder import HistoryFinder
-
-_LOGGER = logging.getLogger(__name__)
 
 
 def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
@@ -1033,41 +1029,8 @@ class TUIApp(
             return None
         return value
 
-    async def _run_prompt_toolkit(self, session: PromptSession[Any]) -> object:
-        loop = asyncio.get_running_loop()
-        previous_handler = loop.get_exception_handler()
-        loop.set_exception_handler(self._handle_loop_exception)
-        try:
-            return await session.app.run_async(set_exception_handler=False)
-        finally:
-            loop.set_exception_handler(previous_handler)
-
-    def _handle_loop_exception(
-        self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
-    ) -> None:
-        error = context.get("exception")
-        if isinstance(error, BaseException):
-            message = str(error).strip() or type(error).__name__
-            _LOGGER.error("unhandled exception in tui event loop", exc_info=error)
-        else:
-            message = str(context.get("message", "unexpected ui error"))
-            _LOGGER.error("unhandled exception in tui event loop: %s", message)
-        self._print_unit(
-            render_event(
-                StreamEvent(
-                    StreamEventType.ERROR,
-                    error=ErrorInfo("ui_error", message),
-                )
-            )
-        )
-        self._invalidate_prompt()
-
-    async def _run_full_screen(
-        self,
-        session: FullScreenPromptSession,
-        prompt_task: asyncio.Task[object] | None = None,
-    ) -> None:
-        prompt_task = prompt_task or asyncio.create_task(self._run_prompt_toolkit(session))
+    async def _run_full_screen(self, session: FullScreenPromptSession, prompt_task: asyncio.Task[object] | None = None) -> None:
+        prompt_task = prompt_task or asyncio.create_task(run_prompt_toolkit(session, self))
         self._input_loop_active = True
         try:
             while not self._exit_requested:
@@ -1171,7 +1134,7 @@ class TUIApp(
             prompt_task: asyncio.Task[object] | None = None
             if isinstance(session, FullScreenPromptSession):
                 self._install_full_screen_layout(session)
-                prompt_task = asyncio.create_task(self._run_prompt_toolkit(session))
+                prompt_task = asyncio.create_task(run_prompt_toolkit(session, self))
             try:
                 startup_task = asyncio.create_task(self._prepare_prompt(resume_ui=resume_ui))
                 try:
