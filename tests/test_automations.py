@@ -74,11 +74,12 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.automations import commands
 from zeta.automations import runner as automation_runner
 from zeta.automations.authoring import import_jobs, listing, resolve_job
+from zeta.automations.commands import review_job
 from zeta.automations.daemon import daemon_lock, serve
 from zeta.automations.delivery import SlackDelivery
 from zeta.automations.models import instant, parse_job
 from zeta.automations.runner import _receipt, poll_events, run_claimed
-from zeta.automations.services import validate_permissions
+from zeta.automations.services import mount_services, validate_permissions
 from zeta.automations.store import SQLiteStore
 from zeta.automations.tick import tick
 from zeta.automations.trigger import Schedule, cron_matches, parse_trigger
@@ -100,13 +101,18 @@ START = datetime(2026, 9, 9, 11, 0, tzinfo=UTC)
 DUE = START + timedelta(hours=1)
 
 
-async def test_no_delivery_runs_without_slack_and_records_run(tmp_path: Path) -> None:
+async def test_no_delivery_job_approves_and_runs_without_slack_config(
+    tmp_path: Path,
+) -> None:
     document = _job(tmp_path).document()
     document.pop("deliver")
+    document["servers"] = []
     job = parse_job("inbox-only", document)
     with SQLiteStore(tmp_path) as store:
         state = store.draft(job)
-        store.approve(job.name, state.revision, None, START)
+        review = await review_job(store, job.name, tmp_path)
+        assert review.recipient is None
+        store.approve(job.name, state.revision, review.recipient, START)
         occurrence = tick(store, DUE)[0]
         run_id = store.claim(occurrence)
         await run_claimed(
@@ -115,11 +121,26 @@ async def test_no_delivery_runs_without_slack_and_records_run(tmp_path: Path) ->
             run_id,
             home=tmp_path,
             backend=FakeBackend([ScriptedTurn(content=[TextContent("sent")])]),
-            mount_factory=_empty_mount,
+            mount_factory=mount_services,
         )
         run = store.runs(job.name)[0]
         assert run.status == "completed"
         assert run.delivery == ""
+
+
+def test_approve_rejects_recipient_delivery_mismatch(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        delivery = _job(tmp_path)
+        state = store.draft(delivery)
+        with pytest.raises(ValueError, match="recipient must match"):
+            store.approve(delivery.name, state.revision, None, START)
+        no_delivery = parse_job(
+            "inbox-only",
+            {**delivery.document(), "servers": [], "deliver": "none"},
+        )
+        state = store.draft(no_delivery)
+        with pytest.raises(ValueError, match="recipient must match"):
+            store.approve(no_delivery.name, state.revision, "U123", START)
 
 
 def test_automation_schema_does_not_require_delivery() -> None:
@@ -133,17 +154,35 @@ def test_automation_schema_does_not_require_delivery() -> None:
     assert "deliver" not in schema["properties"]["job"]["required"]
 
 
-async def test_runtime_missing_delivery_tool_has_actionable_error(tmp_path: Path) -> None:
+async def test_runtime_missing_delivery_tool_has_actionable_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from tests.test_mcp import _FakeClient
+    from zeta.mcp import mount as mount_module
+
+    class Client(_FakeClient):
+        async def list_tools(self):
+            return []
+
+    monkeypatch.setattr(mount_module, "_build_client", Client)
+    (tmp_path / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "slack": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.slack.com/mcp",
+                        "auth": {"type": "oauth"},
+                    }
+                }
+            }
+        )
+    )
     job = _job(tmp_path)
     with SQLiteStore(tmp_path) as store:
         _arm(store, job)
         occurrence = tick(store, DUE)[0]
         run_id = store.claim(occurrence)
-
-        async def missing_delivery(*_args):
-            raise ValueError(
-                "delivery to slack needs slack__slack_send_message, which the slack MCP server does not offer (the token may lack chat:write); omit deliver or grant chat:write"
-            )
 
         await run_claimed(
             store,
@@ -151,7 +190,7 @@ async def test_runtime_missing_delivery_tool_has_actionable_error(tmp_path: Path
             run_id,
             home=tmp_path,
             backend=FakeBackend([ScriptedTurn(content=[TextContent("sent")])]),
-            mount_factory=missing_delivery,
+            mount_factory=mount_services,
         )
         run = store.runs(job.name)[0]
         assert run.status == "failed"

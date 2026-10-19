@@ -232,14 +232,18 @@ class SQLiteStore:
         return self._state(row)
 
     def approve(self, name: str, revision: int, recipient: str | None, now: datetime) -> None:
-        if recipient is not None and (
-            not recipient or recipient[0] not in "CUGD" or not recipient.isalnum()
-        ):
-            raise ValueError(
-                "approval requires a resolved Slack user or conversation ID"
-            )
         with self._transaction():
             state = self.get(name)
+            if (recipient is None) != (state.job.deliver == "none"):
+                raise ValueError(
+                    "approval recipient must match the job delivery configuration"
+                )
+            if recipient is not None and (
+                not recipient or recipient[0] not in "CUGD" or not recipient.isalnum()
+            ):
+                raise ValueError(
+                    "approval requires a resolved Slack user or conversation ID"
+                )
             if state.revision != revision:
                 raise ValueError("draft changed; inspect and approve the new revision")
             if state.enabled:

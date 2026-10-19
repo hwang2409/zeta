@@ -104,7 +104,10 @@ def run(args: argparse.Namespace) -> int:
                 store.approve(
                     review.name, review.revision, review.recipient, datetime.now(UTC)
                 )
-                print(f"{review.name} r{review.revision} armed for {review.recipient}.")
+                print(
+                    f"{review.name} r{review.revision} armed"
+                    + (f" for {review.recipient}." if review.recipient else ".")
+                )
         return 0
     except KeyboardInterrupt:
         return 130
