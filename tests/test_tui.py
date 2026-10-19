@@ -113,10 +113,12 @@ from zeta.tui.bootstrap import surface_shutdown_notifications
 from zeta.tui.cards import markdown as markdown_module
 from zeta.tui.cards.base import compact_tool_card, failure_status
 from zeta.tui.layout import (
+    QueuedPanel,
     composer_content_width,
     content_width,
     full_screen_content,
     queued_lines,
+    queued_panel,
 )
 from zeta.tui.render import (
     _render_tool_output,
@@ -6064,6 +6066,70 @@ async def test_verbose_transition_flushes_before_raw_event(
     assert line_index < raw_index
 
 
+def _panel(app: TUIApp) -> QueuedPanel:
+    return queued_panel(app._agent_navigation, app.queued_messages)
+
+
+def _panel_text(app: TUIApp) -> str:
+    return "".join(text for _style, text in queued_lines(_panel(app), 80))
+
+
+@pytest.mark.asyncio
+async def test_queued_panel_follows_the_viewed_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    child = child_store.session_dir
+    child_store.agent_lifecycle_path.write_text(
+        json.dumps(
+            {
+                "description": "Worker",
+                "agent_type": "worker",
+                "state": "running",
+                "handle": "root:worker",
+            }
+        )
+    )
+    prompt = child_store.pending_prompt_queue.append("child one")
+    monkeypatch.setattr(
+        TUIApp, "queued_messages", property(lambda _self: ("main one", "main two"))
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    navigation = app._agent_navigation
+
+    assert _panel(app) == QueuedPanel("main", ("main one", "main two"))
+    assert "queued · main · 2" in _panel_text(app)
+    assert "child one" not in _panel_text(app)
+
+    navigation.refresh(force=True)
+    navigation.selected_index = next(
+        index for index, entry in enumerate(navigation.entries) if entry.path == child
+    )
+    navigation.open_selected()
+    await wait_until(lambda: _panel(app).messages == ("child one",))
+    assert _panel(app) == QueuedPanel("root:worker", ("child one",), 2)
+    text = _panel_text(app)
+    assert "queued · root:worker · 1" in text
+    assert "main · 2 queued" in text
+    assert "main one" not in text
+
+    child_store.pending_prompt_queue.acknowledge(prompt.id)
+    navigation.refresh(force=True)
+    await wait_until(lambda: _panel(app).messages == ())
+    assert _panel_text(app).strip() == "main · 2 queued"
+
+    navigation.back_to_parent()
+    assert _panel(app) == QueuedPanel("main", ("main one", "main two"))
+    child_store.close()
+    await app.close()
+
+
 @pytest.mark.asyncio
 async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> None:
     # Backslash-prefixed submissions opt into the legacy follow-up behavior
@@ -6084,7 +6150,7 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
         pipe.send_text("\\ second\r")
         await wait_until(lambda: app.queued_messages == ("second",))
         assert "› second" in "".join(
-            text for _style, text in queued_lines(app.queued_messages, 80)
+            text for _style, text in queued_lines(_panel(app), 80)
         )
         backend.release.set()
         await wait_until(lambda: len(backend.calls) == 2)

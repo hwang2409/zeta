@@ -28,6 +28,7 @@ from zeta.tui import theme
 from zeta.tui.cards.agent import AgentCard
 from zeta.tui.layout import (
     CONTENT_MARGIN,
+    QueuedPanel,
     TranscriptMargins,
     content_width,
     queued_lines,
@@ -156,12 +157,18 @@ def test_sent_message_band_bleeds_into_margins_but_tool_cards_do_not() -> None:
 
 
 def test_queued_lines_list_each_message_on_one_truncated_row() -> None:
-    def rows(messages: tuple[str, ...], width: int = 40) -> list[str]:
-        return "".join(text for _style, text in queued_lines(messages, width)).split("\n")
+    def rows(
+        messages: tuple[str, ...], width: int = 40, *, label: str = "main", main: int = 0
+    ) -> list[str]:
+        panel = QueuedPanel(label, messages, main)
+        return "".join(text for _style, text in queued_lines(panel, width)).split("\n")
 
-    assert rows(("fix the\nbuild",)) == ["  queued", "  › fix the build"]
+    assert rows(("fix the\nbuild",)) == ["  queued · main · 1", "  › fix the build"]
     many = rows(("a", "b", "c", "a much longer message that cannot fit on one row"))
-    assert many == ["  queued · 4", "  › a", "  › b", "  › c", "    +1 more"]
+    assert many == ["  queued · main · 4", "  › a", "  › b", "  › c", "    +1 more"]
+    child = rows(("go on",), label="root:worker", main=2)
+    assert child == ["  queued · root:worker · 1", "  › go on", "  main · 2 queued"]
+    assert rows((), label="root:worker", main=1) == ["  main · 1 queued"]
     long = rows(("x" * 100,), width=30)[1]
     assert get_cwidth(long) == 2 + 2 + content_width(30) - 2
     assert long.endswith("...")

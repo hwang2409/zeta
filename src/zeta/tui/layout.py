@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.enums import DEFAULT_BUFFER
@@ -227,12 +227,36 @@ class TranscriptMargins(VSplit):
                     row[x] = margin
 
 
-def queued_lines(messages: Sequence[str], terminal_width: int) -> StyleAndTextTuples:
+class QueuedPanel(NamedTuple):
+    """Queued messages of the viewed session, plus the main queue size in a child view."""
+
+    label: str
+    messages: Sequence[str]
+    main_waiting: int = 0
+
+
+def queued_panel(
+    navigation: AgentNavigation | None, main: Sequence[str]
+) -> QueuedPanel:
+    """The viewed session's queue; a child view also counts the main queue."""
+
+    child = navigation.child_queued_messages() if navigation is not None else None
+    if child is None:
+        return QueuedPanel("main", main)
+    label, messages = child
+    return QueuedPanel(label, messages, len(main))
+
+
+def queued_lines(panel: QueuedPanel, terminal_width: int) -> StyleAndTextTuples:
     """Describe messages that are submitted but not yet sent, one row each."""
 
     indent = " " * CONTENT_MARGIN
-    count = f" · {len(messages)}" if len(messages) > 1 else ""
-    fragments: StyleAndTextTuples = [(f"fg:{theme.CHROME}", f"{indent}queued{count}")]
+    messages = panel.messages
+    fragments: StyleAndTextTuples = []
+    if messages:
+        fragments.append(
+            (f"fg:{theme.CHROME}", f"{indent}queued · {panel.label} · {len(messages)}")
+        )
     width = max(1, content_width(terminal_width) - 2)
     for message in messages[:QUEUED_VISIBLE_ROWS]:
         fragments += [
@@ -243,6 +267,12 @@ def queued_lines(messages: Sequence[str], terminal_width: int) -> StyleAndTextTu
     hidden = len(messages) - QUEUED_VISIBLE_ROWS
     if hidden > 0:
         fragments += [("", "\n"), (f"fg:{theme.CHROME}", f"{indent}  +{hidden} more")]
+    if panel.main_waiting:
+        if fragments:
+            fragments.append(("", "\n"))
+        fragments.append(
+            (f"fg:{theme.CHROME}", f"{indent}main · {panel.main_waiting} queued")
+        )
     return fragments
 
 
@@ -575,18 +605,21 @@ def full_screen_content(
     padded_composer_rows = list(composer_rows)
     if padded_composer_rows:
         padded_composer_rows[0] = ComposerPadding(padded_composer_rows[0])
-    queued_panel = ConditionalContainer(
+    def viewed_queue() -> QueuedPanel:
+        return queued_panel(agent_navigation, queued_messages())
+
+    queued_rows = ConditionalContainer(
         Window(
             FormattedTextControl(
                 lambda: queued_lines(
-                    queued_messages(), get_app().output.get_size().columns
+                    viewed_queue(), get_app().output.get_size().columns
                 )
             ),
             dont_extend_height=True,
         ),
-        Condition(lambda: bool(queued_messages())),
+        Condition(lambda: bool(viewed_queue().messages or viewed_queue().main_waiting)),
     )
-    bottom_rows = [spacer, todo_panel, queued_panel, *padded_composer_rows]
+    bottom_rows = [spacer, todo_panel, queued_rows, *padded_composer_rows]
     if list_panel is not None:
         bottom_rows.append(list_panel)
     bottom_rows.append(footer)
