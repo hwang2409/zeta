@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import shlex
 import sys
@@ -2774,8 +2775,10 @@ async def test_parallel_nested_lifecycle_events_survive_large_batch(
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
     )
+    baseline_fds = len(os.listdir("/dev/fd"))
 
     events = await asyncio.wait_for(_collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=30)
+    assert len(os.listdir("/dev/fd")) <= baseline_fds + 5
 
     read_lifecycle = [
         event
