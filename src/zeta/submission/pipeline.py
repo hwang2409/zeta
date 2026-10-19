@@ -6,7 +6,6 @@ import asyncio
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from enum import StrEnum
 from itertools import count
 from pathlib import Path
 from typing import Any, Protocol
@@ -31,20 +30,14 @@ from ..tools._shared.shell import (
 )
 from ..tui.composer import UndoCandidate, parse_input
 from ..tui.user import USER_DISPLAY_TEXT_METADATA
-from .model import Submission, SubmissionHost, dispatch_provider
-from .notification_retry import NotificationRetry, RetryKind
-
-
-class SubmissionState(StrEnum):
-    """States owned by the submission consumer."""
-
-    QUEUED = "queued"
-    PREPROCESSING = "preprocessing"
-    AWAITING_APPROVAL = "awaiting-approval"
-    READY = "ready"
-    DISPATCHED = "dispatched"
-    CANCELED = "canceled"
-    DENIED = "denied"
+from .model import (
+    Submission,
+    SubmissionHost,
+    SubmissionState,
+    _Entry,
+    dispatch_provider,
+)
+from .notification_retry import NotificationRetry
 
 
 class _Message(Protocol):
@@ -115,28 +108,6 @@ class _UndoAction:
     pass
 
 
-@dataclass(slots=True)
-class _Entry:
-    submission: Submission
-    state: SubmissionState = SubmissionState.QUEUED
-    parsed: str = ""
-    model_input: ModelInputEnvelope | None = None
-    attachment_value: str | None = None
-    message: Message | None = None
-    candidate: UndoCandidate | None = None
-    signal: AbortSignal | None = None
-    child_task: asyncio.Task[Any] | None = None
-    preprocessing: bool = False
-    persist_user_message: bool = True
-    acknowledge_on_provider_done: bool = False
-    completion: asyncio.Future[None] | None = None
-    acknowledged: asyncio.Future[None] | None = None
-    undo_requested: bool = False
-    denied: bool = False
-    printed: bool = False
-    notification: bool = False
-
-
 class SubmissionPipeline:
     """Serialize actions and own every submission transition."""
 
@@ -161,7 +132,17 @@ class SubmissionPipeline:
         self._command_results: dict[int, str | None] = {}
         self._provider_entry: _Entry | None = None
         self._provider_task: asyncio.Task[bool] | None = None
-        self._notification_retry = NotificationRetry(lambda: self._send(None))
+        self._notification_retry = NotificationRetry(
+            wake=lambda: self._send(None),
+            has_notification=lambda: (
+                self._host.loop.notification_system_message() is not None
+            ),
+            schedule_history=self._host.loop.schedule_notification_history_retry,
+            rollback=self._rollback_provider_dispatch,
+            report_failure=lambda exc: self._host._print_system(
+                f"submission failed: {exc}"
+            ),
+        )
         self._durable_tasks: dict[str, asyncio.Task[Any]] = {}
         self._control_entry: _Entry | None = None
         self._closed = False
@@ -522,34 +503,15 @@ class SubmissionPipeline:
     def start_notification_wake(self) -> None:
         """Dispatch the ready notification attempt without blocking the consumer."""
 
-        kind = self._notification_retry.ready_kind
-        if kind is None:
-            return
-        try:
-            if not self._prepare_notification_attempt(kind):
-                self._notification_retry.recovered()
-                return
-            submission = self._new_submission("", 0, (), None, 1, steer=False)
-            entry = self._notification_entry(submission)
-            self._notification_retry.started()
-            self._dispatch_provider(entry, user_text="", notification=True)
-        except Exception as exc:  # noqa: BLE001
-            self._rollback_provider_dispatch()
-            if self._notification_retry.failed(kind):
-                self._host._print_system(f"submission failed: {exc}")
+        self._notification_retry.attempt(self._start_notification_provider)
 
-    def _prepare_notification_attempt(self, kind: RetryKind) -> bool:
-        if kind == "history":
-            self._host.loop.schedule_notification_history_retry()
-            return True
-        return self._host.loop.notification_system_message() is not None
+    def _start_notification_provider(self) -> None:
+        submission = self._new_submission("", 0, (), None, 1, steer=False)
+        entry = self._notification_entry(submission)
+        self._dispatch_provider(entry, user_text="", notification=True)
 
     def _notification_entry(self, submission: Submission) -> _Entry:
-        entry = _Entry(
-            submission,
-            state=SubmissionState.DISPATCHED,
-            notification=True,
-        )
+        entry = _Entry(submission, state=SubmissionState.DISPATCHED)
         entry.signal = self._new_signal()
         self._entries[submission.id] = entry
         return entry
@@ -914,8 +876,8 @@ class SubmissionPipeline:
         ):
             return
         entry = self._provider_entry
-        if entry.notification:
-            self._finish_notification_provider(message.task)
+        if entry.message is None:
+            self._notification_retry.provider_finished(message.task)
         pending = self._host.loop.store.pending_client_steering()
         if self._provider_entry.message is not None and pending is not None:
             entries = sorted(self._entries.values(), key=lambda item: item.submission.id)
@@ -933,22 +895,6 @@ class SubmissionPipeline:
                 entry.state = SubmissionState.READY
         self._ack_entry(self._provider_entry)
         self._provider_entry, self._provider_task = None, None
-
-    def _finish_notification_provider(self, task: asyncio.Task[bool]) -> None:
-        if task.cancelled():
-            self._notification_retry.recovered()
-            return
-        try:
-            succeeded = task.result() is not False
-        except Exception as exc:  # noqa: BLE001
-            succeeded = False
-            if self._notification_retry.failed("history"):
-                self._host._print_system(f"submission failed: {exc}")
-        if succeeded:
-            self._notification_retry.recovered()
-            return
-        self._host.loop.schedule_notification_history_retry()
-        self._notification_retry.failed("history")
 
     async def _wait_for_preprocessing(
         self,
