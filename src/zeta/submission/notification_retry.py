@@ -137,10 +137,23 @@ class NotificationRetry:
     @staticmethod
     def _is_transient(failure: NotificationFailure) -> bool:
         error = failure.error
+        notification_error = isinstance(error, ErrorInfo) and (
+            error.code
+            in {
+                "os_error",
+                "overloaded_error",
+                "rate_limit_error",
+                "server_is_overloaded",
+                "slow_down",
+                "stream_error",
+            }
+            or error.status_code in {408, 409, 425}
+            or error.status_code is not None
+            and 500 <= error.status_code < 600
+        )
         return (
             isinstance(error, OSError)
-            or isinstance(error, ErrorInfo)
-            and error.code in {"os_error", "stream_error"}
+            or notification_error
             or retryable_provider_error(error, failure.event_data)
         )
 

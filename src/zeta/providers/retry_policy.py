@@ -15,15 +15,7 @@ import httpx
 MAX_PROVIDER_ATTEMPTS = 5
 MAX_PROVIDER_RETRY_SECONDS = 60.0
 MAX_PROVIDER_RETRY_DELAY_SECONDS = 30.0
-_RETRYABLE_STATUS_CODES = {408, 409, 425, 429}
-_RETRYABLE_ERROR_CODES = {
-    "overloaded_error",
-    "rate_limit_error",
-    "server_is_overloaded",
-    "slow_down",
-    "timeout",
-    "transport_error",
-}
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
 _TERMINAL_ERROR_CODES = {
     "auth_error",
     "authentication_error",
@@ -184,12 +176,10 @@ def retryable_provider_error(
     code = getattr(error, "code", None)
     if code in _TERMINAL_ERROR_CODES:
         return False
-    if status_code in _RETRYABLE_STATUS_CODES or (
-        type(status_code) is int and 500 <= status_code < 600
-    ):
-        return True
-    if type(status_code) is int and 400 <= status_code < 500:
+    if type(status_code) is int and 400 <= status_code < 500 and status_code != 429:
         return False
+    if status_code in _RETRYABLE_STATUS_CODES:
+        return True
     if (
         getattr(error, "retryable", False)
         or getattr(error, "is_stall", False)
@@ -197,7 +187,7 @@ def retryable_provider_error(
     ):
         return True
     message = getattr(error, "message", None)
-    if code in _RETRYABLE_ERROR_CODES:
+    if code in {"timeout", "transport_error"}:
         return True
     if (
         code == "http_error"
