@@ -7,7 +7,6 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -39,10 +38,11 @@ from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
 from ..tools.registry import ToolExecutionContext
-from .background import finish_background_child, finish_gate_message
+from .background import finish_background_child
 from .budget import MAX_AGENT_DEPTH
 from .budget import child_depth as next_agent_depth
 from .conversation_channel import has_follow_up_loop
+from .finish_gate import FinishGateControl, FinishGateState, run_finish_gate
 from .presets import (
     GENERAL_PRESET,
     RUN_PRESET,
@@ -57,21 +57,8 @@ from .receipt import (
 )
 
 logger = logging.getLogger(__name__)
-
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
-
-
-@dataclass(slots=True)
-class _FinishGateState:
-    deadline: float
-    max_turns: int
-    turns: int = 0
-    handoff: tuple[str, str] | None = None
-
-    @property
-    def exhausted(self) -> bool:
-        return self.turns >= self.max_turns
 
 
 async def consume_child(
@@ -91,6 +78,8 @@ async def consume_child(
     error_message: Callable[[BaseException], str],
     record_report: Callable[[str], None] | None = None,
     notification_turn: bool = False,
+    finish_gate_state: FinishGateState | None = None,
+    delivering_prompt_id: str | None = None,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
 
@@ -116,8 +105,8 @@ async def consume_child(
 
     async def consume_events(
         events: AsyncIterator[StreamEvent],
-        gate_state: _FinishGateState | None = None,
-    ) -> bool:
+        gate_control: FinishGateControl | None = None,
+    ) -> None:
         nonlocal failure_message, final_message, tool_calls
         final_message = None
         async for event in events:
@@ -169,13 +158,10 @@ async def consume_child(
                 update_turns(turns)
                 if event.data.get("tool_calls") == 0 and event.message is not None:
                     final_message = event.message
-                if gate_state is not None:
-                    gate_state.turns += 1
-                    if gate_state.handoff is not None or gate_state.exhausted:
-                        return False
+                if gate_control is not None and gate_control.turn_ended():
+                    return
             elif event.type is StreamEventType.ERROR and event.error is not None:
                 failure_message = event.error.message
-        return True
 
     def owned_children() -> tuple[tuple[str, str], ...]:
         instance_id = child_loop.agent_instance_id
@@ -201,98 +187,17 @@ async def consume_child(
         tasks = owned_tasks()
         if final_message is not None and (children or tasks):
             fallback_message = final_message
-            gate_state = _FinishGateState(
-                deadline=(
-                    asyncio.get_running_loop().time()
-                    + child_loop._background_owner.finish_gate_timeout
-                ),
-                max_turns=child_loop._background_owner.finish_gate_max_turns,
+            gate_result = await run_finish_gate(
+                child_loop,
+                children,
+                tasks,
+                consume_events,
+                lambda: failure_message is not None,
+                finish_gate_state,
+                delivering_prompt_id,
             )
-            bound_exited = False
-
-            async def handoff(arguments: dict[str, Any]) -> str:
-                gate_state.handoff = (arguments["reason"], arguments["outputs"])
-                return "background work handed off"
-
-            async def consume_gate_events(events: AsyncIterator[StreamEvent]) -> bool:
-                try:
-                    async with asyncio.timeout_at(gate_state.deadline):
-                        return await consume_events(events, gate_state)
-                except TimeoutError:
-                    nonlocal bound_exited
-                    bound_exited = True
-                    return False
-                finally:
-                    close = getattr(events, "aclose", None)
-                    if close is not None:
-                        await close()
-
-            child_loop.tool_registry.register(
-                "agent_handoff",
-                handoff,
-                description=(
-                    "Hand off running background work to the parent. Sub-agents "
-                    "continue and report to the parent. Background tasks cannot be "
-                    "adopted and are killed when this agent completes; provide where "
-                    "their output can be found."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "reason": {"type": "string", "minLength": 1},
-                        "outputs": {"type": "string", "minLength": 1},
-                    },
-                    "required": ["reason", "outputs"],
-                    "additionalProperties": False,
-                },
-                requires_approval=False,
-            )
-            try:
-                gate = finish_gate_message(children, tasks)
-                keep_going = await consume_gate_events(
-                    child_loop.run_turn(
-                        "",
-                        origin=MessageOrigin.HARNESS_NUDGE,
-                        user_message=gate,
-                    )
-                )
-                if gate_state.exhausted and gate_state.handoff is None:
-                    bound_exited = True
-                while keep_going and failure_message is None:
-                    children = owned_children()
-                    tasks = owned_tasks()
-                    pending_follow_up = bool(child_loop.store.pending_prompts())
-                    pending_notification = (
-                        child_loop.notification_system_message() is not None
-                    )
-                    if pending_follow_up:
-                        break
-                    if not children and not tasks and not pending_notification:
-                        break
-                    if children or tasks:
-                        remaining = (
-                            gate_state.deadline - asyncio.get_running_loop().time()
-                        )
-                        if remaining <= 0:
-                            bound_exited = True
-                            break
-                        try:
-                            async with asyncio.timeout(remaining):
-                                await child_loop._background_owner.conversation_channel.wait(
-                                    child_loop.agent_instance_id or ""
-                                )
-                        except TimeoutError:
-                            bound_exited = True
-                            break
-                    if child_loop.notification_system_message() is None:
-                        continue
-                    keep_going = await consume_gate_events(
-                        child_loop.run_notification_turn()
-                    )
-            finally:
-                child_loop.tool_registry.unregister("agent_handoff")
-            if gate_state.handoff is not None:
-                reason, outputs = gate_state.handoff
+            if gate_result.handoff is not None:
+                reason, outputs = gate_result.handoff
                 final_message = Message(
                     MessageRole.ASSISTANT,
                     [
@@ -302,9 +207,22 @@ async def consume_child(
                         )
                     ],
                 )
-            elif (
-                bound_exited and (owned_children() or owned_tasks())
-            ) or final_message is None:
+            elif gate_result.reason is not None and (
+                owned_children() or owned_tasks()
+            ):
+                if owned_tasks():
+                    fallback_message = Message(
+                        MessageRole.ASSISTANT,
+                        [
+                            TextContent(
+                                assistant_text(fallback_message)
+                                + f"\n{gate_result.reason}; "
+                                "running background tasks were killed."
+                            )
+                        ],
+                    )
+                final_message = fallback_message
+            elif final_message is None:
                 final_message = fallback_message
     except asyncio.CancelledError:
         raise
@@ -371,6 +289,7 @@ async def consume_run(
     current_entry = None
     segment_reports: list[str] = []
     kwargs["record_report"] = segment_reports.append
+    kwargs["finish_gate_state"] = FinishGateState()
 
     def finalize(res: dict[str, object]) -> dict[str, object]:
         if segment_reports and receipt_components is not None:
@@ -436,6 +355,7 @@ async def consume_run(
             )
             if pending:
                 current_entry = pending[0]
+                kwargs["delivering_prompt_id"] = current_entry.id
                 result = await consume_child(
                     child_loop,
                     current_entry.data["text"],
@@ -443,6 +363,7 @@ async def consume_run(
                     **kwargs,
                 )
                 continue
+            kwargs["delivering_prompt_id"] = None
             if child_loop.notification_wake.pending_message() is not None:
                 result = await consume_child(
                     child_loop,
