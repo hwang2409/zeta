@@ -176,17 +176,20 @@ pending-prompt queue, loop, registry, and store open.
 
 on each transition into `idle`, publish exactly one bounded, nonterminal
 `child_idle` notification to the direct parent and wake it without polling. the
-notification includes a bounded `child_instance_id`, `child_session_path`,
-`text` excerpt of the last assistant text, and optional
-`ask_parent_question_id`. its status is `child_idle`; it is a durable relevant
-notification, not a terminal completion. give it its own bounded schema in
-notification validation: accept `status = child_idle` with only those fields and
-the existing bounded text/description envelope, while terminal statuses continue
-to require their terminal fields (`src/zeta/core/store/_validation.py:32-49`
-currently accepts only `completed`, `error`, and `canceled`). repeated status
-reads do not republish it. this makes even the original bare `WAIT` response
-visible to a parent that is waiting for terminal completion; the parent can
-send approval or other direction with `agent_send`.
+notification has the dedicated kind `child_idle`, and includes a bounded
+`child_instance_id`, `child_session_path`, `text` excerpt of the last assistant
+text, and optional `ask_parent_question_id`. its status is `child_idle`; it is a
+durable relevant notification, not a terminal completion. give this kind its own
+bounded validator and append path: accept `kind = child_idle` and
+`status = child_idle` with only those fields and the existing bounded
+text/description envelope, while terminal statuses continue to require their
+terminal fields (`src/zeta/core/store/_validation.py:32-49` currently accepts
+only `completed`, `error`, and `canceled`). keep it in the normal pending-
+notification queue, but exclude it from terminal completion lookup, recovery,
+and exactly-once terminal deduplication. repeated status reads do not republish
+it. this makes even the original bare `WAIT` response visible to a parent that
+is waiting for terminal completion; the parent can send approval or other
+direction with `agent_send`.
 
 these events wake an idle child and produce one ordinary model turn:
 
@@ -310,7 +313,7 @@ arguments and successful tool result before entering `finishing`.
 | `running` or `idle` | valid `finish` wins | `finishing`; close admission and durably store report plus successful result |
 | `finishing` | second `finish` or any other tool call | `finishing`; reject as `child is finishing` |
 | `finishing` | turn end or later stream/provider failure | terminal from the explicit report; publish it once |
-| `finishing` | cancellation or restart recovery | unchanged; accepted `finish` already closed admission and its report remains authoritative |
+| `finishing` | cancellation, graceful shutdown, or restart recovery | finalize the accepted report exactly once; map its status to the terminal lifecycle state, publish or recover its terminal receipt, close questions and markers, and release resources |
 | any live state except `finishing` | cancellation or restart recovery wins | `canceled`; atomically close admission and clean up owned work |
 | `running` or `idle` | provider failure before accepted `finish` | `failed` after retries; clean up owned work |
 | any terminal state | any event | unchanged; no second terminal receipt |
@@ -330,8 +333,12 @@ arguments and successful tool result before entering `finishing`.
   is already closed and the explicit report remains authoritative; publish no
   second receipt.
 - **parent exit:** graceful parent shutdown cancels live children as it does
-  now. a crash is reconciled as canceled on recovery. child conversations stay
-  available for inspection, but `agent_send` cannot revive them.
+  now, except an accepted `finish` is finalized exactly once from its stored
+  report as described for `finishing`. a crash is reconciled the same way: map
+  the stored report to its terminal lifecycle state, publish or recover its
+  terminal receipt, close questions and markers, and release resources. child
+  conversations stay available for inspection, but `agent_send` cannot revive
+  them.
 - **restart:** do not rehydrate idle loops in the first version. durable idle
   state makes the reason visible during recovery, but recovery converts it to a
   canceled terminal result. this avoids pretending process tasks, in-memory
@@ -466,6 +473,9 @@ must fail on the pre-implementation revision for the expected reason.
   delivers later approval, and lets the child report.
 - `tests/test_agent.py::test_idle_notification_wakes_waiting_parent_without_polling`
   checks one bounded `child_idle` notice with last text and open question id.
+- `tests/test_agent.py::test_child_idle_then_terminal_receipt_is_appended_and_delivered_once`
+  appends an idle notice first, then proves terminal completion is still appended
+  and delivered once rather than being suppressed by completion deduplication.
 - `tests/test_agent.py::test_idle_child_wakes_for_task_and_child_completion_only`
   covers relevant wakes and excludes reads, progress, and unrelated notices.
 - `tests/test_agent.py::test_child_idle_wakes_idle_explicit_finish_parent_tree`
@@ -519,6 +529,9 @@ must fail on the pre-implementation revision for the expected reason.
   after terminal publication.
 - `tests/test_agent.py::test_idle_child_restart_recovers_as_canceled` covers the
   shared fence cleanup and v1 no-rehydration rule.
+- `tests/test_agent.py::test_finish_recovery_after_durable_acceptance_publishes_report_once`
+  interrupts after durable acceptance and before normal terminal publication,
+  then proves recovery finalizes the stored report and emits one terminal receipt.
 - `tests/test_agents.py::test_explicit_finish_requires_global_and_profile_opt_in`,
   `tests/test_settings.py::test_project_cannot_enable_explicit_finish`, and
   `tests/test_tui.py::test_idle_agent_card_reports_count_fd_floor_and_warning`
