@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import subprocess
 import time
 import weakref
 from collections import deque
@@ -15,7 +16,7 @@ from shutil import (
 from typing import Any
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application import get_app
+from prompt_toolkit.application import get_app, run_in_terminal
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.styles import DynamicStyle, Style
@@ -970,9 +971,14 @@ class TUIApp(
         if not self._full_screen_active(): return f"project instructions: {path}"
         command = shlex.join(project_instructions_editor_command(path))
         async def run() -> str:
-            try: status = await get_app().run_system_command(command)
-            except (OSError, RuntimeError) as exc: return f"project instructions editor error: {exc} ({path})"
-            if status: return f"project instructions editor error: exited with status {status} ({path})"
+            try:
+                status = await run_in_terminal(
+                    lambda: subprocess.call(command, shell=True), in_executor=True
+                )
+            except (OSError, RuntimeError) as exc:
+                return f"project instructions editor error: {exc} ({path})"
+            if status:
+                return f"project instructions editor error: exited with status {status} ({path})"
             return f"project instructions: {path} (applies to new and resumed sessions)"
         return run()
     def _print_system(self, output: str) -> None:

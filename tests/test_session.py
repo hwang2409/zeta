@@ -20,6 +20,7 @@ from rich.cells import cell_len
 from rich.console import Console
 from rich.text import Text
 
+import zeta.tui.app as tui_app
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser, main
 from zeta.core.abort import AbortGenerationRegistry
@@ -467,6 +468,106 @@ def test_repo_agents_ignore_warns_with_custom_system_prompt_on_resume(
     resumed = create_app(_args("--resume", session_id))
 
     assert any("repository AGENTS.md" in notice for notice in resumed._startup_notices)
+
+
+@pytest.mark.asyncio
+async def test_project_instructions_opens_editor_once_in_tui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _, private = _private_project(home, root, "")
+    editor = tmp_path / "editor"
+    invocation = tmp_path / "invocation"
+    editor.write_text(f'#!/bin/sh\nprintf "%s" "$1" > {invocation}\n')
+    editor.chmod(0o755)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setenv("EDITOR", str(editor))
+    monkeypatch.chdir(root)
+    app = create_app(_args())
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    calls = 0
+
+    async def run_in_terminal(func, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return func()
+
+    monkeypatch.setattr(tui_app, "run_in_terminal", run_in_terminal)
+    result = await app._slash_commands.dispatch_async(app, "/project-instructions")
+
+    assert calls == 1
+    assert invocation.read_text() == str(private)
+    assert result == f"project instructions: {private} (applies to new and resumed sessions)"
+    assert await app._slash_commands.dispatch_async(app, "/status")
+    app.loop.store.close()
+
+
+@pytest.mark.parametrize("editor", ["missing-editor", "nonzero-editor"])
+@pytest.mark.asyncio
+async def test_project_instructions_editor_failure_prints_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, editor: str
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _, private = _private_project(home, root, "")
+    if editor == "nonzero-editor":
+        editor_path = tmp_path / editor
+        editor_path.write_text("#!/bin/sh\nexit 9\n")
+        editor_path.chmod(0o755)
+        monkeypatch.setenv("EDITOR", str(editor_path))
+    else:
+        monkeypatch.setenv("EDITOR", editor)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    app = create_app(_args())
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+
+    async def run_in_terminal(func, **_kwargs):
+        return func()
+
+    monkeypatch.setattr(tui_app, "run_in_terminal", run_in_terminal)
+    result = await app._slash_commands.dispatch_async(app, "/project-instructions")
+
+    assert result is not None
+    assert "project instructions editor error" in result
+    assert str(private) in result
+    assert await app._slash_commands.dispatch_async(app, "/status")
+    app.loop.store.close()
+
+
+@pytest.mark.asyncio
+async def test_project_instructions_serve_does_not_start_editor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _, private = _private_project(home, root, "")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    registry = create_slash_registry(
+        zeta_home=home, project_dir=root, skill_catalog=SkillCatalog.empty()
+    )
+    calls = 0
+
+    async def run_in_terminal(func, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return func()
+
+    monkeypatch.setattr(tui_app, "run_in_terminal", run_in_terminal)
+    result = await registry.dispatch_async(SimpleNamespace(), "/project-instructions")
+
+    assert result == f"project instructions: {private}"
+    assert private.is_file()
+    assert calls == 0
 
 
 def test_project_instructions_slash_command_creates_file(
