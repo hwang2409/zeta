@@ -15,7 +15,22 @@ import httpx
 MAX_PROVIDER_ATTEMPTS = 5
 MAX_PROVIDER_RETRY_SECONDS = 60.0
 MAX_PROVIDER_RETRY_DELAY_SECONDS = 30.0
-_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
+_RETRYABLE_STATUS_CODES = {
+    408,
+    409,
+    425,
+    429,
+    500,
+    502,
+    503,
+    504,
+    520,
+    521,
+    522,
+    523,
+    524,
+    529,
+}
 _TERMINAL_ERROR_CODES = {
     "auth_error",
     "authentication_error",
@@ -180,7 +195,11 @@ def retryable_provider_error(
         return False
     # Preserve the notification-turn rule: client errors are permanent even
     # when an untrusted response body claims to be a server failure.
-    if type(status_code) is int and 400 <= status_code < 500 and status_code != 429:
+    if (
+        type(status_code) is int
+        and 400 <= status_code < 500
+        and status_code not in {408, 409, 425, 429}
+    ):
         return False
     if code == "server_error":
         return True

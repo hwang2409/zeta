@@ -93,16 +93,15 @@ class StreamDiagnostics:
         self.written = True
 
     @staticmethod
-    def record_failure(
-        path: Path,
-        error: BaseException,
-        *,
-        model: str | None,
-        context: Mapping[str, Any],
-        attempt: int,
-        will_retry: bool,
-    ) -> None:
-        """Record bounded lifecycle facts without provider text or prompts."""
+    def record_failure_decision(error: BaseException, *, will_retry: bool) -> None:
+        """Record one Codex failure after its retry owner makes the decision."""
+        diagnostic = getattr(error, "stream_diagnostic", None)
+        if not isinstance(diagnostic, tuple) or len(diagnostic) != 4:
+            return
+        path, model, context, attempt = diagnostic
+        if getattr(error, "stream_diagnostic_recorded", False):
+            return
+        error.stream_diagnostic_recorded = True
         write_stream_diagnostic(
             path,
             {
@@ -118,6 +117,7 @@ class StreamDiagnostics:
                 "stream_age_seconds": context.get("stream_age_seconds", 0.0),
                 "event_count": context.get("event_count", 0),
                 "attempt": attempt,
+                "retryable": getattr(error, "retryable", False),
                 "will_retry": will_retry,
             },
         )

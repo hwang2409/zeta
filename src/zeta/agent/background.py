@@ -872,9 +872,8 @@ async def finish_background_child(
     validate_result: Callable[[object, str], ToolResult],
     publish_event: Callable[[StreamEvent], None],
     cleanup: Callable[[], None],
-    close_child: Callable[[], Awaitable[tuple[str, ...]]],
+    close_child: Callable[[], Awaitable[tuple[tuple[str, str], ...]]],
     error_message: Callable[[BaseException], str],
-    killed_task_details: Callable[[], tuple[tuple[str, str], ...]] | None = None,
     marker_key: str | None = None,
     agent_instance_id: str | None = None,
     background_owner: BackgroundAgentOwner | None = None,
@@ -905,9 +904,9 @@ async def finish_background_child(
             status = "error"
             notification_text = f"agent error: {error_message(exc)}"
         # Closing the child after its final turn terminates any task it still
-        # owns. close() kills them silently and returns their ids so the parent
-        # is never left guessing why child work disappeared.
-        killed_tasks = list(await close_child() or ())
+        # owns and returns secret-safe labels for the parent receipt.
+        killed_task_records = list(await close_child() or ())
+        killed_tasks = [task_id for task_id, _label in killed_task_records]
         # Completion metadata is persisted in more than one store. Keep the
         # legacy field bounded even when a child owned an unbounded task list.
         killed_task_metadata = [task_id[:64] for task_id in killed_tasks[:64]]
@@ -915,10 +914,9 @@ async def finish_background_child(
         killed_task_ids_truncated = len(killed_tasks) > len(
             killed_task_metadata
         ) or any(len(task_id) > 64 for task_id in killed_tasks)
-        detail_by_id = dict(killed_task_details() if killed_task_details else ())
         killed_task_labels = [
-            f"{task_id} ({detail_by_id.get(task_id, 'command unavailable')}; archive: {child_path}/background-output.archive)"
-            for task_id in killed_tasks
+            f"{task_id} ({label}; archive: {child_path}/background-output.archive)"
+            for task_id, label in killed_task_records
         ]
         killed_task_notice = (
             "\nbackground tasks killed on child completion: "

@@ -1022,27 +1022,16 @@ async def run_agent_tool(
             if child_policy is not None:
                 child_policy.cleanup()
 
-        killed_task_details: list[tuple[str, str]] = []
-
-        async def close_background_child() -> tuple[str, ...]:
-            task_details = {
-                task.task_id: task.headline
+        async def close_background_child() -> tuple[tuple[str, str], ...]:
+            task_labels = {
+                task.task_id: task.safe_label
                 for task in child_loop.tool_registry.background_tasks.snapshot()
             }
             killed = await child_loop.close(cancel_background=False)
-            if killed:
-                task_details.update(
-                    {
-                        task.task_id: task.headline
-                        for task in child_loop.tool_registry.background_tasks.snapshot()
-                    }
-                )
-            killed_task_details.extend(
-                (task_id, task_details[task_id])
+            return tuple(
+                (task_id, task_labels.get(task_id, "command unavailable"))
                 for task_id in killed
-                if task_id in task_details
             )
-            return killed
 
         async def finish_background() -> None:
             try:
@@ -1072,7 +1061,6 @@ async def run_agent_tool(
                     publish_event=loop._publish_background_event,
                     cleanup=cleanup_background_child,
                     close_child=close_background_child,
-                    killed_task_details=lambda: tuple(killed_task_details),
                     error_message=error_message,
                     marker_key=child_marker_key,
                     agent_instance_id=loop.agent_instance_id,

@@ -6,6 +6,7 @@ import asyncio
 import codecs
 import logging
 import os
+import shlex
 import shutil
 import signal
 import tempfile
@@ -116,6 +117,10 @@ class BackgroundTaskInfo:
     @property
     def headline(self) -> str:
         return _command_headline(self.command)
+
+    @property
+    def safe_label(self) -> str:
+        return _command_program(self.command)
 
 
 @dataclass(slots=True)
@@ -1143,6 +1148,19 @@ def _command_headline(command: str, limit: int = 80) -> str:
     if len(headline) <= limit:
         return headline
     return headline[: max(0, limit - 3)] + "..."
+
+
+def _command_program(command: str) -> str:
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return "command unavailable"
+    for word in words:
+        name, separator, _value = word.partition("=")
+        if separator and name.isidentifier():
+            continue
+        return Path(word).name or "command unavailable"
+    return "command unavailable"
 
 
 def _output_tail(output: bytearray | None) -> str:

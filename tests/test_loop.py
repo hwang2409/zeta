@@ -1693,7 +1693,7 @@ async def test_loop_owned_stall_retry_starts_after_real_90s_silence(
     budget = None
     monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
 
-    async def advance(delay: float, _abort_signal=None) -> bool:
+    async def advance(delay: float, _abort_signal=None, _source=None) -> bool:
         nonlocal now
         now += delay
         return True
@@ -1975,7 +1975,7 @@ async def test_child_retries_response_failed_server_error(
         path = tmp_path / "codex.json"
 
         async def access_token(self, _client: httpx.AsyncClient) -> str:
-            encode = lambda value: base64.urlsafe_b64encode(  # noqa: E731
+            encode = lambda value: base64.urlsafe_b64encode(
                 json.dumps(value).encode()
             ).decode().rstrip("=")
             return ".".join(

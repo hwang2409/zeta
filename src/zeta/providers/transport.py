@@ -18,6 +18,7 @@ from .retry_policy import (
     current_retry_budget,
     retry_error_label,
 )
+from .stream_diagnostics import StreamDiagnostics
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
 DEFAULT_STREAM_STALL_SECONDS = 90.0
@@ -216,13 +217,12 @@ async def retry_provider_completion(
         # A stall after that event can still be retried safely.
         # A response.failed server_error may follow response.created; it still
         # has no persisted assistant content and is safe under the shared budget.
-        if (
-            started
-            and (not stalled or committed)
-            and getattr(error, "code", None) != "server_error"
+        if committed or (
+            started and not stalled and getattr(error, "code", None) != "server_error"
         ):
             if pending_truncated_end is not None:
                 yield pending_truncated_end
+            StreamDiagnostics.record_failure_decision(error, will_retry=False)
             raise error
         if is_unauthorized(error):
             if refreshed:
@@ -238,6 +238,7 @@ async def retry_provider_completion(
             owner="transport",
             event_data={"retryable": True} if stalled else None,
         )
+        StreamDiagnostics.record_failure_decision(error, will_retry=plan is not None)
         if plan is None:
             if budget.exhausted:
                 on_exhausted(error, budget.attempts - 1)

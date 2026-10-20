@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import monotonic
 
 from ..codex import (
     CODEX_API_URL,
@@ -51,7 +52,7 @@ from .transport import (
     wait_for_response_headers,
 )
 from .usage import normalize_usage
-from .retry_policy import current_retry_budget, retryable_provider_error
+from .retry_policy import current_retry_budget
 from ..protocol.types import (
     CompletionBackend,
     ContentBlock,
@@ -303,13 +304,11 @@ class CodexBackend(CompletionBackend):
                 and getattr(primary_exception, "code", None) == "server_error"
             ):
                 budget = current_retry_budget()
-                StreamDiagnostics.record_failure(
+                primary_exception.stream_diagnostic = (
                     self.diagnostics_path,
-                    primary_exception,
-                    model=self.model,
-                    context=getattr(primary_exception, "diagnostic_context", {}),
-                    attempt=budget.attempts if budget is not None else 1,
-                    will_retry=retryable_provider_error(primary_exception),
+                    self.model,
+                    getattr(primary_exception, "diagnostic_context", {}),
+                    budget.attempts if budget is not None else 1,
                 )
             primary_exception = await cleanup_transport(
                 stream_context=stream_context,
@@ -323,6 +322,8 @@ class CodexBackend(CompletionBackend):
                 raise primary_exception
 
     def _record_retry_exhausted(self, error: RuntimeError, retries: int) -> None:
+        if getattr(error, "stream_diagnostic", None) is not None:
+            return
         StreamDiagnostics.record_retry_exhausted(
             self.diagnostics_path,
             error,
@@ -385,7 +386,7 @@ async def _decode_response(
     items: dict[int, _ItemState] = {}
     blocks: dict[BlockKey, _BlockState] = {}
     usage: dict[str, Any] = {}
-    response_data: dict[str, Any] = {}
+    response_data: dict[str, Any] = {"stream_started_at": monotonic()}
     reassembly = _ReassemblyState()
     finished = StreamFinished()
     async for line in sse_lines(
@@ -446,6 +447,13 @@ async def _decode_response(
         )
 
 
+def _stream_age(response_data: Mapping[str, Any]) -> float:
+    started_at = response_data.get("stream_started_at")
+    if not isinstance(started_at, (int, float)):
+        return 0.0
+    return max(0.0, monotonic() - started_at)
+
+
 def _translate_event(
     event: str,
     payload: Mapping[str, Any],
@@ -485,6 +493,7 @@ def _translate_event(
             "terminal_event_type": None,
             "last_event_type": event_type,
             "event_count": 1,
+            "stream_age_seconds": _stream_age(response_data),
         }
         raise failure
     if event_type == "response.created":
@@ -945,6 +954,7 @@ def _decode_terminal_response(
             "terminal_event_type": event_type,
             "last_event_type": event_type,
             "event_count": response_data.get("event_count", 1),
+            "stream_age_seconds": _stream_age(response_data),
         }
         raise failure
     if response is not None and not isinstance(response, Mapping):
