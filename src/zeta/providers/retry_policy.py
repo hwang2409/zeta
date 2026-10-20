@@ -50,6 +50,7 @@ class ProviderRetryBudget:
 
     started_at: float = field(default_factory=lambda: time.monotonic())
     attempts: int = 0
+    max_attempts: int = MAX_PROVIDER_ATTEMPTS
     retry_wait_seconds: float = 0.0
     original_error: Any | None = None
     exhausted: bool = False
@@ -63,7 +64,7 @@ class ProviderRetryBudget:
         return time.monotonic() - self.started_at - self.excluded_stall_seconds
 
     def start_attempt(self, owner: str, *, is_stall: bool = False) -> bool:
-        if self.attempts >= MAX_PROVIDER_ATTEMPTS:
+        if self.attempts >= self.max_attempts:
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
             return False
@@ -88,7 +89,7 @@ class ProviderRetryBudget:
             return None
         if not retryable_provider_error(source, event_data):
             return None
-        if self.attempts >= MAX_PROVIDER_ATTEMPTS:
+        if self.attempts >= self.max_attempts:
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
             return None

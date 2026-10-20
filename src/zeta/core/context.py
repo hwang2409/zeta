@@ -26,6 +26,7 @@ from ..context_eviction import (
     eviction_view,
     normalize_evicted_tool_result,
     valid_eviction_view,
+    catch_up_summary_candidates,
 )
 from ..compaction import (
     CompactionPolicy,
@@ -119,7 +120,6 @@ def _text_from_message(message: Message) -> str:
 
 class ContextAssembler:
     """Build provider messages from the active branch and compact old entries."""
-
     def __init__(
         self,
         store: ConversationStore,
@@ -135,6 +135,8 @@ class ContextAssembler:
         telemetry_sink: Callable[[Mapping[str, Any]], None] | None = None,
         on_token_growth: Callable[[int], None] | None = None,
         on_before_eviction: Callable[[int, int], None] | None = None,
+        eviction_summary_cache: Any = None,
+        eviction_summary_worker: Any = None,
         safety_margin: float = DEFAULT_SAFETY_MARGIN,
     ) -> None:
         if token_budget <= 0:
@@ -155,6 +157,8 @@ class ContextAssembler:
         self.telemetry_sink = telemetry_sink
         self.on_token_growth = on_token_growth
         self.on_before_eviction = on_before_eviction
+        self.eviction_summary_cache = eviction_summary_cache
+        self.eviction_summary_worker = eviction_summary_worker
         self.last_compaction_telemetry: dict[str, Any] = {}
         self._descendant_usage = {
             "input_tokens": 0,
@@ -182,17 +186,13 @@ class ContextAssembler:
         self._session_usage = SessionUsage(
             sink=self.usage_sink, on_growth=self.on_token_growth
         )
-
     @property
     def digest(self) -> str | None:
         return self.last_context.digest if self.last_context is not None else None
-
     def needs_compaction(self, *, force: bool = False) -> bool:
         """Return whether the next assembly must compact the active branch."""
-
         if force:
             return True
-
         branch = self.store.replay()
         items = self._visible_items(branch)
         system_prompt = self._system_prompt_message()
@@ -203,11 +203,9 @@ class ContextAssembler:
         return self.compaction_policy.should_compact(
             self._total_tokens(messages), self.trigger_token_budget
         )
-
     @property
     def token_count(self) -> int | None:
         return self.last_context.token_count if self.last_context is not None else None
-
     @property
     def calibration_ratio(self) -> float:
         return self._calibration.ratio
@@ -753,6 +751,8 @@ class ContextAssembler:
             token_counter=self.token_counter,
             unconsumed_source_seqs=unconsumed,
             source_messages=source_messages,
+            summary_cache=self.eviction_summary_cache,
+            summaries_enabled=self.eviction_summary_cache is not None,
         )
         if not result.items_evicted:
             return (
@@ -761,6 +761,9 @@ class ContextAssembler:
                 else _EvictionPlan("none-fallback")
             )
         view = eviction_view(records, result)
+        if self.eviction_summary_worker is not None:
+            for request in result.summary_misses:
+                self.eviction_summary_worker.admit(request)
         view_messages = self._eviction_view_messages(view)
         proposed = [
             *system_messages,
@@ -796,6 +799,15 @@ class ContextAssembler:
             telemetry,
         )
 
+    def eviction_summary_candidates(self) -> tuple[Any, ...]:
+        branch = self.store.active_branch_snapshot()
+        visible = self._visible_items(branch)
+        records = tuple(
+            (e.seq, Message.from_dict(e.data["message"]))
+            for e in branch
+            if e.type == "message"
+        )
+        return catch_up_summary_candidates(records, (item.message for item in visible))
     def _plan_reuse_eviction(
         self, branch: Sequence[ConversationEntry], system_messages: Sequence[Message]
     ) -> _EvictionPlan:
@@ -1150,7 +1162,6 @@ class ContextAssembler:
     @staticmethod
     def _eviction_view_messages(view: Sequence[Mapping[str, Any]]) -> list[Message]:
         """Project a stored or proposed eviction view into request messages."""
-
         messages: list[Message] = []
         for index, item in enumerate(view):
             messages.append(ContextAssembler._eviction_view_message(item))
