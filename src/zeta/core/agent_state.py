@@ -227,6 +227,7 @@ class AgentStateMixin:
         background: bool = False,
         child_instance_id: str | None = None,
         accepts_follow_ups: bool = False,
+        explicit_finish: bool = False,
         turns_used: int = 0,
     ) -> None:
         """Persist a running child marker before the child starts."""
@@ -252,6 +253,8 @@ class AgentStateMixin:
                 marker["background"] = True
             if accepts_follow_ups:
                 marker["accepts_follow_ups"] = True
+            if explicit_finish:
+                marker["explicit_finish"] = True
             if child_instance_id is not None:
                 marker["child_instance_id"] = child_instance_id
             marker.update(_agent_type_metadata(agent_type))

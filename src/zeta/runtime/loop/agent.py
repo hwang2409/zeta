@@ -23,11 +23,8 @@ from ...agent.plan_mode import (
     plan_mode_messages,
     plan_mode_tool_schemas,
 )
-from ...agent.receipt import (
-    TerminalState,
-    finalize_agent_results,
-    terminal_state,
-)
+from ...agent.receipt import finalize_agent_results
+from ...agent.result_payload import ChildResultPayloadMixin
 from ...agent.runner import run_agent_tool
 from ...agent.tool_results import validated_tool_result as _validated_tool_result
 from ...core.abort import AbortSignal as ToolAbortSignal
@@ -89,7 +86,6 @@ from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
 from ...tools import ToolHandler, ToolRegistry, ToolStreamPublisher
-from ...tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
@@ -124,6 +120,7 @@ from .tool_schema import canonical_tool_schemas
 TaskResult = TypeVar("TaskResult")
 
 class AgentLoop(
+    ChildResultPayloadMixin,
     PlanModeRuntimeMixin,
     SkillRefreshMixin,
     StoreWriteMixin,
@@ -132,15 +129,6 @@ class AgentLoop(
     MCPSession,
 ):
     post_stream_provider_retry = True
-
-    def notify_background_persisted(self) -> None:
-        """Wake this loop after a durable background notification."""
-        if self.agent_depth > 0:
-            if self.agent_instance_id is not None:
-                self._background_owner.conversation_channel.wake(self.agent_instance_id)
-        else:
-            self._background_owner.notify_wake()
-        self._schedule_transcript_index()
 
     def __init__(
         self,
@@ -203,7 +191,10 @@ class AgentLoop(
         self._mcp_notice_sink: Callable[[str], None] | None = None
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
-        self._closed = False; self._turn_active = False; self.explicit_finish = False
+        self._closed = False
+        self._turn_active = False
+        self.explicit_finish = False
+        self._explicit_finish_report: dict[str, object] | None = None
         self.notification_wake = NotificationWake(store)
         # Partial assistant persistence uses these values so provider metadata is
         # retained even when the stream later fails or is cancelled.
@@ -493,81 +484,6 @@ class AgentLoop(
         self._tracked_tasks.add(task)
         task.add_done_callback(self._tracked_tasks.discard)
         return task
-
-    def _child_result_payload(
-        self,
-        tool_call_id: str,
-        content: str,
-        *,
-        state: TerminalState | None = None,
-        error: bool | None = None,
-        child_session_path: str | None = None,
-        turns_used: int | None = None,
-        agent_type: str | None = None,
-        child_instance_id: str | None = None,
-        status: str | None = None,
-        description: str | None = None,
-        depth: int | None = None,
-        stats: dict[str, object] | None = None,
-        include_stats: bool = True,
-        canceled: bool = False,
-        notice: str | None = None,
-        notice_items: Sequence[str] | None = None,
-        max_bytes: int | None = None,
-        report_status: str | None = None, summary: str | None = None, head_sha: str | None = None, verdict: str | None = None,
-    ) -> dict[str, object]:
-        child_store = self._agent_child_stores.get(tool_call_id)
-        path = (
-            child_session_path
-            if child_session_path is not None
-            else str(child_store.session_dir)
-            if child_store is not None
-            else ""
-        )
-        turns = (
-            turns_used
-            if turns_used is not None
-            else self._agent_child_turns.get(tool_call_id, 0)
-        )
-        if child_instance_id is None and child_store is not None:
-            child_instance_id = child_store.agent_handle()
-        result_status = (
-            "running"
-            if status == "running"
-            else state
-            or terminal_state(
-                error=error is True,
-                canceled=canceled,
-                status=status,
-            )
-        )
-        return agent_result(
-            content,
-            tool_call_id=tool_call_id,
-            error=result_status == "failed",
-            turns_used=turns,
-            child_session_path=path,
-            agent_type=agent_type if isinstance(agent_type, str) else None,
-            status=status if status == "running" else None,
-            child_instance_id=child_instance_id,
-            description=description,
-            depth=depth,
-            stats=stats,
-            include_stats=include_stats,
-            canceled=result_status == "canceled",
-            notice=notice,
-            notice_items=notice_items,
-            report_status=report_status, summary=summary, head_sha=head_sha, verdict=verdict,
-            max_bytes=(
-                max_bytes
-                if max_bytes is not None
-                else getattr(
-                    getattr(self, "tool_registry", None),
-                    "max_output_chars",
-                    MAX_AGENT_RESULT_BYTES,
-                )
-            ),
-        )
 
     def _canceled_agent_result(
         self,

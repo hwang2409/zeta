@@ -329,6 +329,10 @@ def _compact_structured_content(
     compact: dict[str, Any] = {}
     for key in (
         "child_instance_id",
+        "report_status",
+        "summary",
+        "head_sha",
+        "verdict",
         "status",
         "turns_used",
         "agent_type",
@@ -501,6 +505,64 @@ def build_agent_receipt(
         max_bytes=max_bytes,
         envelope=envelope,
     )
+
+
+def build_explicit_finish_receipt(
+    report: Mapping[str, object],
+    stats: Mapping[str, object] | None,
+    *,
+    structured_content: Mapping[str, object] | None = None,
+    tool_call_id: str = "",
+    max_bytes: int = MAX_AGENT_RESULT_BYTES,
+) -> StructuredToolResult:
+    """Build one receipt whose text and structured content share one summary."""
+
+    report_status = report.get("status")
+    summary = report.get("summary")
+    if report_status not in {"done", "blocked", "failed"} or type(summary) is not str:
+        raise ValueError("invalid explicit finish report")
+    state: TerminalState = "failed" if report_status == "failed" else "completed"
+    base = dict(structured_content or {})
+    base["report_status"] = report_status
+    for key in ("head_sha", "verdict"):
+        if key in report:
+            base[key] = report[key]
+
+    def candidate(length: int) -> StructuredToolResult:
+        canonical = summary[:length]
+        return build_agent_receipt(
+            state,
+            f"{report_status}: {canonical}",
+            stats,
+            structured_content={**base, "summary": canonical},
+            tool_call_id=tool_call_id,
+            max_bytes=max_bytes,
+        )
+
+    def keeps(value: StructuredToolResult, expected: str) -> bool:
+        structured = value.get("structuredContent")
+        content = value.get("content")
+        expected_text = f"{report_status}: {expected}"
+        return (
+            isinstance(structured, dict)
+            and structured.get("summary") == expected
+            and isinstance(content, list)
+            and bool(content)
+            and content[0].get("text", "").startswith(expected_text)
+        )
+
+    full = candidate(len(summary))
+    if keeps(full, summary):
+        return full
+    low, high = 0, len(summary)
+    while low < high:
+        middle = (low + high + 1) // 2
+        value = candidate(middle)
+        if keeps(value, summary[:middle]):
+            low = middle
+        else:
+            high = middle - 1
+    return candidate(low)
 
 
 def build_agent_progress(

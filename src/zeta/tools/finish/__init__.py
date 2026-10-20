@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...agent.explicit_finish import owned_work_descriptions
 from ..registry import AbortSignal, ToolExecutionContext, ToolRegistry, text_block
 
 _STATUSES = {"done", "blocked", "failed"}
@@ -14,6 +15,14 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
     """Register the finish tool on one eligible child loop."""
     if child_loop is None:
         return
+
+    registry.set_execution_guard(
+        lambda _name: (
+            "child is finishing"
+            if child_loop._explicit_finish_report is not None
+            else None
+        )
+    )
 
     async def finish(
         _registry: ToolRegistry,
@@ -40,9 +49,14 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
             return _error("verdict must be pass, fail, or inconclusive")
         if child_loop._explicit_finish_report is not None:
             return _error("child is finishing")
-        work = tuple(child_loop.background_work_descriptions)
+        work = owned_work_descriptions(child_loop)
         if work:
-            return _error("finish refused; clear owned work first: " + ", ".join(work))
+            shown = ", ".join(work[:16])
+            if len(work) > 16:
+                shown += f", … (+{len(work) - 16} more)"
+            return _error(
+                "finish refused; wait, cancel, or hand off owned work first: " + shown
+            )
         report = {"status": status, "summary": summary.strip()}
         if head_sha is not None:
             report["head_sha"] = head_sha

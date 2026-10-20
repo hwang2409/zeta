@@ -235,6 +235,15 @@ class NotificationWake:
 class AgentNotificationMixin:
     """Add durable notification wake inputs to an agent loop."""
 
+    def notify_background_persisted(self) -> None:
+        """Wake this loop after a durable background notification."""
+        if self.agent_depth > 0:
+            if self.agent_instance_id is not None:
+                self._background_owner.conversation_channel.wake(self.agent_instance_id)
+        else:
+            self._background_owner.notify_wake()
+        self._schedule_transcript_index()
+
     def run_turn(
         self,
         user_text: str,

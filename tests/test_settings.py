@@ -739,3 +739,12 @@ def test_inbox_feature_switch_defaults_on_and_can_be_disabled(tmp_path: Path) ->
         cli_token_budget=None,
         default_provider="codex",
     ).inbox_enabled is False
+
+
+def test_project_cannot_enable_explicit_finish(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write(project, "[agents]\nexplicit_finish = true\n")
+    loaded = load_settings(home=home, project_dir=project)
+    assert loaded.settings.agents_explicit_finish is None
+    assert any("agents" in warning and "project" in warning for warning in loaded.warnings)

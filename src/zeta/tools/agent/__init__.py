@@ -21,6 +21,7 @@ from ...agent.receipt import (
     agent_stats,
     build_agent_progress,
     build_agent_receipt,
+    build_explicit_finish_receipt,
     encode_json,
     format_agent_stats,
     terminal_state,
@@ -937,6 +938,22 @@ def agent_result(
             tool_call_id=tool_call_id,
             max_bytes=max_bytes,
             include_stats=include_stats,
+        )
+    if report_status is not None and summary is not None:
+        report: dict[str, object] = {
+            "status": report_status,
+            "summary": summary,
+        }
+        if head_sha is not None:
+            report["head_sha"] = head_sha
+        if verdict is not None:
+            report["verdict"] = verdict
+        return build_explicit_finish_receipt(
+            report,
+            stats,
+            structured_content=structured_content,
+            tool_call_id=tool_call_id,
+            max_bytes=max_bytes,
         )
     state = terminal_state(error=error, canceled=canceled, status=status)
     return build_agent_receipt(
