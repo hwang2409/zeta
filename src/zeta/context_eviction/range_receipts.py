@@ -34,11 +34,17 @@ def range_receipt_candidate(
     allows: Callable[[int], bool],
     is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
     coarse: bool = False,
+    compacted_tool_calls: bool = False,
 ) -> RangeCandidate:
     """Coalesce receipt exchanges, or globally fold eligible old records."""
 
     if coarse:
-        return _coarse_candidate(records, allows=allows, is_smaller=is_smaller)
+        return _coarse_candidate(
+            records,
+            allows=allows,
+            is_smaller=is_smaller,
+            compacted_tool_calls=compacted_tool_calls,
+        )
 
     output: list[tuple[int, Message]] = []
     coalesced: set[int] = set()
@@ -60,7 +66,9 @@ def range_receipt_candidate(
         run.clear()
 
     while index < len(records):
-        unit, next_index = _receipt_unit(records, index, allows)
+        unit, next_index = _receipt_unit(
+            records, index, allows, compacted_tool_calls=compacted_tool_calls
+        )
         if unit is None:
             flush()
             output.append(records[index])
@@ -79,12 +87,15 @@ def _coarse_candidate(
     *,
     allows: Callable[[int], bool],
     is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
+    compacted_tool_calls: bool,
 ) -> RangeCandidate:
     units: list[_ReceiptUnit] = []
     unit_indexes: set[int] = set()
     index = 0
     while index < len(records):
-        unit, next_index = _coarse_receipt_unit(records, index, allows)
+        unit, next_index = _coarse_receipt_unit(
+            records, index, allows, compacted_tool_calls=compacted_tool_calls
+        )
         if unit is not None:
             units.append(unit)
             unit_indexes.update(range(index, next_index))
@@ -127,6 +138,8 @@ def _coarse_receipt_unit(
     records: Sequence[tuple[int, Message]],
     index: int,
     allows: Callable[[int], bool],
+    *,
+    compacted_tool_calls: bool,
 ) -> tuple[_ReceiptUnit | None, int]:
     seq, message = records[index]
     if not allows(seq):
@@ -135,13 +148,17 @@ def _coarse_receipt_unit(
         return _ReceiptUnit((records[index],), "user"), index + 1
     if message.metadata.get("eviction_range"):
         return _ReceiptUnit((records[index],), "range"), index + 1
-    return _receipt_unit(records, index, allows)
+    return _receipt_unit(
+        records, index, allows, compacted_tool_calls=compacted_tool_calls
+    )
 
 
 def _receipt_unit(
     records: Sequence[tuple[int, Message]],
     index: int,
     allows: Callable[[int], bool],
+    *,
+    compacted_tool_calls: bool,
 ) -> tuple[_ReceiptUnit | None, int]:
     seq, message = records[index]
     if (
@@ -160,8 +177,9 @@ def _receipt_unit(
     ]
     if calls:
         if any(not isinstance(block, ToolUseContent) for block in message.content):
-            return None, index + 1
-        if not _is_receipt_kind(message, seq, "tool_call"):
+            if not compacted_tool_calls or not _is_compacted_tool_call_receipt(message, seq):
+                return None, index + 1
+        elif not _is_receipt_kind(message, seq, "tool_call"):
             return None, index + 1
         expected = {call.id: call.name for call in calls}
         grouped = [records[index]]
@@ -190,6 +208,25 @@ def _receipt_unit(
         if _is_receipt_kind(message, seq, kind):
             return _ReceiptUnit((records[index],), kind), index + 1
     return None, index + 1
+
+
+def _is_compacted_tool_call_receipt(message: Message, seq: int) -> bool:
+    calls = [
+        block.tool_call
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    ]
+    text = [block.text for block in message.content if isinstance(block, TextContent)]
+    return (
+        message.metadata == {"context_evicted": True, "source_seq": seq}
+        and bool(calls)
+        and all(
+            call.arguments == {"eviction_receipt": {"source_seq": seq}}
+            for call in calls
+        )
+        and text == [f"[assistant reasoning evicted · seq {seq}]"]
+        and len(message.content) == len(calls) + 1
+    )
 
 
 def _is_receipt_kind(

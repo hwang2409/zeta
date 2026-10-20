@@ -251,6 +251,7 @@ def _evict_deterministic(
     source_messages: Mapping[int, Message] | None = None,
     summary_cache: SummaryCache | None = None,
     summaries_enabled: bool = False,
+    summary_reserve_pass: bool = False,
 ) -> EvictionResult:
     """Replace old re-derivable results with bounded semantic digests.
     ``unconsumed_source_seqs`` identifies tool results and notifications stored
@@ -277,6 +278,7 @@ def _evict_deterministic(
             sum(token_counter(message) for _, message in originals),
             sum(map(token_counter, candidates)),
         ),
+        compacted_tool_calls=summary_reserve_pass,
     )
     if range_candidate.coalesced_source_seqs:
         records = range_candidate.records
@@ -450,6 +452,7 @@ def _evict_deterministic(
                 sum(token_counter(message) for _, message in originals),
                 sum(map(token_counter, candidates)),
             ),
+            compacted_tool_calls=summary_reserve_pass,
         )
         if range_candidate.coalesced_source_seqs:
             records = range_candidate.records
@@ -466,6 +469,7 @@ def _evict_deterministic(
             records,
             allows=eligibility.allows,
             coarse=True,
+            compacted_tool_calls=summary_reserve_pass,
             is_smaller=lambda originals, candidates: _strictly_smaller(
                 sum(token_counter(message) for _, message in originals),
                 sum(map(token_counter, candidates)),

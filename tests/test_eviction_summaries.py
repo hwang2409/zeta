@@ -14,11 +14,13 @@ import pytest
 import scripts.eviction_summaries_replay as replay_script
 from zeta.context_accounting import message_token_count
 from zeta.context_eviction import (
+    _structured_result_receipt,
     decorate_receipt,
     evict_messages,
     eviction_summary_candidates,
     normalize_receipt,
 )
+from zeta.context_eviction.range_receipts import range_receipt_candidate
 from zeta.context_eviction.summaries import (
     EvictionSummaryWorker,
     SummaryCache,
@@ -89,6 +91,58 @@ def _ready_cache(tmp_path, records, text="short verdict"):
     return cache
 
 
+def test_reserve_can_fold_compacted_tool_batches_below_summary_target() -> None:
+    records = []
+    for seq in (1, 3):
+        call_id = f"call-{seq}"
+        records.extend(
+            [
+                (
+                    seq,
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [
+                            ToolUseContent(
+                                ToolCall(
+                                    call_id,
+                                    "agent",
+                                    {"eviction_receipt": {"source_seq": seq}},
+                                )
+                            ),
+                            TextContent(f"[assistant reasoning evicted · seq {seq}]"),
+                        ],
+                        metadata={"context_evicted": True, "source_seq": seq},
+                    ),
+                ),
+                (
+                    seq + 1,
+                    _structured_result_receipt(
+                        role=MessageRole.TOOL_RESULT,
+                        receipt_kind="orchestration",
+                        tool_name="agent",
+                        tool_call_id=call_id,
+                        seq=seq + 1,
+                        payload={"status": "completed"},
+                        content_digest="0" * 64,
+                    ),
+                ),
+            ]
+        )
+
+    folded = range_receipt_candidate(
+        records,
+        allows=lambda _seq: True,
+        is_smaller=lambda originals, candidates: sum(
+            message_token_count(message) for _, message in originals
+        )
+        > sum(map(message_token_count, candidates)),
+        compacted_tool_calls=True,
+    )
+
+    assert len(folded.records) == 1
+    assert folded.records[0][1].metadata.get("eviction_range") is True
+
+
 def test_reserve_lets_ready_summaries_fit(tmp_path) -> None:
     import zeta.context_eviction as eviction
 
@@ -120,7 +174,7 @@ def test_reserve_counts_items_evicted_by_the_second_pass(tmp_path) -> None:
 
 def test_eviction_result_reports_reserve_tokens(tmp_path) -> None:
     records = _separated_assistants(20)
-    cache = _ready_cache(tmp_path, records)
+    cache = _ready_cache(tmp_path, records, "summary " * 10)
     result = _evict(records, cache, enabled=True, target=500)
     assert result.reserve_tokens > 0
     assert _evict(records, target=500).reserve_tokens == 0
