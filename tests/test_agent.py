@@ -6532,6 +6532,7 @@ class _TaskFinishGateBackend(CompletionBackend):
         self.mixed_child = mixed_child
         self.gate_delay = gate_delay
         self.gate_seen = asyncio.Event()
+        self.gate_delay_finished = asyncio.Event()
         self.gate_text = ""
         self.grandchild_started = asyncio.Event()
         self.release_grandchild = asyncio.Event()
@@ -6663,7 +6664,10 @@ class _TaskFinishGateBackend(CompletionBackend):
             if task_id is not None:
                 self.gate_seen.set()
                 if self.gate_delay:
-                    await asyncio.sleep(self.gate_delay)
+                    try:
+                        await asyncio.sleep(self.gate_delay)
+                    finally:
+                        self.gate_delay_finished.set()
             if self.action == "kill":
                 assert task_id is not None
                 blocks = [
@@ -6792,6 +6796,7 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
     )
 
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    await asyncio.wait_for(backend.gate_delay_finished.wait(), timeout=2)
     release.touch()
     await asyncio.wait_for(backend.task_output_read.wait(), timeout=10)
     notification = await _wait_completion(store, containing="task-evidence")
