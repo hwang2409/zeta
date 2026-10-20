@@ -411,7 +411,7 @@ def test_linked_worktree_loads_primary_project_memory_on_open_and_resume(
         asyncio.run(resumed.close())
 
 
-def test_new_frontend_session_runs_one_git_discovery_sequence(
+def test_startup_runs_git_discovery_once_for_association_and_instruction_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.core import project_context

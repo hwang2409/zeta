@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
 from ..core.project_context import (
+    discover_project,
     discover_repo_root,
     load_project_context,
 )
@@ -1143,13 +1144,17 @@ def _child_base_system_prompt(
         child_registry.verify_cwd_identity()
     home_hint = loop.active_home
     zeta_home = Path(home_hint) if home_hint else env_home()
+    discovery = discover_project(cwd_override, user_home=zeta_home.parent)
+    if not (Path(cwd_override) / ".git").exists():
+        discover_repo_root(cwd_override)
     context = load_project_context(
         cwd=cwd_override,
-        repo_root=discover_repo_root(cwd_override),
+        repo_root=discovery.primary_root or discovery.cwd,
         zeta_home=zeta_home,
         catalog=loop.tool_registry.skill_catalog,
         project_id=loop.root_project_id or "__no_project__",
         inbox_enabled=False,
+        discovery=discovery,
     )
     return context.system_prompt
 

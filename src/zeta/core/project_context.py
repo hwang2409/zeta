@@ -586,7 +586,11 @@ def _walk_up_agents_files(cwd: Path, stop_at: Path) -> list[Path]:
 
 
 def resolve_project_context(
-    cwd: str | Path, home: Path, project_id: str | None = None
+    cwd: str | Path,
+    home: Path,
+    project_id: str | None = None,
+    *,
+    discovery: ProjectDiscovery | None = None,
 ) -> Project | None:
     """Resolve the project whose private instructions apply to ``cwd``."""
     registry = ProjectRegistry(home / "projects")
@@ -616,7 +620,7 @@ def resolve_project_context(
     ):
         project = direct
     else:
-        discovery = discover_project(cwd, user_home=home.parent)
+        discovery = discovery or discover_project(cwd, user_home=home.parent)
         project = None
     if project is None and discovery is not None and discovery.primary_root is not None:
         project = _project_at_root(registry, discovery.primary_root, discovery)
@@ -643,21 +647,27 @@ def resolve_project_context(
 
 
 def _project_instruction_context(
-    working_dir: Path, home: Path, project_id: str | None
+    working_dir: Path,
+    home: Path,
+    project_id: str | None,
+    discovery: ProjectDiscovery | None = None,
 ) -> tuple[Project | None, Project | None, bool, tuple[str, ...]]:
     """Resolve session memory, cwd-private instructions, and repository policy."""
     try:
         registry = ProjectRegistry(home / "projects")
         if project_id is None:
+            discovery = discovery or discover_project(working_dir, user_home=home.parent)
             session_project = associate_project_discovery(
-                discover_project(working_dir, user_home=home.parent),
-                registry,
-                create=False,
+                discovery, registry, create=False
             ).project
-            cwd_project = resolve_project_context(working_dir, home)
+            cwd_project = resolve_project_context(
+                working_dir, home, discovery=discovery
+            )
         else:
             session_project = ProjectRegistry(home / "projects").show_project(project_id)
-            cwd_project = resolve_project_context(working_dir, home)
+            cwd_project = resolve_project_context(
+                working_dir, home, discovery=discovery
+            )
         ignored = cwd_project is not None and cwd_project.repo_agents == "ignore"
         notices = (
             ("warning: repository AGENTS.md files were ignored by project settings",)
@@ -733,6 +743,7 @@ def load_project_context(
     catalog: SkillCatalog,
     project_id: str | None = None,
     inbox_enabled: bool = True,
+    discovery: ProjectDiscovery | None = None,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
 
@@ -764,7 +775,7 @@ def load_project_context(
         private_project,
         repo_agents_ignored,
         project_notices,
-    ) = _project_instruction_context(working_dir, home, project_id)
+    ) = _project_instruction_context(working_dir, home, project_id, discovery)
     notices.extend(project_notices)
     loaded: list[Path] = []
     memory_index: int | None = None

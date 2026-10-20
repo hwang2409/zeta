@@ -400,6 +400,7 @@ def _create_app_with_root(
             catalog=skill_catalog,
             project_id=discovery.project.project_id if discovery.project else None,
             inbox_enabled=config.inbox_enabled,
+            discovery=discovery,
         )
     recency: _SessionRecency | None = None
     pending_override = None

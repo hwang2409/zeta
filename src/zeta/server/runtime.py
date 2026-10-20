@@ -308,15 +308,17 @@ class ServerRuntime:
 
         session_cwd = cwd if cwd is not None else self.cwd
         config = self._config(provider, model, cwd=session_cwd)
+        discovery = None
         repo_root = discover_repo_root(session_cwd)
+        if (session_cwd / ".git").is_file():
+            discovery = discover_project(session_cwd, user_home=self.home.parent)
+            repo_root = discovery.primary_root or discovery.cwd
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
         project = self.manager.project_registry.find_for_directory(session_cwd)
         if project is None and (session_cwd / ".git").is_file():
             project = associate_project_discovery(
-                discover_project(session_cwd, user_home=self.home.parent),
-                self.manager.project_registry,
-                create=False,
+                discovery, self.manager.project_registry, create=False
             ).project
         project_id = project.project_id if project is not None else "__no_project__"
         context = load_project_context(
@@ -326,6 +328,7 @@ class ServerRuntime:
             catalog=skill_catalog,
             project_id=project_id,
             inbox_enabled=config.inbox_enabled,
+            discovery=discovery,
         )
         composition = self._compose(
             cwd=session_cwd,
