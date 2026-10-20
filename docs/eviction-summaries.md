@@ -132,7 +132,7 @@ v1 defaults are fixed implementation limits except for the enable switch:
 
 use a per-session token bucket that starts full at 150,000 input tokens, refills continuously at 100,000 tokens per hour using monotonic time, and never exceeds 150,000. reserve estimated input under one lock before every provider attempt; reconcile against reported usage afterward. cache hits cost no tokens. a key that cannot reserve remains queued, subject to the 256-key bound, and receipts continue to fall back exactly.
 
-measurements explain these values: the shorter target session had 314 eligible items and about 130,960 input tokens, so the 150,000-token burst can prepare it without the former lifetime cutoff. the longer session had 1,079 items and about 354,885 tokens; a 100,000-token lifetime cap covered only about 28%, while the rolling rate can continue serving a long-lived session. a 150,000 burst still bounds a sudden catch-up scan, and the 100,000/hour refill bounds sustained cost. timestamps were unavailable, so rollout telemetry must validate readiness rather than assume an active-hour duration.
+measurements explain these values: the shorter target session had 314 eligible items and about 130,960 input tokens, so the 150,000-token burst can prepare it without the former lifetime cutoff. the longer session had 1,079 items and about 354,885 tokens; a 100,000-token lifetime cap covered only about 28%, while the rolling rate can continue serving a long-lived session. a 150,000 burst still bounds a sudden catch-up scan, and the 100,000/hour refill bounds sustained cost. timestamps were unavailable, so rollout telemetry must validate readiness rather than assume an active-hour duration. Restart refills the bucket to its burst capacity; this accepted limit is not persisted.
 
 ## receipt format and accounting
 
@@ -174,10 +174,10 @@ add one global-only setting:
 
 ```toml
 [eviction_summaries]
-enabled = true
+enabled = false
 ```
 
-`enabled` defaults to `true`. repository settings cannot enable or tune model spend; current settings distinguish global keys from the project allowlist (`src/zeta/config/settings.py:65-101`). no model option, cli flag, or live toggle is added.
+`enabled` defaults to `false`. The orchestrator enables it after the replay gate passes; no release-build override is used. repository settings cannot enable or tune model spend; current settings distinguish global keys from the project allowlist (`src/zeta/config/settings.py:65-101`). no model option, cli flag, or live toggle is added.
 
 v1 is eligible only when enabled, `SessionMetadata.parent_session_id is None`, and the runtime is not an attention/discussion fork. durable parent metadata excludes child and grandchild sessions (`src/zeta/core/session.py:89-114`); the fork check matches automatic-memory composition (`src/zeta/runtime/composition.py:250-268`). a settings change applies on next start or resume.
 
@@ -193,7 +193,7 @@ new tests use fake providers and temporary session directories; they make no net
 - `tests/test_eviction_summaries.py::test_cache_append_and_compaction_are_durable_and_off_loop`: cover safe append, atomic compaction, and event-loop responsiveness.
 - `tests/test_eviction_summaries.py::test_malformed_cache_records_degrade_independently_to_misses`: place malformed first, middle, and final lines around valid records.
 - `tests/test_eviction_summaries.py::test_summary_safety_allows_facts_but_rejects_control_data`: allow `the blocker requires running test x` and `the user promised to push after approval`; reject real prompt-injection samples, tool/control markup, a fake secret, and malformed output. assert sanitized input, side file, and receipt behavior.
-- `tests/test_eviction_summaries.py::test_token_bucket_refills_and_bounds_burst`: exhaust 150,000 tokens, advance fake monotonic time, assert 100,000/hour refill and unchanged receipt fallback while deferred.
+- `tests/test_eviction_summaries.py::test_token_bucket_refills_and_bounds_burst`: exhaust 150,000 tokens, advance fake monotonic time, assert 100,000/hour refill, unchanged receipt fallback while deferred, and restart refill to the burst capacity.
 - `tests/test_eviction_summaries.py::test_folded_range_renders_exact_summary_and_recall_bounds`: assert deterministic counts, exact bounds, and no per-item concatenation.
 - `tests/test_eviction_summaries.py::test_enriched_receipt_uses_actual_token_count_for_target`: prove selection is unchanged and `tokens_after` equals a final recount.
 - `tests/test_eviction_summaries.py::test_enriched_receipts_normalize_across_materialized_passes`: begin with persisted enriched item and range receipts; perform later normal and coarse folding; assert the same source selection and recall bounds as deterministic receipts, the same final target result whenever the deterministic pass reached it, no receipt-floor growth, and no enrichment after disabling before the next rewrite.
@@ -201,11 +201,11 @@ new tests use fake providers and temporary session directories; they make no net
 - `tests/test_settings.py::test_eviction_summaries_defaults_enabled_and_global_can_disable`: cover default, false, invalid keys, and project-layer rejection.
 - `tests/test_runtime_composition.py::test_eviction_summary_worker_only_for_top_level_sessions`: cover top-level, child, grandchild, and attention fork.
 
-existing eviction and range suites remain the regression oracle (`tests/test_context_eviction.py`, `tests/test_eviction_range_receipts.py`). replay the two measured sessions with feature on and off; compare selected source sequences, range bounds, target result, factual recall, sanitized-item count, cache readiness, added receipt tokens, provider usage, safety rejects, queue drops, and latency. telemetry is aggregate only and never logs source or summary text.
+existing eviction and range suites remain the regression oracle (`tests/test_context_eviction.py`, `tests/test_eviction_range_receipts.py`). run `scripts/eviction_summaries_replay.py SESSION_DIR --out OUT.json` for each measured session. It replays off/on using the real sanitizer and summarizer path, writes no session files, and reports selected source sequences, range bounds, target result, readiness rate, queue drops, and token totals. The script does not score recall; the orchestrator uses the existing experiment harness. telemetry is aggregate only and never logs source or summary text.
 
 ## rollout, rollback, and alternatives
 
-land disabled in release builds until unit and sanitized replay tests pass, then enable by default for top-level sessions. if cost, safety, or cache behavior is unacceptable, set `enabled = false`; the next rewrite normalizes away summaries. code rollback ignores the derived side file without transcript migration.
+land with `enabled = false`; after merge, run `scripts/eviction_summaries_replay.py SESSION_DIR --out OUT.json` and enable it only when selected sequences and range bounds are identical, all safety fixtures pass, readiness and queue drops are reported, and the orchestrator accepts recall results from the existing experiment harness. if cost, safety, or cache behavior is unacceptable, set `enabled = false`; the next rewrite normalizes away summaries. code rollback ignores the derived side file without transcript migration.
 
 rejected alternatives:
 
