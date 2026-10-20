@@ -16,7 +16,6 @@ from ..mcp.prompt_commands import (
     dispatch_prompt,
 )
 from ..model_input import ModelInputEnvelope, skill_model_input
-from ..project_registry import ProjectRegistry
 from ..protocol.types import (
     Message,
     MessageOrigin,
@@ -1151,7 +1150,7 @@ def create_slash_registry(
         if project_dir is not None
         else discover_project_root(Path.cwd())
     )
-    project_root = private_project_root if project_eligible is not False else (private_project_root if effective_home and ProjectRegistry(Path(effective_home).expanduser() / "projects").find_for_directory(private_project_root) else None)
+    project_root = None if project_eligible is False else private_project_root
     registry.register(SlashCommand("status", _run_status, "show session status"))
     registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
@@ -1174,7 +1173,7 @@ def create_slash_registry(
     )
     registry.register(SlashCommand(
         "project-instructions",
-        lambda session, args: project_instructions_path(args, project_root, Path(effective_home).expanduser().resolve() if effective_home else None, getattr(session, "open_project_instructions_editor", None)),
+        lambda session, args: project_instructions_path(args, private_project_root, Path(effective_home).expanduser().resolve() if effective_home else None, getattr(session, "open_project_instructions_editor", None)),
         "open or create private project instructions in your editor",
     ))
     registry.register(

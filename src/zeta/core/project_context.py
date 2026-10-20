@@ -623,10 +623,18 @@ def project_instructions_path(
             "project instructions: this folder is not a zeta project. run `git init` "
             "here and restart zeta, or start zeta inside a registered project."
         )
-    registry = ProjectRegistry(zeta_home / "projects")
-    discovery = discover_project(project_root, user_home=zeta_home.parent)
-    project = resolve_project_context(discovery, registry)
+    try:
+        registry = ProjectRegistry(zeta_home / "projects")
+        discovery = discover_project(project_root, user_home=zeta_home.parent)
+        project = resolve_project_context(discovery, registry)
+    except ProjectRegistryError as exc:
+        return f"project instructions error: {exc}"
     if project is None:
+        if discovery.primary_root is None:
+            return (
+                "project instructions: this folder is not a zeta project. run `git init` "
+                "here and restart zeta, or start zeta inside a registered project."
+            )
         return (
             "project instructions: this git project is not registered. "
             "run `/project init` to associate this directory."
