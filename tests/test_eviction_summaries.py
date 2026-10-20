@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import httpx
+import pytest
 
 from zeta.context_accounting import message_token_count
 from zeta.context_eviction import (
@@ -26,7 +30,10 @@ from zeta.context_eviction.summaries import (
     trim_summary,
     valid_summary,
 )
+from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
+from zeta.memory.provider import complete_reconciliation, use_response_byte_limit
+from zeta.oauth import OAuthTokens
 from zeta.protocol.types import (
     Message,
     MessageRole,
@@ -35,6 +42,9 @@ from zeta.protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.providers.codex import CodexBackend
+from zeta.providers.factory import build_backend
+from zeta.providers.retry_policy import ProviderRetryBudget, use_retry_budget
 
 
 def _assistant(seq: int, text: str | None = None) -> tuple[int, Message]:
@@ -393,6 +403,143 @@ def test_worker_bounds_and_prioritizes_queue(tmp_path) -> None:
     assert len(worker.queue) == 2
     assert worker.drops == 0
     worker.closed = True
+
+
+class _CountingBucket(TokenBucket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reservations = 0
+
+    async def reserve(self, amount: int) -> bool:
+        self.reservations += 1
+        return await super().reserve(amount)
+
+
+def _codex_access_token() -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps(
+            {"https://api.openai.com/auth": {"chatgpt_account_id": "test-account"}}
+        ).encode()
+    ).decode().rstrip("=")
+    return f"header.{payload}.signature"
+
+
+def _retrying_summary_provider(tmp_path, handler):
+    backend, _ = build_backend(
+        "codex",
+        "gpt-5.6-luna",
+        home=tmp_path,
+        stall_seconds=0,
+        stall_retries=0,
+    )
+    assert isinstance(backend, CodexBackend)
+    backend.token_store.save(OAuthTokens(_codex_access_token(), "refresh", 4_000_000_000))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend.client = client
+
+    async def invoke(prompt: str) -> str:
+        with (
+            use_response_byte_limit(512),
+            use_retry_budget(ProviderRetryBudget(max_attempts=1)),
+        ):
+            response = await complete_reconciliation(backend, prompt)
+        return response.text
+
+    return invoke, client
+
+
+@pytest.mark.asyncio
+async def test_summary_key_makes_exactly_three_transport_dispatches(tmp_path) -> None:
+    dispatches = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal dispatches
+        dispatches += 1
+        return httpx.Response(503, headers={"retry-after": "0"}, request=request)
+
+    provider, client = _retrying_summary_provider(tmp_path, handler)
+    worker = EvictionSummaryWorker(
+        SummaryCache(tmp_path), provider, sleep=lambda _: asyncio.sleep(0)
+    )
+    bucket = _CountingBucket()
+    worker.bucket = bucket
+    request = SummaryRequest(SummaryKey("assistant", 1, 1, "a" * 64), "source")
+    await worker._call(request)
+    await worker.close()
+    await client.aclose()
+
+    assert dispatches == 3
+    assert bucket.reservations == 3
+
+
+@pytest.mark.asyncio
+async def test_summary_retry_after_is_honored_by_worker(tmp_path) -> None:
+    dispatches = 0
+    waits: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal dispatches
+        dispatches += 1
+        return httpx.Response(503, headers={"retry-after": "0.01"}, request=request)
+
+    async def record_wait(delay: float) -> None:
+        waits.append(delay)
+
+    provider, client = _retrying_summary_provider(tmp_path, handler)
+    worker = EvictionSummaryWorker(SummaryCache(tmp_path), provider, sleep=record_wait)
+    request = SummaryRequest(SummaryKey("assistant", 1, 1, "b" * 64), "source")
+    await worker._call(request)
+    await worker.close()
+    await client.aclose()
+
+    assert dispatches == 3
+    assert waits == [0.01, 0.01]
+
+    over_limit_calls = 0
+
+    async def over_limit(_prompt: str) -> str:
+        nonlocal over_limit_calls
+        over_limit_calls += 1
+        error = RuntimeError("retry later")
+        error.retryable = True  # type: ignore[attr-defined]
+        error.retry_after = 31  # type: ignore[attr-defined]
+        raise error
+
+    blocked = EvictionSummaryWorker(
+        SummaryCache(tmp_path / "over-limit"), over_limit, sleep=record_wait
+    )
+    over_limit_request = SummaryRequest(
+        SummaryKey("assistant", 2, 2, "c" * 64), "source"
+    )
+    await blocked._call(over_limit_request)
+    await blocked.close()
+
+    assert over_limit_calls == 1
+
+
+def test_resume_catch_up_regenerates_every_item_in_a_folded_range(tmp_path) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions, session_id="folded")
+    records = [_assistant(1), _assistant(2)]
+    entries = [store.append_message(message) for _, message in records]
+    folded = _evict(records, target=1)
+    assert len(folded.messages) == 1
+    assert folded.messages[0].metadata["range_seq_end"] == 2
+    store.append_compaction_marker(
+        "evicted",
+        entries[0].seq,
+        entries[-1].seq,
+        kind="evict",
+        view=[{"seq": 1, "message": folded.messages[0].to_dict()}],
+    )
+
+    reopened = ConversationStore(sessions, session_id="folded")
+    candidates = ContextAssembler(reopened).eviction_summary_candidates()
+
+    assert [(request.key.seq_start, request.key.seq_end) for request in candidates] == [
+        (1, 1),
+        (2, 2),
+    ]
 
 
 def test_worker_retries_are_rate_limited_and_hash_changes_rearm(tmp_path) -> None:

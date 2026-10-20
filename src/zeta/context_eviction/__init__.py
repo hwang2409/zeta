@@ -186,16 +186,26 @@ def eviction_summary_candidates(
 
 
 def catch_up_summary_candidates(
-    records: Sequence[tuple[int, Message]], covered_source_seqs: Collection[int]
+    records: Sequence[tuple[int, Message]], receipts: Iterable[Message]
 ) -> tuple[SummaryRequest, ...]:
     """Return eligible work still covered by materialized eviction receipts."""
+    covered_intervals: list[tuple[int, int]] = []
+    for receipt in receipts:
+        metadata = receipt.metadata
+        start = metadata.get("source_seq")
+        end = metadata.get("range_seq_end", start)
+        if metadata.get("context_evicted") and type(start) is int and type(end) is int:
+            covered_intervals.append((start, end))
     eligibility = _eviction_eligibility(records, ())
     return tuple(
         request
         for request in _project_summary_candidates(
             records, evictable_source_seqs=eligibility.evictable_source_seqs
         )
-        if request.key.seq_start in covered_source_seqs
+        if any(
+            start <= request.key.seq_start <= end
+            for start, end in covered_intervals
+        )
     )
 
 

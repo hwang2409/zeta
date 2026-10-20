@@ -26,6 +26,7 @@ from ..memory.provider import complete_reconciliation, use_response_byte_limit
 from ..memory.reconciler import ReconciliationResponse
 from ..models.catalog import default_model, provider_for_model
 from ..protocol.types import CompletionBackend, StreamEvent
+from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from ..tools._shared.user_discovery import ExternalToolDiscovery, apply_external_tools
@@ -35,6 +36,58 @@ from .loop.skill_refresh import RuntimePrompt
 
 BackendBuilder = Callable[..., tuple[CompletionBackend, str]]
 BackgroundEventSink = Callable[[StreamEvent], None]
+
+
+def _create_eviction_summary_worker(
+    *,
+    loop: AgentLoop,
+    opened: OpenedSession,
+    config: ResolvedConfig,
+    backend_builder: BackendBuilder,
+    home: Path,
+    effective_budget: int,
+) -> EvictionSummaryWorker:
+    summary_backend: CompletionBackend | None = None
+
+    async def invoke_summary(prompt: str) -> SummaryResponse:
+        nonlocal summary_backend
+        if summary_backend is None:
+            summary_model = "gpt-5.6-luna"
+            summary_provider = provider_for_model(summary_model)
+            summary_backend, _ = backend_builder(
+                summary_provider,
+                summary_model,
+                home=home,
+                stall_seconds=config.stream_stall_seconds,
+                stall_retries=0,
+                token_budget=effective_budget,
+            )
+        with (
+            use_response_byte_limit(512),
+            use_retry_budget(ProviderRetryBudget(max_attempts=1)),
+        ):
+            response = await complete_reconciliation(summary_backend, prompt)
+        return SummaryResponse(
+            response.text,
+            input_tokens=sum(
+                int(response.usage.get(key, 0) or 0)
+                for key in (
+                    "input_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                )
+            ),
+            output_tokens=int(response.usage.get("output_tokens", 0) or 0),
+        )
+
+    return EvictionSummaryWorker(
+        SummaryCache(
+            opened.store.session_dir,
+            directory_fd=opened.store.directory_fd,
+        ),
+        invoke_summary,
+        scan=loop.context_assembler.eviction_summary_candidates,
+    )
 
 
 def _runtime_prompt(context: ProjectContext) -> RuntimePrompt:
@@ -313,47 +366,15 @@ def compose_runtime(
             and metadata.parent_session_id is None
             and attention_fork is None
         ):
-            summary_backend: CompletionBackend | None = None
-
-            async def invoke_summary(prompt: str) -> SummaryResponse:
-                nonlocal summary_backend
-                if summary_backend is None:
-                    summary_model = "gpt-5.6-luna"
-                    summary_provider = provider_for_model(summary_model)
-                    summary_backend, _ = backend_builder(
-                        summary_provider,
-                        summary_model,
-                        home=home,
-                        stall_seconds=config.stream_stall_seconds,
-                        stall_retries=0,
-                        token_budget=effective_budget,
-                    )
-                with use_response_byte_limit(512):
-                    response = await complete_reconciliation(
-                        summary_backend, prompt, single_attempt=True
-                    )
-                return SummaryResponse(
-                    response.text,
-                    input_tokens=sum(
-                        int(response.usage.get(key, 0) or 0)
-                        for key in (
-                            "input_tokens",
-                            "cache_read_input_tokens",
-                            "cache_creation_input_tokens",
-                        )
-                    ),
-                    output_tokens=int(response.usage.get("output_tokens", 0) or 0),
-                )
-
-            summary_cache = SummaryCache(
-                opened.store.session_dir,
-                directory_fd=opened.store.directory_fd,
+            eviction_summary_worker = _create_eviction_summary_worker(
+                loop=loop,
+                opened=opened,
+                config=config,
+                backend_builder=backend_builder,
+                home=home,
+                effective_budget=effective_budget,
             )
-            eviction_summary_worker = EvictionSummaryWorker(
-                summary_cache,
-                invoke_summary,
-                scan=loop.context_assembler.eviction_summary_candidates,
-            )
+            summary_cache = eviction_summary_worker.cache
             loop.eviction_summary_worker = eviction_summary_worker
             loop.context_assembler.eviction_summary_cache = summary_cache
             loop.context_assembler.eviction_summary_worker = eviction_summary_worker

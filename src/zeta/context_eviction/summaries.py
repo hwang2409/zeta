@@ -269,6 +269,21 @@ def _transient_failure(exc: BaseException) -> bool:
     return retryable_provider_error(exc)
 
 
+def _retry_delay(exc: BaseException, attempt: int) -> float | None:
+    from ..providers.retry_policy import (
+        MAX_PROVIDER_RETRY_DELAY_SECONDS,
+        retry_wait_seconds,
+    )
+
+    retry_after = getattr(exc, "retry_after", None)
+    if (
+        type(retry_after) in {int, float}
+        and retry_after > MAX_PROVIDER_RETRY_DELAY_SECONDS
+    ):
+        return None
+    return retry_wait_seconds(exc, attempt)
+
+
 class EvictionSummaryWorker:
     """Session-owned scheduler with bounded, range-first background work."""
 
@@ -410,9 +425,10 @@ class EvictionSummaryWorker:
             except (OSError, RuntimeError, ValueError, TypeError) as exc:
                 if not _transient_failure(exc) or attempt == 2:
                     break
-                from ..providers.retry_policy import retry_wait_seconds
-
-                await self.sleep(retry_wait_seconds(exc, attempt + 1))
+                delay = _retry_delay(exc, attempt + 1)
+                if delay is None:
+                    break
+                await self.sleep(delay)
                 continue
             if isinstance(response, SummaryResponse):
                 await self.bucket.reconcile(estimate, response.input_tokens)

@@ -802,18 +802,12 @@ class ContextAssembler:
     def eviction_summary_candidates(self) -> tuple[Any, ...]:
         branch = self.store.active_branch_snapshot()
         visible = self._visible_items(branch)
-        covered = {
-            int(i.message.metadata["source_seq"])
-            for i in visible
-            if i.message.metadata.get("context_evicted")
-            and type(i.message.metadata.get("source_seq")) is int
-        }
         records = tuple(
             (e.seq, Message.from_dict(e.data["message"]))
             for e in branch
             if e.type == "message"
         )
-        return catch_up_summary_candidates(records, covered)
+        return catch_up_summary_candidates(records, (item.message for item in visible))
     def _plan_reuse_eviction(
         self, branch: Sequence[ConversationEntry], system_messages: Sequence[Message]
     ) -> _EvictionPlan:
