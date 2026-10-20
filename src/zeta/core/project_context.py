@@ -605,6 +605,30 @@ def resolve_project_context(
     return project
 
 
+def _project_instruction_context(
+    working_dir: Path, home: Path, project_id: str | None
+) -> tuple[Project | None, Project | None, bool, tuple[str, ...]]:
+    """Resolve session memory, cwd-private instructions, and repository policy."""
+    try:
+        if project_id is None:
+            session_project = resolve_project_context(working_dir, home)
+            cwd_project = session_project
+        else:
+            session_project = ProjectRegistry(home / "projects").show_project(project_id)
+            cwd_project = resolve_project_context(working_dir, home, project_id)
+            if cwd_project is None:
+                cwd_project = resolve_project_context(working_dir, home)
+        ignored = session_project is not None and session_project.repo_agents == "ignore"
+        notices = (
+            ("warning: repository AGENTS.md files were ignored by project settings",)
+            if ignored
+            else ()
+        )
+        return session_project, cwd_project, ignored, notices
+    except (ProjectRegistryError, OSError) as exc:
+        return None, None, False, (f"context · project settings unavailable: {exc}",)
+
+
 def project_instructions_path(
     args: str, project_root: Path | None, zeta_home: Path | None
 ) -> str:
@@ -623,6 +647,39 @@ def project_instructions_path(
     except OSError as exc:
         return f"project instructions error: {exc}"
     return f"project instructions: {path}"
+
+
+def _instruction_files(
+    working_dir: Path,
+    stop_at: Path,
+    home: Path,
+    private_project: Project | None,
+    *,
+    repo_agents_ignored: bool,
+) -> list[Path]:
+    candidates = _walk_up_agents_files(working_dir, stop_at)
+    stop_agents = stop_at / AGENTS_FILENAME
+    if _present(stop_agents):
+        candidates.append(stop_agents)
+    else:
+        claude = stop_at / CLAUDE_FILENAME
+        if _present(claude):
+            candidates.append(claude)
+
+    seen: set[Path] = set()
+    files: list[Path] = []
+    home_agents = (home / AGENTS_FILENAME).resolve()
+    if not repo_agents_ignored:
+        for path in candidates:
+            resolved = path.resolve()
+            if resolved != home_agents and resolved not in seen:
+                seen.add(resolved)
+                files.append(resolved)
+    if private_project is not None:
+        private_agents = home / "projects" / private_project.project_id / AGENTS_FILENAME
+        if _present(private_agents):
+            files.append(private_agents.resolve())
+    return files
 
 
 def load_project_context(
@@ -662,29 +719,13 @@ def load_project_context(
     notices: list[str] = []
     if seed_notice is not None:
         notices.append(seed_notice)
-    try:
-        if project_id is not None:
-            project_for_context = ProjectRegistry(home / "projects").show_project(project_id)
-            resolved_project = resolve_project_context(working_dir, home, project_id)
-            project_matches = resolved_project is not None
-            if resolved_project is None:
-                resolved_project = resolve_project_context(working_dir, home)
-        else:
-            resolved_project = resolve_project_context(working_dir, home)
-            project_for_context = resolved_project
-            project_matches = True
-    except (ProjectRegistryError, OSError) as exc:
-        project_for_context = None
-        project_matches = False
-        notices.append(f"context · project settings unavailable: {exc}")
-    repo_agents_ignored = (
-        project_for_context is not None
-        and project_for_context.repo_agents == "ignore"
-    )
-    if repo_agents_ignored:
-        notices.append(
-            "warning: repository AGENTS.md files were ignored by project settings"
-        )
+    (
+        project_for_context,
+        private_project,
+        repo_agents_ignored,
+        project_notices,
+    ) = _project_instruction_context(working_dir, home, project_id)
+    notices.extend(project_notices)
     loaded: list[Path] = []
     memory_index: int | None = None
     memory_block: str | None = None
@@ -698,45 +739,15 @@ def load_project_context(
             load_identity(catalog=catalog, identity=home_identity),
             runtime_guidance,
         ]
-        candidates: list[Path] = []
-        candidates.extend(_walk_up_agents_files(working_dir, stop_at))
-        # Always attempt to include the repository-root AGENTS.md (or fall
-        # back to CLAUDE.md for repos that never migrated). When cwd is
-        # inside stop_at the walk already picked this up; the dedupe below
-        # drops the duplicate. When cwd sits outside stop_at (unusual, but
-        # supported for tests and edge callers), this keeps the anchor.
-        stop_agents = stop_at / AGENTS_FILENAME
-        if _present(stop_agents):
-            candidates.append(stop_agents)
-        else:
-            claude = stop_at / CLAUDE_FILENAME
-            if _present(claude):
-                candidates.append(claude)
-
-        seen: set[Path] = set()
-        deduped: list[Path] = []
-        home_agents = (home / AGENTS_FILENAME).resolve()
-        for path in candidates:
-            resolved = path.resolve()
-            if resolved == home_agents:
-                continue
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            deduped.append(resolved)
-
         # A private per-project file is outside the repository and is loaded
         # after repository instructions, so it wins on conflicts.
-        if repo_agents_ignored:
-            repo_candidates = tuple(candidates)
-            candidates = []
-        else:
-            repo_candidates = ()
-        private_project = project_for_context if project_matches else resolved_project
-        if private_project is not None:
-            private_agents = home / "projects" / private_project.project_id / AGENTS_FILENAME
-            if _present(private_agents):
-                deduped.append(private_agents.resolve())
+        deduped = _instruction_files(
+            working_dir,
+            stop_at,
+            home,
+            private_project,
+            repo_agents_ignored=repo_agents_ignored,
+        )
 
         # Only optional walked instructions and project memory consume this
         # budget.  The home identity and append section are mandatory and are
@@ -745,8 +756,6 @@ def load_project_context(
         instructions_bytes = 0
         skipped: list[Path] = []
         kept: list[tuple[Path, str]] = []
-        if repo_candidates:
-            deduped = [path for path in deduped if path not in repo_candidates]
         for path in reversed(deduped):
             content = path.read_text(encoding="utf-8")
             section = _format_section(path, content)
