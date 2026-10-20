@@ -541,11 +541,11 @@ async def test_top_level_summary_worker_decorates_next_eviction_pass(
     assert worker is not None
     call = Message(
         MessageRole.ASSISTANT,
-        [ToolUseContent(ToolCall("agent-1", "agent", {"prompt": "review"}))],
+        [ToolUseContent(ToolCall("task-1", "task_output", {"task_id": "task-1"}))],
     )
     result = Message(
         MessageRole.USER,
-        tool_result=ToolResult("agent-1", "review passed at abc1234 " * 100),
+        tool_result=ToolResult("task-1", "review passed at abc1234 " * 100),
     )
     records = [(1, call), (2, result)]
     request = eviction_summary_candidates(records)[0]
