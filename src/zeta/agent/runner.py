@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
-from ..core.project_context import discover_repo_root, load_project_context
+from ..core.project_context import (
+    discover_repo_root,
+    load_project_context,
+    resolve_project_context,
+)
 from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
@@ -1140,12 +1144,17 @@ def _child_base_system_prompt(
         child_registry.verify_cwd_identity()
     home_hint = loop.active_home
     zeta_home = Path(home_hint) if home_hint else env_home()
+    project = resolve_project_context(cwd_override, zeta_home, loop.root_project_id)
     context = load_project_context(
         cwd=cwd_override,
         repo_root=discover_repo_root(cwd_override),
         zeta_home=zeta_home,
         catalog=loop.tool_registry.skill_catalog,
-        project_id=loop.root_project_id,
+        project_id=(
+            project.project_id
+            if project is not None
+            else (loop.root_project_id or "__no_project__")
+        ),
         inbox_enabled=False,
     )
     return context.system_prompt

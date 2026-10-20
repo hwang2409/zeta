@@ -13,7 +13,11 @@ from typing import Any
 from ..config.settings import load_settings
 from ..config.settings import resolve as resolve_settings
 from ..core.approval import ApprovalPolicy
-from ..core.project_context import discover_repo_root, load_project_context
+from ..core.project_context import (
+    discover_repo_root,
+    load_project_context,
+    resolve_project_context,
+)
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
 from ..core.slash import effective_budget_for_model, resolve_session_budget
 from ..models.catalog import REMOVED_PROVIDER_ERROR
@@ -305,11 +309,13 @@ class ServerRuntime:
         repo_root = discover_repo_root(session_cwd)
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
+        project = resolve_project_context(session_cwd, self.home)
         context = load_project_context(
             cwd=session_cwd,
             repo_root=repo_root,
             zeta_home=self.home,
             catalog=skill_catalog,
+            project_id=project.project_id if project is not None else None,
             inbox_enabled=config.inbox_enabled,
         )
         composition = self._compose(
@@ -414,7 +420,7 @@ class ServerRuntime:
 
     def _compose(self, *, cwd: Path, **kwargs: object) -> RuntimeComposition:
         try:
-            project = self.manager.project_registry.find_for_directory(cwd)
+            project = resolve_project_context(cwd, self.home)
             project_id = project.project_id if project is not None else None
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logging.getLogger(__name__).warning(

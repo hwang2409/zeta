@@ -567,6 +567,22 @@ def _walk_up_agents_files(cwd: Path, stop_at: Path) -> list[Path]:
     return files
 
 
+def resolve_project_context(
+    cwd: str | Path, home: Path, project_id: str | None = None
+) -> Project | None:
+    """Resolve the registry project that owns ``cwd`` and validate its id."""
+    registry = ProjectRegistry(home / "projects")
+    if not registry.root.exists():
+        return None
+    discovery = associate_project_discovery(
+        discover_project(cwd, user_home=home.parent), registry, create=False
+    )
+    project = discovery.project
+    if project_id is not None and (project is None or project.project_id != project_id):
+        return None
+    return project
+
+
 def project_instructions_path(
     args: str, project_root: Path | None, zeta_home: Path | None
 ) -> str:
@@ -575,7 +591,7 @@ def project_instructions_path(
         return "project instructions unchanged: command does not accept arguments"
     if project_root is None or zeta_home is None:
         return "project instructions error: not inside a project"
-    project = ProjectRegistry(zeta_home / "projects").find_for_directory(project_root)
+    project = resolve_project_context(project_root, zeta_home)
     if project is None:
         return "project instructions error: project is not registered"
     path = zeta_home / "projects" / project.project_id / AGENTS_FILENAME
@@ -624,6 +640,19 @@ def load_project_context(
     notices: list[str] = []
     if seed_notice is not None:
         notices.append(seed_notice)
+    try:
+        project_for_context = resolve_project_context(working_dir, home, project_id)
+    except (ProjectRegistryError, OSError) as exc:
+        project_for_context = None
+        notices.append(f"context · project settings unavailable: {exc}")
+    repo_agents_ignored = (
+        project_for_context is not None
+        and project_for_context.repo_agents == "ignore"
+    )
+    if repo_agents_ignored:
+        notices.append(
+            "warning: repository AGENTS.md files were ignored by project settings"
+        )
     loaded: list[Path] = []
     memory_index: int | None = None
     memory_block: str | None = None
@@ -666,23 +695,9 @@ def load_project_context(
 
         # A private per-project file is outside the repository and is loaded
         # after repository instructions, so it wins on conflicts.
-        project_for_context = None
-        try:
-            registry_for_context = ProjectRegistry(home / "projects")
-            if registry_for_context.root.exists():
-                project_for_context = (
-                    registry_for_context.show_project(project_id)
-                    if project_id is not None
-                    else registry_for_context.find_for_directory(working_dir)
-                )
-        except (ProjectRegistryError, OSError) as exc:
-            notices.append(f"context · project settings unavailable: {exc}")
-        if project_for_context is not None and project_for_context.repo_agents == "ignore":
+        if repo_agents_ignored:
             repo_candidates = tuple(candidates)
             candidates = []
-            notices.append(
-                "warning: repository AGENTS.md files were ignored by project settings"
-            )
         else:
             repo_candidates = ()
         if project_for_context is not None:
@@ -968,5 +983,6 @@ __all__ = [
     "discover_project_root",
     "discover_repo_root",
     "load_project_context",
+    "resolve_project_context",
     "resolve_prompt_argument",
 ]
