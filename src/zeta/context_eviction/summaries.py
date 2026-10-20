@@ -247,6 +247,12 @@ class EvictionSummaryWorker:
         self._blocked_until: dict[str, float] = {}
         self._bounds_hash: dict[tuple[str, int, int], str] = {}
 
+    def start(self) -> None:
+        """Start deferred resume work after an event loop becomes available."""
+        self._ensure_task()
+        if self._first_activity is not None or self.queue:
+            self._wake.set()
+
     def activity(self, _seq: int | None = None) -> None:
         if self.closed:
             return

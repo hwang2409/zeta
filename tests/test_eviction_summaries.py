@@ -317,6 +317,27 @@ def test_worker_coalesces_activity_and_honors_max_wait(tmp_path) -> None:
     assert scans[0] - started < 0.07
 
 
+def test_worker_deferred_start_runs_resume_catchup(tmp_path) -> None:
+    scans: list[int] = []
+    worker = EvictionSummaryWorker(
+        SummaryCache(tmp_path),
+        lambda _prompt: asyncio.sleep(0, result="ok"),
+        scan=lambda: scans.append(1) or (),
+        idle_seconds=0.01,
+        max_wait_seconds=0.02,
+    )
+    worker.activity()
+    assert worker._task is None
+
+    async def run() -> None:
+        worker.start()
+        await asyncio.sleep(0.03)
+        await worker.close()
+
+    asyncio.run(run())
+    assert scans == [1]
+
+
 def test_worker_bounds_and_prioritizes_queue(tmp_path) -> None:
     worker = EvictionSummaryWorker(
         SummaryCache(tmp_path), lambda _prompt: asyncio.sleep(0, result="ok"), max_pending=2

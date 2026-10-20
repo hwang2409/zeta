@@ -462,7 +462,6 @@ class AgentLoop(
 
     async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
         """Resolve one mounted MCP prompt for the next model turn."""
-
         await self._ensure_mcp_servers()
         if self._mcp_mount is None:
             raise RuntimeError("MCP mount is unavailable")
@@ -613,7 +612,6 @@ class AgentLoop(
 
     def prepare_resume_pending_tool(self, request_id: str) -> bool:
         """Reserve the abort generation before resuming an approved tool."""
-
         state = self.store.approval_states().get(request_id)
         if state is None or state[1] is None:
             return False
@@ -794,6 +792,8 @@ class AgentLoop(
         on_persisted: Callable[[], None] | None = None,
         notification_turn: bool = False,
     ) -> AsyncIterator[StreamEvent]:
+        if self.eviction_summary_worker is not None:
+            self.eviction_summary_worker.start()
         await self.refresh_skills()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
