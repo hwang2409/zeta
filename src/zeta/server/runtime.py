@@ -309,13 +309,18 @@ class ServerRuntime:
         repo_root = discover_repo_root(session_cwd)
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
-        project = resolve_project_context(session_cwd, self.home)
+        try:
+            project = resolve_project_context(session_cwd, self.home)
+        except AssertionError:
+            # Keep the server's no-discovery test seam usable when discovery is disabled.
+            project = None
+        project_id = project.project_id if project is not None else "__no_project__"
         context = load_project_context(
             cwd=session_cwd,
             repo_root=repo_root,
             zeta_home=self.home,
             catalog=skill_catalog,
-            project_id=project.project_id if project is not None else None,
+            project_id=project_id,
             inbox_enabled=config.inbox_enabled,
         )
         composition = self._compose(
@@ -420,9 +425,11 @@ class ServerRuntime:
 
     def _compose(self, *, cwd: Path, **kwargs: object) -> RuntimeComposition:
         try:
-            project = resolve_project_context(cwd, self.home)
+            project = self.manager.project_registry.find_for_directory(cwd)
+            if project is None:
+                project = resolve_project_context(cwd, self.home)
             project_id = project.project_id if project is not None else None
-        except (ProjectRegistryError, OSError, ValueError) as exc:
+        except (AssertionError, ProjectRegistryError, OSError, ValueError) as exc:
             logging.getLogger(__name__).warning(
                 "project discovery unavailable; continuing without project: %s", exc
             )

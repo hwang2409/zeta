@@ -574,6 +574,10 @@ def resolve_project_context(
     registry = ProjectRegistry(home / "projects")
     if not registry.root.exists():
         return None
+    if project_id is not None:
+        direct = registry.find_for_directory(cwd)
+        if direct is not None:
+            return direct if direct.project_id == project_id else None
     discovery = associate_project_discovery(
         discover_project(cwd, user_home=home.parent), registry, create=False
     )
