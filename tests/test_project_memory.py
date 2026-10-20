@@ -40,14 +40,16 @@ def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
         repo_root=repository,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
-        project_id=project.project_id,
+        session_project=project,
+        cwd_project=project,
     )
     disabled = load_project_context(
         cwd=repository,
         repo_root=repository,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
-        project_id=project.project_id,
+        session_project=project,
+        cwd_project=project,
         inbox_enabled=False,
     )
 
@@ -76,6 +78,8 @@ def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -
         repo_root=repository,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=None,
     )
     assert "shipping the first version" in context.system_prompt
     assert any(path.name == "state.md" for path in context.files)
@@ -101,6 +105,8 @@ def test_resume_replaces_only_current_project_memory(tmp_path: Path) -> None:
         repo_root=repository,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     ProjectRegistry(home / "projects").update_memory(
         project.project_id, {"state.md": "# Current state\\nnew state"}

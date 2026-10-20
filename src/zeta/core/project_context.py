@@ -586,97 +586,27 @@ def _walk_up_agents_files(cwd: Path, stop_at: Path) -> list[Path]:
 
 
 def resolve_project_context(
-    cwd: str | Path,
-    home: Path,
-    project_id: str | None = None,
-    *,
-    discovery: ProjectDiscovery | None = None,
+    discovery: ProjectDiscovery, registry: ProjectRegistry
 ) -> Project | None:
-    """Resolve the project whose private instructions apply to ``cwd``."""
-    registry = ProjectRegistry(home / "projects")
-    if not registry.root.exists():
+    """Resolve cwd-owned private instructions without running Git or creating a project."""
+
+    if not discovery.eligible or not registry.root.exists():
         return None
-    discovery: ProjectDiscovery | None = None
-    path = Path(cwd).expanduser().resolve()
-    direct = next(
+    if discovery.primary_root is None:
+        return _project_at_root(registry, discovery.cwd, discovery)
+    project = _project_at_root(registry, discovery.primary_root, discovery)
+    if project is not None or discovery.common_dir is None:
+        return project
+    return next(
         (
             candidate
             for candidate in registry.list_projects()
-            if candidate.canonical_integration_root is not None
-            and Path(candidate.canonical_integration_root).expanduser().resolve() == path
+            if _valid_registry_candidate(candidate, discovery) is not None
+            and _checkout_common_dir(Path(candidate.canonical_integration_root))
+            == discovery.common_dir
         ),
-        _valid_registry_candidate(registry.find_for_directory(cwd),
-                                  ProjectDiscovery(
-                                           Path(cwd).resolve(), Path(cwd).resolve(), None,
-                                           None, home.parent, Path(Path(cwd).resolve().anchor),
-                                           True,
-                                       )),
+        None,
     )
-    if direct is not None and not any(
-        (parent / ".git").is_dir()
-        for parent in [Path(cwd).resolve(), *Path(cwd).resolve().parents]
-        if parent != Path(direct.canonical_integration_root).resolve()
-        and Path(direct.canonical_integration_root).resolve() in parent.parents
-    ):
-        project = direct
-    else:
-        discovery = discovery or discover_project(cwd, user_home=home.parent)
-        project = None
-    if project is None and discovery is not None and discovery.primary_root is not None:
-        project = _project_at_root(registry, discovery.primary_root, discovery)
-        if project is None and discovery.common_dir is not None:
-            project = next(
-                (
-                    candidate
-                    for candidate in registry.list_projects()
-                    if _valid_registry_candidate(candidate, discovery) is not None
-                    and _checkout_common_dir(
-                        Path(candidate.canonical_integration_root)
-                    )
-                    == discovery.common_dir
-                ),
-                None,
-            )
-    elif project is None and discovery is not None:
-        project = _valid_registry_candidate(
-            registry.find_for_directory(cwd), discovery
-        )
-    if project_id is not None and (project is None or project.project_id != project_id):
-        return None
-    return project
-
-
-def _project_instruction_context(
-    working_dir: Path,
-    home: Path,
-    project_id: str | None,
-    discovery: ProjectDiscovery | None = None,
-) -> tuple[Project | None, Project | None, bool, tuple[str, ...]]:
-    """Resolve session memory, cwd-private instructions, and repository policy."""
-    try:
-        registry = ProjectRegistry(home / "projects")
-        if project_id is None:
-            discovery = discovery or discover_project(working_dir, user_home=home.parent)
-            session_project = associate_project_discovery(
-                discovery, registry, create=False
-            ).project
-            cwd_project = resolve_project_context(
-                working_dir, home, discovery=discovery
-            )
-        else:
-            session_project = ProjectRegistry(home / "projects").show_project(project_id)
-            cwd_project = resolve_project_context(
-                working_dir, home, discovery=discovery
-            )
-        ignored = cwd_project is not None and cwd_project.repo_agents == "ignore"
-        notices = (
-            ("warning: repository AGENTS.md files were ignored by project settings",)
-            if ignored
-            else ()
-        )
-        return session_project, cwd_project, ignored, notices
-    except (ProjectRegistryError, OSError) as exc:
-        return None, None, False, (f"context · project settings unavailable: {exc}",)
 
 
 def project_instructions_path(
@@ -687,7 +617,9 @@ def project_instructions_path(
         return "project instructions unchanged: command does not accept arguments"
     if project_root is None or zeta_home is None:
         return "project instructions error: not inside a project"
-    project = resolve_project_context(project_root, zeta_home)
+    registry = ProjectRegistry(zeta_home / "projects")
+    discovery = discover_project(project_root, user_home=zeta_home.parent)
+    project = resolve_project_context(discovery, registry)
     if project is None:
         return "project instructions error: project is not registered"
     path = zeta_home / "projects" / project.project_id / AGENTS_FILENAME
@@ -741,9 +673,9 @@ def load_project_context(
     system_append: str | None = None,
     byte_cap: int = CONTEXT_BYTE_CAP,
     catalog: SkillCatalog,
-    project_id: str | None = None,
+    session_project: Project | None = None,
+    cwd_project: Project | None = None,
     inbox_enabled: bool = True,
-    discovery: ProjectDiscovery | None = None,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
 
@@ -770,13 +702,13 @@ def load_project_context(
     notices: list[str] = []
     if seed_notice is not None:
         notices.append(seed_notice)
-    (
-        project_for_context,
-        private_project,
-        repo_agents_ignored,
-        project_notices,
-    ) = _project_instruction_context(working_dir, home, project_id, discovery)
-    notices.extend(project_notices)
+    repo_agents_ignored = (
+        cwd_project is not None and cwd_project.repo_agents == "ignore"
+    )
+    if repo_agents_ignored:
+        notices.append(
+            "warning: repository AGENTS.md files were ignored by project settings"
+        )
     loaded: list[Path] = []
     memory_index: int | None = None
     memory_block: str | None = None
@@ -796,7 +728,7 @@ def load_project_context(
             working_dir,
             stop_at,
             home,
-            private_project,
+            cwd_project,
             repo_agents_ignored=repo_agents_ignored,
         )
 
@@ -831,7 +763,7 @@ def load_project_context(
         # starting; surface it as a startup notice instead.
         try:
             registry = ProjectRegistry(home / "projects")
-            project = project_for_context
+            project = session_project
             if project is not None:
                 manual_memory_sections: list[str] = []
                 automatic_memory_sections: list[str] = []

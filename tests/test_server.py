@@ -4670,18 +4670,19 @@ async def test_serve_linked_worktree_runs_one_git_discovery(
     root = tmp_path / "repo"
     worktree = tmp_path / "linked"
     root.mkdir()
-    subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+
+    async def run_git(*args: str) -> None:
+        await asyncio.to_thread(
+            subprocess.run, ["git", *args], cwd=root, check=True, capture_output=True
+        )
+
+    await run_git("init")
+    await run_git("config", "user.email", "test@example.com")
+    await run_git("config", "user.name", "Test")
     (root / "tracked").write_text("initial", encoding="utf-8")
-    subprocess.run(["git", "add", "tracked"], cwd=root, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "worktree", "add", "-b", "feature", str(worktree)],
-        cwd=root,
-        check=True,
-        capture_output=True,
-    )
+    await run_git("add", "tracked")
+    await run_git("commit", "-m", "initial")
+    await run_git("worktree", "add", "-b", "feature", str(worktree))
     ProjectRegistry(home / "projects").create_project("repo", "test", root)
     real_run = subprocess.run
     commands: list[list[str]] = []
@@ -4722,7 +4723,7 @@ async def test_serve_session_loads_private_instructions(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("registered", [False, True])
-async def test_server_uses_only_existing_project_without_new_git_discovery(
+async def test_server_uses_only_existing_project_after_one_git_discovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registered: bool
 ) -> None:
     from zeta.core import project_context
@@ -4741,13 +4742,19 @@ async def test_server_uses_only_existing_project_without_new_git_discovery(
         else None
     )
 
-    def fail_new_discovery(*args: object, **kwargs: object) -> object:
-        raise AssertionError("server must not run automatic project discovery")
+    real_discovery_git = project_context._run_discovery_git
+    calls = 0
 
-    monkeypatch.setattr(project_context, "_run_discovery_git", fail_new_discovery)
+    def count_discovery(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return real_discovery_git(*args, **kwargs)
+
+    monkeypatch.setattr(project_context, "_run_discovery_git", count_discovery)
     runtime = ServerRuntime(home, cwd=cwd, provider="codex")
     try:
         metadata = await runtime.create_session()
+        assert calls == 3
         assert metadata.project_id == (
             existing.project_id if existing is not None else None
         )

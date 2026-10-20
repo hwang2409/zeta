@@ -7468,13 +7468,13 @@ async def test_agent_cwd_sets_child_bash_session_cwd(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     loop_thread = threading.get_ident()
     discovery_threads: list[int] = []
-    real_discover = agent_runner_module.discover_repo_root
+    real_discover = agent_runner_module.discover_project
 
-    def discover_repo_root(cwd: str | Path | None = None) -> Path:
+    def discover_project(*args: object, **kwargs: object):
         discovery_threads.append(threading.get_ident())
-        return real_discover(cwd)
+        return real_discover(*args, **kwargs)
 
-    monkeypatch.setattr(agent_runner_module, "discover_repo_root", discover_repo_root)
+    monkeypatch.setattr(agent_runner_module, "discover_project", discover_project)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
@@ -8349,7 +8349,8 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
         repo_root=child_cwd,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
-        project_id=parent_project.project_id,
+        session_project=parent_project,
+        cwd_project=registry.show_project(child_project.project_id),
         inbox_enabled=False,
     )
     assert any("repository AGENTS.md" in notice for notice in context.notices) is (ignored_project == "project-b")

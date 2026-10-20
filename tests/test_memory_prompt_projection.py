@@ -25,6 +25,11 @@ from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 
 
+def _context_projects(registry: ProjectRegistry, project_id: str) -> dict[str, object]:
+    project = registry.show_project(project_id)
+    return {"session_project": project, "cwd_project": project}
+
+
 def _source(seq: int, *, observed_at: str = "2026-10-08T12:00:00Z") -> tuple[MemorySource, ...]:
     return (
         MemorySource(
@@ -200,7 +205,8 @@ def test_format_one_prompt_block_is_byte_identical_golden(tmp_path: Path) -> Non
         repo_root=workspace,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
-        project_id=project.project_id,
+        session_project=project,
+        cwd_project=project,
     )
     assert context.memory_offset is not None and context.memory_length is not None
     block = context.system_prompt[
@@ -243,7 +249,7 @@ def test_format_two_outer_budget_keeps_short_complete_entry(tmp_path: Path) -> N
         zeta_home=home,
         byte_cap=1_000,
         catalog=SkillCatalog.empty(),
-        project_id=project_id,
+        **_context_projects(registry, project_id),
     )
 
     assert "short retained entry" in context.system_prompt
@@ -259,7 +265,7 @@ def test_active_run_prompt_is_byte_stable_after_memory_commit(tmp_path: Path) ->
         repo_root=workspace,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
-        project_id=project_id,
+        **_context_projects(registry, project_id),
     )
     active_prompt = context.system_prompt
     changed_text = "UNIQUE-MEMORY-COMMIT-AFTER-SNAPSHOT"
@@ -272,7 +278,7 @@ def test_active_run_prompt_is_byte_stable_after_memory_commit(tmp_path: Path) ->
         repo_root=workspace,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
-        project_id=project_id,
+        **_context_projects(registry, project_id),
     ).system_prompt
 
 
@@ -284,7 +290,7 @@ def test_same_cwd_child_inherits_parent_memory_snapshot(tmp_path: Path) -> None:
         repo_root=workspace,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
-        project_id=project_id,
+        **_context_projects(registry, project_id),
     )
     parent_prompt = context.system_prompt
     _add(registry, project_id, (AddOperation("state", "new memory", _source(2)),))
@@ -371,7 +377,7 @@ async def test_serve_unknown_recipe_preserves_custom_bytes_and_refreshes_owned_m
         repo_root=workspace,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
-        project_id=project_id,
+        **_context_projects(registry, project_id),
     )
     assert context.memory_offset is not None
     assert context.memory_length is not None
@@ -415,7 +421,7 @@ def test_format_two_projection_is_fixture_only(tmp_path: Path) -> None:
         repo_root=workspace,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
-        project_id=project_id,
+        **_context_projects(registry, project_id),
     )
     assert "fixture entry" in context.system_prompt
 

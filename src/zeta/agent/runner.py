@@ -14,8 +14,8 @@ from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
 from ..core.project_context import (
     discover_project,
-    discover_repo_root,
     load_project_context,
+    resolve_project_context,
 )
 from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
@@ -23,7 +23,7 @@ from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
 from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
-from ..project_registry import ProjectRegistryError
+from ..project_registry import ProjectRegistry, ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -1145,16 +1145,22 @@ def _child_base_system_prompt(
     home_hint = loop.active_home
     zeta_home = Path(home_hint) if home_hint else env_home()
     discovery = discover_project(cwd_override, user_home=zeta_home.parent)
-    if not (Path(cwd_override) / ".git").exists():
-        discover_repo_root(cwd_override)
+    registry = ProjectRegistry(zeta_home / "projects")
+    session_project = None
+    if loop.root_project_id is not None:
+        try:
+            session_project = registry.show_project(loop.root_project_id)
+        except ProjectRegistryError:
+            pass
+    cwd_project = resolve_project_context(discovery, registry)
     context = load_project_context(
         cwd=cwd_override,
         repo_root=discovery.primary_root or discovery.cwd,
         zeta_home=zeta_home,
         catalog=loop.tool_registry.skill_catalog,
-        project_id=loop.root_project_id or "__no_project__",
+        session_project=session_project,
+        cwd_project=cwd_project,
         inbox_enabled=False,
-        discovery=discovery,
     )
     return context.system_prompt
 
