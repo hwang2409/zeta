@@ -38,7 +38,10 @@ from zeta.context_eviction.summaries import (
     valid_summary,
 )
 from zeta.context_eviction.summary_receipts import receipt_summary_request
-from zeta.context_eviction.summary_reserve import finalize_summaries
+from zeta.context_eviction.summary_reserve import (
+    estimate_summary_reserve,
+    finalize_summaries,
+)
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
@@ -359,6 +362,148 @@ def test_reserve_fold_counts_summaries_of_ranges_it_creates(tmp_path) -> None:
     assert off.tokens_after - deterministic_tokens <= needed + largest_fold
 
 
+def _coarse_reserve_case(tmp_path):
+    records = []
+    for start in range(1, 101, 5):
+        records.extend(_compacted_tool_batch(start))
+        records.extend(_compacted_tool_batch(start + 2))
+        records.append((start + 4, Message(MessageRole.SYSTEM, [TextContent("keep")])))
+    sources = {
+        seq: Message(message.role, [TextContent("source " * 300)])
+        for seq, message in records
+    }
+    target = 1_800
+    off = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=sources,
+    )
+    cache = SummaryCache(tmp_path)
+    request = next(
+        request
+        for message in off.messages
+        if (request := receipt_summary_request(message, sources)) is not None
+    )
+    asyncio.run(cache.put(request.key, "summary"))
+    reserve = estimate_summary_reserve(
+        off.messages,
+        off.tokens_after,
+        target,
+        message_token_count,
+        sources,
+        cache,
+    )
+    return records, sources, target, off, cache, reserve
+
+
+def test_reserve_pass_never_removes_more_than_capped_reserve(tmp_path) -> None:
+    records, sources, target, off, cache, reserve = _coarse_reserve_case(tmp_path)
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=sources,
+        summary_cache=cache,
+        summaries_enabled=True,
+    )
+    deterministic_tokens = sum(
+        message_token_count(normalize_receipt(message)) for message in result.messages
+    )
+    atomic_fold_bound = max(map(message_token_count, off.messages))
+
+    assert off.tokens_after - deterministic_tokens <= reserve + atomic_fold_bound
+    assert result.tokens_after <= target
+    assert any(
+        message.metadata.get("summary_data") is not None for message in result.messages
+    )
+    call_ids = {
+        block.tool_call.id
+        for message in result.messages
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    }
+    result_ids = {
+        message.tool_result.tool_call_id
+        for message in result.messages
+        if message.tool_result is not None
+    }
+    assert call_ids == result_ids
+    assert all(
+        "recall_history" in message.content[0].text
+        for message in result.messages
+        if message.metadata.get("eviction_range")
+    )
+
+
+def test_reserve_pass_targets_requested_reserve_not_full_cap(
+    tmp_path, monkeypatch
+) -> None:
+    records, sources, target, off, cache, reserve = _coarse_reserve_case(tmp_path)
+    passes = []
+    import zeta.context_eviction as eviction
+
+    deterministic = eviction._evict_deterministic
+
+    def wrapped(*args, **kwargs):
+        if args[0] is records:
+            passes.append(kwargs["target_tokens"])
+        return deterministic(*args, **kwargs)
+
+    monkeypatch.setattr(eviction, "_evict_deterministic", wrapped)
+    evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=sources,
+        summary_cache=cache,
+        summaries_enabled=True,
+    )
+
+    assert passes == [target, off.tokens_after - reserve]
+
+
+def test_eviction_result_keeps_original_reserve_request(tmp_path) -> None:
+    records, sources, target, _, cache, reserve = _coarse_reserve_case(tmp_path)
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=sources,
+        summary_cache=cache,
+        summaries_enabled=True,
+    )
+
+    assert reserve > 0
+    assert result.reserve_tokens == reserve
+
+
+def test_incremental_kind_counts_includes_new_shown_receipts(tmp_path) -> None:
+    _, sources, _, off, _, _ = _coarse_reserve_case(tmp_path)
+    records = list(zip(off.source_seqs, off.messages, strict=True))
+    folded = range_receipt_candidate(
+        records,
+        allows=lambda _seq: True,
+        coarse=True,
+        is_smaller=lambda originals, candidates: (
+            sum(message_token_count(message) for _, message in originals)
+            > sum(map(message_token_count, candidates))
+        ),
+    )
+    coarse = next(
+        message for _, message in folded.records if "user_count" in message.metadata
+    )
+    shown = decorate_receipt(coarse, "coarse summary")
+
+    counts = replay_script._kind_counts(off.messages, sources, shown_messages=[shown])
+
+    assert counts["coarse"]["shown"] == 1
+
+
 def test_eviction_result_reports_reserve_tokens(tmp_path) -> None:
     records = _separated_assistants(20)
     cache = _ready_cache(tmp_path, records, "summary " * 10)
@@ -669,16 +814,28 @@ def test_replay_fold_bound_uses_deterministic_range_receipt(tmp_path) -> None:
         asyncio.run(cache.put(request.key, "summary " * 40))
     off = _evict(records, target=800)
     on = _evict(records, cache, enabled=True, target=800)
+    folded = range_receipt_candidate(
+        list(zip(off.source_seqs, off.messages, strict=True)),
+        allows=lambda _seq: True,
+        coarse=True,
+        is_smaller=lambda originals, candidates: (
+            sum(message_token_count(message) for _, message in originals)
+            > sum(map(message_token_count, candidates))
+        ),
+    )
     range_receipt = next(
-        message for message in on.messages if message.metadata.get("eviction_range")
+        message
+        for _, message in folded.records
+        if message.metadata.get("eviction_range")
     )
     decorated_range = decorate_receipt(range_receipt, "summary " * 40)
     on = replace(
         on,
         messages=[
             decorated_range if message is range_receipt else message
-            for message in on.messages
+            for _, message in folded.records
         ],
+        source_seqs=tuple(seq for seq, _ in folded.records),
     )
     bounds = (
         decorated_range.metadata["source_seq"],

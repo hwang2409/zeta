@@ -55,17 +55,9 @@ def evict_messages(
         if reserve:
             result = deterministic_evict(
                 records,
-                target_tokens=max(0, first_pass_tokens - target_tokens // 10),
+                target_tokens=max(0, first_pass_tokens - reserve),
                 summary_target_tokens=target_tokens,
                 **arguments,
-            )
-            reserve = estimate_summary_reserve(
-                result.messages,
-                first_pass_tokens,
-                target_tokens,
-                token_counter,
-                source_messages,
-                summary_cache,
             )
     reached_target = result.reached_target if not reserve else True
     misses = result.summary_misses
@@ -201,6 +193,16 @@ class ReserveFoldTracker:
             summary_cache=summary_cache,
         )
         self.done = False
+
+    def has_ready_decoration(self, message: Message) -> bool:
+        return bool(
+            _ready_decorations(
+                [message],
+                token_counter=self._token_counter,
+                source_messages=self._source_messages,
+                summary_cache=self._summary_cache,
+            )
+        )
 
     def __call__(
         self,

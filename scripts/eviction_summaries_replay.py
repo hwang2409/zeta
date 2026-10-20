@@ -18,6 +18,7 @@ from zeta.context_eviction import (
     eviction_summary_candidates,
     normalize_receipt,
 )
+from zeta.context_eviction.range_receipts import _coarse_receipt_unit
 from zeta.context_eviction.receipt_constructors import RECEIPT_FIELDS_METADATA
 from zeta.context_eviction.summaries import (
     EvictionSummaryWorker,
@@ -158,6 +159,36 @@ def _ready_decoration_growth(
     return growth
 
 
+def _atomic_coarse_fold_bound(result: Any) -> int:
+    """Bound the initial coarse batch or one later complete receipt unit."""
+    records = list(zip(result.source_seqs, result.messages, strict=True))
+    units: list[tuple[int, str]] = []
+    index = 0
+    while index < len(records):
+        unit, next_index = _coarse_receipt_unit(records, index, lambda _seq: True)
+        if unit is not None:
+            units.append(
+                (
+                    sum(message_token_count(message) for _, message in unit.records),
+                    unit.kind,
+                )
+            )
+        index = next_index
+    first_batch_end = next(
+        (
+            count
+            for count in range(2, len(units) + 1)
+            if any(kind != "user" for _, kind in units[:count])
+        ),
+        len(units),
+    )
+    first_batch_tokens = sum(tokens for tokens, _ in units[:first_batch_end])
+    later_unit_tokens = max(
+        (tokens for tokens, _ in units[first_batch_end:]), default=0
+    )
+    return max(first_batch_tokens, later_unit_tokens)
+
+
 def _largest_new_range_saving(off: Any, on: Any) -> int:
     off_ranges = {
         (message.metadata["source_seq"], message.metadata["range_seq_end"])
@@ -258,13 +289,7 @@ def _kind_counts(
         kind: {"receipts": 0, "eligible": 0, "shown": 0, "shown_rate": 1.0}
         for kind in ("assistant", "orchestration", "notification", "range", "coarse")
     }
-    shown_keys = {
-        request.key.as_string()
-        for message in (shown_messages if shown_messages is not None else messages)
-        if message.metadata.get("summary_data") is not None
-        and (request := receipt_summary_request(message, sources)) is not None
-    }
-    for message in messages:
+    for message in shown_messages if shown_messages is not None else messages:
         receipt_kind = _receipt_kind(message)
         if receipt_kind is not None:
             counts[receipt_kind]["receipts"] += 1
@@ -277,7 +302,7 @@ def _kind_counts(
             else request.key.kind
         )
         counts[kind]["eligible"] += 1
-        if request.key.as_string() in shown_keys:
+        if message.metadata.get("summary_data") is not None:
             counts[kind]["shown"] += 1
     for values in counts.values():
         eligible = int(values["eligible"])
@@ -339,6 +364,12 @@ async def replay_incremental_markers(
         for message in messages:
             if (request := receipt_summary_request(message, sources)) is not None:
                 worker.admit(request)
+        off = evict_messages(
+            records,
+            fixed_tokens=fixed_tokens,
+            target_tokens=target,
+            source_messages=sources,
+        )
         on = await _converge_enabled_view(
             worker,
             records,
@@ -349,6 +380,32 @@ async def replay_incremental_markers(
         deterministic_tokens = fixed_tokens + sum(
             message_token_count(normalize_receipt(message)) for message in on.messages
         )
+        extra_evicted = min(off.tokens_after, target) - deterministic_tokens
+        atomic_fold_bound = _atomic_coarse_fold_bound(off)
+        shown_count = sum(
+            message.metadata.get("summary_data") is not None for message in on.messages
+        )
+        available_summary_tokens = target - deterministic_tokens
+        ready_summary_fits = any(
+            message_token_count(decorate_receipt(message, summary))
+            - message_token_count(normalize_receipt(message))
+            <= available_summary_tokens
+            for message in on.messages
+            if (request := receipt_summary_request(message, sources)) is not None
+            and (summary := cache.get(request.key)) is not None
+        )
+        if extra_evicted > on.reserve_tokens + atomic_fold_bound:
+            raise SystemExit(
+                f"marker {marker.seq}: summary reserve exceeded the atomic-fold bound"
+            )
+        if on.tokens_after > target:
+            raise SystemExit(
+                f"marker {marker.seq}: summary-enabled eviction exceeded target"
+            )
+        if on.reserve_tokens and ready_summary_fits and not shown_count:
+            raise SystemExit(
+                f"marker {marker.seq}: reserve created but no ready summary was shown"
+            )
         marker_reports.append(
             {
                 "marker_seq": marker.seq,
@@ -357,6 +414,10 @@ async def replay_incremental_markers(
                 "target_tokens": target,
                 "fixed_tokens": fixed_tokens,
                 "kinds": _kind_counts(messages, sources, shown_messages=on.messages),
+                "feature_off_tokens_after": off.tokens_after,
+                "deterministic_tokens_after": deterministic_tokens,
+                "extra_evicted_tokens": extra_evicted,
+                "atomic_fold_bound": atomic_fold_bound,
                 "added_tokens": on.tokens_after - deterministic_tokens,
                 "reserve_used": on.reserve_tokens,
                 "tokens_after": on.tokens_after,
@@ -428,6 +489,7 @@ async def replay(
     kind_counts = _kind_counts(on.messages, sources)
     off_view, on_view = _view(off), _view(on)
     largest_single_fold_saving = _largest_new_range_saving(off, on)
+    atomic_fold_bound = _atomic_coarse_fold_bound(off)
     deterministic_tokens = sum(
         message_token_count(normalize_receipt(message)) for message in on.messages
     )
@@ -442,10 +504,11 @@ async def replay(
         "feature_on": on_view,
         "off_selected_count": len(off_view["selected_seqs"]),
         "on_selected_count": len(on_view["selected_seqs"]),
-        "extra_evicted_tokens": off.tokens_after - deterministic_tokens,
+        "extra_evicted_tokens": min(off.tokens_after, target) - deterministic_tokens,
         "reserve_tokens": on.reserve_tokens,
         "largest_single_fold_saving": largest_single_fold_saving,
-        "reserve_bound": on.reserve_tokens + largest_single_fold_saving,
+        "atomic_fold_bound": atomic_fold_bound,
+        "reserve_bound": on.reserve_tokens + atomic_fold_bound,
         "tokens_vs_target": {
             "off": off.tokens_after - target,
             "on": on.tokens_after - target,

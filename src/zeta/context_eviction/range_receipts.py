@@ -44,6 +44,7 @@ def range_receipt_candidate(
             records,
             allows=allows,
             is_smaller=is_smaller,
+            stop_after_fold=stop_after_fold,
         )
     output: list[tuple[int, Message]] = []
     coalesced: set[int] = set()
@@ -94,34 +95,86 @@ def _coarse_candidate(
     *,
     allows: Callable[[int], bool],
     is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
+    stop_after_fold: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool]
+    | None,
 ) -> RangeCandidate:
-    units: list[_ReceiptUnit] = []
-    unit_indexes: set[int] = set()
+    indexed_units: list[tuple[_ReceiptUnit, range]] = []
     index = 0
     while index < len(records):
         unit, next_index = _coarse_receipt_unit(records, index, allows)
         if unit is not None:
-            units.append(unit)
-            unit_indexes.update(range(index, next_index))
+            indexed_units.append((unit, range(index, next_index)))
         index = next_index
 
+    units = [unit for unit, _ in indexed_units]
     if len(units) < 2 or not any(unit.kind != "user" for unit in units):
         return RangeCandidate(list(records), frozenset())
-    flattened = [record for unit in units for record in unit.records]
-    start = min(_unit_start(unit) for unit in units)
-    end = max(_unit_end(unit) for unit in units)
-    receipt = _range_receipt(start, end, units, include_user_metadata=True)
-    if not is_smaller(flattened, [receipt]):
-        return RangeCandidate(list(records), frozenset())
+
+    selected_count = len(units)
+    receipt: Message | None = None
+    committed_count = 0
+    if stop_after_fold is not None:
+        for candidate_count in range(2, len(units) + 1):
+            selected = units[:candidate_count]
+            if not any(unit.kind != "user" for unit in selected):
+                continue
+            flattened = [record for unit in selected for record in unit.records]
+            candidate = _range_receipt(
+                min(_unit_start(unit) for unit in selected),
+                max(_unit_end(unit) for unit in selected),
+                selected,
+                include_user_metadata=True,
+            )
+            originals = (
+                flattened
+                if receipt is None
+                else [
+                    (
+                        min(_unit_start(unit) for unit in units[:committed_count]),
+                        receipt,
+                    ),
+                    *[
+                        record
+                        for unit in units[committed_count:candidate_count]
+                        for record in unit.records
+                    ],
+                ]
+            )
+            if not is_smaller(originals, [candidate]):
+                continue
+            if stop_after_fold(originals, [candidate]):
+                receipt = candidate
+                selected_count = candidate_count
+                break
+            receipt = candidate
+            committed_count = candidate_count
+            selected_count = candidate_count
+
+    selected = units[:selected_count]
+    flattened = [record for unit in selected for record in unit.records]
+    start = min(_unit_start(unit) for unit in selected)
+    if receipt is None:
+        receipt = _range_receipt(
+            start,
+            max(_unit_end(unit) for unit in selected),
+            selected,
+            include_user_metadata=True,
+        )
+        if not is_smaller(flattened, [receipt]):
+            return RangeCandidate(list(records), frozenset())
+    unit_indexes = {
+        record_index
+        for _, indexes in indexed_units[:selected_count]
+        for record_index in indexes
+    }
     output = [
-        record for index, record in enumerate(records) if index not in unit_indexes
+        record
+        for record_index, record in enumerate(records)
+        if record_index not in unit_indexes
     ]
     output.append((start, receipt))
     output.sort(key=lambda record: record[0])
-    return RangeCandidate(
-        output,
-        frozenset(seq for seq, _ in flattened),
-    )
+    return RangeCandidate(output, frozenset(seq for seq, _ in flattened))
 
 
 def _unit_start(unit: _ReceiptUnit) -> int:
