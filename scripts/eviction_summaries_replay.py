@@ -65,7 +65,7 @@ def _offline_summary(prompt: str, target_tokens: int | None) -> str:
         and estimated_text_tokens(" ".join(words)) < target_tokens
         and len(words) < 60
     ):
-        words.append("detail")
+        words.append("fact")
     return " ".join(words)
 
 
