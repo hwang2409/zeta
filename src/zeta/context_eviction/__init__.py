@@ -43,7 +43,6 @@ from .summary_receipts import (
 from .summary_receipts import (
     eviction_summary_candidates as _project_summary_candidates,
 )
-from .summary_reserve import evict_messages
 
 EVICTION_KIND = "evict"
 TARGET_RATIO = 0.55
@@ -87,6 +86,7 @@ class EvictionResult:
     reached_target: bool
     source_seqs: tuple[int, ...] = field(default=(), compare=False)
     summary_misses: tuple[SummaryRequest, ...] = field(default=(), compare=False)
+    reserve_tokens: int = field(default=0, compare=False)
 
 
 def estimated_text_tokens(text: str) -> int:
@@ -165,21 +165,13 @@ def _finalize_summaries(
         )
         decorated_tokens = token_counter(decorated)
         next_total = running_total - token_counter(message) + decorated_tokens
-        if (
-            decorated_tokens < original_tokens
-            and result.reached_target
-            and next_total <= target_tokens
-        ):
+        if decorated_tokens < original_tokens and result.reached_target and next_total <= target_tokens:
             messages[index] = decorated
             running_total = next_total
     return EvictionResult(
-        messages,
-        result.items_evicted,
-        result.tokens_before,
-        running_total,
-        result.reached_target,
-        result.source_seqs,
-        tuple(misses),
+        messages, result.items_evicted, result.tokens_before, running_total,
+        result.reached_target, result.source_seqs, tuple(misses),
+        result.reserve_tokens,
     )
 
 
@@ -213,7 +205,8 @@ def catch_up_summary_candidates(
             records, evictable_source_seqs=eligibility.evictable_source_seqs
         )
         if any(
-            start <= request.key.seq_start <= end for start, end in covered_intervals
+            start <= request.key.seq_start <= end
+            for start, end in covered_intervals
         )
     )
 
@@ -260,13 +253,11 @@ def _evict_deterministic(
     summaries_enabled: bool = False,
 ) -> EvictionResult:
     """Replace old re-derivable results with bounded semantic digests.
-
     ``unconsumed_source_seqs`` identifies tool results and notifications stored
     after the latest persisted assistant response. The module protects their
     required call records and adds its other workflow protections once, before
     any transformation.
     """
-
     records = [(seq, normalize_receipt(message)) for seq, message in records]
     messages = [message for _, message in records]
     before = fixed_tokens + sum(token_counter(message) for message in messages)
@@ -279,7 +270,6 @@ def _evict_deterministic(
         messages = [message for _, message in records]
         changed.update(regenerated)
     from .range_receipts import range_receipt_candidate
-
     range_candidate = range_receipt_candidate(
         records,
         allows=eligibility.allows,
@@ -293,12 +283,10 @@ def _evict_deterministic(
         messages = [message for _, message in records]
         changed.update(range_candidate.coalesced_source_seqs)
         eligibility = _eviction_eligibility(records, unconsumed_source_seqs)
-
     calls = _tool_calls(messages)
     call_indexes = _call_indexes(messages)
     message_tokens = [token_counter(message) for message in messages]
     running_total = fixed_tokens + sum(message_tokens)
-
     def replace_many(replacements: Sequence[tuple[int, Message]]) -> bool:
         nonlocal running_total
         indexes = [index for index, _ in replacements]
@@ -315,13 +303,10 @@ def _evict_deterministic(
             messages[index] = replacement
             changed.add(records[index][0])
         return True
-
     def replace(index: int, replacement: Message) -> bool:
         return replace_many(((index, replacement),))
-
     def finish(reached: bool) -> EvictionResult:
         return _result(records, messages, changed, before, running_total, reached)
-
     for index, (seq, _) in enumerate(records):
         message = messages[index]
         if (
@@ -333,7 +318,6 @@ def _evict_deterministic(
         replace(index, _tool_call_receipt(message, seq))
         if running_total <= target_tokens:
             return finish(True)
-
     read_counts = _collapse_repeated_reads(
         records,
         messages,
@@ -343,7 +327,6 @@ def _evict_deterministic(
         eligibility,
         replace_many,
     )
-
     def digest_results(*, failed: bool) -> EvictionResult | None:
         for index, (seq, _) in enumerate(records):
             message = messages[index]
@@ -364,11 +347,9 @@ def _evict_deterministic(
             if running_total <= target_tokens:
                 return finish(True)
         return None
-
     reached = digest_results(failed=False)
     if reached is not None:
         return reached
-
     for index, (seq, _) in enumerate(records):
         message = messages[index]
         if (
@@ -1246,3 +1227,5 @@ def _bounded_with_hint(value: str, max_chars: int, hint: str) -> str:
     if len(suffix) >= max_chars:
         return suffix[:max_chars]
     return value[: max_chars - len(suffix)] + suffix
+
+from .summary_reserve import evict_messages

@@ -131,21 +131,27 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
         summary_cache=cache,  # type: ignore[arg-type]
         summaries_enabled=True,
     )
-    for message in first_on.messages:
-        if (request := receipt_summary_request(message, sources)) is not None:
+    on = first_on
+    for _ in range(3):
+        for message in on.messages:
+            if (request := receipt_summary_request(message, sources)) is not None:
+                worker.admit(request)
+        for request in on.summary_misses:
             worker.admit(request)
-    for request in first_on.summary_misses:
-        worker.admit(request)
-    while worker.queue:
-        await worker.run_once()
-    on = evict_messages(
-        records,
-        fixed_tokens=0,
-        target_tokens=target,
-        source_messages=sources,
-        summary_cache=cache,  # type: ignore[arg-type]
-        summaries_enabled=True,
-    )
+        while worker.queue:
+            await worker.run_once()
+        next_on = evict_messages(
+            records,
+            fixed_tokens=0,
+            target_tokens=target,
+            source_messages=sources,
+            summary_cache=cache,  # type: ignore[arg-type]
+            summaries_enabled=True,
+        )
+        if next_on.source_seqs == on.source_seqs and next_on.tokens_after == on.tokens_after:
+            on = next_on
+            break
+        on = next_on
     await worker.close()
     requests = [
         (message, request)
@@ -168,14 +174,13 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
         "off_selected_count": len(off_view["selected_seqs"]),
         "on_selected_count": len(on_view["selected_seqs"]),
         "extra_evicted_tokens": off.tokens_after - on.tokens_after,
-        "reserve_used": max(0, first_on.tokens_after - on.tokens_after),
+        "reserve_tokens": on.reserve_tokens,
         "tokens_vs_target": {
             "off": off.tokens_after - target,
             "on": on.tokens_after - target,
         },
-        "summary_readiness_rate": (
-            len(ready) / eligible_receipts if eligible_receipts else 1.0
-        ),
+        "shown_rate": summary_count / eligible_receipts if eligible_receipts else 1.0,
+        "cache_ready_rate": len(ready) / eligible_receipts if eligible_receipts else 1.0,
         "queue_drops": worker.drops,
         "token_totals": {"off": off.tokens_after, "on": on.tokens_after},
         "summary_count": summary_count,

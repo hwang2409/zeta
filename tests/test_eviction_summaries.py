@@ -106,6 +106,26 @@ def test_reserve_lets_ready_summaries_fit(tmp_path) -> None:
     assert result.tokens_after <= 500
 
 
+def test_reserve_counts_items_evicted_by_the_second_pass(tmp_path) -> None:
+    records = _separated_assistants(20)
+    cache = _ready_cache(tmp_path, records)
+    result = _evict(records, cache, enabled=True, target=500)
+    shown = {
+        message.metadata["source_seq"]
+        for message in result.messages
+        if message.metadata.get("summary_data") is not None
+    }
+    assert shown
+
+
+def test_eviction_result_reports_reserve_tokens(tmp_path) -> None:
+    records = _separated_assistants(20)
+    cache = _ready_cache(tmp_path, records)
+    result = _evict(records, cache, enabled=True, target=500)
+    assert result.reserve_tokens > 0
+    assert _evict(records, target=500).reserve_tokens == 0
+
+
 def test_reserve_capped_at_ten_percent_of_target(tmp_path, monkeypatch) -> None:
     records = _separated_assistants(20)
     cache = _ready_cache(tmp_path, records, "summary " * 40)
@@ -154,7 +174,8 @@ def test_reserve_at_most_two_deterministic_passes(tmp_path, monkeypatch) -> None
 
     def wrapped(*args, **kwargs):
         nonlocal calls
-        calls += 1
+        if kwargs["target_tokens"] > 0:
+            calls += 1
         return original(*args, **kwargs)
 
     monkeypatch.setattr(eviction, "_evict_deterministic", wrapped)
