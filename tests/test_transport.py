@@ -55,6 +55,20 @@ def test_http_429_remains_retryable() -> None:
     assert retryable_provider_error(error)
 
 
+def test_server_error_code_is_retryable() -> None:
+    error = RuntimeError("server_error: stream error")
+    error.code = "server_error"
+
+    assert retryable_provider_error(error)
+
+
+def test_server_error_with_permanent_4xx_status_is_not_retried() -> None:
+    error = CodexHTTPError("server_error", status_code=400)
+    error.code = "server_error"
+
+    assert not retryable_provider_error(error)
+
+
 async def _unused_retry(_token: str) -> AsyncIterator[StreamEvent]:
     raise AssertionError("auth retry is unreachable")
     yield

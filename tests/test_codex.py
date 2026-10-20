@@ -4453,6 +4453,81 @@ def test_codex_serializes_thinking_only_message_then_nudge() -> None:
 
 
 @pytest.mark.asyncio
+async def test_response_failed_server_error_is_retryable() -> None:
+    response = httpx.Response(
+        200,
+        text=sse(
+            [
+                event("response.created", response={"id": "resp-1"}),
+                event(
+                    "response.failed",
+                    response={"error": {"code": "server_error", "message": "secret provider text"}},
+                ),
+            ]
+        ),
+    )
+    try:
+        with pytest.raises(CodexStreamError) as raised:
+            [item async for item in codex_module._decode_response(response)]
+        assert raised.value.retryable is True
+        assert raised.value.code == "server_error"
+    finally:
+        await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_response_failed_diagnostic_records_structured_context(tmp_path: Path) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(
+                [
+                    event("response.created", response={"id": "resp-diag"}),
+                    event(
+                        "response.failed",
+                        response={
+                            "error": {
+                                "code": "server_error",
+                                "status_code": 400,
+                                "message": "raw provider message must not be logged",
+                            }
+                        },
+                    ),
+                ]
+            ),
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend = CodexBackend(
+        client=client,
+        token_store=store_for(tmp_path / "codex.json"),
+        diagnostics_path=tmp_path / "diagnostics.jsonl",
+    )
+    with pytest.raises(CodexStreamError):
+        [item async for item in backend.complete([], [])]
+    records = [json.loads(line) for line in (tmp_path / "diagnostics.jsonl").read_text().splitlines()]
+    assert len(records) == 1
+    record = records[0]
+    assert record["model"] == DEFAULT_CODEX_MODEL
+    assert record["provider"] == "codex"
+    assert record["code"] == "server_error"
+    assert record["status"] == 400
+    assert record["response_id"] == "resp-diag"
+    assert record["terminal_event_type"] == "response.failed"
+    assert record["last_event_type"] == "response.failed"
+    assert record["stream_age_seconds"] >= 0
+    assert record["event_count"] == 2
+    assert record["attempt"] == 1
+    assert record["will_retry"] is False
+    serialized = (tmp_path / "diagnostics.jsonl").read_text()
+    assert "raw provider message" not in serialized
+    assert "secret provider text" not in serialized
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("shape", ["flat", "nested", "failed"])
 @pytest.mark.parametrize("detail,retryable", [
     ({"code": "server_is_overloaded"}, True),

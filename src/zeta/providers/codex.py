@@ -399,6 +399,7 @@ async def _decode_response(
         if record is None:
             continue
         event, payload = record
+        response_data["event_count"] = response_data.get("event_count", 0) + 1
         translated, response_state = _translate_event(
             event,
             payload,
@@ -415,6 +416,7 @@ async def _decode_response(
             yield translated
     record = decoder.finish()
     if record is not None:
+        response_data["event_count"] = response_data.get("event_count", 0) + 1
         translated, response_state = _translate_event(
             record[0],
             record[1],
@@ -942,7 +944,7 @@ def _decode_terminal_response(
             "response_id": response_data.get("id"),
             "terminal_event_type": event_type,
             "last_event_type": event_type,
-            "event_count": 1,
+            "event_count": response_data.get("event_count", 1),
         }
         raise failure
     if response is not None and not isinstance(response, Mapping):

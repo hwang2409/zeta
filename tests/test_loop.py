@@ -1893,6 +1893,73 @@ async def test_metadata_only_provider_events_are_retry_safe(
 
 
 @pytest.mark.asyncio
+async def test_child_retries_response_failed_server_error(tmp_path: Path) -> None:
+    failure = codex_module.CodexStreamError(
+        "server_error: stream error", code="server_error", retryable=True
+    )
+    class Backend(CompletionBackend):
+        calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            self.calls += 1
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            if self.calls == 1:
+                raise failure
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+            )
+
+    backend = Backend()
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn(
+            "start", origin=MessageOrigin.USER
+        )
+    )
+    assert backend.calls == 2
+    assert sum(event.type is StreamEventType.ASSISTANT_RESET for event in events) == 1
+    assistant_messages = [
+        message for message in store.messages() if message.role is MessageRole.ASSISTANT
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0].content == [TextContent("done")]
+
+
+@pytest.mark.asyncio
+async def test_server_error_after_completed_tool_call_is_not_retried(tmp_path: Path) -> None:
+    failure = codex_module.CodexStreamError(
+        "server_error: stream error", code="server_error", retryable=True
+    )
+    class Backend(CompletionBackend):
+        calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            self.calls += 1
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(
+                    MessageRole.ASSISTANT,
+                    [ToolUseContent(ToolCall("tool-1", "echo", {}))],
+                ),
+            )
+            raise failure
+
+    backend = Backend()
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn(
+            "start", origin=MessageOrigin.USER
+        )
+    )
+    assert backend.calls == 1
+    assert not any(event.type is StreamEventType.RETRY for event in events)
+
+
+@pytest.mark.asyncio
 async def test_retry_after_midstream_request_failed_succeeds(tmp_path: Path) -> None:
     backend = AttemptBackend(
         [

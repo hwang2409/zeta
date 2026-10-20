@@ -1025,12 +1025,24 @@ async def run_agent_tool(
         killed_task_details: list[tuple[str, str]] = []
 
         async def close_background_child() -> tuple[str, ...]:
-            killed_task_details.extend(
-                (task.task_id, task.headline)
+            task_details = {
+                task.task_id: task.headline
                 for task in child_loop.tool_registry.background_tasks.snapshot()
-                if task.running
+            }
+            killed = await child_loop.close(cancel_background=False)
+            if killed:
+                task_details.update(
+                    {
+                        task.task_id: task.headline
+                        for task in child_loop.tool_registry.background_tasks.snapshot()
+                    }
+                )
+            killed_task_details.extend(
+                (task_id, task_details[task_id])
+                for task_id in killed
+                if task_id in task_details
             )
-            return await child_loop.close(cancel_background=False)
+            return killed
 
         async def finish_background() -> None:
             try:
