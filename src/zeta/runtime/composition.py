@@ -10,11 +10,8 @@ from typing import Any
 
 from ..config.settings import ResolvedConfig
 from ..config.tool_policy import ToolPolicy
-from ..context_eviction.summaries import (
-    EvictionSummaryWorker,
-    SummaryCache,
-    SummaryResponse,
-)
+from ..context_eviction.summaries import EvictionSummaryWorker, SummaryCache
+from ..context_eviction.summary_provider import build_summary_provider
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.hooks import load_hooks_for_provider
 from ..core.project_context import ProjectContext, ProjectDiscovery
@@ -22,11 +19,10 @@ from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
 from ..media.image_policy import image_policy_for_provider
 from ..memory.auto import AutoMemoryConfig, AutoMemoryReconciler
-from ..memory.provider import complete_reconciliation, use_response_byte_limit
+from ..memory.provider import complete_reconciliation
 from ..memory.reconciler import ReconciliationResponse
 from ..models.catalog import default_model, provider_for_model
 from ..protocol.types import CompletionBackend, StreamEvent
-from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from ..tools._shared.user_discovery import ExternalToolDiscovery, apply_external_tools
@@ -47,45 +43,25 @@ def _create_eviction_summary_worker(
     home: Path,
     effective_budget: int,
 ) -> EvictionSummaryWorker:
-    summary_backend: CompletionBackend | None = None
-
-    async def invoke_summary(prompt: str) -> SummaryResponse:
-        nonlocal summary_backend
-        if summary_backend is None:
-            summary_model = "gpt-5.6-luna"
-            summary_provider = provider_for_model(summary_model)
-            summary_backend, _ = backend_builder(
-                summary_provider,
-                summary_model,
-                home=home,
-                stall_seconds=config.stream_stall_seconds,
-                stall_retries=0,
-                token_budget=effective_budget,
-            )
-        with (
-            use_response_byte_limit(512),
-            use_retry_budget(ProviderRetryBudget(max_attempts=1)),
-        ):
-            response = await complete_reconciliation(summary_backend, prompt)
-        return SummaryResponse(
-            response.text,
-            input_tokens=sum(
-                int(response.usage.get(key, 0) or 0)
-                for key in (
-                    "input_tokens",
-                    "cache_read_input_tokens",
-                    "cache_creation_input_tokens",
-                )
-            ),
-            output_tokens=int(response.usage.get("output_tokens", 0) or 0),
+    def build_backend() -> CompletionBackend:
+        summary_model = "gpt-5.6-luna"
+        summary_provider = provider_for_model(summary_model)
+        backend, _ = backend_builder(
+            summary_provider,
+            summary_model,
+            home=home,
+            stall_seconds=config.stream_stall_seconds,
+            stall_retries=0,
+            token_budget=effective_budget,
         )
+        return backend
 
     return EvictionSummaryWorker(
         SummaryCache(
             opened.store.session_dir,
             directory_fd=opened.store.directory_fd,
         ),
-        invoke_summary,
+        build_summary_provider(build_backend),
         scan=loop.context_assembler.eviction_summary_candidates,
     )
 

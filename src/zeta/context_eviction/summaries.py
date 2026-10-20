@@ -108,6 +108,9 @@ class SummaryResponse:
     output_tokens: int = 0
 
 
+SummaryProvider = Callable[[str], Awaitable[SummaryResponse | str]]
+
+
 class SummaryCache:
     """Tolerant derived JSONL cache backed by a pinned session directory."""
 
@@ -287,7 +290,7 @@ def _retry_delay(exc: BaseException, attempt: int) -> float | None:
 class EvictionSummaryWorker:
     """Session-owned scheduler with bounded, range-first background work."""
 
-    def __init__(self, cache: SummaryCache, provider: Callable[[str], Awaitable[SummaryResponse | str]],
+    def __init__(self, cache: SummaryCache, provider: SummaryProvider,
                  *, scan: Callable[[], Iterable[SummaryRequest]] | None = None,
                  max_pending: int = 256, idle_seconds: float = 2, max_wait_seconds: float = 30,
                  retry_delay: float = 60, clock: Callable[[], float] = time.monotonic,

@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import scripts.eviction_summaries_replay as replay_script
 from zeta.context_accounting import message_token_count
 from zeta.context_eviction import (
     decorate_receipt,
@@ -32,7 +33,6 @@ from zeta.context_eviction.summaries import (
 )
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
-from zeta.memory.provider import complete_reconciliation, use_response_byte_limit
 from zeta.oauth import OAuthTokens
 from zeta.protocol.types import (
     Message,
@@ -44,7 +44,6 @@ from zeta.protocol.types import (
 )
 from zeta.providers.codex import CodexBackend
 from zeta.providers.factory import build_backend
-from zeta.providers.retry_policy import ProviderRetryBudget, use_retry_budget
 
 
 def _assistant(seq: int, text: str | None = None) -> tuple[int, Message]:
@@ -437,15 +436,7 @@ def _retrying_summary_provider(tmp_path, handler):
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     backend.client = client
 
-    async def invoke(prompt: str) -> str:
-        with (
-            use_response_byte_limit(512),
-            use_retry_budget(ProviderRetryBudget(max_attempts=1)),
-        ):
-            response = await complete_reconciliation(backend, prompt)
-        return response.text
-
-    return invoke, client
+    return backend, client
 
 
 @pytest.mark.asyncio
@@ -457,9 +448,13 @@ async def test_summary_key_makes_exactly_three_transport_dispatches(tmp_path) ->
         dispatches += 1
         return httpx.Response(503, headers={"retry-after": "0"}, request=request)
 
-    provider, client = _retrying_summary_provider(tmp_path, handler)
+    from zeta.context_eviction.summary_provider import build_summary_provider
+
+    backend, client = _retrying_summary_provider(tmp_path, handler)
     worker = EvictionSummaryWorker(
-        SummaryCache(tmp_path), provider, sleep=lambda _: asyncio.sleep(0)
+        SummaryCache(tmp_path),
+        build_summary_provider(backend),
+        sleep=lambda _: asyncio.sleep(0),
     )
     bucket = _CountingBucket()
     worker.bucket = bucket
@@ -470,6 +465,36 @@ async def test_summary_key_makes_exactly_three_transport_dispatches(tmp_path) ->
 
     assert dispatches == 3
     assert bucket.reservations == 3
+
+
+@pytest.mark.asyncio
+async def test_replay_summary_path_makes_at_most_three_transport_dispatches(
+    tmp_path, monkeypatch
+) -> None:
+    dispatches = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal dispatches
+        dispatches += 1
+        return httpx.Response(503, headers={"retry-after": "0"}, request=request)
+
+    backend, client = _retrying_summary_provider(tmp_path, handler)
+    monkeypatch.setattr(
+        replay_script,
+        "build_backend",
+        lambda *_args, **_kwargs: (backend, "gpt-5.6-luna"),
+    )
+    provider = replay_script._provider("gpt-5.6-luna", offline=False)
+    worker = EvictionSummaryWorker(
+        SummaryCache(tmp_path), provider, sleep=lambda _: asyncio.sleep(0)
+    )
+    await worker._call(
+        SummaryRequest(SummaryKey("assistant", 1, 1, "c" * 64), "source")
+    )
+    await worker.close()
+    await client.aclose()
+
+    assert dispatches == 3
 
 
 @pytest.mark.asyncio
@@ -485,8 +510,12 @@ async def test_summary_retry_after_is_honored_by_worker(tmp_path) -> None:
     async def record_wait(delay: float) -> None:
         waits.append(delay)
 
-    provider, client = _retrying_summary_provider(tmp_path, handler)
-    worker = EvictionSummaryWorker(SummaryCache(tmp_path), provider, sleep=record_wait)
+    from zeta.context_eviction.summary_provider import build_summary_provider
+
+    backend, client = _retrying_summary_provider(tmp_path, handler)
+    worker = EvictionSummaryWorker(
+        SummaryCache(tmp_path), build_summary_provider(backend), sleep=record_wait
+    )
     request = SummaryRequest(SummaryKey("assistant", 1, 1, "b" * 64), "source")
     await worker._call(request)
     await worker.close()

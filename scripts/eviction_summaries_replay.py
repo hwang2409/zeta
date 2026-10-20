@@ -21,10 +21,10 @@ from zeta.context_eviction.summaries import (
     trim_summary,
     valid_summary,
 )
+from zeta.context_eviction.summary_provider import build_summary_provider
 from zeta.context_eviction.summary_receipts import receipt_summary_request
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
-from zeta.memory.provider import complete_reconciliation, use_response_byte_limit
 from zeta.models.catalog import provider_for_model
 from zeta.protocol.types import Message
 from zeta.providers.factory import build_backend
@@ -64,23 +64,7 @@ def _provider(model: str, *, offline: bool):
         stall_retries=0,
     )
 
-    async def complete(prompt: str) -> SummaryResponse:
-        with use_response_byte_limit(512):
-            response = await complete_reconciliation(backend, prompt)
-        return SummaryResponse(
-            response.text,
-            sum(
-                int(response.usage.get(key, 0) or 0)
-                for key in (
-                    "input_tokens",
-                    "cache_read_input_tokens",
-                    "cache_creation_input_tokens",
-                )
-            ),
-            int(response.usage.get("output_tokens", 0) or 0),
-        )
-
-    return complete
+    return build_summary_provider(backend)
 
 
 def _inputs(session_dir: Path) -> tuple[list[tuple[int, Message]], dict[int, Message], int]:
