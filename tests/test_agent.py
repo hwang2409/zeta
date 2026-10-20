@@ -460,7 +460,7 @@ async def test_background_owner_waits_for_child_close_before_unregister(
     release_close = asyncio.Event()
     cleanup_called = asyncio.Event()
 
-    async def close_child() -> tuple[tuple[str, str], ...]:
+    async def close_child() -> tuple[str, ...]:
         close_started.set()
         await release_close.wait()
         return ()
@@ -562,9 +562,7 @@ async def test_background_completion_truncates_long_killed_task_id(
         ),
         publish_event=lambda event: None,
         cleanup=lambda: None,
-        close_child=lambda: asyncio.sleep(
-            0, result=((long_task_id, "python"),)
-        ),
+        close_child=lambda: asyncio.sleep(0, result=(long_task_id,)),
         error_message=str,
     )
 
@@ -7139,6 +7137,12 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
             _python("import time; time.sleep(30)") + " --password=password-secret-789",
             "password-secret-789",
         ),
+        ("<'/tmp/password-secret' cat", "password-secret"),
+        ("3<'url-user:url-pass@example.com' cat", "url-user:url-pass@example.com"),
+        (
+            "<<'heredoc-secret' cat\nbody\nheredoc-secret",
+            "heredoc-secret",
+        ),
     ],
 )
 async def test_killed_task_receipt_never_contains_command_secrets(
@@ -7182,7 +7186,8 @@ async def test_killed_task_receipt_never_contains_command_secrets(
     task_id = notification.data["killed_task_ids"][0]
     assert task_id in text
     assert secret not in text
-    assert "background-output.archive" in text
+    assert "background command" in text
+    assert "archive: " + str(loop.store.session_dir / "agents/1/background-output.archive") in text
     assert "command unavailable" not in text
     await loop.close()
 

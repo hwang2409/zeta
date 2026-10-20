@@ -1022,16 +1022,8 @@ async def run_agent_tool(
             if child_policy is not None:
                 child_policy.cleanup()
 
-        async def close_background_child() -> tuple[tuple[str, str], ...]:
-            task_labels = {
-                task.task_id: task.safe_label
-                for task in child_loop.tool_registry.background_tasks.snapshot()
-            }
-            killed = await child_loop.close(cancel_background=False)
-            return tuple(
-                (task_id, task_labels.get(task_id, "command unavailable"))
-                for task_id in killed
-            )
+        async def close_background_child() -> tuple[str, ...]:
+            return tuple(await child_loop.close(cancel_background=False))
 
         async def finish_background() -> None:
             try:
