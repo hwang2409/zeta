@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run a read-only feature-off/on eviction-summary replay."""
+
 from __future__ import annotations
 
 import argparse
@@ -51,6 +52,7 @@ class _MemoryCache:
 
 def _provider(model: str, *, offline: bool):
     if offline:
+
         async def fake(prompt: str) -> SummaryResponse:
             digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
             return SummaryResponse(f"offline factual summary {digest}", 0, 0)
@@ -67,7 +69,9 @@ def _provider(model: str, *, offline: bool):
     return build_summary_provider(backend)
 
 
-def _inputs(session_dir: Path) -> tuple[list[tuple[int, Message]], dict[int, Message], int]:
+def _inputs(
+    session_dir: Path,
+) -> tuple[list[tuple[int, Message]], dict[int, Message], int]:
     store = ConversationStore(
         session_dir.parent,
         session_id=session_dir.name,
@@ -127,6 +131,9 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
         summary_cache=cache,  # type: ignore[arg-type]
         summaries_enabled=True,
     )
+    for message in first_on.messages:
+        if (request := receipt_summary_request(message, sources)) is not None:
+            worker.admit(request)
     for request in first_on.summary_misses:
         worker.admit(request)
     while worker.queue:
@@ -152,12 +159,19 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
     off_view, on_view = _view(off), _view(on)
     return {
         "session_dir": str(session_dir),
+        "target_tokens": target,
         "model": model,
         "offline": offline,
         "feature_off": off_view,
         "feature_on": on_view,
-        "selected_seqs_identical": off_view["selected_seqs"] == on_view["selected_seqs"],
-        "range_bounds_identical": off_view["range_bounds"] == on_view["range_bounds"],
+        "off_selected_count": len(off_view["selected_seqs"]),
+        "on_selected_count": len(on_view["selected_seqs"]),
+        "extra_evicted_tokens": off.tokens_after - on.tokens_after,
+        "reserve_used": max(0, first_on.tokens_after - on.tokens_after),
+        "tokens_vs_target": {
+            "off": off.tokens_after - target,
+            "on": on.tokens_after - target,
+        },
         "summary_readiness_rate": (
             summary_count / eligible_receipts if eligible_receipts else 1.0
         ),
@@ -175,8 +189,11 @@ def main() -> None:
     parser.add_argument("--offline", action="store_true")
     args = parser.parse_args()
     result = asyncio.run(replay(args.session_dir, args.model, args.offline))
-    if not result["selected_seqs_identical"] or not result["range_bounds_identical"]:
-        raise SystemExit("eviction selection changed with summaries enabled")
+    if (
+        result["feature_on"]["reached_target"]
+        and result["feature_on"]["tokens_after"] > result["target_tokens"]
+    ):
+        raise SystemExit("summary-enabled eviction exceeded target")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))

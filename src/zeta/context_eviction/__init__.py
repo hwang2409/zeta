@@ -43,6 +43,7 @@ from .summary_receipts import (
 from .summary_receipts import (
     eviction_summary_candidates as _project_summary_candidates,
 )
+from .summary_reserve import evict_messages
 
 EVICTION_KIND = "evict"
 TARGET_RATIO = 0.55
@@ -164,12 +165,21 @@ def _finalize_summaries(
         )
         decorated_tokens = token_counter(decorated)
         next_total = running_total - token_counter(message) + decorated_tokens
-        if decorated_tokens < original_tokens and result.reached_target and next_total <= target_tokens:
+        if (
+            decorated_tokens < original_tokens
+            and result.reached_target
+            and next_total <= target_tokens
+        ):
             messages[index] = decorated
             running_total = next_total
     return EvictionResult(
-        messages, result.items_evicted, result.tokens_before, running_total,
-        result.reached_target, result.source_seqs, tuple(misses),
+        messages,
+        result.items_evicted,
+        result.tokens_before,
+        running_total,
+        result.reached_target,
+        result.source_seqs,
+        tuple(misses),
     )
 
 
@@ -203,8 +213,7 @@ def catch_up_summary_candidates(
             records, evictable_source_seqs=eligibility.evictable_source_seqs
         )
         if any(
-            start <= request.key.seq_start <= end
-            for start, end in covered_intervals
+            start <= request.key.seq_start <= end for start, end in covered_intervals
         )
     )
 
@@ -239,7 +248,7 @@ def active_eviction_summary_candidates(
     return eviction_summary_candidates(records, unconsumed_source_seqs=unconsumed)
 
 
-def evict_messages(
+def _evict_deterministic(
     records: Sequence[tuple[int, Message]],
     *,
     fixed_tokens: int,
@@ -311,15 +320,7 @@ def evict_messages(
         return replace_many(((index, replacement),))
 
     def finish(reached: bool) -> EvictionResult:
-        return _finalize_summaries(
-            _result(records, messages, changed, before, running_total, reached),
-            fixed_tokens=fixed_tokens,
-            target_tokens=target_tokens,
-            token_counter=token_counter,
-            source_messages=source_messages,
-            summary_cache=summary_cache,
-            summaries_enabled=summaries_enabled,
-        )
+        return _result(records, messages, changed, before, running_total, reached)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]

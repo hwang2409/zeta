@@ -13,7 +13,7 @@ v1 covers:
 - assistant text, but not assistant reasoning; and
 - range receipts that fold one or more of those kinds.
 
-ordinary bash and tool digests, eviction selection, protected tails, trigger and target ratios, folding rules, source sequence bounds, and `recall_history` behavior do not change.
+ordinary bash and tool digests, protected tails, trigger and target ratios, folding rules, source sequence bounds, and `recall_history` behavior do not change. selection is unchanged when summaries are disabled or no ready summaries exist.
 
 ## motivation and evidence
 
@@ -24,8 +24,8 @@ in the luna experiment, `evict400k_summ` improved lenient recall by 4.4 points o
 ## invariants and pass flow
 
 1. before every selection or folding pass, reconstruct persisted enriched item and range receipts into exactly today's deterministic form. extend the existing persisted-receipt regeneration seam (`src/zeta/context_eviction/__init__.py:377-425`); enriched text is never canonical input to selection or folding.
-2. run today's unchanged eligibility, replacement order, strict-smaller checks, and normal/coarse range folding on that normalized view. `evict_messages` remains the sole owner of selection and folding (`src/zeta/context_eviction/__init__.py:125-374`).
-3. after the deterministic result is complete, decorate its eligible receipts by synchronous cache lookup. do not feed decorated receipts back through range recognition. recount the finished messages for `tokens_after`.
+2. run today's unchanged eligibility, replacement order, strict-smaller checks, and normal/coarse range folding on that normalized view. when summaries are enabled and ready decorations exist, a second deterministic pass may target `target - reserve`, with reserve capped at 10% of target. `evict_messages` remains the sole owner of selection and folding (`src/zeta/context_eviction/__init__.py:125-374`).
+3. after the deterministic result is complete, decorate its eligible receipts by synchronous cache lookup against the original target. do not feed decorated receipts back through range recognition. recount the finished messages for `tokens_after`; decorated receipt tokens use the existing token counter and only strictly smaller decorations are accepted.
 4. a cache miss or any failure renders byte-for-byte today's receipt for that item or range. disabling the feature therefore removes enrichment on the next materialized rewrite.
 5. eviction never awaits, starts, cancels, drains, or otherwise coordinates with a provider call. an exact range miss is returned as data from the completed pass and admitted to the worker afterward.
 6. every enriched receipt keeps all current deterministic fields and exact `recall_history` bounds. source history remains authoritative.
@@ -201,11 +201,11 @@ new tests use fake providers and temporary session directories; they make no net
 - `tests/test_settings.py::test_eviction_summaries_defaults_disabled_and_global_can_enable`: cover default, global enable, invalid keys, and project-layer rejection.
 - `tests/test_auto_memory_integration.py::test_eviction_summary_worker_only_for_top_level_sessions`: cover top-level, child, grandchild, and attention fork.
 
-existing eviction and range suites remain the regression oracle (`tests/test_context_eviction.py`, `tests/test_eviction_range_receipts.py`). run `scripts/eviction_summaries_replay.py SESSION_DIR --out OUT.json` for each measured session. it accepts `--model`, and `--offline` uses a deterministic fake for tests. it replays off/on using the real sanitizer and worker path, writes no session files, and reports selected source sequences, range bounds, target result, readiness rate, queue drops, and token totals. the script does not score recall; the orchestrator uses the existing experiment harness. telemetry is aggregate only and never logs source or summary text.
+existing eviction and range suites remain the regression oracle (`tests/test_context_eviction.py`, `tests/test_eviction_range_receipts.py`). run `scripts/eviction_summaries_replay.py SESSION_DIR --out OUT.json` for each measured session. it accepts `--model`, and `--offline` uses a deterministic fake for tests. it replays off/on using the real sanitizer and worker path, writes no session files, and reports selected counts, extra evicted tokens, target result, reserve used, readiness rate, queue drops, and token totals. the script does not score recall; the orchestrator uses the existing experiment harness. telemetry is aggregate only and never logs source or summary text.
 
 ## rollout, rollback, and alternatives
 
-land with `enabled = false`; after merge, run `scripts/eviction_summaries_replay.py SESSION_DIR --out OUT.json` and enable it only when selected sequences and range bounds are identical, all safety fixtures pass, readiness and queue drops are reported, and the orchestrator accepts recall results from the existing experiment harness. if cost, safety, or cache behavior is unacceptable, set `enabled = false`; the next rewrite normalizes away summaries. code rollback ignores the derived side file without transcript migration.
+land with `enabled = false`; after merge, run `scripts/eviction_summaries_replay.py SESSION_DIR --out OUT.json` and enable it only when readiness is at least 0.8, `tokens_after` is at or below target, all safety fixtures pass, queue drops are reported, and the orchestrator accepts recall results from the existing experiment harness. if cost, safety, or cache behavior is unacceptable, set `enabled = false`; the next rewrite normalizes away summaries. code rollback ignores the derived side file without transcript migration.
 
 rejected alternatives:
 

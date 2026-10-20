@@ -31,6 +31,7 @@ from zeta.context_eviction.summaries import (
     trim_summary,
     valid_summary,
 )
+from zeta.context_eviction.summary_receipts import receipt_summary_request
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
@@ -50,6 +51,17 @@ def _assistant(seq: int, text: str | None = None) -> tuple[int, Message]:
     return seq, Message(MessageRole.ASSISTANT, [TextContent(text or ("fact " * 300))])
 
 
+def _separated_assistants(count: int) -> list[tuple[int, Message]]:
+    return [
+        item
+        for seq in range(1, count * 2, 2)
+        for item in (
+            _assistant(seq),
+            (seq + 1, Message(MessageRole.SYSTEM, [TextContent("keep")])),
+        )
+    ]
+
+
 def _evict(records, cache=None, *, enabled=False, target=500):
     return evict_messages(
         records,
@@ -63,6 +75,91 @@ def _evict(records, cache=None, *, enabled=False, target=500):
 
 def _key(record: tuple[int, Message]) -> SummaryKey:
     return eviction_summary_candidates([record])[0].key
+
+
+def _ready_cache(tmp_path, records, text="short verdict"):
+    cache = SummaryCache(tmp_path)
+    first = _evict(records, cache, enabled=True, target=500)
+    requests = [
+        *eviction_summary_candidates(records),
+        *first.summary_misses,
+    ]
+    for request in requests:
+        asyncio.run(cache.put(request.key, text))
+    return cache
+
+
+def test_reserve_lets_ready_summaries_fit(tmp_path) -> None:
+    import zeta.context_eviction as eviction
+
+    assert hasattr(eviction, "_evict_deterministic")
+    records = _separated_assistants(20)
+    result = _evict(records, _ready_cache(tmp_path, records), enabled=True, target=500)
+    eligible = sum(
+        receipt_summary_request(message, dict(records)) is not None
+        for message in result.messages
+    )
+    summarized = sum(
+        message.metadata.get("summary_data") is not None for message in result.messages
+    )
+    assert summarized >= eligible * 0.8
+    assert result.tokens_after <= 500
+
+
+def test_reserve_capped_at_ten_percent_of_target(tmp_path, monkeypatch) -> None:
+    records = _separated_assistants(20)
+    cache = _ready_cache(tmp_path, records, "summary " * 40)
+    targets = []
+    import zeta.context_eviction as eviction
+
+    deterministic = eviction._evict_deterministic
+
+    def wrapped(*args, **kwargs):
+        if kwargs["target_tokens"] > 0:
+            targets.append(kwargs["target_tokens"])
+        return deterministic(*args, **kwargs)
+
+    monkeypatch.setattr(eviction, "_evict_deterministic", wrapped)
+    _evict(records, cache, enabled=True, target=500)
+    assert len(targets) <= 2
+    if len(targets) == 2:
+        assert targets[1] == 450
+
+
+def test_no_ready_summaries_is_byte_identical_to_disabled(tmp_path) -> None:
+    records = [_assistant(seq) for seq in range(1, 8)]
+    off = _evict(records, target=500)
+    on = _evict(records, SummaryCache(tmp_path), enabled=True, target=500)
+    assert [m.to_dict() for m in on.messages] == [m.to_dict() for m in off.messages]
+    assert on.source_seqs == off.source_seqs
+    assert on.tokens_after == off.tokens_after
+
+
+def test_reserve_not_applied_when_pass_missed_target(tmp_path) -> None:
+    records = [_assistant(seq) for seq in range(1, 3)]
+    cache = _ready_cache(tmp_path, records)
+    off = _evict(records, target=1)
+    on = _evict(records, cache, enabled=True, target=1)
+    assert [m.to_dict() for m in on.messages] == [m.to_dict() for m in off.messages]
+    assert on.tokens_after == off.tokens_after
+
+
+def test_reserve_at_most_two_deterministic_passes(tmp_path, monkeypatch) -> None:
+    records = _separated_assistants(20)
+    cache = _ready_cache(tmp_path, records)
+    import zeta.context_eviction as eviction
+
+    original = eviction._evict_deterministic
+    calls = 0
+
+    def wrapped(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(eviction, "_evict_deterministic", wrapped)
+    _evict(records, cache, enabled=True, target=500)
+    assert calls <= 2
 
 
 def test_missing_summary_preserves_current_receipts_byte_for_byte(tmp_path) -> None:
@@ -118,9 +215,9 @@ def test_exact_range_is_queued_only_after_real_pass_miss(tmp_path) -> None:
     assert all(not item.exact_range for item in eviction_summary_candidates(records))
     assert result.summary_misses
     assert all(item.exact_range for item in result.summary_misses)
-    assert [(item.key.seq_start, item.key.seq_end) for item in result.summary_misses] == [
-        (1, 2)
-    ]
+    assert [
+        (item.key.seq_start, item.key.seq_end) for item in result.summary_misses
+    ] == [(1, 2)]
 
 
 def test_range_source_projection_excludes_ordinary_tools(tmp_path) -> None:
@@ -142,7 +239,9 @@ def test_range_source_projection_excludes_ordinary_tools(tmp_path) -> None:
         ),
         _assistant(4),
     ]
-    missed = _evict(records, SummaryCache(tmp_path), enabled=True, target=1).summary_misses
+    missed = _evict(
+        records, SummaryCache(tmp_path), enabled=True, target=1
+    ).summary_misses
     assert len(missed) == 1
     assert (missed[0].key.seq_start, missed[0].key.seq_end) == (1, 4)
     assert "PRIVATE" not in missed[0].source
@@ -289,7 +388,10 @@ def test_enriched_receipts_normalize_across_materialized_passes(tmp_path) -> Non
     decorated_range = decorate_receipt(
         deterministic.messages[0], "persisted exact range summary"
     )
-    assert normalize_receipt(decorated_range).to_dict() == deterministic.messages[0].to_dict()
+    assert (
+        normalize_receipt(decorated_range).to_dict()
+        == deterministic.messages[0].to_dict()
+    )
 
     normal_replay = evict_messages(
         decorated_items,
@@ -303,9 +405,9 @@ def test_enriched_receipts_normalize_across_materialized_passes(tmp_path) -> Non
         target_tokens=1,
         source_messages=dict(records),
     )
-    assert [normalize_receipt(message).to_dict() for message in normal_replay.messages] == [
-        message.to_dict() for message in deterministic.messages
-    ]
+    assert [
+        normalize_receipt(message).to_dict() for message in normal_replay.messages
+    ] == [message.to_dict() for message in deterministic.messages]
     assert [message.to_dict() for message in disabled_rewrite.messages] == [
         message.to_dict() for message in deterministic.messages
     ]
@@ -392,7 +494,9 @@ def test_worker_deferred_start_runs_resume_catchup(tmp_path) -> None:
 
 def test_worker_bounds_and_prioritizes_queue(tmp_path) -> None:
     worker = EvictionSummaryWorker(
-        SummaryCache(tmp_path), lambda _prompt: asyncio.sleep(0, result="ok"), max_pending=2
+        SummaryCache(tmp_path),
+        lambda _prompt: asyncio.sleep(0, result="ok"),
+        max_pending=2,
     )
     one = SummaryRequest(SummaryKey("assistant", 1, 1, "1" * 64), "one")
     two = SummaryRequest(SummaryKey("assistant", 2, 2, "2" * 64), "two")
@@ -415,11 +519,15 @@ class _CountingBucket(TokenBucket):
 
 
 def _codex_access_token() -> str:
-    payload = base64.urlsafe_b64encode(
-        json.dumps(
-            {"https://api.openai.com/auth": {"chatgpt_account_id": "test-account"}}
-        ).encode()
-    ).decode().rstrip("=")
+    payload = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                {"https://api.openai.com/auth": {"chatgpt_account_id": "test-account"}}
+            ).encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
     return f"header.{payload}.signature"
 
 
@@ -432,7 +540,9 @@ def _retrying_summary_provider(tmp_path, handler):
         stall_retries=0,
     )
     assert isinstance(backend, CodexBackend)
-    backend.token_store.save(OAuthTokens(_codex_access_token(), "refresh", 4_000_000_000))
+    backend.token_store.save(
+        OAuthTokens(_codex_access_token(), "refresh", 4_000_000_000)
+    )
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     backend.client = client
 
@@ -643,8 +753,8 @@ def test_replay_script_runs_real_off_on_path_offline(tmp_path) -> None:
     )
     assert completed.returncode == 0, completed.stderr
     result = json.loads(out.read_text())
-    assert result["selected_seqs_identical"] is True
-    assert result["range_bounds_identical"] is True
+    assert result["off_selected_count"] == result["on_selected_count"]
+    assert result["tokens_vs_target"]["on"] > 0
     assert result["summary_count"] == 0
     assert result["queue_drops"] == 0
 
