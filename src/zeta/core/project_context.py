@@ -645,16 +645,16 @@ def load_project_context(
     if seed_notice is not None:
         notices.append(seed_notice)
     try:
-        resolved_project = resolve_project_context(working_dir, home)
-        project_for_context = resolved_project
-        project_matches = project_id is None
         if project_id is not None:
-            registry = ProjectRegistry(home / "projects")
-            project_for_context = registry.show_project(project_id)
-            project_matches = (
-                resolved_project is not None
-                and resolved_project.project_id == project_id
-            )
+            project_for_context = ProjectRegistry(home / "projects").show_project(project_id)
+            resolved_project = resolve_project_context(working_dir, home, project_id)
+            project_matches = resolved_project is not None
+            if resolved_project is None:
+                resolved_project = resolve_project_context(working_dir, home)
+        else:
+            resolved_project = resolve_project_context(working_dir, home)
+            project_for_context = resolved_project
+            project_matches = True
     except (ProjectRegistryError, OSError) as exc:
         project_for_context = None
         project_matches = False

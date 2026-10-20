@@ -309,11 +309,7 @@ class ServerRuntime:
         repo_root = discover_repo_root(session_cwd)
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
-        try:
-            project = resolve_project_context(session_cwd, self.home)
-        except AssertionError:
-            # Keep the server's no-discovery test seam usable when discovery is disabled.
-            project = None
+        project = self.manager.project_registry.find_for_directory(session_cwd)
         project_id = project.project_id if project is not None else "__no_project__"
         context = load_project_context(
             cwd=session_cwd,
@@ -331,6 +327,7 @@ class ServerRuntime:
             project_context=context,
             skill_catalog=skill_catalog,
             agent_catalog=agent_catalog,
+            resolved_project_id=(project.project_id if project is not None else "__no_project__"),
         )
         await self._replace(composition)
         return self.metadata
@@ -423,12 +420,17 @@ class ServerRuntime:
             session_id = state.session_id
             state.loop.set_background_wake_callback(lambda: wake_sink(session_id))
 
-    def _compose(self, *, cwd: Path, **kwargs: object) -> RuntimeComposition:
+    def _compose(
+        self, *, cwd: Path, resolved_project_id: str | None = None, **kwargs: object
+    ) -> RuntimeComposition:
         try:
-            project = self.manager.project_registry.find_for_directory(cwd)
-            if project is None:
-                project = resolve_project_context(cwd, self.home)
-            project_id = project.project_id if project is not None else None
+            if resolved_project_id is not None:
+                project_id = resolved_project_id
+            else:
+                project = self.manager.project_registry.find_for_directory(cwd)
+                if project is None:
+                    project = resolve_project_context(cwd, self.home)
+                project_id = project.project_id if project is not None else None
         except (AssertionError, ProjectRegistryError, OSError, ValueError) as exc:
             logging.getLogger(__name__).warning(
                 "project discovery unavailable; continuing without project: %s", exc
