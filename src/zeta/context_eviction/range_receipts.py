@@ -34,7 +34,6 @@ def range_receipt_candidate(
     allows: Callable[[int], bool],
     is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
     coarse: bool = False,
-    compacted_tool_calls: bool = False,
     stop_after_fold: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool]
     | None = None,
 ) -> RangeCandidate:
@@ -45,9 +44,7 @@ def range_receipt_candidate(
             records,
             allows=allows,
             is_smaller=is_smaller,
-            compacted_tool_calls=compacted_tool_calls,
         )
-
     output: list[tuple[int, Message]] = []
     coalesced: set[int] = set()
     run: list[_ReceiptUnit] = []
@@ -75,9 +72,7 @@ def range_receipt_candidate(
         )
 
     while index < len(records):
-        unit, next_index = _receipt_unit(
-            records, index, allows, compacted_tool_calls=compacted_tool_calls
-        )
+        unit, next_index = _receipt_unit(records, index, allows)
         if unit is None:
             if flush():
                 output.extend(records[index:])
@@ -99,15 +94,12 @@ def _coarse_candidate(
     *,
     allows: Callable[[int], bool],
     is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
-    compacted_tool_calls: bool,
 ) -> RangeCandidate:
     units: list[_ReceiptUnit] = []
     unit_indexes: set[int] = set()
     index = 0
     while index < len(records):
-        unit, next_index = _coarse_receipt_unit(
-            records, index, allows, compacted_tool_calls=compacted_tool_calls
-        )
+        unit, next_index = _coarse_receipt_unit(records, index, allows)
         if unit is not None:
             units.append(unit)
             unit_indexes.update(range(index, next_index))
@@ -150,8 +142,6 @@ def _coarse_receipt_unit(
     records: Sequence[tuple[int, Message]],
     index: int,
     allows: Callable[[int], bool],
-    *,
-    compacted_tool_calls: bool,
 ) -> tuple[_ReceiptUnit | None, int]:
     seq, message = records[index]
     if not allows(seq):
@@ -160,17 +150,13 @@ def _coarse_receipt_unit(
         return _ReceiptUnit((records[index],), "user"), index + 1
     if message.metadata.get("eviction_range"):
         return _ReceiptUnit((records[index],), "range"), index + 1
-    return _receipt_unit(
-        records, index, allows, compacted_tool_calls=compacted_tool_calls
-    )
+    return _receipt_unit(records, index, allows)
 
 
 def _receipt_unit(
     records: Sequence[tuple[int, Message]],
     index: int,
     allows: Callable[[int], bool],
-    *,
-    compacted_tool_calls: bool,
 ) -> tuple[_ReceiptUnit | None, int]:
     seq, message = records[index]
     if (
@@ -189,9 +175,7 @@ def _receipt_unit(
     ]
     if calls:
         if any(not isinstance(block, ToolUseContent) for block in message.content):
-            if not compacted_tool_calls or not _is_compacted_tool_call_receipt(
-                message, seq
-            ):
+            if not _is_compacted_tool_call_receipt(message, seq):
                 return None, index + 1
         elif not _is_receipt_kind(message, seq, "tool_call"):
             return None, index + 1

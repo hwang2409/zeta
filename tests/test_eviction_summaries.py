@@ -159,7 +159,6 @@ def _fold_compacted(records, *, allows=lambda _seq: True):
             sum(message_token_count(message) for _, message in originals)
             > sum(map(message_token_count, candidates))
         ),
-        compacted_tool_calls=True,
     )
 
 
