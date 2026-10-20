@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
@@ -13,11 +12,15 @@ from typing import Any
 from ..config.settings import load_settings
 from ..config.settings import resolve as resolve_settings
 from ..core.approval import ApprovalPolicy
-from ..core.project_context import discover_repo_root, load_project_context
+from ..core.project_context import (
+    associate_project_discovery,
+    discover_project,
+    load_project_context,
+    resolve_project_context,
+)
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
 from ..core.slash import effective_budget_for_model, resolve_session_budget
 from ..models.catalog import REMOVED_PROVIDER_ERROR
-from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -301,15 +304,23 @@ class ServerRuntime:
         """
 
         session_cwd = cwd if cwd is not None else self.cwd
-        config = self._config(provider, model, cwd=session_cwd)
-        repo_root = discover_repo_root(session_cwd)
+        discovery = discover_project(session_cwd, user_home=self.home.parent)
+        repo_root = discovery.primary_root or discovery.cwd
+        config = self._config(provider, model, project_root=repo_root)
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
+        associated = associate_project_discovery(
+            discovery, self.manager.project_registry, create=False
+        )
+        session_project = associated.project
+        cwd_project = resolve_project_context(discovery, self.manager.project_registry)
         context = load_project_context(
             cwd=session_cwd,
             repo_root=repo_root,
             zeta_home=self.home,
             catalog=skill_catalog,
+            session_project=session_project,
+            cwd_project=cwd_project,
             inbox_enabled=config.inbox_enabled,
         )
         composition = self._compose(
@@ -320,6 +331,7 @@ class ServerRuntime:
             project_context=context,
             skill_catalog=skill_catalog,
             agent_catalog=agent_catalog,
+            project_id=session_project.project_id if session_project is not None else None,
         )
         await self._replace(composition)
         return self.metadata
@@ -337,8 +349,24 @@ class ServerRuntime:
             )
         opened = await asyncio.to_thread(self.manager.open, session_id)
         try:
-            repo_root = discover_repo_root(session_cwd)
-            config = self._config(opened.metadata.provider, opened.metadata.model)
+            discovery = discover_project(session_cwd, user_home=self.home.parent)
+            repo_root = discovery.primary_root or discovery.cwd
+            config = self._config(
+                opened.metadata.provider,
+                opened.metadata.model,
+                project_root=repo_root,
+            )
+            session_project = None
+            if opened.metadata.project_id is not None:
+                try:
+                    session_project = self.manager.project_registry.show_project(
+                        opened.metadata.project_id
+                    )
+                except (OSError, ValueError):
+                    pass
+            cwd_project = resolve_project_context(
+                discovery, self.manager.project_registry
+            )
             resumed_prompt = resume_prompt(
                 opened.metadata,
                 manager=self.manager,
@@ -346,6 +374,8 @@ class ServerRuntime:
                 home=self.home,
                 repo_root=repo_root,
                 inbox_enabled=config.inbox_enabled,
+                session_project=session_project,
+                cwd_project=cwd_project,
             )
             context = resumed_prompt.context
             skill_catalog = resumed_prompt.skill_catalog
@@ -359,6 +389,7 @@ class ServerRuntime:
                 skill_catalog=skill_catalog,
                 agent_catalog=agent_catalog,
                 opened=opened,
+                project_id=opened.metadata.project_id,
             )
         except BaseException:
             opened.store.close()
@@ -412,15 +443,9 @@ class ServerRuntime:
             session_id = state.session_id
             state.loop.set_background_wake_callback(lambda: wake_sink(session_id))
 
-    def _compose(self, *, cwd: Path, **kwargs: object) -> RuntimeComposition:
-        try:
-            project = self.manager.project_registry.find_for_directory(cwd)
-            project_id = project.project_id if project is not None else None
-        except (ProjectRegistryError, OSError, ValueError) as exc:
-            logging.getLogger(__name__).warning(
-                "project discovery unavailable; continuing without project: %s", exc
-            )
-            project_id = None
+    def _compose(
+        self, *, cwd: Path, project_id: str | None, **kwargs: object
+    ) -> RuntimeComposition:
         return compose_runtime(
             home=self.home,
             cwd=cwd,
@@ -464,11 +489,13 @@ class ServerRuntime:
         return default_backend(provider, model, home, **kwargs)
 
     def _config(
-        self, provider: str | None, model: str | None, *, cwd: Path | None = None
+        self,
+        provider: str | None,
+        model: str | None,
+        *,
+        project_root: Path | None = None,
     ):
-        # Resume keeps the launch directory's settings layer, as an explicit
-        # CLI ``--resume`` uses the invocation directory's settings.
-        project_dir = discover_repo_root(cwd if cwd is not None else self.cwd) / ".zeta"
+        project_dir = (project_root if project_root is not None else self.cwd) / ".zeta"
         settings = load_settings(home=self.home, project_dir=project_dir)
         return resolve_settings(
             settings.settings,

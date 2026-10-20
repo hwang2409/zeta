@@ -324,7 +324,8 @@ async def test_public_migration_end_to_end_with_real_content(tmp_path: Path) -> 
         repo_root=workspace,
         zeta_home=first,
         catalog=SkillCatalog.empty(),
-        project_id=project_id,
+        session_project=registry.show_project(project_id),
+        cwd_project=registry.show_project(project_id),
     )
     monkey_home = os.environ.get("ZETA_HOME")
     os.environ["ZETA_HOME"] = str(first)

@@ -23,6 +23,35 @@ from zeta.prompts import (
 from zeta.skills import SkillCatalog
 
 
+def _private_project(tmp_path: Path, root: Path) -> tuple[Path, str]:
+    home = tmp_path / "zeta-home"
+    project = ProjectRegistry(home / "projects").create_project(root.name, "git", root)
+    return home, project.project_id
+
+
+def test_project_agents_md_loads_after_repo_agents(tmp_path: Path) -> None:
+    root = tmp_path / "repo"; root.mkdir()
+    (root / "AGENTS.md").write_text("repo rule", encoding="utf-8")
+    home, project_id = _private_project(tmp_path, root)
+    private = home / "projects" / project_id / "AGENTS.md"; private.write_text("private rule", encoding="utf-8")
+    project = ProjectRegistry(home / "projects").show_project(project_id)
+    context = load_project_context(cwd=root, repo_root=root, zeta_home=home, session_project=project, cwd_project=project, catalog=SkillCatalog.empty())
+    assert context.system_prompt.index("repo rule") < context.system_prompt.index("private rule")
+    assert private.resolve() in context.files
+
+
+def test_repo_agents_ignore_mode_skips_repo_files_and_warns(tmp_path: Path) -> None:
+    import json
+    root = tmp_path / "repo"; root.mkdir(); (root / "AGENTS.md").write_text("repo", encoding="utf-8")
+    home, project_id = _private_project(tmp_path, root)
+    record = home / "projects" / project_id / "project.json"
+    value = json.loads(record.read_text(encoding="utf-8")); value["repo_agents"] = "ignore"; record.write_text(json.dumps(value) + "\n", encoding="utf-8")
+    project = ProjectRegistry(home / "projects").show_project(project_id)
+    context = load_project_context(cwd=root, repo_root=root, zeta_home=home, session_project=project, cwd_project=project, catalog=SkillCatalog.empty())
+    assert str(root / "AGENTS.md") not in context.system_prompt
+    assert any("repository AGENTS.md" in notice for notice in context.notices)
+
+
 def _with_runtime_guidance(prompt: str) -> str:
     return f"{prompt}\n\n{load_runtime_guidance().rstrip()}"
 
@@ -923,6 +952,8 @@ def test_automatic_memory_is_rendered_as_delimited_informational_notes(
         repo_root=repository,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     owned = context.system_prompt[
         context.memory_offset : context.memory_offset + context.memory_length
@@ -957,6 +988,8 @@ def test_manual_edit_keeps_automatic_memory_delimited_until_accept(tmp_path: Pat
         repo_root=repository,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     owned = context.system_prompt[
         context.memory_offset : context.memory_offset + context.memory_length
@@ -980,6 +1013,8 @@ def test_manual_edit_keeps_automatic_memory_delimited_until_accept(tmp_path: Pat
         repo_root=repository,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     accepted_owned = accepted.system_prompt[
         accepted.memory_offset : accepted.memory_offset + accepted.memory_length
@@ -1003,6 +1038,8 @@ def test_refresh_ignores_forged_envelope_in_identity(tmp_path: Path) -> None:
         repo_root=repository,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     assert forged in context.system_prompt
     assert context.memory_offset is not None
@@ -1037,6 +1074,8 @@ def test_refresh_ignores_forged_envelope_in_append(tmp_path: Path) -> None:
         zeta_home=home,
         system_append="trailing user prompt\n\n" + forged,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     assert forged in context.system_prompt
     assert context.memory_offset is not None
@@ -1066,6 +1105,8 @@ def test_refresh_legacy_session_without_components_is_unchanged(tmp_path: Path) 
         repo_root=repository,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     registry.update_memory(project.project_id, {"state.md": "# state\nNEW-REAL\n"})
     # A legacy session carries a project id but no structured offset/length.
@@ -1081,12 +1122,14 @@ def test_refresh_legacy_session_without_components_is_unchanged(tmp_path: Path) 
 
 
 def test_refresh_missing_project_is_unchanged(tmp_path: Path) -> None:
-    home, repository, _registry, _project = _memory_project(tmp_path)
+    home, repository, _registry, project = _memory_project(tmp_path)
     context = load_project_context(
         cwd=repository,
         repo_root=repository,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     resumed = refresh_project_memory(
         context.system_prompt,
@@ -1126,6 +1169,8 @@ def test_project_memory_budget_counts_full_envelope(tmp_path: Path) -> None:
         zeta_home=home,
         byte_cap=budget,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     owned = admitted.system_prompt[
         admitted.memory_offset : admitted.memory_offset + admitted.memory_length
@@ -1141,6 +1186,8 @@ def test_project_memory_budget_counts_full_envelope(tmp_path: Path) -> None:
         zeta_home=home,
         byte_cap=budget - 1,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     tight_owned = tightened.system_prompt[
         tightened.memory_offset : tightened.memory_offset + tightened.memory_length
@@ -1157,6 +1204,8 @@ def test_refresh_rejects_offset_length_without_digest(tmp_path: Path) -> None:
         repo_root=repository,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     registry.update_memory(project.project_id, {"state.md": "# state\nNEW-REAL\n"})
     # The reviewer's reproduction: a structured span with no digest must never
@@ -1239,6 +1288,8 @@ def test_project_memory_envelope_boundary(tmp_path: Path, cap_kind: str) -> None
         zeta_home=home,
         byte_cap=cap,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     if cap >= empty_size:
         assert context.memory_offset is not None

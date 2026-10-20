@@ -233,12 +233,32 @@ def _valid_registry_candidate(
     return project
 
 
+def _project_at_root(
+    registry: ProjectRegistry, root: Path, discovery: ProjectDiscovery
+) -> Project | None:
+    project = _valid_registry_candidate(registry.find_for_directory(root), discovery)
+    if (
+        project is not None
+        and Path(project.canonical_integration_root).expanduser().resolve() == root
+    ):
+        return project
+    return next(
+        (
+            candidate
+            for candidate in registry.list_projects()
+            if _valid_registry_candidate(candidate, discovery) is not None
+            and Path(candidate.canonical_integration_root).expanduser().resolve() == root
+        ),
+        None,
+    )
+
+
 def _find_or_create_valid_project(
     registry: ProjectRegistry, root: Path, discovery: ProjectDiscovery
 ) -> Project | None:
     """Create a project without allowing an invalid ancestor match to win."""
 
-    project = _valid_registry_candidate(registry.find_for_directory(root), discovery)
+    project = _project_at_root(registry, root, discovery)
     if project is not None:
         return project
     names = [
@@ -252,9 +272,7 @@ def _find_or_create_valid_project(
                 name, "git", root, memory_profile="zeta"
             )
         except ProjectRegistryError:
-            project = _valid_registry_candidate(
-                registry.find_for_directory(root), discovery
-            )
+            project = _project_at_root(registry, root, discovery)
             if project is not None:
                 return project
     return None
@@ -329,8 +347,6 @@ def same_git_repository(left: str | Path, right: str | Path) -> bool:
             return False
         common_dirs.append(Path(value).expanduser().resolve())
     return common_dirs[0] == common_dirs[1]
-
-
 
 
 def discover_or_find_project(
@@ -567,6 +583,85 @@ def _walk_up_agents_files(cwd: Path, stop_at: Path) -> list[Path]:
     return files
 
 
+def resolve_project_context(
+    discovery: ProjectDiscovery, registry: ProjectRegistry
+) -> Project | None:
+    """Resolve cwd-owned private instructions without running Git or creating a project."""
+
+    if not discovery.eligible or not registry.root.exists():
+        return None
+    if discovery.primary_root is None:
+        return _project_at_root(registry, discovery.cwd, discovery)
+    project = _project_at_root(registry, discovery.primary_root, discovery)
+    if project is not None or discovery.common_dir is None:
+        return project
+    return next(
+        (
+            candidate
+            for candidate in registry.list_projects()
+            if _valid_registry_candidate(candidate, discovery) is not None
+            and _checkout_common_dir(Path(candidate.canonical_integration_root))
+            == discovery.common_dir
+        ),
+        None,
+    )
+
+
+def project_instructions_path(
+    args: str, project_root: Path | None, zeta_home: Path | None
+) -> str:
+    """Create the private project instructions file and return its path."""
+    if args.strip():
+        return "project instructions unchanged: command does not accept arguments"
+    if project_root is None or zeta_home is None:
+        return "project instructions error: not inside a project"
+    registry = ProjectRegistry(zeta_home / "projects")
+    discovery = discover_project(project_root, user_home=zeta_home.parent)
+    project = resolve_project_context(discovery, registry)
+    if project is None:
+        return "project instructions error: project is not registered"
+    path = zeta_home / "projects" / project.project_id / AGENTS_FILENAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+    except OSError as exc:
+        return f"project instructions error: {exc}"
+    return f"project instructions: {path}"
+
+
+def _instruction_files(
+    working_dir: Path,
+    stop_at: Path,
+    home: Path,
+    private_project: Project | None,
+    *,
+    repo_agents_ignored: bool,
+) -> list[Path]:
+    candidates = _walk_up_agents_files(working_dir, stop_at)
+    stop_agents = stop_at / AGENTS_FILENAME
+    if _present(stop_agents):
+        candidates.append(stop_agents)
+    else:
+        claude = stop_at / CLAUDE_FILENAME
+        if _present(claude):
+            candidates.append(claude)
+
+    seen: set[Path] = set()
+    files: list[Path] = []
+    home_agents = (home / AGENTS_FILENAME).resolve()
+    if not repo_agents_ignored:
+        for path in candidates:
+            resolved = path.resolve()
+            if resolved != home_agents and resolved not in seen:
+                seen.add(resolved)
+                files.append(resolved)
+    if private_project is not None:
+        private_agents = home / "projects" / private_project.project_id / AGENTS_FILENAME
+        if _present(private_agents):
+            files.append(private_agents.resolve())
+    return files
+
+
 def load_project_context(
     *,
     cwd: str | Path | None = None,
@@ -576,7 +671,8 @@ def load_project_context(
     system_append: str | None = None,
     byte_cap: int = CONTEXT_BYTE_CAP,
     catalog: SkillCatalog,
-    project_id: str | None = None,
+    session_project: Project | None = None,
+    cwd_project: Project | None = None,
     inbox_enabled: bool = True,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
@@ -604,6 +700,13 @@ def load_project_context(
     notices: list[str] = []
     if seed_notice is not None:
         notices.append(seed_notice)
+    repo_agents_ignored = (
+        cwd_project is not None and cwd_project.repo_agents == "ignore"
+    )
+    if repo_agents_ignored:
+        notices.append(
+            "warning: repository AGENTS.md files were ignored by project settings"
+        )
     loaded: list[Path] = []
     memory_index: int | None = None
     memory_block: str | None = None
@@ -617,32 +720,15 @@ def load_project_context(
             load_identity(catalog=catalog, identity=home_identity),
             runtime_guidance,
         ]
-        candidates: list[Path] = []
-        candidates.extend(_walk_up_agents_files(working_dir, stop_at))
-        # Always attempt to include the repository-root AGENTS.md (or fall
-        # back to CLAUDE.md for repos that never migrated). When cwd is
-        # inside stop_at the walk already picked this up; the dedupe below
-        # drops the duplicate. When cwd sits outside stop_at (unusual, but
-        # supported for tests and edge callers), this keeps the anchor.
-        stop_agents = stop_at / AGENTS_FILENAME
-        if _present(stop_agents):
-            candidates.append(stop_agents)
-        else:
-            claude = stop_at / CLAUDE_FILENAME
-            if _present(claude):
-                candidates.append(claude)
-
-        seen: set[Path] = set()
-        deduped: list[Path] = []
-        home_agents = (home / AGENTS_FILENAME).resolve()
-        for path in candidates:
-            resolved = path.resolve()
-            if resolved == home_agents:
-                continue
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            deduped.append(resolved)
+        # A private per-project file is outside the repository and is loaded
+        # after repository instructions, so it wins on conflicts.
+        deduped = _instruction_files(
+            working_dir,
+            stop_at,
+            home,
+            cwd_project,
+            repo_agents_ignored=repo_agents_ignored,
+        )
 
         # Only optional walked instructions and project memory consume this
         # budget.  The home identity and append section are mandatory and are
@@ -675,13 +761,7 @@ def load_project_context(
         # starting; surface it as a startup notice instead.
         try:
             registry = ProjectRegistry(home / "projects")
-            project = None
-            if registry.root.exists():
-                project = (
-                    registry.show_project(project_id)
-                    if project_id is not None
-                    else registry.find_for_directory(working_dir)
-                )
+            project = session_project
             if project is not None:
                 manual_memory_sections: list[str] = []
                 automatic_memory_sections: list[str] = []
@@ -926,5 +1006,6 @@ __all__ = [
     "discover_project_root",
     "discover_repo_root",
     "load_project_context",
+    "resolve_project_context",
     "resolve_prompt_argument",
 ]

@@ -5,16 +5,19 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 
 from ..core.project_context import (
     ProjectContext,
+    _format_section,
     load_project_context,
     refresh_project_memory,
 )
 from ..core.session import SessionManager, SessionMetadata
 from ..core.store import ConversationStore
 from ..core.store.prompt_composition import PromptComposition
+from ..project_registry import Project
 from ..skills import (
     SkillCatalog,
     discover_session_skills,
@@ -151,6 +154,84 @@ def _adopted_context(metadata: SessionMetadata, notices: tuple[str, ...]) -> Pro
     )
 
 
+def _project_instruction_notice(
+    metadata: SessionMetadata, *, home: Path, cwd_project: Project | None
+) -> str | None:
+    if cwd_project is None:
+        return None
+    path = home / "projects" / cwd_project.project_id / "AGENTS.md"
+    old_path = str(path)
+    if old_path not in metadata.context_files:
+        return None
+    if not path.is_file():
+        return "project instructions removed since this session started; using the current file"
+    current = _format_section(path, path.read_text(encoding="utf-8"))
+    if current not in metadata.system_prompt:
+        return "project instructions changed since this session started; using the current file"
+    return None
+
+
+def _resume_composition(
+    current: SessionMetadata,
+    *,
+    home: Path,
+    repo_root: Path,
+    inbox_enabled: bool,
+    session_project: Project | None,
+    cwd_project: Project | None,
+    system_override: str | None,
+    system_append: str | None,
+    context_loader: ContextLoader,
+    skills: SkillCatalog,
+    agents: AgentCatalog,
+    explicit_custom: bool,
+) -> PromptComposition:
+    rebuild = (
+        current.prompt_recipe == "default"
+        or (current.prompt_recipe is None and not current.system_prompt)
+        or explicit_custom
+    )
+    if rebuild:
+        context = context_loader(
+            cwd=Path(current.cwd),
+            repo_root=repo_root,
+            zeta_home=home,
+            system_override=system_override,
+            system_append=system_append,
+            catalog=skills,
+            session_project=session_project,
+            cwd_project=cwd_project,
+            inbox_enabled=inbox_enabled,
+        )
+    else:
+        context = _conservative_context(current, home=home)
+        if current.prompt_recipe is not None:
+            context = _replace_context_skill_index(context, skills)
+    notices = list(context.notices)
+    if cwd_project is not None and cwd_project.repo_agents == "ignore":
+        warning = "warning: repository AGENTS.md files were ignored by project settings"
+        if warning not in notices:
+            notices.append(warning)
+    changed_notice = _project_instruction_notice(
+        current, home=home, cwd_project=cwd_project
+    )
+    if changed_notice is not None and changed_notice not in notices:
+        notices.append(changed_notice)
+    context = replace(context, notices=tuple(notices))
+    return PromptComposition(
+        system_prompt=context.system_prompt,
+        context_files=tuple(str(path) for path in context.files),
+        skill_catalog=skills,
+        agent_catalog=agents,
+        prompt_recipe=context.prompt_recipe,
+        prompt_components=context.prompt_components,
+        project_memory_offset=context.memory_offset,
+        project_memory_length=context.memory_length,
+        project_memory_digest=context.memory_digest,
+        notices=context.notices,
+    )
+
+
 def resume_prompt(
     metadata: SessionMetadata,
     *,
@@ -159,6 +240,8 @@ def resume_prompt(
     home: Path,
     repo_root: Path,
     inbox_enabled: bool,
+    session_project: Project | None = None,
+    cwd_project: Project | None = None,
     system_override: str | None = None,
     system_append: str | None = None,
     context_loader: ContextLoader = load_project_context,
@@ -176,40 +259,20 @@ def resume_prompt(
     explicit_custom = system_override is not None or system_append is not None
     skills, agents = _catalogs(home=home, repo_root=repo_root)
 
-    def compose(current: SessionMetadata) -> PromptComposition:
-        rebuild = (
-            current.prompt_recipe == "default"
-            or (current.prompt_recipe is None and not current.system_prompt)
-            or explicit_custom
-        )
-        if rebuild:
-            context = context_loader(
-                cwd=Path(current.cwd),
-                repo_root=repo_root,
-                zeta_home=home,
-                system_override=system_override,
-                system_append=system_append,
-                catalog=skills,
-                project_id=current.project_id,
-                inbox_enabled=inbox_enabled,
-            )
-        else:
-            context = _conservative_context(current, home=home)
-            if current.prompt_recipe is not None:
-                context = _replace_context_skill_index(context, skills)
-        return PromptComposition(
-            system_prompt=context.system_prompt,
-            context_files=tuple(str(path) for path in context.files),
-            skill_catalog=skills,
-            agent_catalog=agents,
-            prompt_recipe=context.prompt_recipe,
-            prompt_components=context.prompt_components,
-            project_memory_offset=context.memory_offset,
-            project_memory_length=context.memory_length,
-            project_memory_digest=context.memory_digest,
-            notices=context.notices,
-        )
-
+    compose = partial(
+        _resume_composition,
+        home=home,
+        repo_root=repo_root,
+        inbox_enabled=inbox_enabled,
+        session_project=session_project,
+        cwd_project=cwd_project,
+        system_override=system_override,
+        system_append=system_append,
+        context_loader=context_loader,
+        skills=skills,
+        agents=agents,
+        explicit_custom=explicit_custom,
+    )
     owns_skill_index = metadata.prompt_recipe is not None
     composition = manager.resume_prompt_composition(metadata, store, compose)
     context = _adopted_context(metadata, composition.notices)

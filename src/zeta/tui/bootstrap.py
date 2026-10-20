@@ -18,6 +18,7 @@ from ..core.project_context import (
     PromptArgumentError,
     associate_project_discovery,
     discover_project,
+    resolve_project_context,
     resolve_prompt_argument,
 )
 from ..core.session import (
@@ -29,6 +30,7 @@ from ..core.session import (
     format_relative_age,
 )
 from ..models.catalog import REMOVED_PROVIDER_ERROR
+from ..project_registry import ProjectRegistryError
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
@@ -340,6 +342,13 @@ def _create_app_with_root(
         raise SessionError(str(exc)) from exc
     if config.auto_project and not ephemeral and not resuming:
         discovery = associate_project_discovery(discovery, manager.project_registry)
+    cwd_project = resolve_project_context(discovery, manager.project_registry)
+    session_project = discovery.project
+    if resuming and metadata.project_id is not None:
+        try:
+            session_project = manager.project_registry.show_project(metadata.project_id)
+        except ProjectRegistryError:
+            session_project = None
     override_on_resume = False
     if resuming:
         cli_provider = getattr(args, "provider", None)
@@ -377,6 +386,8 @@ def _create_app_with_root(
             home=home,
             repo_root=repo_root,
             inbox_enabled=config.inbox_enabled,
+            session_project=session_project,
+            cwd_project=cwd_project,
             system_override=system_prompt_override,
             system_append=system_prompt_append,
             context_loader=_app.load_project_context,
@@ -398,7 +409,8 @@ def _create_app_with_root(
             system_override=system_prompt_override,
             system_append=system_prompt_append,
             catalog=skill_catalog,
-            project_id=discovery.project.project_id if discovery.project else None,
+            session_project=session_project,
+            cwd_project=cwd_project,
             inbox_enabled=config.inbox_enabled,
         )
     recency: _SessionRecency | None = None

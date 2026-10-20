@@ -39,7 +39,7 @@ from .commands.custom_commands import (
     render_custom_input,
     resolve_custom_input,
 )
-from .project_context import discover_project_root
+from .project_context import discover_project_root, project_instructions_path
 from .store import ConversationEntry
 
 
@@ -50,7 +50,6 @@ class UsageCounterSource(Protocol):
     output_tokens_this_session: int
     cache_read_input_tokens_this_session: int
     cache_creation_input_tokens_this_session: int
-
 
 @dataclass(frozen=True, slots=True)
 class UsageSnapshot:
@@ -1147,14 +1146,12 @@ def create_slash_registry(
 
     effective_home = zeta_home or os.environ.get("ZETA_HOME")
     registry = SlashCommandRegistry()
-    if project_eligible is False:
-        project_root = None
-    else:
-        project_root = (
-            Path(project_dir).expanduser().resolve()
-            if project_dir is not None
-            else discover_project_root(Path.cwd())
-        )
+    private_project_root = (
+        Path(project_dir).expanduser().resolve()
+        if project_dir is not None
+        else discover_project_root(Path.cwd())
+    )
+    project_root = None if project_eligible is False else private_project_root
     registry.register(SlashCommand("status", _run_status, "show session status"))
     registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
@@ -1175,6 +1172,11 @@ def create_slash_registry(
     registry.register(
         SlashCommand("implement", _run_implement, "implement the proposed plan")
     )
+    registry.register(SlashCommand(
+        "project-instructions",
+        lambda _session, args: project_instructions_path(args, private_project_root, Path(effective_home).expanduser().resolve() if effective_home else None),
+        "open or create private project instructions",
+    ))
     registry.register(
         SlashCommand(
             "init",

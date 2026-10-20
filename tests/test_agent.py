@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import threading
 from collections.abc import AsyncIterator, Sequence
@@ -7467,13 +7468,13 @@ async def test_agent_cwd_sets_child_bash_session_cwd(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     loop_thread = threading.get_ident()
     discovery_threads: list[int] = []
-    real_discover = agent_runner_module.discover_repo_root
+    real_discover = agent_runner_module.discover_project
 
-    def discover_repo_root(cwd: str | Path | None = None) -> Path:
+    def discover_project(*args: object, **kwargs: object):
         discovery_threads.append(threading.get_ident())
-        return real_discover(cwd)
+        return real_discover(*args, **kwargs)
 
-    monkeypatch.setattr(agent_runner_module, "discover_repo_root", discover_repo_root)
+    monkeypatch.setattr(agent_runner_module, "discover_project", discover_project)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
@@ -8218,6 +8219,142 @@ def test_agent_status_text_shows_cwd() -> None:
         finished_omitted=0,
     )
     assert "cwd:" not in hidden["content"][0]["text"]
+
+
+def test_child_startup_runs_one_git_discovery_in_repo_subdirectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import project_context
+    from zeta.project_registry import ProjectRegistry
+
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "repo"
+    child_cwd = root / "src"
+    child_cwd.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("repo", "test", root)
+    real_run = subprocess.run
+    commands: list[list[str]] = []
+
+    def count_git(command: list[str], *args: object, **kwargs: object):
+        commands.append(command)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(project_context.subprocess, "run", count_git)
+    loop = SimpleNamespace(
+        store=SimpleNamespace(cwd=root),
+        context_assembler=SimpleNamespace(system_prompt="parent"),
+        active_home=str(home),
+        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        root_project_id=project.project_id,
+    )
+
+    _child_base_system_prompt(loop, str(child_cwd))
+
+    assert len(commands) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ignored_project", ["project-a", "project-b"])
+async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
+    tmp_path: Path, ignored_project: str,
+) -> None:
+    from zeta.project_registry import ProjectRegistry
+
+    home = tmp_path / "zeta-home"
+    parent_cwd = tmp_path / "project-a"
+    child_cwd = tmp_path / "project-b"
+    parent_cwd.mkdir()
+    child_cwd.mkdir()
+    registry = ProjectRegistry(home / "projects")
+    parent_project = registry.create_project("project-a", "test", parent_cwd)
+    child_project = registry.create_project("project-b", "test", child_cwd)
+    (home / "projects" / parent_project.project_id / "AGENTS.md").write_text(
+        "PARENT-PRIVATE-MARKER", encoding="utf-8"
+    )
+    (home / "projects" / child_project.project_id / "AGENTS.md").write_text(
+        "CHILD-PRIVATE-MARKER", encoding="utf-8"
+    )
+    (child_cwd / "AGENTS.md").write_text("CHILD-REPO-MARKER", encoding="utf-8")
+    _ignore_repo_agents = ignored_project == "project-a"
+    ignored_id = (
+        parent_project.project_id if _ignore_repo_agents else child_project.project_id
+    )
+    for project in (parent_project, child_project):
+        record = json.loads(
+            (home / "projects" / project.project_id / "project.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        record["repo_agents"] = "include"
+        (home / "projects" / project.project_id / "project.json").write_text(
+            json.dumps(record) + "\n", encoding="utf-8"
+        )
+    record = json.loads(
+        (home / "projects" / ignored_id / "project.json").read_text(encoding="utf-8")
+    )
+    record["repo_agents"] = "ignore"
+    (home / "projects" / ignored_id / "project.json").write_text(
+        json.dumps(record) + "\n", encoding="utf-8"
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
+    tools = ToolRegistry(
+        parent_cwd,
+        project_id=parent_project.project_id,
+        project_registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "child-1",
+                        "agent",
+                        {
+                            "prompt": "child-work",
+                            "description": "other project child",
+                            "cwd": str(child_cwd),
+                        },
+                    )
+                ]
+            ),
+            ScriptedTurn([TextContent("child done")]),
+        ]
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=tools,
+        max_turns=1,
+        system_prompt="parent prompt",
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=parent_project.project_id,
+        project_registry=registry,
+    )
+    loop.set_mcp_scope(home=home, project_dir=parent_cwd)
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    child_system = backend.calls[1][0][0]
+    system_text = " ".join(
+        block.text for block in child_system.content if isinstance(block, TextContent)
+    )
+    assert "CHILD-PRIVATE-MARKER" in system_text
+    assert "PARENT-PRIVATE-MARKER" not in system_text
+    from zeta.core.project_context import load_project_context
+    context = load_project_context(
+        cwd=child_cwd,
+        repo_root=child_cwd,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        session_project=parent_project,
+        cwd_project=registry.show_project(child_project.project_id),
+        inbox_enabled=False,
+    )
+    assert any("repository AGENTS.md" in notice for notice in context.notices) is (ignored_project == "project-b")
+    await loop.close()
 
 
 @pytest.mark.asyncio
