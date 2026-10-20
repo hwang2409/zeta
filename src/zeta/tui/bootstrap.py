@@ -340,9 +340,12 @@ def _create_app_with_root(
         )
     except SettingsError as exc:
         raise SessionError(str(exc)) from exc
-    if config.auto_project and not ephemeral and not resuming:
-        discovery = associate_project_discovery(discovery, manager.project_registry)
-    cwd_project = resolve_project_context(discovery, manager.project_registry)
+    try:
+        if config.auto_project and not ephemeral and not resuming:
+            discovery = associate_project_discovery(discovery, manager.project_registry)
+        cwd_project = resolve_project_context(discovery, manager.project_registry)
+    except ProjectRegistryError:
+        cwd_project = None
     session_project = discovery.project
     if resuming and metadata.project_id is not None:
         try:

@@ -602,6 +602,84 @@ def test_project_instructions_outside_git_project_explains_next_step(
     app.loop.store.close()
 
 
+def test_slash_registry_builds_with_malformed_project_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _private_project(home, root, "")
+    project_json = next((home / "projects").glob("*/project.json"))
+    record = json.loads(project_json.read_text(encoding="utf-8"))
+    del record["name"]
+    project_json.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+
+    app = create_app(_args())
+
+    result = app._slash_commands.dispatch(app, "/project-instructions")
+
+    assert isinstance(result, str)
+    assert result.startswith("project instructions error:")
+    app.loop.store.close()
+
+
+def test_slash_registry_builds_with_no_project_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(_args())
+
+    result = app._slash_commands.dispatch(app, "/project-instructions")
+
+    assert result == (
+        "project instructions: this folder is not a zeta project. run `git init` "
+        "here and restart zeta, or start zeta inside a registered project."
+    )
+    app.loop.store.close()
+
+
+def test_init_unchanged_for_registered_non_git_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _private_project(home, root, "")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+
+    app = create_app(_args())
+
+    assert app._slash_commands.dispatch(app, "/init") == "init error: not inside a project"
+    app.loop.store.close()
+
+
+def test_project_instructions_unregistered_git_repo_suggests_project_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    home.mkdir()
+    (home / "settings.toml").write_text("auto_project = false\n")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+
+    app = create_app(_args())
+
+    assert app._slash_commands.dispatch(app, "/project-instructions") == (
+        "project instructions: this git project is not registered. "
+        "run `/project init` to associate this directory."
+    )
+    app.loop.store.close()
+
+
 def test_project_instructions_editor_command_prefers_visual_and_splits_args(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
