@@ -645,9 +645,19 @@ def load_project_context(
     if seed_notice is not None:
         notices.append(seed_notice)
     try:
-        project_for_context = resolve_project_context(working_dir, home, project_id)
+        resolved_project = resolve_project_context(working_dir, home)
+        project_for_context = resolved_project
+        project_matches = project_id is None
+        if project_id is not None:
+            registry = ProjectRegistry(home / "projects")
+            project_for_context = registry.show_project(project_id)
+            project_matches = (
+                resolved_project is not None
+                and resolved_project.project_id == project_id
+            )
     except (ProjectRegistryError, OSError) as exc:
         project_for_context = None
+        project_matches = False
         notices.append(f"context · project settings unavailable: {exc}")
     repo_agents_ignored = (
         project_for_context is not None
@@ -704,7 +714,7 @@ def load_project_context(
             candidates = []
         else:
             repo_candidates = ()
-        if project_for_context is not None:
+        if project_for_context is not None and project_matches:
             private_agents = home / "projects" / project_for_context.project_id / AGENTS_FILENAME
             if _present(private_agents):
                 deduped.append(private_agents.resolve())
