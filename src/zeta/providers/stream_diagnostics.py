@@ -93,6 +93,36 @@ class StreamDiagnostics:
         self.written = True
 
     @staticmethod
+    def record_failure(
+        path: Path,
+        error: BaseException,
+        *,
+        model: str | None,
+        context: Mapping[str, Any],
+        attempt: int,
+        will_retry: bool,
+    ) -> None:
+        """Record bounded lifecycle facts without provider text or prompts."""
+        write_stream_diagnostic(
+            path,
+            {
+                "timestamp": time.time(),
+                "cause": "provider_stream_failure",
+                "model": model,
+                "provider": "codex",
+                "code": getattr(error, "code", None),
+                "status": getattr(error, "status_code", None),
+                "response_id": context.get("response_id"),
+                "terminal_event_type": context.get("terminal_event_type"),
+                "last_event_type": context.get("last_event_type"),
+                "stream_age_seconds": context.get("stream_age_seconds", 0.0),
+                "event_count": context.get("event_count", 0),
+                "attempt": attempt,
+                "will_retry": will_retry,
+            },
+        )
+
+    @staticmethod
     def record_reassembly_mismatches(path: Path, *, count: int) -> None:
         """Record mismatch frequency without logging provider content."""
 
@@ -164,10 +194,7 @@ def _encode_record(record: Mapping[str, Any], cap: int) -> bytes:
         record["cause"] = f"{cause.__module__}.{cause.__qualname__}"
     else:
         record.pop("cause", None)
-    bounded = {
-        key: _bound_value(value, cap)
-        for key, value in record.items()
-    }
+    bounded = {key: _bound_value(value, cap) for key, value in record.items()}
     encoded = _json_line(bounded)
     while len(encoded) > cap:
         text_fields = [

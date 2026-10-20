@@ -31,9 +31,13 @@ def decode_stream_error(
     status_code = status if type(status) is int else None
     reason = detail.get("type")
     retry_reason = (
-        reason if type(reason) is str and reason in {"overloaded_error", "rate_limit_error"}
+        reason
+        if type(reason) is str
+        and reason in {"overloaded_error", "rate_limit_error", "server_error"}
         else None
     )
+    if retry_reason is None and code == "server_error":
+        retry_reason = "server_error"
     if retry_reason is None and code in _OVERLOADED_CODES:
         # OpenAI/Codex report capacity errors as codes rather than Anthropic types.
         retry_reason = "overloaded_error"

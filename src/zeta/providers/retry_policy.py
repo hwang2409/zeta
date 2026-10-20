@@ -96,7 +96,9 @@ class ProviderRetryBudget:
         delay = retry_wait_seconds(source, self.attempts, event_data)
         is_stall = bool(getattr(source, "is_stall", False))
         stall_seconds = getattr(source, "stall_seconds", 0.0)
-        has_stall_duration = isinstance(stall_seconds, (int, float)) and stall_seconds > 0
+        has_stall_duration = (
+            isinstance(stall_seconds, (int, float)) and stall_seconds > 0
+        )
         if is_stall:
             if has_stall_duration:
                 self.excluded_stall_seconds += float(stall_seconds)
@@ -106,9 +108,8 @@ class ProviderRetryBudget:
                 return None
             self.stall_retries += 1
         if (
-            (not is_stall or has_stall_duration)
-            and self._effective_elapsed() + delay > MAX_PROVIDER_RETRY_SECONDS
-        ):
+            not is_stall or has_stall_duration
+        ) and self._effective_elapsed() + delay > MAX_PROVIDER_RETRY_SECONDS:
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
             return None
@@ -177,8 +178,12 @@ def retryable_provider_error(
     code = getattr(error, "code", None)
     if code in _TERMINAL_ERROR_CODES:
         return False
+    # Preserve the notification-turn rule: client errors are permanent even
+    # when an untrusted response body claims to be a server failure.
     if type(status_code) is int and 400 <= status_code < 500 and status_code != 429:
         return False
+    if code == "server_error":
+        return True
     if status_code in _RETRYABLE_STATUS_CODES:
         return True
     if (

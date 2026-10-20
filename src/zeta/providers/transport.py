@@ -214,7 +214,13 @@ async def retry_provider_completion(
         stalled = is_stall(error)
         # MESSAGE_START carries response.created metadata, not assistant content.
         # A stall after that event can still be retried safely.
-        if started and (not stalled or committed):
+        # A response.failed server_error may follow response.created; it still
+        # has no persisted assistant content and is safe under the shared budget.
+        if (
+            started
+            and (not stalled or committed)
+            and getattr(error, "code", None) != "server_error"
+        ):
             if pending_truncated_end is not None:
                 yield pending_truncated_end
             raise error
@@ -369,7 +375,5 @@ async def cleanup_transport[ErrorT: RuntimeError](
             )
             primary_exception = merge_exception(primary_exception, cleanup)
     if task_is_cancelling():
-        primary_exception = merge_exception(
-            primary_exception, asyncio.CancelledError()
-        )
+        primary_exception = merge_exception(primary_exception, asyncio.CancelledError())
     return primary_exception

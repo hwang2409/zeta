@@ -42,9 +42,7 @@ def finish_gate_message(
             f"{len(children)} background sub-agents still running: {child_list}"
         )
     if tasks:
-        task_list = ", ".join(
-            f"{task_id}: {headline}" for task_id, headline in tasks
-        )
+        task_list = ", ".join(f"{task_id}: {headline}" for task_id, headline in tasks)
         running.append(f"{len(tasks)} background tasks still running: {task_list}")
     stop_choices = []
     if children:
@@ -738,9 +736,17 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                         status=recovered_status,
                         turns_used=marker.get("turns_used", 0),
                     )
-                    recovered_killed_ids = lifecycle.get("killed_task_ids") if lifecycle else None
-                    recovered_killed_count = lifecycle.get("killed_task_count") if lifecycle else None
-                    recovered_killed_truncated = lifecycle.get("killed_task_ids_truncated", False) if lifecycle else False
+                    recovered_killed_ids = (
+                        lifecycle.get("killed_task_ids") if lifecycle else None
+                    )
+                    recovered_killed_count = (
+                        lifecycle.get("killed_task_count") if lifecycle else None
+                    )
+                    recovered_killed_truncated = (
+                        lifecycle.get("killed_task_ids_truncated", False)
+                        if lifecycle
+                        else False
+                    )
                     recovered_result = build_agent_receipt(
                         recovered_state,
                         recovered_text,
@@ -769,18 +775,16 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                             existing_stats if type(existing_stats) is dict else None
                         )
                     if notification_store is not loop.store:
-                        appended, _ = (
-                            loop.store.append_agent_notification_if_absent(
-                                child_instance_id,
-                                child_session_path=marker["child_session_path"],
-                                description=marker["description"],
-                                status=recovered_status,
-                                text=recovered_text,
-                                stats=recovered_stats,
-                                killed_task_ids=recovered_killed_ids,
-                                killed_task_count=recovered_killed_count,
-                                killed_task_ids_truncated=recovered_killed_truncated,
-                            )
+                        appended, _ = loop.store.append_agent_notification_if_absent(
+                            child_instance_id,
+                            child_session_path=marker["child_session_path"],
+                            description=marker["description"],
+                            status=recovered_status,
+                            text=recovered_text,
+                            stats=recovered_stats,
+                            killed_task_ids=recovered_killed_ids,
+                            killed_task_count=recovered_killed_count,
+                            killed_task_ids_truncated=recovered_killed_truncated,
                         )
                         store_notification_index[child_instance_id] = appended
                         recovered_status = appended.data["status"]
@@ -870,6 +874,7 @@ async def finish_background_child(
     cleanup: Callable[[], None],
     close_child: Callable[[], Awaitable[tuple[str, ...]]],
     error_message: Callable[[BaseException], str],
+    killed_task_details: Callable[[], tuple[tuple[str, str], ...]] | None = None,
     marker_key: str | None = None,
     agent_instance_id: str | None = None,
     background_owner: BackgroundAgentOwner | None = None,
@@ -907,12 +912,17 @@ async def finish_background_child(
         # legacy field bounded even when a child owned an unbounded task list.
         killed_task_metadata = [task_id[:64] for task_id in killed_tasks[:64]]
         killed_task_count = len(killed_tasks)
-        killed_task_ids_truncated = len(killed_tasks) > len(killed_task_metadata) or any(
-            len(task_id) > 64 for task_id in killed_tasks
-        )
+        killed_task_ids_truncated = len(killed_tasks) > len(
+            killed_task_metadata
+        ) or any(len(task_id) > 64 for task_id in killed_tasks)
+        detail_by_id = dict(killed_task_details() if killed_task_details else ())
+        killed_task_labels = [
+            f"{task_id} ({detail_by_id.get(task_id, 'command unavailable')}; archive: {child_path}/background-output.archive)"
+            for task_id in killed_tasks
+        ]
         killed_task_notice = (
             "\nbackground tasks killed on child completion: "
-            + ", ".join(killed_tasks)
+            + ", ".join(killed_task_labels)
             if killed_tasks
             else None
         )

@@ -82,6 +82,7 @@ class CodexStreamError(CodexBackendError):
         self.retryable = retryable
         self.retry_reason = retry_reason
         self.is_stall = is_stall
+        self.diagnostic_context: dict[str, object] = {}
 
 
 CODEX_API_URL = "https://chatgpt.com/backend-api/codex/responses"
