@@ -148,10 +148,11 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
     )
     await worker.close()
     requests = [
-        request
+        (message, request)
         for message in on.messages
         if (request := receipt_summary_request(message, sources)) is not None
     ]
+    ready = [request for _, request in requests if cache.get(request.key) is not None]
     summary_count = sum(
         message.metadata.get("summary_data") is not None for message in on.messages
     )
@@ -173,7 +174,7 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
             "on": on.tokens_after - target,
         },
         "summary_readiness_rate": (
-            summary_count / eligible_receipts if eligible_receipts else 1.0
+            len(ready) / eligible_receipts if eligible_receipts else 1.0
         ),
         "queue_drops": worker.drops,
         "token_totals": {"off": off.tokens_after, "on": on.tokens_after},
