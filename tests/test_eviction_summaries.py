@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import json
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -14,11 +16,13 @@ import pytest
 import scripts.eviction_summaries_replay as replay_script
 from zeta.context_accounting import message_token_count
 from zeta.context_eviction import (
+    _structured_result_receipt,
     decorate_receipt,
     evict_messages,
     eviction_summary_candidates,
     normalize_receipt,
 )
+from zeta.context_eviction.range_receipts import range_receipt_candidate
 from zeta.context_eviction.summaries import (
     EvictionSummaryWorker,
     SummaryCache,
@@ -31,6 +35,7 @@ from zeta.context_eviction.summaries import (
     trim_summary,
     valid_summary,
 )
+from zeta.context_eviction.summary_receipts import receipt_summary_request
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
@@ -50,6 +55,17 @@ def _assistant(seq: int, text: str | None = None) -> tuple[int, Message]:
     return seq, Message(MessageRole.ASSISTANT, [TextContent(text or ("fact " * 300))])
 
 
+def _separated_assistants(count: int) -> list[tuple[int, Message]]:
+    return [
+        item
+        for seq in range(1, count * 2, 2)
+        for item in (
+            _assistant(seq),
+            (seq + 1, Message(MessageRole.SYSTEM, [TextContent("keep")])),
+        )
+    ]
+
+
 def _evict(records, cache=None, *, enabled=False, target=500):
     return evict_messages(
         records,
@@ -63,6 +79,338 @@ def _evict(records, cache=None, *, enabled=False, target=500):
 
 def _key(record: tuple[int, Message]) -> SummaryKey:
     return eviction_summary_candidates([record])[0].key
+
+
+def _ready_cache(tmp_path, records, text="short verdict"):
+    cache = SummaryCache(tmp_path)
+    first = _evict(records, cache, enabled=True, target=500)
+    requests = [
+        *eviction_summary_candidates(records),
+        *first.summary_misses,
+    ]
+    for request in requests:
+        asyncio.run(cache.put(request.key, text))
+    return cache
+
+
+def _compacted_tool_batch(
+    seq: int,
+    *,
+    role: MessageRole = MessageRole.ASSISTANT,
+    attached_result: bool = False,
+    extra_text: str | None = None,
+    marker: str | None = None,
+    marker_first: bool = False,
+    arguments: dict | None = None,
+    include_result: bool = True,
+) -> list[tuple[int, Message]]:
+    call_id = f"call-{seq}"
+    content = [
+        ToolUseContent(
+            ToolCall(
+                call_id,
+                "agent",
+                arguments
+                if arguments is not None
+                else {"eviction_receipt": {"source_seq": seq}},
+            )
+        ),
+    ]
+    if marker != "missing":
+        marker_content = TextContent(
+            marker or f"[assistant reasoning evicted · seq {seq}]"
+        )
+        content.insert(0, marker_content) if marker_first else content.append(
+            marker_content
+        )
+    if extra_text is not None:
+        content.append(TextContent(extra_text))
+    message = Message(
+        role,
+        content,
+        tool_result=ToolResult(call_id, "attached") if attached_result else None,
+        metadata={"context_evicted": True, "source_seq": seq},
+    )
+    records = [(seq, message)]
+    if include_result:
+        records.append(
+            (
+                seq + 1,
+                _structured_result_receipt(
+                    role=MessageRole.TOOL_RESULT,
+                    receipt_kind="orchestration",
+                    tool_name="agent",
+                    tool_call_id=call_id,
+                    seq=seq + 1,
+                    payload={"status": "completed"},
+                    content_digest="0" * 64,
+                ),
+            )
+        )
+    return records
+
+
+def _fold_compacted(records, *, allows=lambda _seq: True):
+    return range_receipt_candidate(
+        records,
+        allows=allows,
+        is_smaller=lambda originals, candidates: (
+            sum(message_token_count(message) for _, message in originals)
+            > sum(map(message_token_count, candidates))
+        ),
+        compacted_tool_calls=True,
+    )
+
+
+def test_reserve_can_fold_compacted_tool_batches_below_summary_target() -> None:
+    records = [record for seq in (1, 3) for record in _compacted_tool_batch(seq)]
+
+    folded = _fold_compacted(records)
+
+    assert len(folded.records) == 1
+    assert folded.records[0][1].metadata.get("eviction_range") is True
+
+
+def test_reserve_fold_stops_once_reserve_target_is_met(tmp_path) -> None:
+    import zeta.context_eviction as eviction
+
+    records = []
+    for start in (1, 6, 11):
+        records.extend(_compacted_tool_batch(start))
+        records.extend(_compacted_tool_batch(start + 2))
+        records.append((start + 4, Message(MessageRole.SYSTEM, [TextContent("keep")])))
+    before = sum(message_token_count(message) for _, message in records)
+    first_fold = _fold_compacted(records[:4])
+    first_saving = before - (
+        sum(message_token_count(message) for _, message in first_fold.records)
+        + sum(message_token_count(message) for _, message in records[4:])
+    )
+    fold_savings = []
+    for start in (0, 5, 10):
+        folded = _fold_compacted(records[start : start + 4])
+        fold_savings.append(
+            sum(
+                message_token_count(message)
+                for _, message in records[start : start + 4]
+            )
+            - sum(message_token_count(message) for _, message in folded.records)
+        )
+
+    result = eviction._evict_deterministic(
+        records,
+        fixed_tokens=0,
+        target_tokens=before - first_saving,
+        token_counter=message_token_count,
+        source_messages=dict(records),
+        summary_cache=SummaryCache(tmp_path),
+        summary_target_tokens=before - first_saving,
+    )
+
+    assert (
+        sum(
+            message.metadata.get("eviction_range") is True
+            for message in result.messages
+        )
+        == 1
+    )
+    assert before - result.tokens_after <= first_saving + max(fold_savings)
+
+
+@pytest.mark.parametrize(
+    ("case", "batch", "allows"),
+    [
+        ("system role", {"role": MessageRole.SYSTEM}, lambda _seq: True),
+        ("user role", {"role": MessageRole.USER}, lambda _seq: True),
+        ("attached result", {"attached_result": True}, lambda _seq: True),
+        ("extra text", {"extra_text": "extra"}, lambda _seq: True),
+        ("wrong marker", {"marker": "[wrong]"}, lambda _seq: True),
+        ("marker first", {"marker_first": True}, lambda _seq: True),
+        ("missing marker", {"marker": "missing"}, lambda _seq: True),
+        ("wrong arguments", {"arguments": {"wrong": True}}, lambda _seq: True),
+        ("incomplete result", {"include_result": False}, lambda _seq: True),
+        ("protected result", {}, lambda seq: seq != 2),
+    ],
+)
+def test_compacted_call_matcher_rejects_near_misses(case, batch, allows) -> None:
+    del case
+    records = [
+        *_compacted_tool_batch(1, **batch),
+        *_compacted_tool_batch(3),
+    ]
+
+    folded = _fold_compacted(records, allows=allows)
+
+    assert not folded.coalesced_source_seqs
+    assert [message.to_dict() for _, message in folded.records] == [
+        message.to_dict() for _, message in records
+    ]
+
+
+def test_summary_reserve_module_does_not_import_package_init() -> None:
+    path = Path("src/zeta/context_eviction/summary_reserve.py")
+    tree = ast.parse(path.read_text())
+    forbidden = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and (
+            (node.level == 1 and node.module is None)
+            or node.module == "zeta.context_eviction"
+        )
+    ]
+    assert not forbidden
+
+
+def test_reserve_lets_ready_summaries_fit(tmp_path) -> None:
+    import zeta.context_eviction as eviction
+
+    assert hasattr(eviction, "_evict_deterministic")
+    records = _separated_assistants(20)
+    result = _evict(records, _ready_cache(tmp_path, records), enabled=True, target=500)
+    eligible = sum(
+        receipt_summary_request(message, dict(records)) is not None
+        for message in result.messages
+    )
+    summarized = sum(
+        message.metadata.get("summary_data") is not None for message in result.messages
+    )
+    assert summarized >= eligible * 0.8
+    assert result.tokens_after <= 500
+
+
+def test_reserve_counts_items_evicted_by_the_second_pass(tmp_path) -> None:
+    records = _separated_assistants(20)
+    cache = _ready_cache(tmp_path, records)
+    result = _evict(records, cache, enabled=True, target=500)
+    shown = {
+        message.metadata["source_seq"]
+        for message in result.messages
+        if message.metadata.get("summary_data") is not None
+    }
+    assert shown
+
+
+def test_reserve_fold_counts_summaries_of_ranges_it_creates(tmp_path) -> None:
+    records = []
+    for start in range(1, 61, 5):
+        records.extend(_compacted_tool_batch(start))
+        records.extend(_compacted_tool_batch(start + 2))
+        records.append((start + 4, Message(MessageRole.SYSTEM, [TextContent("keep")])))
+    sources = {
+        seq: Message(message.role, [TextContent("source " * 300)])
+        for seq, message in records
+    }
+    target = 3_600
+    cache = SummaryCache(tmp_path)
+    off = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=sources,
+    )
+    result = off
+    for _ in range(4):
+        result = evict_messages(
+            records,
+            fixed_tokens=0,
+            target_tokens=target,
+            token_counter=message_token_count,
+            source_messages=sources,
+            summary_cache=cache,
+            summaries_enabled=True,
+        )
+        for message in result.messages:
+            if (request := receipt_summary_request(message, sources)) is not None:
+                asyncio.run(cache.put(request.key, "summary " * 8))
+        for request in result.summary_misses:
+            asyncio.run(cache.put(request.key, "summary " * 8))
+
+    ready = [
+        request
+        for message in result.messages
+        if (request := receipt_summary_request(message, sources)) is not None
+        and cache.get(request.key) is not None
+    ]
+    shown = sum(
+        message.metadata.get("summary_data") is not None for message in result.messages
+    )
+    deterministic_tokens = sum(
+        message_token_count(normalize_receipt(message)) for message in result.messages
+    )
+    growth = replay_script._ready_decoration_growth(result.messages, sources, cache)
+    needed = max(0, growth - (target - off.tokens_after))
+    largest_fold = replay_script._largest_new_range_saving(off, result)
+
+    assert shown == len(ready)
+    assert result.tokens_after <= target
+    assert off.tokens_after - deterministic_tokens <= needed + largest_fold
+
+
+def test_eviction_result_reports_reserve_tokens(tmp_path) -> None:
+    records = _separated_assistants(20)
+    cache = _ready_cache(tmp_path, records, "summary " * 10)
+    result = _evict(records, cache, enabled=True, target=500)
+    assert result.reserve_tokens > 0
+    assert _evict(records, target=500).reserve_tokens == 0
+
+
+def test_reserve_capped_at_ten_percent_of_target(tmp_path, monkeypatch) -> None:
+    records = _separated_assistants(20)
+    cache = _ready_cache(tmp_path, records, "summary " * 40)
+    passes = []
+    import zeta.context_eviction as eviction
+
+    deterministic = eviction._evict_deterministic
+
+    def wrapped(*args, **kwargs):
+        result = deterministic(*args, **kwargs)
+        if kwargs["target_tokens"] > 0:
+            passes.append((kwargs["target_tokens"], result.tokens_after))
+        return result
+
+    monkeypatch.setattr(eviction, "_evict_deterministic", wrapped)
+    _evict(records, cache, enabled=True, target=500)
+    assert len(passes) <= 2
+    if len(passes) == 2:
+        assert passes[1][0] == max(0, passes[0][1] - 50)
+
+
+def test_no_ready_summaries_is_byte_identical_to_disabled(tmp_path) -> None:
+    records = [_assistant(seq) for seq in range(1, 8)]
+    off = _evict(records, target=500)
+    on = _evict(records, SummaryCache(tmp_path), enabled=True, target=500)
+    assert [m.to_dict() for m in on.messages] == [m.to_dict() for m in off.messages]
+    assert on.source_seqs == off.source_seqs
+    assert on.tokens_after == off.tokens_after
+
+
+def test_reserve_not_applied_when_pass_missed_target(tmp_path) -> None:
+    records = [_assistant(seq) for seq in range(1, 3)]
+    cache = _ready_cache(tmp_path, records)
+    off = _evict(records, target=1)
+    on = _evict(records, cache, enabled=True, target=1)
+    assert [m.to_dict() for m in on.messages] == [m.to_dict() for m in off.messages]
+    assert on.tokens_after == off.tokens_after
+
+
+def test_reserve_at_most_two_deterministic_passes(tmp_path, monkeypatch) -> None:
+    records = _separated_assistants(20)
+    cache = _ready_cache(tmp_path, records)
+    import zeta.context_eviction as eviction
+
+    original = eviction._evict_deterministic
+    calls = 0
+
+    def wrapped(*args, **kwargs):
+        nonlocal calls
+        if kwargs["target_tokens"] > 0:
+            calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(eviction, "_evict_deterministic", wrapped)
+    _evict(records, cache, enabled=True, target=500)
+    assert calls <= 2
 
 
 def test_missing_summary_preserves_current_receipts_byte_for_byte(tmp_path) -> None:
@@ -118,9 +466,9 @@ def test_exact_range_is_queued_only_after_real_pass_miss(tmp_path) -> None:
     assert all(not item.exact_range for item in eviction_summary_candidates(records))
     assert result.summary_misses
     assert all(item.exact_range for item in result.summary_misses)
-    assert [(item.key.seq_start, item.key.seq_end) for item in result.summary_misses] == [
-        (1, 2)
-    ]
+    assert [
+        (item.key.seq_start, item.key.seq_end) for item in result.summary_misses
+    ] == [(1, 2)]
 
 
 def test_range_source_projection_excludes_ordinary_tools(tmp_path) -> None:
@@ -142,7 +490,9 @@ def test_range_source_projection_excludes_ordinary_tools(tmp_path) -> None:
         ),
         _assistant(4),
     ]
-    missed = _evict(records, SummaryCache(tmp_path), enabled=True, target=1).summary_misses
+    missed = _evict(
+        records, SummaryCache(tmp_path), enabled=True, target=1
+    ).summary_misses
     assert len(missed) == 1
     assert (missed[0].key.seq_start, missed[0].key.seq_end) == (1, 4)
     assert "PRIVATE" not in missed[0].source
@@ -266,6 +616,39 @@ def test_enriched_receipt_uses_actual_token_count_for_target(tmp_path) -> None:
     assert result.source_seqs == (1,)
 
 
+def test_replay_fold_bound_uses_deterministic_range_receipt(tmp_path) -> None:
+    records = _separated_assistants(10)
+    cache = SummaryCache(tmp_path)
+    for request in eviction_summary_candidates(records):
+        asyncio.run(cache.put(request.key, "summary " * 40))
+    off = _evict(records, target=800)
+    on = _evict(records, cache, enabled=True, target=800)
+    range_receipt = next(
+        message for message in on.messages if message.metadata.get("eviction_range")
+    )
+    decorated_range = decorate_receipt(range_receipt, "summary " * 40)
+    on = replace(
+        on,
+        messages=[
+            decorated_range if message is range_receipt else message
+            for message in on.messages
+        ],
+    )
+    bounds = (
+        decorated_range.metadata["source_seq"],
+        decorated_range.metadata["range_seq_end"],
+    )
+    original_tokens = sum(
+        message_token_count(message)
+        for seq, message in zip(off.source_seqs, off.messages, strict=True)
+        if bounds[0] <= seq <= bounds[1]
+    )
+
+    assert replay_script._largest_new_range_saving(off, on) == (
+        original_tokens - message_token_count(normalize_receipt(decorated_range))
+    )
+
+
 def test_enriched_receipts_normalize_across_materialized_passes(tmp_path) -> None:
     records = [_assistant(1), _assistant(2)]
     decorated_items = [
@@ -289,7 +672,10 @@ def test_enriched_receipts_normalize_across_materialized_passes(tmp_path) -> Non
     decorated_range = decorate_receipt(
         deterministic.messages[0], "persisted exact range summary"
     )
-    assert normalize_receipt(decorated_range).to_dict() == deterministic.messages[0].to_dict()
+    assert (
+        normalize_receipt(decorated_range).to_dict()
+        == deterministic.messages[0].to_dict()
+    )
 
     normal_replay = evict_messages(
         decorated_items,
@@ -303,9 +689,9 @@ def test_enriched_receipts_normalize_across_materialized_passes(tmp_path) -> Non
         target_tokens=1,
         source_messages=dict(records),
     )
-    assert [normalize_receipt(message).to_dict() for message in normal_replay.messages] == [
-        message.to_dict() for message in deterministic.messages
-    ]
+    assert [
+        normalize_receipt(message).to_dict() for message in normal_replay.messages
+    ] == [message.to_dict() for message in deterministic.messages]
     assert [message.to_dict() for message in disabled_rewrite.messages] == [
         message.to_dict() for message in deterministic.messages
     ]
@@ -392,7 +778,9 @@ def test_worker_deferred_start_runs_resume_catchup(tmp_path) -> None:
 
 def test_worker_bounds_and_prioritizes_queue(tmp_path) -> None:
     worker = EvictionSummaryWorker(
-        SummaryCache(tmp_path), lambda _prompt: asyncio.sleep(0, result="ok"), max_pending=2
+        SummaryCache(tmp_path),
+        lambda _prompt: asyncio.sleep(0, result="ok"),
+        max_pending=2,
     )
     one = SummaryRequest(SummaryKey("assistant", 1, 1, "1" * 64), "one")
     two = SummaryRequest(SummaryKey("assistant", 2, 2, "2" * 64), "two")
@@ -415,11 +803,15 @@ class _CountingBucket(TokenBucket):
 
 
 def _codex_access_token() -> str:
-    payload = base64.urlsafe_b64encode(
-        json.dumps(
-            {"https://api.openai.com/auth": {"chatgpt_account_id": "test-account"}}
-        ).encode()
-    ).decode().rstrip("=")
+    payload = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                {"https://api.openai.com/auth": {"chatgpt_account_id": "test-account"}}
+            ).encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
     return f"header.{payload}.signature"
 
 
@@ -432,7 +824,9 @@ def _retrying_summary_provider(tmp_path, handler):
         stall_retries=0,
     )
     assert isinstance(backend, CodexBackend)
-    backend.token_store.save(OAuthTokens(_codex_access_token(), "refresh", 4_000_000_000))
+    backend.token_store.save(
+        OAuthTokens(_codex_access_token(), "refresh", 4_000_000_000)
+    )
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     backend.client = client
 
@@ -643,8 +1037,8 @@ def test_replay_script_runs_real_off_on_path_offline(tmp_path) -> None:
     )
     assert completed.returncode == 0, completed.stderr
     result = json.loads(out.read_text())
-    assert result["selected_seqs_identical"] is True
-    assert result["range_bounds_identical"] is True
+    assert result["off_selected_count"] == result["on_selected_count"]
+    assert result["tokens_vs_target"]["on"] > 0
     assert result["summary_count"] == 0
     assert result["queue_drops"] == 0
 

@@ -8,9 +8,7 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from math import ceil
 
-from ..context_accounting import message_token_count
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import (
     Message,
@@ -22,6 +20,7 @@ from ..protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from . import summary_reserve
 from .receipt_constructors import (
     RECEIPT_KIND_METADATA as RECEIPT_KIND_METADATA,
 )
@@ -35,14 +34,15 @@ from .receipt_constructors import (
     _tool_call_receipt,
 )
 from .summaries import SummaryCache, SummaryRequest
-from .summary_receipts import (
+from .summary_receipts import (  # noqa: F401
     decorate_receipt,
+    normalize_evicted_tool_result,
     normalize_receipt,
-    receipt_summary_request,
 )
 from .summary_receipts import (
     eviction_summary_candidates as _project_summary_candidates,
 )
+from .token_estimates import estimated_text_tokens, estimated_tokens  # noqa: F401
 
 EVICTION_KIND = "evict"
 TARGET_RATIO = 0.55
@@ -86,11 +86,7 @@ class EvictionResult:
     reached_target: bool
     source_seqs: tuple[int, ...] = field(default=(), compare=False)
     summary_misses: tuple[SummaryRequest, ...] = field(default=(), compare=False)
-
-
-def estimated_text_tokens(text: str) -> int:
-    """Use the project's stable token approximation for persisted text."""
-    return max(1, ceil(len(text) / 4))
+    reserve_tokens: int = field(default=0, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,76 +97,6 @@ class _EvictionEligibility:
 
     def allows(self, source_seq: int) -> bool:
         return source_seq in self.evictable_source_seqs
-
-
-def estimated_tokens(message: Message) -> int:
-    """Use the same stable approximation as normal context accounting."""
-
-    return message_token_count(message)
-
-
-def normalize_evicted_tool_result(message: Message) -> Message:
-    """Drop legacy display-only copies from a persisted eviction receipt."""
-
-    result = message.tool_result
-    if (
-        result is None
-        or not message.metadata.get("context_evicted")
-        or "eviction_content_digest" not in message.metadata
-    ):
-        return message
-    return Message(
-        message.role,
-        tool_result=ToolResult(
-            result.tool_call_id,
-            result.content,
-            is_error=result.is_error,
-            content_blocks=result.content_blocks,
-            is_canceled=result.is_canceled,
-        ),
-        metadata=message.metadata,
-    )
-
-
-def _finalize_summaries(
-    result: EvictionResult,
-    *,
-    fixed_tokens: int,
-    target_tokens: int,
-    token_counter: Callable[[Message], int],
-    source_messages: Mapping[int, Message] | None,
-    summary_cache: SummaryCache | None,
-    summaries_enabled: bool,
-) -> EvictionResult:
-    if not summaries_enabled or summary_cache is None or source_messages is None:
-        return result
-    messages = list(result.messages)
-    running_total = fixed_tokens + sum(map(token_counter, messages))
-    misses: list[SummaryRequest] = []
-    for index, message in enumerate(messages):
-        request = receipt_summary_request(message, source_messages)
-        if request is None:
-            continue
-        summary = summary_cache.get(request.key)
-        if summary is None:
-            if request.exact_range:
-                misses.append(request)
-            continue
-        decorated = decorate_receipt(message, summary)
-        original_tokens = sum(
-            token_counter(source)
-            for seq, source in source_messages.items()
-            if request.key.seq_start <= seq <= request.key.seq_end
-        )
-        decorated_tokens = token_counter(decorated)
-        next_total = running_total - token_counter(message) + decorated_tokens
-        if decorated_tokens < original_tokens and result.reached_target and next_total <= target_tokens:
-            messages[index] = decorated
-            running_total = next_total
-    return EvictionResult(
-        messages, result.items_evicted, result.tokens_before, running_total,
-        result.reached_target, result.source_seqs, tuple(misses),
-    )
 
 
 def eviction_summary_candidates(
@@ -203,8 +129,7 @@ def catch_up_summary_candidates(
             records, evictable_source_seqs=eligibility.evictable_source_seqs
         )
         if any(
-            start <= request.key.seq_start <= end
-            for start, end in covered_intervals
+            start <= request.key.seq_start <= end for start, end in covered_intervals
         )
     )
 
@@ -244,11 +169,36 @@ def evict_messages(
     *,
     fixed_tokens: int,
     target_tokens: int,
+    token_counter: Callable[[Message], int] | None = None,
+    unconsumed_source_seqs: Collection[int] = (),
+    source_messages: Mapping[int, Message] | None = None,
+    summary_cache: SummaryCache | None = None,
+    summaries_enabled: bool = False,
+) -> EvictionResult:
+    return summary_reserve.evict_messages(
+        records,
+        fixed_tokens=fixed_tokens,
+        target_tokens=target_tokens,
+        token_counter=token_counter or estimated_tokens,
+        unconsumed_source_seqs=unconsumed_source_seqs,
+        source_messages=source_messages,
+        summary_cache=summary_cache,
+        summaries_enabled=summaries_enabled,
+        deterministic_evict=_evict_deterministic,
+    )
+
+
+def _evict_deterministic(
+    records: Sequence[tuple[int, Message]],
+    *,
+    fixed_tokens: int,
+    target_tokens: int,
     token_counter: Callable[[Message], int] = estimated_tokens,
     unconsumed_source_seqs: Collection[int] = (),
     source_messages: Mapping[int, Message] | None = None,
     summary_cache: SummaryCache | None = None,
     summaries_enabled: bool = False,
+    summary_target_tokens: int | None = None,
 ) -> EvictionResult:
     """Replace old re-derivable results with bounded semantic digests.
 
@@ -271,6 +221,22 @@ def evict_messages(
         changed.update(regenerated)
     from .range_receipts import range_receipt_candidate
 
+    reserve_tracker = (
+        summary_reserve.ReserveFoldTracker(
+            messages,
+            fixed_tokens=fixed_tokens,
+            target_tokens=summary_target_tokens,
+            cap_tokens=target_tokens,
+            token_counter=token_counter,
+            source_messages=source_messages,
+            summary_cache=summary_cache,
+        )
+        if summary_target_tokens is not None
+        and source_messages is not None
+        and summary_cache is not None
+        else None
+    )
+
     range_candidate = range_receipt_candidate(
         records,
         allows=eligibility.allows,
@@ -278,6 +244,8 @@ def evict_messages(
             sum(token_counter(message) for _, message in originals),
             sum(map(token_counter, candidates)),
         ),
+        compacted_tool_calls=reserve_tracker is not None,
+        stop_after_fold=reserve_tracker,
     )
     if range_candidate.coalesced_source_seqs:
         records = range_candidate.records
@@ -311,15 +279,10 @@ def evict_messages(
         return replace_many(((index, replacement),))
 
     def finish(reached: bool) -> EvictionResult:
-        return _finalize_summaries(
-            _result(records, messages, changed, before, running_total, reached),
-            fixed_tokens=fixed_tokens,
-            target_tokens=target_tokens,
-            token_counter=token_counter,
-            source_messages=source_messages,
-            summary_cache=summary_cache,
-            summaries_enabled=summaries_enabled,
-        )
+        return _result(records, messages, changed, before, running_total, reached)
+
+    if reserve_tracker is not None and reserve_tracker.done:
+        return finish(True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -468,12 +431,16 @@ def evict_messages(
                 sum(token_counter(message) for _, message in originals),
                 sum(map(token_counter, candidates)),
             ),
+            compacted_tool_calls=reserve_tracker is not None,
+            stop_after_fold=reserve_tracker,
         )
         if range_candidate.coalesced_source_seqs:
             records = range_candidate.records
             messages = [message for _, message in records]
             changed.update(range_candidate.coalesced_source_seqs)
             running_total = fixed_tokens + sum(map(token_counter, messages))
+            if reserve_tracker is not None and reserve_tracker.done:
+                return finish(True)
 
     if source_messages is not None and running_total > target_tokens:
         # The global fold is only a fallback after ordinary eviction remains over target.
@@ -484,6 +451,7 @@ def evict_messages(
             records,
             allows=eligibility.allows,
             coarse=True,
+            compacted_tool_calls=reserve_tracker is not None,
             is_smaller=lambda originals, candidates: _strictly_smaller(
                 sum(token_counter(message) for _, message in originals),
                 sum(map(token_counter, candidates)),
