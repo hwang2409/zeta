@@ -66,16 +66,19 @@ async def test_clone_for_session_close_releases_cwd_descriptor(tmp_path: Path) -
         tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
     )
     store = ConversationStore(tmp_path / "session")
-    baseline = len(os.listdir("/dev/fd"))
     clones = [
         parent.clone_for_session(store),
         parent.clone_for_session(store, cwd=tmp_path),
     ]
 
-    assert len(os.listdir("/dev/fd")) >= baseline + len(clones)
-    for clone in clones:
+    clone_fds = [clone._cwd_fd for clone in clones]
+    assert all(fd is not None and os.fstat(fd) for fd in clone_fds)
+    for clone, fd in zip(clones, clone_fds):
         await clone.close()
-    assert len(os.listdir("/dev/fd")) == baseline
+        assert fd is not None
+        with pytest.raises(OSError) as error:
+            os.fstat(fd)
+        assert error.value.errno == errno.EBADF
 
     await parent.close()
     await parent.close()
