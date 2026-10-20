@@ -513,6 +513,40 @@ def test_completed_summary_is_reused_after_resume(tmp_path) -> None:
     assert _evict([record], resumed, enabled=True).messages[0].metadata["summary_data"]
 
 
+def test_cached_summary_from_previous_prompt_version_is_a_miss(tmp_path) -> None:
+    record = _assistant(1)
+    key = _key(record)
+    old_row = {
+        "version": 1,
+        "prompt_version": 1,
+        "kind": key.kind,
+        "seq_start": key.seq_start,
+        "seq_end": key.seq_end,
+        "source_sha256": key.source_sha256,
+        "summary": "stale prompt summary",
+    }
+    (tmp_path / "eviction-summaries.jsonl").write_text(json.dumps(old_row) + "\n")
+
+    async def run() -> None:
+        cache = SummaryCache(tmp_path)
+        await cache.load()
+        assert cache.get(key) is None
+        prompts: list[str] = []
+
+        async def provider(prompt: str) -> str:
+            prompts.append(prompt)
+            return "fresh prompt summary"
+
+        worker = EvictionSummaryWorker(cache, provider)
+        assert worker.admit(SummaryRequest(key, "factual source"))
+        await worker.run_once()
+        await worker.close()
+        assert prompts == [summary_prompt("factual source")]
+        assert cache.get(key) == "fresh prompt summary"
+
+    asyncio.run(run())
+
+
 def test_cache_append_and_compaction_are_durable_and_off_loop(tmp_path) -> None:
     async def run() -> None:
         cache = SummaryCache(tmp_path)
@@ -539,7 +573,7 @@ def test_cache_append_and_compaction_are_durable_and_off_loop(tmp_path) -> None:
 def test_malformed_cache_records_degrade_independently_to_misses(tmp_path) -> None:
     valid = {
         "version": 1,
-        "prompt_version": 1,
+        "prompt_version": 2,
         "kind": "assistant",
         "seq_start": 2,
         "seq_end": 2,
