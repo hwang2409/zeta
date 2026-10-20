@@ -17,6 +17,7 @@ import scripts.eviction_summaries_replay as replay_script
 from zeta.context_accounting import message_token_count
 from zeta.context_eviction import (
     _structured_result_receipt,
+    catch_up_summary_candidates,
     decorate_receipt,
     evict_messages,
     eviction_summary_candidates,
@@ -37,6 +38,10 @@ from zeta.context_eviction.summaries import (
     valid_summary,
 )
 from zeta.context_eviction.summary_receipts import receipt_summary_request
+from zeta.context_eviction.summary_reserve import (
+    estimate_summary_reserve,
+    finalize_summaries,
+)
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
@@ -92,6 +97,16 @@ def _ready_cache(tmp_path, records, text="short verdict"):
     for request in requests:
         asyncio.run(cache.put(request.key, text))
     return cache
+
+
+def _put_assistant_summary(cache, record, summary):
+    seq, message = record
+    text = " ".join(
+        block.text for block in message.content if isinstance(block, TextContent)
+    )
+    source = f"seq {seq} assistant: {text}"
+    key = SummaryKey("assistant", seq, seq, source_hash(source))
+    asyncio.run(cache.put(key, summary))
 
 
 def _compacted_tool_batch(
@@ -345,6 +360,148 @@ def test_reserve_fold_counts_summaries_of_ranges_it_creates(tmp_path) -> None:
     assert shown == len(ready)
     assert result.tokens_after <= target
     assert off.tokens_after - deterministic_tokens <= needed + largest_fold
+
+
+def _coarse_reserve_case(tmp_path):
+    records = []
+    for start in range(1, 101, 5):
+        records.extend(_compacted_tool_batch(start))
+        records.extend(_compacted_tool_batch(start + 2))
+        records.append((start + 4, Message(MessageRole.SYSTEM, [TextContent("keep")])))
+    sources = {
+        seq: Message(message.role, [TextContent("source " * 300)])
+        for seq, message in records
+    }
+    target = 1_800
+    off = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=sources,
+    )
+    cache = SummaryCache(tmp_path)
+    request = next(
+        request
+        for message in off.messages
+        if (request := receipt_summary_request(message, sources)) is not None
+    )
+    asyncio.run(cache.put(request.key, "summary"))
+    reserve = estimate_summary_reserve(
+        off.messages,
+        off.tokens_after,
+        target,
+        message_token_count,
+        sources,
+        cache,
+    )
+    return records, sources, target, off, cache, reserve
+
+
+def test_reserve_pass_never_removes_more_than_capped_reserve(tmp_path) -> None:
+    records, sources, target, off, cache, reserve = _coarse_reserve_case(tmp_path)
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=sources,
+        summary_cache=cache,
+        summaries_enabled=True,
+    )
+    deterministic_tokens = sum(
+        message_token_count(normalize_receipt(message)) for message in result.messages
+    )
+    atomic_fold_bound = max(map(message_token_count, off.messages))
+
+    assert off.tokens_after - deterministic_tokens <= reserve + atomic_fold_bound
+    assert result.tokens_after <= target
+    assert any(
+        message.metadata.get("summary_data") is not None for message in result.messages
+    )
+    call_ids = {
+        block.tool_call.id
+        for message in result.messages
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    }
+    result_ids = {
+        message.tool_result.tool_call_id
+        for message in result.messages
+        if message.tool_result is not None
+    }
+    assert call_ids == result_ids
+    assert all(
+        "recall_history" in message.content[0].text
+        for message in result.messages
+        if message.metadata.get("eviction_range")
+    )
+
+
+def test_reserve_pass_targets_requested_reserve_not_full_cap(
+    tmp_path, monkeypatch
+) -> None:
+    records, sources, target, off, cache, reserve = _coarse_reserve_case(tmp_path)
+    passes = []
+    import zeta.context_eviction as eviction
+
+    deterministic = eviction._evict_deterministic
+
+    def wrapped(*args, **kwargs):
+        if args[0] is records:
+            passes.append(kwargs["target_tokens"])
+        return deterministic(*args, **kwargs)
+
+    monkeypatch.setattr(eviction, "_evict_deterministic", wrapped)
+    evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=sources,
+        summary_cache=cache,
+        summaries_enabled=True,
+    )
+
+    assert passes == [target, off.tokens_after - reserve]
+
+
+def test_eviction_result_keeps_original_reserve_request(tmp_path) -> None:
+    records, sources, target, _, cache, reserve = _coarse_reserve_case(tmp_path)
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=sources,
+        summary_cache=cache,
+        summaries_enabled=True,
+    )
+
+    assert reserve > 0
+    assert result.reserve_tokens == reserve
+
+
+def test_incremental_kind_counts_includes_new_shown_receipts(tmp_path) -> None:
+    _, sources, _, off, _, _ = _coarse_reserve_case(tmp_path)
+    records = list(zip(off.source_seqs, off.messages, strict=True))
+    folded = range_receipt_candidate(
+        records,
+        allows=lambda _seq: True,
+        coarse=True,
+        is_smaller=lambda originals, candidates: (
+            sum(message_token_count(message) for _, message in originals)
+            > sum(map(message_token_count, candidates))
+        ),
+    )
+    coarse = next(
+        message for _, message in folded.records if "user_count" in message.metadata
+    )
+    shown = decorate_receipt(coarse, "coarse summary")
+
+    counts = replay_script._kind_counts(off.messages, sources, shown_messages=[shown])
+
+    assert counts["coarse"]["shown"] == 1
 
 
 def test_eviction_result_reports_reserve_tokens(tmp_path) -> None:
@@ -657,16 +814,28 @@ def test_replay_fold_bound_uses_deterministic_range_receipt(tmp_path) -> None:
         asyncio.run(cache.put(request.key, "summary " * 40))
     off = _evict(records, target=800)
     on = _evict(records, cache, enabled=True, target=800)
+    folded = range_receipt_candidate(
+        list(zip(off.source_seqs, off.messages, strict=True)),
+        allows=lambda _seq: True,
+        coarse=True,
+        is_smaller=lambda originals, candidates: (
+            sum(message_token_count(message) for _, message in originals)
+            > sum(map(message_token_count, candidates))
+        ),
+    )
     range_receipt = next(
-        message for message in on.messages if message.metadata.get("eviction_range")
+        message
+        for _, message in folded.records
+        if message.metadata.get("eviction_range")
     )
     decorated_range = decorate_receipt(range_receipt, "summary " * 40)
     on = replace(
         on,
         messages=[
             decorated_range if message is range_receipt else message
-            for message in on.messages
+            for _, message in folded.records
         ],
+        source_seqs=tuple(seq for seq, _ in folded.records),
     )
     bounds = (
         decorated_range.metadata["source_seq"],
@@ -1064,6 +1233,8 @@ def test_replay_script_runs_real_off_on_path_offline(tmp_path) -> None:
             "--out",
             str(out),
             "--offline",
+            "--offline-summary-tokens",
+            "80",
         ],
         check=False,
         capture_output=True,
@@ -1074,6 +1245,14 @@ def test_replay_script_runs_real_off_on_path_offline(tmp_path) -> None:
     assert result["off_selected_count"] == result["on_selected_count"]
     assert result["tokens_vs_target"]["on"] > 0
     assert result["summary_count"] == 0
+    assert result["offline_summary_tokens"] == 80
+    assert set(result["kinds"]) == {
+        "assistant",
+        "orchestration",
+        "notification",
+        "range",
+        "coarse",
+    }
     assert result["queue_drops"] == 0
 
 
@@ -1087,27 +1266,197 @@ def test_decorated_receipts_normalize_exactly() -> None:
     assert normalize_receipt(decorated).to_dict() == receipt.to_dict()
 
 
-def test_sources_below_256_tokens_are_not_requested_or_decorated() -> None:
-    small = _assistant(1, "fact " * 150)
-    large = _assistant(2, "fact " * 300)
-    assert eviction_summary_candidates([small]) == ()
-    assert eviction_summary_candidates([large])
+def test_short_assistant_reply_gets_summary_when_decorated_exceeds_plain_receipt(
+    tmp_path,
+) -> None:
+    record = _assistant(1, "fact " * 120)
+    cache = SummaryCache(tmp_path)
+    _put_assistant_summary(cache, record, "useful summary")
 
-    receipt = Message(
-        MessageRole.ASSISTANT,
-        [TextContent("[assistant text evicted · seq 1]")],
-        metadata={
-            "context_evicted": True,
-            "source_seq": 1,
-            "eviction_receipt": "assistant",
-            "eviction_receipt_fields": {"kind": "assistant text"},
-        },
+    plain = _evict([record], target=160).messages[0]
+    result = _evict([record], cache, enabled=True, target=160)
+
+    assert message_token_count(decorate_receipt(plain, "useful summary")) > (
+        message_token_count(plain)
     )
-    assert receipt_summary_request(receipt, {1: small[1]}) is None
-    assert receipt_summary_request(receipt, {1: large[1]}) is not None
+    assert result.messages[0].metadata.get("summary_data") is not None
+    assert result.tokens_after <= 160
 
 
-def test_agent_output_results_are_never_summarized() -> None:
+def test_short_items_below_48_tokens_are_not_requested(tmp_path) -> None:
+    record = _assistant(1, "ok " * 20)
+    cache = SummaryCache(tmp_path)
+    _put_assistant_summary(cache, record, "should not appear")
+
+    assert eviction_summary_candidates([record]) == ()
+    result = _evict([record], cache, enabled=True, target=1)
+    assert result.messages[0].metadata.get("summary_data") is None
+    assert eviction_summary_candidates([_assistant(2, "fact " * 40)])
+
+
+def test_decoration_never_larger_than_source_message(tmp_path) -> None:
+    record = _assistant(1, "source " * 44)
+    plain = _evict([record], target=1).messages[0]
+    assert eviction_summary_candidates([record])
+    cache = SummaryCache(tmp_path)
+    _put_assistant_summary(cache, record, "oversized summary " * 60)
+
+    finalized, _, _ = finalize_summaries(
+        [plain],
+        reached_target=True,
+        fixed_tokens=0,
+        target_tokens=1_000,
+        token_counter=message_token_count,
+        source_messages=dict([record]),
+        summary_cache=cache,
+    )
+
+    assert message_token_count(record[1]) >= 60
+    assert finalized[0].metadata.get("summary_data") is None
+
+
+def test_reserve_cap_prefers_newest_short_item_summaries(tmp_path) -> None:
+    records = [_assistant(seq, "fact " * 120) for seq in range(1, 11)]
+    receipts = [_evict([record], target=1).messages[0] for record in records]
+    cache = SummaryCache(tmp_path)
+    for record in records:
+        _put_assistant_summary(cache, record, "useful summary")
+    target = 1_000
+    deterministic_tokens = sum(map(message_token_count, receipts))
+    fixed_tokens = target - deterministic_tokens - target // 10
+
+    finalized, total, _ = finalize_summaries(
+        receipts,
+        reached_target=True,
+        fixed_tokens=fixed_tokens,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=dict(records),
+        summary_cache=cache,
+    )
+    shown = [
+        message.metadata["source_seq"]
+        for message in finalized
+        if message.metadata.get("summary_data") is not None
+    ]
+    repeated, repeated_total, _ = finalize_summaries(
+        receipts,
+        reached_target=True,
+        fixed_tokens=fixed_tokens,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=dict(records),
+        summary_cache=cache,
+    )
+
+    assert shown == [10]
+    assert total <= target
+    assert [message.to_dict() for message in finalized] == [
+        message.to_dict() for message in repeated
+    ]
+    assert total == repeated_total
+
+
+def test_ranges_keep_strict_smaller_and_256_minimum(tmp_path) -> None:
+    short_records = [_assistant(1, "range " * 40), _assistant(2, "range " * 40)]
+    short_receipt = _evict(short_records, target=1).messages[0]
+    assert receipt_summary_request(short_receipt, dict(short_records)) is None
+
+    records = [_assistant(1, "range " * 140), _assistant(2, "range " * 140)]
+    receipt = _evict(records, target=1).messages[0]
+    request = receipt_summary_request(receipt, dict(records))
+    assert request is not None and request.exact_range
+    cache = SummaryCache(tmp_path)
+    asyncio.run(cache.put(request.key, "oversized range summary " * 100))
+    decorated = decorate_receipt(receipt, cache.get(request.key))
+
+    def range_counter(message):
+        if message is decorated or message.metadata.get("summary_data") is not None:
+            return 300
+        if message in dict(records).values():
+            return 100
+        return 10
+
+    finalized, _, _ = finalize_summaries(
+        [receipt],
+        reached_target=True,
+        fixed_tokens=0,
+        target_tokens=2_000,
+        token_counter=range_counter,
+        source_messages=dict(records),
+        summary_cache=cache,
+    )
+
+    assert finalized[0].metadata.get("summary_data") is None
+
+
+def test_small_ranges_are_decorated_before_standalone_items_when_reserve_binds(
+    tmp_path,
+) -> None:
+    range_records = [_assistant(1, "range " * 160), _assistant(2, "range " * 160)]
+    standalone_record = _assistant(10, "standalone " * 120)
+    range_receipt = _evict(range_records, target=1).messages[0]
+    standalone_receipt = _evict([standalone_record], target=1).messages[0]
+    sources = dict([*range_records, standalone_record])
+    cache = SummaryCache(tmp_path)
+    for receipt in (range_receipt, standalone_receipt):
+        request = receipt_summary_request(receipt, sources)
+        assert request is not None
+        asyncio.run(cache.put(request.key, "useful summary"))
+
+    def counter(message):
+        if message.metadata.get("summary_data") is not None:
+            return 20
+        if message in sources.values():
+            return 100
+        return 10
+
+    finalized, _, _ = finalize_summaries(
+        [range_receipt, standalone_receipt],
+        reached_target=True,
+        fixed_tokens=80,
+        target_tokens=110,
+        token_counter=counter,
+        source_messages=sources,
+        summary_cache=cache,
+    )
+
+    assert range_receipt.metadata["source_seq"] == 1
+    assert standalone_receipt.metadata["source_seq"] == 10
+    assert finalized[0].metadata.get("summary_data") == "useful summary"
+    assert finalized[1].metadata.get("summary_data") is None
+
+
+def test_agent_start_ack_receipt_is_not_summarized() -> None:
+    agent_call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("agent-1", "agent", {"task": "review"}))],
+    )
+    agent_result = Message(
+        MessageRole.USER,
+        tool_result=ToolResult("agent-1", "background agent started " * 100),
+    )
+    output_call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("task-1", "task_output", {"task_id": "task-1"}))],
+    )
+    output_result = Message(
+        MessageRole.USER,
+        tool_result=ToolResult("task-1", "task completed with verdict " * 100),
+    )
+
+    requests = eviction_summary_candidates(
+        [(1, agent_call), (2, agent_result), (3, output_call), (4, output_result)]
+    )
+
+    assert len(requests) == 1
+    assert requests[0].key.kind == "orchestration"
+    assert requests[0].key.seq_start == 4
+    assert "task completed with verdict" in requests[0].source
+    assert "background agent started" not in requests[0].source
+
+
+def test_agent_output_never_reaches_summary_by_any_path() -> None:
     output_call = Message(
         MessageRole.ASSISTANT,
         [ToolUseContent(ToolCall("output-1", "agent_output", {"task": "review"}))],
@@ -1115,8 +1464,13 @@ def test_agent_output_results_are_never_summarized() -> None:
     output_result = Message(
         MessageRole.USER,
         tool_result=ToolResult("output-1", "untrusted agent output text " * 300),
+        metadata={
+            "zeta_event": "agent_notifications",
+            "notifications": [{"kind": "agent_completion"}],
+        },
     )
-    assert eviction_summary_candidates([(1, output_call), (2, output_result)]) == ()
+    output_records = [(1, output_call), (2, output_result)]
+    assert eviction_summary_candidates(output_records) == ()
     output_receipt = Message(
         MessageRole.ASSISTANT,
         [TextContent("[range evicted · seq 1-2]")],
@@ -1127,25 +1481,24 @@ def test_agent_output_results_are_never_summarized() -> None:
             "eviction_receipt": "range",
         },
     )
-    assert (
-        receipt_summary_request(output_receipt, {1: output_call, 2: output_result})
-        is None
-    )
+    output_sources = dict(output_records)
+    assert receipt_summary_request(output_receipt, output_sources) is None
+    assert catch_up_summary_candidates(output_records, [output_receipt]) == ()
 
-    agent_call = Message(
+    task_call = Message(
         MessageRole.ASSISTANT,
-        [ToolUseContent(ToolCall("agent-1", "agent", {"task": "review"}))],
+        [ToolUseContent(ToolCall("task-1", "task_output", {"task_id": "task-1"}))],
     )
-    agent_result = Message(
+    task_result = Message(
         MessageRole.USER,
-        tool_result=ToolResult("agent-1", "trusted result " * 300),
+        tool_result=ToolResult("task-1", "trusted result " * 300),
     )
     requests = eviction_summary_candidates(
-        [(1, agent_call), (2, agent_result), (3, output_call), (4, output_result)]
+        [(1, task_call), (2, task_result), (3, output_call), (4, output_result)]
     )
     assert len(requests) == 1
     assert "untrusted agent output text" not in requests[0].source
-    mixed_sources = {1: agent_call, 2: agent_result, 3: output_call, 4: output_result}
+    mixed_sources = {1: task_call, 2: task_result, 3: output_call, 4: output_result}
     mixed_receipt = output_receipt
     mixed_receipt = Message(
         mixed_receipt.role,
@@ -1157,18 +1510,87 @@ def test_agent_output_results_are_never_summarized() -> None:
     assert "untrusted agent output text" not in mixed_request.source
 
 
+def test_replay_incremental_markers_reports_each_marker(tmp_path) -> None:
+    root = tmp_path / "sessions"
+    store = ConversationStore(root, session_id="incremental")
+    first = store.append_message(_assistant(1)[1])
+    first_receipt = _evict([(first.seq, _assistant(1)[1])], target=1).messages[0]
+    first_marker = store.append_compaction_marker(
+        "evicted",
+        first.seq,
+        first.seq,
+        kind="evict",
+        view=[{"seq": first.seq, "message": first_receipt.to_dict()}],
+    )
+    second = store.append_message(_assistant(2)[1])
+    second_records = [(first.seq, _assistant(1)[1]), (second.seq, _assistant(2)[1])]
+    second_receipt = _evict(second_records, target=1).messages[0]
+    store.append_compaction_marker(
+        "evicted again",
+        first.seq,
+        second.seq,
+        replaces=[first_marker.id],
+        kind="evict",
+        view=[{"seq": first.seq, "message": second_receipt.to_dict()}],
+    )
+    (store.session_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "compaction_budget": 1_000,
+                "system_prompt": "fixed system prompt",
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "incremental.json"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).parents[1] / "scripts/eviction_summaries_replay.py"),
+            str(store.session_dir),
+            "--out",
+            str(out),
+            "--offline",
+            "--offline-summary-tokens",
+            "80",
+            "--incremental-markers",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(out.read_text())
+    assert [marker["marker_seq"] for marker in result["markers"]] == [
+        first_marker.seq,
+        second.seq + 1,
+    ]
+    assert len(result["markers"]) == 2
+    assert result["totals"]["marker_count"] == 2
+    assert result["markers"][0]["fixed_tokens"] > 0
+    assert set(result["markers"][0]["kinds"]) == {
+        "assistant",
+        "orchestration",
+        "notification",
+        "range",
+        "coarse",
+    }
+
+
 def test_summary_instruction_asks_for_at_most_60_words() -> None:
     assert "at most 60 words" in SUMMARY_INSTRUCTION
 
 
-def test_orchestration_result_is_eligible() -> None:
+def test_task_output_result_is_eligible() -> None:
     call = Message(
         MessageRole.ASSISTANT,
-        [ToolUseContent(ToolCall("agent-1", "agent", {"prompt": "review"}))],
+        [ToolUseContent(ToolCall("task-1", "task_output", {"task_id": "task-1"}))],
     )
     result = Message(
         MessageRole.USER,
-        tool_result=ToolResult("agent-1", "review passed at abc1234 " * 100),
+        tool_result=ToolResult("task-1", "review passed at abc1234 " * 100),
     )
     candidates = eviction_summary_candidates([(1, call), (2, result)])
     assert [(item.key.kind, item.key.seq_start) for item in candidates] == [

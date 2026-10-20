@@ -259,12 +259,19 @@ def _evict_deterministic(
 
     def replace_many(replacements: Sequence[tuple[int, Message]]) -> bool:
         nonlocal running_total
+        if reserve_tracker is not None and reserve_tracker.done:
+            return False
         indexes = [index for index, _ in replacements]
         candidates = [replacement for _, replacement in replacements]
         replacement_tokens = [token_counter(message) for message in candidates]
         original_tokens = sum(message_tokens[index] for index in indexes)
         if not _strictly_smaller(original_tokens, sum(replacement_tokens)):
             return False
+        if reserve_tracker is not None:
+            reserve_tracker(
+                [(records[index][0], messages[index]) for index in indexes],
+                candidates,
+            )
         running_total += sum(replacement_tokens) - original_tokens
         for index, replacement, replacement_count in zip(
             indexes, candidates, replacement_tokens, strict=True
@@ -276,6 +283,11 @@ def _evict_deterministic(
 
     def replace(index: int, replacement: Message) -> bool:
         return replace_many(((index, replacement),))
+
+    def target_reached() -> bool:
+        return running_total <= target_tokens or (
+            reserve_tracker is not None and reserve_tracker.done
+        )
 
     def finish(reached: bool) -> EvictionResult:
         return _result(records, messages, changed, before, running_total, reached)
@@ -292,7 +304,7 @@ def _evict_deterministic(
         ):
             continue
         replace(index, _tool_call_receipt(message, seq))
-        if running_total <= target_tokens:
+        if target_reached():
             return finish(True)
 
     read_counts = _collapse_repeated_reads(
@@ -322,7 +334,7 @@ def _evict_deterministic(
             path = _read_path(call)
             count = read_counts.get((path, _content_digest(result.content)), 1)
             replace(index, _digest_result(message, call, seq, read_count=count))
-            if running_total <= target_tokens:
+            if target_reached():
                 return finish(True)
         return None
 
@@ -357,7 +369,7 @@ def _evict_deterministic(
             )
         )
         replace(index, replacement)
-        if running_total <= target_tokens:
+        if target_reached():
             return finish(True)
 
     for index, (seq, _) in enumerate(records):
@@ -371,7 +383,7 @@ def _evict_deterministic(
         ):
             continue
         replace(index, _assistant_receipt(seq, "assistant text"))
-        if running_total <= target_tokens:
+        if target_reached():
             return finish(True)
 
     reached = digest_results(failed=True)
@@ -383,7 +395,7 @@ def _evict_deterministic(
         if not eligibility.allows(seq) or not _is_notification_message(message):
             continue
         replace(index, _notification_receipt(message, seq))
-        if running_total <= target_tokens:
+        if target_reached():
             return finish(True)
 
     for index, (seq, _) in enumerate(records):
@@ -399,7 +411,7 @@ def _evict_deterministic(
         ):
             continue
         replace(index, _orchestration_result_receipt(message, call, seq))
-        if running_total <= target_tokens:
+        if target_reached():
             return finish(True)
 
     for index, (seq, _) in enumerate(records):
@@ -416,7 +428,7 @@ def _evict_deterministic(
             continue
         replacement = _workflow_result_receipt(message, call, seq)
         replace(index, replacement)
-        if running_total <= target_tokens:
+        if target_reached():
             return finish(True)
 
     if source_messages is not None:
@@ -445,14 +457,24 @@ def _evict_deterministic(
         from .range_receipts import range_receipt_candidate
 
         records = list(zip((seq for seq, _ in records), messages, strict=True))
+        ready_source_seqs = (
+            {
+                seq
+                for seq, message in records
+                if reserve_tracker.has_ready_decoration(message)
+            }
+            if reserve_tracker is not None
+            else set()
+        )
         coarse_candidate = range_receipt_candidate(
             records,
-            allows=eligibility.allows,
+            allows=lambda seq: eligibility.allows(seq) and seq not in ready_source_seqs,
             coarse=True,
             is_smaller=lambda originals, candidates: _strictly_smaller(
                 sum(token_counter(message) for _, message in originals),
                 sum(map(token_counter, candidates)),
             ),
+            stop_after_fold=reserve_tracker,
         )
         if coarse_candidate.coalesced_source_seqs:
             records = coarse_candidate.records
@@ -460,7 +482,7 @@ def _evict_deterministic(
             changed.update(coarse_candidate.coalesced_source_seqs)
             running_total = fixed_tokens + sum(map(token_counter, messages))
 
-    return finish(running_total <= target_tokens)
+    return finish(target_reached())
 
 
 def _evict_persisted_records(

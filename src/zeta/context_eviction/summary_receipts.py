@@ -19,11 +19,28 @@ from .summaries import SummaryKey, SummaryRequest, source_hash, valid_summary
 from .token_estimates import estimated_text_tokens
 
 MIN_SUMMARY_SOURCE_TOKENS = 256
+# Short single items are common and carried the recall gain in the experiment.
+MIN_SHORT_ITEM_SOURCE_TOKENS = 48
+SHORT_ITEM_SUMMARY_KINDS = frozenset({"assistant", "notification", "orchestration"})
 
 
-def summary_source_is_large_enough(source: str) -> bool:
-    """Only spend model calls on sources above the fixed minimum size."""
-    return estimated_text_tokens(source) >= MIN_SUMMARY_SOURCE_TOKENS
+def summary_source_is_large_enough(source: str, *, kind: str) -> bool:
+    """Apply the source threshold for this summary kind."""
+    minimum = (
+        MIN_SHORT_ITEM_SOURCE_TOKENS
+        if kind in SHORT_ITEM_SUMMARY_KINDS
+        else MIN_SUMMARY_SOURCE_TOKENS
+    )
+    return estimated_text_tokens(source) >= minimum
+
+
+def summary_decoration_fits_source(
+    kind: str, *, decorated_tokens: int, source_tokens: int
+) -> bool:
+    """Keep range savings strict while allowing non-growing single items."""
+    if kind in SHORT_ITEM_SUMMARY_KINDS:
+        return decorated_tokens <= source_tokens
+    return decorated_tokens < source_tokens
 
 
 def normalize_receipt(message: Message) -> Message:
@@ -163,11 +180,13 @@ def _summary_source(
 def _summary_kind(message: Message, calls: Mapping[str, ToolCall]) -> str | None:
     if message.metadata.get("context_evicted"):
         return None
-    if _notification(message):
-        return "notification"
     result = message.tool_result
     call = calls.get(result.tool_call_id) if result is not None else None
-    if call is not None and call.name in {"agent", "task_output"}:
+    if call is not None and call.name == "agent_output":
+        return None
+    if _notification(message):
+        return "notification"
+    if call is not None and call.name == "task_output":
         return "orchestration"
     if (
         message.role is MessageRole.ASSISTANT
@@ -196,7 +215,7 @@ def eviction_summary_candidates(
         if kind is None or seq not in evictable_source_seqs:
             continue
         source = _summary_source(source_messages, seq, seq)
-        if not summary_source_is_large_enough(source):
+        if not summary_source_is_large_enough(source, kind=kind):
             continue
         requests.append(
             SummaryRequest(SummaryKey(kind, seq, seq, source_hash(source)), source)
@@ -240,7 +259,7 @@ def receipt_summary_request(
     if kind is None:
         return None
     source = _summary_source(source_messages, start, end)
-    if not summary_source_is_large_enough(source):
+    if not summary_source_is_large_enough(source, kind=kind):
         return None
     return SummaryRequest(
         SummaryKey(kind, start, end, source_hash(source)),
