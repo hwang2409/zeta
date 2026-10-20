@@ -542,7 +542,7 @@ must fail on the pre-implementation revision for the expected reason.
 
 ## open questions
 
-1. **pending user confirmation:** use no hard idle-child cap in v1, report the
-   count and known floor of at least three fds per idle child in `agent_status`
-   and the tui, and warn above 16 idle children per root tree (at least 48 fds)
-   without ending or rejecting any child?
+1. **decided:** no hard idle-child cap in v1. report the idle count and known
+   floor of at least three fds per idle child in `agent_status` and the tui, and
+   warn above 16 idle children per root tree (at least 48 fds), without ending
+   or rejecting any child.
