@@ -131,12 +131,13 @@ register one session tool named `finish` for eligible children:
 optional because neither applies to every contract. the tool requires no
 approval and is not parallel-safe.
 
-`finish` records terminal intent. its successful result tells the model that no
-more work or prose is needed. zeta lets the current provider turn close so the
-provider message remains valid, ignores later assistant prose as the report,
-and then finalizes from the recorded tool arguments. a second `finish` in the
-same turn is rejected. other tool calls after a successful `finish` are rejected
-as “child is finishing.”
+`finish` attempts to record terminal intent through the serialized terminal
+transition described below. its successful result tells the model that no more
+work or prose is needed. zeta durably records the accepted arguments and tool
+result, enters `finishing`, and lets the current provider turn close so the
+provider message remains valid. later assistant prose is ignored as the report.
+a second `finish`, and every other tool call after a successful `finish` in the
+same turn, is rejected as `child is finishing`.
 
 report status and runtime state are separate:
 
@@ -148,11 +149,19 @@ report status and runtime state are separate:
 
 add `report_status`, `summary`, and supplied optional fields to structured
 completion content. notification text starts with `done:`, `blocked:`, or
-`failed:` and then the summary. use the existing receipt builder and notification
-byte ceilings; trim only the summary, never the status or structured scalar
-fields. do not persist both free-form final prose and the summary. this keeps one
-bounded canonical receipt for the original agent call, lifecycle final result,
-and parent completion notice.
+`failed:` and then the summary. `MAX_AGENT_NOTIFICATION_TEXT` is a 10,000
+**character** validation check (`src/zeta/core/store/_validation.py:11,32-49`);
+the terminal receipt limit is separately byte-based
+(`src/zeta/agent/receipt.py:21-27`).
+
+before building text or structured content, compute one canonical summary by
+trimming a utf-8-safe prefix until the complete persisted receipt envelope fits
+the byte limit with that same summary in both representations. never trim
+`report_status`, `head_sha`, or `verdict`. extend `_compact_structured_content`
+(`src/zeta/agent/receipt.py:273-344`) to preserve those three bounded scalars
+before optional metadata and preserve the already-bounded summary when it fits.
+do not persist free-form final prose too. exact-limit tests must use multibyte
+text and measure the complete serialized envelope, not python character count.
 
 ### no-tool turn and idle state
 
@@ -168,6 +177,14 @@ ends without `finish`, or any later woken turn ends without it, set lifecycle
 state to `idle`, set `current_step` to `idle, waiting for follow-up`, and wait.
 `idle` is non-terminal: keep the parent marker, pending-prompt queue, loop,
 registry, and store open.
+
+on each transition into `idle`, publish exactly one bounded, nonterminal
+`child_idle` notification to the direct parent and wake it without polling. the
+notification includes the child id, a bounded excerpt of the last assistant
+text, and the id of any open `ask_parent` question. repeated status reads do not
+republish it. this makes even the original bare `WAIT` response visible to a
+parent that is waiting for terminal completion; the parent can send approval or
+other direction with `agent_send`.
 
 these events wake an idle child and produce one ordinary model turn:
 
@@ -188,25 +205,30 @@ these events do not wake it:
 
 ### idle timeout and capacity
 
-an idle child auto-finishes after 30 minutes with no wake event and no running
-owned task. every listed wake event resets the clock. time spent while a task is
-running does not count. when the last task exits, its wake is delivered; if the
-following turn returns to idle, a new 30-minute clock starts.
+for the phoebe trial, use a 60-minute idle timeout **pending user
+confirmation**. every listed wake event resets the clock. time while the child
+owns a running process task or any live descendant agent does not count. after
+the final owned descendant becomes terminal, deliver its notification; if the
+following turn returns to idle, start a new 60-minute clock. auto-finish never
+cancels or adopts owned work.
 
 the synthesized completion has lifecycle state `completed`, report status
 `blocked`, reason `idle_timeout`, and summary:
 
-> auto-finished after 30 minutes idle without an explicit finish report.
+> auto-finished after 60 minutes idle without an explicit finish report.
 
 append a bounded excerpt of the child's last assistant text when one exists.
 include normal turns, elapsed time, and tool-call statistics. do not claim that
 the contract succeeded.
 
-cap idle explicit-finish children at 16 per root agent tree. active model turns
-and children with running tasks do not count toward this idle cap. if a child
-would become the seventeenth idle child, auto-finish that child as `blocked`
-with reason `idle_capacity`; do not evict an older child silently. the parent
-can cancel any live child with `agent_cancel`.
+for the phoebe trial, cap idle explicit-finish children at 16 per root agent
+tree **pending user confirmation**. active model turns and children that own a
+running task or live descendant agent do not count. reject admission of the
+newest excess child to idle by synthesizing `blocked` with reason
+`idle_capacity`; do not evict an older child, cancel work, or hand ownership to
+its parent. apply capacity only after owned descendants clear and their
+notifications are read. the parent can cancel any live child with
+`agent_cancel`.
 
 there is no separate “finish now” parent tool in the first version. the parent
 can send “finish now” with `agent_send`, which gives the child a chance to write
@@ -231,22 +253,67 @@ remove its inferred-final-message entry condition. retain one safety rule from
 pr #512: a process task that is still running 3,600 seconds after the child
 first becomes idle is killed, and its exit wakes the child to report. this is a
 resource safety deadline, not a finish gate and not a model-turn deadline. if
-the child does not call `finish` after that wake, the normal 30-minute idle
-clock applies.
+the child does not call `finish` after that wake, the normal idle clock applies.
 
 this leaves one normal path: explicit `finish`; and three harness-owned terminal
-paths: idle timeout/capacity, cancellation, and unrecoverable error.
+paths: idle timeout/capacity, cancellation, and unrecoverable error. non-opted-in
+profiles retain the old finish gate unchanged.
+
+### serialized terminal-transition fence
+
+use one per-child serialized fence for accepted `finish`, idle timeout, capacity
+auto-finish, cancellation, and restart recovery. this extends today's prompt
+and notification draining in `src/zeta/agent/runner.py:344-384`; do not build a
+separate check for each terminal path.
+
+under the fence, inspect prompt delivery claims, relevant task/direct-child
+notification claims, owned work, and the durable pending queues. close the
+pending-prompt queue only with the existing atomic “close if empty” operation.
+a prompt committed before closure wins and must be read. a sender racing after
+closure gets a delivery error and cannot believe an unread follow-up was
+accepted. a task or direct-child terminal notification that is pending or
+claimed also wins and must be read.
+
+explicit `finish` returns a tool error telling the child to read the pending
+input when any winning prompt or relevant notification exists. timeout and
+capacity defer, wake the child with that input, and retry only after it returns
+to idle. cancellation and restart recovery still terminate by policy, but use
+the same fence. they first give already-committed prompts an explicit canceled
+delivery outcome, then use “close if empty” and record cancellation atomically;
+they never force-close a nonempty queue or masquerade as explicit or automatic
+completion. the fence accepts `finish` only when queues are empty, no relevant
+delivery is claimed, and no owned work is live. it then durably records the
+arguments and successful tool result before entering `finishing`.
+
+### state transitions
+
+| state | event under the fence | next state and action |
+| --- | --- | --- |
+| `running` | healthy turn without accepted `finish` | nudge once, then `idle` and publish one `child_idle` |
+| `running` or `idle` | prompt or relevant notification wins | `running`; deliver it before any terminal transition |
+| `running` or `idle` | `finish`, but input is pending/claimed or work is owned | unchanged; reject with a tool error that identifies what to read or clear |
+| `running` or `idle` | valid `finish` wins | `finishing`; close admission and durably store report plus successful result |
+| `finishing` | second `finish` or any other tool call | `finishing`; reject as `child is finishing` |
+| `finishing` | turn end or later stream/provider failure | terminal from the explicit report; publish it once |
+| `idle` | timeout/capacity, but input or owned descendants exist | `running` for input, or remain `idle` with clock paused; do not auto-finish |
+| `idle` | timeout/capacity wins with no input or descendants | `completed` with synthesized `blocked` receipt |
+| any live state | cancellation or restart recovery wins | `canceled`; atomically close admission and clean up owned work |
+| `running` or `idle` | provider failure before accepted `finish` | `failed` after retries; clean up owned work |
+| any terminal state | any event | unchanged; no second terminal receipt |
 
 ### errors, cancellation, exit, and restart
 
 - **provider error:** apply configured retries, including pr #521 when merged.
-  if retries are exhausted, emit a failed receipt containing the sanitized
-  provider error and killed-task metadata. do not nudge or enter idle because
-  no healthy model turn exists. close the child and kill process tasks.
-- **cancellation:** `agent_cancel` remains immediate. mark `canceled`, close
-  pending questions, cancel descendants, kill process tasks, and publish the
-  current bounded canceled receipt. a prior `finish` that has not yet been
-  durably published does not outrank cancellation.
+  before the fence has durably accepted `finish` and its successful tool result,
+  an exhausted provider error wins: emit a failed receipt containing the
+  sanitized provider error and killed-task metadata, close the child, and clean
+  up owned work. after that durable point, the explicit report wins; a later
+  stream failure cannot replace it and zeta publishes that report once.
+- **cancellation:** `agent_cancel` remains immediate after it acquires the shared
+  fence. mark `canceled`, close pending questions, cancel descendants, kill
+  process tasks, and publish the current bounded canceled receipt. a `finish`
+  that was not durably accepted before cancellation acquired the fence does not
+  outrank cancellation.
 - **parent exit:** graceful parent shutdown cancels live children as it does
   now. a crash is reconciled as canceled on recovery. child conversations stay
   available for inspection, but `agent_send` cannot revive them.
@@ -269,6 +336,14 @@ bounded canonical report and structured status exactly once. the original
 background agent tool result remains `running`; the later notification remains
 the terminal receipt, as today.
 
+extend agent notification validation with bounded `report_status`, `head_sha`,
+and `verdict`, preserving their enums and sha pattern. keep child-generated text
+json-serialized; do not interpolate it into unquoted prompt text. extend
+`_notification_receipt` (`src/zeta/context_eviction/__init__.py:1050-1080`) to
+retain those exact scalars after context eviction. retain summary text only when
+it fits the existing eviction text budget; otherwise store its digest and rely
+on the existing `recall_history` source link for exact recovery.
+
 ### resource and token cost
 
 an idle child makes no provider request, so it uses no model tokens. it retains:
@@ -279,11 +354,12 @@ an idle child makes no provider request, so it uses no model tokens. it retains:
 - tool registry state and any approval/store leases.
 
 exact memory depends on provider and transcript size, so the design does not
-promise a byte figure. the 16-child idle cap bounds the known baseline to at
-least 32 retained directory fds per root tree, plus provider and tool-specific
-resources. metrics must record the observed fd count and rss delta at idle entry
-and exit during the phoebe trial. pr #498's close path remains mandatory on all
-terminal paths.
+promise a byte figure. a confirmed 16-child idle cap would bound the known
+baseline to at least 32 retained directory fds per root tree, plus provider and
+tool-specific resources; excluded children with owned descendants remain
+additional live resources and must be counted separately. metrics must record
+the observed fd count and rss delta at idle entry and exit during the phoebe
+trial. pr #498's close path remains mandatory on all terminal paths.
 
 ## alternatives considered
 
@@ -355,52 +431,64 @@ important.
 
 ## test plan
 
-all node ids are proposed and should be created test-first.
+all node ids are proposed and must be created test-first. each semantic test
+must fail on the pre-implementation revision for the expected reason.
 
 - `tests/test_agent.py::test_explicit_finish_done_publishes_canonical_report`
-  verifies schema, lifecycle mapping, structured fields, one notification, and
-  receipt bounds.
+  covers schema, lifecycle mapping, structured fields, and one notification.
 - `tests/test_agent.py::test_explicit_finish_blocked_and_failed_map_to_receipts`
-  verifies report status separately from runtime/error state.
-- `tests/test_agent.py::test_explicit_finish_nudges_once_then_idles`
-  verifies a no-tool turn, one nudge, durable idle state, and no provider call
-  while waiting.
-- `tests/test_agent.py::test_idle_child_wakes_for_follow_up_and_parent_answer`
-  verifies `agent_send` and an `ask_parent` answer.
+  proves `blocked` has `isError: false` while `failed` has `isError: true`.
+- `tests/test_agent.py::test_explicit_finish_nudges_once_then_idles` covers one
+  nudge, durable idle state, and no provider call while waiting.
+- `tests/test_agent.py::test_wait_with_running_task_wakes_parent_then_accepts_approval`
+  reproduces the original bare `WAIT`, keeps the task alive, wakes the parent,
+  delivers later approval, and lets the child report.
+- `tests/test_agent.py::test_idle_notification_wakes_waiting_parent_without_polling`
+  checks one bounded `child_idle` notice with last text and open question id.
 - `tests/test_agent.py::test_idle_child_wakes_for_task_and_child_completion_only`
-  verifies task/child notifications and rejects status reads, progress, and
-  unrelated notifications as wakes.
+  covers relevant wakes and excludes reads, progress, and unrelated notices.
+- `tests/test_agent.py::test_reviewer_follow_up_committed_at_finish_boundary_is_read`
+  uses a barrier to prove a committed prompt wins over `finish`; a send after
+  closure is rejected.
+- `tests/test_agent.py::test_pending_task_or_child_notification_rejects_finish`
+  barrier-tests both pending and claimed notification delivery.
+- `tests/test_agent.py::test_terminal_fence_follow_up_wins_timeout_capacity_cancel_and_recovery_races`
+  barrier-tests queue closure and deterministic delivery outcomes for every
+  harness-owned terminal transition.
 - `tests/test_agent.py::test_explicit_finish_refuses_owned_work_until_clear`
-  verifies task/child refusal, cancellation, and descendant handoff.
+  covers task/child refusal, cancellation, and descendant handoff.
+- `tests/test_agent.py::test_idle_timeout_pauses_for_owned_task_and_child_agent`
+  covers both ownership types, no cancellation or implicit handoff, and timeout
+  only after ownership clears and its notification is read.
+- `tests/test_agent.py::test_idle_capacity_excludes_owned_task_and_child_agent`
+  covers both ownership types and newest-child admission only after they clear.
+- `tests/test_agent.py::test_explicit_finish_twice_rejects_second_call` and
+  `tests/test_agent.py::test_tool_call_after_successful_finish_is_rejected`
+  close the same-turn protocol after one accepted report.
+- `tests/test_agent.py::test_provider_error_after_successful_finish_keeps_report`
+  proves the durable explicit report outranks a later stream failure; the
+  existing pre-acceptance provider-error test proves the opposite boundary.
+- `tests/test_agent_receipt.py::test_explicit_finish_multibyte_summary_fits_exact_envelope_limit`
+  checks utf-8-safe trimming and both summary representations at the persisted
+  byte limit.
+- `tests/test_context_eviction.py::test_notification_receipt_preserves_finish_head_sha_and_verdict`
+  verifies exact scalar recovery after eviction and summary digest/recall when
+  text does not fit.
 - `tests/test_background.py::test_explicit_finish_task_safety_deadline_kills_and_wakes`
-  verifies the single 3,600-second task deadline and killed-task metadata.
-- `tests/test_agent.py::test_idle_timeout_auto_finishes_blocked_with_last_text`
-  verifies the 30-minute reset rules and bounded synthesized report.
-- `tests/test_agent.py::test_idle_capacity_auto_finishes_newest_child`
-  verifies the 16-child cap without evicting an older child.
-- `tests/test_agent.py::test_explicit_finish_provider_error_fails_without_idle`
-  verifies exhausted retries, failed receipt, and task cleanup.
-- `tests/test_agent.py::test_explicit_finish_cancel_wins_before_publication`
-  verifies cancellation ordering and cleanup.
-- `tests/test_agent.py::test_idle_child_parent_exit_recovers_as_canceled`
-  verifies no rehydration and durable inspection data.
-- `tests/test_agents.py::test_explicit_finish_requires_global_and_profile_opt_in`
-  verifies the eligibility matrix, catalog snapshot, and foreground exclusion.
-- `tests/test_settings.py::test_project_cannot_enable_explicit_finish`
-  verifies global-only experimental control and default false.
-- `tests/test_tui.py::test_idle_agent_card_and_status_remain_live`
-  verifies `agent_status`, tui state, idle duration, and follow-up eligibility.
-- existing finish-gate tests remain unchanged for legacy profiles; new deletion
-  tests prove opted-in runs never enter `run_finish_gate`.
+  covers the single 3,600-second task deadline and killed-task metadata.
+- `tests/test_agent.py::test_explicit_finish_cancel_wins_before_acceptance` and
+  `tests/test_agent.py::test_idle_child_restart_recovers_as_canceled` cover the
+  shared fence, cleanup, and v1 no-rehydration rule.
+- `tests/test_agents.py::test_explicit_finish_requires_global_and_profile_opt_in`,
+  `tests/test_settings.py::test_project_cannot_enable_explicit_finish`, and
+  `tests/test_tui.py::test_idle_agent_card_and_status_remain_live` cover rollout
+  eligibility, configuration, and inspection.
+- existing finish-gate tests remain unchanged for legacy profiles; an opted-in
+  regression proves those runs never enter `run_finish_gate`.
 
 ## open questions
 
-1. is 30 minutes the correct initial idle timeout for phoebe, or should the
-   experiment start at 60 minutes to favor follow-up continuity?
-2. is 16 idle children per root tree an acceptable cap for phoebe's normal
-   orchestration fan-out?
-3. should `blocked` be a successful transport receipt as proposed, or should it
-   set `isError: true` even though the agent reported normally?
-4. after the phoebe trial, should restart rehydration be designed before the
-   protocol becomes the default, or can cancellation-on-restart remain the
-   permanent rule?
+1. **pending user confirmation:** use a 60-minute idle timeout for the phoebe
+   trial to favor follow-up continuity?
+2. **pending user confirmation:** cap idle children at 16 per root tree, reject
+   the newest excess admission, and exclude children with owned descendants?
