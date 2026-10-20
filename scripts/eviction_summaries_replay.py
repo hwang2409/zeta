@@ -260,7 +260,7 @@ def _kind_counts(
     }
     shown_keys = {
         request.key.as_string()
-        for message in shown_messages or messages
+        for message in (shown_messages if shown_messages is not None else messages)
         if message.metadata.get("summary_data") is not None
         and (request := receipt_summary_request(message, sources)) is not None
     }
