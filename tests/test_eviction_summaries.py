@@ -99,6 +99,7 @@ def _compacted_tool_batch(
     attached_result: bool = False,
     extra_text: str | None = None,
     marker: str | None = None,
+    marker_first: bool = False,
     arguments: dict | None = None,
     include_result: bool = True,
 ) -> list[tuple[int, Message]]:
@@ -115,9 +116,10 @@ def _compacted_tool_batch(
         ),
     ]
     if marker != "missing":
-        content.append(
-            TextContent(marker or f"[assistant reasoning evicted · seq {seq}]")
+        marker_content = TextContent(
+            marker or f"[assistant reasoning evicted · seq {seq}]"
         )
+        content.insert(0, marker_content) if marker_first else content.append(marker_content)
     if extra_text is not None:
         content.append(TextContent(extra_text))
     message = Message(
@@ -170,7 +172,7 @@ def test_reserve_can_fold_compacted_tool_batches_below_summary_target() -> None:
     assert folded.records[0][1].metadata.get("eviction_range") is True
 
 
-def test_reserve_fold_stops_once_reserve_target_is_met() -> None:
+def test_reserve_fold_stops_once_reserve_target_is_met(tmp_path) -> None:
     import zeta.context_eviction as eviction
 
     records = []
@@ -197,7 +199,9 @@ def test_reserve_fold_stops_once_reserve_target_is_met() -> None:
         fixed_tokens=0,
         target_tokens=before - first_saving,
         token_counter=message_token_count,
-        summary_reserve_pass=True,
+        source_messages=dict(records),
+        summary_cache=SummaryCache(tmp_path),
+        summary_target_tokens=before - first_saving,
     )
 
     assert sum(message.metadata.get("eviction_range") is True for message in result.messages) == 1
@@ -212,6 +216,7 @@ def test_reserve_fold_stops_once_reserve_target_is_met() -> None:
         ("attached result", {"attached_result": True}, lambda _seq: True),
         ("extra text", {"extra_text": "extra"}, lambda _seq: True),
         ("wrong marker", {"marker": "[wrong]"}, lambda _seq: True),
+        ("marker first", {"marker_first": True}, lambda _seq: True),
         ("missing marker", {"marker": "missing"}, lambda _seq: True),
         ("wrong arguments", {"arguments": {"wrong": True}}, lambda _seq: True),
         ("incomplete result", {"include_result": False}, lambda _seq: True),
@@ -277,6 +282,63 @@ def test_reserve_counts_items_evicted_by_the_second_pass(tmp_path) -> None:
     assert shown
 
 
+def test_reserve_fold_counts_summaries_of_ranges_it_creates(tmp_path) -> None:
+    records = []
+    for start in range(1, 61, 5):
+        records.extend(_compacted_tool_batch(start))
+        records.extend(_compacted_tool_batch(start + 2))
+        records.append((start + 4, Message(MessageRole.SYSTEM, [TextContent("keep")])))
+    sources = {
+        seq: Message(message.role, [TextContent("source " * 300)])
+        for seq, message in records
+    }
+    target = 3_600
+    cache = SummaryCache(tmp_path)
+    off = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=sources,
+    )
+    result = off
+    for _ in range(4):
+        result = evict_messages(
+            records,
+            fixed_tokens=0,
+            target_tokens=target,
+            token_counter=message_token_count,
+            source_messages=sources,
+            summary_cache=cache,
+            summaries_enabled=True,
+        )
+        for message in result.messages:
+            if (request := receipt_summary_request(message, sources)) is not None:
+                asyncio.run(cache.put(request.key, "summary " * 8))
+        for request in result.summary_misses:
+            asyncio.run(cache.put(request.key, "summary " * 8))
+
+    ready = [
+        request
+        for message in result.messages
+        if (request := receipt_summary_request(message, sources)) is not None
+        and cache.get(request.key) is not None
+    ]
+    shown = sum(
+        message.metadata.get("summary_data") is not None for message in result.messages
+    )
+    deterministic_tokens = sum(
+        message_token_count(normalize_receipt(message)) for message in result.messages
+    )
+    growth = replay_script._ready_decoration_growth(result.messages, sources, cache)
+    needed = max(0, growth - (target - off.tokens_after))
+    largest_fold = replay_script._largest_new_range_saving(off, result)
+
+    assert shown == len(ready)
+    assert result.tokens_after <= target
+    assert off.tokens_after - deterministic_tokens <= needed + largest_fold
+
+
 def test_eviction_result_reports_reserve_tokens(tmp_path) -> None:
     records = _separated_assistants(20)
     cache = _ready_cache(tmp_path, records, "summary " * 10)
@@ -288,21 +350,22 @@ def test_eviction_result_reports_reserve_tokens(tmp_path) -> None:
 def test_reserve_capped_at_ten_percent_of_target(tmp_path, monkeypatch) -> None:
     records = _separated_assistants(20)
     cache = _ready_cache(tmp_path, records, "summary " * 40)
-    targets = []
+    passes = []
     import zeta.context_eviction as eviction
 
     deterministic = eviction._evict_deterministic
 
     def wrapped(*args, **kwargs):
+        result = deterministic(*args, **kwargs)
         if kwargs["target_tokens"] > 0:
-            targets.append(kwargs["target_tokens"])
-        return deterministic(*args, **kwargs)
+            passes.append((kwargs["target_tokens"], result.tokens_after))
+        return result
 
     monkeypatch.setattr(eviction, "_evict_deterministic", wrapped)
     _evict(records, cache, enabled=True, target=500)
-    assert len(targets) <= 2
-    if len(targets) == 2:
-        assert targets[1] == 450
+    assert len(passes) <= 2
+    if len(passes) == 2:
+        assert passes[1][0] == max(0, passes[0][1] - 50)
 
 
 def test_no_ready_summaries_is_byte_identical_to_disabled(tmp_path) -> None:

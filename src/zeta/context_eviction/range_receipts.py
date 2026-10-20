@@ -225,23 +225,28 @@ def _receipt_unit(
 
 
 def _is_compacted_tool_call_receipt(message: Message, seq: int) -> bool:
+    marker = f"[assistant reasoning evicted · seq {seq}]"
+    if (
+        not message.content
+        or not isinstance(message.content[-1], TextContent)
+        or message.content[-1].text != marker
+    ):
+        return False
     calls = [
         block.tool_call
-        for block in message.content
+        for block in message.content[:-1]
         if isinstance(block, ToolUseContent)
     ]
-    text = [block.text for block in message.content if isinstance(block, TextContent)]
     return (
         message.role is MessageRole.ASSISTANT
         and message.tool_result is None
         and message.metadata == {"context_evicted": True, "source_seq": seq}
+        and len(calls) == len(message.content) - 1
         and bool(calls)
         and all(
             call.arguments == {"eviction_receipt": {"source_seq": seq}}
             for call in calls
         )
-        and text == [f"[assistant reasoning evicted · seq {seq}]"]
-        and len(message.content) == len(calls) + 1
     )
 
 

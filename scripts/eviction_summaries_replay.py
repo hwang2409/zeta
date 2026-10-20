@@ -175,15 +175,12 @@ async def _enabled_pass(
     )
 
 
-async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]:
-    records, sources, target = _inputs(session_dir)
-    off = evict_messages(
-        records, fixed_tokens=0, target_tokens=target, source_messages=sources
-    )
-    cache = _MemoryCache()
-    worker = EvictionSummaryWorker(cache, _provider(model, offline=offline))
-    for request in eviction_summary_candidates(records):
-        worker.admit(request)
+async def _converge_enabled_view(
+    worker: EvictionSummaryWorker,
+    records: list[tuple[int, Message]],
+    sources: dict[int, Message],
+    target: int,
+) -> Any:
     on = await _enabled_pass(worker, records, sources, target)
     for _ in range(3):
         for message in on.messages:
@@ -193,9 +190,21 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
             worker.admit(request)
         next_on = await _enabled_pass(worker, records, sources, target)
         if next_on.source_seqs == on.source_seqs and next_on.tokens_after == on.tokens_after:
-            on = next_on
-            break
+            return next_on
         on = next_on
+    return on
+
+
+async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]:
+    records, sources, target = _inputs(session_dir)
+    off = evict_messages(
+        records, fixed_tokens=0, target_tokens=target, source_messages=sources
+    )
+    cache = _MemoryCache()
+    worker = EvictionSummaryWorker(cache, _provider(model, offline=offline))
+    for request in eviction_summary_candidates(records):
+        worker.admit(request)
+    on = await _converge_enabled_view(worker, records, sources, target)
     await worker.close()
     requests = [
         (message, request)
@@ -222,7 +231,7 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
         "feature_on": on_view,
         "off_selected_count": len(off_view["selected_seqs"]),
         "on_selected_count": len(on_view["selected_seqs"]),
-        "extra_evicted_tokens": off.tokens_after - on.tokens_after,
+        "extra_evicted_tokens": off.tokens_after - deterministic_tokens,
         "reserve_tokens": on.reserve_tokens,
         "largest_single_fold_saving": largest_single_fold_saving,
         "reserve_bound": on.reserve_tokens + largest_single_fold_saving,

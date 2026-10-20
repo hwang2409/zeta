@@ -20,6 +20,7 @@ from ..protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from . import summary_reserve
 from .receipt_constructors import (
     RECEIPT_KIND_METADATA as RECEIPT_KIND_METADATA,
 )
@@ -41,7 +42,6 @@ from .summary_receipts import (  # noqa: F401
 from .summary_receipts import (
     eviction_summary_candidates as _project_summary_candidates,
 )
-from .summary_reserve import estimate_summary_reserve, finalize_summaries
 from .token_estimates import estimated_text_tokens, estimated_tokens  # noqa: F401
 
 EVICTION_KIND = "evict"
@@ -186,28 +186,29 @@ def evict_messages(
         "summaries_enabled": summaries_enabled,
     }
     result = _evict_deterministic(records, target_tokens=target_tokens, **arguments)
+    first_pass_tokens = result.tokens_after
     reserve = 0
     if summaries_enabled and summary_cache is not None and source_messages is not None and result.reached_target:
-        reserve = estimate_summary_reserve(
-            result.messages,
-            current_tokens=result.tokens_after,
-            target_tokens=target_tokens,
-            token_counter=token_counter,
-            source_messages=source_messages,
-            summary_cache=summary_cache,
+        reserve = summary_reserve.estimate_summary_reserve(
+            result.messages, result.tokens_after, target_tokens, token_counter,
+            source_messages, summary_cache,
         )
         if reserve:
             result = _evict_deterministic(
                 records,
-                target_tokens=target_tokens - reserve,
-                summary_reserve_pass=True,
+                target_tokens=max(0, first_pass_tokens - target_tokens // 10),
+                summary_target_tokens=target_tokens,
                 **arguments,
+            )
+            reserve = summary_reserve.estimate_summary_reserve(
+                result.messages, first_pass_tokens, target_tokens, token_counter,
+                source_messages, summary_cache,
             )
     reached_target = result.reached_target if not reserve else True
     misses = result.summary_misses
     messages, tokens_after = result.messages, result.tokens_after
     if summaries_enabled and summary_cache is not None and source_messages is not None:
-        messages, tokens_after, misses = finalize_summaries(
+        messages, tokens_after, misses = summary_reserve.finalize_summaries(
             messages,
             reached_target=reached_target,
             fixed_tokens=fixed_tokens,
@@ -232,7 +233,7 @@ def _evict_deterministic(
     source_messages: Mapping[int, Message] | None = None,
     summary_cache: SummaryCache | None = None,
     summaries_enabled: bool = False,
-    summary_reserve_pass: bool = False,
+    summary_target_tokens: int | None = None,
 ) -> EvictionResult:
     """Replace old re-derivable results with bounded semantic digests.
 
@@ -255,20 +256,21 @@ def _evict_deterministic(
         changed.update(regenerated)
     from .range_receipts import range_receipt_candidate
 
-    running_total = (
-        fixed_tokens + sum(token_counter(message) for _, message in records)
-        if summary_reserve_pass
-        else 0
-    )
-
-    def stop_after_reserve_fold(
-        originals: Sequence[tuple[int, Message]], candidates: Sequence[Message]
-    ) -> bool:
-        nonlocal running_total
-        running_total += sum(map(token_counter, candidates)) - sum(
-            token_counter(message) for _, message in originals
+    reserve_tracker = (
+        summary_reserve.ReserveFoldTracker(
+            messages,
+            fixed_tokens=fixed_tokens,
+            target_tokens=summary_target_tokens,
+            cap_tokens=target_tokens,
+            token_counter=token_counter,
+            source_messages=source_messages,
+            summary_cache=summary_cache,
         )
-        return running_total <= target_tokens
+        if summary_target_tokens is not None
+        and source_messages is not None
+        and summary_cache is not None
+        else None
+    )
 
     range_candidate = range_receipt_candidate(
         records,
@@ -277,8 +279,8 @@ def _evict_deterministic(
             sum(token_counter(message) for _, message in originals),
             sum(map(token_counter, candidates)),
         ),
-        compacted_tool_calls=summary_reserve_pass,
-        stop_after_fold=stop_after_reserve_fold if summary_reserve_pass else None,
+        compacted_tool_calls=reserve_tracker is not None,
+        stop_after_fold=reserve_tracker,
     )
     if range_candidate.coalesced_source_seqs:
         records = range_candidate.records
@@ -314,7 +316,7 @@ def _evict_deterministic(
     def finish(reached: bool) -> EvictionResult:
         return _result(records, messages, changed, before, running_total, reached)
 
-    if summary_reserve_pass and running_total <= target_tokens:
+    if reserve_tracker is not None and reserve_tracker.done:
         return finish(True)
 
     for index, (seq, _) in enumerate(records):
@@ -464,14 +466,16 @@ def _evict_deterministic(
                 sum(token_counter(message) for _, message in originals),
                 sum(map(token_counter, candidates)),
             ),
-            compacted_tool_calls=summary_reserve_pass,
-            stop_after_fold=stop_after_reserve_fold if summary_reserve_pass else None,
+            compacted_tool_calls=reserve_tracker is not None,
+            stop_after_fold=reserve_tracker,
         )
         if range_candidate.coalesced_source_seqs:
             records = range_candidate.records
             messages = [message for _, message in records]
             changed.update(range_candidate.coalesced_source_seqs)
             running_total = fixed_tokens + sum(map(token_counter, messages))
+            if reserve_tracker is not None and reserve_tracker.done:
+                return finish(True)
 
     if source_messages is not None and running_total > target_tokens:
         # The global fold is only a fallback after ordinary eviction remains over target.
@@ -482,7 +486,7 @@ def _evict_deterministic(
             records,
             allows=eligibility.allows,
             coarse=True,
-            compacted_tool_calls=summary_reserve_pass,
+            compacted_tool_calls=reserve_tracker is not None,
             is_smaller=lambda originals, candidates: _strictly_smaller(
                 sum(token_counter(message) for _, message in originals),
                 sum(map(token_counter, candidates)),
