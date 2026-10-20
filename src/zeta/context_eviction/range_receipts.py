@@ -35,9 +35,7 @@ def range_receipt_candidate(
     is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
     coarse: bool = False,
     compacted_tool_calls: bool = False,
-    stop_after_fold: Callable[
-        [Sequence[tuple[int, Message]], Sequence[Message]], bool
-    ]
+    stop_after_fold: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool]
     | None = None,
 ) -> RangeCandidate:
     """Coalesce receipt exchanges, or globally fold eligible old records."""
@@ -70,7 +68,11 @@ def range_receipt_candidate(
         else:
             output.extend(flattened)
         run.clear()
-        return folded is not None and stop_after_fold is not None and stop_after_fold(flattened, folded)
+        return (
+            folded is not None
+            and stop_after_fold is not None
+            and stop_after_fold(flattened, folded)
+        )
 
     while index < len(records):
         unit, next_index = _receipt_unit(
@@ -83,11 +85,7 @@ def range_receipt_candidate(
             output.append(records[index])
             index += 1
             continue
-        if (
-            run
-            and unit.records[0][0] != run[-1].records[-1][0] + 1
-            and flush()
-        ):
+        if run and unit.records[0][0] != run[-1].records[-1][0] + 1 and flush():
             output.extend(records[index:])
             return RangeCandidate(output, frozenset(coalesced))
         run.append(unit)
@@ -191,7 +189,9 @@ def _receipt_unit(
     ]
     if calls:
         if any(not isinstance(block, ToolUseContent) for block in message.content):
-            if not compacted_tool_calls or not _is_compacted_tool_call_receipt(message, seq):
+            if not compacted_tool_calls or not _is_compacted_tool_call_receipt(
+                message, seq
+            ):
                 return None, index + 1
         elif not _is_receipt_kind(message, seq, "tool_call"):
             return None, index + 1

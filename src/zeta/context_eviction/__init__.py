@@ -129,8 +129,7 @@ def catch_up_summary_candidates(
             records, evictable_source_seqs=eligibility.evictable_source_seqs
         )
         if any(
-            start <= request.key.seq_start <= end
-            for start, end in covered_intervals
+            start <= request.key.seq_start <= end for start, end in covered_intervals
         )
     )
 
@@ -176,50 +175,16 @@ def evict_messages(
     summary_cache: SummaryCache | None = None,
     summaries_enabled: bool = False,
 ) -> EvictionResult:
-    token_counter = token_counter or estimated_tokens
-    arguments = {
-        "fixed_tokens": fixed_tokens,
-        "token_counter": token_counter,
-        "unconsumed_source_seqs": unconsumed_source_seqs,
-        "source_messages": source_messages,
-        "summary_cache": summary_cache,
-        "summaries_enabled": summaries_enabled,
-    }
-    result = _evict_deterministic(records, target_tokens=target_tokens, **arguments)
-    first_pass_tokens = result.tokens_after
-    reserve = 0
-    if summaries_enabled and summary_cache is not None and source_messages is not None and result.reached_target:
-        reserve = summary_reserve.estimate_summary_reserve(
-            result.messages, result.tokens_after, target_tokens, token_counter,
-            source_messages, summary_cache,
-        )
-        if reserve:
-            result = _evict_deterministic(
-                records,
-                target_tokens=max(0, first_pass_tokens - target_tokens // 10),
-                summary_target_tokens=target_tokens,
-                **arguments,
-            )
-            reserve = summary_reserve.estimate_summary_reserve(
-                result.messages, first_pass_tokens, target_tokens, token_counter,
-                source_messages, summary_cache,
-            )
-    reached_target = result.reached_target if not reserve else True
-    misses = result.summary_misses
-    messages, tokens_after = result.messages, result.tokens_after
-    if summaries_enabled and summary_cache is not None and source_messages is not None:
-        messages, tokens_after, misses = summary_reserve.finalize_summaries(
-            messages,
-            reached_target=reached_target,
-            fixed_tokens=fixed_tokens,
-            target_tokens=target_tokens,
-            token_counter=token_counter,
-            source_messages=source_messages,
-            summary_cache=summary_cache,
-        )
-    return EvictionResult(
-        messages, result.items_evicted, result.tokens_before, tokens_after,
-        reached_target, result.source_seqs, misses, reserve,
+    return summary_reserve.evict_messages(
+        records,
+        fixed_tokens=fixed_tokens,
+        target_tokens=target_tokens,
+        token_counter=token_counter or estimated_tokens,
+        unconsumed_source_seqs=unconsumed_source_seqs,
+        source_messages=source_messages,
+        summary_cache=summary_cache,
+        summaries_enabled=summaries_enabled,
+        deterministic_evict=_evict_deterministic,
     )
 
 

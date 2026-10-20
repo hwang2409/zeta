@@ -153,7 +153,10 @@ def _largest_new_range_saving(off: Any, on: Any) -> int:
             for seq, original in zip(off.source_seqs, off.messages, strict=True)
             if bounds[0] <= seq <= bounds[1]
         )
-        largest = max(largest, original_tokens - message_token_count(message))
+        largest = max(
+            largest,
+            original_tokens - message_token_count(normalize_receipt(message)),
+        )
     return largest
 
 
@@ -189,7 +192,10 @@ async def _converge_enabled_view(
         for request in on.summary_misses:
             worker.admit(request)
         next_on = await _enabled_pass(worker, records, sources, target)
-        if next_on.source_seqs == on.source_seqs and next_on.tokens_after == on.tokens_after:
+        if (
+            next_on.source_seqs == on.source_seqs
+            and next_on.tokens_after == on.tokens_after
+        ):
             return next_on
         on = next_on
     return on
@@ -240,7 +246,9 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
             "on": on.tokens_after - target,
         },
         "shown_rate": summary_count / eligible_receipts if eligible_receipts else 1.0,
-        "cache_ready_rate": len(ready) / eligible_receipts if eligible_receipts else 1.0,
+        "cache_ready_rate": len(ready) / eligible_receipts
+        if eligible_receipts
+        else 1.0,
         "queue_drops": worker.drops,
         "token_totals": {"off": off.tokens_after, "on": on.tokens_after},
         "eligible_receipts": eligible_receipts,

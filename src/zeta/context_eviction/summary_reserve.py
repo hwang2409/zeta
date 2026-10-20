@@ -1,10 +1,89 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import replace
+from typing import Any
 
 from ..protocol.types import Message
 from .summaries import SummaryCache, SummaryRequest
 from .summary_receipts import decorate_receipt, receipt_summary_request
+
+
+def evict_messages(
+    records: Sequence[tuple[int, Message]],
+    *,
+    fixed_tokens: int,
+    target_tokens: int,
+    token_counter: Callable[[Message], int],
+    unconsumed_source_seqs: Collection[int],
+    source_messages: Mapping[int, Message] | None,
+    summary_cache: SummaryCache | None,
+    summaries_enabled: bool,
+    deterministic_evict: Callable[..., Any],
+) -> Any:
+    """Run deterministic eviction and at most one summary-reserve pass."""
+    arguments = {
+        "fixed_tokens": fixed_tokens,
+        "token_counter": token_counter,
+        "unconsumed_source_seqs": unconsumed_source_seqs,
+        "source_messages": source_messages,
+        "summary_cache": summary_cache,
+        "summaries_enabled": summaries_enabled,
+    }
+    result = deterministic_evict(records, target_tokens=target_tokens, **arguments)
+    first_pass_tokens = result.tokens_after
+    reserve = 0
+    summaries_ready = (
+        summaries_enabled
+        and summary_cache is not None
+        and source_messages is not None
+        and result.reached_target
+    )
+    if summaries_ready:
+        reserve = estimate_summary_reserve(
+            result.messages,
+            result.tokens_after,
+            target_tokens,
+            token_counter,
+            source_messages,
+            summary_cache,
+        )
+        if reserve:
+            result = deterministic_evict(
+                records,
+                target_tokens=max(0, first_pass_tokens - target_tokens // 10),
+                summary_target_tokens=target_tokens,
+                **arguments,
+            )
+            reserve = estimate_summary_reserve(
+                result.messages,
+                first_pass_tokens,
+                target_tokens,
+                token_counter,
+                source_messages,
+                summary_cache,
+            )
+    reached_target = result.reached_target if not reserve else True
+    misses = result.summary_misses
+    messages, tokens_after = result.messages, result.tokens_after
+    if summaries_enabled and summary_cache is not None and source_messages is not None:
+        messages, tokens_after, misses = finalize_summaries(
+            messages,
+            reached_target=reached_target,
+            fixed_tokens=fixed_tokens,
+            target_tokens=target_tokens,
+            token_counter=token_counter,
+            source_messages=source_messages,
+            summary_cache=summary_cache,
+        )
+    return replace(
+        result,
+        messages=messages,
+        tokens_after=tokens_after,
+        reached_target=reached_target,
+        summary_misses=misses,
+        reserve_tokens=reserve,
+    )
 
 
 def ready_decoration_growth(
@@ -139,7 +218,11 @@ def finalize_summaries(
         )
         decorated_tokens = token_counter(decorated)
         next_total = running_total - token_counter(message) + decorated_tokens
-        if decorated_tokens < original_tokens and reached_target and next_total <= target_tokens:
+        if (
+            decorated_tokens < original_tokens
+            and reached_target
+            and next_total <= target_tokens
+        ):
             finalized[index] = decorated
             running_total = next_total
     return finalized, running_total, tuple(misses)

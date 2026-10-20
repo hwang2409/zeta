@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -119,7 +120,9 @@ def _compacted_tool_batch(
         marker_content = TextContent(
             marker or f"[assistant reasoning evicted · seq {seq}]"
         )
-        content.insert(0, marker_content) if marker_first else content.append(marker_content)
+        content.insert(0, marker_content) if marker_first else content.append(
+            marker_content
+        )
     if extra_text is not None:
         content.append(TextContent(extra_text))
     message = Message(
@@ -151,20 +154,16 @@ def _fold_compacted(records, *, allows=lambda _seq: True):
     return range_receipt_candidate(
         records,
         allows=allows,
-        is_smaller=lambda originals, candidates: sum(
-            message_token_count(message) for _, message in originals
-        )
-        > sum(map(message_token_count, candidates)),
+        is_smaller=lambda originals, candidates: (
+            sum(message_token_count(message) for _, message in originals)
+            > sum(map(message_token_count, candidates))
+        ),
         compacted_tool_calls=True,
     )
 
 
 def test_reserve_can_fold_compacted_tool_batches_below_summary_target() -> None:
-    records = [
-        record
-        for seq in (1, 3)
-        for record in _compacted_tool_batch(seq)
-    ]
+    records = [record for seq in (1, 3) for record in _compacted_tool_batch(seq)]
 
     folded = _fold_compacted(records)
 
@@ -190,7 +189,10 @@ def test_reserve_fold_stops_once_reserve_target_is_met(tmp_path) -> None:
     for start in (0, 5, 10):
         folded = _fold_compacted(records[start : start + 4])
         fold_savings.append(
-            sum(message_token_count(message) for _, message in records[start : start + 4])
+            sum(
+                message_token_count(message)
+                for _, message in records[start : start + 4]
+            )
             - sum(message_token_count(message) for _, message in folded.records)
         )
 
@@ -204,7 +206,13 @@ def test_reserve_fold_stops_once_reserve_target_is_met(tmp_path) -> None:
         summary_target_tokens=before - first_saving,
     )
 
-    assert sum(message.metadata.get("eviction_range") is True for message in result.messages) == 1
+    assert (
+        sum(
+            message.metadata.get("eviction_range") is True
+            for message in result.messages
+        )
+        == 1
+    )
     assert before - result.tokens_after <= first_saving + max(fold_savings)
 
 
@@ -606,6 +614,39 @@ def test_enriched_receipt_uses_actual_token_count_for_target(tmp_path) -> None:
     result = _evict([record], cache, enabled=True, target=100)
     assert result.tokens_after == message_token_count(result.messages[0])
     assert result.source_seqs == (1,)
+
+
+def test_replay_fold_bound_uses_deterministic_range_receipt(tmp_path) -> None:
+    records = _separated_assistants(10)
+    cache = SummaryCache(tmp_path)
+    for request in eviction_summary_candidates(records):
+        asyncio.run(cache.put(request.key, "summary " * 40))
+    off = _evict(records, target=800)
+    on = _evict(records, cache, enabled=True, target=800)
+    range_receipt = next(
+        message for message in on.messages if message.metadata.get("eviction_range")
+    )
+    decorated_range = decorate_receipt(range_receipt, "summary " * 40)
+    on = replace(
+        on,
+        messages=[
+            decorated_range if message is range_receipt else message
+            for message in on.messages
+        ],
+    )
+    bounds = (
+        decorated_range.metadata["source_seq"],
+        decorated_range.metadata["range_seq_end"],
+    )
+    original_tokens = sum(
+        message_token_count(message)
+        for seq, message in zip(off.source_seqs, off.messages, strict=True)
+        if bounds[0] <= seq <= bounds[1]
+    )
+
+    assert replay_script._largest_new_range_saving(off, on) == (
+        original_tokens - message_token_count(normalize_receipt(decorated_range))
+    )
 
 
 def test_enriched_receipts_normalize_across_materialized_passes(tmp_path) -> None:

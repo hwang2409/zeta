@@ -1,4 +1,5 @@
 """Canonical source projection and reversible eviction-receipt decoration."""
+
 from __future__ import annotations
 
 import json
@@ -72,8 +73,10 @@ def _decorate_text(text: str, summary: str, *, kind: str) -> str:
 
 def decorate_receipt(message: Message, summary: str | None) -> Message:
     """Decorate one receipt reversibly without changing canonical metadata."""
-    if not summary or not valid_summary(summary) or not message.metadata.get(
-        "context_evicted"
+    if (
+        not summary
+        or not valid_summary(summary)
+        or not message.metadata.get("context_evicted")
     ):
         return message
     kind = str(message.metadata.get(RECEIPT_KIND_METADATA, ""))
