@@ -17,6 +17,7 @@ import scripts.eviction_summaries_replay as replay_script
 from zeta.context_accounting import message_token_count
 from zeta.context_eviction import (
     _structured_result_receipt,
+    catch_up_summary_candidates,
     decorate_receipt,
     evict_messages,
     eviction_summary_candidates,
@@ -1233,7 +1234,73 @@ def test_ranges_keep_strict_smaller_and_256_minimum(tmp_path) -> None:
     assert finalized[0].metadata.get("summary_data") is None
 
 
-def test_agent_output_results_are_never_summarized() -> None:
+def test_small_ranges_are_decorated_before_standalone_items_when_reserve_binds(
+    tmp_path,
+) -> None:
+    range_records = [_assistant(1, "range " * 160), _assistant(2, "range " * 160)]
+    standalone_record = _assistant(10, "standalone " * 120)
+    range_receipt = _evict(range_records, target=1).messages[0]
+    standalone_receipt = _evict([standalone_record], target=1).messages[0]
+    sources = dict([*range_records, standalone_record])
+    cache = SummaryCache(tmp_path)
+    for receipt in (range_receipt, standalone_receipt):
+        request = receipt_summary_request(receipt, sources)
+        assert request is not None
+        asyncio.run(cache.put(request.key, "useful summary"))
+
+    def counter(message):
+        if message.metadata.get("summary_data") is not None:
+            return 20
+        if message in sources.values():
+            return 100
+        return 10
+
+    finalized, _, _ = finalize_summaries(
+        [range_receipt, standalone_receipt],
+        reached_target=True,
+        fixed_tokens=80,
+        target_tokens=110,
+        token_counter=counter,
+        source_messages=sources,
+        summary_cache=cache,
+    )
+
+    assert range_receipt.metadata["source_seq"] == 1
+    assert standalone_receipt.metadata["source_seq"] == 10
+    assert finalized[0].metadata.get("summary_data") == "useful summary"
+    assert finalized[1].metadata.get("summary_data") is None
+
+
+def test_agent_start_ack_receipt_is_not_summarized() -> None:
+    agent_call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("agent-1", "agent", {"task": "review"}))],
+    )
+    agent_result = Message(
+        MessageRole.USER,
+        tool_result=ToolResult("agent-1", "background agent started " * 100),
+    )
+    output_call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("task-1", "task_output", {"task_id": "task-1"}))],
+    )
+    output_result = Message(
+        MessageRole.USER,
+        tool_result=ToolResult("task-1", "task completed with verdict " * 100),
+    )
+
+    requests = eviction_summary_candidates(
+        [(1, agent_call), (2, agent_result), (3, output_call), (4, output_result)]
+    )
+
+    assert len(requests) == 1
+    assert requests[0].key.kind == "orchestration"
+    assert requests[0].key.seq_start == 4
+    assert "task completed with verdict" in requests[0].source
+    assert "background agent started" not in requests[0].source
+
+
+def test_agent_output_never_reaches_summary_by_any_path() -> None:
     output_call = Message(
         MessageRole.ASSISTANT,
         [ToolUseContent(ToolCall("output-1", "agent_output", {"task": "review"}))],
@@ -1241,8 +1308,13 @@ def test_agent_output_results_are_never_summarized() -> None:
     output_result = Message(
         MessageRole.USER,
         tool_result=ToolResult("output-1", "untrusted agent output text " * 300),
+        metadata={
+            "zeta_event": "agent_notifications",
+            "notifications": [{"kind": "agent_completion"}],
+        },
     )
-    assert eviction_summary_candidates([(1, output_call), (2, output_result)]) == ()
+    output_records = [(1, output_call), (2, output_result)]
+    assert eviction_summary_candidates(output_records) == ()
     output_receipt = Message(
         MessageRole.ASSISTANT,
         [TextContent("[range evicted · seq 1-2]")],
@@ -1253,10 +1325,9 @@ def test_agent_output_results_are_never_summarized() -> None:
             "eviction_receipt": "range",
         },
     )
-    assert (
-        receipt_summary_request(output_receipt, {1: output_call, 2: output_result})
-        is None
-    )
+    output_sources = dict(output_records)
+    assert receipt_summary_request(output_receipt, output_sources) is None
+    assert catch_up_summary_candidates(output_records, [output_receipt]) == ()
 
     agent_call = Message(
         MessageRole.ASSISTANT,
@@ -1281,6 +1352,75 @@ def test_agent_output_results_are_never_summarized() -> None:
     mixed_request = receipt_summary_request(mixed_receipt, mixed_sources)
     assert mixed_request is not None
     assert "untrusted agent output text" not in mixed_request.source
+
+
+def test_replay_incremental_markers_reports_each_marker(tmp_path) -> None:
+    root = tmp_path / "sessions"
+    store = ConversationStore(root, session_id="incremental")
+    first = store.append_message(_assistant(1)[1])
+    first_receipt = _evict([(first.seq, _assistant(1)[1])], target=1).messages[0]
+    first_marker = store.append_compaction_marker(
+        "evicted",
+        first.seq,
+        first.seq,
+        kind="evict",
+        view=[{"seq": first.seq, "message": first_receipt.to_dict()}],
+    )
+    second = store.append_message(_assistant(2)[1])
+    second_records = [(first.seq, _assistant(1)[1]), (second.seq, _assistant(2)[1])]
+    second_receipt = _evict(second_records, target=1).messages[0]
+    store.append_compaction_marker(
+        "evicted again",
+        first.seq,
+        second.seq,
+        replaces=[first_marker.id],
+        kind="evict",
+        view=[{"seq": first.seq, "message": second_receipt.to_dict()}],
+    )
+    (store.session_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "compaction_budget": 1_000,
+                "system_prompt": "fixed system prompt",
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "incremental.json"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).parents[1] / "scripts/eviction_summaries_replay.py"),
+            str(store.session_dir),
+            "--out",
+            str(out),
+            "--offline",
+            "--offline-summary-tokens",
+            "80",
+            "--incremental-markers",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(out.read_text())
+    assert [marker["marker_seq"] for marker in result["markers"]] == [
+        first_marker.seq,
+        second.seq + 1,
+    ]
+    assert len(result["markers"]) == 2
+    assert result["totals"]["marker_count"] == 2
+    assert result["markers"][0]["fixed_tokens"] > 0
+    assert set(result["markers"][0]["kinds"]) == {
+        "assistant",
+        "orchestration",
+        "notification",
+        "range",
+        "coarse",
+    }
 
 
 def test_summary_instruction_asks_for_at_most_60_words() -> None:
