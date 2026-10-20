@@ -104,14 +104,15 @@ def test_mirror_edits_are_ignored_and_overwritten(tmp_path: Path) -> None:
         "authoritative\n"
     )
     assert registry.memory_digest(project_id) == digest_before_edit
-    workspace = Path(
-        registry.show_project(project_id).canonical_integration_root or ""
-    )
+    project = registry.show_project(project_id)
+    workspace = Path(project.canonical_integration_root or "")
     context = load_project_context(
         cwd=workspace,
         repo_root=workspace,
         zeta_home=registry.root.parent,
         catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
     )
     assert "authoritative" in context.system_prompt
     assert "local disk edit" not in context.system_prompt
