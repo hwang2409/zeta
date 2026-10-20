@@ -34,7 +34,15 @@ from .receipt_constructors import (
     _structured_result_receipt,
     _tool_call_receipt,
 )
-from .summaries import SummaryCache
+from .summaries import SummaryCache, SummaryRequest
+from .summary_receipts import (
+    decorate_receipt,
+    normalize_receipt,
+    receipt_summary_request,
+)
+from .summary_receipts import (
+    eviction_summary_candidates as _project_summary_candidates,
+)
 
 EVICTION_KIND = "evict"
 TARGET_RATIO = 0.55
@@ -77,6 +85,7 @@ class EvictionResult:
     tokens_after: int
     reached_target: bool
     source_seqs: tuple[int, ...] = field(default=(), compare=False)
+    summary_misses: tuple[SummaryRequest, ...] = field(default=(), compare=False)
 
 
 def estimated_text_tokens(text: str) -> int:
@@ -123,32 +132,89 @@ def normalize_evicted_tool_result(message: Message) -> Message:
     )
 
 
-def normalize_receipt(message: Message) -> Message:
-    """Restore the deterministic receipt kept in owned decoration metadata."""
-    text = message.metadata.get("eviction_deterministic_text")
-    if not isinstance(text, str):
-        return message
-    metadata = dict(message.metadata)
-    metadata.pop("summary_data", None)
-    metadata.pop("eviction_deterministic_text", None)
-    return Message(message.role, [TextContent(text)], tool_result=message.tool_result, metadata=metadata)
+def _finalize_summaries(
+    result: EvictionResult,
+    *,
+    fixed_tokens: int,
+    target_tokens: int,
+    token_counter: Callable[[Message], int],
+    source_messages: Mapping[int, Message] | None,
+    summary_cache: SummaryCache | None,
+    summaries_enabled: bool,
+) -> EvictionResult:
+    if not summaries_enabled or summary_cache is None or source_messages is None:
+        return result
+    messages = list(result.messages)
+    running_total = fixed_tokens + sum(map(token_counter, messages))
+    misses: list[SummaryRequest] = []
+    for index, message in enumerate(messages):
+        request = receipt_summary_request(message, source_messages)
+        if request is None:
+            continue
+        summary = summary_cache.get(request.key)
+        if summary is None:
+            if request.exact_range:
+                misses.append(request)
+            continue
+        decorated = decorate_receipt(message, summary)
+        original_tokens = sum(
+            token_counter(source)
+            for seq, source in source_messages.items()
+            if request.key.seq_start <= seq <= request.key.seq_end
+        )
+        decorated_tokens = token_counter(decorated)
+        next_total = running_total - token_counter(message) + decorated_tokens
+        if decorated_tokens < original_tokens and (
+            not result.reached_target or next_total <= target_tokens
+        ):
+            messages[index] = decorated
+            running_total = next_total
+    return EvictionResult(
+        messages, result.items_evicted, result.tokens_before, running_total,
+        result.reached_target, result.source_seqs, tuple(misses),
+    )
 
 
-def decorate_receipt(message: Message, summary: str | None) -> Message:
-    """Add only validated summary text, while retaining exact rollback data."""
-    if not summary or not valid_summary(summary) or not message.metadata.get("context_evicted"):
-        return message
-    text = "\\n".join(block.text for block in message.content if isinstance(block, TextContent))
-    metadata = dict(message.metadata)
-    metadata.setdefault("eviction_deterministic_text", text)
-    metadata["summary_data"] = summary
-    decorated = text + ("; summary_data=\\\"" + summary.replace('\\\"', '\\\\\\"') + "\\\"")
-    return Message(message.role, [TextContent(decorated)], tool_result=message.tool_result, metadata=metadata)
+def eviction_summary_candidates(
+    records: Sequence[tuple[int, Message]],
+    *,
+    unconsumed_source_seqs: Collection[int] = (),
+) -> tuple[SummaryRequest, ...]:
+    """Project covered single-item work through shared eviction eligibility."""
+    eligibility = _eviction_eligibility(records, unconsumed_source_seqs)
+    return _project_summary_candidates(
+        records, evictable_source_seqs=eligibility.evictable_source_seqs
+    )
 
 
-def valid_summary(value: str) -> bool:
-    from .summaries import valid_summary as _valid_summary
-    return _valid_summary(value)
+def store_summary_candidates(store: ConversationStore) -> tuple[SummaryRequest, ...]:
+    """Read one active branch and project its eligible single-item work."""
+    records = [
+        (entry.seq, Message.from_dict(entry.data["message"]))
+        for entry in store.replay()
+        if entry.type == "message"
+    ]
+    latest_assistant = max(
+        (
+            seq
+            for seq, message in records
+            if message.role is MessageRole.ASSISTANT
+            and message.metadata.get("zeta_event") != "agent_notifications"
+        ),
+        default=None,
+    )
+    unconsumed = {
+        seq
+        for seq, message in records
+        if (latest_assistant is None or seq > latest_assistant)
+        and (
+            message.tool_result is not None
+            or message.metadata.get("zeta_event") == "agent_notifications"
+        )
+    }
+    return eviction_summary_candidates(
+        records, unconsumed_source_seqs=unconsumed
+    )
 
 
 def evict_messages(
@@ -223,13 +289,15 @@ def evict_messages(
         return replace_many(((index, replacement),))
 
     def finish(reached: bool) -> EvictionResult:
-        result = _result(records, messages, changed, before, running_total, reached)
-        if summaries_enabled and summary_cache is not None and reached:
-            decorated = [decorate_receipt(message, message.metadata.get("summary_data")) for message in result.messages]
-            after = fixed_tokens + sum(token_counter(message) for message in decorated)
-            if after <= target_tokens:
-                return EvictionResult(decorated, result.items_evicted, before, after, reached, result.source_seqs)
-        return result
+        return _finalize_summaries(
+            _result(records, messages, changed, before, running_total, reached),
+            fixed_tokens=fixed_tokens,
+            target_tokens=target_tokens,
+            token_counter=token_counter,
+            source_messages=source_messages,
+            summary_cache=summary_cache,
+            summaries_enabled=summaries_enabled,
+        )
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -405,20 +473,7 @@ def evict_messages(
             changed.update(coarse_candidate.coalesced_source_seqs)
             running_total = fixed_tokens + sum(map(token_counter, messages))
 
-    result = _result(
-        records,
-        messages,
-        changed,
-        before,
-        running_total,
-        running_total <= target_tokens,
-    )
-    if summaries_enabled and summary_cache is not None and result.reached_target:
-        decorated = [decorate_receipt(message, message.metadata.get("summary_data")) for message in result.messages]
-        after = fixed_tokens + sum(token_counter(message) for message in decorated)
-        if after <= target_tokens:
-            return EvictionResult(decorated, result.items_evicted, before, after, result.reached_target, result.source_seqs)
-    return result
+    return finish(running_total <= target_tokens)
 
 
 def _evict_persisted_records(

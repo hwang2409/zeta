@@ -1,17 +1,19 @@
-"""Derived, asynchronous summaries for eviction receipts."""
+"""Asynchronous model summaries used only to decorate eviction receipts."""
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
+import os
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
+from ..core.session_files import atomic_publish_file, open_session_file
 from ..memory.safety import contains_secret, redact_secrets
 
 SUMMARY_INSTRUCTION = (
@@ -19,28 +21,33 @@ SUMMARY_INSTRUCTION = (
     "branches, sha prefixes, verdicts, blockers, dependencies, user decisions, "
     "and promises. output at most 512 utf-8 bytes.\n\n"
 )
-_PROMPT_VERSION = 1
-_RECORD_VERSION = 1
+PROMPT_VERSION = 1
+RECORD_VERSION = 1
+CACHE_NAME = "eviction-summaries.jsonl"
+MAX_CACHE_BYTES = 4 * 1024 * 1024
+_CONTROL = re.compile(
+    r"<\/?(?:tool|tool_call|tool_result|system|assistant|user)[^>]*>"
+    r"|ignore (?:all |any )?(?:previous|prior|above) instructions?"
+    r"|(?:system|developer)\s*(?:message|instruction)\s*:"
+    r"|you are now",
+    re.IGNORECASE,
+)
 
 
 def sanitize_source(source: str) -> str:
-    """Remove secrets and untrusted control markup before model input."""
+    """Redact secrets and remove model-control markup from model input."""
     value = redact_secrets(source)
-    value = re.sub(r"<\/?(?:tool|system|assistant|user)[^>]*>", " ", value, flags=re.IGNORECASE)
-    return value[:65536]
-
-
-def valid_summary(value: str) -> bool:
-    return bool(value) and not contains_secret(value) and not re.search(
-        r"<\/?(?:tool|system|assistant|user)[^>]*>|ignore previous|you are now",
-        value,
-        re.IGNORECASE,
-    )
+    value = _CONTROL.sub("[control data omitted]", value)
+    return value.encode()[:65536].decode("utf-8", "ignore")
 
 
 def trim_summary(value: str) -> str:
-    data = value.encode("utf-8")[:512]
-    return data.decode("utf-8", "ignore").strip()
+    return value.encode("utf-8")[:512].decode("utf-8", "ignore").strip()
+
+
+def valid_summary(value: str) -> bool:
+    value = trim_summary(value)
+    return bool(value) and not contains_secret(value) and _CONTROL.search(value) is None
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,59 +56,149 @@ class SummaryKey:
     seq_start: int
     seq_end: int
     source_sha256: str
-    prompt_version: int = _PROMPT_VERSION
+    prompt_version: int = PROMPT_VERSION
 
     def as_string(self) -> str:
         return f"{self.prompt_version}:{self.kind}:{self.seq_start}:{self.seq_end}:{self.source_sha256}"
 
 
-class SummaryCache:
-    """A tolerant JSONL cache. malformed records are independent misses."""
-    def __init__(self, session_dir: str | Path):
-        self.path = Path(session_dir) / "eviction-summaries.jsonl"
-        self.records: dict[str, str] = {}
-        self._load()
-        self._lock = asyncio.Lock()
+@dataclass(frozen=True, slots=True)
+class SummaryRequest:
+    key: SummaryKey
+    source: str
+    exact_range: bool = False
 
-    def _load(self) -> None:
-        try:
-            lines = self.path.read_text().splitlines()
-        except (FileNotFoundError, OSError):
+
+@dataclass(frozen=True, slots=True)
+class SummaryResponse:
+    text: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+class SummaryCache:
+    """Tolerant derived JSONL cache backed by a pinned session directory."""
+
+    def __init__(self, session_dir: str | Path, *, directory_fd: int | None = None):
+        self.path = Path(session_dir) / CACHE_NAME
+        self._directory_fd = directory_fd
+        self.records: dict[str, str] = {}
+        self._lock = asyncio.Lock()
+        self.loaded = False
+
+    def _fd(self) -> tuple[int, bool]:
+        if self._directory_fd is not None:
+            return self._directory_fd, False
+        return os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY), True
+
+    async def load(self) -> None:
+        if self.loaded:
             return
-        for line in lines:
+        await asyncio.to_thread(self._load_sync)
+
+    def _load_sync(self) -> None:
+        fd, close = self._fd()
+        try:
             try:
-                row = json.loads(line)
-                key = SummaryKey(str(row["kind"]), int(row["seq_start"]), int(row["seq_end"]), str(row["source_sha256"]), int(row["prompt_version"]))
-                summary = str(row["summary"])
-                if row.get("version") == _RECORD_VERSION and valid_summary(summary):
-                    self.records[key.as_string()] = trim_summary(summary)
-            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
-                continue
+                file_fd = open_session_file(fd, CACHE_NAME, os.O_RDONLY)
+            except FileNotFoundError:
+                self.loaded = True
+                return
+            with os.fdopen(file_fd, "rb") as stream:
+                lines = stream.read(MAX_CACHE_BYTES + 1).splitlines()
+            for raw in lines:
+                try:
+                    row = json.loads(raw)
+                    key = SummaryKey(
+                        str(row["kind"]), int(row["seq_start"]), int(row["seq_end"]),
+                        str(row["source_sha256"]), int(row["prompt_version"]),
+                    )
+                    summary = trim_summary(str(row["summary"]))
+                    if row.get("version") == RECORD_VERSION and valid_summary(summary):
+                        self.records[key.as_string()] = summary
+                except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                    continue
+            self.loaded = True
+        except (OSError, ValueError):
+            self.records.clear()
+            self.loaded = True
+        finally:
+            if close:
+                os.close(fd)
 
     def get(self, key: SummaryKey) -> str | None:
         return self.records.get(key.as_string())
 
-    async def put(self, key: SummaryKey, summary: str, *, input_tokens: int = 0) -> bool:
-        summary = trim_summary(summary)
+    async def put(self, key: SummaryKey, response: SummaryResponse | str) -> bool:
+        if isinstance(response, str):
+            response = SummaryResponse(response)
+        summary = trim_summary(response.text)
         if not valid_summary(summary):
             return False
-        row = {"version": 1, "prompt_version": key.prompt_version, "kind": key.kind, "seq_start": key.seq_start, "seq_end": key.seq_end, "source_sha256": key.source_sha256, "summary": summary, "input_tokens": input_tokens, "output_tokens": len(summary), "created_at": time.time()}
-        line = json.dumps(row, separators=(",", ":")) + "\n"
+        row = {
+            "version": RECORD_VERSION, "prompt_version": key.prompt_version,
+            "kind": key.kind, "seq_start": key.seq_start, "seq_end": key.seq_end,
+            "source_sha256": key.source_sha256, "summary": summary,
+            "input_tokens": response.input_tokens, "output_tokens": response.output_tokens,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        line = (json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n").encode()
         async with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as stream:
+            await asyncio.to_thread(self._append_sync, line)
+            self.records[key.as_string()] = summary
+            if await asyncio.to_thread(self._needs_compaction):
+                await asyncio.to_thread(self._compact_sync)
+        return True
+
+    def _needs_compaction(self) -> bool:
+        try:
+            return self.path.stat().st_size > MAX_CACHE_BYTES
+        except OSError:
+            return False
+
+    def _append_sync(self, line: bytes) -> None:
+        fd, close = self._fd()
+        try:
+            file_fd = open_session_file(fd, CACHE_NAME, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+            with os.fdopen(file_fd, "ab") as stream:
                 stream.write(line)
                 stream.flush()
-                import os
                 os.fsync(stream.fileno())
-            self.records[key.as_string()] = summary
-        return True
+        finally:
+            if close:
+                os.close(fd)
+
+    def _compact_sync(self) -> None:
+        rows = []
+        for encoded, summary in self.records.items():
+            prompt, kind, start, end, digest = encoded.split(":", 4)
+            rows.append({"version": RECORD_VERSION, "prompt_version": int(prompt), "kind": kind,
+                         "seq_start": int(start), "seq_end": int(end), "source_sha256": digest,
+                         "summary": summary, "input_tokens": 0, "output_tokens": 0,
+                         "created_at": datetime.now(UTC).isoformat()})
+        rows.sort(key=lambda row: (row["seq_start"], row["seq_end"]), reverse=True)
+        data = b""
+        for row in rows:
+            line = (json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n").encode()
+            if len(data) + len(line) > MAX_CACHE_BYTES:
+                break
+            data = line + data
+        fd, close = self._fd()
+        try:
+            atomic_publish_file(fd, CACHE_NAME, data)
+        finally:
+            if close:
+                os.close(fd)
 
 
 class TokenBucket:
-    def __init__(self, capacity: int = 150_000, refill_per_hour: int = 100_000, clock: Callable[[], float] = time.monotonic):
-        self.capacity, self.rate, self.clock = capacity, refill_per_hour / 3600, clock
-        self.tokens, self.updated = capacity, clock()
+    def __init__(self, capacity: int = 150_000, refill_per_hour: int = 100_000,
+                 clock: Callable[[], float] = time.monotonic):
+        self.capacity = capacity
+        self.rate = refill_per_hour / 3600
+        self.clock = clock
+        self.tokens = float(capacity)
+        self.updated = clock()
         self.lock = asyncio.Lock()
 
     async def reserve(self, amount: int) -> bool:
@@ -114,62 +211,177 @@ class TokenBucket:
             self.tokens -= amount
             return True
 
+    async def reconcile(self, estimate: int, actual: int) -> None:
+        async with self.lock:
+            self.tokens = min(self.capacity, max(0.0, self.tokens + estimate - actual))
+
+
+def _transient_failure(exc: BaseException) -> bool:
+    status = getattr(exc, "status_code", None)
+    if type(status) is int:
+        return status in {408, 409, 425, 429} or status >= 500
+    return isinstance(exc, (TimeoutError, ConnectionError, asyncio.TimeoutError))
+
 
 class EvictionSummaryWorker:
-    """Coalescing bounded worker; callers provide already projected source."""
-    def __init__(self, cache: SummaryCache, provider: Callable[[str], Awaitable[Any]], *, max_pending: int = 256, clock: Callable[[], float] = time.monotonic):
-        self.cache, self.provider, self.max_pending, self.clock = cache, provider, max_pending, clock
-        self.queue: OrderedDict[SummaryKey, str] = OrderedDict()
-        self.running: set[asyncio.Task[Any]] = set()
+    """Session-owned scheduler with bounded, range-first background work."""
+
+    def __init__(self, cache: SummaryCache, provider: Callable[[str], Awaitable[SummaryResponse | str]],
+                 *, scan: Callable[[], Iterable[SummaryRequest]] | None = None,
+                 max_pending: int = 256, idle_seconds: float = 2, max_wait_seconds: float = 30,
+                 retry_delay: float = 60, clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep):
+        self.cache, self.provider, self.scan = cache, provider, scan
+        self.max_pending, self.idle_seconds = max_pending, idle_seconds
+        self.max_wait_seconds, self.retry_delay, self.clock = max_wait_seconds, retry_delay, clock
+        self.sleep = sleep
+        self.queue: OrderedDict[SummaryKey, SummaryRequest] = OrderedDict()
+        self.running: set[asyncio.Task[None]] = set()
         self.bucket = TokenBucket(clock=clock)
         self.closed = False
         self.drops = 0
+        self._wake = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._first_activity: float | None = None
+        self._last_activity: float | None = None
+        self._blocked_until: dict[str, float] = {}
+        self._bounds_hash: dict[tuple[str, int, int], str] = {}
 
-    def admit(self, key: SummaryKey, source: str, *, exact_range: bool = False) -> bool:
+    def activity(self, _seq: int | None = None) -> None:
+        if self.closed:
+            return
+        now = self.clock()
+        self._first_activity = now if self._first_activity is None else self._first_activity
+        self._last_activity = now
+        self._ensure_task()
+        self._wake.set()
+
+    def admit(self, request: SummaryRequest | SummaryKey, source: str | None = None,
+              *, exact_range: bool = False) -> bool:
+        if isinstance(request, SummaryKey):
+            request = SummaryRequest(request, source or "", exact_range)
+        key = request.key
         if self.closed or self.cache.get(key) is not None:
             return False
+        bounds = (key.kind, key.seq_start, key.seq_end)
+        old_hash = self._bounds_hash.get(bounds)
+        if old_hash != key.source_sha256:
+            self._bounds_hash[bounds] = key.source_sha256
+            self._blocked_until.pop(key.as_string(), None)
+            for queued in tuple(self.queue):
+                if (queued.kind, queued.seq_start, queued.seq_end) == bounds:
+                    self.queue.pop(queued)
+        if self._blocked_until.get(key.as_string(), 0) > self.clock():
+            return False
         if key in self.queue:
-            self.queue[key] = source
             return True
         if len(self.queue) >= self.max_pending:
-            self.drops += 1
-            return False
-        if exact_range:
-            self.queue = OrderedDict([(key, source), *self.queue.items()])
-        else:
-            self.queue[key] = source
+            if request.exact_range:
+                victim = next((item for item, value in reversed(self.queue.items()) if not value.exact_range), None)
+                if victim is not None:
+                    self.queue.pop(victim)
+                else:
+                    self.drops += 1
+                    return False
+            else:
+                self.drops += 1
+                return False
+        self.queue[key] = request
+        self.queue = OrderedDict(
+            sorted(
+                self.queue.items(),
+                key=lambda item: (
+                    not item[1].exact_range,
+                    item[0].seq_start,
+                    item[0].seq_end,
+                ),
+            )
+        )
+        self._ensure_task()
+        self._wake.set()
         return True
+
+    def _ensure_task(self) -> None:
+        if self._task is not None or self.closed:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._task = loop.create_task(self._run())
+
+    async def _run(self) -> None:
+        await self.cache.load()
+        while not self.closed:
+            if self._first_activity is not None and self._last_activity is not None:
+                deadline = min(self._last_activity + self.idle_seconds,
+                               self._first_activity + self.max_wait_seconds)
+                delay = max(0.0, deadline - self.clock())
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
+                    self._wake.clear()
+                    continue
+                except TimeoutError:
+                    if self.scan is not None:
+                        for request in self.scan():
+                            self.admit(request)
+                    self._first_activity = self._last_activity = None
+            await self.run_once()
+            if self.queue:
+                await asyncio.sleep(1)
+                continue
+            self._wake.clear()
+            await self._wake.wait()
 
     async def run_once(self) -> None:
         if self.closed:
             return
         while self.queue and len(self.running) < 2:
-            key, source = self.queue.popitem(last=False)
-            task = asyncio.create_task(self._call(key, source))
+            _, request = self.queue.popitem(last=False)
+            task = asyncio.create_task(self._call(request))
             self.running.add(task)
             task.add_done_callback(self.running.discard)
         if self.running:
             await asyncio.gather(*tuple(self.running), return_exceptions=True)
 
-    async def _call(self, key: SummaryKey, source: str) -> None:
-        prompt = SUMMARY_INSTRUCTION + sanitize_source(source)
+    async def _call(self, request: SummaryRequest) -> None:
+        prompt = SUMMARY_INSTRUCTION + sanitize_source(request.source)
         estimate = max(1, len(prompt) // 4)
-        if not await self.bucket.reserve(estimate):
-            self.admit(key, source)
+        for attempt in range(3):
+            if not await self.bucket.reserve(estimate):
+                self.admit(request)
+                return
+            try:
+                response = await self.provider(prompt)
+            except asyncio.CancelledError:
+                raise
+            except (OSError, RuntimeError, ValueError, TypeError) as exc:
+                if not _transient_failure(exc) or attempt == 2:
+                    break
+                await self.sleep(2 ** (attempt + 1))
+                continue
+            if isinstance(response, SummaryResponse):
+                await self.bucket.reconcile(estimate, response.input_tokens)
+            try:
+                await self.cache.put(request.key, response)
+            except (OSError, ValueError):
+                return
             return
-        try:
-            result = await self.provider(prompt)
-            text = result if isinstance(result, str) else str(getattr(result, "text", result))
-            await self.cache.put(key, text, input_tokens=estimate)
-        except (OSError, RuntimeError, ValueError, TypeError):
-            return
+        self._blocked_until[request.key.as_string()] = self.clock() + self.retry_delay
 
     async def close(self, grace: float = 2.5) -> None:
         self.closed = True
-        if self.running:
-            _, pending = await asyncio.wait(self.running, timeout=grace)
+        self.queue.clear()
+        self._wake.set()
+        pending = set(self.running)
+        if pending:
+            _, pending = await asyncio.wait(pending, timeout=grace)
             for task in pending:
                 task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        if self._task is not None:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
 
 
 def source_hash(source: str) -> str:

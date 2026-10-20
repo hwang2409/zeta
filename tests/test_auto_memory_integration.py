@@ -10,6 +10,7 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.config.settings import load_settings, resolve
+from zeta.context_eviction import evict_messages, eviction_summary_candidates
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import OpenedSession, SessionManager
 from zeta.core.slash import create_slash_registry
@@ -21,7 +22,10 @@ from zeta.protocol.types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ToolCall,
+    ToolResult,
     ToolSchema,
+    ToolUseContent,
     with_message_origin,
 )
 from zeta.runtime.composition import RuntimeComposition, compose_runtime
@@ -70,6 +74,22 @@ class _MemoryScriptBackend(CompletionBackend):
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent(proposal)]),
             data={"usage": {"input_tokens": 10, "output_tokens": 5}},
+        )
+
+
+class _SummaryBackend(CompletionBackend):
+    async def complete(
+        self, messages: Sequence[Message], tools: Sequence[ToolSchema]
+    ) -> AsyncIterator[StreamEvent]:
+        assert tools == ()
+        del messages
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(
+                MessageRole.ASSISTANT,
+                [TextContent("worker preserved verdict abc1234")],
+            ),
+            data={"usage": {"input_tokens": 20, "output_tokens": 5}},
         )
 
 
@@ -242,6 +262,9 @@ async def test_attention_fork_composition_cannot_write_project_memory(
     workspace = tmp_path / "workspace"
     home.mkdir()
     workspace.mkdir()
+    (home / "settings.toml").write_text(
+        "[eviction_summaries]\nenabled = true\n", encoding="utf-8"
+    )
     config = _resolve(home)
     manager = SessionManager(home)
     project = manager.project_registry.create_project("demo", "scope", workspace)
@@ -293,6 +316,7 @@ async def test_attention_fork_composition_cannot_write_project_memory(
     )
     try:
         assert composition.memory_reconciler is None
+        assert composition.eviction_summary_worker is None
         assert composition.opened.store.on_persisted_activity is None
         assert composition.loop.context_assembler.on_before_eviction is None
         assert "inbox" not in composition.loop.tool_registry.registered_names
@@ -398,3 +422,153 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
     )
     assert index.search("normalindexcanary")
     assert index.search("forkonlyindexcanary") == ()
+
+
+@pytest.mark.asyncio
+async def test_eviction_summary_worker_only_for_top_level_sessions(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    (home / "settings.toml").write_text(
+        "[memory]\nauto = false\n[eviction_summaries]\nenabled = true\n"
+    )
+    config = _resolve(home)
+    manager = SessionManager(home)
+
+    def backend_builder(provider: str, model: str | None, **kwargs: object):
+        del provider, kwargs
+        return _SummaryBackend(), model or "fake"
+
+    top = compose_runtime(
+        home=home,
+        cwd=workspace,
+        manager=manager,
+        config=config,
+        provider="codex",
+        model="fake",
+        project_context=ProjectContext("system", ()),
+        backend_builder=backend_builder,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    child_opened = manager.create(
+        provider="codex",
+        model="fake",
+        cwd=workspace,
+        parent_session_id=top.opened.metadata.session_id,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    child = compose_runtime(
+        home=home,
+        cwd=workspace,
+        manager=manager,
+        config=config,
+        provider="codex",
+        model="fake",
+        project_context=ProjectContext("system", ()),
+        backend_builder=backend_builder,
+        opened=child_opened,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    grandchild_opened = manager.create(
+        provider="codex",
+        model="fake",
+        cwd=workspace,
+        parent_session_id=child.opened.metadata.session_id,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    grandchild = compose_runtime(
+        home=home,
+        cwd=workspace,
+        manager=manager,
+        config=config,
+        provider="codex",
+        model="fake",
+        project_context=ProjectContext("system", ()),
+        backend_builder=backend_builder,
+        opened=grandchild_opened,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    try:
+        assert top.eviction_summary_worker is not None
+        assert top.opened.store.on_persisted_activity is not None
+        assert child.eviction_summary_worker is None
+        assert grandchild.eviction_summary_worker is None
+    finally:
+        await grandchild.loop.close()
+        await child.loop.close()
+        await top.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_top_level_summary_worker_decorates_next_eviction_pass(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    (home / "settings.toml").write_text(
+        "[memory]\nauto = false\n[eviction_summaries]\nenabled = true\n"
+    )
+    config = _resolve(home)
+    manager = SessionManager(home)
+
+    def backend_builder(provider: str, model: str | None, **kwargs: object):
+        del provider, kwargs
+        return _SummaryBackend(), model or "fake"
+
+    runtime = compose_runtime(
+        home=home,
+        cwd=workspace,
+        manager=manager,
+        config=config,
+        provider="codex",
+        model="fake",
+        project_context=ProjectContext("system", ()),
+        backend_builder=backend_builder,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    worker = runtime.eviction_summary_worker
+    assert worker is not None
+    call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("agent-1", "agent", {"prompt": "review"}))],
+    )
+    result = Message(
+        MessageRole.USER,
+        tool_result=ToolResult("agent-1", "review passed at abc1234 " * 100),
+    )
+    records = [(1, call), (2, result)]
+    request = eviction_summary_candidates(records)[0]
+    first = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=100,
+        source_messages=dict(records),
+        summary_cache=worker.cache,
+        summaries_enabled=True,
+    )
+    assert all("summary_data" not in message.metadata for message in first.messages)
+    worker.admit(request)
+    await worker.run_once()
+    second = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=100,
+        source_messages=dict(records),
+        summary_cache=worker.cache,
+        summaries_enabled=True,
+    )
+    try:
+        assert any(message.metadata.get("summary_data") for message in second.messages)
+    finally:
+        await runtime.loop.close()

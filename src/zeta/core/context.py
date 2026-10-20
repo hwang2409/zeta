@@ -135,6 +135,8 @@ class ContextAssembler:
         telemetry_sink: Callable[[Mapping[str, Any]], None] | None = None,
         on_token_growth: Callable[[int], None] | None = None,
         on_before_eviction: Callable[[int, int], None] | None = None,
+        eviction_summary_cache: Any = None,
+        eviction_summary_worker: Any = None,
         safety_margin: float = DEFAULT_SAFETY_MARGIN,
     ) -> None:
         if token_budget <= 0:
@@ -155,6 +157,8 @@ class ContextAssembler:
         self.telemetry_sink = telemetry_sink
         self.on_token_growth = on_token_growth
         self.on_before_eviction = on_before_eviction
+        self.eviction_summary_cache = eviction_summary_cache
+        self.eviction_summary_worker = eviction_summary_worker
         self.last_compaction_telemetry: dict[str, Any] = {}
         self._descendant_usage = {
             "input_tokens": 0,
@@ -753,6 +757,8 @@ class ContextAssembler:
             token_counter=self.token_counter,
             unconsumed_source_seqs=unconsumed,
             source_messages=source_messages,
+            summary_cache=self.eviction_summary_cache,
+            summaries_enabled=self.eviction_summary_cache is not None,
         )
         if not result.items_evicted:
             return (
@@ -761,6 +767,9 @@ class ContextAssembler:
                 else _EvictionPlan("none-fallback")
             )
         view = eviction_view(records, result)
+        if self.eviction_summary_worker is not None:
+            for request in result.summary_misses:
+                self.eviction_summary_worker.admit(request)
         view_messages = self._eviction_view_messages(view)
         proposed = [
             *system_messages,
@@ -795,6 +804,12 @@ class ContextAssembler:
             tuple(view),
             telemetry,
         )
+
+    def eviction_summary_candidates(self) -> tuple[Any, ...]:
+        """Return covered single-item work from the authoritative active branch."""
+        from ..context_eviction import store_summary_candidates
+
+        return store_summary_candidates(self.store)
 
     def _plan_reuse_eviction(
         self, branch: Sequence[ConversationEntry], system_messages: Sequence[Message]
