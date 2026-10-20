@@ -18,6 +18,7 @@ from zeta.context_eviction import (
     eviction_summary_candidates,
     normalize_receipt,
 )
+from zeta.context_eviction.receipt_constructors import RECEIPT_FIELDS_METADATA
 from zeta.context_eviction.summaries import (
     EvictionSummaryWorker,
     SummaryKey,
@@ -237,7 +238,7 @@ def _receipt_kind(message: Message) -> str | None:
         return "coarse" if "user_count" in message.metadata else "range"
     if receipt_kind in {"assistant", "notification"}:
         return str(receipt_kind)
-    fields = message.metadata.get("eviction_fields")
+    fields = message.metadata.get(RECEIPT_FIELDS_METADATA)
     if (
         receipt_kind == "tool_result"
         and isinstance(fields, dict)
@@ -248,11 +249,20 @@ def _receipt_kind(message: Message) -> str | None:
 
 
 def _kind_counts(
-    messages: list[Message], sources: dict[int, Message]
+    messages: list[Message],
+    sources: dict[int, Message],
+    *,
+    shown_messages: list[Message] | None = None,
 ) -> dict[str, dict[str, int | float]]:
     counts: dict[str, dict[str, int | float]] = {
         kind: {"receipts": 0, "eligible": 0, "shown": 0, "shown_rate": 1.0}
         for kind in ("assistant", "orchestration", "notification", "range", "coarse")
+    }
+    shown_keys = {
+        request.key.as_string()
+        for message in shown_messages or messages
+        if message.metadata.get("summary_data") is not None
+        and (request := receipt_summary_request(message, sources)) is not None
     }
     for message in messages:
         receipt_kind = _receipt_kind(message)
@@ -267,7 +277,7 @@ def _kind_counts(
             else request.key.kind
         )
         counts[kind]["eligible"] += 1
-        if message.metadata.get("summary_data") is not None:
+        if request.key.as_string() in shown_keys:
             counts[kind]["shown"] += 1
     for values in counts.values():
         eligible = int(values["eligible"])
@@ -346,7 +356,7 @@ async def replay_incremental_markers(
                 "source_seq_end": marker.data["source_seq_end"],
                 "target_tokens": target,
                 "fixed_tokens": fixed_tokens,
-                "kinds": _kind_counts(on.messages, sources),
+                "kinds": _kind_counts(messages, sources, shown_messages=on.messages),
                 "added_tokens": on.tokens_after - deterministic_tokens,
                 "reserve_used": on.reserve_tokens,
                 "tokens_after": on.tokens_after,
