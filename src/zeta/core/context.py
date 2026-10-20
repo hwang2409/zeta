@@ -806,10 +806,14 @@ class ContextAssembler:
         )
 
     def eviction_summary_candidates(self) -> tuple[Any, ...]:
-        """Return covered single-item work from the authoritative active branch."""
-        from ..context_eviction import store_summary_candidates
-
-        return store_summary_candidates(self.store)
+        """Return covered single-item work from the materialized active view."""
+        from ..context_eviction import active_eviction_summary_candidates
+        items = self._visible_items(self.store.active_branch_snapshot())
+        rows = tuple(
+            (item.entry.seq, item.entry.type, item.message)
+            for item in items if item.entry is not None
+        )
+        return active_eviction_summary_candidates(rows)
 
     def _plan_reuse_eviction(
         self, branch: Sequence[ConversationEntry], system_messages: Sequence[Message]
@@ -1165,7 +1169,6 @@ class ContextAssembler:
     @staticmethod
     def _eviction_view_messages(view: Sequence[Mapping[str, Any]]) -> list[Message]:
         """Project a stored or proposed eviction view into request messages."""
-
         messages: list[Message] = []
         for index, item in enumerate(view):
             messages.append(ContextAssembler._eviction_view_message(item))

@@ -101,20 +101,35 @@ def _summary_source(
     source_messages: Mapping[int, Message], seq_start: int, seq_end: int
 ) -> str:
     rows: list[str] = []
+    calls = _tool_calls(list(source_messages.values()))
     for seq in sorted(source_messages):
         if not seq_start <= seq <= seq_end:
             continue
         message = source_messages[seq]
+        if _summary_kind(message, calls) is None:
+            continue
         parts = [
             block.text for block in message.content if isinstance(block, TextContent)
         ]
         if message.tool_result is not None:
             parts.append(message.tool_result.content)
+        if _notification(message):
+            parts.append(
+                "notifications="
+                + json.dumps(
+                    message.metadata["notifications"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
         rows.append(f"seq {seq} {message.role.value}: {' '.join(parts)}")
     return "\n".join(rows)
 
 
 def _summary_kind(message: Message, calls: Mapping[str, ToolCall]) -> str | None:
+    if message.metadata.get("context_evicted"):
+        return None
     if _notification(message):
         return "notification"
     result = message.tool_result

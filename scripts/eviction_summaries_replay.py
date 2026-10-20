@@ -9,11 +9,17 @@ import json
 from pathlib import Path
 from typing import Any
 
-from zeta.context_eviction import evict_messages, eviction_summary_candidates
+from zeta.context_eviction import (
+    TARGET_RATIO,
+    evict_messages,
+    eviction_summary_candidates,
+)
 from zeta.context_eviction.summaries import (
     EvictionSummaryWorker,
     SummaryKey,
     SummaryResponse,
+    trim_summary,
+    valid_summary,
 )
 from zeta.context_eviction.summary_receipts import receipt_summary_request
 from zeta.core.context import ContextAssembler
@@ -36,9 +42,10 @@ class _MemoryCache:
         return self.records.get(key.as_string())
 
     async def put(self, key: SummaryKey, response: SummaryResponse | str) -> bool:
-        self.records[key.as_string()] = (
-            response if isinstance(response, str) else response.text
-        )
+        summary = trim_summary(response if isinstance(response, str) else response.text)
+        if not valid_summary(summary):
+            return False
+        self.records[key.as_string()] = summary
         return True
 
 
@@ -98,7 +105,7 @@ def _inputs(session_dir: Path) -> tuple[list[tuple[int, Message]], dict[int, Mes
         for entry in branch
         if entry.type == "message"
     }
-    return records, sources, max(1, int(budget * 0.55))
+    return records, sources, max(1, int(budget * TARGET_RATIO))
 
 
 def _view(result: Any) -> dict[str, Any]:

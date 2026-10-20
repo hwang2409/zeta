@@ -187,34 +187,34 @@ def eviction_summary_candidates(
     )
 
 
-def store_summary_candidates(store: ConversationStore) -> tuple[SummaryRequest, ...]:
-    """Read one active branch and project its eligible single-item work."""
+def active_eviction_summary_candidates(
+    items: Sequence[tuple[int, str, Message]],
+) -> tuple[SummaryRequest, ...]:
+    """Project single-item work from an already materialized active view."""
     records = [
-        (entry.seq, Message.from_dict(entry.data["message"]))
-        for entry in store.replay()
-        if entry.type == "message"
+        (int(message.metadata.get("source_seq", entry_seq)), message)
+        for entry_seq, _, message in items
     ]
     latest_assistant = max(
         (
-            seq
-            for seq, message in records
+            entry_seq
+            for entry_seq, _, message in items
             if message.role is MessageRole.ASSISTANT
             and message.metadata.get("zeta_event") != "agent_notifications"
         ),
         default=None,
     )
     unconsumed = {
-        seq
-        for seq, message in records
-        if (latest_assistant is None or seq > latest_assistant)
+        int(message.metadata.get("source_seq", entry_seq))
+        for entry_seq, entry_type, message in items
+        if entry_type == "message"
+        and (latest_assistant is None or entry_seq > latest_assistant)
         and (
             message.tool_result is not None
             or message.metadata.get("zeta_event") == "agent_notifications"
         )
     }
-    return eviction_summary_candidates(
-        records, unconsumed_source_seqs=unconsumed
-    )
+    return eviction_summary_candidates(records, unconsumed_source_seqs=unconsumed)
 
 
 def evict_messages(
