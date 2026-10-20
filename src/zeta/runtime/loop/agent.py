@@ -203,7 +203,7 @@ class AgentLoop(
         self._mcp_notice_sink: Callable[[str], None] | None = None
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
-        self._closed = False; self._turn_active = False
+        self._closed = False; self._turn_active = False; self.explicit_finish = False
         self.notification_wake = NotificationWake(store)
         # Partial assistant persistence uses these values so provider metadata is
         # retained even when the stream later fails or is cancelled.
