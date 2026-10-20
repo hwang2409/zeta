@@ -71,11 +71,14 @@ should mean “available for more work,” not “destroy this run.”
   descendants instead of recreating their loops
   (`src/zeta/agent/background.py:479-580`).
 - a live child holds an asyncio run and its backend, store, registry, and tool
-  state. it holds at least one session-directory fd in `ConversationStore` and
-  one cwd fd in its cloned `ToolRegistry` (`src/zeta/core/store/_store.py:120-156`,
-  `src/zeta/tools/registry.py:187-264`, `src/zeta/tools/registry.py:658-672`).
-  pr #498 fixed those registry fds leaking after children ended; an idle child
-  still holds them intentionally until it ends.
+  state. it holds at least three fds: the session-directory fd in
+  `ConversationStore`, the separate `runtime.lease` file fd held by its
+  `SessionRuntimeLease`, and one cwd fd in its cloned `ToolRegistry`
+  (`src/zeta/core/store/_store.py:159-178`,
+  `src/zeta/core/store/runtime_lease.py:38-51`,
+  `src/zeta/tools/registry.py:650-672`). pr #498 fixed those registry fds
+  leaking after children ended; an idle child still holds them intentionally
+  until it ends.
 
 ## scope
 
@@ -173,17 +176,26 @@ pending-prompt queue, loop, registry, and store open.
 
 on each transition into `idle`, publish exactly one bounded, nonterminal
 `child_idle` notification to the direct parent and wake it without polling. the
-notification includes the child id, a bounded excerpt of the last assistant
-text, and the id of any open `ask_parent` question. repeated status reads do not
-republish it. this makes even the original bare `WAIT` response visible to a
-parent that is waiting for terminal completion; the parent can send approval or
-other direction with `agent_send`.
+notification includes a bounded `child_instance_id`, `child_session_path`,
+`text` excerpt of the last assistant text, and optional
+`ask_parent_question_id`. its status is `child_idle`; it is a durable relevant
+notification, not a terminal completion. give it its own bounded schema in
+notification validation: accept `status = child_idle` with only those fields and
+the existing bounded text/description envelope, while terminal statuses continue
+to require their terminal fields (`src/zeta/core/store/_validation.py:32-49`
+currently accepts only `completed`, `error`, and `canceled`). repeated status
+reads do not republish it. this makes even the original bare `WAIT` response
+visible to a parent that is waiting for terminal completion; the parent can
+send approval or other direction with `agent_send`.
 
 these events wake an idle child and produce one ordinary model turn:
 
 - a durable `agent_send` follow-up, including an answer to `ask_parent`;
 - exit of one of the child's own background tasks;
-- completion, failure, or cancellation of one of its direct child agents.
+- completion, failure, cancellation, or `child_idle` notification from one of
+  its direct child agents. `child_idle` wakes an already-idle explicit-finish
+  parent even when that parent owns an idle child or grandchild; the parent
+  receives the notification turn before deciding whether to call `finish`.
 
 coalesce simultaneous events into that turn. task and child events use the
 existing notification input, so the model sees what changed before it acts.
@@ -223,10 +235,10 @@ idle clock starts only if the following turn returns to idle.
 
 there is no hard idle-child cap in v1 **pending user confirmation**. instead,
 `agent_status` and the tui report the idle-child count and the known held
-idle-child directory-fd floor: at least two per idle child, one for its session
-store and one for its cloned registry. warn above 16 idle children in one root
-tree, which means a known floor above 32 held directory fds, but do not reject,
-finish, cancel, or hand off any child.
+idle-child fd floor: at least three per idle child—the session-directory fd,
+its `runtime.lease` file fd, and the cloned registry cwd fd. warn above 16 idle
+children in one root tree, which means a known floor above 48 held fds, but do
+not reject, finish, cancel, or hand off any child.
 
 there is no separate “finish now” parent tool in the first version. the parent
 can send “finish now” with `agent_send`, which gives the child a chance to write
@@ -290,7 +302,7 @@ arguments and successful tool result before entering `finishing`.
 | state | event under the fence | next state and action |
 | --- | --- | --- |
 | `running` | healthy turn without accepted `finish` | `idle`; publish one `child_idle` and start the eligible clock |
-| `idle` | external prompt or relevant notification wins | `running`; deliver it and reset the clock |
+| `idle` | external prompt or relevant notification wins | `running`; deliver it and reset the clock (including a durable `child_idle` notification) |
 | `idle` | 10 eligible minutes, fewer than three lifetime nudges | `running`; deliver one idle nudge and reset the clock |
 | `idle` | nudge boundary while turn/work/input exists | stay live; deliver real input first or keep the clock paused |
 | `idle` | 10 eligible minutes after three lifetime nudges | remain `idle`; do not wake or finish |
@@ -298,7 +310,8 @@ arguments and successful tool result before entering `finishing`.
 | `running` or `idle` | valid `finish` wins | `finishing`; close admission and durably store report plus successful result |
 | `finishing` | second `finish` or any other tool call | `finishing`; reject as `child is finishing` |
 | `finishing` | turn end or later stream/provider failure | terminal from the explicit report; publish it once |
-| any live state | cancellation or restart recovery wins | `canceled`; atomically close admission and clean up owned work |
+| `finishing` | cancellation or restart recovery | unchanged; accepted `finish` already closed admission and its report remains authoritative |
+| any live state except `finishing` | cancellation or restart recovery wins | `canceled`; atomically close admission and clean up owned work |
 | `running` or `idle` | provider failure before accepted `finish` | `failed` after retries; clean up owned work |
 | any terminal state | any event | unchanged; no second terminal receipt |
 
@@ -311,10 +324,11 @@ arguments and successful tool result before entering `finishing`.
   up owned work. after that durable point, the explicit report wins; a later
   stream failure cannot replace it and zeta publishes that report once.
 - **cancellation:** `agent_cancel` remains immediate after it acquires the shared
-  fence. mark `canceled`, close pending questions, cancel descendants, kill
-  process tasks, and publish the current bounded canceled receipt. a `finish`
-  that was not durably accepted before cancellation acquired the fence does not
-  outrank cancellation.
+  fence. before accepted `finish`, mark `canceled`, close pending questions,
+  cancel descendants, kill process tasks, and publish the current bounded
+  canceled receipt. after accepted `finish`, cancellation is a no-op: admission
+  is already closed and the explicit report remains authoritative; publish no
+  second receipt.
 - **parent exit:** graceful parent shutdown cancels live children as it does
   now. a crash is reconciled as canceled on recovery. child conversations stay
   available for inspection, but `agent_send` cannot revive them.
@@ -353,14 +367,15 @@ three-nudge lifetime bound. the child retains:
 
 - one asyncio waiter and child/watcher state;
 - its backend and conversation objects in memory;
-- at least two open directory fds: the child session store and registry cwd;
+- at least three open fds: the child session-directory fd, its regular
+  `runtime.lease` file fd, and the registry cwd fd;
 - tool registry state and any approval/store leases.
 
 exact memory depends on provider and transcript size, so the design does not
-promise a byte figure. each idle child has a known floor of two retained
-directory fds; 16 idle children therefore have a floor of 32, before provider
-and tool-specific resources. `agent_status`, the tui warning, and trial metrics
-report both idle-child count and this known fd floor. metrics also record
+promise a byte figure. each idle child has a known floor of at least three
+retained fds; 16 idle children therefore have a floor of at least 48, before
+provider and tool-specific resources. `agent_status`, the tui warning, and
+trial metrics report both idle-child count and this known fd floor. metrics also record
 observed process fd count and rss delta at idle entry and exit. pr #498's close
 path remains mandatory on every terminal path.
 
@@ -425,7 +440,8 @@ warns above 16 instead of inventing a second completion authority.
      provider error;
    - finish refusals due to owned work;
    - idle duration, concurrent idle peak, above-16 warnings, known idle fd
-     floor, observed process fd count, and rss delta.
+     floor (at least three per idle child), observed process fd count, and rss
+     delta.
 7. success requires zero known premature finishes, zero idle children finished
    because of time or capacity, zero running tasks killed by successful
    `finish`, and no increase in unreconciled child markers. review nudge, idle
@@ -452,6 +468,10 @@ must fail on the pre-implementation revision for the expected reason.
   checks one bounded `child_idle` notice with last text and open question id.
 - `tests/test_agent.py::test_idle_child_wakes_for_task_and_child_completion_only`
   covers relevant wakes and excludes reads, progress, and unrelated notices.
+- `tests/test_agent.py::test_child_idle_wakes_idle_explicit_finish_parent_tree`
+  uses a parent, child, and grandchild that all use `finish`, proving a
+  grandchild's durable `child_idle` notification wakes the already-idle parent
+  through the child notification turn.
 - `tests/test_agent.py::test_reviewer_follow_up_committed_at_finish_boundary_is_read`
   uses a barrier to prove a committed prompt wins over `finish`; a send after
   closure is rejected.
@@ -487,17 +507,29 @@ must fail on the pre-implementation revision for the expected reason.
 - `tests/test_background.py::test_explicit_finish_task_safety_deadline_kills_and_wakes`
   covers the single 3,600-second task deadline and killed-task metadata.
 - `tests/test_agent.py::test_explicit_finish_cancel_wins_before_acceptance` and
-  `tests/test_agent.py::test_idle_child_restart_recovers_as_canceled` cover the
-  shared fence, cleanup, and v1 no-rehydration rule.
+  `tests/test_agent.py::test_explicit_finish_cancel_after_acceptance_keeps_report`
+  cover both sides of the shared fence: cancellation wins before acceptance,
+  while cancellation after accepted `finish` is unchanged and emits no second
+  receipt.
+- `tests/test_agent.py::test_parent_exit_cancels_idle_child_subtree_and_cleans_receipts`
+  covers graceful parent exit canceling an idle child and idle grandchild,
+  including subtree marker, pending-prompt queue, task, and receipt cleanup.
+- `tests/test_agent.py::test_events_after_terminal_state_emit_no_second_receipt`
+  proves late prompts, notifications, cancellation, and recovery are ignored
+  after terminal publication.
+- `tests/test_agent.py::test_idle_child_restart_recovers_as_canceled` covers the
+  shared fence cleanup and v1 no-rehydration rule.
 - `tests/test_agents.py::test_explicit_finish_requires_global_and_profile_opt_in`,
   `tests/test_settings.py::test_project_cannot_enable_explicit_finish`, and
   `tests/test_tui.py::test_idle_agent_card_reports_count_fd_floor_and_warning`
-  cover rollout eligibility, configuration, and resource visibility.
+  cover rollout eligibility, configuration, and resource visibility, including
+  the at-least-three-fds-per-idle-child floor and 48-fd warning basis.
 - existing finish-gate tests remain unchanged for legacy profiles; an opted-in
   regression proves those runs never enter `run_finish_gate`.
 
 ## open questions
 
 1. **pending user confirmation:** use no hard idle-child cap in v1, report the
-   count and known two-fd-per-child floor in `agent_status` and the tui, and warn
-   above 16 idle children per root tree without ending or rejecting any child?
+   count and known floor of at least three fds per idle child in `agent_status`
+   and the tui, and warn above 16 idle children per root tree (at least 48 fds)
+   without ending or rejecting any child?
