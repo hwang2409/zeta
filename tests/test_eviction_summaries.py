@@ -41,7 +41,7 @@ def _assistant(seq: int, text: str | None = None) -> tuple[int, Message]:
     return seq, Message(MessageRole.ASSISTANT, [TextContent(text or ("fact " * 300))])
 
 
-def _evict(records, cache=None, *, enabled=False, target=1):
+def _evict(records, cache=None, *, enabled=False, target=500):
     return evict_messages(
         records,
         fixed_tokens=0,
@@ -133,7 +133,7 @@ def test_range_source_projection_excludes_ordinary_tools(tmp_path) -> None:
         ),
         _assistant(4),
     ]
-    missed = _evict(records, SummaryCache(tmp_path), enabled=True).summary_misses
+    missed = _evict(records, SummaryCache(tmp_path), enabled=True, target=1).summary_misses
     assert len(missed) == 1
     assert (missed[0].key.seq_start, missed[0].key.seq_end) == (1, 4)
     assert "PRIVATE" not in missed[0].source
@@ -469,7 +469,7 @@ def test_replay_script_runs_real_off_on_path_offline(tmp_path) -> None:
     result = json.loads(out.read_text())
     assert result["selected_seqs_identical"] is True
     assert result["range_bounds_identical"] is True
-    assert result["summary_count"] == 1
+    assert result["summary_count"] == 0
     assert result["queue_drops"] == 0
 
 

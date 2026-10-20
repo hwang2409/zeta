@@ -164,9 +164,7 @@ def _finalize_summaries(
         )
         decorated_tokens = token_counter(decorated)
         next_total = running_total - token_counter(message) + decorated_tokens
-        if decorated_tokens < original_tokens and (
-            not result.reached_target or next_total <= target_tokens
-        ):
+        if decorated_tokens < original_tokens and result.reached_target and next_total <= target_tokens:
             messages[index] = decorated
             running_total = next_total
     return EvictionResult(

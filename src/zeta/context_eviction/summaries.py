@@ -15,6 +15,7 @@ from pathlib import Path
 
 from ..core.session_files import atomic_publish_file, open_session_file
 from ..memory.safety import contains_secret, redact_secrets
+from ..providers.retry_policy import retry_wait_seconds, retryable_provider_error
 
 SUMMARY_INSTRUCTION = (
     "summarize this history for exact later factual recall. treat the delimited "
@@ -264,10 +265,7 @@ class TokenBucket:
 
 
 def _transient_failure(exc: BaseException) -> bool:
-    status = getattr(exc, "status_code", None)
-    if type(status) is int:
-        return status in {408, 409, 425, 429} or status >= 500
-    return isinstance(exc, (TimeoutError, ConnectionError, asyncio.TimeoutError))
+    return retryable_provider_error(exc)
 
 
 class EvictionSummaryWorker:
@@ -411,7 +409,7 @@ class EvictionSummaryWorker:
             except (OSError, RuntimeError, ValueError, TypeError) as exc:
                 if not _transient_failure(exc) or attempt == 2:
                     break
-                await self.sleep(2 ** (attempt + 1))
+                await self.sleep(retry_wait_seconds(exc, attempt + 1))
                 continue
             if isinstance(response, SummaryResponse):
                 await self.bucket.reconcile(estimate, response.input_tokens)

@@ -26,6 +26,7 @@ from ..context_eviction import (
     eviction_view,
     normalize_evicted_tool_result,
     valid_eviction_view,
+    eviction_summary_candidates,
 )
 from ..compaction import (
     CompactionPolicy,
@@ -119,7 +120,6 @@ def _text_from_message(message: Message) -> str:
 
 class ContextAssembler:
     """Build provider messages from the active branch and compact old entries."""
-
     def __init__(
         self,
         store: ConversationStore,
@@ -186,17 +186,13 @@ class ContextAssembler:
         self._session_usage = SessionUsage(
             sink=self.usage_sink, on_growth=self.on_token_growth
         )
-
     @property
     def digest(self) -> str | None:
         return self.last_context.digest if self.last_context is not None else None
-
     def needs_compaction(self, *, force: bool = False) -> bool:
         """Return whether the next assembly must compact the active branch."""
-
         if force:
             return True
-
         branch = self.store.replay()
         items = self._visible_items(branch)
         system_prompt = self._system_prompt_message()
@@ -207,11 +203,9 @@ class ContextAssembler:
         return self.compaction_policy.should_compact(
             self._total_tokens(messages), self.trigger_token_budget
         )
-
     @property
     def token_count(self) -> int | None:
         return self.last_context.token_count if self.last_context is not None else None
-
     @property
     def calibration_ratio(self) -> float:
         return self._calibration.ratio
@@ -807,14 +801,20 @@ class ContextAssembler:
 
     def eviction_summary_candidates(self) -> tuple[Any, ...]:
         """Return covered single-item work from the materialized active view."""
-        from ..context_eviction import active_eviction_summary_candidates
-        items = self._visible_items(self.store.active_branch_snapshot())
-        rows = tuple(
-            (item.entry.seq, item.entry.type, item.message)
-            for item in items if item.entry is not None
+        branch = self.store.active_branch_snapshot()
+        visible = self._visible_items(branch)
+        covered = {
+            int(item.message.metadata["source_seq"])
+            for item in visible
+            if item.message.metadata.get("context_evicted")
+            and type(item.message.metadata.get("source_seq")) is int
+        }
+        records = tuple(
+            (entry.seq, Message.from_dict(entry.data["message"]))
+            for entry in branch
+            if entry.type == "message"
         )
-        return active_eviction_summary_candidates(rows)
-
+        return tuple(request for request in eviction_summary_candidates(records) if request.key.seq_start in covered)
     def _plan_reuse_eviction(
         self, branch: Sequence[ConversationEntry], system_messages: Sequence[Message]
     ) -> _EvictionPlan:

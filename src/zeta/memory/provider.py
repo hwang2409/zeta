@@ -42,7 +42,7 @@ def _bounded_response(parts: list[str], limit: int) -> str:
 
 
 async def complete_reconciliation(
-    backend: CompletionBackend, prompt: str
+    backend: CompletionBackend, prompt: str, *, single_attempt: bool = False
 ) -> ReconciliationResponse:
     """Return one accepted response using the shared provider retry budget.
 
@@ -104,6 +104,10 @@ async def complete_reconciliation(
                 )
             return ReconciliationResponse(text, usage)
         failure = failure or RuntimeError("memory reconciler returned no final message")
+        if single_attempt:
+            if isinstance(failure, BaseException):
+                raise failure
+            raise RuntimeError("memory reconciliation provider failed")
         plan = budget.plan(failure, owner="memory", event_data=event_data)
         if plan is None:
             if isinstance(failure, BaseException):

@@ -552,7 +552,7 @@ async def test_top_level_summary_worker_decorates_next_eviction_pass(
     first = evict_messages(
         records,
         fixed_tokens=0,
-        target_tokens=100,
+        target_tokens=500,
         source_messages=dict(records),
         summary_cache=worker.cache,
         summaries_enabled=True,
@@ -563,7 +563,7 @@ async def test_top_level_summary_worker_decorates_next_eviction_pass(
     second = evict_messages(
         records,
         fixed_tokens=0,
-        target_tokens=100,
+        target_tokens=500,
         source_messages=dict(records),
         summary_cache=worker.cache,
         summaries_enabled=True,

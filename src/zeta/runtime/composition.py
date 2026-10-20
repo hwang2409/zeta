@@ -329,7 +329,9 @@ def compose_runtime(
                         token_budget=effective_budget,
                     )
                 with use_response_byte_limit(512):
-                    response = await complete_reconciliation(summary_backend, prompt)
+                    response = await complete_reconciliation(
+                        summary_backend, prompt, single_attempt=True
+                    )
                 return SummaryResponse(
                     response.text,
                     input_tokens=sum(
