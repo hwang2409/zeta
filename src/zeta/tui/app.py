@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
+import subprocess
 import time
 import weakref
 from collections import deque
@@ -14,7 +16,7 @@ from shutil import (
 from typing import Any
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application import get_app
+from prompt_toolkit.application import get_app, run_in_terminal
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.styles import DynamicStyle, Style
@@ -29,6 +31,7 @@ from ..core.approval import ApprovalPolicy
 from ..core.project_context import (
     discover_project,
     load_project_context,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_project_context
+    project_instructions_editor_command,
 )
 from ..core.session import (
     env_home,
@@ -374,11 +377,9 @@ class TUIApp(
     @property
     def ephemeral_root(self) -> Path | None:
         return self._ephemeral_root
-
     @property
     def new_session_requested(self) -> bool:
         return self._new_session_requested
-
     def request_new_session(self) -> None:
         self._new_session_requested = True
         self.request_exit()
@@ -966,7 +967,14 @@ class TUIApp(
         self._assistant_chunks.clear()
         self._thinking_chunks.clear()
         self._thinking_duration = self._thinking_started_at = None
-
+    def open_project_instructions_editor(self, path: Path) -> str | Awaitable[str]:
+        if not self._full_screen_active(): return f"project instructions: {path}"
+        command = shlex.join(project_instructions_editor_command(path))
+        async def run() -> str:
+            try: status = await run_in_terminal(lambda: subprocess.call(command, shell=True), in_executor=True)
+            except (OSError, RuntimeError) as exc: return f"project instructions editor error: {exc} ({path})"
+            return (f"project instructions editor error: exited with status {status} ({path})" if status else f"project instructions: {path} (applies to new and resumed sessions)")
+        return run()
     def _print_system(self, output: str) -> None:
         self._print_unit(
             Text(

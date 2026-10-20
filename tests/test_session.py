@@ -20,12 +20,14 @@ from rich.cells import cell_len
 from rich.console import Console
 from rich.text import Text
 
+import zeta.tui.app as tui_app
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser, main
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
+from zeta.core.project_context import project_instructions_editor_command
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -465,6 +467,106 @@ def test_repo_agents_ignore_warns_with_custom_system_prompt_on_resume(
     assert any("repository AGENTS.md" in notice for notice in resumed._startup_notices)
 
 
+@pytest.mark.asyncio
+async def test_project_instructions_opens_editor_once_in_tui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _, private = _private_project(home, root, "")
+    editor = tmp_path / "editor"
+    invocation = tmp_path / "invocation"
+    editor.write_text(f'#!/bin/sh\nprintf "%s" "$1" > {invocation}\n')
+    editor.chmod(0o755)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setenv("EDITOR", str(editor))
+    monkeypatch.chdir(root)
+    app = create_app(_args())
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    calls = 0
+
+    async def run_in_terminal(func, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return func()
+
+    monkeypatch.setattr(tui_app, "run_in_terminal", run_in_terminal)
+    result = await app._slash_commands.dispatch_async(app, "/project-instructions")
+
+    assert calls == 1
+    assert invocation.read_text() == str(private)
+    assert result == f"project instructions: {private} (applies to new and resumed sessions)"
+    assert await app._slash_commands.dispatch_async(app, "/status")
+    app.loop.store.close()
+
+
+@pytest.mark.parametrize("editor", ["missing-editor", "nonzero-editor"])
+@pytest.mark.asyncio
+async def test_project_instructions_editor_failure_prints_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, editor: str
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _, private = _private_project(home, root, "")
+    if editor == "nonzero-editor":
+        editor_path = tmp_path / editor
+        editor_path.write_text("#!/bin/sh\nexit 9\n")
+        editor_path.chmod(0o755)
+        monkeypatch.setenv("EDITOR", str(editor_path))
+    else:
+        monkeypatch.setenv("EDITOR", editor)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    app = create_app(_args())
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+
+    async def run_in_terminal(func, **_kwargs):
+        return func()
+
+    monkeypatch.setattr(tui_app, "run_in_terminal", run_in_terminal)
+    result = await app._slash_commands.dispatch_async(app, "/project-instructions")
+
+    assert result is not None
+    assert "project instructions editor error" in result
+    assert str(private) in result
+    assert await app._slash_commands.dispatch_async(app, "/status")
+    app.loop.store.close()
+
+
+@pytest.mark.asyncio
+async def test_project_instructions_serve_does_not_start_editor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _, private = _private_project(home, root, "")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    registry = create_slash_registry(
+        zeta_home=home, project_dir=root, skill_catalog=SkillCatalog.empty()
+    )
+    calls = 0
+
+    async def run_in_terminal(func, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return func()
+
+    monkeypatch.setattr(tui_app, "run_in_terminal", run_in_terminal)
+    result = await registry.dispatch_async(SimpleNamespace(), "/project-instructions")
+
+    assert result == f"project instructions: {private}"
+    assert private.is_file()
+    assert calls == 0
+
+
 def test_project_instructions_slash_command_creates_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -481,6 +583,115 @@ def test_project_instructions_slash_command_creates_file(
 
     assert result == f"project instructions: {home / 'projects' / project_id / 'AGENTS.md'}"
     assert private.is_file()
+
+
+def test_project_instructions_outside_git_project_explains_next_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    app = create_app(_args())
+
+    result = app._slash_commands.dispatch(app, "/project-instructions")
+
+    assert result == (
+        "project instructions: this folder is not a zeta project. run `git init` "
+        "here and restart zeta, or start zeta inside a registered project."
+    )
+    app.loop.store.close()
+
+
+def test_project_instructions_reports_registry_error_without_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _private_project(home, root, "")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+
+    app = create_app(_args())
+
+    project_json = next((home / "projects").glob("*/project.json"))
+    record = json.loads(project_json.read_text(encoding="utf-8"))
+    del record["name"]
+    project_json.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    result = app._slash_commands.dispatch(app, "/project-instructions")
+
+    assert result.startswith("project instructions error:")
+    app.loop.store.close()
+
+
+def test_slash_registry_builds_with_no_project_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(_args())
+
+    result = app._slash_commands.dispatch(app, "/project-instructions")
+
+    assert result == (
+        "project instructions: this folder is not a zeta project. run `git init` "
+        "here and restart zeta, or start zeta inside a registered project."
+    )
+    app.loop.store.close()
+
+
+def test_init_unchanged_for_registered_non_git_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _private_project(home, root, "")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+
+    app = create_app(_args())
+
+    assert app._slash_commands.dispatch(app, "/init") == "init error: not inside a project"
+    app.loop.store.close()
+
+
+def test_project_instructions_unregistered_git_repo_suggests_project_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    home.mkdir()
+    (home / "settings.toml").write_text("auto_project = false\n")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+
+    app = create_app(_args())
+
+    assert app._slash_commands.dispatch(app, "/project-instructions") == (
+        "project instructions: this git project is not registered. "
+        "run `/project init` to associate this directory."
+    )
+    app.loop.store.close()
+
+
+def test_project_instructions_editor_command_prefers_visual_and_splits_args(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("VISUAL", "")
+    monkeypatch.setenv("EDITOR", "code -w")
+    assert project_instructions_editor_command(tmp_path / "AGENTS.md") == (
+        "code", "-w", str(tmp_path / "AGENTS.md")
+    )
+    monkeypatch.setenv("VISUAL", "vim --clean")
+    assert project_instructions_editor_command(tmp_path / "AGENTS.md") == (
+        "vim", "--clean", str(tmp_path / "AGENTS.md")
+    )
 
 
 def test_status_lists_private_instructions_file(
