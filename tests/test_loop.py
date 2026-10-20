@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import time
 import warnings
@@ -9,6 +10,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+import zeta.agent.runner as agent_runner_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.codex as codex_module
 import zeta.providers.retry_policy as retry_policy_module
@@ -1691,7 +1693,7 @@ async def test_loop_owned_stall_retry_starts_after_real_90s_silence(
     budget = None
     monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
 
-    async def advance(delay: float, _abort_signal=None) -> bool:
+    async def advance(delay: float, _abort_signal=None, _source=None) -> bool:
         nonlocal now
         now += delay
         return True
@@ -1890,6 +1892,174 @@ async def test_metadata_only_provider_events_are_retry_safe(
         for message in assistant_messages
         for block in message.content
     )
+
+
+@pytest.mark.asyncio
+async def test_child_retries_response_failed_server_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = 0
+
+    def sse(events: list[dict[str, object]]) -> str:
+        return "".join(
+            f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+            for event in events
+        )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            events = [
+                {"type": "response.created", "response": {"id": "failed"}},
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "error": {"code": "server_error", "message": "provider failed"}
+                    },
+                },
+            ]
+        else:
+            events = [
+                {"type": "response.created", "response": {"id": "success"}},
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "message", "id": "message", "role": "assistant"},
+                },
+                {
+                    "type": "response.content_part.added",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text"},
+                },
+                {
+                    "type": "response.output_text.done",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "done",
+                },
+                {
+                    "type": "response.content_part.done",
+                    "output_index": 0,
+                    "content_index": 0,
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "id": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "success",
+                        "status": "completed",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    },
+                },
+            ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(events),
+            request=request,
+        )
+
+    class TokenStore:
+        path = tmp_path / "codex.json"
+
+        async def access_token(self, _client: httpx.AsyncClient) -> str:
+            encode = lambda value: base64.urlsafe_b64encode(
+                json.dumps(value).encode()
+            ).decode().rstrip("=")
+            return ".".join(
+                (
+                    encode({"alg": "none"}),
+                    encode(
+                        {
+                            "exp": 4_000_000_000,
+                            "https://api.openai.com/auth": {
+                                "chatgpt_account_id": "account-test"
+                            },
+                        }
+                    ),
+                    encode({"signature": "fixture"}),
+                )
+            )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    child_backend = codex_module.CodexBackend(
+        client=client, token_store=TokenStore(), diagnostics_path=None
+    )
+    monkeypatch.setattr(
+        agent_runner_module,
+        "resolve_child_backend",
+        lambda _loop, _model: (child_backend, None),
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "session"),
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    call = ToolCall(
+        "agent-1",
+        "agent",
+        {
+            "prompt": "do the work",
+            "description": "retry child",
+            "model": "gpt-5.6-sol",
+            "background": False,
+        },
+    )
+
+    result = await loop._run_agent_tool(
+        call, call.arguments, AbortSignal(), None
+    )
+
+    assert requests == 2, result
+    assert result["isError"] is False
+    assert result["content"][0]["text"].startswith("done")
+    await loop.close()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_server_error_after_completed_tool_call_is_not_retried(tmp_path: Path) -> None:
+    failure = codex_module.CodexStreamError(
+        "server_error: stream error", code="server_error", retryable=True
+    )
+    class Backend(CompletionBackend):
+        calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            self.calls += 1
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(
+                    MessageRole.ASSISTANT,
+                    [ToolUseContent(ToolCall("tool-1", "echo", {}))],
+                ),
+            )
+            raise failure
+
+    backend = Backend()
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn(
+            "start", origin=MessageOrigin.USER
+        )
+    )
+    assert backend.calls == 1
+    assert not any(event.type is StreamEventType.RETRY for event in events)
 
 
 @pytest.mark.asyncio

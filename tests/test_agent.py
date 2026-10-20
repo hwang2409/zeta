@@ -57,6 +57,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.providers.codex import CodexStreamError
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog, SkillMeta
@@ -459,9 +460,10 @@ async def test_background_owner_waits_for_child_close_before_unregister(
     release_close = asyncio.Event()
     cleanup_called = asyncio.Event()
 
-    async def close_child() -> None:
+    async def close_child() -> tuple[str, ...]:
         close_started.set()
         await release_close.wait()
+        return ()
 
     def cleanup() -> None:
         cleanup_called.set()
@@ -7118,6 +7120,75 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
     lifecycle = child_store.agent_lifecycle()
     assert lifecycle is not None
     assert lifecycle["final_result"] == text
+    await loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "secret"),
+    [
+        (
+            _python("import time; time.sleep(30)")
+            + " 'Authorization: Bearer auth-secret-123'",
+            "auth-secret-123",
+        ),
+        ("TOKEN=token-secret-456 " + _python("import time; time.sleep(30)"), "token-secret-456"),
+        (
+            _python("import time; time.sleep(30)") + " --password=password-secret-789",
+            "password-secret-789",
+        ),
+        ("<'/tmp/password-secret' cat", "password-secret"),
+        ("3<'url-user:url-pass@example.com' cat", "url-user:url-pass@example.com"),
+        (
+            "<<'heredoc-secret' cat\nbody\nheredoc-secret",
+            "heredoc-secret",
+        ),
+    ],
+)
+async def test_killed_task_receipt_never_contains_command_secrets(
+    tmp_path: Path, command: str, secret: str
+) -> None:
+    class FailingBackend(_TaskOwningChildBackend):
+        async def complete(self, messages, tool_schemas):
+            started = any(
+                message.role is MessageRole.TOOL_RESULT
+                and any(
+                    isinstance(block, TextContent)
+                    and "started background task" in block.text
+                    for block in message.content
+                )
+                for message in messages
+            )
+            if started:
+                raise CodexStreamError("permanent", code="model_not_found")
+            async for event in super().complete(messages, tool_schemas):
+                yield event
+
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store, finish_gate_max_turns=1)
+    loop = AgentLoop(
+        FailingBackend(command),
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    deadline = asyncio.get_running_loop().time() + 5
+    while asyncio.get_running_loop().time() < deadline:
+        notifications = store.agent_notifications(pending_only=False)
+        if notifications and "background tasks killed on child completion" in notifications[-1].data.get("text", ""):
+            break
+        await asyncio.sleep(0.02)
+    notification = notifications[-1]
+    text = notification.data["text"]
+    assert "background tasks killed on child completion" in text
+    task_id = notification.data["killed_task_ids"][0]
+    assert task_id in text
+    assert secret not in text
+    assert "background command" in text
+    assert "archive: " + str(loop.store.session_dir / "agents/1/background-output.archive") in text
+    assert "command unavailable" not in text
     await loop.close()
 
 

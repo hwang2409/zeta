@@ -211,9 +211,7 @@ async def consume_child(
                         )
                     ],
                 )
-            elif gate_result.reason is not None and (
-                owned_children() or owned_tasks()
-            ):
+            elif gate_result.reason is not None and (owned_children() or owned_tasks()):
                 if owned_tasks():
                     fallback_message = Message(
                         MessageRole.ASSISTANT,
@@ -455,9 +453,17 @@ def resolve_child_backend(
 
 
 async def _build_child_loop(
-    loop: AgentLoop, *, child_backend: CompletionBackend, child_store: ConversationStore,
-    child_instance_id: str, child_depth: int, preset: AgentPreset, model: object,
-    cwd_override: Path | None, follow_up_loop: bool, description: str,
+    loop: AgentLoop,
+    *,
+    child_backend: CompletionBackend,
+    child_store: ConversationStore,
+    child_instance_id: str,
+    child_depth: int,
+    preset: AgentPreset,
+    model: object,
+    cwd_override: Path | None,
+    follow_up_loop: bool,
+    description: str,
 ) -> tuple[AgentLoop, ChildApprovalPolicy | None]:
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None
@@ -505,6 +511,7 @@ async def _build_child_loop(
             )
             child_registry.set_approval_policy(child_policy)
         from ..runtime.loop import AgentLoop
+
         child_model = getattr(child_backend, "model", None)
         if type(child_model) is not str or not child_model:
             child_model = model if type(model) is str and model else "unknown"
@@ -513,10 +520,12 @@ async def _build_child_loop(
             child_budget = effective_budget_for_model(
                 child_provider, child_model, child_budget
             )
+
         def record_child_usage(usage: Mapping[str, Any]) -> None:
             loop.context_assembler.record_descendant_usage(
                 {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
             )
+
         child_loop = AgentLoop(
             child_backend,
             child_store,
@@ -1013,6 +1022,9 @@ async def run_agent_tool(
             if child_policy is not None:
                 child_policy.cleanup()
 
+        async def close_background_child() -> tuple[str, ...]:
+            return tuple(await child_loop.close(cancel_background=False))
+
         async def finish_background() -> None:
             try:
                 await finish_background_child(
@@ -1025,20 +1037,22 @@ async def run_agent_tool(
                     child_path=child_path,
                     description=description,
                     child_turns=child_turns,
-                    build_result=lambda text, error, status, stats, notice=None, notice_items=None: child_result(
-                        text,
-                        error=error,
-                        status=status,
-                        stats=stats,
-                        include_stats=True,
-                        notice=notice,
-                        notice_items=notice_items,
-                        max_bytes=background_receipt_bytes,
+                    build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
+                        child_result(
+                            text,
+                            error=error,
+                            status=status,
+                            stats=stats,
+                            include_stats=True,
+                            notice=notice,
+                            notice_items=notice_items,
+                            max_bytes=background_receipt_bytes,
+                        )
                     ),
                     validate_result=validate_result,
                     publish_event=loop._publish_background_event,
                     cleanup=cleanup_background_child,
-                    close_child=lambda: child_loop.close(cancel_background=False),
+                    close_child=close_background_child,
                     error_message=error_message,
                     marker_key=child_marker_key,
                     agent_instance_id=loop.agent_instance_id,

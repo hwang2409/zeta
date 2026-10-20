@@ -1040,7 +1040,7 @@ class AgentLoop(
                             data={**notice.data, "usage": provider_retry_usage},
                         )
                     yield notice
-                    if await wait_for_provider_retry(plan.delay, turn_abort_signal):
+                    if await wait_for_provider_retry(plan.delay, turn_abort_signal, source):
                         provider_retry_budget.record_retry(plan)
                         yield assistant_reset_event()
                         partial_blocks = []

@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import monotonic
 
 from ..codex import (
     CODEX_API_URL,
@@ -51,6 +52,7 @@ from .transport import (
     wait_for_response_headers,
 )
 from .usage import normalize_usage
+from .retry_policy import current_retry_budget
 from ..protocol.types import (
     CompletionBackend,
     ContentBlock,
@@ -296,6 +298,18 @@ class CodexBackend(CompletionBackend):
         except BaseException as exc:
             primary_exception = exc
         finally:
+            if (
+                primary_exception is not None
+                and self.diagnostics_path is not None
+                and getattr(primary_exception, "code", None) == "server_error"
+            ):
+                budget = current_retry_budget()
+                primary_exception.stream_diagnostic = (
+                    self.diagnostics_path,
+                    self.model,
+                    getattr(primary_exception, "diagnostic_context", {}),
+                    budget.attempts if budget is not None else 1,
+                )
             primary_exception = await cleanup_transport(
                 stream_context=stream_context,
                 entered=entered,
@@ -308,6 +322,8 @@ class CodexBackend(CompletionBackend):
                 raise primary_exception
 
     def _record_retry_exhausted(self, error: RuntimeError, retries: int) -> None:
+        if getattr(error, "stream_diagnostic", None) is not None:
+            return
         StreamDiagnostics.record_retry_exhausted(
             self.diagnostics_path,
             error,
@@ -370,7 +386,7 @@ async def _decode_response(
     items: dict[int, _ItemState] = {}
     blocks: dict[BlockKey, _BlockState] = {}
     usage: dict[str, Any] = {}
-    response_data: dict[str, Any] = {}
+    response_data: dict[str, Any] = {"stream_started_at": monotonic()}
     reassembly = _ReassemblyState()
     finished = StreamFinished()
     async for line in sse_lines(
@@ -384,6 +400,7 @@ async def _decode_response(
         if record is None:
             continue
         event, payload = record
+        response_data["event_count"] = response_data.get("event_count", 0) + 1
         translated, response_state = _translate_event(
             event,
             payload,
@@ -400,6 +417,7 @@ async def _decode_response(
             yield translated
     record = decoder.finish()
     if record is not None:
+        response_data["event_count"] = response_data.get("event_count", 0) + 1
         translated, response_state = _translate_event(
             record[0],
             record[1],
@@ -427,6 +445,13 @@ async def _decode_response(
         StreamDiagnostics.record_reassembly_mismatches(
             diagnostics_path, count=reassembly.mismatches
         )
+
+
+def _stream_age(response_data: Mapping[str, Any]) -> float:
+    started_at = response_data.get("stream_started_at")
+    if not isinstance(started_at, (int, float)):
+        return 0.0
+    return max(0.0, monotonic() - started_at)
 
 
 def _translate_event(
@@ -463,6 +488,13 @@ def _translate_event(
             retry_reason=error.retry_reason,
         )
         failure.provider_prompt_tokens = _provider_prompt_tokens(detail)
+        failure.diagnostic_context = {
+            "response_id": response_data.get("id"),
+            "terminal_event_type": None,
+            "last_event_type": event_type,
+            "event_count": 1,
+            "stream_age_seconds": _stream_age(response_data),
+        }
         raise failure
     if event_type == "response.created":
         if response_state != "not-started":
@@ -865,9 +897,7 @@ def _rebuild_item_text(
 ) -> None:
     def joined(kind: str) -> str:
         return "".join(
-            blocks[key].text
-            for key in sorted(item.blocks)
-            if key[1] == kind
+            blocks[key].text for key in sorted(item.blocks) if key[1] == kind
         )
 
     if item.kind == "message":
@@ -919,6 +949,13 @@ def _decode_terminal_response(
             retry_reason=error.retry_reason,
         )
         failure.provider_prompt_tokens = _provider_prompt_tokens(detail)
+        failure.diagnostic_context = {
+            "response_id": response_data.get("id"),
+            "terminal_event_type": event_type,
+            "last_event_type": event_type,
+            "event_count": response_data.get("event_count", 1),
+            "stream_age_seconds": _stream_age(response_data),
+        }
         raise failure
     if response is not None and not isinstance(response, Mapping):
         raise CodexStreamError("Codex response completion is invalid")
@@ -1093,9 +1130,7 @@ def _merge_completed_item(
                 raise CodexStreamError("Codex completed reasoning summary is invalid")
             completed_summary.append(part["text"])
         streamed_summary = [
-            blocks[key].text
-            for key in sorted(item.blocks)
-            if key[1] == "thinking"
+            blocks[key].text for key in sorted(item.blocks) if key[1] == "thinking"
         ]
         reassembly.reconcile(completed_summary, streamed_summary)
         item.summary_text = "".join(completed_summary)
@@ -1116,9 +1151,7 @@ def _merge_completed_item(
                     )
                 completed_raw.append(part["text"])
         streamed_raw = [
-            blocks[key].text
-            for key in sorted(item.blocks)
-            if key[1] == "thinking_raw"
+            blocks[key].text for key in sorted(item.blocks) if key[1] == "thinking_raw"
         ]
         reassembly.reconcile(completed_raw, streamed_raw)
         item.raw_text = "".join(completed_raw)

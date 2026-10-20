@@ -15,7 +15,22 @@ import httpx
 MAX_PROVIDER_ATTEMPTS = 5
 MAX_PROVIDER_RETRY_SECONDS = 60.0
 MAX_PROVIDER_RETRY_DELAY_SECONDS = 30.0
-_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
+_RETRYABLE_STATUS_CODES = {
+    408,
+    409,
+    425,
+    429,
+    500,
+    502,
+    503,
+    504,
+    520,
+    521,
+    522,
+    523,
+    524,
+    529,
+}
 _TERMINAL_ERROR_CODES = {
     "auth_error",
     "authentication_error",
@@ -96,7 +111,9 @@ class ProviderRetryBudget:
         delay = retry_wait_seconds(source, self.attempts, event_data)
         is_stall = bool(getattr(source, "is_stall", False))
         stall_seconds = getattr(source, "stall_seconds", 0.0)
-        has_stall_duration = isinstance(stall_seconds, (int, float)) and stall_seconds > 0
+        has_stall_duration = (
+            isinstance(stall_seconds, (int, float)) and stall_seconds > 0
+        )
         if is_stall:
             if has_stall_duration:
                 self.excluded_stall_seconds += float(stall_seconds)
@@ -106,9 +123,8 @@ class ProviderRetryBudget:
                 return None
             self.stall_retries += 1
         if (
-            (not is_stall or has_stall_duration)
-            and self._effective_elapsed() + delay > MAX_PROVIDER_RETRY_SECONDS
-        ):
+            not is_stall or has_stall_duration
+        ) and self._effective_elapsed() + delay > MAX_PROVIDER_RETRY_SECONDS:
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
             return None
@@ -177,8 +193,16 @@ def retryable_provider_error(
     code = getattr(error, "code", None)
     if code in _TERMINAL_ERROR_CODES:
         return False
-    if type(status_code) is int and 400 <= status_code < 500 and status_code != 429:
+    # Preserve the notification-turn rule: client errors are permanent even
+    # when an untrusted response body claims to be a server failure.
+    if (
+        type(status_code) is int
+        and 400 <= status_code < 500
+        and status_code not in {408, 409, 425, 429}
+    ):
         return False
+    if code == "server_error":
+        return True
     if status_code in _RETRYABLE_STATUS_CODES:
         return True
     if (

@@ -18,6 +18,7 @@ from .retry_policy import (
     current_retry_budget,
     retry_error_label,
 )
+from .stream_diagnostics import StreamDiagnostics
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
 DEFAULT_STREAM_STALL_SECONDS = 90.0
@@ -214,9 +215,14 @@ async def retry_provider_completion(
         stalled = is_stall(error)
         # MESSAGE_START carries response.created metadata, not assistant content.
         # A stall after that event can still be retried safely.
-        if started and (not stalled or committed):
+        # A response.failed server_error may follow response.created; it still
+        # has no persisted assistant content and is safe under the shared budget.
+        if committed or (
+            started and not stalled and getattr(error, "code", None) != "server_error"
+        ):
             if pending_truncated_end is not None:
                 yield pending_truncated_end
+            StreamDiagnostics.record_failure_decision(error, will_retry=False)
             raise error
         if is_unauthorized(error):
             if refreshed:
@@ -232,6 +238,7 @@ async def retry_provider_completion(
             owner="transport",
             event_data={"retryable": True} if stalled else None,
         )
+        StreamDiagnostics.record_failure_decision(error, will_retry=plan is not None)
         if plan is None:
             if budget.exhausted:
                 on_exhausted(error, budget.attempts - 1)
@@ -369,7 +376,5 @@ async def cleanup_transport[ErrorT: RuntimeError](
             )
             primary_exception = merge_exception(primary_exception, cleanup)
     if task_is_cancelling():
-        primary_exception = merge_exception(
-            primary_exception, asyncio.CancelledError()
-        )
+        primary_exception = merge_exception(primary_exception, asyncio.CancelledError())
     return primary_exception
