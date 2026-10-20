@@ -1,5 +1,7 @@
 # Agents and orchestration
 
+See [explicit completion for background subagents](child-finish-tool.md) for the proposed `finish` tool design.
+
 Custom agent profiles are Markdown files in `~/.zeta/agents/` or
 `<project>/.zeta/agents/`. Their YAML frontmatter defines the profile. For
 example, a worker that can converse with its parent uses:
