@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import threading
 from collections.abc import AsyncIterator, Sequence
@@ -8218,6 +8219,40 @@ def test_agent_status_text_shows_cwd() -> None:
         finished_omitted=0,
     )
     assert "cwd:" not in hidden["content"][0]["text"]
+
+
+def test_child_startup_runs_one_git_discovery_in_repo_subdirectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import project_context
+    from zeta.project_registry import ProjectRegistry
+
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "repo"
+    child_cwd = root / "src"
+    child_cwd.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("repo", "test", root)
+    real_run = subprocess.run
+    commands: list[list[str]] = []
+
+    def count_git(command: list[str], *args: object, **kwargs: object):
+        commands.append(command)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(project_context.subprocess, "run", count_git)
+    loop = SimpleNamespace(
+        store=SimpleNamespace(cwd=root),
+        context_assembler=SimpleNamespace(system_prompt="parent"),
+        active_home=str(home),
+        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        root_project_id=project.project_id,
+    )
+
+    _child_base_system_prompt(loop, str(child_cwd))
+
+    assert len(commands) == 3
 
 
 @pytest.mark.asyncio

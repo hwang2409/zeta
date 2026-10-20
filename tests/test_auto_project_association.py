@@ -471,6 +471,44 @@ def test_hanging_git_frontend_startup_has_one_bounded_warning(
         asyncio.run(app.close())
 
 
+def test_hanging_git_registered_project_one_warning_one_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from zeta.tui.app import create_app
+
+    root = repo(tmp_path)
+    cwd = root / "src"
+    cwd.mkdir()
+    home = tmp_path / "zeta-home"
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    project = ProjectRegistry(home / "projects").create_project("repo", "git", root)
+    private = home / "projects" / project.project_id / "AGENTS.md"
+    private.write_text("PRIVATE-MUST-NOT-LOAD", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nsleep 10\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(cwd)
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    elapsed = time.monotonic() - started
+    try:
+        warnings = [r for r in caplog.records if "git project discovery" in r.message]
+        assert elapsed < 4
+        assert len(warnings) == 1
+        assert app.loop.session_metadata.project_id is None
+        assert "PRIVATE-MUST-NOT-LOAD" not in app.loop.context_assembler.system_prompt.content[0].text
+    finally:
+        asyncio.run(app.close())
+
+
 @pytest.mark.parametrize("failed_call", [2, 3])
 def test_incomplete_git_discovery_is_ineligible_and_warns(
     tmp_path: Path,

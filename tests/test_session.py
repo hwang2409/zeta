@@ -244,6 +244,131 @@ def test_private_instructions_no_git_nested_and_symlinked_cwd(
     assert ("OUTER-PROJECT-PRIVATE" in _system_prompt(app)) is should_load
 
 
+def test_submodule_does_not_load_containing_project_private_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    outer = tmp_path / "outer"
+    inner_source = tmp_path / "inner-source"
+    outer.mkdir()
+    inner_source.mkdir()
+    subprocess.run(["git", "init"], cwd=outer, check=True, capture_output=True)
+    subprocess.run(["git", "init"], cwd=inner_source, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=inner_source, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=inner_source, check=True)
+    (inner_source / "tracked").write_text("initial", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked"], cwd=inner_source, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=inner_source, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "protocol.file.allow=always", "submodule", "add", str(inner_source), "nested"],
+        cwd=outer,
+        check=True,
+        capture_output=True,
+    )
+    project_id, _ = _private_project(home, outer, "OUTER-PRIVATE-MARKER")
+    _ignore_repo_agents(home, project_id)
+    nested = outer / "nested"
+    (nested / "AGENTS.md").write_text("NESTED-REPO-MARKER", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(nested)
+
+    app = create_app(_args())
+
+    assert app.loop.session_metadata.project_id == project_id
+    assert "OUTER-PRIVATE-MARKER" not in _system_prompt(app)
+    assert "NESTED-REPO-MARKER" in _system_prompt(app)
+    assert not any("repository AGENTS.md" in notice for notice in app._startup_notices)
+
+
+def test_nested_linked_worktree_does_not_load_containing_project_private_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    outer = tmp_path / "outer"
+    source = tmp_path / "source"
+    outer.mkdir()
+    source.mkdir()
+    subprocess.run(["git", "init"], cwd=source, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=source, check=True)
+    (source / "tracked").write_text("initial", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked"], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=source, check=True, capture_output=True)
+    nested = outer / "nested-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "nested", str(nested)],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    project_id, _ = _private_project(home, outer, "OUTER-PRIVATE-MARKER")
+    _ignore_repo_agents(home, project_id)
+    (nested / "AGENTS.md").write_text("NESTED-WORKTREE-MARKER", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(nested)
+
+    app = create_app(_args())
+
+    assert app.loop.session_metadata.project_id == project_id
+    assert "OUTER-PRIVATE-MARKER" not in _system_prompt(app)
+    assert "NESTED-WORKTREE-MARKER" in _system_prompt(app)
+    assert not any("repository AGENTS.md" in notice for notice in app._startup_notices)
+
+
+def _change_session_project(home: Path, session_id: str, project_id: str) -> None:
+    path = home / "sessions" / session_id / "meta.json"
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    metadata["project_id"] = project_id
+    path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+
+
+def test_resume_notices_private_file_change_when_session_and_cwd_projects_differ(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    _, private = _private_project(home, project_a, "PRIVATE-BEFORE")
+    project_b_id, _ = _private_project(home, project_b, "PROJECT-B")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(project_a)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    first.loop.store.close()
+    _change_session_project(home, session_id, project_b_id)
+    private.write_text("PRIVATE-AFTER", encoding="utf-8")
+
+    resumed = create_app(_args("--resume", session_id))
+
+    assert "PRIVATE-AFTER" in _system_prompt(resumed)
+    assert any("project instructions changed" in notice for notice in resumed._startup_notices)
+
+
+def test_resume_warns_repo_agents_ignore_when_session_and_cwd_projects_differ(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    project_a_id, _ = _private_project(home, project_a, "PROJECT-A")
+    project_b_id, _ = _private_project(home, project_b, "PROJECT-B")
+    _ignore_repo_agents(home, project_a_id)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(project_a)
+    first = create_app(_args("--system-prompt", "CUSTOM-SYSTEM"))
+    session_id = first.loop.store.session_id
+    first.loop.store.close()
+    _change_session_project(home, session_id, project_b_id)
+
+    resumed = create_app(_args("--resume", session_id))
+
+    assert any("repository AGENTS.md" in notice for notice in resumed._startup_notices)
+
+
 def test_resume_with_changed_private_instructions_rebuilds_and_notifies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

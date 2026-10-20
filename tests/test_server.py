@@ -4659,6 +4659,47 @@ async def test_serve_session_loads_private_instructions_from_linked_worktree(
 
 
 @pytest.mark.asyncio
+async def test_serve_linked_worktree_runs_one_git_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import project_context
+    from zeta.project_registry import ProjectRegistry
+    from zeta.server.runtime import ServerRuntime
+
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "repo"
+    worktree = tmp_path / "linked"
+    root.mkdir()
+    subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+    (root / "tracked").write_text("initial", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature", str(worktree)],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    ProjectRegistry(home / "projects").create_project("repo", "test", root)
+    real_run = subprocess.run
+    commands: list[list[str]] = []
+
+    def count_git(command: list[str], *args: object, **kwargs: object):
+        commands.append(command)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(project_context.subprocess, "run", count_git)
+    runtime = ServerRuntime(home, cwd=worktree, provider="codex")
+    try:
+        await runtime.create_session()
+        assert len(commands) == 3
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_serve_session_loads_private_instructions(tmp_path: Path) -> None:
     from zeta.project_registry import ProjectRegistry
     from zeta.server.runtime import ServerRuntime
