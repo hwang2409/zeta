@@ -41,6 +41,7 @@ from ..skills.agent_catalog import load_agent
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
+from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from .background import finish_background_child
 from .budget import MAX_AGENT_DEPTH
@@ -591,17 +592,10 @@ async def _build_child_loop(
             project_registry=loop.project_registry,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
-            explicit_finish=(
-                loop.explicit_finish
-                and preset.explicit_finish
-                and follow_up_loop
-            ),
         )
+        child_loop.explicit_finish = loop.explicit_finish and preset.explicit_finish and follow_up_loop
         child_loop.one_shot = getattr(loop, "one_shot", False)
-        if child_loop.explicit_finish:
-            from ..tools.finish import register as register_finish
-
-            register_finish(child_registry, child_loop=child_loop)
+        if child_loop.explicit_finish: register_finish(child_registry, child_loop=child_loop)
         loop._background_owner.conversation_channel.register_loop(child_instance_id)
         if loop.plan_mode:
             child_loop.set_plan_mode(True)
