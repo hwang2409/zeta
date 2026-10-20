@@ -1094,7 +1094,10 @@ def test_agent_output_results_are_never_summarized() -> None:
             "eviction_receipt": "range",
         },
     )
-    assert receipt_summary_request(output_receipt, {1: output_call, 2: output_result}) is None
+    assert (
+        receipt_summary_request(output_receipt, {1: output_call, 2: output_result})
+        is None
+    )
 
     agent_call = Message(
         MessageRole.ASSISTANT,
