@@ -244,7 +244,6 @@ def _evict_deterministic(
             sum(token_counter(message) for _, message in originals),
             sum(map(token_counter, candidates)),
         ),
-        compacted_tool_calls=True,
         stop_after_fold=reserve_tracker,
     )
     if range_candidate.coalesced_source_seqs:
@@ -431,7 +430,6 @@ def _evict_deterministic(
                 sum(token_counter(message) for _, message in originals),
                 sum(map(token_counter, candidates)),
             ),
-            compacted_tool_calls=True,
             stop_after_fold=reserve_tracker,
         )
         if range_candidate.coalesced_source_seqs:
@@ -451,7 +449,6 @@ def _evict_deterministic(
             records,
             allows=eligibility.allows,
             coarse=True,
-            compacted_tool_calls=True,
             is_smaller=lambda originals, candidates: _strictly_smaller(
                 sum(token_counter(message) for _, message in originals),
                 sum(map(token_counter, candidates)),

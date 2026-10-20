@@ -970,6 +970,85 @@ def test_coarse_fold_compacted_tool_call_receipts_without_summaries() -> None:
     )
 
 
+def test_coarse_fallback_folds_compacted_tool_call_receipts() -> None:
+    def mixed_call(seq: int) -> Message:
+        return Message(
+            MessageRole.ASSISTANT,
+            [
+                ToolUseContent(
+                    ToolCall(
+                        f"call-{seq}",
+                        "read",
+                        {"eviction_receipt": {"source_seq": seq}},
+                    )
+                ),
+                TextContent(f"[assistant reasoning evicted · seq {seq}]"),
+            ],
+            metadata={"context_evicted": True, "source_seq": seq},
+        )
+
+    records = [
+        (1, mixed_call(1)),
+        (
+            2,
+            _semantic_result_receipt(
+                role=MessageRole.TOOL_RESULT,
+                tool_name="read",
+                tool_call_id="call-1",
+                seq=2,
+                digest="digest",
+                content_digest="0" * 64,
+            ),
+        ),
+        (
+            5,
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent("separator")],
+                metadata={"eviction_view_invalid": True},
+            ),
+        ),
+        (10, mixed_call(10)),
+        (
+            11,
+            _semantic_result_receipt(
+                role=MessageRole.TOOL_RESULT,
+                tool_name="read",
+                tool_call_id="call-10",
+                seq=11,
+                digest="digest",
+                content_digest="0" * 64,
+            ),
+        ),
+    ]
+
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=150,
+        source_messages=dict(records),
+        summaries_enabled=False,
+    )
+
+    assert result.reached_target is True
+    assert len(result.messages) == 2
+    assert any(
+        message.metadata.get("eviction_view_invalid") is True
+        for message in result.messages
+    )
+    assert all(
+        not any(isinstance(block, ToolUseContent) for block in message.content)
+        and message.tool_result is None
+        for message in result.messages
+    )
+    receipt = next(
+        message for message in result.messages if message.metadata.get("eviction_range")
+    )
+    assert "recall_history seq_start=1, seq_end=11 for exact content" in _range_text(
+        receipt
+    )
+
+
 def test_coarse_fold_preserves_tool_pairs_and_order() -> None:
     records: list[tuple[int, Message]] = []
     for group in range(5):
