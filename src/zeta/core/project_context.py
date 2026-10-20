@@ -349,8 +349,6 @@ def same_git_repository(left: str | Path, right: str | Path) -> bool:
     return common_dirs[0] == common_dirs[1]
 
 
-
-
 def discover_or_find_project(
     registry: ProjectRegistry, cwd: str | Path, user_home: Path
 ) -> Project | None:
