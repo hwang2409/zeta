@@ -602,25 +602,25 @@ def test_project_instructions_outside_git_project_explains_next_step(
     app.loop.store.close()
 
 
-def test_slash_registry_builds_with_malformed_project_registry(
+def test_project_instructions_reports_registry_error_without_raising(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
     root = tmp_path / "project"
     root.mkdir()
     _private_project(home, root, "")
-    project_json = next((home / "projects").glob("*/project.json"))
-    record = json.loads(project_json.read_text(encoding="utf-8"))
-    del record["name"]
-    project_json.write_text(json.dumps(record) + "\n", encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(root)
 
     app = create_app(_args())
 
+    project_json = next((home / "projects").glob("*/project.json"))
+    record = json.loads(project_json.read_text(encoding="utf-8"))
+    del record["name"]
+    project_json.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
     result = app._slash_commands.dispatch(app, "/project-instructions")
 
-    assert isinstance(result, str)
     assert result.startswith("project instructions error:")
     app.loop.store.close()
 
