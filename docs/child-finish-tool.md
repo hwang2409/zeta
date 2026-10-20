@@ -8,8 +8,8 @@ date: 2026-10-20
 
 background `worker` and `reviewer` children should remain live until they call a
 new `finish` tool. a turn that ends without `finish` is not completion. zeta
-nudges the child once, then records it as idle and waits without using model
-tokens.
+records the child as idle and waits without using model tokens. after 10
+eligible idle minutes, it can wake the child with a bounded reminder.
 
 this behavior starts behind a global setting and profile opt-in. phoebe will use
 it before it becomes the default. foreground children and other profiles keep
@@ -80,9 +80,10 @@ should mean “available for more work,” not “destroy this run.”
 ## scope
 
 this design distinguishes a completed contract from a quiet turn, preserves
-context for follow-ups, waits without model calls, keeps terminal data bounded,
-and replaces the opted-in finish gate. it does not change foreground children,
-resume processes after zeta exits, add a workflow framework, or change provider
+context for follow-ups, waits without model calls except for bounded idle
+nudges, keeps terminal data bounded, and replaces the opted-in finish gate. it
+does not change foreground children, resume processes after zeta exits, add a
+workflow framework, or change provider
 retry policy; pr #521 owns retries.
 
 ## proposed design
@@ -165,18 +166,10 @@ text and measure the complete serialized envelope, not python character count.
 
 ### no-tool turn and idle state
 
-on the first normal turn that ends without a successful `finish`, send one
-harness nudge in a new model turn:
-
-> you have not called `finish`. if the contract is complete, call it now. if
-> you need a parent answer, call `ask_parent`. otherwise end this turn and zeta
-> will keep you idle for follow-ups without using tokens.
-
-this nudge occurs at most once for the child's lifetime. if the nudge turn also
-ends without `finish`, or any later woken turn ends without it, set lifecycle
-state to `idle`, set `current_step` to `idle, waiting for follow-up`, and wait.
-`idle` is non-terminal: keep the parent marker, pending-prompt queue, loop,
-registry, and store open.
+when a normal turn ends without a successful `finish`, set lifecycle state to
+`idle`, set `current_step` to `idle, waiting for follow-up`, and wait without an
+immediate extra model turn. `idle` is non-terminal: keep the parent marker,
+pending-prompt queue, loop, registry, and store open.
 
 on each transition into `idle`, publish exactly one bounded, nonterminal
 `child_idle` notification to the direct parent and wake it without polling. the
@@ -200,35 +193,40 @@ these events do not wake it:
 - `agent_status`, `agent_output`, tui viewing, or other reads;
 - unrelated parent or sibling notifications;
 - progress output from a still-running task;
-- elapsed time before a terminal timeout;
+- elapsed time before the 10-minute idle-nudge boundary;
 - repeated status polling.
 
-### idle timeout and capacity
+### idle nudge and resource warning
 
-for the phoebe trial, use a 60-minute idle timeout **pending user
-confirmation**. every listed wake event resets the clock. time while the child
-owns a running process task or any live descendant agent does not count. after
-the final owned descendant becomes terminal, deliver its notification; if the
-following turn returns to idle, start a new 60-minute clock. auto-finish never
-cancels or adopts owned work.
+an idle period becomes eligible for one automatic nudge after 10 continuous
+minutes only when the child is still idle, no model turn is active, it owns no
+running process task or live child agent, and no follow-up or relevant
+notification is pending or claimed. recheck all conditions under the serialized
+fence before waking it with this ordinary model message:
 
-the synthesized completion has lifecycle state `completed`, report status
-`blocked`, reason `idle_timeout`, and summary:
+> you have been idle for 10 minutes. call `finish` if the contract is complete,
+> call `ask_parent` if you are waiting on a decision, or continue the work.
 
-> auto-finished after 60 minutes idle without an explicit finish report.
+the nudge is a wake event, not a terminal path. it resets the idle clock and
+produces one ordinary turn. if that turn ends without `finish`, the child enters
+a new idle period and can receive another nudge after the same 10-minute rule.
+allow at most three automatic idle nudges over the child's lifetime. after the
+third, leave it idle until an external wake, cancellation, provider-error exit,
+or restart recovery; never spend another model turn merely because time passed.
+this absolute bound prevents a child that repeatedly returns no tool calls from
+creating a nudge loop.
 
-append a bounded excerpt of the child's last assistant text when one exists.
-include normal turns, elapsed time, and tool-call statistics. do not claim that
-the contract succeeded.
+any wake event resets the 10-minute clock. time while a task or child agent is
+live, while a model turn is active, or while input is pending or claimed does
+not count. the task/child completion or queued input is delivered first; a new
+idle clock starts only if the following turn returns to idle.
 
-for the phoebe trial, cap idle explicit-finish children at 16 per root agent
-tree **pending user confirmation**. active model turns and children that own a
-running task or live descendant agent do not count. reject admission of the
-newest excess child to idle by synthesizing `blocked` with reason
-`idle_capacity`; do not evict an older child, cancel work, or hand ownership to
-its parent. apply capacity only after owned descendants clear and their
-notifications are read. the parent can cancel any live child with
-`agent_cancel`.
+there is no hard idle-child cap in v1 **pending user confirmation**. instead,
+`agent_status` and the tui report the idle-child count and the known held
+idle-child directory-fd floor: at least two per idle child, one for its session
+store and one for its cloned registry. warn above 16 idle children in one root
+tree, which means a known floor above 32 held directory fds, but do not reject,
+finish, cancel, or hand off any child.
 
 there is no separate “finish now” parent tool in the first version. the parent
 can send “finish now” with `agent_send`, which gives the child a chance to write
@@ -252,19 +250,21 @@ for opted-in children, delete the 8-turn and 600-second finish-gate model loop.
 remove its inferred-final-message entry condition. retain one safety rule from
 pr #512: a process task that is still running 3,600 seconds after the child
 first becomes idle is killed, and its exit wakes the child to report. this is a
-resource safety deadline, not a finish gate and not a model-turn deadline. if
-the child does not call `finish` after that wake, the normal idle clock applies.
+resource safety deadline, not a finish gate, idle-child completion, or a
+model-turn deadline. if the child does not call `finish` after that wake, it
+returns to idle under the normal nudge rule.
 
-this leaves one normal path: explicit `finish`; and three harness-owned terminal
-paths: idle timeout/capacity, cancellation, and unrecoverable error. non-opted-in
+an opted-in idle child never finishes because of elapsed time or tree capacity.
+only accepted `finish`, parent/user cancellation, an unrecoverable provider
+error before accepted `finish`, or restart recovery ends it. non-opted-in
 profiles retain the old finish gate unchanged.
 
 ### serialized terminal-transition fence
 
-use one per-child serialized fence for accepted `finish`, idle timeout, capacity
-auto-finish, cancellation, and restart recovery. this extends today's prompt
-and notification draining in `src/zeta/agent/runner.py:344-384`; do not build a
-separate check for each terminal path.
+use one per-child serialized fence for accepted `finish`, the idle-nudge wake,
+cancellation, and restart recovery. this extends today's prompt and notification
+draining in `src/zeta/agent/runner.py:344-384`; do not build a separate check for
+each path.
 
 under the fence, inspect prompt delivery claims, relevant task/direct-child
 notification claims, owned work, and the durable pending queues. close the
@@ -275,28 +275,29 @@ accepted. a task or direct-child terminal notification that is pending or
 claimed also wins and must be read.
 
 explicit `finish` returns a tool error telling the child to read the pending
-input when any winning prompt or relevant notification exists. timeout and
-capacity defer, wake the child with that input, and retry only after it returns
-to idle. cancellation and restart recovery still terminate by policy, but use
-the same fence. they first give already-committed prompts an explicit canceled
-delivery outcome, then use “close if empty” and record cancellation atomically;
-they never force-close a nonempty queue or masquerade as explicit or automatic
-completion. the fence accepts `finish` only when queues are empty, no relevant
-delivery is claimed, and no owned work is live. it then durably records the
+input when any winning prompt or relevant notification exists. an idle-nudge
+attempt loses to that input, delivers it instead, and resets the clock.
+cancellation and restart recovery still terminate by policy, but use the same
+fence. they first give already-committed prompts an explicit canceled delivery
+outcome, then use “close if empty” and record cancellation atomically; they
+never force-close a nonempty queue or masquerade as explicit completion. the
+fence accepts `finish` only when queues are empty, no relevant delivery is
+claimed, and no owned work is live. it then durably records the
 arguments and successful tool result before entering `finishing`.
 
 ### state transitions
 
 | state | event under the fence | next state and action |
 | --- | --- | --- |
-| `running` | healthy turn without accepted `finish` | nudge once, then `idle` and publish one `child_idle` |
-| `running` or `idle` | prompt or relevant notification wins | `running`; deliver it before any terminal transition |
+| `running` | healthy turn without accepted `finish` | `idle`; publish one `child_idle` and start the eligible clock |
+| `idle` | external prompt or relevant notification wins | `running`; deliver it and reset the clock |
+| `idle` | 10 eligible minutes, fewer than three lifetime nudges | `running`; deliver one idle nudge and reset the clock |
+| `idle` | nudge boundary while turn/work/input exists | stay live; deliver real input first or keep the clock paused |
+| `idle` | 10 eligible minutes after three lifetime nudges | remain `idle`; do not wake or finish |
 | `running` or `idle` | `finish`, but input is pending/claimed or work is owned | unchanged; reject with a tool error that identifies what to read or clear |
 | `running` or `idle` | valid `finish` wins | `finishing`; close admission and durably store report plus successful result |
 | `finishing` | second `finish` or any other tool call | `finishing`; reject as `child is finishing` |
 | `finishing` | turn end or later stream/provider failure | terminal from the explicit report; publish it once |
-| `idle` | timeout/capacity, but input or owned descendants exist | `running` for input, or remain `idle` with clock paused; do not auto-finish |
-| `idle` | timeout/capacity wins with no input or descendants | `completed` with synthesized `blocked` receipt |
 | any live state | cancellation or restart recovery wins | `canceled`; atomically close admission and clean up owned work |
 | `running` or `idle` | provider failure before accepted `finish` | `failed` after retries; clean up owned work |
 | any terminal state | any event | unchanged; no second terminal receipt |
@@ -346,7 +347,9 @@ on the existing `recall_history` source link for exact recovery.
 
 ### resource and token cost
 
-an idle child makes no provider request, so it uses no model tokens. it retains:
+while waiting, an idle child makes no provider request and uses no model tokens.
+each eligible idle nudge makes one ordinary provider turn, subject to the
+three-nudge lifetime bound. the child retains:
 
 - one asyncio waiter and child/watcher state;
 - its backend and conversation objects in memory;
@@ -354,12 +357,12 @@ an idle child makes no provider request, so it uses no model tokens. it retains:
 - tool registry state and any approval/store leases.
 
 exact memory depends on provider and transcript size, so the design does not
-promise a byte figure. a confirmed 16-child idle cap would bound the known
-baseline to at least 32 retained directory fds per root tree, plus provider and
-tool-specific resources; excluded children with owned descendants remain
-additional live resources and must be counted separately. metrics must record
-the observed fd count and rss delta at idle entry and exit during the phoebe
-trial. pr #498's close path remains mandatory on all terminal paths.
+promise a byte figure. each idle child has a known floor of two retained
+directory fds; 16 idle children therefore have a floor of 32, before provider
+and tool-specific resources. `agent_status`, the tui warning, and trial metrics
+report both idle-child count and this known fd floor. metrics also record
+observed process fd count and rss delta at idle entry and exit. pr #498's close
+path remains mandatory on every terminal path.
 
 ## alternatives considered
 
@@ -395,11 +398,11 @@ rejected for the first release. rebuilding a valid model loop, tool registry,
 approval state, and task ownership is a larger durability protocol. persisted
 conversation remains available even when the live lease ends.
 
-### no idle timeout or cap
+### auto-finish idle children
 
-rejected. idle children use no tokens but retain fds, memory, leases, and a live
-address for follow-ups. pr #498 showed that descriptor lifetime is operationally
-important.
+rejected. elapsed time and tree size do not show that a contract ended. idle
+children retain resources, so v1 exposes their count and known fd floor and
+warns above 16 instead of inventing a second completion authority.
 
 ## rollout and measurement
 
@@ -416,15 +419,17 @@ important.
 6. compare with the preceding 100 eligible children. record:
    - `agent_send` failures because the target already finished;
    - no-tool turns followed by later parent messages;
-   - auto-finishes by `idle_timeout` and `idle_capacity`;
+   - idle-nudge count, nudge responses, and nudge tokens;
+   - parent/user cancellations of idle children;
    - tasks killed on normal completion, safety deadline, cancellation, and
      provider error;
    - finish refusals due to owned work;
-   - idle duration, concurrent idle peak, fd count, and rss delta;
-   - extra nudge turns and tokens.
-7. success requires zero known premature finishes, zero running tasks killed by
-   successful `finish`, and no increase in unreconciled child markers. review
-   timeout/cap and token data before changing defaults.
+   - idle duration, concurrent idle peak, above-16 warnings, known idle fd
+     floor, observed process fd count, and rss delta.
+7. success requires zero known premature finishes, zero idle children finished
+   because of time or capacity, zero running tasks killed by successful
+   `finish`, and no increase in unreconciled child markers. review nudge, idle
+   resource, and token data before changing defaults.
 8. after review, opt packaged background `run` into the protocol. remove the
    setting and legacy finish gate only in a later migration. do not silently
    change foreground `general`, `explore`, or `plan` behavior.
@@ -438,8 +443,8 @@ must fail on the pre-implementation revision for the expected reason.
   covers schema, lifecycle mapping, structured fields, and one notification.
 - `tests/test_agent.py::test_explicit_finish_blocked_and_failed_map_to_receipts`
   proves `blocked` has `isError: false` while `failed` has `isError: true`.
-- `tests/test_agent.py::test_explicit_finish_nudges_once_then_idles` covers one
-  nudge, durable idle state, and no provider call while waiting.
+- `tests/test_agent.py::test_explicit_finish_no_tool_turn_enters_idle_without_request`
+  covers durable idle state and no immediate extra provider call.
 - `tests/test_agent.py::test_wait_with_running_task_wakes_parent_then_accepts_approval`
   reproduces the original bare `WAIT`, keeps the task alive, wakes the parent,
   delivers later approval, and lets the child report.
@@ -452,16 +457,21 @@ must fail on the pre-implementation revision for the expected reason.
   closure is rejected.
 - `tests/test_agent.py::test_pending_task_or_child_notification_rejects_finish`
   barrier-tests both pending and claimed notification delivery.
-- `tests/test_agent.py::test_terminal_fence_follow_up_wins_timeout_capacity_cancel_and_recovery_races`
-  barrier-tests queue closure and deterministic delivery outcomes for every
-  harness-owned terminal transition.
+- `tests/test_agent.py::test_terminal_fence_serializes_finish_idle_nudge_cancel_and_recovery`
+  barrier-tests queue closure, nudge eligibility, and deterministic delivery
+  outcomes for every fenced path.
 - `tests/test_agent.py::test_explicit_finish_refuses_owned_work_until_clear`
   covers task/child refusal, cancellation, and descendant handoff.
-- `tests/test_agent.py::test_idle_timeout_pauses_for_owned_task_and_child_agent`
-  covers both ownership types, no cancellation or implicit handoff, and timeout
-  only after ownership clears and its notification is read.
-- `tests/test_agent.py::test_idle_capacity_excludes_owned_task_and_child_agent`
-  covers both ownership types and newest-child admission only after they clear.
+- `tests/test_agent.py::test_idle_nudge_after_ten_minutes_without_running_work`
+  verifies one ordinary nudge turn after the exact eligible boundary.
+- `tests/test_agent.py::test_idle_nudge_waits_for_task_child_active_turn_and_input`
+  covers both ownership types, a model turn, and pending or claimed input.
+- `tests/test_agent.py::test_idle_wake_resets_nudge_clock` verifies follow-up,
+  task, child, and nudge wakes restart a full 10-minute period.
+- `tests/test_agent.py::test_idle_nudge_stops_after_three_lifetime_nudges`
+  proves repeated no-tool replies cannot create an unbounded nudge loop.
+- `tests/test_agent.py::test_idle_child_never_auto_finishes_for_time_or_count`
+  advances time and creates more than 16 idle children without terminal output.
 - `tests/test_agent.py::test_explicit_finish_twice_rejects_second_call` and
   `tests/test_agent.py::test_tool_call_after_successful_finish_is_rejected`
   close the same-turn protocol after one accepted report.
@@ -481,14 +491,13 @@ must fail on the pre-implementation revision for the expected reason.
   shared fence, cleanup, and v1 no-rehydration rule.
 - `tests/test_agents.py::test_explicit_finish_requires_global_and_profile_opt_in`,
   `tests/test_settings.py::test_project_cannot_enable_explicit_finish`, and
-  `tests/test_tui.py::test_idle_agent_card_and_status_remain_live` cover rollout
-  eligibility, configuration, and inspection.
+  `tests/test_tui.py::test_idle_agent_card_reports_count_fd_floor_and_warning`
+  cover rollout eligibility, configuration, and resource visibility.
 - existing finish-gate tests remain unchanged for legacy profiles; an opted-in
   regression proves those runs never enter `run_finish_gate`.
 
 ## open questions
 
-1. **pending user confirmation:** use a 60-minute idle timeout for the phoebe
-   trial to favor follow-up continuity?
-2. **pending user confirmation:** cap idle children at 16 per root tree, reject
-   the newest excess admission, and exclude children with owned descendants?
+1. **pending user confirmation:** use no hard idle-child cap in v1, report the
+   count and known two-fd-per-child floor in `agent_status` and the tui, and warn
+   above 16 idle children per root tree without ending or rejecting any child?
