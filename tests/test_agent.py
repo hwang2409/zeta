@@ -8221,8 +8221,9 @@ def test_agent_status_text_shows_cwd() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ignored_project", ["project-a", "project-b"])
 async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
-    tmp_path: Path,
+    tmp_path: Path, ignored_project: str,
 ) -> None:
     from zeta.project_registry import ProjectRegistry
 
@@ -8239,6 +8240,28 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
     )
     (home / "projects" / child_project.project_id / "AGENTS.md").write_text(
         "CHILD-PRIVATE-MARKER", encoding="utf-8"
+    )
+    (child_cwd / "AGENTS.md").write_text("CHILD-REPO-MARKER", encoding="utf-8")
+    _ignore_repo_agents = ignored_project == "project-a"
+    ignored_id = (
+        parent_project.project_id if _ignore_repo_agents else child_project.project_id
+    )
+    for project in (parent_project, child_project):
+        record = json.loads(
+            (home / "projects" / project.project_id / "project.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        record["repo_agents"] = "include"
+        (home / "projects" / project.project_id / "project.json").write_text(
+            json.dumps(record) + "\n", encoding="utf-8"
+        )
+    record = json.loads(
+        (home / "projects" / ignored_id / "project.json").read_text(encoding="utf-8")
+    )
+    record["repo_agents"] = "ignore"
+    (home / "projects" / ignored_id / "project.json").write_text(
+        json.dumps(record) + "\n", encoding="utf-8"
     )
     store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
     tools = ToolRegistry(
@@ -8285,6 +8308,16 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
     )
     assert "CHILD-PRIVATE-MARKER" in system_text
     assert "PARENT-PRIVATE-MARKER" not in system_text
+    from zeta.core.project_context import load_project_context
+    context = load_project_context(
+        cwd=child_cwd,
+        repo_root=child_cwd,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        project_id=parent_project.project_id,
+        inbox_enabled=False,
+    )
+    assert any("repository AGENTS.md" in notice for notice in context.notices) is (ignored_project == "project-b")
     await loop.close()
 
 

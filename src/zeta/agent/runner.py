@@ -15,7 +15,6 @@ from ..core.checkpoints import _now
 from ..core.project_context import (
     discover_repo_root,
     load_project_context,
-    resolve_project_context,
 )
 from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
@@ -1144,17 +1143,12 @@ def _child_base_system_prompt(
         child_registry.verify_cwd_identity()
     home_hint = loop.active_home
     zeta_home = Path(home_hint) if home_hint else env_home()
-    project = resolve_project_context(cwd_override, zeta_home, loop.root_project_id)
     context = load_project_context(
         cwd=cwd_override,
         repo_root=discover_repo_root(cwd_override),
         zeta_home=zeta_home,
         catalog=loop.tool_registry.skill_catalog,
-        project_id=(
-            project.project_id
-            if project is not None
-            else (loop.root_project_id or "__no_project__")
-        ),
+        project_id=loop.root_project_id or "__no_project__",
         inbox_enabled=False,
     )
     return context.system_prompt

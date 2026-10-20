@@ -4623,6 +4623,42 @@ async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_serve_session_loads_private_instructions_from_linked_worktree(
+    tmp_path: Path,
+) -> None:
+    from zeta.project_registry import ProjectRegistry
+    from zeta.server.runtime import ServerRuntime
+
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "repo"
+    worktree = tmp_path / "linked"
+    root.mkdir()
+
+    async def run_git(*args: str) -> None:
+        await asyncio.to_thread(
+            subprocess.run, ["git", *args], cwd=root, check=True, capture_output=True
+        )
+
+    await run_git("init")
+    await run_git("config", "user.email", "test@example.com")
+    await run_git("config", "user.name", "test")
+    (root / "tracked").write_text("initial", encoding="utf-8")
+    await run_git("add", "tracked")
+    await run_git("commit", "-m", "initial")
+    await run_git("worktree", "add", "-b", "feature", str(worktree))
+    project = ProjectRegistry(home / "projects").create_project("repo", "test", root)
+    private = home / "projects" / project.project_id / "AGENTS.md"
+    private.write_text("LINKED-SERVE-PRIVATE-MARKER", encoding="utf-8")
+    runtime = ServerRuntime(home, cwd=worktree, provider="codex")
+    try:
+        metadata = await runtime.create_session()
+        assert metadata.project_id == project.project_id
+        assert "LINKED-SERVE-PRIVATE-MARKER" in metadata.system_prompt
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_serve_session_loads_private_instructions(tmp_path: Path) -> None:
     from zeta.project_registry import ProjectRegistry
     from zeta.server.runtime import ServerRuntime

@@ -14,6 +14,8 @@ from ..config.settings import load_settings
 from ..config.settings import resolve as resolve_settings
 from ..core.approval import ApprovalPolicy
 from ..core.project_context import (
+    associate_project_discovery,
+    discover_project,
     discover_repo_root,
     load_project_context,
     resolve_project_context,
@@ -310,6 +312,12 @@ class ServerRuntime:
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
         project = self.manager.project_registry.find_for_directory(session_cwd)
+        if project is None and (session_cwd / ".git").is_file():
+            project = associate_project_discovery(
+                discover_project(session_cwd, user_home=self.home.parent),
+                self.manager.project_registry,
+                create=False,
+            ).project
         project_id = project.project_id if project is not None else "__no_project__"
         context = load_project_context(
             cwd=session_cwd,

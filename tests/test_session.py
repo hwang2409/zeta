@@ -223,12 +223,14 @@ def test_private_instructions_no_git_nested_and_symlinked_cwd(
     project_id, private = _private_project(home, root, "OUTER-PROJECT-PRIVATE")
     cwd = root
     should_load = True
+    session_association = True
     if layout == "nested-git":
         cwd = root / "inner"
         cwd.mkdir()
         subprocess.run(["git", "init"], cwd=cwd, check=True, capture_output=True)
-        # The nested repository is a distinct project, so the outer private file loses.
+        # Nested repositories keep the containing session project, but not its private instructions.
         should_load = False
+        session_association = True
     elif layout == "symlinked":
         cwd = tmp_path / "project-link"
         cwd.symlink_to(root, target_is_directory=True)
@@ -237,7 +239,7 @@ def test_private_instructions_no_git_nested_and_symlinked_cwd(
 
     app = create_app(_args())
 
-    assert (app.loop.session_metadata.project_id == project_id) is should_load
+    assert (app.loop.session_metadata.project_id == project_id) is session_association
     assert (str(private.resolve()) in app.slash_status().context_files) is should_load
     assert ("OUTER-PROJECT-PRIVATE" in _system_prompt(app)) is should_load
 

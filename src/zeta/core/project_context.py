@@ -285,13 +285,13 @@ def associate_project_discovery(
 
     if not discovery.eligible:
         return discovery
-    project = (
-        _project_at_root(registry, discovery.primary_root, discovery)
-        if discovery.primary_root is not None
-        else _valid_registry_candidate(
-            registry.find_for_directory(discovery.cwd), discovery
-        )
+    project = _valid_registry_candidate(
+        registry.find_for_directory(discovery.cwd), discovery
     )
+    if project is None and discovery.primary_root is not None:
+        project = _valid_registry_candidate(
+            registry.find_for_directory(discovery.primary_root), discovery
+        )
     if project is None and discovery.common_dir is not None:
         project = next(
             (
@@ -588,20 +588,55 @@ def _walk_up_agents_files(cwd: Path, stop_at: Path) -> list[Path]:
 def resolve_project_context(
     cwd: str | Path, home: Path, project_id: str | None = None
 ) -> Project | None:
-    """Resolve the registry project that owns ``cwd`` and validate its id."""
+    """Resolve the project whose private instructions apply to ``cwd``."""
     registry = ProjectRegistry(home / "projects")
     if not registry.root.exists():
         return None
-    if project_id is not None:
-        direct = registry.find_for_directory(cwd)
-        if direct is not None:
-            return direct if direct.project_id == project_id else None
-    discovery = associate_project_discovery(
-        discover_project(cwd, user_home=home.parent), registry, create=False
+    discovery: ProjectDiscovery | None = None
+    path = Path(cwd).expanduser().resolve()
+    direct = next(
+        (
+            candidate
+            for candidate in registry.list_projects()
+            if candidate.canonical_integration_root is not None
+            and Path(candidate.canonical_integration_root).expanduser().resolve() == path
+        ),
+        _valid_registry_candidate(registry.find_for_directory(cwd),
+                                  ProjectDiscovery(
+                                           Path(cwd).resolve(), Path(cwd).resolve(), None,
+                                           None, home.parent, Path(Path(cwd).resolve().anchor),
+                                           True,
+                                       )),
     )
-    project = discovery.project
-    if project is None and discovery.primary_root is None:
-        project = registry.find_for_directory(cwd)
+    if direct is not None and not any(
+        (parent / ".git").is_dir()
+        for parent in [Path(cwd).resolve(), *Path(cwd).resolve().parents]
+        if parent != Path(direct.canonical_integration_root).resolve()
+        and Path(direct.canonical_integration_root).resolve() in parent.parents
+    ):
+        project = direct
+    else:
+        discovery = discover_project(cwd, user_home=home.parent)
+        project = None
+    if project is None and discovery is not None and discovery.primary_root is not None:
+        project = _project_at_root(registry, discovery.primary_root, discovery)
+        if project is None and discovery.common_dir is not None:
+            project = next(
+                (
+                    candidate
+                    for candidate in registry.list_projects()
+                    if _valid_registry_candidate(candidate, discovery) is not None
+                    and _checkout_common_dir(
+                        Path(candidate.canonical_integration_root)
+                    )
+                    == discovery.common_dir
+                ),
+                None,
+            )
+    elif project is None and discovery is not None:
+        project = _valid_registry_candidate(
+            registry.find_for_directory(cwd), discovery
+        )
     if project_id is not None and (project is None or project.project_id != project_id):
         return None
     return project
@@ -612,15 +647,18 @@ def _project_instruction_context(
 ) -> tuple[Project | None, Project | None, bool, tuple[str, ...]]:
     """Resolve session memory, cwd-private instructions, and repository policy."""
     try:
+        registry = ProjectRegistry(home / "projects")
         if project_id is None:
-            session_project = resolve_project_context(working_dir, home)
-            cwd_project = session_project
+            session_project = associate_project_discovery(
+                discover_project(working_dir, user_home=home.parent),
+                registry,
+                create=False,
+            ).project
+            cwd_project = resolve_project_context(working_dir, home)
         else:
             session_project = ProjectRegistry(home / "projects").show_project(project_id)
-            cwd_project = resolve_project_context(working_dir, home, project_id)
-            if cwd_project is None:
-                cwd_project = resolve_project_context(working_dir, home)
-        ignored = session_project is not None and session_project.repo_agents == "ignore"
+            cwd_project = resolve_project_context(working_dir, home)
+        ignored = cwd_project is not None and cwd_project.repo_agents == "ignore"
         notices = (
             ("warning: repository AGENTS.md files were ignored by project settings",)
             if ignored
