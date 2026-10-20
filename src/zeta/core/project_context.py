@@ -288,7 +288,9 @@ def associate_project_discovery(
     project = (
         _project_at_root(registry, discovery.primary_root, discovery)
         if discovery.primary_root is not None
-        else None
+        else _valid_registry_candidate(
+            registry.find_for_directory(discovery.cwd), discovery
+        )
     )
     if project is None and discovery.common_dir is not None:
         project = next(

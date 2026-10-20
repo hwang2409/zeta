@@ -220,7 +220,7 @@ def test_private_instructions_no_git_nested_and_symlinked_cwd(
     home = tmp_path / "zeta-home"
     root = tmp_path / "project"
     root.mkdir()
-    _, private = _private_project(home, root, "OUTER-PROJECT-PRIVATE")
+    project_id, private = _private_project(home, root, "OUTER-PROJECT-PRIVATE")
     cwd = root
     should_load = True
     if layout == "nested-git":
@@ -237,6 +237,7 @@ def test_private_instructions_no_git_nested_and_symlinked_cwd(
 
     app = create_app(_args())
 
+    assert (app.loop.session_metadata.project_id == project_id) is should_load
     assert (str(private.resolve()) in app.slash_status().context_files) is should_load
     assert ("OUTER-PROJECT-PRIVATE" in _system_prompt(app)) is should_load
 
