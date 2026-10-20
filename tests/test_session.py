@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import multiprocessing
+import subprocess
 import threading
 import time
 import uuid
@@ -28,6 +29,7 @@ from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
+from zeta.project_registry import ProjectRegistry
 from zeta.prompts import load_runtime_guidance
 from zeta.protocol.types import (
     Message,
@@ -55,6 +57,24 @@ def _args(*values: str):
 
 def _with_runtime_guidance(prompt: str) -> str:
     return f"{prompt}\n\n{load_runtime_guidance().rstrip()}"
+
+
+def _private_project(home: Path, root: Path, marker: str) -> tuple[str, Path]:
+    project = ProjectRegistry(home / "projects").create_project(root.name, "test", root)
+    path = home / "projects" / project.project_id / "AGENTS.md"
+    path.write_text(marker, encoding="utf-8")
+    return project.project_id, path
+
+
+def _system_prompt(app: TUIApp) -> str:
+    return app.loop.context_assembler.system_prompt.content[0].text
+
+
+def _ignore_repo_agents(home: Path, project_id: str) -> None:
+    path = home / "projects" / project_id / "project.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["repo_agents"] = "ignore"
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
 
 async def wait_until(check: Callable[[], bool]) -> None:
@@ -136,6 +156,220 @@ def test_fresh_session_injects_context_and_lists_files(
     assert "You are zeta" in system_prompt
     assert "repo rules" in system_prompt
     assert str((tmp_path / "AGENTS.md").resolve()) in app.slash_status().context_files
+
+
+def test_private_instructions_wrong_project_id_not_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    _private_project(home, project_a, "PROJECT-A-PRIVATE")
+    project_b_id, _ = _private_project(home, project_b, "PROJECT-B-PRIVATE")
+    opened = SessionManager(home).create(
+        provider="codex",
+        model="offline",
+        cwd=project_a,
+        project_id=project_b_id,
+        prompt_recipe="default",
+        auto_project=False,
+    )
+    session_id = opened.store.session_id
+    opened.store.close()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+
+    app = create_app(_args("--resume", session_id))
+
+    assert "PROJECT-B-PRIVATE" not in _system_prompt(app)
+
+
+def test_private_instructions_load_in_real_git_linked_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "repo"
+    worktree = tmp_path / "linked"
+    root.mkdir()
+    subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+    (root / "tracked").write_text("initial", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature", str(worktree)],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    _private_project(home, root, "LINKED-WORKTREE-PRIVATE")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(worktree)
+
+    app = create_app(_args())
+
+    assert "LINKED-WORKTREE-PRIVATE" in _system_prompt(app)
+
+
+@pytest.mark.parametrize("layout", ["no-git", "nested-git", "symlinked"])
+def test_private_instructions_no_git_nested_and_symlinked_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _, private = _private_project(home, root, "OUTER-PROJECT-PRIVATE")
+    cwd = root
+    should_load = True
+    if layout == "nested-git":
+        cwd = root / "inner"
+        cwd.mkdir()
+        subprocess.run(["git", "init"], cwd=cwd, check=True, capture_output=True)
+        # The nested repository is a distinct project, so the outer private file loses.
+        should_load = False
+    elif layout == "symlinked":
+        cwd = tmp_path / "project-link"
+        cwd.symlink_to(root, target_is_directory=True)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(cwd)
+
+    app = create_app(_args())
+
+    assert (str(private.resolve()) in app.slash_status().context_files) is should_load
+    assert ("OUTER-PROJECT-PRIVATE" in _system_prompt(app)) is should_load
+
+
+def test_resume_with_changed_private_instructions_rebuilds_and_notifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _, private = _private_project(home, root, "PRIVATE-BEFORE")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    first.loop.store.close()
+    private.write_text("PRIVATE-AFTER", encoding="utf-8")
+
+    resumed = create_app(_args("--resume", session_id))
+
+    assert "PRIVATE-BEFORE" not in _system_prompt(resumed)
+    assert "PRIVATE-AFTER" in _system_prompt(resumed)
+    assert any("project instructions changed" in notice for notice in resumed._startup_notices)
+
+
+def test_resume_with_unchanged_private_instructions_keeps_prefix_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _private_project(home, root, "UNCHANGED-PRIVATE")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    prefix = _system_prompt(first)
+    first.loop.store.close()
+
+    resumed = create_app(_args("--resume", session_id))
+
+    assert _system_prompt(resumed) == prefix
+    assert not any("project instructions" in notice for notice in resumed._startup_notices)
+
+
+def test_resume_with_removed_private_instructions_notifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _, private = _private_project(home, root, "REMOVED-PRIVATE")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    first.loop.store.close()
+    private.unlink()
+
+    resumed = create_app(_args("--resume", session_id))
+
+    assert "REMOVED-PRIVATE" not in _system_prompt(resumed)
+    assert any("project instructions removed" in notice for notice in resumed._startup_notices)
+
+
+def test_repo_agents_ignore_warns_with_custom_system_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    project_id, _ = _private_project(home, root, "PRIVATE")
+    _ignore_repo_agents(home, project_id)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+
+    app = create_app(_args("--system-prompt", "CUSTOM-SYSTEM"))
+
+    assert any("repository AGENTS.md" in notice for notice in app._startup_notices)
+
+
+def test_repo_agents_ignore_warns_with_custom_system_prompt_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    project_id, _ = _private_project(home, root, "PRIVATE")
+    _ignore_repo_agents(home, project_id)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    first = create_app(_args("--system-prompt", "CUSTOM-SYSTEM"))
+    session_id = first.loop.store.session_id
+    first.loop.store.close()
+
+    resumed = create_app(_args("--resume", session_id))
+
+    assert any("repository AGENTS.md" in notice for notice in resumed._startup_notices)
+
+
+def test_project_instructions_slash_command_creates_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    project_id, private = _private_project(home, root, "")
+    private.unlink()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    app = create_app(_args())
+
+    result = app._slash_commands.dispatch(app, "/project-instructions")
+
+    assert result == f"project instructions: {home / 'projects' / project_id / 'AGENTS.md'}"
+    assert private.is_file()
+
+
+def test_status_lists_private_instructions_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _, private = _private_project(home, root, "STATUS-PRIVATE")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    app = create_app(_args())
+
+    output = app._slash_commands.dispatch(app, "/status")
+
+    assert output is not None
+    assert f"context_files: {private.resolve()}" in output
 
 
 def test_resume_renders_legacy_computer_tool_messages(

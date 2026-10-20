@@ -233,12 +233,32 @@ def _valid_registry_candidate(
     return project
 
 
+def _project_at_root(
+    registry: ProjectRegistry, root: Path, discovery: ProjectDiscovery
+) -> Project | None:
+    project = _valid_registry_candidate(registry.find_for_directory(root), discovery)
+    if (
+        project is not None
+        and Path(project.canonical_integration_root).expanduser().resolve() == root
+    ):
+        return project
+    return next(
+        (
+            candidate
+            for candidate in registry.list_projects()
+            if _valid_registry_candidate(candidate, discovery) is not None
+            and Path(candidate.canonical_integration_root).expanduser().resolve() == root
+        ),
+        None,
+    )
+
+
 def _find_or_create_valid_project(
     registry: ProjectRegistry, root: Path, discovery: ProjectDiscovery
 ) -> Project | None:
     """Create a project without allowing an invalid ancestor match to win."""
 
-    project = _valid_registry_candidate(registry.find_for_directory(root), discovery)
+    project = _project_at_root(registry, root, discovery)
     if project is not None:
         return project
     names = [
@@ -252,9 +272,7 @@ def _find_or_create_valid_project(
                 name, "git", root, memory_profile="zeta"
             )
         except ProjectRegistryError:
-            project = _valid_registry_candidate(
-                registry.find_for_directory(root), discovery
-            )
+            project = _project_at_root(registry, root, discovery)
             if project is not None:
                 return project
     return None
@@ -267,13 +285,11 @@ def associate_project_discovery(
 
     if not discovery.eligible:
         return discovery
-    project = _valid_registry_candidate(
-        registry.find_for_directory(discovery.cwd), discovery
+    project = (
+        _project_at_root(registry, discovery.primary_root, discovery)
+        if discovery.primary_root is not None
+        else None
     )
-    if project is None and discovery.primary_root is not None:
-        project = _valid_registry_candidate(
-            registry.find_for_directory(discovery.primary_root), discovery
-        )
     if project is None and discovery.common_dir is not None:
         project = next(
             (
@@ -582,6 +598,8 @@ def resolve_project_context(
         discover_project(cwd, user_home=home.parent), registry, create=False
     )
     project = discovery.project
+    if project is None and discovery.primary_root is None:
+        project = registry.find_for_directory(cwd)
     if project_id is not None and (project is None or project.project_id != project_id):
         return None
     return project
@@ -714,8 +732,9 @@ def load_project_context(
             candidates = []
         else:
             repo_candidates = ()
-        if project_for_context is not None and project_matches:
-            private_agents = home / "projects" / project_for_context.project_id / AGENTS_FILENAME
+        private_project = project_for_context if project_matches else resolved_project
+        if private_project is not None:
+            private_agents = home / "projects" / private_project.project_id / AGENTS_FILENAME
             if _present(private_agents):
                 deduped.append(private_agents.resolve())
 

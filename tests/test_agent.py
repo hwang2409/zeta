@@ -8221,6 +8221,74 @@ def test_agent_status_text_shows_cwd() -> None:
 
 
 @pytest.mark.asyncio
+async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
+    tmp_path: Path,
+) -> None:
+    from zeta.project_registry import ProjectRegistry
+
+    home = tmp_path / "zeta-home"
+    parent_cwd = tmp_path / "project-a"
+    child_cwd = tmp_path / "project-b"
+    parent_cwd.mkdir()
+    child_cwd.mkdir()
+    registry = ProjectRegistry(home / "projects")
+    parent_project = registry.create_project("project-a", "test", parent_cwd)
+    child_project = registry.create_project("project-b", "test", child_cwd)
+    (home / "projects" / parent_project.project_id / "AGENTS.md").write_text(
+        "PARENT-PRIVATE-MARKER", encoding="utf-8"
+    )
+    (home / "projects" / child_project.project_id / "AGENTS.md").write_text(
+        "CHILD-PRIVATE-MARKER", encoding="utf-8"
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
+    tools = ToolRegistry(
+        parent_cwd,
+        project_id=parent_project.project_id,
+        project_registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "child-1",
+                        "agent",
+                        {
+                            "prompt": "child-work",
+                            "description": "other project child",
+                            "cwd": str(child_cwd),
+                        },
+                    )
+                ]
+            ),
+            ScriptedTurn([TextContent("child done")]),
+        ]
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=tools,
+        max_turns=1,
+        system_prompt="parent prompt",
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=parent_project.project_id,
+        project_registry=registry,
+    )
+    loop.set_mcp_scope(home=home, project_dir=parent_cwd)
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    child_system = backend.calls[1][0][0]
+    system_text = " ".join(
+        block.text for block in child_system.content if isinstance(block, TextContent)
+    )
+    assert "CHILD-PRIVATE-MARKER" in system_text
+    assert "PARENT-PRIVATE-MARKER" not in system_text
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_child_cwd_inherits_parent_project_memory_and_tools(
     tmp_path: Path,
 ) -> None:

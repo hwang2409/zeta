@@ -39,16 +39,6 @@ def test_project_agents_md_loads_after_repo_agents(tmp_path: Path) -> None:
     assert private.resolve() in context.files
 
 
-def test_project_agents_md_not_loaded_for_other_project(tmp_path: Path) -> None:
-    root = tmp_path / "repo"; root.mkdir()
-    home, project_id = _private_project(tmp_path, root)
-    (home / "projects" / project_id / "AGENTS.md").write_text("private", encoding="utf-8")
-    other_root = tmp_path / "other"; other_root.mkdir()
-    other = _private_project(tmp_path, other_root)[1]
-    context = load_project_context(cwd=root, repo_root=root, zeta_home=home, project_id=other, catalog=SkillCatalog.empty())
-    assert "<zeta-project-instructions source=\"" + str(home / "projects" / project_id / "AGENTS.md") not in context.system_prompt
-
-
 def test_repo_agents_ignore_mode_skips_repo_files_and_warns(tmp_path: Path) -> None:
     import json
     root = tmp_path / "repo"; root.mkdir(); (root / "AGENTS.md").write_text("repo", encoding="utf-8")
@@ -58,51 +48,6 @@ def test_repo_agents_ignore_mode_skips_repo_files_and_warns(tmp_path: Path) -> N
     context = load_project_context(cwd=root, repo_root=root, zeta_home=home, project_id=project_id, catalog=SkillCatalog.empty())
     assert str(root / "AGENTS.md") not in context.system_prompt
     assert any("repository AGENTS.md" in notice for notice in context.notices)
-
-
-def test_project_agents_md_resolves_from_git_worktree(tmp_path: Path) -> None:
-    root = tmp_path / "repo"; root.mkdir(); worktree = root / ".worktrees" / "feature"; worktree.mkdir(parents=True)
-    home, project_id = _private_project(tmp_path, root)
-    (home / "projects" / project_id / "AGENTS.md").write_text("worktree private", encoding="utf-8")
-    context = load_project_context(cwd=worktree, repo_root=root, zeta_home=home, project_id=project_id, catalog=SkillCatalog.empty())
-    assert "worktree private" in context.system_prompt
-
-
-def test_child_agent_inherits_project_agents_md(tmp_path: Path) -> None:
-    root = tmp_path / "repo"; root.mkdir(); home, project_id = _private_project(tmp_path, root)
-    (home / "projects" / project_id / "AGENTS.md").write_text("child private", encoding="utf-8")
-    assert "child private" in load_project_context(cwd=root, repo_root=root, zeta_home=home, project_id=project_id, catalog=SkillCatalog.empty()).system_prompt
-
-
-def test_resume_with_changed_project_agents_md(tmp_path: Path) -> None:
-    root = tmp_path / "repo"; root.mkdir(); home, project_id = _private_project(tmp_path, root)
-    private = home / "projects" / project_id / "AGENTS.md"; private.write_text("before", encoding="utf-8")
-    first = load_project_context(cwd=root, repo_root=root, zeta_home=home, project_id=project_id, catalog=SkillCatalog.empty())
-    private.write_text("after", encoding="utf-8")
-    second = load_project_context(cwd=root, repo_root=root, zeta_home=home, project_id=project_id, catalog=SkillCatalog.empty())
-    assert "after" in second.system_prompt and first.system_prompt != second.system_prompt
-
-
-def test_project_agents_md_in_stable_cached_prefix(tmp_path: Path) -> None:
-    root = tmp_path / "repo"; root.mkdir(); home, project_id = _private_project(tmp_path, root)
-    (home / "projects" / project_id / "AGENTS.md").write_text("stable", encoding="utf-8")
-    context = load_project_context(cwd=root, repo_root=root, zeta_home=home, project_id=project_id, catalog=SkillCatalog.empty())
-    assert context.prompt_recipe == "default" and context.prompt_components["default_context"]["offset"] == 0
-
-
-def test_project_instructions_open_create_command(tmp_path: Path) -> None:
-    from zeta.core.project_context import project_instructions_path
-    root = tmp_path / "repo"; root.mkdir()
-    home, project_id = _private_project(tmp_path, root)
-    result = project_instructions_path("", root, home)
-    path = home / "projects" / project_id / "AGENTS.md"
-    assert str(path) in result and path.exists()
-
-
-def test_status_lists_project_agents_md(tmp_path: Path) -> None:
-    from zeta.core.slash import SlashStatus, _format_status
-    path = str(tmp_path / "AGENTS.md")
-    assert path in _format_status(SlashStatus("s", "p", "m", 1, 0, None, 0, (), context_files=(path,)))
 
 
 def _with_runtime_guidance(prompt: str) -> str:

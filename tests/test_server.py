@@ -4623,6 +4623,27 @@ async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_serve_session_loads_private_instructions(tmp_path: Path) -> None:
+    from zeta.project_registry import ProjectRegistry
+    from zeta.server.runtime import ServerRuntime
+
+    home = tmp_path / "zeta-home"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    project = ProjectRegistry(home / "projects").create_project("project", "test", cwd)
+    private = home / "projects" / project.project_id / "AGENTS.md"
+    private.write_text("SERVE-PRIVATE-MARKER", encoding="utf-8")
+    runtime = ServerRuntime(home, cwd=cwd, provider="codex")
+    try:
+        metadata = await runtime.create_session()
+
+        assert "SERVE-PRIVATE-MARKER" in metadata.system_prompt
+        assert str(private.resolve()) in metadata.context_files
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("registered", [False, True])
 async def test_server_uses_only_existing_project_without_new_git_discovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registered: bool
