@@ -10,10 +10,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+from zeta.context_accounting import message_token_count
 from zeta.context_eviction import (
     TARGET_RATIO,
+    decorate_receipt,
     evict_messages,
     eviction_summary_candidates,
+    normalize_receipt,
 )
 from zeta.context_eviction.summaries import (
     EvictionSummaryWorker,
@@ -112,6 +115,66 @@ def _view(result: Any) -> dict[str, Any]:
     }
 
 
+def _ready_decoration_growth(
+    messages: list[Message], sources: dict[int, Message], cache: _MemoryCache
+) -> int:
+    growth = 0
+    for message in messages:
+        plain = normalize_receipt(message)
+        request = receipt_summary_request(plain, sources)
+        if request is None or (summary := cache.get(request.key)) is None:
+            continue
+        decorated = decorate_receipt(plain, summary)
+        source_tokens = sum(
+            message_token_count(source)
+            for seq, source in sources.items()
+            if request.key.seq_start <= seq <= request.key.seq_end
+        )
+        if message_token_count(decorated) < source_tokens:
+            growth += message_token_count(decorated) - message_token_count(plain)
+    return growth
+
+
+def _largest_new_range_saving(off: Any, on: Any) -> int:
+    off_ranges = {
+        (message.metadata["source_seq"], message.metadata["range_seq_end"])
+        for message in off.messages
+        if message.metadata.get("eviction_range")
+    }
+    largest = 0
+    for message in on.messages:
+        if not message.metadata.get("eviction_range"):
+            continue
+        bounds = (message.metadata["source_seq"], message.metadata["range_seq_end"])
+        if bounds in off_ranges:
+            continue
+        original_tokens = sum(
+            message_token_count(original)
+            for seq, original in zip(off.source_seqs, off.messages, strict=True)
+            if bounds[0] <= seq <= bounds[1]
+        )
+        largest = max(largest, original_tokens - message_token_count(message))
+    return largest
+
+
+async def _enabled_pass(
+    worker: EvictionSummaryWorker,
+    records: list[tuple[int, Message]],
+    sources: dict[int, Message],
+    target: int,
+) -> Any:
+    while worker.queue:
+        await worker.run_once()
+    return evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=target,
+        source_messages=sources,
+        summary_cache=worker.cache,
+        summaries_enabled=True,
+    )
+
+
 async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]:
     records, sources, target = _inputs(session_dir)
     off = evict_messages(
@@ -121,33 +184,14 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
     worker = EvictionSummaryWorker(cache, _provider(model, offline=offline))
     for request in eviction_summary_candidates(records):
         worker.admit(request)
-    while worker.queue:
-        await worker.run_once()
-    first_on = evict_messages(
-        records,
-        fixed_tokens=0,
-        target_tokens=target,
-        source_messages=sources,
-        summary_cache=cache,  # type: ignore[arg-type]
-        summaries_enabled=True,
-    )
-    on = first_on
+    on = await _enabled_pass(worker, records, sources, target)
     for _ in range(3):
         for message in on.messages:
             if (request := receipt_summary_request(message, sources)) is not None:
                 worker.admit(request)
         for request in on.summary_misses:
             worker.admit(request)
-        while worker.queue:
-            await worker.run_once()
-        next_on = evict_messages(
-            records,
-            fixed_tokens=0,
-            target_tokens=target,
-            source_messages=sources,
-            summary_cache=cache,  # type: ignore[arg-type]
-            summaries_enabled=True,
-        )
+        next_on = await _enabled_pass(worker, records, sources, target)
         if next_on.source_seqs == on.source_seqs and next_on.tokens_after == on.tokens_after:
             on = next_on
             break
@@ -164,6 +208,11 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
     )
     eligible_receipts = len(requests)
     off_view, on_view = _view(off), _view(on)
+    largest_single_fold_saving = _largest_new_range_saving(off, on)
+    deterministic_tokens = sum(
+        message_token_count(normalize_receipt(message)) for message in on.messages
+    )
+    ready_growth = _ready_decoration_growth(on.messages, sources, cache)
     return {
         "session_dir": str(session_dir),
         "target_tokens": target,
@@ -175,6 +224,8 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
         "on_selected_count": len(on_view["selected_seqs"]),
         "extra_evicted_tokens": off.tokens_after - on.tokens_after,
         "reserve_tokens": on.reserve_tokens,
+        "largest_single_fold_saving": largest_single_fold_saving,
+        "reserve_bound": on.reserve_tokens + largest_single_fold_saving,
         "tokens_vs_target": {
             "off": off.tokens_after - target,
             "on": on.tokens_after - target,
@@ -183,7 +234,12 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
         "cache_ready_rate": len(ready) / eligible_receipts if eligible_receipts else 1.0,
         "queue_drops": worker.drops,
         "token_totals": {"off": off.tokens_after, "on": on.tokens_after},
+        "eligible_receipts": eligible_receipts,
         "summary_count": summary_count,
+        "deterministic_tokens_after": deterministic_tokens,
+        "decoration_headroom": target - deterministic_tokens,
+        "ready_decoration_growth": ready_growth,
+        "shown_decoration_growth": on.tokens_after - deterministic_tokens,
     }
 
 
@@ -200,6 +256,8 @@ def main() -> None:
         and result["feature_on"]["tokens_after"] > result["target_tokens"]
     ):
         raise SystemExit("summary-enabled eviction exceeded target")
+    if result["extra_evicted_tokens"] > result["reserve_bound"]:
+        raise SystemExit("summary reserve exceeded the final-fold bound")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))

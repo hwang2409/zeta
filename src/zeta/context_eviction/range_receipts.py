@@ -35,6 +35,10 @@ def range_receipt_candidate(
     is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
     coarse: bool = False,
     compacted_tool_calls: bool = False,
+    stop_after_fold: Callable[
+        [Sequence[tuple[int, Message]], Sequence[Message]], bool
+    ]
+    | None = None,
 ) -> RangeCandidate:
     """Coalesce receipt exchanges, or globally fold eligible old records."""
 
@@ -51,12 +55,14 @@ def range_receipt_candidate(
     run: list[_ReceiptUnit] = []
     index = 0
 
-    def flush() -> None:
+    def flush() -> bool:
         flattened = [record for unit in run for record in unit.records]
+        folded: list[Message] | None = None
         if len(run) >= 2:
             start, end = flattened[0][0], flattened[-1][0]
             receipt = _range_receipt(start, end, run)
             if is_smaller(flattened, [receipt]):
+                folded = [receipt]
                 output.append((start, receipt))
                 coalesced.update(seq for seq, _ in flattened)
             else:
@@ -64,18 +70,26 @@ def range_receipt_candidate(
         else:
             output.extend(flattened)
         run.clear()
+        return folded is not None and stop_after_fold is not None and stop_after_fold(flattened, folded)
 
     while index < len(records):
         unit, next_index = _receipt_unit(
             records, index, allows, compacted_tool_calls=compacted_tool_calls
         )
         if unit is None:
-            flush()
+            if flush():
+                output.extend(records[index:])
+                return RangeCandidate(output, frozenset(coalesced))
             output.append(records[index])
             index += 1
             continue
-        if run and unit.records[0][0] != run[-1].records[-1][0] + 1:
-            flush()
+        if (
+            run
+            and unit.records[0][0] != run[-1].records[-1][0] + 1
+            and flush()
+        ):
+            output.extend(records[index:])
+            return RangeCandidate(output, frozenset(coalesced))
         run.append(unit)
         index = next_index
     flush()
@@ -218,7 +232,9 @@ def _is_compacted_tool_call_receipt(message: Message, seq: int) -> bool:
     ]
     text = [block.text for block in message.content if isinstance(block, TextContent)]
     return (
-        message.metadata == {"context_evicted": True, "source_seq": seq}
+        message.role is MessageRole.ASSISTANT
+        and message.tool_result is None
+        and message.metadata == {"context_evicted": True, "source_seq": seq}
         and bool(calls)
         and all(
             call.arguments == {"eviction_receipt": {"source_seq": seq}}

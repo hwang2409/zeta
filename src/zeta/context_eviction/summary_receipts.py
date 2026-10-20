@@ -28,6 +28,28 @@ def normalize_receipt(message: Message) -> Message:
         return message
 
 
+def normalize_evicted_tool_result(message: Message) -> Message:
+    """Drop legacy display-only copies from a persisted eviction receipt."""
+    result = message.tool_result
+    if (
+        result is None
+        or not message.metadata.get("context_evicted")
+        or "eviction_content_digest" not in message.metadata
+    ):
+        return message
+    return Message(
+        message.role,
+        tool_result=ToolResult(
+            result.tool_call_id,
+            result.content,
+            is_error=result.is_error,
+            content_blocks=result.content_blocks,
+            is_canceled=result.is_canceled,
+        ),
+        metadata=message.metadata,
+    )
+
+
 def _decorate_text(text: str, summary: str, *, kind: str) -> str:
     encoded = json.dumps(summary, ensure_ascii=False)
     if kind in {"notification", "tool_result"} and "}; recall_history" in text:

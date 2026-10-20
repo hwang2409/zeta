@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import json
@@ -91,47 +92,63 @@ def _ready_cache(tmp_path, records, text="short verdict"):
     return cache
 
 
-def test_reserve_can_fold_compacted_tool_batches_below_summary_target() -> None:
-    records = []
-    for seq in (1, 3):
-        call_id = f"call-{seq}"
-        records.extend(
-            [
-                (
-                    seq,
-                    Message(
-                        MessageRole.ASSISTANT,
-                        [
-                            ToolUseContent(
-                                ToolCall(
-                                    call_id,
-                                    "agent",
-                                    {"eviction_receipt": {"source_seq": seq}},
-                                )
-                            ),
-                            TextContent(f"[assistant reasoning evicted · seq {seq}]"),
-                        ],
-                        metadata={"context_evicted": True, "source_seq": seq},
-                    ),
-                ),
-                (
-                    seq + 1,
-                    _structured_result_receipt(
-                        role=MessageRole.TOOL_RESULT,
-                        receipt_kind="orchestration",
-                        tool_name="agent",
-                        tool_call_id=call_id,
-                        seq=seq + 1,
-                        payload={"status": "completed"},
-                        content_digest="0" * 64,
-                    ),
-                ),
-            ]
+def _compacted_tool_batch(
+    seq: int,
+    *,
+    role: MessageRole = MessageRole.ASSISTANT,
+    attached_result: bool = False,
+    extra_text: str | None = None,
+    marker: str | None = None,
+    arguments: dict | None = None,
+    include_result: bool = True,
+) -> list[tuple[int, Message]]:
+    call_id = f"call-{seq}"
+    content = [
+        ToolUseContent(
+            ToolCall(
+                call_id,
+                "agent",
+                arguments
+                if arguments is not None
+                else {"eviction_receipt": {"source_seq": seq}},
+            )
+        ),
+    ]
+    if marker != "missing":
+        content.append(
+            TextContent(marker or f"[assistant reasoning evicted · seq {seq}]")
         )
+    if extra_text is not None:
+        content.append(TextContent(extra_text))
+    message = Message(
+        role,
+        content,
+        tool_result=ToolResult(call_id, "attached") if attached_result else None,
+        metadata={"context_evicted": True, "source_seq": seq},
+    )
+    records = [(seq, message)]
+    if include_result:
+        records.append(
+            (
+                seq + 1,
+                _structured_result_receipt(
+                    role=MessageRole.TOOL_RESULT,
+                    receipt_kind="orchestration",
+                    tool_name="agent",
+                    tool_call_id=call_id,
+                    seq=seq + 1,
+                    payload={"status": "completed"},
+                    content_digest="0" * 64,
+                ),
+            )
+        )
+    return records
 
-    folded = range_receipt_candidate(
+
+def _fold_compacted(records, *, allows=lambda _seq: True):
+    return range_receipt_candidate(
         records,
-        allows=lambda _seq: True,
+        allows=allows,
         is_smaller=lambda originals, candidates: sum(
             message_token_count(message) for _, message in originals
         )
@@ -139,8 +156,96 @@ def test_reserve_can_fold_compacted_tool_batches_below_summary_target() -> None:
         compacted_tool_calls=True,
     )
 
+
+def test_reserve_can_fold_compacted_tool_batches_below_summary_target() -> None:
+    records = [
+        record
+        for seq in (1, 3)
+        for record in _compacted_tool_batch(seq)
+    ]
+
+    folded = _fold_compacted(records)
+
     assert len(folded.records) == 1
     assert folded.records[0][1].metadata.get("eviction_range") is True
+
+
+def test_reserve_fold_stops_once_reserve_target_is_met() -> None:
+    import zeta.context_eviction as eviction
+
+    records = []
+    for start in (1, 6, 11):
+        records.extend(_compacted_tool_batch(start))
+        records.extend(_compacted_tool_batch(start + 2))
+        records.append((start + 4, Message(MessageRole.SYSTEM, [TextContent("keep")])))
+    before = sum(message_token_count(message) for _, message in records)
+    first_fold = _fold_compacted(records[:4])
+    first_saving = before - (
+        sum(message_token_count(message) for _, message in first_fold.records)
+        + sum(message_token_count(message) for _, message in records[4:])
+    )
+    fold_savings = []
+    for start in (0, 5, 10):
+        folded = _fold_compacted(records[start : start + 4])
+        fold_savings.append(
+            sum(message_token_count(message) for _, message in records[start : start + 4])
+            - sum(message_token_count(message) for _, message in folded.records)
+        )
+
+    result = eviction._evict_deterministic(
+        records,
+        fixed_tokens=0,
+        target_tokens=before - first_saving,
+        token_counter=message_token_count,
+        summary_reserve_pass=True,
+    )
+
+    assert sum(message.metadata.get("eviction_range") is True for message in result.messages) == 1
+    assert before - result.tokens_after <= first_saving + max(fold_savings)
+
+
+@pytest.mark.parametrize(
+    ("case", "batch", "allows"),
+    [
+        ("system role", {"role": MessageRole.SYSTEM}, lambda _seq: True),
+        ("user role", {"role": MessageRole.USER}, lambda _seq: True),
+        ("attached result", {"attached_result": True}, lambda _seq: True),
+        ("extra text", {"extra_text": "extra"}, lambda _seq: True),
+        ("wrong marker", {"marker": "[wrong]"}, lambda _seq: True),
+        ("missing marker", {"marker": "missing"}, lambda _seq: True),
+        ("wrong arguments", {"arguments": {"wrong": True}}, lambda _seq: True),
+        ("incomplete result", {"include_result": False}, lambda _seq: True),
+        ("protected result", {}, lambda seq: seq != 2),
+    ],
+)
+def test_compacted_call_matcher_rejects_near_misses(case, batch, allows) -> None:
+    del case
+    records = [
+        *_compacted_tool_batch(1, **batch),
+        *_compacted_tool_batch(3),
+    ]
+
+    folded = _fold_compacted(records, allows=allows)
+
+    assert not folded.coalesced_source_seqs
+    assert [message.to_dict() for _, message in folded.records] == [
+        message.to_dict() for _, message in records
+    ]
+
+
+def test_summary_reserve_module_does_not_import_package_init() -> None:
+    path = Path("src/zeta/context_eviction/summary_reserve.py")
+    tree = ast.parse(path.read_text())
+    forbidden = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and (
+            (node.level == 1 and node.module is None)
+            or node.module == "zeta.context_eviction"
+        )
+    ]
+    assert not forbidden
 
 
 def test_reserve_lets_ready_summaries_fit(tmp_path) -> None:
