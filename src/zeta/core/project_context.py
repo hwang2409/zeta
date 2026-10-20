@@ -34,8 +34,10 @@ SUPPORTED_MEMORY_FORMATS = frozenset({1, 2})
 import hashlib
 import logging
 import os
+import shlex
 import subprocess
 import tempfile
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from html import escape
 from pathlib import Path
@@ -608,25 +610,42 @@ def resolve_project_context(
 
 
 def project_instructions_path(
-    args: str, project_root: Path | None, zeta_home: Path | None
-) -> str:
-    """Create the private project instructions file and return its path."""
+    args: str,
+    project_root: Path | None,
+    zeta_home: Path | None,
+    editor: Callable[[Path], str | Awaitable[str]] | None = None,
+) -> str | Awaitable[str]:
+    """Create the private project instructions file and optionally open it."""
     if args.strip():
         return "project instructions unchanged: command does not accept arguments"
     if project_root is None or zeta_home is None:
-        return "project instructions error: not inside a project"
+        return (
+            "project instructions: this folder is not a zeta project. run `git init` "
+            "here and restart zeta, or start zeta inside a registered project."
+        )
     registry = ProjectRegistry(zeta_home / "projects")
     discovery = discover_project(project_root, user_home=zeta_home.parent)
     project = resolve_project_context(discovery, registry)
     if project is None:
-        return "project instructions error: project is not registered"
+        return (
+            "project instructions: this git project is not registered. "
+            "run `/project init` to associate this directory."
+        )
     path = zeta_home / "projects" / project.project_id / AGENTS_FILENAME
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch(exist_ok=True)
     except OSError as exc:
         return f"project instructions error: {exc}"
-    return f"project instructions: {path}"
+    if editor is None:
+        return f"project instructions: {path}"
+    return editor(path)
+
+
+def project_instructions_editor_command(path: Path) -> tuple[str, ...]:
+    """Build the selected external editor command for one file."""
+    configured = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    return (*shlex.split(configured), str(path))
 
 
 def _instruction_files(

@@ -575,7 +575,6 @@ class SlashSession(Protocol):
 
     def slash_send(self, args: str) -> str: ...
 
-
     def slash_tools(self, args: str) -> str: ...
 
     def slash_undo(self, args: str) -> str: ...
@@ -1174,8 +1173,8 @@ def create_slash_registry(
     )
     registry.register(SlashCommand(
         "project-instructions",
-        lambda _session, args: project_instructions_path(args, private_project_root, Path(effective_home).expanduser().resolve() if effective_home else None),
-        "open or create private project instructions",
+        lambda session, args: project_instructions_path(args, private_project_root, Path(effective_home).expanduser().resolve() if effective_home else None, getattr(session, "open_project_instructions_editor", None)),
+        "open or create private project instructions in your editor",
     ))
     registry.register(
         SlashCommand(

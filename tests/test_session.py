@@ -26,6 +26,10 @@ from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
+from zeta.core.project_context import (
+    project_instructions_editor_command,
+    project_instructions_path,
+)
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -481,6 +485,30 @@ def test_project_instructions_slash_command_creates_file(
 
     assert result == f"project instructions: {home / 'projects' / project_id / 'AGENTS.md'}"
     assert private.is_file()
+
+
+def test_project_instructions_outside_git_project_explains_next_step(
+    tmp_path: Path,
+) -> None:
+    result = project_instructions_path("", None, tmp_path / "zeta-home")
+    assert result == (
+        "project instructions: this folder is not a zeta project. run `git init` "
+        "here and restart zeta, or start zeta inside a registered project."
+    )
+
+
+def test_project_instructions_editor_command_prefers_visual_and_splits_args(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("VISUAL", "")
+    monkeypatch.setenv("EDITOR", "code -w")
+    assert project_instructions_editor_command(tmp_path / "AGENTS.md") == (
+        "code", "-w", str(tmp_path / "AGENTS.md")
+    )
+    monkeypatch.setenv("VISUAL", "vim --clean")
+    assert project_instructions_editor_command(tmp_path / "AGENTS.md") == (
+        "vim", "--clean", str(tmp_path / "AGENTS.md")
+    )
 
 
 def test_status_lists_private_instructions_file(
