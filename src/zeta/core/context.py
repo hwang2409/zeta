@@ -26,7 +26,7 @@ from ..context_eviction import (
     eviction_view,
     normalize_evicted_tool_result,
     valid_eviction_view,
-    eviction_summary_candidates,
+    catch_up_summary_candidates,
 )
 from ..compaction import (
     CompactionPolicy,
@@ -800,21 +800,20 @@ class ContextAssembler:
         )
 
     def eviction_summary_candidates(self) -> tuple[Any, ...]:
-        """Return covered single-item work from the materialized active view."""
         branch = self.store.active_branch_snapshot()
         visible = self._visible_items(branch)
         covered = {
-            int(item.message.metadata["source_seq"])
-            for item in visible
-            if item.message.metadata.get("context_evicted")
-            and type(item.message.metadata.get("source_seq")) is int
+            int(i.message.metadata["source_seq"])
+            for i in visible
+            if i.message.metadata.get("context_evicted")
+            and type(i.message.metadata.get("source_seq")) is int
         }
         records = tuple(
-            (entry.seq, Message.from_dict(entry.data["message"]))
-            for entry in branch
-            if entry.type == "message"
+            (e.seq, Message.from_dict(e.data["message"]))
+            for e in branch
+            if e.type == "message"
         )
-        return tuple(request for request in eviction_summary_candidates(records) if request.key.seq_start in covered)
+        return catch_up_summary_candidates(records, covered)
     def _plan_reuse_eviction(
         self, branch: Sequence[ConversationEntry], system_messages: Sequence[Message]
     ) -> _EvictionPlan:

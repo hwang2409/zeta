@@ -185,6 +185,20 @@ def eviction_summary_candidates(
     )
 
 
+def catch_up_summary_candidates(
+    records: Sequence[tuple[int, Message]], covered_source_seqs: Collection[int]
+) -> tuple[SummaryRequest, ...]:
+    """Return eligible work still covered by materialized eviction receipts."""
+    eligibility = _eviction_eligibility(records, ())
+    return tuple(
+        request
+        for request in _project_summary_candidates(
+            records, evictable_source_seqs=eligibility.evictable_source_seqs
+        )
+        if request.key.seq_start in covered_source_seqs
+    )
+
+
 def active_eviction_summary_candidates(
     items: Sequence[tuple[int, str, Message]],
 ) -> tuple[SummaryRequest, ...]:
