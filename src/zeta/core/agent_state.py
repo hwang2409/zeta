@@ -20,7 +20,7 @@ from .agent_progress import (
 from .checkpoints import ConversationIntegrityError, _now
 from .session_files import child_directory, write_session_json
 
-_AGENT_STATES = {"running", "completed", "canceled", "failed"}
+_AGENT_STATES = {"running", "idle", "completed", "canceled", "failed"}
 
 
 def _lifecycle_elapsed(
@@ -429,6 +429,8 @@ class AgentStateMixin:
         current_step: str | None = None,
         turns_used: int | None = None,
         tool_calls: int | None = None,
+        state: str | None = None,
+        idle_since: str | None = None,
     ) -> None:
         """Update a live child's process-local progress."""
 
@@ -438,6 +440,10 @@ class AgentStateMixin:
             raise ValueError("agent lifecycle turns must be nonnegative")
         if tool_calls is not None and (type(tool_calls) is not int or tool_calls < 0):
             raise ValueError("agent lifecycle tool calls must be nonnegative")
+        if state is not None and state not in {"running", "idle"}:
+            raise ValueError("agent lifecycle live state is invalid")
+        if idle_since is not None and not isinstance(idle_since, str):
+            raise ValueError("agent lifecycle idle timestamp is invalid")
         if self._agent_lifecycle is None:
             return
         if current_step is not None:
@@ -446,6 +452,10 @@ class AgentStateMixin:
             self._agent_lifecycle["turns_used"] = turns_used
         if tool_calls is not None:
             self._agent_lifecycle["tool_calls"] = tool_calls
+        if state is not None:
+            self._agent_lifecycle["state"] = state
+        if idle_since is not None:
+            self._agent_lifecycle["idle_since"] = idle_since
         self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(self._agent_lifecycle)
         publish_live_agent_lifecycle(self.agent_lifecycle_path, self._agent_lifecycle)
 
@@ -462,7 +472,7 @@ class AgentStateMixin:
     ) -> None:
         """Persist a terminal child state and its final result text."""
 
-        if state not in _AGENT_STATES - {"running"} or not final_result:
+        if state not in _AGENT_STATES - {"running", "idle"} or not final_result:
             raise ValueError("invalid terminal agent lifecycle")
         if turns_used is not None and (type(turns_used) is not int or turns_used < 0):
             raise ValueError("agent lifecycle turns must be nonnegative")

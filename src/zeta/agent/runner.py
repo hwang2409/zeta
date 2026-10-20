@@ -90,6 +90,7 @@ async def consume_child(
     final_message: Message | None = None
     failure_message: str | None = None
     tool_calls = 0
+    explicit_report: dict[str, object] | None = None
 
     def terminal_result(
         *, state: TerminalState, text: str, **result_options: object
@@ -111,7 +112,7 @@ async def consume_child(
         events: AsyncIterator[StreamEvent],
         gate_control: FinishGateControl | None = None,
     ) -> None:
-        nonlocal failure_message, final_message, tool_calls
+        nonlocal failure_message, final_message, tool_calls, explicit_report
         final_message = None
         async for event in events:
             if event.type is StreamEventType.TURN_START:
@@ -151,6 +152,14 @@ async def consume_child(
                     depth=lifecycle_depth(event.tool_call),
                 )
             elif event.type is StreamEventType.TOOL_EXECUTION_END:
+                if (
+                    event.tool_call is not None
+                    and event.tool_call.name == "finish"
+                    and event.tool_result is not None
+                    and not event.tool_result.is_error
+                    and isinstance(event.tool_result.structured_content, dict)
+                ):
+                    explicit_report = dict(event.tool_result.structured_content)
                 publish_lifecycle(
                     "execution_end",
                     event.tool_call,
@@ -187,6 +196,19 @@ async def consume_child(
             else child_loop.run_turn(prompt, origin=origin)
         )
         await consume_events(events)
+        if explicit_report is not None:
+            report_status = explicit_report.get("status")
+            summary = explicit_report.get("summary")
+            status = "failed" if report_status == "failed" else "completed"
+            text = f"{report_status}: {summary}"
+            return terminal_result(
+                state=status,
+                text=text,
+                report_status=report_status,
+                summary=summary,
+                head_sha=explicit_report.get("head_sha"),
+                verdict=explicit_report.get("verdict"),
+            )
         children = owned_children()
         tasks = owned_tasks()
         if final_message is not None and (children or tasks):
@@ -246,6 +268,8 @@ async def consume_child(
         return terminal_result(state="failed", text=text)
     if record_report is not None:
         record_report(final_text)
+    if child_loop.explicit_finish:
+        return terminal_result(state="idle", text=final_text, status="running")
     return terminal_result(state="completed", text=final_text)
 
 
@@ -275,12 +299,16 @@ async def consume_run(
     final_finish_lifecycle = finish_lifecycle
 
     def keep_lifecycle_running(state: str, text: str) -> dict[str, object]:
-        del state, text
         if not callable(child_turns):
             return {}
+        idle = state == "idle"
+        if idle:
+            child_store.update_agent_lifecycle(
+                state="idle", current_step="idle, waiting for follow-up", idle_since=_now()
+            )
         return agent_stats(
             child_store.agent_lifecycle(),
-            status="running",
+            status="idle" if idle else "running",
             turns_used=child_turns(),
         )
 
@@ -344,6 +372,20 @@ async def consume_run(
             child_loop, prompt, origin=MessageOrigin.AGENT_PROMPT, **kwargs
         )
         while not result.get("isError"):
+            structured = result.get("structuredContent")
+            if (
+                getattr(child_loop, "explicit_finish", False)
+                and isinstance(structured, dict)
+                and structured.get("status") == "running"
+            ):
+                await child_loop._background_owner.conversation_channel.wait(
+                    child_loop.agent_instance_id
+                )
+                result = await consume_child(
+                    child_loop, "", origin=MessageOrigin.NOTIFICATION,
+                    notification_turn=True, **kwargs
+                )
+                continue
             # Ack only after a follow-up actually reached the child. A cancel or
             # backend error mid-consume_child leaves the prompt pending, so the
             # next run gets a chance to redeliver it instead of it silently gone.
@@ -549,8 +591,17 @@ async def _build_child_loop(
             project_registry=loop.project_registry,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
+            explicit_finish=(
+                loop.explicit_finish
+                and preset.explicit_finish
+                and follow_up_loop
+            ),
         )
         child_loop.one_shot = getattr(loop, "one_shot", False)
+        if child_loop.explicit_finish:
+            from ..tools.finish import register as register_finish
+
+            register_finish(child_registry, child_loop=child_loop)
         loop._background_owner.conversation_channel.register_loop(child_instance_id)
         if loop.plan_mode:
             child_loop.set_plan_mode(True)
@@ -870,6 +921,10 @@ async def run_agent_tool(
         notice: str | None = None,
         notice_items: Sequence[str] | None = None,
         max_bytes: int | None = None,
+        report_status: str | None = None,
+        summary: str | None = None,
+        head_sha: str | None = None,
+        verdict: str | None = None,
     ) -> dict[str, object]:
         payload = loop._child_result_payload(
             tool_call.id,
@@ -887,6 +942,10 @@ async def run_agent_tool(
             notice=notice,
             notice_items=notice_items,
             max_bytes=max_bytes,
+            report_status=report_status,
+            summary=summary,
+            head_sha=head_sha,
+            verdict=verdict,
         )
         if not background and state is not None:
             content = payload.get("content")

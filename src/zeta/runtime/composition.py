@@ -290,6 +290,7 @@ def compose_runtime(
             root_project_id=metadata.project_id,
             parent_session_id=metadata.parent_session_id,
             project_registry=manager.project_registry,
+            explicit_finish=config.agents_explicit_finish,
             **loop_kwargs,
         )
         loop.post_stream_provider_retry = post_stream_provider_retry

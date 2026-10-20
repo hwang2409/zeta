@@ -175,6 +175,7 @@ class AgentLoop(
         skill_home: Path | None = None,
         skill_project_dir: Path | None = None,
         freeze_skill_catalog: bool = False,
+        explicit_finish: bool = False,
     ) -> None:
         if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
@@ -185,6 +186,7 @@ class AgentLoop(
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
         self.parent_session_id = parent_session_id
+        self.explicit_finish = explicit_finish
         # Directory of the ROOT session that owns the durable child-link index;
         # threaded down every loop so nested children publish their lineage
         # intent into a single flat directory the root can reconcile.
@@ -206,6 +208,7 @@ class AgentLoop(
         self._activated = False
         self._closed = False
         self._turn_active = False
+        self._explicit_finish_report: dict[str, object] | None = None
         self.notification_wake = NotificationWake(store)
         # Partial assistant persistence uses these values so provider metadata is
         # retained even when the stream later fails or is cancelled.
@@ -516,6 +519,10 @@ class AgentLoop(
         notice: str | None = None,
         notice_items: Sequence[str] | None = None,
         max_bytes: int | None = None,
+        report_status: str | None = None,
+        summary: str | None = None,
+        head_sha: str | None = None,
+        verdict: str | None = None,
     ) -> dict[str, object]:
         child_store = self._agent_child_stores.get(tool_call_id)
         path = (
@@ -558,6 +565,10 @@ class AgentLoop(
             canceled=result_status == "canceled",
             notice=notice,
             notice_items=notice_items,
+            report_status=report_status,
+            summary=summary,
+            head_sha=head_sha,
+            verdict=verdict,
             max_bytes=(
                 max_bytes
                 if max_bytes is not None
