@@ -24,6 +24,7 @@ from zeta.context_eviction import (
 )
 from zeta.context_eviction.range_receipts import range_receipt_candidate
 from zeta.context_eviction.summaries import (
+    SUMMARY_INSTRUCTION,
     EvictionSummaryWorker,
     SummaryCache,
     SummaryKey,
@@ -445,7 +446,7 @@ def test_single_item_scan_uses_shared_eviction_eligibility() -> None:
             seq,
             Message(
                 MessageRole.USER,
-                [TextContent("notification")],
+                [TextContent("notification " * 300)],
                 metadata={"zeta_event": "agent_notifications", "notifications": []},
             ),
         )
@@ -1053,6 +1054,77 @@ def test_decorated_receipts_normalize_exactly() -> None:
     assert normalize_receipt(decorated).to_dict() == receipt.to_dict()
 
 
+def test_sources_below_256_tokens_are_not_requested_or_decorated() -> None:
+    small = _assistant(1, "fact " * 150)
+    large = _assistant(2, "fact " * 300)
+    assert eviction_summary_candidates([small]) == ()
+    assert eviction_summary_candidates([large])
+
+    receipt = Message(
+        MessageRole.ASSISTANT,
+        [TextContent("[assistant text evicted · seq 1]")],
+        metadata={
+            "context_evicted": True,
+            "source_seq": 1,
+            "eviction_receipt": "assistant",
+            "eviction_receipt_fields": {"kind": "assistant text"},
+        },
+    )
+    assert receipt_summary_request(receipt, {1: small[1]}) is None
+    assert receipt_summary_request(receipt, {1: large[1]}) is not None
+
+
+def test_agent_output_results_are_never_summarized() -> None:
+    output_call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("output-1", "agent_output", {"task": "review"}))],
+    )
+    output_result = Message(
+        MessageRole.USER,
+        tool_result=ToolResult("output-1", "untrusted agent output text " * 300),
+    )
+    assert eviction_summary_candidates([(1, output_call), (2, output_result)]) == ()
+    output_receipt = Message(
+        MessageRole.ASSISTANT,
+        [TextContent("[range evicted · seq 1-2]")],
+        metadata={
+            "context_evicted": True,
+            "source_seq": 1,
+            "range_seq_end": 2,
+            "eviction_receipt": "range",
+        },
+    )
+    assert receipt_summary_request(output_receipt, {1: output_call, 2: output_result}) is None
+
+    agent_call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("agent-1", "agent", {"task": "review"}))],
+    )
+    agent_result = Message(
+        MessageRole.USER,
+        tool_result=ToolResult("agent-1", "trusted result " * 300),
+    )
+    requests = eviction_summary_candidates(
+        [(1, agent_call), (2, agent_result), (3, output_call), (4, output_result)]
+    )
+    assert len(requests) == 1
+    assert "untrusted agent output text" not in requests[0].source
+    mixed_sources = {1: agent_call, 2: agent_result, 3: output_call, 4: output_result}
+    mixed_receipt = output_receipt
+    mixed_receipt = Message(
+        mixed_receipt.role,
+        mixed_receipt.content,
+        metadata={**mixed_receipt.metadata, "source_seq": 1, "range_seq_end": 4},
+    )
+    mixed_request = receipt_summary_request(mixed_receipt, mixed_sources)
+    assert mixed_request is not None
+    assert "untrusted agent output text" not in mixed_request.source
+
+
+def test_summary_instruction_asks_for_at_most_60_words() -> None:
+    assert "at most 60 words" in SUMMARY_INSTRUCTION
+
+
 def test_orchestration_result_is_eligible() -> None:
     call = Message(
         MessageRole.ASSISTANT,
@@ -1060,7 +1132,7 @@ def test_orchestration_result_is_eligible() -> None:
     )
     result = Message(
         MessageRole.USER,
-        tool_result=ToolResult("agent-1", "review passed at abc1234"),
+        tool_result=ToolResult("agent-1", "review passed at abc1234 " * 100),
     )
     candidates = eviction_summary_candidates([(1, call), (2, result)])
     assert [(item.key.kind, item.key.seq_start) for item in candidates] == [

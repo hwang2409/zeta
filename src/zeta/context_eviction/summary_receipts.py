@@ -16,6 +16,14 @@ from ..protocol.types import (
 )
 from .receipt_constructors import RECEIPT_FIELDS_METADATA, RECEIPT_KIND_METADATA
 from .summaries import SummaryKey, SummaryRequest, source_hash, valid_summary
+from .token_estimates import estimated_text_tokens
+
+MIN_SUMMARY_SOURCE_TOKENS = 256
+
+
+def summary_source_is_large_enough(source: str) -> bool:
+    """Only spend model calls on sources above the fixed minimum size."""
+    return estimated_text_tokens(source) >= MIN_SUMMARY_SOURCE_TOKENS
 
 
 def normalize_receipt(message: Message) -> Message:
@@ -159,7 +167,7 @@ def _summary_kind(message: Message, calls: Mapping[str, ToolCall]) -> str | None
         return "notification"
     result = message.tool_result
     call = calls.get(result.tool_call_id) if result is not None else None
-    if call is not None and call.name in {"agent", "agent_output", "task_output"}:
+    if call is not None and call.name in {"agent", "task_output"}:
         return "orchestration"
     if (
         message.role is MessageRole.ASSISTANT
@@ -188,6 +196,8 @@ def eviction_summary_candidates(
         if kind is None or seq not in evictable_source_seqs:
             continue
         source = _summary_source(source_messages, seq, seq)
+        if not summary_source_is_large_enough(source):
+            continue
         requests.append(
             SummaryRequest(SummaryKey(kind, seq, seq, source_hash(source)), source)
         )
@@ -230,6 +240,8 @@ def receipt_summary_request(
     if kind is None:
         return None
     source = _summary_source(source_messages, start, end)
+    if not summary_source_is_large_enough(source):
+        return None
     return SummaryRequest(
         SummaryKey(kind, start, end, source_hash(source)),
         source,
