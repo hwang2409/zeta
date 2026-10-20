@@ -37,6 +37,7 @@ from zeta.context_eviction.summaries import (
     valid_summary,
 )
 from zeta.context_eviction.summary_receipts import receipt_summary_request
+from zeta.context_eviction.summary_reserve import finalize_summaries
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
@@ -92,6 +93,16 @@ def _ready_cache(tmp_path, records, text="short verdict"):
     for request in requests:
         asyncio.run(cache.put(request.key, text))
     return cache
+
+
+def _put_assistant_summary(cache, record, summary):
+    seq, message = record
+    text = " ".join(
+        block.text for block in message.content if isinstance(block, TextContent)
+    )
+    source = f"seq {seq} assistant: {text}"
+    key = SummaryKey("assistant", seq, seq, source_hash(source))
+    asyncio.run(cache.put(key, summary))
 
 
 def _compacted_tool_batch(
@@ -1065,6 +1076,8 @@ def test_replay_script_runs_real_off_on_path_offline(tmp_path) -> None:
             "--out",
             str(out),
             "--offline",
+            "--offline-summary-tokens",
+            "80",
         ],
         check=False,
         capture_output=True,
@@ -1075,6 +1088,14 @@ def test_replay_script_runs_real_off_on_path_offline(tmp_path) -> None:
     assert result["off_selected_count"] == result["on_selected_count"]
     assert result["tokens_vs_target"]["on"] > 0
     assert result["summary_count"] == 0
+    assert result["offline_summary_tokens"] == 80
+    assert set(result["kinds"]) == {
+        "assistant",
+        "orchestration",
+        "notification",
+        "range",
+        "coarse",
+    }
     assert result["queue_drops"] == 0
 
 
@@ -1088,24 +1109,128 @@ def test_decorated_receipts_normalize_exactly() -> None:
     assert normalize_receipt(decorated).to_dict() == receipt.to_dict()
 
 
-def test_sources_below_256_tokens_are_not_requested_or_decorated() -> None:
-    small = _assistant(1, "fact " * 150)
-    large = _assistant(2, "fact " * 300)
-    assert eviction_summary_candidates([small]) == ()
-    assert eviction_summary_candidates([large])
+def test_short_assistant_reply_gets_summary_when_decorated_exceeds_plain_receipt(
+    tmp_path,
+) -> None:
+    record = _assistant(1, "fact " * 120)
+    cache = SummaryCache(tmp_path)
+    _put_assistant_summary(cache, record, "useful summary")
 
-    receipt = Message(
-        MessageRole.ASSISTANT,
-        [TextContent("[assistant text evicted · seq 1]")],
-        metadata={
-            "context_evicted": True,
-            "source_seq": 1,
-            "eviction_receipt": "assistant",
-            "eviction_receipt_fields": {"kind": "assistant text"},
-        },
+    plain = _evict([record], target=160).messages[0]
+    result = _evict([record], cache, enabled=True, target=160)
+
+    assert message_token_count(decorate_receipt(plain, "useful summary")) > (
+        message_token_count(plain)
     )
-    assert receipt_summary_request(receipt, {1: small[1]}) is None
-    assert receipt_summary_request(receipt, {1: large[1]}) is not None
+    assert result.messages[0].metadata.get("summary_data") is not None
+    assert result.tokens_after <= 160
+
+
+def test_short_items_below_48_tokens_are_not_requested(tmp_path) -> None:
+    record = _assistant(1, "ok " * 20)
+    cache = SummaryCache(tmp_path)
+    _put_assistant_summary(cache, record, "should not appear")
+
+    assert eviction_summary_candidates([record]) == ()
+    result = _evict([record], cache, enabled=True, target=1)
+    assert result.messages[0].metadata.get("summary_data") is None
+    assert eviction_summary_candidates([_assistant(2, "fact " * 40)])
+
+
+def test_decoration_never_larger_than_source_message(tmp_path) -> None:
+    record = _assistant(1, "source " * 44)
+    plain = _evict([record], target=1).messages[0]
+    assert eviction_summary_candidates([record])
+    cache = SummaryCache(tmp_path)
+    _put_assistant_summary(cache, record, "oversized summary " * 60)
+
+    finalized, _, _ = finalize_summaries(
+        [plain],
+        reached_target=True,
+        fixed_tokens=0,
+        target_tokens=1_000,
+        token_counter=message_token_count,
+        source_messages=dict([record]),
+        summary_cache=cache,
+    )
+
+    assert message_token_count(record[1]) >= 60
+    assert finalized[0].metadata.get("summary_data") is None
+
+
+def test_reserve_cap_prefers_newest_short_item_summaries(tmp_path) -> None:
+    records = [_assistant(seq, "fact " * 120) for seq in range(1, 11)]
+    receipts = [_evict([record], target=1).messages[0] for record in records]
+    cache = SummaryCache(tmp_path)
+    for record in records:
+        _put_assistant_summary(cache, record, "useful summary")
+    target = 1_000
+    deterministic_tokens = sum(map(message_token_count, receipts))
+    fixed_tokens = target - deterministic_tokens - target // 10
+
+    finalized, total, _ = finalize_summaries(
+        receipts,
+        reached_target=True,
+        fixed_tokens=fixed_tokens,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=dict(records),
+        summary_cache=cache,
+    )
+    shown = [
+        message.metadata["source_seq"]
+        for message in finalized
+        if message.metadata.get("summary_data") is not None
+    ]
+    repeated, repeated_total, _ = finalize_summaries(
+        receipts,
+        reached_target=True,
+        fixed_tokens=fixed_tokens,
+        target_tokens=target,
+        token_counter=message_token_count,
+        source_messages=dict(records),
+        summary_cache=cache,
+    )
+
+    assert shown == [10]
+    assert total <= target
+    assert [message.to_dict() for message in finalized] == [
+        message.to_dict() for message in repeated
+    ]
+    assert total == repeated_total
+
+
+def test_ranges_keep_strict_smaller_and_256_minimum(tmp_path) -> None:
+    short_records = [_assistant(1, "range " * 40), _assistant(2, "range " * 40)]
+    short_receipt = _evict(short_records, target=1).messages[0]
+    assert receipt_summary_request(short_receipt, dict(short_records)) is None
+
+    records = [_assistant(1, "range " * 140), _assistant(2, "range " * 140)]
+    receipt = _evict(records, target=1).messages[0]
+    request = receipt_summary_request(receipt, dict(records))
+    assert request is not None and request.exact_range
+    cache = SummaryCache(tmp_path)
+    asyncio.run(cache.put(request.key, "oversized range summary " * 100))
+    decorated = decorate_receipt(receipt, cache.get(request.key))
+
+    def range_counter(message):
+        if message is decorated or message.metadata.get("summary_data") is not None:
+            return 300
+        if message in dict(records).values():
+            return 100
+        return 10
+
+    finalized, _, _ = finalize_summaries(
+        [receipt],
+        reached_target=True,
+        fixed_tokens=0,
+        target_tokens=2_000,
+        token_counter=range_counter,
+        source_messages=dict(records),
+        summary_cache=cache,
+    )
+
+    assert finalized[0].metadata.get("summary_data") is None
 
 
 def test_agent_output_results_are_never_summarized() -> None:

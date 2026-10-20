@@ -6,7 +6,11 @@ from typing import Any
 
 from ..protocol.types import Message
 from .summaries import SummaryCache, SummaryRequest
-from .summary_receipts import decorate_receipt, receipt_summary_request
+from .summary_receipts import (
+    decorate_receipt,
+    receipt_summary_request,
+    summary_decoration_fits_source,
+)
 
 
 def evict_messages(
@@ -93,7 +97,7 @@ def ready_decoration_growth(
     source_messages: Mapping[int, Message],
     summary_cache: SummaryCache,
 ) -> int:
-    """Return growth from ready decorations that are smaller than their sources."""
+    """Return growth from ready decorations allowed for their summary kind."""
     growth = 0
     for message in messages:
         request = receipt_summary_request(message, source_messages)
@@ -106,7 +110,11 @@ def ready_decoration_growth(
             if request.key.seq_start <= seq <= request.key.seq_end
         )
         decorated_tokens = token_counter(decorated)
-        if decorated_tokens < source_tokens:
+        if summary_decoration_fits_source(
+            request.key.kind,
+            decorated_tokens=decorated_tokens,
+            source_tokens=source_tokens,
+        ):
             growth += decorated_tokens - token_counter(message)
     return growth
 
@@ -197,10 +205,11 @@ def finalize_summaries(
     source_messages: Mapping[int, Message],
     summary_cache: SummaryCache,
 ) -> tuple[list[Message], int, tuple[SummaryRequest, ...]]:
-    """Decorate ready receipts in order without exceeding the original target."""
+    """Decorate newest ready receipts first without exceeding the original target."""
     finalized = list(messages)
     running_total = fixed_tokens + sum(map(token_counter, finalized))
     misses: list[SummaryRequest] = []
+    ready: list[tuple[int, Message, SummaryRequest, str]] = []
     for index, message in enumerate(finalized):
         request = receipt_summary_request(message, source_messages)
         if request is None:
@@ -210,8 +219,16 @@ def finalize_summaries(
             if request.exact_range:
                 misses.append(request)
             continue
+        ready.append((index, message, request, summary))
+
+    # When reserve is scarce, retain facts nearest the orchestrator's active tail.
+    ready.sort(
+        key=lambda item: (item[2].key.seq_end, item[2].key.seq_start, item[0]),
+        reverse=True,
+    )
+    for index, message, request, summary in ready:
         decorated = decorate_receipt(message, summary)
-        original_tokens = sum(
+        source_tokens = sum(
             token_counter(source)
             for seq, source in source_messages.items()
             if request.key.seq_start <= seq <= request.key.seq_end
@@ -219,7 +236,11 @@ def finalize_summaries(
         decorated_tokens = token_counter(decorated)
         next_total = running_total - token_counter(message) + decorated_tokens
         if (
-            decorated_tokens < original_tokens
+            summary_decoration_fits_source(
+                request.key.kind,
+                decorated_tokens=decorated_tokens,
+                source_tokens=source_tokens,
+            )
             and reached_target
             and next_total <= target_tokens
         ):

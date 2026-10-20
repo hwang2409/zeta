@@ -26,7 +26,11 @@ from zeta.context_eviction.summaries import (
     valid_summary,
 )
 from zeta.context_eviction.summary_provider import build_summary_provider
-from zeta.context_eviction.summary_receipts import receipt_summary_request
+from zeta.context_eviction.summary_receipts import (
+    receipt_summary_request,
+    summary_decoration_fits_source,
+)
+from zeta.context_eviction.token_estimates import estimated_text_tokens
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.models.catalog import provider_for_model
@@ -53,12 +57,25 @@ class _MemoryCache:
         return True
 
 
-def _provider(model: str, *, offline: bool):
+def _offline_summary(prompt: str, target_tokens: int | None) -> str:
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+    words = ["offline", "factual", "summary", digest]
+    while (
+        target_tokens is not None
+        and estimated_text_tokens(" ".join(words)) < target_tokens
+        and len(words) < 60
+    ):
+        words.append("detail")
+    return " ".join(words)
+
+
+def _provider(model: str, *, offline: bool, offline_summary_tokens: int | None = None):
     if offline:
 
         async def fake(prompt: str) -> SummaryResponse:
-            digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
-            return SummaryResponse(f"offline factual summary {digest}", 0, 0)
+            return SummaryResponse(
+                _offline_summary(prompt, offline_summary_tokens), 0, 0
+            )
 
         return fake
     backend, _ = build_backend(
@@ -130,8 +147,13 @@ def _ready_decoration_growth(
             for seq, source in sources.items()
             if request.key.seq_start <= seq <= request.key.seq_end
         )
-        if message_token_count(decorated) < source_tokens:
-            growth += message_token_count(decorated) - message_token_count(plain)
+        decorated_tokens = message_token_count(decorated)
+        if summary_decoration_fits_source(
+            request.key.kind,
+            decorated_tokens=decorated_tokens,
+            source_tokens=source_tokens,
+        ):
+            growth += decorated_tokens - message_token_count(plain)
     return growth
 
 
@@ -201,13 +223,25 @@ async def _converge_enabled_view(
     return on
 
 
-async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]:
+async def replay(
+    session_dir: Path,
+    model: str,
+    offline: bool,
+    offline_summary_tokens: int | None = None,
+) -> dict[str, Any]:
     records, sources, target = _inputs(session_dir)
     off = evict_messages(
         records, fixed_tokens=0, target_tokens=target, source_messages=sources
     )
     cache = _MemoryCache()
-    worker = EvictionSummaryWorker(cache, _provider(model, offline=offline))
+    worker = EvictionSummaryWorker(
+        cache,
+        _provider(
+            model,
+            offline=offline,
+            offline_summary_tokens=offline_summary_tokens,
+        ),
+    )
     for request in eviction_summary_candidates(records):
         worker.admit(request)
     on = await _converge_enabled_view(worker, records, sources, target)
@@ -222,6 +256,21 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
         message.metadata.get("summary_data") is not None for message in on.messages
     )
     eligible_receipts = len(requests)
+    kind_counts = {
+        kind: {"eligible": 0, "shown": 0, "shown_rate": 1.0}
+        for kind in ("assistant", "orchestration", "notification", "range", "coarse")
+    }
+    for message, request in requests:
+        kind = request.key.kind
+        if kind == "range" and "user_count" in message.metadata:
+            kind = "coarse"
+        counts = kind_counts[kind]
+        counts["eligible"] += 1
+        if message.metadata.get("summary_data") is not None:
+            counts["shown"] += 1
+    for counts in kind_counts.values():
+        if counts["eligible"]:
+            counts["shown_rate"] = counts["shown"] / counts["eligible"]
     off_view, on_view = _view(off), _view(on)
     largest_single_fold_saving = _largest_new_range_saving(off, on)
     deterministic_tokens = sum(
@@ -233,6 +282,7 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
         "target_tokens": target,
         "model": model,
         "offline": offline,
+        "offline_summary_tokens": offline_summary_tokens,
         "feature_off": off_view,
         "feature_on": on_view,
         "off_selected_count": len(off_view["selected_seqs"]),
@@ -253,6 +303,7 @@ async def replay(session_dir: Path, model: str, offline: bool) -> dict[str, Any]
         "token_totals": {"off": off.tokens_after, "on": on.tokens_after},
         "eligible_receipts": eligible_receipts,
         "summary_count": summary_count,
+        "kinds": kind_counts,
         "deterministic_tokens_after": deterministic_tokens,
         "decoration_headroom": target - deterministic_tokens,
         "ready_decoration_growth": ready_growth,
@@ -266,8 +317,21 @@ def main() -> None:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--model", default="gpt-5.6-luna")
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--offline-summary-tokens", type=int)
     args = parser.parse_args()
-    result = asyncio.run(replay(args.session_dir, args.model, args.offline))
+    if args.offline_summary_tokens is not None:
+        if not args.offline:
+            parser.error("--offline-summary-tokens requires --offline")
+        if args.offline_summary_tokens < 1:
+            parser.error("--offline-summary-tokens must be positive")
+    result = asyncio.run(
+        replay(
+            args.session_dir,
+            args.model,
+            args.offline,
+            args.offline_summary_tokens,
+        )
+    )
     if (
         result["feature_on"]["reached_target"]
         and result["feature_on"]["tokens_after"] > result["target_tokens"]
