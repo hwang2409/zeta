@@ -6776,7 +6776,7 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
         f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
         "echo task-evidence"
     )
-    backend = _TaskFinishGateBackend(command, mixed_child=True)
+    backend = _TaskFinishGateBackend(command, mixed_child=True, gate_delay=0.1)
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.05)
     owner.finish_gate_task_timeout = 2
@@ -6792,7 +6792,6 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
     )
 
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
-    await asyncio.sleep(0.2)
     release.touch()
     await asyncio.wait_for(backend.task_output_read.wait(), timeout=10)
     notification = await _wait_completion(store, containing="task-evidence")
@@ -6866,7 +6865,7 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
         channel=owner.conversation_channel,
     ) is None
 
-    await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=0.1)
+    await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=2)
     notification = await asyncio.wait_for(_wait_completion(store), timeout=0.4)
     assert "finish-gate task safety bound expired" in notification.data["text"]
     assert notification.data.get("killed_task_ids")

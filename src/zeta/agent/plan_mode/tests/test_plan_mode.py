@@ -660,6 +660,12 @@ async def test_shift_tab_toggles_plan_mode() -> None:
     from zeta.tui.key_bindings import build_key_bindings
 
     toggles: list[str] = []
+    toggle_seen = asyncio.Event()
+
+    def on_plan_toggle() -> None:
+        toggles.append("toggle")
+        toggle_seen.set()
+
     with create_pipe_input() as pipe:
         session = PromptSession(
             input=pipe,
@@ -667,19 +673,20 @@ async def test_shift_tab_toggles_plan_mode() -> None:
             key_bindings=build_key_bindings(
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
-                on_plan_toggle=lambda: toggles.append("toggle"),
+                on_plan_toggle=on_plan_toggle,
             ),
             multiline=True,
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0)
         pipe.send_text("\x1b[Z")  # shift+tab
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(toggle_seen.wait(), timeout=1)
         assert toggles == ["toggle"]
 
         # It is not a printable key, so it works with text in the composer too.
+        toggle_seen.clear()
         pipe.send_text("hello\x1b[Z")
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(toggle_seen.wait(), timeout=1)
         assert toggles == ["toggle", "toggle"]
         assert session.default_buffer.text == "hello"
 
