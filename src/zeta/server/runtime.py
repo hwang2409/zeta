@@ -425,7 +425,9 @@ class ServerRuntime:
     ) -> RuntimeComposition:
         try:
             if resolved_project_id is not None:
-                project_id = resolved_project_id
+                project_id = (
+                    None if resolved_project_id == "__no_project__" else resolved_project_id
+                )
             else:
                 project = self.manager.project_registry.find_for_directory(cwd)
                 if project is None:
