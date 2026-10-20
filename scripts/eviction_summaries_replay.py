@@ -34,7 +34,7 @@ from zeta.context_eviction.token_estimates import estimated_text_tokens
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.models.catalog import provider_for_model
-from zeta.protocol.types import Message
+from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.providers.factory import build_backend
 
 
@@ -187,12 +187,14 @@ async def _enabled_pass(
     records: list[tuple[int, Message]],
     sources: dict[int, Message],
     target: int,
+    *,
+    fixed_tokens: int = 0,
 ) -> Any:
     while worker.queue:
         await worker.run_once()
     return evict_messages(
         records,
-        fixed_tokens=0,
+        fixed_tokens=fixed_tokens,
         target_tokens=target,
         source_messages=sources,
         summary_cache=worker.cache,
@@ -205,15 +207,21 @@ async def _converge_enabled_view(
     records: list[tuple[int, Message]],
     sources: dict[int, Message],
     target: int,
+    *,
+    fixed_tokens: int = 0,
 ) -> Any:
-    on = await _enabled_pass(worker, records, sources, target)
+    on = await _enabled_pass(
+        worker, records, sources, target, fixed_tokens=fixed_tokens
+    )
     for _ in range(3):
         for message in on.messages:
             if (request := receipt_summary_request(message, sources)) is not None:
                 worker.admit(request)
         for request in on.summary_misses:
             worker.admit(request)
-        next_on = await _enabled_pass(worker, records, sources, target)
+        next_on = await _enabled_pass(
+            worker, records, sources, target, fixed_tokens=fixed_tokens
+        )
         if (
             next_on.source_seqs == on.source_seqs
             and next_on.tokens_after == on.tokens_after
@@ -221,6 +229,157 @@ async def _converge_enabled_view(
             return next_on
         on = next_on
     return on
+
+
+def _receipt_kind(message: Message) -> str | None:
+    receipt_kind = message.metadata.get("eviction_receipt")
+    if receipt_kind == "range":
+        return "coarse" if "user_count" in message.metadata else "range"
+    if receipt_kind in {"assistant", "notification"}:
+        return str(receipt_kind)
+    fields = message.metadata.get("eviction_fields")
+    if (
+        receipt_kind == "tool_result"
+        and isinstance(fields, dict)
+        and fields.get("receipt_kind") == "orchestration"
+    ):
+        return "orchestration"
+    return None
+
+
+def _kind_counts(
+    messages: list[Message], sources: dict[int, Message]
+) -> dict[str, dict[str, int | float]]:
+    counts: dict[str, dict[str, int | float]] = {
+        kind: {"receipts": 0, "eligible": 0, "shown": 0, "shown_rate": 1.0}
+        for kind in ("assistant", "orchestration", "notification", "range", "coarse")
+    }
+    for message in messages:
+        receipt_kind = _receipt_kind(message)
+        if receipt_kind is not None:
+            counts[receipt_kind]["receipts"] += 1
+        request = receipt_summary_request(message, sources)
+        if request is None:
+            continue
+        kind = (
+            "coarse"
+            if request.key.kind == "range" and "user_count" in message.metadata
+            else request.key.kind
+        )
+        counts[kind]["eligible"] += 1
+        if message.metadata.get("summary_data") is not None:
+            counts[kind]["shown"] += 1
+    for values in counts.values():
+        eligible = int(values["eligible"])
+        if eligible:
+            values["shown_rate"] = int(values["shown"]) / eligible
+    return counts
+
+
+async def replay_incremental_markers(
+    session_dir: Path,
+    model: str,
+    offline: bool,
+    offline_summary_tokens: int | None = None,
+) -> dict[str, Any]:
+    store = ConversationStore(
+        session_dir.parent,
+        session_id=session_dir.name,
+        _read_only=True,
+        _must_exist=True,
+    )
+    branch = store.replay()
+    metadata = json.loads((session_dir / "meta.json").read_text())
+    budget = int(metadata.get("compaction_budget") or 200_000)
+    target = max(1, int(budget * TARGET_RATIO))
+    sources = {
+        entry.seq: Message.from_dict(entry.data["message"])
+        for entry in branch
+        if entry.type == "message"
+    }
+    markers = [
+        entry
+        for entry in branch
+        if entry.type == "compaction" and entry.data.get("kind") == "evict"
+    ]
+    cache = _MemoryCache()
+    worker = EvictionSummaryWorker(
+        cache,
+        _provider(
+            model,
+            offline=offline,
+            offline_summary_tokens=offline_summary_tokens,
+        ),
+    )
+    marker_reports: list[dict[str, Any]] = []
+    for marker in markers:
+        messages = ContextAssembler._eviction_view_messages(marker.data["view"])
+        records = [
+            (int(message.metadata.get("source_seq", marker.seq)), message)
+            for message in messages
+        ]
+        fixed_messages = []
+        if system_prompt := metadata.get("system_prompt"):
+            fixed_messages.append(
+                Message(MessageRole.SYSTEM, [TextContent(str(system_prompt))])
+            )
+        if pinned := marker.data.get("pinned_message"):
+            fixed_messages.append(Message.from_dict(pinned))
+        fixed_tokens = sum(map(message_token_count, fixed_messages))
+        for message in messages:
+            if (request := receipt_summary_request(message, sources)) is not None:
+                worker.admit(request)
+        on = await _converge_enabled_view(
+            worker,
+            records,
+            sources,
+            target,
+            fixed_tokens=fixed_tokens,
+        )
+        deterministic_tokens = fixed_tokens + sum(
+            message_token_count(normalize_receipt(message)) for message in on.messages
+        )
+        marker_reports.append(
+            {
+                "marker_seq": marker.seq,
+                "source_seq_start": marker.data["source_seq_start"],
+                "source_seq_end": marker.data["source_seq_end"],
+                "target_tokens": target,
+                "fixed_tokens": fixed_tokens,
+                "kinds": _kind_counts(on.messages, sources),
+                "added_tokens": on.tokens_after - deterministic_tokens,
+                "reserve_used": on.reserve_tokens,
+                "tokens_after": on.tokens_after,
+                "reached_target": on.reached_target,
+            }
+        )
+    await worker.close()
+    total_kinds = _kind_counts([], sources)
+    for report in marker_reports:
+        for kind, values in report["kinds"].items():
+            total_kinds[kind]["receipts"] += int(values["receipts"])
+            total_kinds[kind]["eligible"] += int(values["eligible"])
+            total_kinds[kind]["shown"] += int(values["shown"])
+    for values in total_kinds.values():
+        eligible = int(values["eligible"])
+        if eligible:
+            values["shown_rate"] = int(values["shown"]) / eligible
+    return {
+        "session_dir": str(session_dir),
+        "mode": "incremental_markers",
+        "target_tokens": target,
+        "model": model,
+        "offline": offline,
+        "offline_summary_tokens": offline_summary_tokens,
+        "markers": marker_reports,
+        "totals": {
+            "marker_count": len(marker_reports),
+            "kinds": total_kinds,
+            "added_tokens": sum(report["added_tokens"] for report in marker_reports),
+            "reserve_used": sum(report["reserve_used"] for report in marker_reports),
+        },
+        "queue_drops": worker.drops,
+    }
 
 
 async def replay(
@@ -256,21 +415,7 @@ async def replay(
         message.metadata.get("summary_data") is not None for message in on.messages
     )
     eligible_receipts = len(requests)
-    kind_counts = {
-        kind: {"eligible": 0, "shown": 0, "shown_rate": 1.0}
-        for kind in ("assistant", "orchestration", "notification", "range", "coarse")
-    }
-    for message, request in requests:
-        kind = request.key.kind
-        if kind == "range" and "user_count" in message.metadata:
-            kind = "coarse"
-        counts = kind_counts[kind]
-        counts["eligible"] += 1
-        if message.metadata.get("summary_data") is not None:
-            counts["shown"] += 1
-    for counts in kind_counts.values():
-        if counts["eligible"]:
-            counts["shown_rate"] = counts["shown"] / counts["eligible"]
+    kind_counts = _kind_counts(on.messages, sources)
     off_view, on_view = _view(off), _view(on)
     largest_single_fold_saving = _largest_new_range_saving(off, on)
     deterministic_tokens = sum(
@@ -318,27 +463,30 @@ def main() -> None:
     parser.add_argument("--model", default="gpt-5.6-luna")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--offline-summary-tokens", type=int)
+    parser.add_argument("--incremental-markers", action="store_true")
     args = parser.parse_args()
     if args.offline_summary_tokens is not None:
         if not args.offline:
             parser.error("--offline-summary-tokens requires --offline")
         if args.offline_summary_tokens < 1:
             parser.error("--offline-summary-tokens must be positive")
+    replay_call = replay_incremental_markers if args.incremental_markers else replay
     result = asyncio.run(
-        replay(
+        replay_call(
             args.session_dir,
             args.model,
             args.offline,
             args.offline_summary_tokens,
         )
     )
-    if (
-        result["feature_on"]["reached_target"]
-        and result["feature_on"]["tokens_after"] > result["target_tokens"]
-    ):
-        raise SystemExit("summary-enabled eviction exceeded target")
-    if result["extra_evicted_tokens"] > result["reserve_bound"]:
-        raise SystemExit("summary reserve exceeded the final-fold bound")
+    if not args.incremental_markers:
+        if (
+            result["feature_on"]["reached_target"]
+            and result["feature_on"]["tokens_after"] > result["target_tokens"]
+        ):
+            raise SystemExit("summary-enabled eviction exceeded target")
+        if result["extra_evicted_tokens"] > result["reserve_bound"]:
+            raise SystemExit("summary reserve exceeded the final-fold bound")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))

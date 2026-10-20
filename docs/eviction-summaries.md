@@ -125,15 +125,17 @@ v1 defaults are fixed implementation limits except for the enable switch:
 | input-token burst | 150,000 | bound immediate session spend |
 | concurrency | 2 | remaining keys stay queued |
 | pending queue | 256 | retain ranges, then oldest items |
-| minimum single-item source size | 48 source tokens | assistant, orchestration, and notification items below this size use current receipts |
+| minimum single-item source size | 48 source tokens | assistant, `task_output`, and notification items below this size use current receipts |
 | minimum range/coarse source size | 256 source tokens | smaller folded sources use current receipts |
 | retry attempts | 3 | each attempted call is rate-limited |
 | retry backoff floor | 60 seconds | no immediate retry loop |
 | shutdown grace | 2.5 seconds | cancel unfinished calls |
 
-`agent_output` results are not summary-eligible. in a range source, their result text is omitted while other eligible rows remain. one per-kind rule applies the 48-token minimum to assistant, orchestration, and notification items and the 256-token minimum to range and coarse receipts. request, reserve estimation, and decoration use that same rule and the stable `estimated_text_tokens` approximation over the projected source because a calibrated counter is not available at request time.
+the live targets are orchestrator replies and durable child-completion notifications. `agent` tool results are short start acknowledgements, so standalone `agent` receipts are not requested or decorated. `task_output` results remain eligible orchestration sources. a range that contains an `agent` acknowledgement remains eligible only through another covered assistant, notification, or `task_output` source. `agent_output` results are excluded from single-item requests, range source text, and resume catch-up.
 
-live replay showed that evicted items are mostly short: 285 ready summaries were hidden because the enriched receipt was not smaller than its source. allowing the three measured single-item kinds to spend the existing bounded reserve restores the experiment's useful content without making eviction larger than retaining the source. ranges and coarse receipts keep the stricter rule because they already summarize multiple source items.
+one per-kind rule applies the 48-token minimum to assistant, `task_output`, and notification items and the 256-token minimum to range and coarse receipts. request, reserve estimation, and decoration use that same rule and the stable `estimated_text_tokens` approximation over the projected source because a calibrated counter is not available at request time. single-item decorations must never exceed their source; range and coarse decorations must be strictly smaller.
+
+live replay showed that evicted items are mostly short: 285 ready summaries were hidden because the enriched receipt was not smaller than its source. allowing the measured single-item kinds to spend the existing bounded reserve restores useful content without making eviction larger than retaining the source. ranges and coarse receipts keep the stricter rule because they already summarize multiple source items.
 
 use a per-session token bucket that starts full at 150,000 input tokens, refills continuously at 100,000 tokens per hour using monotonic time, and never exceeds 150,000. reserve estimated input under one lock before every provider attempt; reconcile against reported usage afterward. cache hits cost no tokens. a key that cannot reserve remains queued, subject to the 256-key bound, and receipts continue to fall back exactly.
 
@@ -146,7 +148,7 @@ measurements explain these values: the shorter target session had 314 eligible i
 ### orchestration result
 
 ```text
-[orchestration result receipt] {"call":"agent-7","child_instance_id":"root:7","description":"review final head","original_chars":18420,"sha256":"0123456789abcdef","status":"success","summary_data":"review passed at abc1234; pr #512 is merge-ready","tool":"agent"}; recall_history seq_start=91, seq_end=91 for exact result
+[orchestration result receipt] {"original_chars":18420,"sha256":"0123456789abcdef","status":"success","summary_data":"task completed; pr #512 is merge-ready","task_id":"task-7","tool":"task_output"}; recall_history seq_start=91, seq_end=91 for exact result
 ```
 
 ### notification
@@ -171,7 +173,9 @@ without a summary, assistant text remains exactly `[assistant text evicted · se
 
 user excerpts and counts remain under current folding rules (`src/zeta/context_eviction/range_receipts.py:318-385`). a range is enriched only if it contains a v1-covered kind.
 
-after deterministic selection and folding, consider ready summaries newest-first by source sequence, with stable sequence and message-index tie breaks. this gives scarce reserve to facts nearest the orchestrator's active tail. count each complete enriched receipt with the existing `token_counter`. accept a single-item decoration when it is no larger than its original source and does not put the finished view above the pass target; range and coarse decorations must still be strictly smaller than their sources. otherwise keep today's receipt. recount final messages for `tokens_after`. this preserves selected source sequences and target correctness without estimating from the 512-byte limit.
+after deterministic selection and folding, use one priority rule for reserve estimation and final decoration. first consider small non-coarse range receipts that cover an assistant reply, durable notification, or `task_output` source, newest first. then consider standalone notification receipts and assistant-text stubs, newest first. remaining eligible receipts follow, also newest first. stable source-sequence and message-index tie breaks make the result deterministic. this gives scarce reserve to the compact live-orchestrator receipts before standalone items.
+
+count each complete enriched receipt with the existing `token_counter`. accept a single-item decoration when it is no larger than its original source and does not put the finished view above the pass target; range and coarse decorations must still be strictly smaller than their sources. otherwise keep today's receipt. recount final messages for `tokens_after`. this preserves selected source sequences and target correctness without estimating from the 512-byte limit.
 
 ## settings and eligibility
 
@@ -206,7 +210,11 @@ new tests use fake providers and temporary session directories; they make no net
 - `tests/test_settings.py::test_eviction_summaries_defaults_disabled_and_global_can_enable`: cover default, global enable, invalid keys, and project-layer rejection.
 - `tests/test_auto_memory_integration.py::test_eviction_summary_worker_only_for_top_level_sessions`: cover top-level, child, grandchild, and attention fork.
 
-existing eviction and range suites remain the regression oracle (`tests/test_context_eviction.py`, `tests/test_eviction_range_receipts.py`). run `scripts/eviction_summaries_replay.py SESSION_DIR --out OUT.json` for each measured session. it accepts `--model`, and `--offline` uses a deterministic fake for tests. it replays off/on using the real sanitizer and worker path, writes no session files, and reports selected counts, extra evicted tokens, target result, reserve used, readiness rate, queue drops, and token totals. the script does not score recall; the orchestrator uses the existing experiment harness. telemetry is aggregate only and never logs source or summary text.
+existing eviction and range suites remain the regression oracle (`tests/test_context_eviction.py`, `tests/test_eviction_range_receipts.py`). run `scripts/eviction_summaries_replay.py SESSION_DIR --out OUT.json` for each measured session. it accepts `--model`, and `--offline` uses a deterministic fake for tests. `--offline-summary-tokens N` controls the fake summary size.
+
+whole-transcript mode keeps the original one-pass off/on comparison over the final visible projection. it is useful for the original fold bound, but it is not representative of a live session: production evicts incrementally, while this mode can create one global coarse fold and uses no fixed system or pinned-user tokens.
+
+`--incremental-markers` walks persisted `evict` markers in order, loads each stored materialized view, carries one summary cache forward, and applies production eligibility, fit, reserve, system-prompt, and pinned-latest-user accounting at each marker. it reports receipt, eligible, and shown counts and shown rate per kind, plus added tokens and reserve used, for every marker and in total. both modes are read-only and make no provider calls when `--offline` is set. the script does not score recall; the orchestrator uses the existing experiment harness. telemetry is aggregate only and never logs source or summary text.
 
 ## rollout, rollback, and alternatives
 

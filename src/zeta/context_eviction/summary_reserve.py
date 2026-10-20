@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ..protocol.types import Message
@@ -90,16 +90,43 @@ def evict_messages(
     )
 
 
-def ready_decoration_growth(
+@dataclass(frozen=True, slots=True)
+class _ReadyDecoration:
+    index: int
+    message: Message
+    request: SummaryRequest
+    decorated: Message
+    message_tokens: int
+    decorated_tokens: int
+
+    @property
+    def growth(self) -> int:
+        return self.decorated_tokens - self.message_tokens
+
+
+def _summary_priority(item: _ReadyDecoration) -> tuple[int, int, int, int]:
+    """Prioritize useful live-orchestrator receipts, newest first per tier."""
+    kind = item.request.key.kind
+    is_coarse = kind == "range" and "user_count" in item.message.metadata
+    tier = (
+        0
+        if kind == "range" and not is_coarse
+        else 1
+        if kind in {"notification", "assistant"}
+        else 2
+    )
+    return (tier, -item.request.key.seq_end, -item.request.key.seq_start, -item.index)
+
+
+def _ready_decorations(
     messages: Sequence[Message],
     *,
     token_counter: Callable[[Message], int],
     source_messages: Mapping[int, Message],
     summary_cache: SummaryCache,
-) -> int:
-    """Return growth from ready decorations allowed for their summary kind."""
-    growth = 0
-    for message in messages:
+) -> tuple[_ReadyDecoration, ...]:
+    ready: list[_ReadyDecoration] = []
+    for index, message in enumerate(messages):
         request = receipt_summary_request(message, source_messages)
         if request is None or (summary := summary_cache.get(request.key)) is None:
             continue
@@ -115,8 +142,36 @@ def ready_decoration_growth(
             decorated_tokens=decorated_tokens,
             source_tokens=source_tokens,
         ):
-            growth += decorated_tokens - token_counter(message)
-    return growth
+            ready.append(
+                _ReadyDecoration(
+                    index,
+                    message,
+                    request,
+                    decorated,
+                    token_counter(message),
+                    decorated_tokens,
+                )
+            )
+    return tuple(sorted(ready, key=_summary_priority))
+
+
+def ready_decoration_growth(
+    messages: Sequence[Message],
+    *,
+    token_counter: Callable[[Message], int],
+    source_messages: Mapping[int, Message],
+    summary_cache: SummaryCache,
+) -> int:
+    """Return prioritized ready-decoration growth allowed by the source rules."""
+    return sum(
+        item.growth
+        for item in _ready_decorations(
+            messages,
+            token_counter=token_counter,
+            source_messages=source_messages,
+            summary_cache=summary_cache,
+        )
+    )
 
 
 class ReserveFoldTracker:
@@ -182,12 +237,15 @@ def estimate_summary_reserve(
     source_messages: Mapping[int, Message],
     summary_cache: SummaryCache,
 ) -> int:
-    """Return ready decoration growth beyond existing target headroom."""
-    ready_extra = ready_decoration_growth(
-        messages,
-        token_counter=token_counter,
-        source_messages=source_messages,
-        summary_cache=summary_cache,
+    """Return prioritized decoration growth beyond existing target headroom."""
+    ready_extra = sum(
+        item.growth
+        for item in _ready_decorations(
+            messages,
+            token_counter=token_counter,
+            source_messages=source_messages,
+            summary_cache=summary_cache,
+        )
     )
     return min(
         max(0, ready_extra - (target_tokens - current_tokens)),
@@ -208,42 +266,22 @@ def finalize_summaries(
     """Decorate newest ready receipts first without exceeding the original target."""
     finalized = list(messages)
     running_total = fixed_tokens + sum(map(token_counter, finalized))
-    misses: list[SummaryRequest] = []
-    ready: list[tuple[int, Message, SummaryRequest, str]] = []
-    for index, message in enumerate(finalized):
-        request = receipt_summary_request(message, source_messages)
-        if request is None:
-            continue
-        summary = summary_cache.get(request.key)
-        if summary is None:
-            if request.exact_range:
-                misses.append(request)
-            continue
-        ready.append((index, message, request, summary))
-
-    # When reserve is scarce, retain facts nearest the orchestrator's active tail.
-    ready.sort(
-        key=lambda item: (item[2].key.seq_end, item[2].key.seq_start, item[0]),
-        reverse=True,
+    misses = [
+        request
+        for message in finalized
+        if (request := receipt_summary_request(message, source_messages)) is not None
+        and request.exact_range
+        and summary_cache.get(request.key) is None
+    ]
+    ready = _ready_decorations(
+        finalized,
+        token_counter=token_counter,
+        source_messages=source_messages,
+        summary_cache=summary_cache,
     )
-    for index, message, request, summary in ready:
-        decorated = decorate_receipt(message, summary)
-        source_tokens = sum(
-            token_counter(source)
-            for seq, source in source_messages.items()
-            if request.key.seq_start <= seq <= request.key.seq_end
-        )
-        decorated_tokens = token_counter(decorated)
-        next_total = running_total - token_counter(message) + decorated_tokens
-        if (
-            summary_decoration_fits_source(
-                request.key.kind,
-                decorated_tokens=decorated_tokens,
-                source_tokens=source_tokens,
-            )
-            and reached_target
-            and next_total <= target_tokens
-        ):
-            finalized[index] = decorated
+    for item in ready:
+        next_total = running_total + item.growth
+        if reached_target and next_total <= target_tokens:
+            finalized[item.index] = item.decorated
             running_total = next_total
     return finalized, running_total, tuple(misses)

@@ -1329,20 +1329,20 @@ def test_agent_output_never_reaches_summary_by_any_path() -> None:
     assert receipt_summary_request(output_receipt, output_sources) is None
     assert catch_up_summary_candidates(output_records, [output_receipt]) == ()
 
-    agent_call = Message(
+    task_call = Message(
         MessageRole.ASSISTANT,
-        [ToolUseContent(ToolCall("agent-1", "agent", {"task": "review"}))],
+        [ToolUseContent(ToolCall("task-1", "task_output", {"task_id": "task-1"}))],
     )
-    agent_result = Message(
+    task_result = Message(
         MessageRole.USER,
-        tool_result=ToolResult("agent-1", "trusted result " * 300),
+        tool_result=ToolResult("task-1", "trusted result " * 300),
     )
     requests = eviction_summary_candidates(
-        [(1, agent_call), (2, agent_result), (3, output_call), (4, output_result)]
+        [(1, task_call), (2, task_result), (3, output_call), (4, output_result)]
     )
     assert len(requests) == 1
     assert "untrusted agent output text" not in requests[0].source
-    mixed_sources = {1: agent_call, 2: agent_result, 3: output_call, 4: output_result}
+    mixed_sources = {1: task_call, 2: task_result, 3: output_call, 4: output_result}
     mixed_receipt = output_receipt
     mixed_receipt = Message(
         mixed_receipt.role,
@@ -1427,14 +1427,14 @@ def test_summary_instruction_asks_for_at_most_60_words() -> None:
     assert "at most 60 words" in SUMMARY_INSTRUCTION
 
 
-def test_orchestration_result_is_eligible() -> None:
+def test_task_output_result_is_eligible() -> None:
     call = Message(
         MessageRole.ASSISTANT,
-        [ToolUseContent(ToolCall("agent-1", "agent", {"prompt": "review"}))],
+        [ToolUseContent(ToolCall("task-1", "task_output", {"task_id": "task-1"}))],
     )
     result = Message(
         MessageRole.USER,
-        tool_result=ToolResult("agent-1", "review passed at abc1234 " * 100),
+        tool_result=ToolResult("task-1", "review passed at abc1234 " * 100),
     )
     candidates = eviction_summary_candidates([(1, call), (2, result)])
     assert [(item.key.kind, item.key.seq_start) for item in candidates] == [

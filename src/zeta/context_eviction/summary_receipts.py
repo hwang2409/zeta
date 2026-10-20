@@ -180,11 +180,13 @@ def _summary_source(
 def _summary_kind(message: Message, calls: Mapping[str, ToolCall]) -> str | None:
     if message.metadata.get("context_evicted"):
         return None
-    if _notification(message):
-        return "notification"
     result = message.tool_result
     call = calls.get(result.tool_call_id) if result is not None else None
-    if call is not None and call.name in {"agent", "task_output"}:
+    if call is not None and call.name == "agent_output":
+        return None
+    if _notification(message):
+        return "notification"
+    if call is not None and call.name == "task_output":
         return "orchestration"
     if (
         message.role is MessageRole.ASSISTANT
