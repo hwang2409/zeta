@@ -224,6 +224,19 @@ def test_project_record_publish_preserves_legacy_surrogate_text(tmp_path: Path) 
     assert registry.show_project(project.project_id).scope == value["scope"]
 
 
+def test_project_record_without_repo_agents_loads_as_include(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    record = registry.root / project.project_id / "project.json"
+    value = json.loads(record.read_text(encoding="utf-8"))
+    value.pop("repo_agents", None)
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    loaded = registry.show_project(project.project_id)
+    assert loaded.repo_agents == "include"
+    assert registry.list_projects() == [loaded]
+
+
 def test_project_record_loads_boolean_schema_version(tmp_path: Path) -> None:
     registry = ProjectRegistry(tmp_path / "projects")
     project = registry.create_project("demo", "scope")

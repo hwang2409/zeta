@@ -33,8 +33,9 @@ _PROJECT_FIELDS = {
     "created_at",
     "updated_at",
     "canonical_integration_root",
-    "repo_agents",
 }
+# Optional fields; records written before they existed stay valid.
+_OPTIONAL_PROJECT_FIELDS = {"lanes", "repo_agents"}
 
 
 def validate_project_record(
@@ -44,7 +45,7 @@ def validate_project_record(
 
     if (
         not _PROJECT_FIELDS.issubset(value)
-        or not set(value).issubset(_PROJECT_FIELDS | {"lanes"})
+        or not set(value).issubset(_PROJECT_FIELDS | _OPTIONAL_PROJECT_FIELDS)
         or value.get("schema_version") != SCHEMA_VERSION
     ):
         raise ValueError("unknown or invalid project schema")
