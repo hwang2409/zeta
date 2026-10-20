@@ -7123,8 +7123,23 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_provider_failure_receipt_reports_killed_task_headline_and_archive(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("command", "secret"),
+    [
+        (
+            _python("import time; time.sleep(30)")
+            + " 'Authorization: Bearer auth-secret-123'",
+            "auth-secret-123",
+        ),
+        ("TOKEN=token-secret-456 " + _python("import time; time.sleep(30)"), "token-secret-456"),
+        (
+            _python("import time; time.sleep(30)") + " --password=password-secret-789",
+            "password-secret-789",
+        ),
+    ],
+)
+async def test_killed_task_receipt_never_contains_command_secrets(
+    tmp_path: Path, command: str, secret: str
 ) -> None:
     class FailingBackend(_TaskOwningChildBackend):
         async def complete(self, messages, tool_schemas):
@@ -7142,7 +7157,6 @@ async def test_provider_failure_receipt_reports_killed_task_headline_and_archive
             async for event in super().complete(messages, tool_schemas):
                 yield event
 
-    command = _python("import time; time.sleep(30)")
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store, finish_gate_max_turns=1)
     loop = AgentLoop(
@@ -7164,7 +7178,7 @@ async def test_provider_failure_receipt_reports_killed_task_headline_and_archive
     assert "background tasks killed on child completion" in text
     task_id = notification.data["killed_task_ids"][0]
     assert task_id in text
-    assert "pyt" in text
+    assert secret not in text
     assert "background-output.archive" in text
     assert "command unavailable" not in text
     await loop.close()

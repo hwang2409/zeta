@@ -5,7 +5,15 @@ import httpx
 import pytest
 
 import zeta.providers.retry_policy as retry_policy_module
-from zeta.protocol.types import StreamEvent, StreamEventType
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+)
 from zeta.providers.anthropic_errors import AnthropicStreamError
 from zeta.providers.codex_errors import CodexHTTPError
 from zeta.providers.ollama import OllamaError
@@ -67,6 +75,93 @@ def test_server_error_with_permanent_4xx_status_is_not_retried() -> None:
     error.code = "server_error"
 
     assert not retryable_provider_error(error)
+
+
+@pytest.mark.parametrize("status_code", [400, 408, 409, 425, 429])
+@pytest.mark.parametrize("code", [None, "server_error"])
+def test_retry_precedence_for_4xx_statuses(
+    status_code: int, code: str | None
+) -> None:
+    error = CodexHTTPError("provider failure", status_code=status_code)
+    error.code = code
+
+    assert retryable_provider_error(error) is (status_code != 400)
+
+
+class _ServerError(RuntimeError):
+    code = "server_error"
+    retry_after = 0.0
+
+
+async def _server_error_attempts(
+    prefix: list[StreamEvent],
+) -> tuple[list[StreamEvent], int]:
+    attempts = 0
+
+    async def stream() -> AsyncIterator[StreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        for event in prefix:
+            yield event
+        if attempts == 1:
+            raise _ServerError("server_error: stream error")
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+        )
+
+    events = [
+        event
+        async for event in retry_provider_completion(
+            stream,
+            _unused_retry,
+            _unused_refresh,
+            lambda _error: False,
+            lambda error: error,
+            _retry_notice,
+            lambda _error, _retries: None,
+            sleep=lambda _delay: asyncio.sleep(0),
+        )
+    ]
+    return events, attempts
+
+
+@pytest.mark.asyncio
+async def test_server_error_after_text_is_not_retried_inside_transport() -> None:
+    prefix = [
+        StreamEvent(StreamEventType.MESSAGE_START),
+        StreamEvent(StreamEventType.MESSAGE_UPDATE, content=TextContent("partial")),
+    ]
+
+    with pytest.raises(_ServerError):
+        await _server_error_attempts(prefix)
+
+
+@pytest.mark.asyncio
+async def test_server_error_after_completed_tool_call_is_not_retried_inside_transport() -> None:
+    prefix = [
+        StreamEvent(StreamEventType.MESSAGE_START),
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(
+                MessageRole.ASSISTANT,
+                [ToolUseContent(ToolCall("call-1", "read", {"path": "README.md"}))],
+            ),
+        ),
+    ]
+
+    with pytest.raises(_ServerError):
+        await _server_error_attempts(prefix)
+
+
+@pytest.mark.asyncio
+async def test_server_error_before_output_is_retried_inside_transport() -> None:
+    events, attempts = await _server_error_attempts(
+        [StreamEvent(StreamEventType.MESSAGE_START)]
+    )
+
+    assert attempts == 2
+    assert any(event.type is StreamEventType.RETRY for event in events)
 
 
 async def _unused_retry(_token: str) -> AsyncIterator[StreamEvent]:

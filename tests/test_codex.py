@@ -4330,6 +4330,79 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_diagnostic_records_actual_retry_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter([10.0, 11.5])
+    monkeypatch.setattr(codex_module, "monotonic", lambda: next(clock), raising=False)
+
+    async def after_tool_handler(request: httpx.Request) -> httpx.Response:
+        events = tool_stream()[:-1] + [
+            event(
+                "response.failed",
+                response={"error": {"code": "server_error", "message": "failed"}},
+            )
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(events),
+            request=request,
+        )
+
+    path = tmp_path / "after-tool.jsonl"
+    client = httpx.AsyncClient(transport=httpx.MockTransport(after_tool_handler))
+    backend = CodexBackend(
+        client=client,
+        token_store=store_for(tmp_path / "codex.json"),
+        diagnostics_path=path,
+    )
+    with pytest.raises(CodexStreamError):
+        [item async for item in backend.complete([], [])]
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["retryable"] is True
+    assert records[0]["will_retry"] is False
+    assert records[0]["stream_age_seconds"] == 1.5
+    await client.aclose()
+
+    async def fail_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(
+                [
+                    event("response.created", response={"id": "failed"}),
+                    event(
+                        "response.failed",
+                        response={"error": {"code": "server_error", "message": "failed"}},
+                    ),
+                ]
+            ),
+            request=request,
+        )
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("zeta.providers.transport.asyncio.sleep", no_sleep)
+    monkeypatch.setattr(codex_module, "monotonic", lambda: 20.0, raising=False)
+    exhausted_path = tmp_path / "exhausted.jsonl"
+    client = httpx.AsyncClient(transport=httpx.MockTransport(fail_handler))
+    backend = CodexBackend(
+        client=client,
+        token_store=store_for(tmp_path / "codex-exhausted.json"),
+        diagnostics_path=exhausted_path,
+    )
+    with pytest.raises(CodexStreamError):
+        [item async for item in backend.complete([], [])]
+    exhausted = [json.loads(line) for line in exhausted_path.read_text().splitlines()]
+    assert len(exhausted) == 5
+    assert [record["will_retry"] for record in exhausted] == [True] * 4 + [False]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("shape", ["flat", "nested", "failed"])
 @pytest.mark.parametrize("detail,code,status", [
     ({"code": "context_length_exceeded"}, "context_length_exceeded", None),
@@ -4362,6 +4435,79 @@ async def test_stream_error_preserves_structured_metadata(shape, detail, code, s
         assert "Denied" not in info.message
     finally:
         await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_records_actual_retry_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter([10.0, 11.5])
+    monkeypatch.setattr(codex_module, "monotonic", lambda: next(clock), raising=False)
+
+    async def after_tool_handler(request: httpx.Request) -> httpx.Response:
+        events = tool_stream()[:-1] + [
+            event(
+                "response.failed",
+                response={"error": {"code": "server_error", "message": "failed"}},
+            )
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(events),
+            request=request,
+        )
+
+    path = tmp_path / "after-tool.jsonl"
+    client = httpx.AsyncClient(transport=httpx.MockTransport(after_tool_handler))
+    backend = CodexBackend(
+        client=client,
+        token_store=store_for(tmp_path / "codex.json"),
+        diagnostics_path=path,
+    )
+    with pytest.raises(CodexStreamError):
+        [item async for item in backend.complete([], [])]
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["retryable"] is True
+    assert records[0]["will_retry"] is False
+    assert records[0]["stream_age_seconds"] == 1.5
+    await client.aclose()
+
+    async def fail_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(
+                [
+                    event("response.created", response={"id": "failed"}),
+                    event(
+                        "response.failed",
+                        response={"error": {"code": "server_error", "message": "failed"}},
+                    ),
+                ]
+            ),
+            request=request,
+        )
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("zeta.providers.transport.asyncio.sleep", no_sleep)
+    monkeypatch.setattr(codex_module, "monotonic", lambda: 20.0, raising=False)
+    exhausted_path = tmp_path / "exhausted.jsonl"
+    client = httpx.AsyncClient(transport=httpx.MockTransport(fail_handler))
+    backend = CodexBackend(
+        client=client,
+        token_store=store_for(tmp_path / "codex-exhausted.json"),
+        diagnostics_path=exhausted_path,
+    )
+    with pytest.raises(CodexStreamError):
+        [item async for item in backend.complete([], [])]
+    exhausted = [json.loads(line) for line in exhausted_path.read_text().splitlines()]
+    assert len(exhausted) == 5
+    assert [record["will_retry"] for record in exhausted] == [True] * 4 + [False]
+    await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -4524,6 +4670,79 @@ async def test_response_failed_diagnostic_records_structured_context(tmp_path: P
     serialized = (tmp_path / "diagnostics.jsonl").read_text()
     assert "raw provider message" not in serialized
     assert "secret provider text" not in serialized
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_records_actual_retry_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter([10.0, 11.5])
+    monkeypatch.setattr(codex_module, "monotonic", lambda: next(clock), raising=False)
+
+    async def after_tool_handler(request: httpx.Request) -> httpx.Response:
+        events = tool_stream()[:-1] + [
+            event(
+                "response.failed",
+                response={"error": {"code": "server_error", "message": "failed"}},
+            )
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(events),
+            request=request,
+        )
+
+    path = tmp_path / "after-tool.jsonl"
+    client = httpx.AsyncClient(transport=httpx.MockTransport(after_tool_handler))
+    backend = CodexBackend(
+        client=client,
+        token_store=store_for(tmp_path / "codex.json"),
+        diagnostics_path=path,
+    )
+    with pytest.raises(CodexStreamError):
+        [item async for item in backend.complete([], [])]
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["retryable"] is True
+    assert records[0]["will_retry"] is False
+    assert records[0]["stream_age_seconds"] == 1.5
+    await client.aclose()
+
+    async def fail_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(
+                [
+                    event("response.created", response={"id": "failed"}),
+                    event(
+                        "response.failed",
+                        response={"error": {"code": "server_error", "message": "failed"}},
+                    ),
+                ]
+            ),
+            request=request,
+        )
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("zeta.providers.transport.asyncio.sleep", no_sleep)
+    monkeypatch.setattr(codex_module, "monotonic", lambda: 20.0, raising=False)
+    exhausted_path = tmp_path / "exhausted.jsonl"
+    client = httpx.AsyncClient(transport=httpx.MockTransport(fail_handler))
+    backend = CodexBackend(
+        client=client,
+        token_store=store_for(tmp_path / "codex-exhausted.json"),
+        diagnostics_path=exhausted_path,
+    )
+    with pytest.raises(CodexStreamError):
+        [item async for item in backend.complete([], [])]
+    exhausted = [json.loads(line) for line in exhausted_path.read_text().splitlines()]
+    assert len(exhausted) == 5
+    assert [record["will_retry"] for record in exhausted] == [True] * 4 + [False]
     await client.aclose()
 
 
