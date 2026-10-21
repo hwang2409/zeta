@@ -41,6 +41,7 @@ class _AccountCredentialStore:
     def __init__(self, home: Path, provider: str) -> None:
         self.store = AccountStore(home)
         self.account = AccountId(provider, "default")
+        self.store.resolve_credential_path(provider)
 
     def save(self, tokens: OAuthTokens) -> None:
         self.store.ensure_account(
