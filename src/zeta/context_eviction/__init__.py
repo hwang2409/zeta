@@ -492,7 +492,6 @@ def _evict_persisted_records(
     eligibility: _EvictionEligibility,
 ) -> tuple[list[tuple[int, Message]], set[int]]:
     """Evict eligible persisted rows again from their active-branch sources."""
-
     from . import receipt_constructors as rc
     from .range_receipts import _is_receipt_kind
 
@@ -516,16 +515,15 @@ def _evict_persisted_records(
     output = list(records)
     regenerated: set[int] = set()
     for index, (seq, message) in enumerate(records):
-        if eligibility.allows(seq) and not message.metadata.get(rc.RECEIPT_KIND_METADATA):
-            replacement = rc._persisted_reasoning_receipt(message, seq, token_counter)
-            if replacement is not None:
-                output[index] = (seq, replacement)
-                regenerated.add(seq)
+        if eligibility.allows(seq) and not message.metadata.get(
+            rc.RECEIPT_KIND_METADATA
+        ) and (replacement := rc._persisted_reasoning_receipt(message, seq, token_counter)):
+            output[index] = (seq, replacement)
+            regenerated.add(seq)
     result_indexes: dict[str, list[int]] = defaultdict(list)
     for index, (_, message) in enumerate(records):
         if message.tool_result is not None:
             result_indexes[message.tool_result.tool_call_id].append(index)
-
     def is_current(index: int) -> bool:
         seq, message = records[index]
         marker = message.metadata.get(rc.RECEIPT_KIND_METADATA)
@@ -538,7 +536,6 @@ def _evict_persisted_records(
             and marker != "range"
             and _is_receipt_kind(message, seq, marker, tool_name=tool_name)
         )
-
     def can_regenerate(index: int) -> bool:
         seq, message = records[index]
         replacement = generated_by_seq.get(seq)
@@ -549,7 +546,6 @@ def _evict_persisted_records(
             and replacement is not None
             and replacement.metadata.get(RECEIPT_KIND_METADATA)
         )
-
     blocked: set[int] = set()
     for call_index, (seq, message) in enumerate(records):
         call_ids = [
@@ -584,7 +580,6 @@ def _evict_persisted_records(
                 source_seq = records[index][0]
                 output[index] = (source_seq, generated_by_seq[source_seq])
                 regenerated.add(source_seq)
-
     for index, (seq, message) in enumerate(records):
         if index in blocked:
             continue
