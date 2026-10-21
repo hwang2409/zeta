@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -70,7 +71,11 @@ def tool_content(event: StreamEvent) -> str:
         return ""
     blocks = result.content_blocks or []
     if not blocks:
-        return result.content
+        if result.content:
+            return result.content
+        if result.structured_content:
+            return json.dumps(result.structured_content, sort_keys=True, separators=(",", ":"))
+        return ""
     tool_name = event.tool_call.name if event.tool_call is not None else "tool"
     return flatten_tool_content(blocks, detailed_images=True, tool_name=tool_name)
 

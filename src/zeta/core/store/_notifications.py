@@ -12,7 +12,10 @@ from ..checkpoints import ConversationEntry
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     CHILD_IDLE_NOTIFICATION_KIND,
+    CHILD_QUESTION_NOTIFICATION_KIND,
+    CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,
+    PROJECT_INBOX_NOTIFICATION_KIND,
     TASK_EXITED_NOTIFICATION_KIND,
     valid_agent_stats,
     validate_agent_notification_data,
@@ -158,7 +161,7 @@ class NotificationStateMixin:
             raise ValueError("invalid inbox notification")
         data: dict[str, Any] = {
             "origin": MessageOrigin.NOTIFICATION.value,
-            "kind": "project_inbox",
+            "kind": PROJECT_INBOX_NOTIFICATION_KIND,
             "project_id": project_id,
             "message_ids": list(message_ids),
             "description": "project inbox",
@@ -177,7 +180,7 @@ class NotificationStateMixin:
                     entry
                     for notification_id, entry in self._active_notifications.items()
                     if notification_id not in self._active_notification_acks
-                    and entry.data.get("kind") == "project_inbox"
+                    and entry.data.get("kind") == PROJECT_INBOX_NOTIFICATION_KIND
                 ),
                 None,
             )
@@ -228,7 +231,7 @@ class NotificationStateMixin:
             raise ValueError("invalid child question")
         data: dict[str, Any] = {
             "origin": MessageOrigin.NOTIFICATION.value,
-            "kind": "child_question",
+            "kind": CHILD_QUESTION_NOTIFICATION_KIND,
             "child_instance_id": child_instance_id,
             "question_id": question_id,
             "question": question,
@@ -261,7 +264,7 @@ class NotificationStateMixin:
                 entry
                 for notification_id, entry in self._active_notifications.items()
                 if notification_id not in self._active_notification_acks
-                and entry.data.get("kind") == "child_question"
+                and entry.data.get("kind") == CHILD_QUESTION_NOTIFICATION_KIND
                 and entry.data.get("child_instance_id") == child_instance_id
             ]
             if not questions:
@@ -275,7 +278,7 @@ class NotificationStateMixin:
                             "notification",
                             {
                                 "origin": MessageOrigin.NOTIFICATION.value,
-                                "kind": "child_question_withdrawn",
+                                "kind": CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND,
                                 "child_instance_id": child_instance_id,
                                 "question_id": question.data["question_id"],
                                 "description": "child question withdrawn",

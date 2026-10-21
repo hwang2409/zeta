@@ -60,11 +60,10 @@ from ._pending_prompts import (
 )
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
-    CHILD_IDLE_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
+    NOTIFICATION_KINDS,
     TASK_EXITED_NOTIFICATION_KIND,
-    validate_agent_notification_data,
-    validate_child_idle_notification_data,
+    validate_notification_data,
     validate_terminal_transition_data,
 )
 from .runtime_lease import (
@@ -162,7 +161,6 @@ class ConversationStore(
             _, self.directory_fd = lease.enter_context(
                 session_directory(self.root_dir, self.session_id)
             )
-            # Discovery validates without creating locks/state or repairing the log.
             with (
                 nullcontext()
                 if _read_only
@@ -178,7 +176,6 @@ class ConversationStore(
                 self._runtime_lease,
                 lease.pop_all(),
             )
-
     def close(self) -> None:
         """Drain durable writers, then release this store's activity leases."""
         if self._drain_durable_writes_for_close():
@@ -578,19 +575,9 @@ class ConversationStore(
                     raise ValueError("invalid approval resolution")
             elif entry.type == "notification":
                 kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
-                if kind == TASK_EXITED_NOTIFICATION_KIND and (
-                    type(entry.data.get("task_id")) is not str
-                    or not entry.data["task_id"]
-                    or type(entry.data.get("headline")) is not str
-                    or type(entry.data.get("exit_code")) not in {int, type(None)}
-                    or type(entry.data.get("output_tail", "")) is not str
-                ):
-                    raise ValueError("invalid task notification")
-                if kind == AGENT_COMPLETION_NOTIFICATION_KIND:
-                    validate_agent_notification_data(entry.data)
-                elif kind == CHILD_IDLE_NOTIFICATION_KIND:
-                    validate_child_idle_notification_data(entry.data)
-                # Unknown notification kinds are tolerated for forward compat.
+                if kind in NOTIFICATION_KINDS:
+                    validate_notification_data(entry.data)
+                # Unknown kinds remain readable for forward compatibility.
             elif entry.type == "notification_ack":
                 notification_id = entry.data.get("notification_id")
                 if type(notification_id) is not str or not notification_id:
@@ -649,6 +636,14 @@ class ConversationStore(
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
+    @staticmethod
+    def _validate_notification_write(entry_type: str, data: Mapping[str, Any]) -> None:
+        if entry_type != "notification":
+            return
+        kind = data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
+        if kind not in NOTIFICATION_KINDS:
+            raise ValueError(f"unknown notification kind: {kind!r}")
+
     def _append_row(
         self,
         entry_type: str,
@@ -686,6 +681,7 @@ class ConversationStore(
         next_seq = self._entries[-1].seq + 1 if self._entries else 1
         entries: list[ConversationEntry] = []
         for index, (entry_type, data) in enumerate(rows):
+            self._validate_notification_write(entry_type, data)
             entry_id = uuid.uuid4().hex
             if entry_id in prior_ids:
                 raise ConversationIntegrityError(
@@ -735,6 +731,7 @@ class ConversationStore(
         deadline: float | None = None,
         copy_data: bool = True,
     ) -> ConversationEntry:
+        self._validate_notification_write(entry_type, data)
         prior_ids = {entry.id for entry in self._entries}
         if parent_id is not None and parent_id not in prior_ids:
             raise ConversationIntegrityError(f"missing prior parent {parent_id}")
@@ -924,7 +921,6 @@ class ConversationStore(
                 raise ValueError("compaction pinned message must be a user message")
             data["pinned_message"] = pinned_message.to_dict()
         return data
-
 
     def append_message_with_approval_requests(
         self,

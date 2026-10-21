@@ -6,7 +6,8 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-PROTOCOL_VERSION = "1.1"
+PROTOCOL_VERSION = "1.2"
+SUPPORTED_PROTOCOL_VERSIONS = ("1.0", "1.1", PROTOCOL_VERSION)
 # Optional 1.1 features. A client opts in through ``hello.features``; the
 # server echoes the supported subset in ``capabilities.features``.
 FEATURES = (
@@ -50,6 +51,20 @@ class ProtocolError(Exception):
         self.message = message
         self.data = data
         self.request_id = _safe_request_id(request_id)
+
+
+def negotiate_protocol_version(requested: object, advertised: object) -> str:
+    """Select one supported version from a hello request."""
+
+    if requested not in SUPPORTED_PROTOCOL_VERSIONS:
+        raise ProtocolError(
+            -32002,
+            "unsupported protocol version",
+            {"requested": requested, "supported": list(SUPPORTED_PROTOCOL_VERSIONS)},
+        )
+    if requested == "1.0" and advertised in SUPPORTED_PROTOCOL_VERSIONS[1:]:
+        return advertised
+    return requested
 
 
 class FrameCodec:
@@ -351,8 +366,10 @@ __all__ = [
     "MAX_NUMERIC_ID_DIGITS",
     "MAX_REQUEST_ID_BYTES",
     "PROTOCOL_VERSION",
+    "SUPPORTED_PROTOCOL_VERSIONS",
     "TOOL_OUTPUT_MAX_BYTES",
     "FrameCodec",
     "ProtocolError",
     "bounded",
+    "negotiate_protocol_version",
 ]
