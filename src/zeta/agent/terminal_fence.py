@@ -18,11 +18,13 @@ class TerminalTransitionFence:
         notification_pending: Callable[[], bool] = lambda: False,
         persisted_notification_ids: Callable[[], frozenset[str]] = frozenset,
         owned_work: Callable[[], tuple[str, ...]] = tuple,
+        delivering_prompt_id: Callable[[], str | None] = lambda: None,
     ) -> None:
         self._store = store
         self._notification_pending = notification_pending
         self._persisted_notification_ids = persisted_notification_ids
         self._owned_work = owned_work
+        self._delivering_prompt_id = delivering_prompt_id
         self._lock = asyncio.Lock()
 
     async def accept_finish(self, report: dict[str, object]) -> str | None:
@@ -37,6 +39,7 @@ class TerminalTransitionFence:
             reason = self._store.pending_prompt_queue.accept_explicit_finish(
                 report,
                 persisted_notification_ids=self._persisted_notification_ids(),
+                delivering_prompt_id=self._delivering_prompt_id(),
             )
             if reason is None:
                 self._store.update_agent_lifecycle(
