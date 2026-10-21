@@ -570,6 +570,17 @@ def render_agent_notification(event: StreamEvent) -> Text | None:
             question, MAX_AGENT_NOTIFICATION_LINE - cell_len(prefix)
         )
         return Text(message, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
+    if kind == "child_idle":
+        description = event.data.get("description")
+        if not isinstance(description, str) or not description:
+            return Text("background agent notification unavailable", style=theme.ERROR)
+        suffix = " · idle"
+        prefix = "◌ "
+        message = prefix + _compact_notification_text(
+            description,
+            MAX_AGENT_NOTIFICATION_LINE - cell_len(prefix) - cell_len(suffix),
+        ) + suffix
+        return Text(message, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
     if kind == "child_question_withdrawn":
         text = event.data.get("text")
         if not isinstance(text, str):
