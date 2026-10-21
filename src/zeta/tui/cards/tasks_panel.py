@@ -192,9 +192,6 @@ class BackgroundTasksPanel:
     def mode(self) -> str:
         return self._mode
 
-    @property
-    def detail_id(self) -> str | None:
-        return self._detail_id
 
     @property
     def kill_pending(self) -> str | None:

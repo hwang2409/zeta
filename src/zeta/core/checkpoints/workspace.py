@@ -724,7 +724,7 @@ class WorkspaceSnapshotStore:
         return snapshot
 
     def restore(
-        self, snapshot_id: str, cwd: str | Path, *, force: bool = False
+        self, snapshot_id: str, *, force: bool = False
     ) -> WorkspaceSnapshot:
         if self._is_corrupt and not force:
             raise WorkspaceSnapshotError(self.corruption_message)

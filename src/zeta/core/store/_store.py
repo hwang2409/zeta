@@ -150,7 +150,6 @@ class ConversationStore(
         # are unique and exit once, so this mirrors the active-branch scan).
         self._task_notification_ids: set[str] = set()
         self._todo_items: list[TodoItem] = []
-        self._todo_revision = 0
         self._todo_dismissed = False
         self._agent_counter = 0
         self._agent_children: dict[str, dict[str, Any]] = {}
@@ -245,12 +244,6 @@ class ConversationStore(
         return [dict(item) for item in self._todo_items]
 
     @property
-    def todo_revision(self) -> int:
-        """Return the in-process revision of the todo list."""
-
-        return self._todo_revision
-
-    @property
     def todo_dismissed(self) -> bool:
         """Return whether the terminal todo receipt was dismissed."""
 
@@ -271,7 +264,6 @@ class ConversationStore(
         with self._append_lock():
             self._load()
             self._todo_items = [dict(item) for item in normalized]
-            self._todo_revision += 1
             self._todo_dismissed = False
             self._write_session_state(self.bash_cwd, normalized)
 

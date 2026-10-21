@@ -297,23 +297,6 @@ class BackgroundAgentOwner:
             if self._parent_ids.get(instance_id) == parent_instance_id
         )
 
-    async def wait_for_owned_completion(
-        self, parent_instance_id: str, timeout: float
-    ) -> bool:
-        """Idle until one directly owned child finishes or the bound expires."""
-
-        watchers = tuple(
-            watcher
-            for instance_id, watcher in self._watchers.items()
-            if self._parent_ids.get(instance_id) == parent_instance_id
-        )
-        if not watchers:
-            return True
-        done, _ = await asyncio.wait(
-            watchers, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
-        )
-        return bool(done)
-
     async def wait(self) -> None:
         current = asyncio.current_task()
         while True:

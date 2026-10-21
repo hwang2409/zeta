@@ -238,8 +238,8 @@ def _build_agent(
         prompt_suffix=document.body,
         selection_guidance=description,
         model=model if isinstance(model, str) else None,
-        source=source,
         path=document.entry_path.absolute(),
+        source=source,
         agents_root=document.root,
         allow_delegation=allow_delegation,
         accepts_follow_ups=accepts_follow_ups,
@@ -259,7 +259,6 @@ def discover_agents(
     agents_dir = agents_dir or _agents_dir(root)
     return discover_markdown(
         agents_dir,
-        source=source,
         kind="agent",
         build=lambda document: _build_agent(document, source, notices),
         notices=notices,

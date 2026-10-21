@@ -278,7 +278,7 @@ def pull_session(
                 mapped.mkdir(parents=True, exist_ok=True, mode=0o700)
                 previous = _read_manifest(snapshot)
                 _rewrite_cwd(snapshot, mapped)
-                _append_resume_hint(snapshot, mapped, previous)
+                _append_resume_hint(snapshot)
                 manifest = _make_manifest(snapshot, str(mapped), previous=previous)
                 _write_json(snapshot / "transfer.json", manifest)
                 _atomic_replace_directory(snapshot, destination)
@@ -501,9 +501,7 @@ def _rewrite_cwd(snapshot: Path, cwd: Path) -> None:
         _write_json(state_path, state)
 
 
-def _append_resume_hint(
-    snapshot: Path, cwd: Path, manifest: dict[str, object]
-) -> None:
+def _append_resume_hint(snapshot: Path) -> None:
     meta_path = snapshot / "meta.json"
     metadata = _read_json(meta_path)
     prompt = metadata.get("system_prompt", "")
@@ -528,7 +526,7 @@ def _map_missing_cwd(snapshot: Path, placeholder: Path) -> None:
     if not isinstance(cwd, str) or not Path(cwd).is_dir():
         placeholder.mkdir(parents=True, exist_ok=True, mode=0o700)
         _rewrite_cwd(snapshot, placeholder)
-        _append_resume_hint(snapshot, placeholder, manifest)
+        _append_resume_hint(snapshot)
         updated = _make_manifest(snapshot, str(placeholder), previous=manifest)
         _write_json(snapshot / "transfer.json", updated)
 

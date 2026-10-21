@@ -81,12 +81,6 @@ class NotificationWake:
         self._plain_retry_pending = False
 
     @property
-    def has_claimed(self) -> bool:
-        """Return whether a live turn owns uncommitted notification input."""
-
-        return bool(self._claimed_ids)
-
-    @property
     def has_undelivered_claim(self) -> bool:
         """Return whether claimed input is not yet durable in the current turn."""
 

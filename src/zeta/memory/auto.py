@@ -200,10 +200,6 @@ class AutoMemoryReconciler:
             self._ensure_worker()
         return queued
 
-    def observe_tokens(self, _total_tokens: int) -> None:
-        """Compatibility callback; durable transcript activity owns growth."""
-        self.activity()
-
     def activity(self, seq: int | None = None) -> None:
         """Report a transcript append after it has been durably persisted."""
         del seq  # The worker reads the authoritative durable sequence itself.

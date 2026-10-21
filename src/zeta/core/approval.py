@@ -300,15 +300,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             tuple[str, str], tuple[ApprovalRequest, ConversationStore]
         ] = {}
         self._ephemeral: dict[str, tuple[ApprovalRequest, str | None]] = {}
-        self._display_resolver: Callable[[ApprovalRequest], ApprovalRequest] | None = (
-            None
-        )
         self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
-
-    def bind_display_resolver(
-        self, resolver: Callable[[ApprovalRequest], ApprovalRequest] | None
-    ) -> None:
-        self._display_resolver = resolver
 
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
@@ -634,9 +626,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 action=action,
                 capability_resolved=capability_resolved,
             )
-            requests.append(
-                (self._display_resolver or (lambda current: current))(request)
-            )
+            requests.append(request)
         delegated_pending: dict[ConversationStore, dict[str, ToolCall]] = {}
         for (child_id, request_id), (request, delegated_store) in list(
             self._delegated.items()

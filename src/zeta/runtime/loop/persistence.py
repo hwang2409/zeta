@@ -210,7 +210,6 @@ class BoundedFileHistory(FileHistory):
             with self._load_complete:
                 self._disk_load_complete = True
                 self._disk_loading = False
-                self._loaded = True
                 self._load_complete.notify_all()
             message = f"composer history could not be read: {exc}"
             _LOGGER.warning(message)
@@ -231,7 +230,6 @@ class BoundedFileHistory(FileHistory):
             self._pending = [
                 item for item in self._pending if item[0] > self._applied_revision
             ]
-            self._loaded = True
             self._load_complete.notify_all()
 
     async def load(self) -> AsyncGenerator[str, None]:
@@ -247,7 +245,6 @@ class BoundedFileHistory(FileHistory):
             if not self._loaded_strings or self._loaded_strings[0] != string:
                 self._loaded_strings.insert(0, string)
                 del self._loaded_strings[self.limit :]
-            self._loaded = True
         self._writer.submit(
             lambda: self._append_to_file(string),
             lambda entries: self._apply_snapshot(revision, entries),
@@ -272,7 +269,6 @@ class BoundedFileHistory(FileHistory):
                 ]
             newest = [value for _, value in reversed(self._pending)]
             self._loaded_strings = self._merge_newest(newest, disk_entries)
-            self._loaded = True
 
     def _merge_newest(self, newest: list[str], disk_entries: list[str]) -> list[str]:
         local = [
@@ -313,7 +309,6 @@ class BoundedFileHistory(FileHistory):
             entries = entries[: self.limit]
             self._write_entries(entries[::-1])
         self._loaded_strings = entries
-        self._loaded = True
 
     @contextmanager
     def _locked(self) -> Iterator[None]:

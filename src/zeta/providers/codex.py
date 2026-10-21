@@ -508,7 +508,7 @@ def _translate_event(
         return StreamEvent(
             StreamEventType.MESSAGE_START, data=dict(response_data)
         ), "started"
-    _require_response_started(response_state, event_type)
+    _require_response_started(response_state)
     if response_state == "stopped":
         raise CodexStreamError("Codex event follows response completion")
     if event_type in {
@@ -649,7 +649,7 @@ def _translate_event(
     raise CodexStreamError("unsupported Codex SSE event type")
 
 
-def _require_response_started(state: str, event_type: str) -> None:
+def _require_response_started(state: str) -> None:
     if state == "not-started":
         raise CodexStreamError("Codex event precedes response.created")
 

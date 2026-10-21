@@ -110,7 +110,6 @@ def read_markdown(path: Path, kind: str) -> tuple[dict[str, object], str]:
 def discover_markdown[Item](
     directory: Path,
     *,
-    source: str,
     kind: str,
     build: Callable[[MarkdownDocument], Item],
     notices: list[str] | None = None,

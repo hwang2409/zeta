@@ -17,7 +17,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from ...core.abort import AbortSignal
-from ...protocol.types import StructuredToolResult, ToolTextBlock
+from ...protocol.types import StructuredToolResult
 from ..registry import (
     ToolExecutionContext,
     ToolRegistry,
@@ -415,42 +415,6 @@ def response_text(response: httpx.Response) -> str:
 
     encoding = response.encoding or "utf-8"
     return response.content.decode(encoding, errors="replace")
-
-
-def _page_block(
-    notice: str,
-    body: str,
-    *,
-    offset: int,
-    limit: int,
-) -> ToolTextBlock:
-    """Build one readable-text page that fits the provider output limit."""
-
-    full_size_chars = len(body)
-    full_size = len(body.encode("utf-8"))
-    if offset >= full_size_chars:
-        page_end = offset
-    else:
-        page_chars = min(limit, full_size_chars - offset)
-        low = 0
-        high = page_chars
-        while low < high:
-            middle = (low + high + 1) // 2
-            page = body[offset : offset + middle]
-            value = notice + page
-            if len(value) <= limit and len(value.encode("utf-8")) <= limit:
-                low = middle
-            else:
-                high = middle - 1
-        page_end = offset + low
-
-    page = body[offset:page_end]
-    block = text_block(notice + page, full_size=full_size)
-    block["full_size_chars"] = full_size_chars
-    block["truncated"] = page_end < full_size_chars
-    if block["truncated"]:
-        block["next_offset"] = page_end
-    return block
 
 
 class _NormalizedTextWriter:

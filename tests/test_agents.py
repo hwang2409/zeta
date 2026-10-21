@@ -136,6 +136,20 @@ def test_agent_discovery_accepts_official_claude_scalar_tools(
     assert sum("unknown tool name" in notice for notice in catalog.notices) == 2
 
 
+def test_agent_snapshot_round_trip_keeps_project_source(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write_agent(
+        project / ".zeta" / "agents" / "custom.md", "custom", "custom", "body"
+    )
+
+    original = discover_session_agents(home=home, project_dir=project).find("custom")
+    restored = AgentCatalog.from_snapshot(AgentCatalog((original,)).to_snapshot())
+
+    assert original.source == "project"
+    assert restored.find("custom").source == "project"
+
+
 def test_agent_snapshot_omits_body_and_loads_current_file(tmp_path: Path) -> None:
     path = tmp_path / "home" / "agents" / "custom.md"
     _write_agent(path, "custom", "custom", "original body")
