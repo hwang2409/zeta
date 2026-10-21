@@ -599,7 +599,11 @@ def _status_response(
     )
     details_text = f"\n{details}" if details else ""
     idle_usage = idle_usage or idle_resource_usage(children)
-    resource_text = "\n" + format_idle_resource_usage(idle_usage)
+    resource_text = (
+        "\n" + format_idle_resource_usage(idle_usage)
+        if idle_usage["idle_child_count"]
+        else ""
+    )
     content_text = (
         f"agent status: {len(children)} children{resource_text}"
         f"{details_text}{notice}{omission_notice}"
@@ -609,8 +613,9 @@ def _status_response(
         "offset": offset,
         "truncated": truncated,
         "total": total,
-        **idle_usage,
     }
+    if idle_usage["idle_child_count"]:
+        structured.update(idle_usage)
     if finished_omitted:
         structured["finished_omitted"] = finished_omitted
     if truncated and next_offset is not None:
