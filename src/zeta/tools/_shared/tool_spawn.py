@@ -16,7 +16,8 @@ from typing import IO, Any
 _LAUNCHER = """
 import os, sys
 cwd_fd = int(sys.argv[1])
-niceness = int(sys.argv[2])
+ready_fd = int(sys.argv[2])
+niceness = int(sys.argv[3])
 try:
     current = os.getpriority(os.PRIO_PROCESS, 0)
     os.setpriority(os.PRIO_PROCESS, 0, min(19, current + niceness))
@@ -24,11 +25,13 @@ except (AttributeError, OSError):
     pass
 os.fchdir(cwd_fd)
 os.close(cwd_fd)
-for inherited_fd in sys.argv[4:]:
+for inherited_fd in sys.argv[5:]:
     source, target = map(int, inherited_fd.split(':'))
     os.dup2(source, target)
     os.close(source)
-os.execvpe('/bin/sh', ['sh', '-c', sys.argv[3]], os.environ)
+os.write(ready_fd, b'1')
+os.close(ready_fd)
+os.execvpe('/bin/sh', ['sh', '-c', sys.argv[4]], os.environ)
 """
 
 
@@ -40,11 +43,13 @@ class _SpawnedProcess:
         stdin: IO[bytes] | None,
         stdout: IO[bytes],
         stderr: IO[bytes] | None,
+        ready: IO[bytes],
     ) -> None:
         self.pid = pid
         self.stdin = stdin
         self.stdout = stdout
         self.stderr = stderr
+        self.ready = ready
         self.returncode: int | None = None
 
     def poll(self) -> int | None:
@@ -63,7 +68,7 @@ async def _cleanup_unwatched_transport(
     await asyncio.sleep(0)
     if waiter.done():
         waiter.exception()
-    for stream in (process.stdin, process.stdout, process.stderr):
+    for stream in (process.stdin, process.stdout, process.stderr, process.ready):
         if stream is not None:
             stream.close()
     try:
@@ -156,7 +161,9 @@ async def create_tool_subprocess_shell(
             raise
         try:
             await waiter
+            await _wait_for_launcher(process=transport._proc)
         except BaseException:
+            transport._proc.ready.close()
             transport.close()
             await transport._wait()
             raise
@@ -166,12 +173,36 @@ async def create_tool_subprocess_shell(
             os.close(owned_cwd_fd)
 
 
+async def _wait_for_launcher(*, process: _SpawnedProcess) -> None:
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+    fd = process.ready.fileno()
+
+    def consume_ready_byte() -> None:
+        if ready.done():
+            return
+        loop.remove_reader(fd)
+        os.read(fd, 1)
+        ready.set_result(None)
+
+    loop.add_reader(fd, consume_ready_byte)
+    try:
+        await ready
+    finally:
+        loop.remove_reader(fd)
+        process.ready.close()
+
+
 class _PipeOwner:
     def __init__(self, stdin: int, stderr: int) -> None:
         self.opened: set[int] = set()
         self.parent_stdin: IO[bytes] | None = None
         self.parent_stdout: IO[bytes]
         self.parent_stderr: IO[bytes] | None = None
+        parent_ready, self.child_ready = os.pipe()
+        self.opened.update((parent_ready, self.child_ready))
+        self.parent_ready = os.fdopen(parent_ready, "rb", buffering=0)
+        self.opened.remove(parent_ready)
         if stdin == subprocess.PIPE:
             child_stdin, parent_stdin = os.pipe()
             self.opened.update((child_stdin, parent_stdin))
@@ -200,13 +231,20 @@ class _PipeOwner:
             stdin=self.parent_stdin,
             stdout=self.parent_stdout,
             stderr=self.parent_stderr,
+            ready=self.parent_ready,
         )
         self.parent_stdin = self.parent_stdout = self.parent_stderr = None  # type: ignore[assignment]
+        self.parent_ready = None  # type: ignore[assignment]
         self.close()
         return process
 
     def close(self) -> None:
-        for stream in (self.parent_stdin, self.parent_stdout, self.parent_stderr):
+        for stream in (
+            self.parent_stdin,
+            self.parent_stdout,
+            self.parent_stderr,
+            self.parent_ready,
+        ):
             if stream is not None:
                 stream.close()
         for fd in self.opened:
@@ -250,13 +288,24 @@ def _posix_spawn(
     owner: _PipeOwner | None = None
     try:
         owner = _PipeOwner(stdin, stderr)
-        inherited = (cwd_fd, *pass_fds)
+        inherited = (cwd_fd, owner.child_ready, *pass_fds)
         unavailable = {0, 1, 2, *owner.opened, *inherited}
         child_fds = tuple(
             fd for fd in range(3, 3 + len(unavailable) + len(inherited))
             if fd not in unavailable
         )[: len(inherited)]
-        spawn_args = (*args[:3], str(child_fds[0]), *args[3:], *(f"{source}:{target}" for source, target in zip(child_fds[1:], pass_fds, strict=True)))
+        spawn_args = (
+            *args[:3],
+            str(child_fds[0]),
+            str(child_fds[1]),
+            *args[3:],
+            *(
+                f"{source}:{target}"
+                for source, target in zip(
+                    child_fds[2:], pass_fds, strict=True
+                )
+            ),
+        )
         pid = os.posix_spawn(
             spawn_args[0], spawn_args, env,
             file_actions=_file_actions(owner, inherited, child_fds), setsid=True,

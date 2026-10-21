@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 import zeta.tools._shared.sandbox as sandbox_module
+import zeta.tools._shared.tool_spawn as tool_spawn_module
 import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
@@ -1495,8 +1496,13 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(
+        tool_spawn_module,
+        "_LAUNCHER",
+        "import time; time.sleep(0.3)\n" + tool_spawn_module._LAUNCHER,
+    )
     pid_file = tmp_path / "timeout-grandchild.pid"
     child = "import time; time.sleep(30)"
     parent = (
