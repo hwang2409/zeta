@@ -984,6 +984,7 @@ async def run_agent_tool(
                     agent_instance_id=loop.agent_instance_id,
                     background_owner=loop._background_owner,
                     max_receipt_bytes=background_receipt_bytes,
+                    explicit_finish=terminal_fence is not None,
                 )
             finally:
                 loop.notify_background_persisted()

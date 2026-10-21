@@ -937,12 +937,17 @@ async def finish_background_child(
     agent_instance_id: str | None = None,
     background_owner: BackgroundAgentOwner | None = None,
     max_receipt_bytes: int | None = None,
+    explicit_finish: bool = False,
 ) -> None:
     """Persist a background child result and publish its terminal card event."""
 
     status = "completed"
     notification_text = ""
-    explicit_finish_report = TerminalTransitionFence(child_store).accepted_report()
+    explicit_finish_report = (
+        TerminalTransitionFence(child_store).accepted_report()
+        if explicit_finish
+        else None
+    )
     explicit_finish_content: dict[str, object] | None = None
     try:
         try:
