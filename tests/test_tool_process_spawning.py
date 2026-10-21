@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
 import pytest
+
+from zeta.tools._shared.tool_spawn import create_tool_subprocess_shell
 
 _SENTINEL = "ATFORK_ESCAPE"
 
@@ -88,3 +92,31 @@ def test_shell_spawn_does_not_leak_atfork_stderr_to_parent_fd2(
     assert completed.stderr == ""
     result = json.loads(completed.stdout)
     assert result == {"output": "child-output", "stderr": ""}
+
+
+@pytest.mark.asyncio
+async def test_watcher_registration_failure_leaves_no_process_zombie_or_fd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    watcher = loop._watcher
+    child_pid: int | None = None
+    baseline_fds = len(os.listdir("/dev/fd"))
+
+    def fail_registration(pid: int, callback: object, transport: object) -> None:
+        nonlocal child_pid
+        child_pid = pid
+        raise RuntimeError("registration failed")
+
+    monkeypatch.setattr(watcher, "add_child_handler", fail_registration)
+    with pytest.raises(RuntimeError, match="registration failed"):
+        await create_tool_subprocess_shell(
+            "sleep 30", stdin=asyncio.subprocess.DEVNULL
+        )
+
+    assert child_pid is not None
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    with pytest.raises(ChildProcessError):
+        await asyncio.to_thread(os.waitpid, child_pid, os.WNOHANG)
+    assert len(os.listdir("/dev/fd")) == baseline_fds

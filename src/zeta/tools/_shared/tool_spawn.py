@@ -54,6 +54,30 @@ class _SpawnedProcess:
         os.kill(self.pid, signal.SIGKILL)
 
 
+async def _cleanup_unwatched_transport(
+    transport: _ToolSubprocessTransport, waiter: asyncio.Future[None]
+) -> None:
+    process = transport._proc
+    await asyncio.sleep(0)
+    transport.close()
+    await asyncio.sleep(0)
+    if waiter.done():
+        waiter.exception()
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    reap = asyncio.create_task(asyncio.to_thread(os.waitpid, process.pid, 0))
+    try:
+        await asyncio.shield(reap)
+    except BaseException:
+        await asyncio.shield(reap)
+        raise
+
+
 class _ToolSubprocessTransport(unix_events._UnixSubprocessTransport):  # type: ignore[attr-defined]
     def _start(
         self,
@@ -116,9 +140,20 @@ async def create_tool_subprocess_shell(
             pass_fds=tuple(pass_fds),
             env=dict(env) if env is not None else os.environ.copy(),
         )
-        watcher.add_child_handler(
-            transport.get_pid(), loop._child_watcher_callback, transport
-        )
+        try:
+            watcher.add_child_handler(
+                transport.get_pid(), loop._child_watcher_callback, transport
+            )
+        except BaseException:
+            cleanup = asyncio.create_task(
+                _cleanup_unwatched_transport(transport, waiter)
+            )
+            try:
+                await asyncio.shield(cleanup)
+            except BaseException:
+                await asyncio.shield(cleanup)
+                raise
+            raise
         try:
             await waiter
         except BaseException:
@@ -131,15 +166,79 @@ async def create_tool_subprocess_shell(
             os.close(owned_cwd_fd)
 
 
+class _PipeOwner:
+    def __init__(self, stdin: int, stderr: int) -> None:
+        self.opened: set[int] = set()
+        self.parent_stdin: IO[bytes] | None = None
+        self.parent_stdout: IO[bytes]
+        self.parent_stderr: IO[bytes] | None = None
+        if stdin == subprocess.PIPE:
+            child_stdin, parent_stdin = os.pipe()
+            self.opened.update((child_stdin, parent_stdin))
+            self.parent_stdin = os.fdopen(parent_stdin, "wb", buffering=0)
+            self.opened.remove(parent_stdin)
+        else:
+            child_stdin = os.open(os.devnull, os.O_RDONLY)
+            self.opened.add(child_stdin)
+        self.child_stdin = child_stdin
+
+        parent_stdout, self.child_stdout = os.pipe()
+        self.opened.update((parent_stdout, self.child_stdout))
+        self.parent_stdout = os.fdopen(parent_stdout, "rb", buffering=0)
+        self.opened.remove(parent_stdout)
+        if stderr == subprocess.PIPE:
+            parent_stderr, self.child_stderr = os.pipe()
+            self.opened.update((parent_stderr, self.child_stderr))
+            self.parent_stderr = os.fdopen(parent_stderr, "rb", buffering=0)
+            self.opened.remove(parent_stderr)
+        else:
+            self.child_stderr = self.child_stdout
+
+    def transfer(self, pid: int) -> _SpawnedProcess:
+        process = _SpawnedProcess(
+            pid,
+            stdin=self.parent_stdin,
+            stdout=self.parent_stdout,
+            stderr=self.parent_stderr,
+        )
+        self.parent_stdin = self.parent_stdout = self.parent_stderr = None  # type: ignore[assignment]
+        self.close()
+        return process
+
+    def close(self) -> None:
+        for stream in (self.parent_stdin, self.parent_stdout, self.parent_stderr):
+            if stream is not None:
+                stream.close()
+        for fd in self.opened:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.opened.clear()
+
+
+def _file_actions(
+    owner: _PipeOwner, inherited: tuple[int, ...], child_fds: tuple[int, ...]
+) -> list[tuple[int, int, int]]:
+    actions = [
+        (os.POSIX_SPAWN_DUP2, owner.child_stdin, 0),
+        (os.POSIX_SPAWN_DUP2, owner.child_stdout, 1),
+        (os.POSIX_SPAWN_DUP2, owner.child_stderr, 2),
+        *(
+            (os.POSIX_SPAWN_DUP2, source, target)
+            for source, target in zip(inherited, child_fds, strict=True)
+        ),
+    ]
+    actions.extend(
+        (os.POSIX_SPAWN_CLOSE, fd)
+        for fd in owner.opened - {owner.child_stdin, owner.child_stdout, owner.child_stderr}
+    )
+    return actions
+
+
 def _posix_spawn(
-    args: Sequence[str],
-    stdin: int,
-    stdout: int,
-    stderr: int,
-    *,
-    cwd_fd: int,
-    pass_fds: Sequence[int],
-    env: Mapping[str, str],
+    args: Sequence[str], stdin: int, stdout: int, stderr: int, *, cwd_fd: int,
+    pass_fds: Sequence[int], env: Mapping[str, str],
 ) -> _SpawnedProcess:
     if stdin not in (subprocess.PIPE, subprocess.DEVNULL):
         raise ValueError("tool subprocess stdin must be PIPE or DEVNULL")
@@ -148,88 +247,23 @@ def _posix_spawn(
     if stderr not in (subprocess.PIPE, subprocess.STDOUT):
         raise ValueError("tool subprocess stderr must be PIPE or STDOUT")
 
-    opened: list[int] = []
-    parent_stdin: IO[bytes] | None = None
-    parent_stdout: IO[bytes] | None = None
-    parent_stderr: IO[bytes] | None = None
+    owner: _PipeOwner | None = None
     try:
-        if stdin == subprocess.PIPE:
-            child_stdin, parent_stdin_fd = os.pipe()
-            opened.extend((child_stdin, parent_stdin_fd))
-            parent_stdin = os.fdopen(parent_stdin_fd, "wb", buffering=0)
-            opened.remove(parent_stdin_fd)
-        else:
-            child_stdin = os.open(os.devnull, os.O_RDONLY)
-            opened.append(child_stdin)
-
-        parent_stdout_fd, child_stdout = os.pipe()
-        opened.extend((parent_stdout_fd, child_stdout))
-        parent_stdout = os.fdopen(parent_stdout_fd, "rb", buffering=0)
-        opened.remove(parent_stdout_fd)
-
-        if stderr == subprocess.PIPE:
-            parent_stderr_fd, child_stderr = os.pipe()
-            opened.extend((parent_stderr_fd, child_stderr))
-            parent_stderr = os.fdopen(parent_stderr_fd, "rb", buffering=0)
-            opened.remove(parent_stderr_fd)
-        else:
-            child_stderr = child_stdout
-
+        owner = _PipeOwner(stdin, stderr)
         inherited = (cwd_fd, *pass_fds)
-        unavailable = {0, 1, 2, *opened, *inherited}
+        unavailable = {0, 1, 2, *owner.opened, *inherited}
         child_fds = tuple(
-            fd
-            for fd in range(3, 3 + len(unavailable) + len(inherited))
+            fd for fd in range(3, 3 + len(unavailable) + len(inherited))
             if fd not in unavailable
         )[: len(inherited)]
-        cwd_child_fd, *passed_child_fds = child_fds
-        spawn_args = (
-            *args[:3],
-            str(cwd_child_fd),
-            *args[3:],
-            *(
-                f"{source}:{target}"
-                for source, target in zip(passed_child_fds, pass_fds, strict=True)
-            ),
-        )
-        file_actions = [
-            (os.POSIX_SPAWN_DUP2, child_stdin, 0),
-            (os.POSIX_SPAWN_DUP2, child_stdout, 1),
-            (os.POSIX_SPAWN_DUP2, child_stderr, 2),
-            *(
-                (os.POSIX_SPAWN_DUP2, source, target)
-                for source, target in zip(inherited, child_fds, strict=True)
-            ),
-        ]
-        for fd in set(opened) - {child_stdin, child_stdout, child_stderr}:
-            file_actions.append((os.POSIX_SPAWN_CLOSE, fd))
+        spawn_args = (*args[:3], str(child_fds[0]), *args[3:], *(f"{source}:{target}" for source, target in zip(child_fds[1:], pass_fds, strict=True)))
         pid = os.posix_spawn(
-            spawn_args[0],
-            spawn_args,
-            env,
-            file_actions=file_actions,
-            setsid=True,
-            setsigdef=tuple(
-                signal_number
-                for signal_number in (
-                    signal.SIGPIPE,
-                    getattr(signal, "SIGXFZ", None),
-                    getattr(signal, "SIGXFSZ", None),
-                )
-                if signal_number is not None
-            ),
+            spawn_args[0], spawn_args, env,
+            file_actions=_file_actions(owner, inherited, child_fds), setsid=True,
+            setsigdef=tuple(signum for signum in (signal.SIGPIPE, getattr(signal, "SIGXFZ", None), getattr(signal, "SIGXFSZ", None)) if signum is not None),
         )
-        return _SpawnedProcess(
-            pid, stdin=parent_stdin, stdout=parent_stdout, stderr=parent_stderr
-        )
+        return owner.transfer(pid)
     except BaseException:
-        for stream in (parent_stdin, parent_stdout, parent_stderr):
-            if stream is not None:
-                stream.close()
+        if owner is not None:
+            owner.close()
         raise
-    finally:
-        for fd in opened:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
