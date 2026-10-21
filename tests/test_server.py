@@ -40,13 +40,12 @@ from zeta.protocol.types import (
 )
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import ApprovalLifecycle
-from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
-from zeta.server.server import (
+from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
-    _approval_display_fields,
-    _Client,
 )
+from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
+from zeta.server.server import _approval_display_fields, _Client
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
