@@ -962,6 +962,7 @@ def build_key_bindings(
             suppress_history_detach = False
         history_navigation_active = buffer.text != ""
 
+    @bindings.add(Keys.SIGINT, filter=~panel_mode)
     @bindings.add(*resolved_keys["interrupt"], filter=~panel_mode)
     def interrupt(event: KeyPressEvent) -> None:
         on_interrupt()

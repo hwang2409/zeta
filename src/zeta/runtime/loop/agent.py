@@ -573,12 +573,12 @@ class AgentLoop(
             if self.hooks is not None:
                 self.hooks.stop()
                 await self.hooks.close()
-            if self._mcp_mount is not None:
-                await self._mcp_mount.close()
-                self._mcp_mount = None
             if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
                 self._mcp_mount_task.cancel()
                 await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
+            if self._mcp_mount is not None:
+                await self._mcp_mount.close()
+                self._mcp_mount = None
         finally:
             try:
                 killed = await self.tool_registry.close()
