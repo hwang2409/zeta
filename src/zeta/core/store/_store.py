@@ -168,7 +168,6 @@ class ConversationStore(
             _, self.directory_fd = lease.enter_context(
                 session_directory(self.root_dir, self.session_id)
             )
-            # Discovery validates without creating locks/state or repairing the log.
             with (
                 nullcontext()
                 if _read_only
@@ -601,7 +600,6 @@ class ConversationStore(
                     validate_project_inbox_notification_data(entry.data)
                 elif kind in {CHILD_QUESTION_NOTIFICATION_KIND, CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND}:
                     validate_child_question_notification_data(entry.data)
-                # Unknown notification kinds remain tolerated for forward compat.
             elif entry.type == "notification_ack":
                 notification_id = entry.data.get("notification_id")
                 if type(notification_id) is not str or not notification_id:
