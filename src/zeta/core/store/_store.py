@@ -184,7 +184,6 @@ class ConversationStore(
                 self._runtime_lease,
                 lease.pop_all(),
             )
-
     def close(self) -> None:
         """Drain durable writers, then release this store's activity leases."""
         if self._drain_durable_writes_for_close():
