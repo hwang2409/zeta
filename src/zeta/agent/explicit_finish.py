@@ -53,6 +53,22 @@ class IdleNudgeLifecycle:
         self._nudge_limit = nudge_limit
         self._idle_started: float | None = None
         self._nudge_count = 0
+        self._immediate_reminded = False
+
+    async def reserve_immediate_reminder(
+        self, fence: TerminalTransitionFence
+    ) -> bool:
+        """Reserve one immediate reminder, sharing the nudge limit and fence."""
+        if self._immediate_reminded or self._nudge_count >= self._nudge_limit:
+            return False
+        if not await fence.reserve_idle_nudge():
+            return False
+        self._nudge_count += 1
+        self._immediate_reminded = True
+        return True
+
+    def reset_idle_period(self) -> None:
+        self._immediate_reminded = False
 
     async def wait_for_idle_action(
         self,

@@ -211,7 +211,21 @@ these events do not wake it:
 - elapsed time before the 10-minute idle-nudge boundary;
 - repeated status polling.
 
-### idle nudge and resource warning
+### immediate reminder, idle nudge, and resource warning
+
+when an explicit-finish child ends a turn with visible text but without calling
+`finish`, zeta immediately gives it one reminder turn:
+
+> you ended your turn without calling `finish`. call `finish` now with your report, or continue the work.
+
+this reminder is delivered only when the child owns no running process task or
+live child agent and no follow-up or relevant notification is pending or
+claimed. the same serialized fence used by idle nudges decides admission, so
+real input wins and zeta never delivers both. one reminder is allowed per idle
+period; if the reminder also ends without `finish`, the child becomes idle and
+is not reminded again until external input starts a new period. a child with
+owned work or a live child waits for that work or its notification instead.
+the reminder counts toward the lifetime limit of three idle nudges.
 
 an idle period becomes eligible for one automatic nudge after 10 continuous
 minutes only when the child is still idle, no model turn is active, it owns no
@@ -304,7 +318,8 @@ arguments and successful tool result before entering `finishing`.
 
 | state | event under the fence | next state and action |
 | --- | --- | --- |
-| `running` | healthy turn without accepted `finish` | `idle`; publish one `child_idle` and start the eligible clock |
+| `running` | explicit-finish turn with text but without accepted `finish` | `running`; if eligible, deliver one immediate reminder, otherwise continue to idle |
+| `running` | healthy turn without accepted `finish` after the reminder | `idle`; publish one `child_idle` and start the eligible clock |
 | `idle` | external prompt or relevant notification wins | `running`; deliver it and reset the clock (including a durable `child_idle` notification) |
 | `idle` | 10 eligible minutes, fewer than three lifetime nudges | `running`; deliver one idle nudge and reset the clock |
 | `idle` | nudge boundary while turn/work/input exists | stay live; deliver real input first or keep the clock paused |

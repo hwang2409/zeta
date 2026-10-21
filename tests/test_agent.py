@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
+import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
 import zeta.runtime.execution as execution_module
 import zeta.runtime.loop.agent as agent_loop_module
@@ -33,7 +34,10 @@ from zeta.agent.presets import (
     GENERAL_PRESET,
     AgentPreset,
 )
-from zeta.agent.runner import _child_base_system_prompt
+from zeta.agent.runner import (
+    _child_base_system_prompt,
+    _compose_child_system_prompt,
+)
 from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
@@ -3285,6 +3289,29 @@ async def test_unknown_agent_type_returns_loud_error(tmp_path: Path) -> None:
     assert result["isError"] is True
     assert "unknown agent_type" in result["content"][0]["text"]
     assert not (store.session_dir / "agents").exists()
+
+
+def test_explicit_finish_child_prompt_explains_finish() -> None:
+    prompt = _compose_child_system_prompt(
+        "parent instructions",
+        replace(GENERAL_PRESET, explicit_finish=True),
+        explicit_finish=True,
+    )
+
+    assert "this run ends only when you call the `finish` tool" in prompt
+    assert "Ending a turn without calling `finish` leaves you idle" in prompt
+
+
+def test_child_without_explicit_finish_has_no_finish_guidance() -> None:
+    prompt = _compose_child_system_prompt("parent instructions", GENERAL_PRESET)
+
+    assert "this run ends only when you call the `finish` tool" not in prompt
+
+
+def test_top_level_session_prompt_has_no_finish_guidance() -> None:
+    prompt = "top-level instructions"
+
+    assert "this run ends only when you call the `finish` tool" not in prompt
 
 
 @pytest.mark.asyncio
@@ -8648,6 +8675,24 @@ def _explicit_finish_registry(
     return store, registry, loop
 
 
+def test_finish_tool_description_and_child_prompt_say_finish_ends_the_run(
+    tmp_path: Path,
+) -> None:
+    _store, registry, _loop = _explicit_finish_registry(tmp_path)
+    prompt = _compose_child_system_prompt(
+        "parent instructions",
+        GENERAL_PRESET,
+        explicit_finish=True,
+    )
+    description = registry.definitions_by_name["finish"].description
+
+    assert "this run ends only when you call the `finish` tool" in prompt
+    assert "Ending a turn without calling `finish` leaves you idle" in prompt
+    assert "end this run" in description
+    assert "status" in description
+    assert "summary" in description
+
+
 @pytest.mark.asyncio
 async def test_explicit_finish_background_child_preserves_report_end_to_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -8851,8 +8896,347 @@ async def test_explicit_finish_blocked_and_failed_map_to_receipts(
     assert failed["content"][0]["text"].startswith("failed: tests failed")
 
 
+def _reminder_loop(tmp_path: Path) -> tuple[ConversationStore, ToolRegistry, _ExplicitFinishLoop]:
+    store, registry, loop = _explicit_finish_registry(tmp_path)
+    store.start_agent_lifecycle(
+        handle="root:1", started_at="2026-01-01T00:00:00+00:00", depth=1,
+        agent_type="worker", description="work",
+    )
+    loop._terminal_transition_fence = TerminalTransitionFence(
+        store,
+        owned_work=lambda: loop.background_work_descriptions,
+        delivering_prompt_id=lambda: getattr(loop, "_delivering_prompt_id", None),
+    )
+    loop._background_owner.conversation_channel.register_loop("root:1")
+    return store, registry, loop
+
+
 @pytest.mark.asyncio
-async def test_explicit_finish_no_tool_turn_enters_idle_without_request(
+async def test_real_input_wins_over_immediate_reminder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, registry, loop = _reminder_loop(tmp_path)
+    calls: list[str] = []
+    original = loop._terminal_transition_fence.reserve_idle_nudge
+
+    async def reserve() -> bool:
+        store.pending_prompt_queue.append("real input", origin=MessageOrigin.AGENT_SEND)
+        loop._background_owner.conversation_channel.wake("root:1")
+        return await original()
+
+    loop._terminal_transition_fence.reserve_idle_nudge = reserve
+
+    async def consume(_loop, prompt, **kwargs):
+        calls.append(prompt)
+        return {
+            "content": [{"type": "text", "text": "reply"}],
+            "isError": False,
+            "structuredContent": {"status": "done" if len(calls) == 2 else "running"},
+        }
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    await asyncio.wait_for(
+        agent_runner_module.consume_run(loop, "work", child_store=store), 2
+    )
+    assert calls == ["work", "real input"]
+    assert run_consumer_module._IMMEDIATE_FINISH_REMINDER not in calls
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.parametrize("owned_kind", ["task", "child"])
+@pytest.mark.asyncio
+async def test_no_immediate_reminder_while_child_owns_running_task_or_live_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owned_kind: str,
+) -> None:
+    store, registry, loop = _reminder_loop(tmp_path)
+    owned_child: asyncio.Task[None] | None = None
+    if owned_kind == "task":
+        monkeypatch.setattr(
+            registry.background_tasks,
+            "snapshot",
+            lambda: (
+                SimpleNamespace(
+                    running=True, task_id="task-owned", headline="owned task"
+                ),
+            ),
+        )
+    else:
+        owned_child = asyncio.create_task(asyncio.Event().wait())
+        loop._background_owner.register(
+            "root:1:1",
+            lambda: None,
+            owned_child,
+            parent_instance_id="root:1",
+            description="owned child",
+        )
+    prompts: list[str] = []
+    idle_waiting = asyncio.Event()
+
+    async def consume(_loop, prompt, **kwargs):
+        prompts.append(prompt)
+        return {
+            "content": [{"type": "text", "text": "reply"}],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    async def wait_idle(_wake, _timeout):
+        idle_waiting.set()
+        await asyncio.Event().wait()
+        return True
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop, "work", child_store=store, idle_wait=wait_idle
+        )
+    )
+    await asyncio.wait_for(idle_waiting.wait(), 2)
+    assert prompts == ["work"]
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    if owned_child is not None:
+        owned_child.cancel()
+        await asyncio.gather(owned_child, return_exceptions=True)
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_reminder_not_repeated_when_child_ends_again_without_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, registry, loop = _reminder_loop(tmp_path)
+    prompts: list[str] = []
+    idle_waiting = asyncio.Event()
+    release_idle = asyncio.Event()
+
+    async def consume(_loop, prompt, **kwargs):
+        prompts.append(prompt)
+        return {
+            "content": [{"type": "text", "text": "reply"}],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    async def wait_idle(_wake, _timeout):
+        idle_waiting.set()
+        await release_idle.wait()
+        return True
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop, "work", child_store=store, idle_wait=wait_idle
+        )
+    )
+    await asyncio.wait_for(idle_waiting.wait(), 2)
+    assert prompts == ["work", run_consumer_module._IMMEDIATE_FINISH_REMINDER]
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_reminded_child_that_calls_finish_completes_with_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, registry, loop = _reminder_loop(tmp_path)
+    prompts: list[str] = []
+
+    async def consume(_loop, prompt, **kwargs):
+        prompts.append(prompt)
+        if prompt == run_consumer_module._IMMEDIATE_FINISH_REMINDER:
+            result = await registry.execute(
+                ToolCall(
+                    "finish",
+                    "finish",
+                    {
+                        "status": "done",
+                        "summary": "finished",
+                        "verdict": "pass",
+                    },
+                )
+            )
+            assert result["isError"] is False
+            return {
+                "content": [],
+                "isError": False,
+                "structuredContent": {"status": "done"},
+                "explicitFinishReport": loop._explicit_finish_report,
+            }
+        return {
+            "content": [{"type": "text", "text": "reply"}],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    result = await agent_runner_module.consume_run(loop, "work", child_store=store)
+    expected = {
+        "status": "done",
+        "summary": "finished",
+        "verdict": "pass",
+    }
+    assert prompts == ["work", run_consumer_module._IMMEDIATE_FINISH_REMINDER]
+    assert result["explicitFinishReport"] == expected
+    assert loop._explicit_finish_report == expected
+    assert store.pending_prompt_queue.explicit_finish_report() == expected
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.parametrize("terminal_action", ["cancel", "finish"])
+@pytest.mark.asyncio
+async def test_cancel_or_accepted_finish_racing_reminder_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_action: str,
+) -> None:
+    store, registry, loop = _reminder_loop(tmp_path)
+    admission_reached = asyncio.Event()
+    release_admission = asyncio.Event()
+    idle_waiting = asyncio.Event()
+    prompts: list[str] = []
+    original = loop._terminal_transition_fence.reserve_idle_nudge
+
+    async def reserve() -> bool:
+        admission_reached.set()
+        await release_admission.wait()
+        return await original()
+
+    async def wait_idle(_wake, _timeout):
+        idle_waiting.set()
+        await asyncio.Event().wait()
+        return True
+
+    async def consume(_loop, prompt, **kwargs):
+        prompts.append(prompt)
+        return {
+            "content": [{"type": "text", "text": "reply"}],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    loop._terminal_transition_fence.reserve_idle_nudge = reserve
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop, "work", child_store=store, idle_wait=wait_idle
+        )
+    )
+    await asyncio.wait_for(admission_reached.wait(), 2)
+    if terminal_action == "cancel":
+        assert await loop._terminal_transition_fence.cancel() is True
+        accepted_report = None
+    else:
+        result = await registry.execute(
+            ToolCall(
+                "finish-race",
+                "finish",
+                {"status": "done", "summary": "won admission race"},
+            )
+        )
+        assert result["isError"] is False
+        accepted_report = store.pending_prompt_queue.explicit_finish_report()
+    release_admission.set()
+    await asyncio.wait_for(idle_waiting.wait(), 2)
+
+    report = store.pending_prompt_queue.explicit_finish_report()
+    assert (terminal_action == "cancel" and report is None) or (
+        terminal_action == "finish" and report == accepted_report
+    )
+    assert prompts == ["work"]
+    assert run_consumer_module._IMMEDIATE_FINISH_REMINDER not in prompts
+    assert await loop._terminal_transition_fence.cancel() is False
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_immediate_reminder_counts_toward_nudge_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, registry, loop = _reminder_loop(tmp_path)
+    prompts: list[str] = []
+    limit_reached = asyncio.Event()
+    wait_calls = 0
+
+    async def wait_idle(_wake, timeout):
+        nonlocal wait_calls
+        wait_calls += 1
+        if timeout is not None:
+            return False
+        limit_reached.set()
+        await asyncio.Event().wait()
+        return True
+
+    async def consume(_loop, prompt, **kwargs):
+        prompts.append(prompt)
+        return {
+            "content": [{"type": "text", "text": "reply"}],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop, "work", child_store=store, idle_wait=wait_idle
+        )
+    )
+    await asyncio.wait_for(limit_reached.wait(), 2)
+    assert wait_calls == 3
+    assert prompts == [
+        "work",
+        run_consumer_module._IMMEDIATE_FINISH_REMINDER,
+        run_consumer_module._IDLE_NUDGE_PROMPT,
+        run_consumer_module._IDLE_NUDGE_PROMPT,
+    ]
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_non_explicit_finish_child_gets_no_reminder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, registry, loop = _reminder_loop(tmp_path)
+    loop.explicit_finish = False
+    prompts: list[str] = []
+
+    async def consume(_loop, prompt, **kwargs):
+        prompts.append(prompt)
+        return {
+            "content": [{"type": "text", "text": "reply"}],
+            "isError": False,
+            "structuredContent": {"status": "done"},
+        }
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    await asyncio.wait_for(
+        agent_runner_module.consume_run(loop, "work", child_store=store), 2
+    )
+    assert prompts == ["work"]
+    assert run_consumer_module._IMMEDIATE_FINISH_REMINDER not in prompts
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_child_ending_with_text_gets_one_immediate_reminder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = 0
@@ -8877,6 +9261,8 @@ async def test_explicit_finish_no_tool_turn_enters_idle_without_request(
         tool_registry=registry,
     )
 
+    idle_waiting = asyncio.Event()
+
     async def fake_consume(*args, **kwargs):
         nonlocal calls
         calls += 1
@@ -8887,6 +9273,11 @@ async def test_explicit_finish_no_tool_turn_enters_idle_without_request(
             "structuredContent": {"status": "running"},
         }
 
+    async def wait_idle(_wake, _timeout):
+        idle_waiting.set()
+        await asyncio.Event().wait()
+        return True
+
     monkeypatch.setattr(agent_runner_module, "consume_child", fake_consume)
     task = asyncio.create_task(
         agent_runner_module.consume_run(
@@ -8895,10 +9286,11 @@ async def test_explicit_finish_no_tool_turn_enters_idle_without_request(
             child_store=store,
             child_turns=lambda: 1,
             finish_lifecycle=lambda *_: {},
+            idle_wait=wait_idle,
         )
     )
-    await asyncio.sleep(0.05)
-    assert calls == 1
+    await asyncio.wait_for(idle_waiting.wait(), 2)
+    assert calls == 2
     assert store.agent_lifecycle()["state"] == "idle"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -9159,11 +9551,11 @@ async def test_idle_nudge_after_ten_minutes_without_running_work(
         return False
 
     run, prompts, owner, registry, store = await _idle_nudge_run(
-        tmp_path, monkeypatch, idle_wait=expire, finish_after_calls=2
+        tmp_path, monkeypatch, idle_wait=expire, finish_after_calls=3
     )
     await asyncio.wait_for(run, 1)
     assert waits == [600.0]
-    assert prompts[1].startswith("you have been idle for 10 minutes")
+    assert prompts[1].startswith("you ended your turn without calling `finish`")
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
     store.close()
@@ -9175,7 +9567,7 @@ async def test_idle_nudge_waits_for_task_child_active_turn_and_input(
 ) -> None:
     class Fence:
         def __init__(self) -> None:
-            self.checks = iter([False, False, False, False, True, True])
+            self.checks = iter([False, False, False, False, False, True, True])
 
         async def idle_nudge_eligible(self):
             return next(self.checks)
@@ -9197,7 +9589,7 @@ async def test_idle_nudge_waits_for_task_child_active_turn_and_input(
         finish_after_calls=2,
     )
     await asyncio.wait_for(run, 1)
-    assert waits == [None, None, None, None, 600.0]
+    assert waits == [None, None, 600.0]
     assert len(prompts) == 2
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
@@ -9268,11 +9660,11 @@ async def test_idle_wake_resets_nudge_clock(
         return len(waits) == 1
 
     run, prompts, owner, registry, store = await _idle_nudge_run(
-        tmp_path, monkeypatch, idle_wait=wake_then_expire, finish_after_calls=2
+        tmp_path, monkeypatch, idle_wait=wake_then_expire, finish_after_calls=3
     )
     await asyncio.wait_for(run, 1)
     assert waits == [600.0, 600.0]
-    assert len(prompts) == 2
+    assert len(prompts) == 3
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
     store.close()
