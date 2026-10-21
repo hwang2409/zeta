@@ -8,6 +8,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
@@ -60,6 +61,7 @@ from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState
 from .run_consumer import consume_run as consume_follow_up_run
 
 logger = logging.getLogger(__name__)
+_EMPTY_METADATA: Mapping[str, object] = MappingProxyType({})
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
 
@@ -83,7 +85,7 @@ async def consume_child(
     notification_turn: bool = False,
     finish_gate_state: FinishGateState | None = None,
     delivering_prompt_id: str | None = None,
-    explicit_finish_metadata: Mapping[str, object] | None = None,
+    explicit_finish_metadata: Mapping[str, object] = _EMPTY_METADATA,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
 
@@ -207,7 +209,7 @@ async def consume_child(
             structured_content = {
                 "turns_used": child_turns(),
                 "child_session_path": child_path,
-                **(explicit_finish_metadata or {}),
+                **explicit_finish_metadata,
             }
             return {
                 "content": [{"type": "text", "text": text}],
