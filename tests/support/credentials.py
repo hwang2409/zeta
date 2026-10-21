@@ -12,6 +12,22 @@ def _test_home(path: str | Path) -> Path:
     return credential_path.parent / f".{credential_path.name}-account"
 
 
+def named_account_credentials(
+    home: str | Path,
+    provider: str,
+    name: str = "default",
+    *,
+    token_url: str | None = None,
+) -> AccountCredentials:
+    account = AccountId(provider, name)
+    driver = (
+        AnthropicCredentialDriver(token_url=token_url or TOKEN_URL)
+        if provider == "anthropic"
+        else CodexCredentialDriver(token_url=token_url or CODEX_TOKEN_URL)
+    )
+    return AccountCredentials(AccountStore(home), account, driver)
+
+
 def anthropic_credentials(
     path: str | Path,
     *,

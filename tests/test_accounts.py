@@ -19,6 +19,7 @@ import zeta.codex as codex_module
 import zeta.oauth as oauth_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.server.login as server_login
+from tests.support.credentials import named_account_credentials
 from zeta.accounts import AccountError, AccountId, AccountStore
 from zeta.agent.runner import resolve_child_backend
 from zeta.oauth import OAuthTokens
@@ -35,6 +36,7 @@ def tokens() -> OAuthTokens:
 
 
 def test_no_writable_credential_store_outside_account_credentials() -> None:
+    assert not hasattr(AccountStore, "ensure_" + "account")
     storage_methods = {"save", "access_token"}
     driver_methods = {"read", *storage_methods}
     assert not any(
@@ -50,14 +52,35 @@ def test_no_writable_credential_store_outside_account_credentials() -> None:
         assert not any(isinstance(value, Path) for value in vars(driver()).values())
 
 
+def test_missing_codex_login_raises_login_required_error(tmp_path: Path) -> None:
+    credential = named_account_credentials(tmp_path, "codex")
+
+    async def access() -> str:
+        async with httpx.AsyncClient() as client:
+            return await credential.access_token(client)
+
+    with pytest.raises(codex_module.CodexLoginRequiredError):
+        asyncio.run(access())
+
+
+def test_missing_anthropic_login_keeps_auth_error_type(tmp_path: Path) -> None:
+    credential = named_account_credentials(tmp_path, "anthropic")
+
+    async def access() -> str:
+        async with httpx.AsyncClient() as client:
+            return await credential.access_token(client)
+
+    with pytest.raises(anthropic_module.AnthropicAuthError):
+        asyncio.run(access())
+
+
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 def test_provider_driver_refresh_through_account_credentials_keeps_headers_and_rotation(
     provider: str, tmp_path: Path
 ) -> None:
     account_provider = "anthropic" if provider == "claude" else provider
     old = OAuthTokens("old-access", "old-refresh", 1.0)
-    store = AccountStore(tmp_path)
-    store.ensure_account(AccountId(account_provider, "default"), old)
+    named_account_credentials(tmp_path, account_provider).save(old)
     credential = credential_store(provider, home=tmp_path)
     assert credential is not None
     credential._driver.token_url = "https://refresh.test/token"
@@ -281,7 +304,7 @@ def test_migration_is_noop_when_already_migrated(tmp_path: Path) -> None:
 
 def test_account_files_are_0600_and_dirs_are_private(tmp_path: Path) -> None:
     store = AccountStore(tmp_path)
-    store.ensure_account(AccountId("codex", "personal"), tokens())
+    named_account_credentials(tmp_path, "codex", "personal").save(tokens())
     with store.provider_login_lock("codex"):
         pass
     store.migrate()
@@ -294,12 +317,8 @@ def test_account_files_are_0600_and_dirs_are_private(tmp_path: Path) -> None:
 def test_no_token_text_in_errors_logs_or_registry(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    store = AccountStore(tmp_path)
-    store.ensure_account(AccountId("anthropic", "work"), tokens())
-    with pytest.raises(AccountError) as raised:
-        store.ensure_account(AccountId("anthropic", "work"), tokens())
+    named_account_credentials(tmp_path, "anthropic", "work").save(tokens())
 
-    assert _SENTINEL not in str(raised.value)
     assert _SENTINEL not in caplog.text
     metadata = [
         path
@@ -351,10 +370,9 @@ def test_named_login_registers_account(
 
 def test_default_set_and_read_back(tmp_path: Path) -> None:
     store = AccountStore(tmp_path)
-    work = AccountId("anthropic", "work")
     personal = AccountId("anthropic", "personal")
-    store.ensure_account(work, tokens())
-    store.ensure_account(personal, tokens())
+    named_account_credentials(tmp_path, "anthropic", "work").save(tokens())
+    named_account_credentials(tmp_path, "anthropic", "personal").save(tokens())
 
     store.set_default(personal)
 
@@ -487,11 +505,10 @@ def test_bootstrap_writes_credential_registry_row_and_default_together(
 def test_refresh_racing_replacement_login_keeps_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    account = AccountId("codex", "default")
     expired = OAuthTokens("old-access", "old-refresh", 1.0)
     stale = OAuthTokens("stale-refresh", "stale-refresh-token", 4_000_000_000)
     replacement = OAuthTokens("replacement", "replacement-refresh", 4_000_000_000)
-    AccountStore(tmp_path).ensure_account(account, expired)
+    named_account_credentials(tmp_path, "codex").save(expired)
     credential = credential_store("codex", home=tmp_path)
     assert credential is not None
     refresh_started = threading.Event()
@@ -508,7 +525,7 @@ def test_refresh_racing_replacement_login_keeps_replacement(
 
     def replace_login() -> None:
         replacement_started.set()
-        AccountStore(tmp_path).ensure_account(account, replacement, replace=True)
+        named_account_credentials(tmp_path, "codex").save(replacement)
         replacement_done.set()
 
     async def race() -> None:
@@ -536,7 +553,7 @@ def test_account_credential_read_rejects_symlink_and_hardlink(tmp_path: Path) ->
         home = tmp_path / kind
         account = AccountId("codex", "default")
         registry = AccountStore(home)
-        registry.ensure_account(account, tokens())
+        named_account_credentials(home, "codex").save(tokens())
         path = registry.credential_path(account)
         credential = credential_store("codex", home=home)
         assert credential is not None
@@ -555,8 +572,7 @@ def test_account_credential_read_rejects_symlink_and_hardlink(tmp_path: Path) ->
 def test_account_credential_write_fsyncs_file_then_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    account = AccountId("codex", "default")
-    AccountStore(tmp_path).ensure_account(account, tokens())
+    named_account_credentials(tmp_path, "codex").save(tokens())
     credential = credential_store("codex", home=tmp_path)
     assert credential is not None
     events: list[str] = []

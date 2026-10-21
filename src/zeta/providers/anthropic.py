@@ -211,6 +211,9 @@ class AnthropicCredentialDriver:
     http_error_type = AnthropicHTTPError
     provider_label = "Claude"
 
+    def login_required_error(self, message: str) -> AnthropicAuthError:
+        return AnthropicAuthError(message)
+
     def __init__(self, *, token_url: str = TOKEN_URL) -> None:
         self.token_url = token_url
 

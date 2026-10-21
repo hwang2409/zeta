@@ -190,28 +190,6 @@ class AccountStore:
         ):
             yield home_fd
 
-    def ensure_account(
-        self, account: AccountId, tokens: OAuthTokens, *, replace: bool = False
-    ) -> None:
-        with (
-            self._home() as home_fd,
-            self._registry_guard(home_fd),
-            self._lifecycle_guard(home_fd, account),
-        ):
-            value = self._read_registry(home_fd)
-            key = str(account)
-            if key in value["accounts"] and not replace:
-                raise AccountError(f"account {key} already exists; use --replace")
-            with _account_directory(home_fd, account) as account_fd:
-                _write_tokens(account_fd, tokens)
-                _verify_tokens(account_fd, tokens)
-            value["accounts"][key] = {
-                "provider": account.provider,
-                "name": account.name,
-            }
-            value["defaults"].setdefault(account.provider, key)
-            self._write_registry(home_fd, value)
-
     def migrate(self) -> None:
         with (
             self._home() as home_fd,
@@ -299,6 +277,8 @@ class _CredentialDriver(Protocol):
     provider_label: str
 
     def bootstrap(self) -> OAuthTokens | None: ...
+
+    def login_required_error(self, message: str) -> RuntimeError: ...
 
     async def refresh(
         self, refresh_token: str, client: httpx.AsyncClient
@@ -424,7 +404,7 @@ class AccountCredentials:
         self.store._write_registry(home_fd, value)
 
     def _login_required_error(self) -> RuntimeError:
-        return self.auth_error_type(
+        return self._driver.login_required_error(
             f"no {self.provider_label} OAuth login found; log in first"
         )
 

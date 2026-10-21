@@ -206,6 +206,9 @@ class CodexCredentialDriver:
     auth_error_type = CodexAuthError
     provider_label = "Codex"
 
+    def login_required_error(self, message: str) -> CodexLoginRequiredError:
+        return CodexLoginRequiredError(message)
+
     def __init__(self, *, token_url: str = CODEX_TOKEN_URL) -> None:
         self.token_url = token_url
 
