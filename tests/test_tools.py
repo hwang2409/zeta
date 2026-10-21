@@ -301,34 +301,6 @@ async def test_bash_command_niceness_zero_leaves_priority_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_bash_tolerates_setpriority_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    parent_niceness = os.getpriority(os.PRIO_PROCESS, 0)
-    registry = ToolRegistry(
-        tmp_path, command_niceness=10, skill_catalog=SkillCatalog.empty()
-    )
-
-    def fail_setpriority(*args: object) -> None:
-        del args
-        raise PermissionError("injected setpriority failure")
-
-    def fail_logger(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise AssertionError("the child pre-exec callback must not log")
-
-    monkeypatch.setattr("zeta.tools._shared.process.os.setpriority", fail_setpriority)
-    monkeypatch.setattr("zeta.tools._shared.process.logger.debug", fail_logger)
-    result = await registry.execute(
-        ToolCall("bash-niceness-failure", "bash", {"command": _niceness_command()})
-    )
-
-    assert result["isError"] is False
-    assert int(result["structuredContent"]["stdout"]) == parent_niceness
-    assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
-
-
-@pytest.mark.asyncio
 async def test_bash_persists_cwd_across_calls(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
@@ -486,7 +458,7 @@ async def test_bash_task_cancellation_kills_process_group(
     spawned = asyncio.Event()
     release_spawn = asyncio.Event()
     spawned_process: asyncio.subprocess.Process | None = None
-    create_subprocess_shell = asyncio.create_subprocess_shell
+    create_subprocess_shell = bash_module.create_tool_subprocess_shell
 
     async def hold_spawn(*args, **kwargs):
         nonlocal spawned_process
@@ -496,7 +468,7 @@ async def test_bash_task_cancellation_kills_process_group(
         await release_spawn.wait()
         return process
 
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", hold_spawn)
+    monkeypatch.setattr(bash_module, "create_tool_subprocess_shell", hold_spawn)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(

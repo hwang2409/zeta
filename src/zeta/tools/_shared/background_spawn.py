@@ -5,31 +5,20 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
-import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-_FD_SHELL_WRAPPER = (
-    "import os,sys; os.fchdir(int(sys.argv[1])); "
-    "os.execvpe('/bin/sh', ['sh','-c',sys.argv[2]], os.environ)"
-)
+from .tool_spawn import create_tool_subprocess_shell
 
 
 async def create_subprocess_shell_in_fd(
     command: str, directory_fd: int, **kwargs: object
 ) -> asyncio.subprocess.Process:
-    """Run a shell after fchdir'ing an inherited, identity-verified fd."""
+    """Run a shell in an inherited, identity-verified directory."""
 
     kwargs.pop("cwd", None)
-    pass_fds = tuple(kwargs.pop("pass_fds", ()))
-    return await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-c",
-        _FD_SHELL_WRAPPER,
-        str(directory_fd),
-        command,
-        pass_fds=(*pass_fds, directory_fd),
-        **kwargs,
+    return await create_tool_subprocess_shell(
+        command, cwd_fd=directory_fd, **kwargs
     )
 
 

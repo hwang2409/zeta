@@ -30,7 +30,7 @@ async def test_shutdown_joins_inflight_start(
     use_fd = interruption == "spawn"
     spawn = (
         process_module.create_subprocess_shell_in_fd
-        if use_fd else asyncio.create_subprocess_shell
+        if use_fd else process_module.create_tool_subprocess_shell
     )
     close = registry._shutdown
 
@@ -54,7 +54,7 @@ async def test_shutdown_joins_inflight_start(
     if use_fd:
         monkeypatch.setattr(process_module, "create_subprocess_shell_in_fd", paused_spawn)
     else:
-        monkeypatch.setattr(asyncio, "create_subprocess_shell", paused_spawn)
+        monkeypatch.setattr(process_module, "create_tool_subprocess_shell", paused_spawn)
     monkeypatch.setattr(registry, "_shutdown", shutdown)
     command = "exec " + shlex.join((sys.executable, "-c", (
         "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
