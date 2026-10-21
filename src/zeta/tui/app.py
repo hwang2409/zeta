@@ -1127,6 +1127,7 @@ class TUIApp(
                 self._begin_startup_replay()
             if self._history is not None:
                 self._history.set_notice_sink(self._handle_background_notice)
+            self.loop.set_mcp_notice_sink(self._handle_background_notice)
             await self.loop.activate()
             session = session or self._session or self._make_session()
             self._active_session = session
@@ -1183,6 +1184,7 @@ class TUIApp(
                     self._session = None
                     if isinstance(session, FullScreenPromptSession):
                         self._release_ui_ownership()
+                        self._detach_ui_notice_sinks()
                         session.restore_terminal()
                         self._terminal_restored = True
                 else:
@@ -1191,6 +1193,7 @@ class TUIApp(
                         await asyncio.gather(self._active_task, return_exceptions=True)
                     if isinstance(session, FullScreenPromptSession):
                         self._release_ui_ownership()
+                        self._detach_ui_notice_sinks()
                         session.restore_terminal()
                         self._active_session = None
                         self._terminal_restored = True
