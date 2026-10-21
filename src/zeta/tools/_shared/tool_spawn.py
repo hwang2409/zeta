@@ -95,35 +95,36 @@ async def create_tool_subprocess_shell(
             asyncio.streams._DEFAULT_LIMIT, loop
         )
         waiter = loop.create_future()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            watcher = events.get_child_watcher()
-        with watcher:
+        watcher = getattr(loop, "_watcher", None)
+        if watcher is None:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                watcher = events.get_child_watcher()
             if not watcher.is_active():
                 raise RuntimeError("asyncio child watcher is not active")
-            transport = _ToolSubprocessTransport(
-                loop,
-                protocol,
-                (sys.executable, "-c", _LAUNCHER, str(niceness), command),
-                False,
-                stdin,
-                stdout,
-                stderr,
-                0,
-                waiter=waiter,
-                cwd_fd=cwd_fd,
-                pass_fds=tuple(pass_fds),
-                env=dict(env) if env is not None else os.environ.copy(),
-            )
-            watcher.add_child_handler(
-                transport.get_pid(), loop._child_watcher_callback, transport
-            )
-            try:
-                await waiter
-            except BaseException:
-                transport.close()
-                await transport._wait()
-                raise
+        transport = _ToolSubprocessTransport(
+            loop,
+            protocol,
+            (sys.executable, "-c", _LAUNCHER, str(niceness), command),
+            False,
+            stdin,
+            stdout,
+            stderr,
+            0,
+            waiter=waiter,
+            cwd_fd=cwd_fd,
+            pass_fds=tuple(pass_fds),
+            env=dict(env) if env is not None else os.environ.copy(),
+        )
+        watcher.add_child_handler(
+            transport.get_pid(), loop._child_watcher_callback, transport
+        )
+        try:
+            await waiter
+        except BaseException:
+            transport.close()
+            await transport._wait()
+            raise
         return asyncio.subprocess.Process(transport, protocol, loop)
     finally:
         if owned_cwd_fd is not None:
