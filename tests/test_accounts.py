@@ -500,6 +500,9 @@ def test_crash_between_credential_and_registry_publish_recovers_account(
         raise AssertionError("bootstrap source was consulted during recovery")
 
     monkeypatch.setattr(credential._driver, "bootstrap", bootstrap_must_not_run)
+    assert credential.store.resolve_account(
+        "anthropic", credential.account
+    ) == AccountId("anthropic", "default")
 
     async def access() -> str:
         async with httpx.AsyncClient() as client:

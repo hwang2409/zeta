@@ -172,7 +172,10 @@ class AccountStore:
         if account is not None and account.provider != provider:
             raise ValueError("account provider does not match")
         self.migrate()
-        return account or self.default(provider) or AccountId(provider, "default")
+        resolved = account or self.default(provider) or AccountId(provider, "default")
+        with self.credential_guard(resolved) as home_fd:
+            self._recover_account(home_fd, resolved)
+        return resolved
 
     @contextmanager
     def lifecycle_guard(
