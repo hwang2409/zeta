@@ -145,6 +145,7 @@ async def consume_run(
     kwargs["finish_gate_state"] = FinishGateState()
 
     idle_started: float | None = None
+    idle_published = False
     safety_task: asyncio.Task[tuple[str, ...]] | None = None
     try:
         result = await consume_child(
@@ -180,6 +181,7 @@ async def consume_run(
                     origin=MessageOrigin.AGENT_SEND,
                     **kwargs,
                 )
+                idle_published = False
                 continue
             kwargs["delivering_prompt_id"] = None
             if child_loop.notification_wake.pending_message() is not None:
@@ -191,8 +193,29 @@ async def consume_run(
                     notification_turn=True,
                     **kwargs,
                 )
+                idle_published = False
                 continue
             if idle:
+                if not idle_published:
+                    content = result.get("content")
+                    text = "child is idle"
+                    if (
+                        isinstance(content, list)
+                        and content
+                        and isinstance(content[0], dict)
+                        and isinstance(content[0].get("text"), str)
+                    ):
+                        text = content[0]["text"] or text
+                    metadata = kwargs.get("explicit_finish_metadata")
+                    child_path = kwargs.get("child_path")
+                    if isinstance(metadata, dict) and isinstance(child_path, str):
+                        child_loop._background_owner.conversation_channel.publish_idle(
+                            child_instance_id=str(metadata["child_instance_id"]),
+                            child_session_path=child_path,
+                            description=str(metadata["description"]),
+                            text=text,
+                        )
+                    idle_published = True
                 running_tasks = any(
                     task.running
                     for task in child_loop.tool_registry.background_tasks.snapshot()

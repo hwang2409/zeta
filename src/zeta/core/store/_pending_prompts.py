@@ -95,6 +95,85 @@ class PendingPromptQueue:
             if not self._queue_closed_unlocked():
                 self._store._append_row_unlocked("pending_queue_closed", {})
 
+    def accept_explicit_finish(
+        self,
+        report: dict[str, object],
+        *,
+        persisted_notification_ids: frozenset[str] = frozenset(),
+    ) -> str | None:
+        """Atomically close admission and persist one accepted finish report."""
+        with self._store._append_lock():
+            self._store._load()
+            transition = self._terminal_transition_unlocked()
+            if transition is not None:
+                return (
+                    "child is finishing"
+                    if transition.data["action"] == "finish"
+                    else "child is canceled"
+                )
+            if self._pending_unlocked():
+                return "pending follow-up must be read before finish"
+            pending_notifications = [
+                entry
+                for notification_id, entry in self._store._active_notifications.items()
+                if notification_id not in self._store._active_notification_acks
+                and notification_id not in persisted_notification_ids
+                and entry.data.get("display_only") is not True
+            ]
+            if pending_notifications:
+                return "pending notification must be read before finish"
+            self._store._append_many_unlocked(
+                [
+                    ("pending_queue_closed", {}),
+                    ("terminal_transition", {"action": "finish", "report": report}),
+                ]
+            )
+            return None
+
+    def cancel_explicit_child(self) -> bool:
+        """Close admission unless an accepted finish already owns termination."""
+        with self._store._append_lock():
+            self._store._load()
+            transition = self._terminal_transition_unlocked()
+            if transition is not None:
+                return False
+            rows = [
+                ("pending_prompt_ack", {"prompt_id": entry.id})
+                for entry in self._pending_unlocked()
+            ]
+            rows.extend(
+                [
+                    ("pending_queue_closed", {}),
+                    ("terminal_transition", {"action": "cancel"}),
+                ]
+            )
+            self._store._append_many_unlocked(rows)
+            return True
+
+    def explicit_finish_report(self) -> dict[str, object] | None:
+        with self._store._append_lock():
+            self._store._load()
+            transition = self._terminal_transition_unlocked()
+            if transition is None or transition.data["action"] != "finish":
+                return None
+            return dict(transition.data["report"])
+
+    def terminal_transition(self) -> str | None:
+        with self._store._append_lock():
+            self._store._load()
+            transition = self._terminal_transition_unlocked()
+            return str(transition.data["action"]) if transition is not None else None
+
+    def _terminal_transition_unlocked(self) -> ConversationEntry | None:
+        return next(
+            (
+                entry
+                for entry in reversed(self._store.replay())
+                if entry.type == "terminal_transition"
+            ),
+            None,
+        )
+
     def _queue_closed_unlocked(self) -> bool:
         return any(
             entry.type == "pending_queue_closed" for entry in self._store._entries

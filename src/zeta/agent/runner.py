@@ -59,6 +59,7 @@ from .presets import (
 )
 from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState
 from .run_consumer import consume_run as consume_follow_up_run
+from .terminal_fence import TerminalTransitionFence
 
 logger = logging.getLogger(__name__)
 _EMPTY_METADATA: Mapping[str, object] = MappingProxyType({})
@@ -895,9 +896,14 @@ async def run_agent_tool(
         )
     )
     child_canceled = False
+    terminal_fence = getattr(child_loop, "_terminal_transition_fence", None)
+    if getattr(child_loop, "explicit_finish", False) and terminal_fence is None:
+        terminal_fence = TerminalTransitionFence(child_store)
 
     def request_child_cancel() -> None:
-        """Cancel this child without invoking its owner's cancel_all()."""
+        """Cancel this child unless a durable finish already owns termination."""
+        if terminal_fence is not None and not terminal_fence.request_cancel():
+            return
         child_loop.tool_registry.abort()
         child_loop.store.drop_client_steering("abort")
         if not child_task.done():
@@ -906,6 +912,8 @@ async def run_agent_tool(
     async def cancel_child() -> None:
         nonlocal child_canceled
         if child_canceled:
+            return
+        if terminal_fence is not None and terminal_fence.accepted_report() is not None:
             return
         child_canceled = True
         loop._background_owner.cancel_subtree(child_instance_id)
@@ -976,6 +984,7 @@ async def run_agent_tool(
                     agent_instance_id=loop.agent_instance_id,
                     background_owner=loop._background_owner,
                     max_receipt_bytes=background_receipt_bytes,
+                    explicit_finish=terminal_fence is not None,
                 )
             finally:
                 loop.notify_background_persisted()

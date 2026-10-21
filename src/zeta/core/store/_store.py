@@ -60,9 +60,12 @@ from ._pending_prompts import (
 )
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
+    CHILD_IDLE_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
     TASK_EXITED_NOTIFICATION_KIND,
     validate_agent_notification_data,
+    validate_child_idle_notification_data,
+    validate_terminal_transition_data,
 )
 from .runtime_lease import (
     SessionRuntimeLease,
@@ -593,6 +596,8 @@ class ConversationStore(
                     raise ValueError("invalid task notification")
                 if kind == AGENT_COMPLETION_NOTIFICATION_KIND:
                     validate_agent_notification_data(entry.data)
+                elif kind == CHILD_IDLE_NOTIFICATION_KIND:
+                    validate_child_idle_notification_data(entry.data)
                 # Unknown notification kinds are tolerated for forward compat.
             elif entry.type == "notification_ack":
                 notification_id = entry.data.get("notification_id")
@@ -617,6 +622,8 @@ class ConversationStore(
             elif entry.type == "pending_queue_closed":
                 if entry.data != {}:
                     raise ValueError("pending queue closed marker takes no fields")
+            elif entry.type == "terminal_transition":
+                validate_terminal_transition_data(entry.data)
             else:
                 raise ValueError(f"unsupported conversation entry type: {entry.type}")
         except (KeyError, TypeError, ValueError) as exc:

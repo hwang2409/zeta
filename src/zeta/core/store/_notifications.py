@@ -11,10 +11,12 @@ from ...protocol.types import Message, MessageOrigin, ToolUseContent
 from ..checkpoints import ConversationEntry
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
+    CHILD_IDLE_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,
     TASK_EXITED_NOTIFICATION_KIND,
     valid_agent_stats,
     validate_agent_notification_data,
+    validate_child_idle_notification_data,
 )
 
 if TYPE_CHECKING:
@@ -286,6 +288,37 @@ class NotificationStateMixin:
             self._append_many_unlocked(rows)
             return len(questions)
 
+    def append_child_idle_notification(
+        self: ConversationStore,
+        child_instance_id: str,
+        *,
+        child_session_path: str,
+        description: str,
+        text: str,
+        ask_parent_question_id: str | None = None,
+        display_only: bool = False,
+    ) -> ConversationEntry | None:
+        """Persist one nonterminal idle notice unless the child is terminal."""
+        data: dict[str, Any] = {
+            "origin": MessageOrigin.NOTIFICATION.value,
+            "kind": CHILD_IDLE_NOTIFICATION_KIND,
+            "child_instance_id": child_instance_id,
+            "child_session_path": child_session_path,
+            "description": description,
+            "status": CHILD_IDLE_NOTIFICATION_KIND,
+            "text": text[-MAX_AGENT_NOTIFICATION_TEXT:],
+        }
+        if ask_parent_question_id is not None:
+            data["ask_parent_question_id"] = ask_parent_question_id
+        if display_only:
+            data["display_only"] = True
+        validate_child_idle_notification_data(data)
+        with self._append_lock():
+            self._load()
+            if child_instance_id in self._active_completion_notifications:
+                return None
+            return self._snapshot_entry(self._append_row_unlocked("notification", data))
+
     def append_agent_notification(
         self: ConversationStore,
         child_instance_id: str,
@@ -332,6 +365,7 @@ class NotificationStateMixin:
         killed_task_count: int | None = None,
         killed_task_ids_truncated: bool = False,
         background_metadata: tuple[str, str] | None = None,
+        report: dict[str, object] | None = None,
     ) -> tuple[ConversationEntry, bool]:
         """Atomically return the first completion notification or append one."""
         data = self._agent_notification_data(
@@ -345,6 +379,7 @@ class NotificationStateMixin:
             killed_task_count=killed_task_count,
             killed_task_ids_truncated=killed_task_ids_truncated,
             background_metadata=background_metadata,
+            report=report,
         )
         with self._append_lock():
             self._load()
