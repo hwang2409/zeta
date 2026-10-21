@@ -393,7 +393,17 @@ def test_store_replay_accepts_task_and_unknown_notification_kinds(
             "text": "done",
         },
     )
-    store._append_row("notification", {"kind": "monitor_alert", "note": "heads up"})
+    unknown = store.append_child_idle_notification(
+        "future-child",
+        child_session_path="agents/future",
+        description="future notification",
+        text="heads up",
+    )
+    assert unknown is not None
+    persisted = store.path.read_text(encoding="utf-8").replace(
+        '"kind":"child_idle"', '"kind":"monitor_alert"', 1
+    )
+    store.path.write_text(persisted, encoding="utf-8")
 
     # A fresh store on the same session forces load + validation of every row.
     reloaded = ConversationStore(tmp_path, session_id="kinds")
