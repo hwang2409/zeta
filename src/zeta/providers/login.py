@@ -3,12 +3,10 @@
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from ..accounts import AccountId, AccountStore
 from ..core.login_flow import LoginProvider
 from .anthropic import (
     DEFAULT_REDIRECT_URI as ANTHROPIC_REDIRECT_URI,
-)
-from .anthropic import (
-    AnthropicCredentialStore,
 )
 from .anthropic import (
     build_authorization_url as build_anthropic_authorization_url,
@@ -19,7 +17,6 @@ from .anthropic import (
 from .auth import OAuthTokens, build_pkce_parameters
 from .codex import (
     DEFAULT_CODEX_REDIRECT_URI,
-    CodexCredentialStore,
     extract_account_id,
 )
 from .codex import (
@@ -40,6 +37,19 @@ def _no_handle(tokens: OAuthTokens) -> str | None:
     return None
 
 
+class _AccountCredentialStore:
+    def __init__(self, home: Path, provider: str) -> None:
+        self.store = AccountStore(home)
+        self.account = AccountId(provider, "default")
+
+    def save(self, tokens: OAuthTokens) -> None:
+        self.store.ensure_account(
+            self.account,
+            tokens,
+            replace=self.store.contains(self.account),
+        )
+
+
 def _redirect_contract(redirect_uri: str) -> tuple[int, str]:
     parsed = urlsplit(redirect_uri)
     if parsed.port is None or not parsed.path:
@@ -56,7 +66,7 @@ def build_login_provider(provider: str, home: Path) -> LoginProvider[OAuthTokens
             callback_path=callback_path,
             build_authorization_url=build_anthropic_authorization_url,
             exchange_authorization_code=exchange_anthropic_authorization_code,
-            credential_store=AnthropicCredentialStore(home / "anthropic-oauth.json"),
+            credential_store=_AccountCredentialStore(home, "anthropic"),
             token_handle=_no_handle,
         )
     if provider == "codex":
@@ -67,7 +77,7 @@ def build_login_provider(provider: str, home: Path) -> LoginProvider[OAuthTokens
             callback_path=callback_path,
             build_authorization_url=build_codex_authorization_url,
             exchange_authorization_code=exchange_codex_authorization_code,
-            credential_store=CodexCredentialStore(home / "codex-oauth.json"),
+            credential_store=_AccountCredentialStore(home, "codex"),
             token_handle=lambda tokens: extract_account_id(tokens.access_token),
         )
     raise ValueError(f"unsupported login provider: {provider}")

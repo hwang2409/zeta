@@ -496,6 +496,23 @@ def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
     return None
 
 
+@contextmanager
+def credential_file_lock(path: str | Path) -> Iterator[None]:
+    """Serialize access to one OAuth credential file across processes."""
+
+    credential_path = Path(path)
+    credential_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(credential_path.parent, 0o700)
+    lock_path = credential_path.with_name(f".{credential_path.name}.lock")
+    with lock_path.open("a+") as handle:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class OAuthCredentialStore:
     """Own one zeta OAuth file and serialize refreshes across processes."""
 
@@ -511,14 +528,8 @@ class OAuthCredentialStore:
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
-        with self.lock_path.open("a+") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with credential_file_lock(self.path):
+            yield
 
     def read(self) -> OAuthTokens | None:
         with self._lock():

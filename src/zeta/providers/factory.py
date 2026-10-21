@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from ..accounts import AccountId, AccountStore
 from ..config.settings import load_settings
 from ..core.session import env_home
 from ..core.slash import budget_for_model, effective_budget_for_model
@@ -42,14 +43,18 @@ def credential_store(
     provider: str,
     *,
     home: str | Path | None = None,
+    account: AccountId | None = None,
 ) -> OAuthCredentialStore | None:
     """Return the provider's OAuth store, or None when it needs no credentials."""
 
+    if provider not in {"claude", "codex"}:
+        return None
     auth_home = Path(home) if home is not None else env_home()
+    path = AccountStore(auth_home).resolve_credential_path(provider, account)
     if provider == "claude":
-        return AnthropicCredentialStore(auth_home / "anthropic-oauth.json")
+        return AnthropicCredentialStore(path)
     if provider == "codex":
-        return CodexCredentialStore(auth_home / "codex-oauth.json")
+        return CodexCredentialStore(path)
     return None
 
 
@@ -62,7 +67,9 @@ def _anthropic_credential(auth_home: Path) -> AnthropicCredential:
     """
 
     if os.environ.get(API_KEY_OPT_IN_VAR) != "1":
-        return AnthropicCredentialStore(auth_home / "anthropic-oauth.json")
+        credential = credential_store("claude", home=auth_home)
+        assert credential is not None
+        return credential
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise AnthropicAuthError(
@@ -107,7 +114,8 @@ def build_backend(
             **stall_kwargs,
         ), selected_model
     if provider == "codex":
-        credential = CodexCredentialStore(auth_home / "codex-oauth.json")
+        credential = credential_store("codex", home=auth_home)
+        assert credential is not None
         if require_credentials:
             _require_credentials(credential)
         selected_model = model or DEFAULT_CODEX_MODEL

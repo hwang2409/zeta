@@ -207,7 +207,11 @@ class CodexCredentialStore(OAuthCredentialStore):
         codex_auth: str | Path | None = None,
         token_url: str = CODEX_TOKEN_URL,
     ) -> None:
-        super().__init__(path or env_home() / "codex-oauth.json", token_url=token_url)
+        if path is None:
+            from .accounts import AccountStore
+
+            path = AccountStore(env_home()).resolve_credential_path("codex")
+        super().__init__(path, token_url=token_url)
         if codex_auth is not None:
             self.codex_auth = Path(codex_auth)
         elif codex_home := os.environ.get("CODEX_HOME"):

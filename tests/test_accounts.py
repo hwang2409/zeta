@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import multiprocessing
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
 import zeta.accounts.store as account_store
 import zeta.cli.main as cli_main
 from zeta.accounts import AccountError, AccountId, AccountStore
+from zeta.agent.runner import resolve_child_backend
 from zeta.oauth import OAuthTokens
+from zeta.providers.codex import CodexCredentialStore
+from zeta.providers.factory import build_backend, credential_store
+from zeta.runtime import unattended
+from zeta.tui import models as tui_models
 
 _SENTINEL = "token-text-must-not-escape"
 
@@ -283,3 +292,154 @@ def test_default_set_and_read_back(tmp_path: Path) -> None:
 def test_default_to_unknown_account_is_an_error(tmp_path: Path) -> None:
     with pytest.raises(AccountError, match="/accounts"):
         AccountStore(tmp_path).set_default(AccountId("anthropic", "work"))
+
+
+def test_login_then_runtime_reads_the_new_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def complete_login(provider, _pkce_values):
+        provider.credential_store.save(tokens())
+
+    monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
+    monkeypatch.setattr(cli_main, "run_login", complete_login)
+
+    assert cli_main._run_login("anthropic", "work", False) is None
+    backend, _ = build_backend("claude", None, home=tmp_path)
+
+    assert backend.token_store.read() == tokens()
+    assert backend.token_store.path == AccountStore(tmp_path).credential_path(
+        AccountId("anthropic", "work")
+    )
+
+
+def test_migration_then_every_reader_uses_the_account_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legacy = _write_legacy(tmp_path, "anthropic")
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+
+    primary, _ = build_backend("claude", None, home=tmp_path)
+    automation, _ = unattended.build_backend("claude", None, home=tmp_path)
+    memory, _ = build_backend("claude", None, home=tmp_path)
+    child, error = resolve_child_backend(
+        SimpleNamespace(
+            backend=None,
+            context_assembler=SimpleNamespace(token_budget=200_000),
+        ),
+        "claude-sonnet-4-6",
+    )
+    monkeypatch.setattr(
+        tui_models.httpx,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"data": []},
+        ),
+    )
+    assert tui_models.load_model_catalog("claude", home=tmp_path) == frozenset()
+
+    expected = AccountStore(tmp_path).credential_path(
+        AccountId("anthropic", "default")
+    )
+    assert error is None
+    assert child is not None
+    stores = [
+        primary.token_store,
+        child.token_store,
+        automation.token_store,
+        memory.token_store,
+        credential_store("claude", home=tmp_path),
+    ]
+    assert all(store.path == expected and store.read() == tokens() for store in stores)
+    assert not legacy.exists()
+
+
+def test_migration_vs_concurrent_refresh_keeps_the_fresh_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expired = OAuthTokens("old-access", "old-refresh", 1.0)
+    fresh = OAuthTokens("fresh-access", "fresh-refresh", 9_999_999_999.0)
+    legacy = tmp_path / "codex-oauth.json"
+    legacy.write_text(json.dumps(expired.to_dict()))
+    refresh_locked = threading.Event()
+    release_refresh = threading.Event()
+    migration_waiting = threading.Event()
+    original_lock = account_store.credential_file_lock
+
+    def observed_migration_lock(path: Path):
+        migration_waiting.set()
+        return original_lock(path)
+
+    monkeypatch.setattr(
+        account_store, "credential_file_lock", observed_migration_lock
+    )
+    legacy_store = CodexCredentialStore(legacy)
+    result: list[str] = []
+
+    async def return_fresh(_refresh_token: str, _client: httpx.AsyncClient):
+        refresh_locked.set()
+        await asyncio.to_thread(release_refresh.wait)
+        return fresh
+
+    legacy_store.refresh = return_fresh
+
+    def refresh() -> None:
+        async def run() -> None:
+            async with httpx.AsyncClient() as client:
+                result.append(await legacy_store.access_token(client))
+
+        asyncio.run(run())
+
+    refresher = threading.Thread(target=refresh)
+    refresher.start()
+    assert refresh_locked.wait(timeout=5)
+    migration = threading.Thread(target=AccountStore(tmp_path).migrate)
+    migration.start()
+    assert migration_waiting.wait(timeout=5)
+    release_refresh.set()
+    refresher.join(timeout=5)
+    migration.join(timeout=5)
+
+    assert not migration.is_alive() and not refresher.is_alive()
+    assert result == [fresh.access_token]
+    assert credential_store("codex", home=tmp_path).read() == fresh
+    assert not legacy.exists()
+
+
+def test_refresh_after_migration_writes_the_account_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expired = OAuthTokens("old-access", "old-refresh", 1.0)
+    fresh = OAuthTokens("fresh-access", "fresh-refresh", 9_999_999_999.0)
+    (tmp_path / "anthropic-oauth.json").write_text(json.dumps(expired.to_dict()))
+    store = credential_store("claude", home=tmp_path)
+
+    async def return_fresh(_refresh_token: str, _client: httpx.AsyncClient):
+        return fresh
+
+    monkeypatch.setattr(store, "refresh", return_fresh)
+
+    async def refresh() -> str:
+        async with httpx.AsyncClient() as client:
+            return await store.access_token(client)
+
+    assert asyncio.run(refresh()) == fresh.access_token
+    assert store.path == AccountStore(tmp_path).credential_path(
+        AccountId("anthropic", "default")
+    )
+    assert store.read() == fresh
+    assert not (tmp_path / "anthropic-oauth.json").exists()
+
+
+def test_accounts_default_invalid_input_is_a_command_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
+
+    assert cli_main.main(["accounts", "default", "BOGUS:x"]) != 0
+
+    output = capsys.readouterr()
+    assert "invalid account id" in output.err.lower()
+    assert _SENTINEL not in output.err

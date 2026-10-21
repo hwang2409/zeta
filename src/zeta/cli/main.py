@@ -420,6 +420,43 @@ def _run_login(
         return handle
 
 
+def _handle_login(args: argparse.Namespace) -> int:
+    try:
+        handle = (
+            _run_login(args.provider)
+            if args.account == "default" and not args.replace
+            else _run_login(args.provider, args.account, args.replace)
+        )
+    except KeyboardInterrupt:
+        print("login cancelled", file=sys.stderr)
+        return 1
+    except (AccountError, ValueError) as exc:
+        print(f"login failed: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        print("login failed", file=sys.stderr)
+        return 1
+    print(f"logged in as {handle}" if handle else "ok")
+    return 0
+
+
+def _handle_accounts(args: argparse.Namespace) -> int:
+    store = AccountStore(env_home())
+    try:
+        if args.action == "default":
+            if not args.account or ":" not in args.account:
+                raise AccountError("default requires provider:name")
+            provider, name = args.account.split(":", 1)
+            store.set_default(AccountId(provider, name))
+        else:
+            accounts = [str(item) for item in store.list()]
+            print(json.dumps(accounts) if args.json else "\n".join(accounts))
+        return 0
+    except (AccountError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
 def _cleanup_ephemeral(app: object) -> None:
     import shutil
 
@@ -465,38 +502,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "login":
-        try:
-            handle = (
-                _run_login(args.provider)
-                if args.account == "default" and not args.replace
-                else _run_login(args.provider, args.account, args.replace)
-            )
-        except KeyboardInterrupt:
-            print("login cancelled", file=sys.stderr)
-            return 1
-        except AccountError as exc:
-            print(f"login failed: {exc}", file=sys.stderr)
-            return 1
-        except Exception:
-            print("login failed", file=sys.stderr)
-            return 1
-        print(f"logged in as {handle}" if handle else "ok")
-        return 0
+        return _handle_login(args)
     if args.command == "accounts":
-        store = AccountStore(env_home())
-        try:
-            if args.action == "default":
-                if not args.account or ":" not in args.account:
-                    raise AccountError("default requires provider:name")
-                provider, name = args.account.split(":", 1)
-                store.set_default(AccountId(provider, name))
-            else:
-                accounts = [str(item) for item in store.list()]
-                print(json.dumps(accounts) if args.json else "\n".join(accounts))
-            return 0
-        except AccountError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
+        return _handle_accounts(args)
     if args.command == "mcp":
         from ..core.project_context import discover_repo_root
         from ..mcp.management import MCPManagementError, MCPManagementService

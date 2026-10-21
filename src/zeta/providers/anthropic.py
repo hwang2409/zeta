@@ -215,10 +215,11 @@ class AnthropicCredentialStore(OAuthCredentialStore):
         claude_credentials: str | Path | None = None,
         token_url: str = TOKEN_URL,
     ) -> None:
-        super().__init__(
-            path or env_home() / "anthropic-oauth.json",
-            token_url=token_url,
-        )
+        if path is None:
+            from ..accounts import AccountStore
+
+            path = AccountStore(env_home()).resolve_credential_path("anthropic")
+        super().__init__(path, token_url=token_url)
         self.claude_credentials = (
             Path(claude_credentials) if claude_credentials is not None else None
         )

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.session_files import child_directory, open_session_file
-from ..oauth import OAuthTokens
+from ..oauth import OAuthTokens, credential_file_lock
 
 _PROVIDERS = {"anthropic", "codex"}
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
@@ -146,6 +146,22 @@ class AccountStore:
     def credential_path(self, account: AccountId) -> Path:
         return self.accounts / account.provider / account.name / "oauth.json"
 
+    def resolve_credential_path(
+        self, provider: str, account: AccountId | None = None
+    ) -> Path:
+        """Migrate legacy auth, then resolve an account or the global default."""
+
+        provider = "anthropic" if provider == "claude" else provider
+        if provider not in _PROVIDERS:
+            raise ValueError("invalid account provider")
+        if account is not None and account.provider != provider:
+            raise ValueError("account provider does not match")
+        self.migrate()
+        selected = account or self.default(provider) or AccountId(provider, "default")
+        if account is not None and not self.contains(account):
+            raise AccountError(f"account {account} does not exist; use /accounts")
+        return self.credential_path(selected)
+
     def ensure_account(
         self, account: AccountId, tokens: OAuthTokens, *, replace: bool = False
     ) -> None:
@@ -179,7 +195,12 @@ class AccountStore:
     def _migrate_provider(self, home_fd: int, provider: str) -> None:
         account = AccountId(provider, "default")
         legacy_name = f"{provider}-oauth.json"
-        with self._registry_guard(home_fd), self._lifecycle_guard(home_fd, account):
+        legacy_path = self.home / legacy_name
+        with (
+            self._registry_guard(home_fd),
+            self._lifecycle_guard(home_fd, account),
+            credential_file_lock(legacy_path),
+        ):
             value = self._read_registry(home_fd)
             registered = str(account) in value["accounts"]
             legacy_exists = _exists_regular(home_fd, legacy_name)

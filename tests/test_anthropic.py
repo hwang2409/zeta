@@ -1900,7 +1900,7 @@ def test_default_claude_store_honors_isolated_zeta_home(
 
     store = AnthropicCredentialStore()
 
-    assert store.path == zeta_home / "anthropic-oauth.json"
+    assert store.path == zeta_home / "accounts" / "anthropic" / "default" / "oauth.json"
     assert store.bootstrap() is None
 
 

@@ -3543,7 +3543,7 @@ def test_default_credential_store_honors_isolated_zeta_home(
 
     store = credential_store("codex", home=zeta_home)
     assert store is not None
-    zeta_home.mkdir()
+    store.path.parent.mkdir(parents=True)
     store.path.write_text(
         json.dumps(
             {
@@ -3553,7 +3553,7 @@ def test_default_credential_store_honors_isolated_zeta_home(
         )
     )
 
-    assert store.path == zeta_home / "codex-oauth.json"
+    assert store.path == zeta_home / "accounts" / "codex" / "default" / "oauth.json"
     assert store.bootstrap() is None
     assert store.read() is not None
 
