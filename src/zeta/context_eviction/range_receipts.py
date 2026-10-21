@@ -34,8 +34,6 @@ def range_receipt_candidate(
     allows: Callable[[int], bool],
     is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
     coarse: bool = False,
-    stop_after_fold: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool]
-    | None = None,
 ) -> RangeCandidate:
     """Coalesce receipt exchanges, or globally fold eligible old records."""
 
@@ -44,21 +42,18 @@ def range_receipt_candidate(
             records,
             allows=allows,
             is_smaller=is_smaller,
-            stop_after_fold=stop_after_fold,
         )
     output: list[tuple[int, Message]] = []
     coalesced: set[int] = set()
     run: list[_ReceiptUnit] = []
     index = 0
 
-    def flush() -> bool:
+    def flush() -> None:
         flattened = [record for unit in run for record in unit.records]
-        folded: list[Message] | None = None
         if len(run) >= 2:
             start, end = flattened[0][0], flattened[-1][0]
             receipt = _range_receipt(start, end, run)
             if is_smaller(flattened, [receipt]):
-                folded = [receipt]
                 output.append((start, receipt))
                 coalesced.update(seq for seq, _ in flattened)
             else:
@@ -66,24 +61,16 @@ def range_receipt_candidate(
         else:
             output.extend(flattened)
         run.clear()
-        return (
-            folded is not None
-            and stop_after_fold is not None
-            and stop_after_fold(flattened, folded)
-        )
 
     while index < len(records):
         unit, next_index = _receipt_unit(records, index, allows)
         if unit is None:
-            if flush():
-                output.extend(records[index:])
-                return RangeCandidate(output, frozenset(coalesced))
+            flush()
             output.append(records[index])
             index += 1
             continue
-        if run and unit.records[0][0] != run[-1].records[-1][0] + 1 and flush():
-            output.extend(records[index:])
-            return RangeCandidate(output, frozenset(coalesced))
+        if run and unit.records[0][0] != run[-1].records[-1][0] + 1:
+            flush()
         run.append(unit)
         index = next_index
     flush()
@@ -95,8 +82,6 @@ def _coarse_candidate(
     *,
     allows: Callable[[int], bool],
     is_smaller: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool],
-    stop_after_fold: Callable[[Sequence[tuple[int, Message]], Sequence[Message]], bool]
-    | None,
 ) -> RangeCandidate:
     indexed_units: list[tuple[_ReceiptUnit, range]] = []
     index = 0
@@ -112,43 +97,6 @@ def _coarse_candidate(
 
     selected_count = len(units)
     receipt: Message | None = None
-    committed_count = 0
-    if stop_after_fold is not None:
-        for candidate_count in range(2, len(units) + 1):
-            selected = units[:candidate_count]
-            if not any(unit.kind != "user" for unit in selected):
-                continue
-            flattened = [record for unit in selected for record in unit.records]
-            candidate = _range_receipt(
-                min(_unit_start(unit) for unit in selected),
-                max(_unit_end(unit) for unit in selected),
-                selected,
-                include_user_metadata=True,
-            )
-            originals = (
-                flattened
-                if receipt is None
-                else [
-                    (
-                        min(_unit_start(unit) for unit in units[:committed_count]),
-                        receipt,
-                    ),
-                    *[
-                        record
-                        for unit in units[committed_count:candidate_count]
-                        for record in unit.records
-                    ],
-                ]
-            )
-            if not is_smaller(originals, [candidate]):
-                continue
-            if stop_after_fold(originals, [candidate]):
-                receipt = candidate
-                selected_count = candidate_count
-                break
-            receipt = candidate
-            committed_count = candidate_count
-            selected_count = candidate_count
 
     selected = units[:selected_count]
     flattened = [record for unit in selected for record in unit.records]

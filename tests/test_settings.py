@@ -42,32 +42,6 @@ def _write(base: Path, body: str) -> Path:
     return path
 
 
-def test_eviction_summaries_defaults_disabled_and_global_can_enable(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    defaults = resolve(
-        load_settings(home=home).settings,
-        cli_provider=None,
-        cli_model=None,
-        cli_yolo=None,
-        cli_token_budget=None,
-        default_provider="codex",
-    )
-    assert defaults.eviction_summaries_enabled is False
-    _write(home, "[eviction_summaries]\nenabled = true\n")
-    configured = load_settings(home=home, project_dir=project)
-    assert configured.settings.eviction_summaries_enabled is True
-    _write(project, "[eviction_summaries]\nenabled = false\n")
-    rejected = load_settings(home=home, project_dir=project)
-    assert rejected.settings.eviction_summaries_enabled is True
-    assert any("eviction_summaries" in warning for warning in rejected.warnings)
-    _write(home, "[eviction_summaries]\nenabled = 'yes'\n")
-    with pytest.raises(SettingsError, match="must be a boolean"):
-        load_settings(home=home)
-
-
 def test_missing_files_are_silent(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"

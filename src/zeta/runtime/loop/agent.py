@@ -201,7 +201,6 @@ class AgentLoop(
         self._turn_stop_reason: str | None = None
         self._turn_output_tokens: int | None = None
         self.memory_reconciler: AutoMemoryReconciler | None = None
-        self.eviction_summary_worker: Any = None
         self._turn_provider_retry_records: list[dict[str, object]] = []
         recover_agent_children(self)
         self.tool_registry = select_tool_registry(
@@ -547,8 +546,6 @@ class AgentLoop(
         killed: tuple[str, ...] = ()
         if self.memory_reconciler is not None:
             await self.memory_reconciler.close()
-        if self.eviction_summary_worker is not None:
-            await self.eviction_summary_worker.close()
         if self.agent_depth == 0:
             self._background_owner.set_wake_callback(None)
         try:
@@ -708,8 +705,6 @@ class AgentLoop(
         on_persisted: Callable[[], None] | None = None,
         notification_turn: bool = False,
     ) -> AsyncIterator[StreamEvent]:
-        if self.eviction_summary_worker is not None:
-            self.eviction_summary_worker.start()
         await self.refresh_skills()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
