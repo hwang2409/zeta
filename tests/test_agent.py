@@ -9749,6 +9749,40 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
 
 
 @pytest.mark.asyncio
+async def test_explicit_finish_accepts_from_the_follow_up_being_delivered(
+    tmp_path: Path,
+) -> None:
+    store, registry, loop = _explicit_finish_registry(tmp_path)
+    prompt = store.pending_prompt_queue.append(
+        "review this first", origin=MessageOrigin.AGENT_SEND
+    )
+    loop._delivering_prompt_id = prompt.id
+    accepted = await registry.execute(
+        ToolCall("finish-1", "finish", {"status": "done", "summary": "done"})
+    )
+    assert accepted["isError"] is False
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_refuses_a_second_unread_follow_up(
+    tmp_path: Path,
+) -> None:
+    store, registry, loop = _explicit_finish_registry(tmp_path)
+    first = store.pending_prompt_queue.append(
+        "review this first", origin=MessageOrigin.AGENT_SEND
+    )
+    store.pending_prompt_queue.append("review this second", origin=MessageOrigin.AGENT_SEND)
+    loop._delivering_prompt_id = first.id
+    refused = await registry.execute(
+        ToolCall("finish-1", "finish", {"status": "done", "summary": "done"})
+    )
+    assert refused["isError"] is True
+    assert "pending follow-up" in refused["content"][0]["text"]
+    await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_reviewer_follow_up_committed_at_finish_boundary_is_read(
     tmp_path: Path,
 ) -> None:
