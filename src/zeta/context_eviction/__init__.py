@@ -493,6 +493,7 @@ def _evict_persisted_records(
 ) -> tuple[list[tuple[int, Message]], set[int]]:
     """Evict eligible persisted rows again from their active-branch sources."""
 
+    from .persisted_hybrids import canonicalize
     from .range_receipts import _is_receipt_kind
 
     source_records = [
@@ -512,33 +513,7 @@ def _evict_persisted_records(
         unconsumed_source_seqs=protected,
     )
     generated_by_seq = dict(zip(generated.source_seqs, generated.messages, strict=True))
-    output = list(records)
-    regenerated: set[int] = set()
-    for index, (seq, message) in enumerate(records):
-        if not eligibility.allows(seq) or message.metadata.get(RECEIPT_KIND_METADATA):
-            continue
-        marker = f"[assistant reasoning evicted · seq {seq}]"
-        if (
-            message.role is not MessageRole.ASSISTANT
-            or not message.content
-            or not isinstance(message.content[-1], TextContent)
-            or message.content[-1].text != marker
-        ):
-            continue
-        body = message.content[:-1]
-        tool_content = [block for block in body if isinstance(block, ToolUseContent)]
-        if tool_content and all(
-            isinstance(block, (TextContent, ToolUseContent)) for block in body
-        ):
-            replacement = _tool_call_receipt(
-                Message(message.role, tool_content, metadata=message.metadata), seq
-            )
-        elif body and all(isinstance(block, TextContent) for block in body):
-            replacement = _assistant_receipt(seq, "assistant text")
-        else:
-            continue
-        output[index] = (seq, replacement)
-        regenerated.add(seq)
+    output, regenerated = canonicalize(records, allows=eligibility.allows)
     result_indexes: dict[str, list[int]] = defaultdict(list)
     for index, (_, message) in enumerate(records):
         if message.tool_result is not None:

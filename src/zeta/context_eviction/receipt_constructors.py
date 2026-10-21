@@ -21,6 +21,27 @@ RECEIPT_KIND_METADATA = "eviction_receipt"
 RECEIPT_FIELDS_METADATA = "eviction_receipt_fields"
 
 
+def _canonicalize_reasoning_hybrid(message: Message, seq: int) -> Message | None:
+    """Turn a trusted persisted reasoning hybrid into a receipt view."""
+    if message.role is not MessageRole.ASSISTANT or not message.content:
+        return None
+    marker = f"[assistant reasoning evicted · seq {seq}]"
+    last = message.content[-1]
+    if not isinstance(last, TextContent) or last.text != marker:
+        return None
+    body = message.content[:-1]
+    tool_content = [block for block in body if isinstance(block, ToolUseContent)]
+    if tool_content and all(
+        isinstance(block, (TextContent, ToolUseContent)) for block in body
+    ):
+        return _tool_call_receipt(
+            Message(message.role, tool_content, metadata=message.metadata), seq
+        )
+    if body and all(isinstance(block, TextContent) for block in body):
+        return _assistant_receipt(seq, "assistant text")
+    return None
+
+
 def _tool_call_receipt(
     message: Message,
     seq: int,
