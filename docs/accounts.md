@@ -178,7 +178,8 @@ zeta accounts refresh
 zeta accounts logout anthropic:work
 ```
 
-`default` changes the global default for new sessions. `switch` is reserved for
+`default` changes the global default, which a session uses only when it has no
+saved selection at load (see the session-load rule above). `switch` is reserved for
 an attached tui or serve session and always targets that session. there is no
 legacy `--provider` alias. one login flow per provider is allowed at a time;
 adding another account is sequential. an existing account requires confirmation
@@ -308,8 +309,9 @@ in #529).
 ## open questions for henry
 
 none are required to implement this v1. the selected product behavior is current
-session plus an explicit global default for future sessions; live children and
-other sessions are never retargeted. terms approval and redacted provider
+session plus an explicit global default that any session without a saved
+selection pins at load, new or resumed; live children and other sessions are
+never retargeted. terms approval and redacted provider
 fixtures are release gates, not product questions.
 
 [codex-rate-limit-parser]: https://github.com/openai/codex/blob/430a16799d90e296fb27b1e94f206023902b7e56/codex-rs/codex-api/src/rate_limits.rs#L15-L87
