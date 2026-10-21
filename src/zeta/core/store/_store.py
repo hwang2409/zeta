@@ -61,10 +61,16 @@ from ._pending_prompts import (
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     CHILD_IDLE_NOTIFICATION_KIND,
+    CHILD_QUESTION_NOTIFICATION_KIND,
+    CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
+    PROJECT_INBOX_NOTIFICATION_KIND,
     TASK_EXITED_NOTIFICATION_KIND,
     validate_agent_notification_data,
     validate_child_idle_notification_data,
+    validate_child_question_notification_data,
+    validate_project_inbox_notification_data,
+    validate_task_exited_notification_data,
     validate_terminal_transition_data,
 )
 from .runtime_lease import (
@@ -586,19 +592,20 @@ class ConversationStore(
                     raise ValueError("invalid approval resolution")
             elif entry.type == "notification":
                 kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
-                if kind == TASK_EXITED_NOTIFICATION_KIND and (
-                    type(entry.data.get("task_id")) is not str
-                    or not entry.data["task_id"]
-                    or type(entry.data.get("headline")) is not str
-                    or type(entry.data.get("exit_code")) not in {int, type(None)}
-                    or type(entry.data.get("output_tail", "")) is not str
-                ):
-                    raise ValueError("invalid task notification")
-                if kind == AGENT_COMPLETION_NOTIFICATION_KIND:
+                if kind == TASK_EXITED_NOTIFICATION_KIND:
+                    validate_task_exited_notification_data(entry.data)
+                elif kind == AGENT_COMPLETION_NOTIFICATION_KIND:
                     validate_agent_notification_data(entry.data)
                 elif kind == CHILD_IDLE_NOTIFICATION_KIND:
                     validate_child_idle_notification_data(entry.data)
-                # Unknown notification kinds are tolerated for forward compat.
+                elif kind == PROJECT_INBOX_NOTIFICATION_KIND:
+                    validate_project_inbox_notification_data(entry.data)
+                elif kind in {
+                    CHILD_QUESTION_NOTIFICATION_KIND,
+                    CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND,
+                }:
+                    validate_child_question_notification_data(entry.data)
+                # Unknown notification kinds remain tolerated for forward compat.
             elif entry.type == "notification_ack":
                 notification_id = entry.data.get("notification_id")
                 if type(notification_id) is not str or not notification_id:

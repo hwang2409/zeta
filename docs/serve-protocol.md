@@ -549,7 +549,7 @@ call ID.
 
 `usage` carries the provider usage object. `compaction_start` and
 `compaction_end` carry loop `data`; the latter can include `token_count`.
-`sub_agent_receipt` carries the existing agent notification `data` object.
+`sub_agent_receipt` carries the existing agent completion notification `data` object. `project_inbox_notification`, `child_question`, `child_question_withdrawn`, and `child_idle` carry their durable notification `data` object with the matching kind.
 
 ### reconnecting sessions and background completions
 
@@ -729,6 +729,10 @@ Event fields are:
 | `approval_request` | `event`, `request_id: string`, `tool_call: ToolCall`, `delegated: boolean` | `session_id`, `agent_instance_id: string` (delegated only) |
 | `approval_end` | `event`, `request_id: string`, `tool_call: ToolCall`, `data: object` | `session_id` |
 | `sub_agent_receipt` | `event`, `data: object` | `session_id` |
+| `project_inbox_notification` | `event`, `data: object` | `session_id` |
+| `child_question` | `event`, `data: object` | `session_id` |
+| `child_question_withdrawn` | `event`, `data: object` | `session_id` |
+| `child_idle` | `event`, `data: object` | `session_id` |
 | `retry` | `event`, `data: object` | `session_id` |
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id` |

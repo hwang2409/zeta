@@ -679,6 +679,11 @@ class _Client:
         return {
             "session": session,
             "state": runtime.state.status if runtime.state is not None else "idle",
+            "explicit_finish": (
+                runtime.loop.explicit_finish
+                if runtime.loop is not None
+                else runtime._config(None, None).agents_explicit_finish
+            ),
             "pending_approvals": pending,
             "usage": dict(runtime.usage),
             "compaction_markers": (
@@ -976,11 +981,13 @@ class _Client:
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
             notification = dict(event.data)
-            event_name = (
-                "task_exit_notification"
-                if notification.get("kind", "agent_completion") == "task_exited"
-                else "sub_agent_receipt"
-            )
+            event_name = {
+                "task_exited": "task_exit_notification",
+                "project_inbox": "project_inbox_notification",
+                "child_question": "child_question",
+                "child_question_withdrawn": "child_question_withdrawn",
+                "child_idle": "child_idle",
+            }.get(notification.get("kind", "agent_completion"), "sub_agent_receipt")
             await self._notify(event_name, session_id, data=notification)
             return
         if kind is StreamEventType.ERROR:

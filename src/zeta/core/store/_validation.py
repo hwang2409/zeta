@@ -13,6 +13,18 @@ MAX_AGENT_NOTIFICATION_TEXT = 10_000
 AGENT_COMPLETION_NOTIFICATION_KIND = "agent_completion"
 CHILD_IDLE_NOTIFICATION_KIND = "child_idle"
 TASK_EXITED_NOTIFICATION_KIND = "task_exited"
+PROJECT_INBOX_NOTIFICATION_KIND = "project_inbox"
+CHILD_QUESTION_NOTIFICATION_KIND = "child_question"
+CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND = "child_question_withdrawn"
+
+NOTIFICATION_KINDS = (
+    AGENT_COMPLETION_NOTIFICATION_KIND,
+    CHILD_IDLE_NOTIFICATION_KIND,
+    TASK_EXITED_NOTIFICATION_KIND,
+    PROJECT_INBOX_NOTIFICATION_KIND,
+    CHILD_QUESTION_NOTIFICATION_KIND,
+    CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND,
+)
 
 
 def valid_agent_stats(value: object) -> bool:
@@ -119,11 +131,65 @@ def validate_child_idle_notification_data(data: Mapping[str, Any]) -> None:
         raise ValueError("invalid child idle notification")
 
 
+def validate_project_inbox_notification_data(data: Mapping[str, Any]) -> None:
+    if (
+        data.get("origin") != "notification"
+        or data.get("kind") != PROJECT_INBOX_NOTIFICATION_KIND
+        or data.get("status") != "new"
+        or type(data.get("project_id")) is not str
+        or not data["project_id"]
+        or type(data.get("message_ids")) is not list
+        or not data["message_ids"]
+        or any(type(item) is not str or not item for item in data["message_ids"])
+        or type(data.get("text")) is not str
+        or not data["text"]
+    ):
+        raise ValueError("invalid project inbox notification")
+
+
+def validate_child_question_notification_data(data: Mapping[str, Any]) -> None:
+    if (
+        data.get("origin") != "notification"
+        or data.get("kind") not in {
+            CHILD_QUESTION_NOTIFICATION_KIND,
+            CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND,
+        }
+        or type(data.get("child_instance_id")) is not str
+        or not data["child_instance_id"]
+        or type(data.get("question_id")) is not str
+        or not data["question_id"]
+        or type(data.get("description")) is not str
+        or not data["description"]
+        or type(data.get("text")) is not str
+        or not data["text"]
+    ):
+        raise ValueError("invalid child question notification")
+    if data["kind"] == CHILD_QUESTION_NOTIFICATION_KIND:
+        if data.get("status") != "pending" or type(data.get("question")) is not str:
+            raise ValueError("invalid child question notification")
+    elif data.get("status") != "withdrawn":
+        raise ValueError("invalid withdrawn child question notification")
+
+
+def validate_task_exited_notification_data(data: Mapping[str, Any]) -> None:
+    if (
+        data.get("origin") != "notification"
+        or data.get("kind") != TASK_EXITED_NOTIFICATION_KIND
+        or type(data.get("task_id")) is not str
+        or not data["task_id"]
+        or type(data.get("headline")) is not str
+        or not data["headline"]
+        or type(data.get("exit_code")) not in {int, type(None)}
+    ):
+        raise ValueError("invalid task notification")
+
+
 def validate_agent_notification_data(data: Mapping[str, Any]) -> None:
     """Apply the shared append/load contract for an agent notification."""
 
     if (
-        type(data.get("child_instance_id")) is not str
+        data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND) != AGENT_COMPLETION_NOTIFICATION_KIND
+        or type(data.get("child_instance_id")) is not str
         or not data["child_instance_id"]
         or type(data.get("child_session_path")) is not str
         or not data["child_session_path"]
