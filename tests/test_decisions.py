@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
+from tests.support.fake_backend import FakeBackend
 from zeta.attention_decisions import DecisionItem, open_decisions
 from zeta.attention_forks import (
     create_discussion_fork,
@@ -13,10 +16,16 @@ from zeta.attention_forks import (
     release_discussion_fork,
 )
 from zeta.attention_records import AttentionStore
+from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
+from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.skills import SkillCatalog
+from zeta.tools.registry import ToolRegistry
+from zeta.tools.resolve_attention import register_fork
 from zeta.tui.agent_card import AgentNavigation
+from zeta.tui.app import TUIApp
 from zeta.tui.cards.decisions import DecisionsPanel
 from zeta.tui.overlay import OverlayControl
 from zeta.tui.render import format_status
@@ -69,6 +78,90 @@ def test_status_bar_shows_main_indicator_during_discussion() -> None:
 
 
 # -- session-scoped scan ----------------------------------------------------
+
+
+def _decisions_app(home: Path, opened) -> TUIApp:
+    return TUIApp(
+        AgentLoop(
+            FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()
+        ),
+        provider="codex",
+        model="fake",
+        zeta_home=home,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+
+
+@pytest.mark.asyncio
+async def test_decisions_tick_counts_only_current_root_session(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = _session(tmp_path, project.project_id)
+    other = _session(tmp_path, project.project_id)
+    _request(current, project.project_id, "Current", "This one.")
+    _request(other, project.project_id, "Other", "Not this one.")
+
+    app = _decisions_app(tmp_path, current)
+    child = ConversationStore(
+        current.store.session_dir / "agents", session_id="child"
+    )
+    app._agent_navigation.current_path = child.session_dir
+    await app._decisions_tick()
+
+    assert app.decisions_count == 1
+
+    await app.loop.tool_registry.close()
+    child.close()
+    current.store.close()
+    other.store.close()
+
+
+@pytest.mark.asyncio
+async def test_decisions_tick_clears_after_resolve_attention(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = _session(tmp_path, project.project_id)
+    other = _session(tmp_path, project.project_id)
+    _request(other, project.project_id, "Other", "Not this one.")
+    anchor = current.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
+    )
+    record = _request(
+        current,
+        project.project_id,
+        "Current",
+        "This one.",
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+    )
+    app = _decisions_app(tmp_path, current)
+    await app._decisions_tick()
+    assert app.decisions_count == 1
+
+    fork_id = create_discussion_fork(tmp_path, current.store.session_id, record.id)
+    fork = manager.open(fork_id)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=fork.store,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=manager.project_registry,
+        tool_allow=fork.metadata.tool_allow,
+    )
+    register_fork(registry)
+    result = await registry.definitions_by_name["resolve_attention"].handler(
+        {"decision": "Use SQLite."}
+    )
+    assert result["isError"] is False
+
+    await app._decisions_tick()
+    assert app.decisions_count == 0
+
+    await registry.close()
+    fork.store.close()
+    await app.loop.tool_registry.close()
+    current.store.close()
+    other.store.close()
 
 
 def test_open_decisions_lists_live_open_items_for_one_session(tmp_path: Path) -> None:
