@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta.tools._shared import tool_spawn
 from zeta.tools._shared.tool_spawn import create_tool_subprocess_shell
 
 _SENTINEL = "ATFORK_ESCAPE"
@@ -120,3 +121,62 @@ async def test_watcher_registration_failure_leaves_no_process_zombie_or_fd(
     with pytest.raises(ChildProcessError):
         await asyncio.to_thread(os.waitpid, child_pid, os.WNOHANG)
     assert len(os.listdir("/dev/fd")) == baseline_fds
+
+
+async def _assert_launcher_failure_is_reaped(
+    monkeypatch: pytest.MonkeyPatch, launcher: str
+) -> None:
+    child_pid: int | None = None
+    await asyncio.to_thread(lambda: None)
+    baseline_fds = len(os.listdir("/dev/fd"))
+    original_spawn = tool_spawn._posix_spawn
+
+    def capture_spawn(*args: object, **kwargs: object) -> tool_spawn._SpawnedProcess:
+        nonlocal child_pid
+        process = original_spawn(*args, **kwargs)  # type: ignore[arg-type]
+        child_pid = process.pid
+        return process
+
+    monkeypatch.setattr(tool_spawn, "_LAUNCHER", launcher)
+    monkeypatch.setattr(tool_spawn, "_posix_spawn", capture_spawn)
+    with pytest.raises(RuntimeError, match="tool subprocess launcher failed to start"):
+        await create_tool_subprocess_shell("printf unreachable")
+
+    assert child_pid is not None
+    with pytest.raises(ProcessLookupError):
+        os.killpg(child_pid, 0)
+    with pytest.raises(ChildProcessError):
+        await asyncio.to_thread(os.waitpid, child_pid, os.WNOHANG)
+    assert len(os.listdir("/dev/fd")) == baseline_fds
+
+
+@pytest.mark.asyncio
+async def test_launcher_eof_before_ready_is_a_spawn_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _assert_launcher_failure_is_reaped(monkeypatch, "raise SystemExit(1)")
+
+
+@pytest.mark.asyncio
+async def test_launcher_wrong_ready_byte_is_a_spawn_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _assert_launcher_failure_is_reaped(
+        monkeypatch,
+        "import os, sys; os.write(int(sys.argv[2]), b'0')",
+    )
+
+
+@pytest.mark.asyncio
+async def test_launcher_hang_before_ready_is_bounded_and_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tool_spawn, "_LAUNCHER_START_TIMEOUT_SECONDS", 0.1)
+    started = asyncio.get_running_loop().time()
+
+    await _assert_launcher_failure_is_reaped(
+        monkeypatch,
+        "import signal; signal.pause()",
+    )
+
+    assert asyncio.get_running_loop().time() - started < 2

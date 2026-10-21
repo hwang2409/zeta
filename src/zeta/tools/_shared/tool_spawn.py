@@ -13,6 +13,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import IO, Any
 
+_LAUNCHER_START_TIMEOUT_SECONDS = 10.0
+
 _LAUNCHER = """
 import os, sys
 cwd_fd = int(sys.argv[1])
@@ -182,12 +184,17 @@ async def _wait_for_launcher(*, process: _SpawnedProcess) -> None:
         if ready.done():
             return
         loop.remove_reader(fd)
-        os.read(fd, 1)
-        ready.set_result(None)
+        ready.set_result(os.read(fd, 1))
 
     loop.add_reader(fd, consume_ready_byte)
     try:
-        await ready
+        try:
+            async with asyncio.timeout(_LAUNCHER_START_TIMEOUT_SECONDS):
+                ready_byte = await ready
+        except TimeoutError:
+            raise RuntimeError("tool subprocess launcher failed to start") from None
+        if ready_byte != b"1":
+            raise RuntimeError("tool subprocess launcher failed to start")
     finally:
         loop.remove_reader(fd)
         process.ready.close()
