@@ -1472,15 +1472,28 @@ skill_catalog=SkillCatalog.empty(),
 @pytest.mark.asyncio
 async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     marker = tmp_path / "timeout-child-alive"
+    started = tmp_path / "timeout-child-started"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
-    result = await registry.execute(
-        ToolCall(
-            "bash-timeout",
-            "bash",
-            {"command": _descendant_command(marker), "timeout": 0.05},
+    execution = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "bash-timeout",
+                "bash",
+                {
+                    "command": _descendant_command(marker, delay=1, started=started),
+                    "timeout": 0.5,
+                },
+            )
         )
     )
+    for _ in range(100):
+        if started.exists():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("descendant did not start")
+    result = await execution
     await asyncio.sleep(0.4)
 
     assert result["isError"] is True

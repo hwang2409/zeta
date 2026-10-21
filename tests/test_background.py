@@ -646,16 +646,33 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     tracked = []
     tracked_ready = asyncio.Event()
+    stores_released = asyncio.Event()
     owner = loop._background_owner
-    track_store = owner.track_store
+    track_stores = owner.track_store
+    release_stores = owner.release_unused_stores
 
     def track(child_store):
         tracked.append(child_store)
-        track_store(child_store)
+        track_stores(child_store)
         if len(tracked) == 2:
             tracked_ready.set()
 
+    def store_closed(child_store) -> bool:
+        try:
+            os.fstat(child_store.directory_fd)
+        except OSError:
+            return True
+        return False
+
+    def release() -> None:
+        release_stores()
+        if len(tracked) == 2 and all(
+            store_closed(child_store) for child_store in tracked
+        ):
+            stores_released.set()
+
     owner.track_store = track
+    owner.release_unused_stores = release
 
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
@@ -664,7 +681,7 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
         os.fstat(tracked[0].directory_fd)
 
         backend.completion_gate.set()
-        await asyncio.wait_for(owner.wait(), timeout=5)
+        await asyncio.wait_for(stores_released.wait(), timeout=5)
         for child_store in tracked:
             with pytest.raises(OSError):
                 os.fstat(child_store.directory_fd)

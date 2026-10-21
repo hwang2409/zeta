@@ -7155,10 +7155,10 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
             _python("import time; time.sleep(30)") + " --password=password-secret-789",
             "password-secret-789",
         ),
-        ("<'/tmp/password-secret' cat", "password-secret"),
-        ("3<'url-user:url-pass@example.com' cat", "url-user:url-pass@example.com"),
+        ("<'/tmp/password-secret' cat; sleep 30", "password-secret"),
+        ("3<'url-user:url-pass@example.com' cat; sleep 30", "url-user:url-pass@example.com"),
         (
-            "<<'heredoc-secret' cat\nbody\nheredoc-secret",
+            "<<'heredoc-secret' cat\nbody\nheredoc-secret; sleep 30",
             "heredoc-secret",
         ),
     ],
