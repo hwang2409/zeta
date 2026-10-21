@@ -493,11 +493,8 @@ def _evict_persisted_records(
 ) -> tuple[list[tuple[int, Message]], set[int]]:
     """Evict eligible persisted rows again from their active-branch sources."""
 
+    from . import receipt_constructors as rc
     from .range_receipts import _is_receipt_kind
-    from .receipt_constructors import (
-        RECEIPT_KIND_METADATA,
-        _persisted_reasoning_receipt,
-    )
 
     source_records = [
         (seq, source_messages[seq])
@@ -519,12 +516,11 @@ def _evict_persisted_records(
     output = list(records)
     regenerated: set[int] = set()
     for index, (seq, message) in enumerate(records):
-        if not eligibility.allows(seq) or message.metadata.get(RECEIPT_KIND_METADATA):
-            continue
-        replacement = _persisted_reasoning_receipt(message, seq, token_counter)
-        if replacement is not None:
-            output[index] = (seq, replacement)
-            regenerated.add(seq)
+        if eligibility.allows(seq) and not message.metadata.get(rc.RECEIPT_KIND_METADATA):
+            replacement = rc._persisted_reasoning_receipt(message, seq, token_counter)
+            if replacement is not None:
+                output[index] = (seq, replacement)
+                regenerated.add(seq)
     result_indexes: dict[str, list[int]] = defaultdict(list)
     for index, (_, message) in enumerate(records):
         if message.tool_result is not None:
@@ -532,7 +528,7 @@ def _evict_persisted_records(
 
     def is_current(index: int) -> bool:
         seq, message = records[index]
-        marker = message.metadata.get(RECEIPT_KIND_METADATA)
+        marker = message.metadata.get(rc.RECEIPT_KIND_METADATA)
         result = message.tool_result
         tool_name = None
         if result is not None and (call := source_calls.get(result.tool_call_id)):
