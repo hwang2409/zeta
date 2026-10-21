@@ -24,6 +24,21 @@ from zeta.skills.loader import (
 from zeta.tools import ToolRegistry
 
 
+def test_skill_snapshot_round_trip_keeps_project_source(tmp_path: Path) -> None:
+    skill_path = tmp_path / ".zeta" / "skills" / "review.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text(
+        "---\nname: review\ndescription: review code\nkeywords: [review]\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    original = discover_session_skills(project_dir=tmp_path).find("review")
+    restored = SkillCatalog.from_snapshot(SkillCatalog((original,)).to_snapshot())
+
+    assert original.source == "project"
+    assert restored.find("review").source == "project"
+
+
 def test_discover_and_load_skill(tmp_path: Path) -> None:
     skill_path = tmp_path / "skills" / "review.md"
     skill_path.parent.mkdir()

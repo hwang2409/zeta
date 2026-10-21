@@ -7,7 +7,6 @@ Sources verified 2026-10-06:
 
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass
 from enum import Enum
 
@@ -102,9 +101,3 @@ def image_policy_for_provider(provider: str) -> ImagePolicy:
         return _PROVIDER_POLICIES[provider]
     except KeyError as exc:
         raise ValueError(f"unknown image provider: {provider}") from exc
-
-
-def data_url_length(data: bytes, media_type: str) -> int:
-    """Return the serialized data-URL length without allocating base64 text."""
-
-    return len(f"data:{media_type};base64,") + len(base64.b64encode(data))

@@ -46,7 +46,6 @@ class TranscriptPresenter:
         self._full_screen_active = full_screen_active
         self._print_callback = print_callback
         self._printed_units = False
-        self._assistant_unit_open = False
         self._active_tool_calls: set[ToolLifecycleKey] = set()
         self._background_tool_ids: set[ToolLifecycleKey] = set()
         self._pending_tool_renders: list[RenderableType] = []
@@ -142,7 +141,6 @@ class TranscriptPresenter:
                 self.transcript.touch(self._assistant_unit)
         else:
             self.update_assistant(self._assistant_stream)
-        self._assistant_unit_open = True
 
     def update_assistant(self, rendered: RenderableType) -> None:
         """Replace the one mutable unit used by an in-flight assistant message."""
@@ -171,7 +169,6 @@ class TranscriptPresenter:
                 self._assistant_live.update(
                     Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
                 )
-        self._assistant_unit_open = True
 
     def finish_assistant(
         self,
@@ -196,7 +193,6 @@ class TranscriptPresenter:
                 self.print_unit(rendered)
         self._assistant_unit = None
         self._assistant_stream = None
-        self._assistant_unit_open = False
 
     def finish_assistant_message(self, rendered: RenderableType | None) -> None:
         """Render the complete assistant message in one transcript unit."""
@@ -231,10 +227,8 @@ class TranscriptPresenter:
         self._assistant_message_region.clear()
         self._assistant_unit = None
         self._assistant_stream = None
-        self._assistant_unit_open = False
 
     def reset_assistant_unit(self) -> None:
-        self._assistant_unit_open = False
         self._assistant_unit = None
         self._assistant_stream = None
 
@@ -603,6 +597,5 @@ class TranscriptPresenter:
         self._assistant_unit = None
         self._assistant_message_units.clear()
         self._assistant_message_region.clear()
-        self._assistant_unit_open = False
         self._printed_units = False
         self.transcript.clear()

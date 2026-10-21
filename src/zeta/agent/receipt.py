@@ -166,7 +166,6 @@ def _candidate(
     answer: str,
     suffix: str,
     structured_content: dict[str, Any] | None,
-    tool_call_id: str,
 ) -> StructuredToolResult:
     text = answer + suffix
     result: StructuredToolResult = {
@@ -235,7 +234,7 @@ def _with_answer_limit(
         shown = answer[:length]
         if shown != answer:
             shown += _TRUNCATION_NOTE
-        return _candidate(state, shown, suffix, structured_content, tool_call_id)
+        return _candidate(state, shown, suffix, structured_content)
 
     full = candidate(len(answer))
     if _fits(full, tool_call_id, envelope, max_bytes):
@@ -251,13 +250,13 @@ def _with_answer_limit(
     bounded = candidate(low)
     if _fits(bounded, tool_call_id, envelope, max_bytes):
         return bounded
-    minimal = _candidate(state, "", suffix, structured_content, tool_call_id)
+    minimal = _candidate(state, "", suffix, structured_content)
     if _fits(minimal, tool_call_id, envelope, max_bytes):
         return minimal
-    reduced = _candidate(state, "", suffix, None, tool_call_id)
+    reduced = _candidate(state, "", suffix, None)
     if _fits(reduced, tool_call_id, envelope, max_bytes):
         return reduced
-    return _candidate(state, "", "", None, tool_call_id)
+    return _candidate(state, "", "", None)
 
 
 def _notice_summary(items: Sequence[str], kept: int) -> str:
@@ -285,7 +284,7 @@ def _compact_structured_content(
 
     def fits(value: dict[str, Any] | None) -> bool:
         return _fits(
-            _candidate(state, "", suffix, value, tool_call_id),
+            _candidate(state, "", suffix, value),
             tool_call_id,
             envelope,
             max_bytes,
@@ -374,7 +373,6 @@ def _build_component_receipt(
             text + shown_notice,
             suffix,
             structured_content,
-            tool_call_id,
         )
 
     def fits(parts: tuple[str, str, str]) -> bool:

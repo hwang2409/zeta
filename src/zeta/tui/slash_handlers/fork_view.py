@@ -105,9 +105,6 @@ class ForkViewMixin:
             source_path=source_dir,
         )
 
-    @property
-    def is_discussion_fork(self) -> bool:
-        return self._fork_context is not None
 
     @property
     def fork_header_notice(self) -> str | None:

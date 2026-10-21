@@ -834,18 +834,6 @@ class ToolRegistry:
             self._session_store.set_bash_cwd(cwd)
         self.bash_cwd = cwd
 
-    def set_approval_subject_resolver(
-        self, tool: str, resolver: Callable[[Mapping[str, object]], str | None]
-    ) -> None:
-        definition = self._tools.get(tool)
-        if definition is None:
-            raise KeyError(tool)
-        self._tools[tool] = replace(
-            definition, approval_subject_resolver=resolver
-        )
-        if self.approval_policy is not None:
-            self.approval_policy.bind_rule_resolver(self.resolve_approval_rule)
-
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
         if self.enforce_approvals and policy is None:
             raise ValueError("cannot remove an enforced approval policy")

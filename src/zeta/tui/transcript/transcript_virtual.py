@@ -676,7 +676,6 @@ class TranscriptVirtualMixin:
         locations = locations[:wanted] or [(None, 0)]
         unit_line_numbers = unit_line_numbers[:wanted] or [0]
         self._virtual_start = start
-        self._virtual_lines = lines
         self._virtual_locations = locations
         self._virtual_width = width
         self._virtual_height = height

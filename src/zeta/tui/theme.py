@@ -154,8 +154,6 @@ BUILT_IN_PALETTES: Mapping[str, Palette] = MappingProxyType(
 # and mutated in place on every subsequent switch. Consumers that reach them
 # via ``theme.BODY`` (``from . import theme``) see the current values; a
 # stale ``from .theme import BODY`` capture pins the value at import.
-SURFACE: str
-TINT: str
 ACCENT: str
 DIM: str
 BODY: str
@@ -176,7 +174,6 @@ AFFORDANCE: str
 DIFF_ADD: str
 DIFF_REMOVE: str
 DIFF_CONTEXT: str
-USER_ROLE: str
 SEARCH_MATCH: str
 SEARCH_CURRENT: str
 MENU_BG: str
@@ -237,17 +234,15 @@ def set_active_palette(palette: Palette) -> None:
     also flip to the new palette on the next render.
     """
 
-    global _ACTIVE, SURFACE, TINT, ACCENT, DIM, BODY, ERROR, CODE_BG, CODE_THEME
+    global _ACTIVE, ACCENT, DIM, BODY, ERROR, CODE_BG, CODE_THEME
     global CHROME, CARD_BG, CARD_BORDER, COMPOSER_BORDER, COMPOSER_FOCUS
     global VIM_STATE, PLAN_STATE, COMMAND, RECEIPT, THOUGHT, AFFORDANCE
     global DIFF_ADD, DIFF_REMOVE, DIFF_CONTEXT
-    global USER_ROLE, SEARCH_MATCH, SEARCH_CURRENT, MENU_BG, ON_ACCENT
+    global SEARCH_MATCH, SEARCH_CURRENT, MENU_BG, ON_ACCENT
     global COMPOSER_FILL, COMPOSER_PLACEHOLDER
     global USER_BG, READ_BG, SHELL_BG, EDIT_BG, AGENT_BG
     global AGENT_MAIN, AGENT_CHILD, NOTICE, WARNING, SUCCESS
     _ACTIVE = palette
-    SURFACE = palette.surface
-    TINT = palette.tint
     ACCENT = palette.accent
     DIM = palette.dim
     BODY = palette.body
@@ -274,7 +269,6 @@ def set_active_palette(palette: Palette) -> None:
     DIFF_ADD = palette.diff_add
     DIFF_REMOVE = palette.diff_remove
     DIFF_CONTEXT = palette.diff_context or DIM
-    USER_ROLE = ACCENT
     AGENT_MAIN = palette.agent_main
     AGENT_CHILD = palette.agent_child
     NOTICE = palette.notice

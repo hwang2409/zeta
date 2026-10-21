@@ -581,7 +581,9 @@ class ContextAssembler:
         stale_plans = 0
         while True:
             plan = await asyncio.to_thread(
-                _cooperative_call, self._plan_eviction, **snapshot
+                _cooperative_call,
+                self._plan_eviction,
+                **{key: value for key, value in snapshot.items() if key != "branch_id"},
             )
             # Cancellation is observed here before any durable or assembler mutation.
             await asyncio.sleep(0)
@@ -644,7 +646,6 @@ class ContextAssembler:
         self,
         *,
         branch: Sequence[ConversationEntry],
-        branch_id: str | None,
         items: Sequence[_ContextItem],
         latest_user: int | None,
         system_messages: Sequence[Message],

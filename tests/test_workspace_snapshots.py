@@ -93,7 +93,7 @@ def test_snapshot_and_restore_round_trip(git_repo: Path, tmp_path: Path) -> None
     (git_repo / "untracked.txt").unlink()
     (git_repo / "added.txt").write_text("added later\n")
 
-    store.restore(snapshot.id, git_repo)
+    store.restore(snapshot.id)
 
     files = _repo_workspace_files(git_repo)
     assert files == {
@@ -116,7 +116,7 @@ def test_restore_never_deletes_ignored_files(git_repo: Path, tmp_path: Path) -> 
     (git_repo / "tracked.txt").write_text("edited")
     (git_repo / "build" / "artifact.bin").write_text("compiled newer")
 
-    store.restore(snapshot.id, git_repo)
+    store.restore(snapshot.id)
 
     assert (git_repo / "build" / "artifact.bin").read_text() == "compiled newer"
     assert (git_repo / "tracked.txt").read_text() == "initial tracked\n"
@@ -139,7 +139,7 @@ def test_snapshot_and_restore_preserve_user_git_state(
     store = WorkspaceSnapshotStore(session_dir, "session-1")
     snapshot = store.take(git_repo, label="invariance")
     (git_repo / "tracked.txt").write_text("drift")
-    store.restore(snapshot.id, git_repo)
+    store.restore(snapshot.id)
 
     assert _hash(git_repo / ".git" / "index") == index_before
     assert (git_repo / ".git" / "HEAD").read_text() == head_before
@@ -201,20 +201,20 @@ def test_undo_redo_stack_navigation(git_repo: Path, tmp_path: Path) -> None:
     assert store.current_id == snap_3.id
     target = store.undo_target()
     assert target and target.id == snap_2.id
-    store.restore(snap_2.id, git_repo)
+    store.restore(snap_2.id)
     assert (git_repo / "tracked.txt").read_text() == "v2"
     target = store.undo_target()
     assert target and target.id == snap_1.id
-    store.restore(snap_1.id, git_repo)
+    store.restore(snap_1.id)
     assert (git_repo / "tracked.txt").read_text() == "v1"
 
     forward = store.redo_target()
     assert forward and forward.id == snap_2.id
-    store.restore(snap_2.id, git_repo)
+    store.restore(snap_2.id)
     assert (git_repo / "tracked.txt").read_text() == "v2"
     forward = store.redo_target()
     assert forward and forward.id == snap_3.id
-    store.restore(snap_3.id, git_repo)
+    store.restore(snap_3.id)
     assert (git_repo / "tracked.txt").read_text() == "v3"
     assert store.redo_target() is None
 
@@ -239,7 +239,7 @@ def test_non_git_workspace_records_unavailable_snapshot(tmp_path: Path) -> None:
     snapshot = store.take(workspace, label="conv-only")
     assert snapshot.mode == SNAPSHOT_MODE_UNAVAILABLE
     (workspace / "file.txt").write_text("edited")
-    restored = store.restore(snapshot.id, workspace)
+    restored = store.restore(snapshot.id)
     assert restored.mode == SNAPSHOT_MODE_UNAVAILABLE
     assert (workspace / "file.txt").read_text() == "edited"
 
@@ -497,7 +497,7 @@ def test_restore_interrupt_leaves_pre_restore_state_recoverable(
 
         monkeypatch.setattr(workspace_module, "_run_git", interrupt_at(target))
         with pytest.raises(KeyboardInterrupt):
-            store.restore(baseline.id, git_repo)
+            store.restore(baseline.id)
         monkeypatch.setattr(workspace_module, "_run_git", real_run_git)
 
         # Safety ref must exist and reference blobs matching the pre-restore state
@@ -554,7 +554,7 @@ def test_restore_succeeds_and_cleans_up_safety_ref(
     (git_repo / "tracked.txt").write_text("v1\n")
     snap = store.take(git_repo, label="v1")
     (git_repo / "tracked.txt").write_text("v2\n")
-    store.restore(snap.id, git_repo)
+    store.restore(snap.id)
 
     # Successful restore leaves no orphan safety refs behind
     assert _shadow_refs(session_dir, SNAPSHOT_SAFETY_REF_NAMESPACE) == []
@@ -602,7 +602,7 @@ def test_take_after_restore_earlier_truncates_abandoned_tail(
     (git_repo / "tracked.txt").write_text("v3")
     snap_3 = store.take(git_repo, label="v3")
 
-    store.restore(snap_1.id, git_repo)
+    store.restore(snap_1.id)
     (git_repo / "tracked.txt").write_text("branch-checkpoint")
     new_snap = store.take(git_repo, label="branch")
 
@@ -619,7 +619,7 @@ def test_take_after_restore_earlier_truncates_abandoned_tail(
     assert f"{SNAPSHOT_REF_NAMESPACE}/{new_snap.id}" in ref_names
 
     # /undo now stops at snap_1's predecessor chain, never at v3
-    store.restore(new_snap.id, git_repo)
+    store.restore(new_snap.id)
     undo_target = store.undo_target()
     assert undo_target is not None and undo_target.id == snap_1.id
     assert store.by_id(snap_3.id) is None
@@ -880,8 +880,8 @@ def test_corrupt_snapshot_marker_clears_only_through_explicit_reset(
     assert snapshots.is_corrupt
     older = snapshots.snapshots[0]
     with pytest.raises(workspace_module.WorkspaceSnapshotError, match="corrupt"):
-        snapshots.restore(older.id, git_repo)
-    snapshots.restore(older.id, git_repo, force=True)
+        snapshots.restore(older.id)
+    snapshots.restore(older.id, force=True)
     snapshots.set_current(older.id)
     reopened.slash_checkpoint("blocked-write")
     assert snapshots.is_corrupt
@@ -1254,7 +1254,7 @@ def test_shadow_git_uses_pinned_directory_after_path_swap(git_repo, tmp_path):
         (git_repo / "tracked.txt").write_text("changed")
         second = store.take(git_repo, label="second")
         assert second.tree_sha != first.tree_sha
-        store.restore(first.id, git_repo)
+        store.restore(first.id)
         assert (git_repo / "tracked.txt").read_text() == "initial tracked\n"
         assert list(outside.iterdir()) == []
         assert (pinned / "workspace_shadow.git" / "HEAD").is_file()
@@ -1284,7 +1284,7 @@ def test_restore_persists_safety_ref_before_workspace_changes(git_repo, tmp_path
 
     monkeypatch.setattr(workspace, "_materialise_tree", checked_materialise)
     try:
-        store.restore(snapshot.id, git_repo)
+        store.restore(snapshot.id)
         assert (git_repo / "tracked.txt").read_text() == "initial tracked\n"
     finally:
         store.close()

@@ -198,11 +198,6 @@ class MessageFinder:
             return
         self._selected = max(0, min(len(self._rows) - 1, self._selected + delta))
 
-    def select(self, index: int) -> None:
-        if not self._rows:
-            self._selected = 0
-            return
-        self._selected = max(0, min(len(self._rows) - 1, index))
 
     def preview(self) -> tuple[str, ...]:
         """Return the selected message's original lines for the preview pane."""

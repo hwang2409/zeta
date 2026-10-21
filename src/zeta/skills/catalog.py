@@ -335,7 +335,6 @@ def discover_skills(
 
     return discover_markdown(
         skills_dir,
-        source=source,
         kind="skill",
         build=build,
         notices=notices,

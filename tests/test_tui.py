@@ -10173,7 +10173,6 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
                 composer_rows,
                 footer,
                 todo,
-                store,
                 agent_navigation=navigation,
                 on_scroll_up=transcript.scroll_up,
                 on_scroll_down=transcript.scroll_down,
