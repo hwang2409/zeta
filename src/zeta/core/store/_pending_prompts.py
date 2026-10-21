@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import weakref
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from ...protocol.types import MessageOrigin
@@ -158,11 +159,36 @@ class PendingPromptQueue:
                 return None
             return dict(transition.data["report"])
 
+    def idle_nudge_eligible(
+        self,
+        *,
+        admission_allowed: Callable[[], bool] = lambda: True,
+        persisted_notification_ids: frozenset[str] = frozenset(),
+    ) -> bool:
+        """Atomically reject a nudge when input, work, or termination exists."""
+        with self._store._append_lock():
+            self._store._load()
+            return admission_allowed() and self._idle_nudge_eligible_unlocked(
+                persisted_notification_ids
+            )
+
     def terminal_transition(self) -> str | None:
         with self._store._append_lock():
             self._store._load()
             transition = self._terminal_transition_unlocked()
             return str(transition.data["action"]) if transition is not None else None
+
+    def _idle_nudge_eligible_unlocked(
+        self, persisted_notification_ids: frozenset[str]
+    ) -> bool:
+        if self._terminal_transition_unlocked() is not None or self._pending_unlocked():
+            return False
+        return not any(
+            notification_id not in self._store._active_notification_acks
+            and notification_id not in persisted_notification_ids
+            and entry.data.get("display_only") is not True
+            for notification_id, entry in self._store._active_notifications.items()
+        )
 
     def _terminal_transition_unlocked(self) -> ConversationEntry | None:
         return next(

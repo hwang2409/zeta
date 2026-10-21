@@ -34,6 +34,7 @@ from zeta.agent.presets import (
     AgentPreset,
 )
 from zeta.agent.runner import _child_base_system_prompt
+from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
@@ -8619,6 +8620,13 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
         key: terminal.tool_result.structured_content[key] for key in expected
     } == expected
     assert {key: notification.data[key] for key in expected} == expected
+    from zeta.tools.agent import _read_agent_status
+
+    status = _read_agent_status(
+        store,
+        requested_handle=str(notification.data["child_instance_id"]),
+    )
+    assert status[0]["report_status"] == "done"
     await loop.close()
 
 
@@ -8785,6 +8793,7 @@ async def test_explicit_finish_no_tool_turn_enters_idle_without_request(
         explicit_finish=True,
         agent_instance_id="root:1",
         _background_owner=owner,
+        _terminal_transition_fence=TerminalTransitionFence(store),
         notification_wake=SimpleNamespace(pending_message=lambda: None),
         tool_registry=registry,
     )
@@ -8852,6 +8861,7 @@ async def test_idle_child_is_running_during_wake_turn(
         explicit_finish=True,
         agent_instance_id="parent:1",
         _background_owner=owner,
+        _terminal_transition_fence=TerminalTransitionFence(child_store),
         notification_wake=SimpleNamespace(pending_message=lambda: None),
         tool_registry=registry,
     )
@@ -8939,6 +8949,9 @@ async def test_idle_child_wakes_for_task_and_child_completion_only(
         explicit_finish=True,
         agent_instance_id="root:1",
         _background_owner=owner,
+        _terminal_transition_fence=TerminalTransitionFence(
+            store, notification_pending=lambda: pending.pending_message() is not None
+        ),
         notification_wake=pending,
         tool_registry=registry,
     )
@@ -8993,6 +9006,285 @@ async def test_idle_child_wakes_for_task_and_child_completion_only(
     owner.conversation_channel.wake("root:1")
     await asyncio.wait_for(run, 1)
     assert len(turns) == 4
+    owner.conversation_channel.unregister_loop("root:1")
+    await registry.close()
+    store.close()
+
+
+async def _idle_nudge_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    idle_wait,
+    fence=None,
+    finish_after_calls: int | None = None,
+):
+    store = ConversationStore(tmp_path)
+    store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="work",
+    )
+    owner = BackgroundAgentOwner(store)
+    owner.conversation_channel.register_loop("root:1")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.bind_session_store(store)
+    if fence is None:
+        fence = TerminalTransitionFence(store)
+    loop = SimpleNamespace(
+        explicit_finish=True,
+        agent_instance_id="root:1",
+        _background_owner=owner,
+        _terminal_transition_fence=fence,
+        notification_wake=SimpleNamespace(pending_message=lambda: None),
+        tool_registry=registry,
+    )
+    prompts: list[str] = []
+
+    async def fake_consume(_loop, prompt, **kwargs):
+        prompts.append(prompt)
+        done = finish_after_calls is not None and len(prompts) >= finish_after_calls
+        if not done:
+            kwargs["finish_lifecycle"]("idle", "WAIT")
+        return {
+            "content": [{"type": "text", "text": "done" if done else "WAIT"}],
+            "isError": False,
+            "structuredContent": {"status": "done" if done else "running"},
+        }
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", fake_consume)
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "work",
+            child_store=store,
+            child_turns=lambda: len(prompts),
+            finish_lifecycle=lambda *_: {},
+            idle_clock=lambda: 0.0,
+            idle_wait=idle_wait,
+        )
+    )
+    return run, prompts, owner, registry, store
+
+
+@pytest.mark.asyncio
+async def test_idle_nudge_after_ten_minutes_without_running_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waits: list[float | None] = []
+
+    async def expire(_wait, timeout):
+        waits.append(timeout)
+        return False
+
+    run, prompts, owner, registry, store = await _idle_nudge_run(
+        tmp_path, monkeypatch, idle_wait=expire, finish_after_calls=2
+    )
+    await asyncio.wait_for(run, 1)
+    assert waits == [600.0]
+    assert prompts[1].startswith("you have been idle for 10 minutes")
+    owner.conversation_channel.unregister_loop("root:1")
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_nudge_waits_for_task_child_active_turn_and_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Fence:
+        def __init__(self) -> None:
+            self.checks = iter([False, False, False, False, True, True])
+
+        async def idle_nudge_eligible(self):
+            return next(self.checks)
+
+        async def reserve_idle_nudge(self):
+            return next(self.checks)
+
+    waits: list[float | None] = []
+
+    async def wake_then_expire(_wait, timeout):
+        waits.append(timeout)
+        return len(waits) < 5
+
+    run, prompts, owner, registry, store = await _idle_nudge_run(
+        tmp_path,
+        monkeypatch,
+        idle_wait=wake_then_expire,
+        fence=Fence(),
+        finish_after_calls=2,
+    )
+    await asyncio.wait_for(run, 1)
+    assert waits == [None, None, None, None, 600.0]
+    assert len(prompts) == 2
+    owner.conversation_channel.unregister_loop("root:1")
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_nudge_loses_to_prompt_committed_after_eligibility_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timed_out = False
+    eligibility_checked = asyncio.Event()
+    prompt_committed = asyncio.Event()
+    real_fence: TerminalTransitionFence | None = None
+
+    class PromptAfterEligibilityFence:
+        async def idle_nudge_eligible(self) -> bool:
+            assert real_fence is not None
+            eligible = await real_fence.idle_nudge_eligible()
+            if timed_out and eligible:
+                eligibility_checked.set()
+                await prompt_committed.wait()
+            return eligible
+
+        async def reserve_idle_nudge(self) -> bool:
+            assert real_fence is not None
+            eligibility_checked.set()
+            await prompt_committed.wait()
+            return await real_fence.reserve_idle_nudge()
+
+    async def expire(_wait, _timeout):
+        nonlocal timed_out
+        timed_out = True
+        return False
+
+    fence = PromptAfterEligibilityFence()
+    run, prompts, owner, registry, store = await _idle_nudge_run(
+        tmp_path,
+        monkeypatch,
+        idle_wait=expire,
+        fence=fence,
+        finish_after_calls=2,
+    )
+    real_fence = TerminalTransitionFence(store)
+
+    async def commit_prompt() -> None:
+        await eligibility_checked.wait()
+        store.append_pending_prompt("real follow-up")
+        prompt_committed.set()
+
+    commit = asyncio.create_task(commit_prompt())
+    await asyncio.wait_for(run, 1)
+    await commit
+    assert prompts == ["work", "real follow-up"]
+    owner.conversation_channel.unregister_loop("root:1")
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_wake_resets_nudge_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waits: list[float | None] = []
+
+    async def wake_then_expire(_wait, timeout):
+        waits.append(timeout)
+        return len(waits) == 1
+
+    run, prompts, owner, registry, store = await _idle_nudge_run(
+        tmp_path, monkeypatch, idle_wait=wake_then_expire, finish_after_calls=2
+    )
+    await asyncio.wait_for(run, 1)
+    assert waits == [600.0, 600.0]
+    assert len(prompts) == 2
+    owner.conversation_channel.unregister_loop("root:1")
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_nudge_stops_after_three_lifetime_nudges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fourth_wait = asyncio.Event()
+
+    async def expire_then_block(wait, timeout):
+        if timeout is not None:
+            return False
+        fourth_wait.set()
+        await wait()
+        return True
+
+    run, prompts, owner, registry, store = await _idle_nudge_run(
+        tmp_path, monkeypatch, idle_wait=expire_then_block
+    )
+    await asyncio.wait_for(fourth_wait.wait(), 1)
+    assert len(prompts) == 4
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    owner.conversation_channel.unregister_loop("root:1")
+    await registry.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_child_never_auto_finishes_for_time_or_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent.explicit_finish import idle_resource_usage
+    from zeta.tools.agent import _status_response
+
+    blocked = asyncio.Event()
+
+    async def expire_then_block(wait, timeout):
+        if timeout is not None:
+            return False
+        blocked.set()
+        await wait()
+        return True
+
+    run, prompts, owner, registry, store = await _idle_nudge_run(
+        tmp_path, monkeypatch, idle_wait=expire_then_block
+    )
+    await asyncio.wait_for(blocked.wait(), 1)
+    usage = idle_resource_usage([{"state": "idle"}] * 17)
+    assert usage == {
+        "idle_child_count": 17,
+        "idle_child_fd_floor": 51,
+        "idle_child_warning": True,
+    }
+    rows = [
+        {
+            "handle": f"root:{index}",
+            "state": "idle",
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "finished_at": None,
+            "elapsed": 600.0,
+            "turns_used": 1,
+            "tool_calls": 0,
+            "current_step": "idle, waiting for follow-up",
+            "depth": 1,
+            "agent_type": "worker",
+            "description": "work",
+            "cwd": "",
+            "idle_since": "2026-01-01T00:00:00+00:00",
+        }
+        for index in range(17)
+    ]
+    status = _status_response(
+        rows,
+        offset=0,
+        total=17,
+        truncated=False,
+        next_offset=None,
+        finished_omitted=0,
+    )
+    assert status["structuredContent"]["idle_child_count"] == 17
+    assert status["structuredContent"]["idle_child_fd_floor"] == 51
+    assert status["structuredContent"]["idle_child_warning"] is True
+    assert not run.done()
+    assert len(prompts) == 4
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
     store.close()
@@ -9519,13 +9811,46 @@ async def test_terminal_fence_serializes_finish_idle_nudge_cancel_and_recovery(
 ) -> None:
     from zeta.agent.terminal_fence import TerminalTransitionFence
 
-    store = ConversationStore(tmp_path)
-    fence = TerminalTransitionFence(store)
-    assert await fence.idle_nudge_eligible() is True
-    assert await fence.accept_finish({"status": "done", "summary": "done"}) is None
-    assert await fence.cancel() is False
-    assert await fence.recover() == {"status": "done", "summary": "done"}
-    assert await fence.idle_nudge_eligible() is False
+    prompt_store = ConversationStore(tmp_path, session_id="prompt")
+    prompt_fence = TerminalTransitionFence(prompt_store)
+    prompt_ready = asyncio.Event()
+
+    async def nudge_after_prompt() -> bool:
+        await prompt_ready.wait()
+        return await prompt_fence.reserve_idle_nudge()
+
+    nudge = asyncio.create_task(nudge_after_prompt())
+    prompt_store.append_pending_prompt("real follow-up")
+    prompt_ready.set()
+    assert await nudge is False
+
+    finish_store = ConversationStore(tmp_path, session_id="finish")
+    finish_fence = TerminalTransitionFence(finish_store)
+    finish_ready = asyncio.Event()
+
+    async def nudge_after_finish() -> bool:
+        await finish_ready.wait()
+        return await finish_fence.reserve_idle_nudge()
+
+    nudge = asyncio.create_task(nudge_after_finish())
+    assert await finish_fence.accept_finish({"status": "done", "summary": "done"}) is None
+    finish_ready.set()
+    assert await nudge is False
+    assert await finish_fence.cancel() is False
+    assert await finish_fence.recover() == {"status": "done", "summary": "done"}
+
+    cancel_store = ConversationStore(tmp_path, session_id="cancel")
+    cancel_fence = TerminalTransitionFence(cancel_store)
+    cancel_ready = asyncio.Event()
+
+    async def nudge_after_cancel() -> bool:
+        await cancel_ready.wait()
+        return await cancel_fence.reserve_idle_nudge()
+
+    nudge = asyncio.create_task(nudge_after_cancel())
+    assert await cancel_fence.cancel() is True
+    cancel_ready.set()
+    assert await nudge is False
 
 
 @pytest.mark.asyncio

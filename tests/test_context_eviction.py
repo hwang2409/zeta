@@ -2474,6 +2474,42 @@ async def test_old_turn_content_still_evicted(tmp_path: Path) -> None:
     assert "OLD_PROMPT_NEEDLE" not in str(calls["old-agent"].arguments)
 
 
+def test_notification_receipt_preserves_finish_head_sha_and_verdict() -> None:
+    import zeta.context_eviction as eviction_module
+
+    head_sha = "abcdef0123456789"
+    message = Message(
+        MessageRole.SYSTEM,
+        [TextContent("durable notifications:\n" + "large finish report " * 2_000)],
+        metadata={
+            "zeta_event": "agent_notifications",
+            "notifications": [
+                {
+                    "notification_id": "finish-1",
+                    "kind": "agent_completion",
+                    "child_instance_id": "root:1",
+                    "status": "completed",
+                    "report_status": "done",
+                    "head_sha": head_sha,
+                    "verdict": "pass",
+                    "summary": "large finish report " * 2_000,
+                }
+            ],
+        },
+    )
+
+    receipt = eviction_module._notification_receipt(message, 42)
+    fields = receipt.metadata["eviction_receipt_fields"]["payload"]
+    preserved = fields["notifications"][0]
+    assert preserved["head_sha"] == head_sha
+    assert preserved["verdict"] == "pass"
+    assert preserved["report_status"] == "done"
+    assert preserved["summary_sha256"]
+    assert "summary" not in preserved
+    assert "sha256" in receipt.content[0].text
+    assert "recall_history seq_start=42, seq_end=42" in receipt.content[0].text
+
+
 @pytest.mark.asyncio
 async def test_evict_digests_old_completion_notifications_and_recall_restores(
     tmp_path: Path,

@@ -12,6 +12,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ...agent.explicit_finish import (
+    format_idle_resource_usage,
+    idle_resource_usage,
+)
 from ...agent.presets import (
     GENERAL_PRESET,
     AgentType,
@@ -493,6 +497,20 @@ def _project_agent_status(
         idle_since = lifecycle.get("idle_since")
         if type(idle_since) is str:
             item["idle_since"] = idle_since
+    notifications = getattr(store, "agent_notifications", lambda **_kwargs: [])(
+        pending_only=False
+    )
+    report_status = next(
+        (
+            entry.data.get("report_status")
+            for entry in reversed(notifications)
+            if entry.data.get("child_instance_id") == handle
+            and entry.data.get("report_status") in {"done", "blocked", "failed"}
+        ),
+        None,
+    )
+    if isinstance(report_status, str):
+        item["report_status"] = report_status
     final_result = (
         _status_text(lifecycle.get("final_result", _MISSING), "final_result")
         if finished_at is not None
@@ -539,19 +557,25 @@ def _status_response(
     truncated: bool,
     next_offset: int | None,
     finished_omitted: int,
+    idle_usage: dict[str, object] | None = None,
 ) -> dict[str, object]:
     details = "\n".join(
         (
             "child {handle}: state: {state}; started_at: {started_at}; "
             "finished_at: {finished_at}; elapsed: {elapsed:.2f}s; "
             "turns_used: {turns_used}; step: {current_step}; "
-            "{cwd_field}result: {final_result}{unknown_reason}"
+            "{cwd_field}result: {final_result}{report_status_field}{unknown_reason}"
         ).format(
             **{
                 **child,
                 "final_result": child.get("final_result", ""),
                 "cwd_field": (
                     f"cwd: {child['cwd']}; " if child.get("cwd") else ""
+                ),
+                "report_status_field": (
+                    f"; report_status: {child['report_status']}"
+                    if child.get("report_status")
+                    else ""
                 ),
                 "unknown_reason": (
                     f"; reason: {child['reason']}"
@@ -574,8 +598,15 @@ def _status_response(
         else ""
     )
     details_text = f"\n{details}" if details else ""
+    idle_usage = idle_usage or idle_resource_usage(children)
+    resource_text = (
+        "\n" + format_idle_resource_usage(idle_usage)
+        if idle_usage["idle_child_count"]
+        else ""
+    )
     content_text = (
-        f"agent status: {len(children)} children{details_text}{notice}{omission_notice}"
+        f"agent status: {len(children)} children{resource_text}"
+        f"{details_text}{notice}{omission_notice}"
     )
     structured: dict[str, object] = {
         "children": children,
@@ -583,6 +614,8 @@ def _status_response(
         "truncated": truncated,
         "total": total,
     }
+    if idle_usage["idle_child_count"]:
+        structured.update(idle_usage)
     if finished_omitted:
         structured["finished_omitted"] = finished_omitted
     if truncated and next_offset is not None:
@@ -772,6 +805,7 @@ async def _agent_status(
     if limit is not None and (type(limit) is not int or limit < 1):
         return _agent_error("limit must be a positive integer", max_bytes)
     total = len(children)
+    root_idle_usage = idle_resource_usage(children)
     raw_page = children[offset : offset + limit if limit is not None else None]
     page: list[dict[str, StructuredContentValue]] = []
     for index, child in enumerate(raw_page):
@@ -800,6 +834,7 @@ async def _agent_status(
             truncated=truncated,
             next_offset=next_offset if truncated else None,
             finished_omitted=finished_omitted,
+            idle_usage=root_idle_usage,
         )
         try:
             fits = len(encode_json(result)) <= max_bytes
@@ -819,6 +854,7 @@ async def _agent_status(
         truncated=False,
         next_offset=None,
         finished_omitted=finished_omitted,
+        idle_usage=root_idle_usage,
     )
     if count == 1:
         result["content"] = [

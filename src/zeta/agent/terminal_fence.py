@@ -61,11 +61,19 @@ class TerminalTransitionFence:
             return self.accepted_report()
 
     async def idle_nudge_eligible(self) -> bool:
-        """Return phase-3 nudge eligibility through the shared fence."""
+        """Return whether the idle clock may run."""
         async with self._lock:
-            return (
-                self._store.pending_prompt_queue.terminal_transition() is None
-                and not self._store.pending_prompts()
-                and not self._notification_pending()
-                and not self._owned_work()
-            )
+            return self._idle_nudge_eligible()
+
+    async def reserve_idle_nudge(self) -> bool:
+        """Atomically let durable input win before reserving one nudge turn."""
+        async with self._lock:
+            return self._idle_nudge_eligible()
+
+    def _idle_nudge_eligible(self) -> bool:
+        return self._store.pending_prompt_queue.idle_nudge_eligible(
+            admission_allowed=lambda: (
+                not self._notification_pending() and not self._owned_work()
+            ),
+            persisted_notification_ids=self._persisted_notification_ids(),
+        )

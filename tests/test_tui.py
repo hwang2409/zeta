@@ -4151,6 +4151,39 @@ def test_agent_rendering_stays_on_one_status_line() -> None:
     assert isinstance(progress, Panel)
 
 
+def test_idle_agent_card_reports_count_fd_floor_and_warning(tmp_path: Path) -> None:
+    from zeta.tui.cards.agent_sync import AgentTranscriptTreeSnapshot
+
+    call = ToolCall(
+        "agent-idle",
+        "agent",
+        {"prompt": "inspect", "description": "idle tree"},
+    )
+    card = AgentCard(call)
+    root = tmp_path / "agent"
+    card.set_child_session_path(str(root))
+    snapshot = AgentTranscriptTreeSnapshot(
+        root,
+        (),
+        tuple(
+            {
+                "state": "idle",
+                "idle_since": "2026-01-01T00:00:00+00:00",
+            }
+            for _ in range(17)
+        ),
+    )
+
+    assert card.apply_transcript_snapshot(snapshot) is True
+    rendered = card.current()
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "idle · waiting for follow-up" in plain
+    assert "idle children: 17" in plain
+    assert "known fd floor: 51" in plain
+    assert "warning: more than 16 idle children" in plain
+
+
 def test_agent_running_card_shows_step_elapsed_and_turns() -> None:
     call = ToolCall(
         "agent-running",

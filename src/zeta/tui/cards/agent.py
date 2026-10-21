@@ -6,6 +6,7 @@ import asyncio
 import re
 import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from ...agent.conversation_channel import has_follow_up_loop
+from ...agent.explicit_finish import format_idle_resource_usage, idle_resource_usage
 from ...agent.presets import GENERAL_PRESET, get_agent_preset
 from ...agent.receipt import (
     agent_stats,
@@ -513,6 +515,23 @@ class AgentCard:
         if Path(self._child_session_path) != snapshot.root:
             return False
         tail = tuple(type(self)._tail_lines(snapshot, snapshot.root, MAX_TAIL_LINES))
+        usage = idle_resource_usage(snapshot.lifecycles)
+        status_lines: list[str] = []
+        root_lifecycle = snapshot.lifecycles[0] if snapshot.lifecycles else {}
+        if root_lifecycle.get("state") == "idle":
+            idle_since = root_lifecycle.get("idle_since")
+            try:
+                idle_seconds = max(
+                    0.0,
+                    (datetime.now(UTC) - datetime.fromisoformat(str(idle_since))).total_seconds(),
+                )
+            except ValueError:
+                idle_seconds = 0.0
+            status_lines.append(f"idle · waiting for follow-up · {idle_seconds:.1f}s")
+        if usage["idle_child_count"]:
+            status_lines.append(format_idle_resource_usage(usage))
+        if status_lines:
+            tail = (*status_lines, *tail)
         changed = not self._tail_loaded or tail != self._tail
         self._tail = tail
         self._tail_loaded = True

@@ -10,7 +10,7 @@ from ..core.checkpoints import _now
 from ..core.store import ConversationStore
 from ..protocol.types import MessageOrigin
 from ..tools.agent import agent_stats
-from .explicit_finish import kill_tasks_after_deadline
+from .explicit_finish import IdleNudgeLifecycle, kill_tasks_after_deadline
 from .finish_gate import FinishGateState
 from .receipt import (
     MAX_AGENT_RESULT_BYTES,
@@ -21,6 +21,12 @@ from .receipt import (
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
+
+
+_IDLE_NUDGE_PROMPT = (
+    "you have been idle for 10 minutes. call `finish` if the contract is complete, "
+    "call `ask_parent` if you are waiting on a decision, or continue the work."
+)
 
 
 def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -> None:
@@ -122,6 +128,11 @@ async def consume_run(
     finish_lifecycle = kwargs.get("finish_lifecycle")
     child_turns = kwargs.get("child_turns")
     final_finish_lifecycle = finish_lifecycle
+    idle_lifecycle = IdleNudgeLifecycle(
+        clock=kwargs.pop("idle_clock", None) or asyncio.get_running_loop().time,
+        wait=kwargs.pop("idle_wait", None),
+        nudge_seconds=kwargs.pop("idle_nudge_seconds", None),
+    )
 
     def keep_lifecycle_running(state: str, text: str) -> dict[str, object]:
         if not callable(child_turns):
@@ -144,7 +155,7 @@ async def consume_run(
     kwargs["record_report"] = segment_reports.append
     kwargs["finish_gate_state"] = FinishGateState()
 
-    idle_started: float | None = None
+    safety_started: float | None = None
     idle_published = False
     safety_task: asyncio.Task[tuple[str, ...]] | None = None
     try:
@@ -158,8 +169,8 @@ async def consume_run(
                 and isinstance(structured, dict)
                 and structured.get("status") == "running"
             )
-            if idle and idle_started is None:
-                idle_started = asyncio.get_running_loop().time()
+            if idle and safety_started is None:
+                safety_started = asyncio.get_running_loop().time()
             # Ack only after a follow-up actually reached the child. A cancel or
             # backend error mid-consume_child leaves the prompt pending, so the
             # next run gets a chance to redeliver it instead of it silently gone.
@@ -221,7 +232,7 @@ async def consume_run(
                     for task in child_loop.tool_registry.background_tasks.snapshot()
                 )
                 if running_tasks and safety_task is None:
-                    elapsed = asyncio.get_running_loop().time() - idle_started
+                    elapsed = asyncio.get_running_loop().time() - safety_started
                     timeout = max(
                         0.0,
                         child_loop._background_owner.finish_gate_task_timeout - elapsed,
@@ -231,9 +242,22 @@ async def consume_run(
                             child_loop.tool_registry.background_tasks, timeout
                         )
                     )
-                await child_loop._background_owner.conversation_channel.wait(
-                    child_loop.agent_instance_id
+                action = await idle_lifecycle.wait_for_idle_action(
+                    lambda: child_loop._background_owner.conversation_channel.wait(
+                        child_loop.agent_instance_id
+                    ),
+                    child_loop._terminal_transition_fence,
                 )
+                if action == "external_input":
+                    continue
+                _transition_running(child_loop, child_store)
+                result = await consume_child(
+                    child_loop,
+                    _IDLE_NUDGE_PROMPT,
+                    origin=MessageOrigin.AGENT_PROMPT,
+                    **kwargs,
+                )
+                idle_published = False
                 continue
             pending = child_store.close_pending_queue_if_empty()
             if pending:

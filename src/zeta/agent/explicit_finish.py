@@ -3,12 +3,107 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Literal
 
 from .presets import AgentPreset
 
 if TYPE_CHECKING:
     from ..tools._shared.process import BackgroundTaskRegistry
+    from .terminal_fence import TerminalTransitionFence
+
+
+IDLE_CHILD_FD_FLOOR = 3
+IDLE_CHILD_WARNING_THRESHOLD = 16
+
+IdleAction = Literal["external_input", "nudge"]
+
+
+async def _wait_for_idle_wake(
+    wait: Callable[[], Awaitable[None]], timeout: float | None
+) -> bool:
+    """Return true for an external wake and false for the nudge deadline."""
+    if timeout is None:
+        await wait()
+        return True
+    try:
+        await asyncio.wait_for(wait(), timeout=max(0.0, timeout))
+    except TimeoutError:
+        return False
+    return True
+
+
+class IdleNudgeLifecycle:
+    """Own idle-period timing, lifetime limits, and atomic nudge admission."""
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float],
+        wait: Callable[
+            [Callable[[], Awaitable[None]], float | None], Awaitable[bool]
+        ]
+        | None = None,
+        nudge_seconds: float | None = None,
+        nudge_limit: int = 3,
+    ) -> None:
+        self._clock = clock
+        self._wait = wait or _wait_for_idle_wake
+        self._nudge_seconds = 10 * 60 if nudge_seconds is None else nudge_seconds
+        self._nudge_limit = nudge_limit
+        self._idle_started: float | None = None
+        self._nudge_count = 0
+
+    async def wait_for_idle_action(
+        self,
+        wake: Callable[[], Awaitable[None]],
+        fence: TerminalTransitionFence,
+    ) -> IdleAction:
+        eligible = await fence.idle_nudge_eligible()
+        if eligible and self._nudge_count < self._nudge_limit:
+            now = self._clock()
+            if self._idle_started is None:
+                self._idle_started = now
+            timeout = self._nudge_seconds - (now - self._idle_started)
+        else:
+            self._idle_started = None
+            timeout = None
+
+        if await self._wait(wake, timeout):
+            self._idle_started = None
+            return "external_input"
+        if not await fence.reserve_idle_nudge():
+            self._idle_started = None
+            return "external_input"
+
+        self._nudge_count += 1
+        self._idle_started = None
+        return "nudge"
+
+
+def idle_resource_usage(states: Iterable[Mapping[str, object]]) -> dict[str, object]:
+    """Return the known resource floor for one root agent tree."""
+
+    idle_count = sum(
+        1
+        for state in states
+        if isinstance(state, dict) and state.get("state") == "idle"
+    )
+    fd_floor = idle_count * IDLE_CHILD_FD_FLOOR
+    return {
+        "idle_child_count": idle_count,
+        "idle_child_fd_floor": fd_floor,
+        "idle_child_warning": idle_count > IDLE_CHILD_WARNING_THRESHOLD,
+    }
+
+
+def format_idle_resource_usage(usage: dict[str, object]) -> str:
+    """Format one stable status line for tools and agent cards."""
+
+    count = usage["idle_child_count"]
+    floor = usage["idle_child_fd_floor"]
+    warning = "; warning: more than 16 idle children" if usage["idle_child_warning"] else ""
+    return f"idle children: {count}; known fd floor: {floor}{warning}"
 
 
 def eligible(*, global_enabled: bool, preset: AgentPreset, background: bool) -> bool:
