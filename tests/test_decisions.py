@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,7 @@ from zeta.tui.agent_card import AgentNavigation
 from zeta.tui.cards.decisions import DecisionsPanel
 from zeta.tui.overlay import OverlayControl
 from zeta.tui.render import format_status
+from zeta.tui.slash_handlers.decisions_panel import DecisionsMixin
 
 
 def _plain(lines: list[list[tuple[str, str]]]) -> str:
@@ -66,10 +68,10 @@ def test_status_bar_shows_main_indicator_during_discussion() -> None:
     assert "◆ main" not in hidden
 
 
-# -- scan across live sessions ---------------------------------------------
+# -- session-scoped scan ----------------------------------------------------
 
 
-def test_open_decisions_lists_live_open_items_from_two_sessions(tmp_path: Path) -> None:
+def test_open_decisions_lists_live_open_items_for_one_session(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "git")
     first = _session(tmp_path, project.project_id)
@@ -81,19 +83,59 @@ def test_open_decisions_lists_live_open_items_from_two_sessions(tmp_path: Path) 
     )
     _request(second, project.project_id, "Pick region", "Where to deploy.")
 
-    items = open_decisions(tmp_path)
-    titles = {item.record.title for item in items}
-    assert titles == {"Pick DB", "Pick region"}
-    assert {item.session_id for item in items} == {
-        first.store.session_id,
-        second.store.session_id,
-    }
-    assert all(item.project_name == "alpha" for item in items)
+    first_items = open_decisions(tmp_path, first.store.session_id)
+    assert {item.record.title for item in first_items} == {"Pick DB"}
+    assert all(item.project_name == "alpha" for item in first_items)
+
+    second_items = open_decisions(tmp_path, second.store.session_id)
+    assert {item.record.title for item in second_items} == {"Pick region"}
 
     first.store.close()
     second.store.close()
     # A closed (not live) session no longer contributes a pending decision.
-    assert open_decisions(tmp_path) == ()
+    assert open_decisions(tmp_path, first.store.session_id) == ()
+
+
+def test_decisions_slash_lists_only_current_session(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = _session(tmp_path, project.project_id)
+    other = _session(tmp_path, project.project_id)
+    _request(current, project.project_id, "Current", "This one.")
+    _request(other, project.project_id, "Other", "Not this one.")
+
+    app = SimpleNamespace(
+        _home=tmp_path,
+        _decisions_session_id=current.store.session_id,
+        loop=current,
+    )
+    output = DecisionsMixin.slash_decisions(app, "")
+    assert "Current" in output
+    assert "Other" not in output
+    assert current.store.session_id[:8] not in output
+
+    current.store.close()
+    other.store.close()
+
+
+def test_discussion_fork_decisions_use_source_session(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    source = _session(tmp_path, project.project_id)
+    other = _session(tmp_path, project.project_id)
+    record = _request(source, project.project_id, "Source", "Discuss this.")
+    _request(other, project.project_id, "Other", "Not this one.")
+    app = SimpleNamespace(
+        _fork_context=SimpleNamespace(source_session_id=source.store.session_id),
+        loop=SimpleNamespace(store=SimpleNamespace(session_id="fork")),
+    )
+    session_id = DecisionsMixin._decisions_session_id.fget(app)
+    assert session_id == source.store.session_id
+    assert [item.record.title for item in open_decisions(tmp_path, session_id)] == [
+        record.title
+    ]
+    source.store.close()
+    other.store.close()
 
 
 # -- popup rendering --------------------------------------------------------
