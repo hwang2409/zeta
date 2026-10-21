@@ -3,6 +3,7 @@
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from ..accounts import AccountId, AccountStore
 from ..core.login_flow import LoginProvider
 from .anthropic import (
     DEFAULT_REDIRECT_URI as ANTHROPIC_REDIRECT_URI,
@@ -47,7 +48,14 @@ def _redirect_contract(redirect_uri: str) -> tuple[int, str]:
     return parsed.port, parsed.path
 
 
-def build_login_provider(provider: str, home: Path) -> LoginProvider[OAuthTokens]:
+def build_login_provider(
+    provider: str, home: Path, *, account: str | None = None
+) -> LoginProvider[OAuthTokens]:
+    credential_path = (
+        AccountStore(home).credential_path(AccountId(provider, account))
+        if account is not None
+        else home / ("anthropic-oauth.json" if provider == "anthropic" else "codex-oauth.json")
+    )
     if provider == "anthropic":
         callback_port, callback_path = _redirect_contract(ANTHROPIC_REDIRECT_URI)
         return LoginProvider(
@@ -56,7 +64,7 @@ def build_login_provider(provider: str, home: Path) -> LoginProvider[OAuthTokens
             callback_path=callback_path,
             build_authorization_url=build_anthropic_authorization_url,
             exchange_authorization_code=exchange_anthropic_authorization_code,
-            credential_store=AnthropicCredentialStore(home / "anthropic-oauth.json"),
+            credential_store=AnthropicCredentialStore(credential_path),
             token_handle=_no_handle,
         )
     if provider == "codex":
@@ -67,7 +75,7 @@ def build_login_provider(provider: str, home: Path) -> LoginProvider[OAuthTokens
             callback_path=callback_path,
             build_authorization_url=build_codex_authorization_url,
             exchange_authorization_code=exchange_codex_authorization_code,
-            credential_store=CodexCredentialStore(home / "codex-oauth.json"),
+            credential_store=CodexCredentialStore(credential_path),
             token_handle=lambda tokens: extract_account_id(tokens.access_token),
         )
     raise ValueError(f"unsupported login provider: {provider}")

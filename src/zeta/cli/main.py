@@ -11,6 +11,7 @@ import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from ..accounts import AccountError, AccountId, AccountStore
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.login_flow import run_login
@@ -262,11 +263,15 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command")
     login_parser = commands.add_parser("login", help="log in to an OAuth provider")
     login_parser.add_argument(
-        "--provider",
-        choices=("anthropic", "codex"),
-        default="anthropic",
-        help="OAuth provider (default: anthropic)",
+        "provider", choices=("anthropic", "codex"), nargs="?", default="anthropic",
     )
+    login_parser.add_argument("--provider", dest="provider_flag", choices=("anthropic", "codex"))
+    login_parser.add_argument("--account", default="default")
+    login_parser.add_argument("--replace", action="store_true")
+    accounts_parser = commands.add_parser("accounts", help="manage subscription accounts")
+    accounts_parser.add_argument("action", nargs="?", choices=("default", "logout", "refresh"))
+    accounts_parser.add_argument("account", nargs="?")
+    accounts_parser.add_argument("--json", action="store_true")
     from .inbox import add_subcommand as _add_inbox_subcommand
     from .project import add_subcommand as _add_project_subcommand
     from .session import add_subcommand as _add_session_subcommand
@@ -374,10 +379,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_login(provider: str) -> str | None:
-    return asyncio.run(
-        run_login(build_login_provider(provider, env_home()), pkce_values)
-    )
+def _run_login(provider: str, account: str, replace: bool) -> str | None:
+    home = env_home()
+    store = AccountStore(home)
+    provider_impl = build_login_provider(provider, home, account=account)
+    handle = asyncio.run(run_login(provider_impl, pkce_values))
+    tokens = provider_impl.credential_store.read()
+    if tokens is None:
+        raise AccountError("login did not produce credentials")
+    store.ensure_account(AccountId(provider, account), tokens, replace=replace)
+    return handle
 
 
 def _cleanup_ephemeral(app: object) -> None:
@@ -426,7 +437,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "login":
         try:
-            handle = _run_login(args.provider)
+            provider = args.provider or args.provider_flag
+            if provider is None:
+                parser.error("login requires a provider")
+            handle = (
+                _run_login(provider)
+                if args.account == "default" and not args.replace
+                else _run_login(provider, args.account, args.replace)
+            )
         except KeyboardInterrupt:
             print("login cancelled", file=sys.stderr)
             return 1
@@ -435,6 +453,25 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"logged in as {handle}" if handle else "ok")
         return 0
+    if args.command == "accounts":
+        store = AccountStore(env_home())
+        try:
+            if args.action == "default":
+                if not args.account or ":" not in args.account:
+                    raise AccountError("default requires provider:name")
+                provider, name = args.account.split(":", 1)
+                store.set_default(AccountId(provider, name))
+            elif args.action == "logout":
+                raise AccountError("logout is deferred to phase 2")
+            elif args.action == "refresh":
+                raise AccountError("refresh is deferred to phase 2")
+            else:
+                accounts = [str(item) for item in store.list()]
+                print(json.dumps(accounts) if args.json else "\\n".join(accounts))
+            return 0
+        except AccountError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     if args.command == "mcp":
         from ..core.project_context import discover_repo_root
         from ..mcp.management import MCPManagementError, MCPManagementService

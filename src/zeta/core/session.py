@@ -123,6 +123,9 @@ class SessionMetadata:
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
+    account_selections: dict[str, str] = field(default_factory=dict)
+    native_boundaries: dict[str, int] = field(default_factory=dict)
+    switch_sequence: int = 0
 
     @classmethod
     def new(
@@ -153,6 +156,9 @@ class SessionMetadata:
         tool_allow: tuple[str, ...] | None = None,
         tool_deny: tuple[str, ...] = (),
         tool_allow_layers: tuple[tuple[str, ...], ...] = (),
+        account_selections: dict[str, str] | None = None,
+        native_boundaries: dict[str, int] | None = None,
+        switch_sequence: int = 0,
     ) -> SessionMetadata:
         timestamp = _now()
         return cls(
@@ -188,6 +194,9 @@ class SessionMetadata:
             tool_allow=tool_allow,
             tool_deny=tool_deny,
             tool_allow_layers=tool_allow_layers,
+            account_selections=dict(account_selections or {}),
+            native_boundaries=dict(native_boundaries or {}),
+            switch_sequence=switch_sequence,
         )
 
     @classmethod
@@ -344,6 +353,17 @@ class SessionMetadata:
                 raise SessionError(
                     f"session metadata agent catalog is invalid: {path}"
                 ) from exc
+        account_selections = value.get("account_selections", {})
+        native_boundaries = value.get("native_boundaries", {})
+        switch_sequence = value.get("switch_sequence", 0)
+        if (
+            not isinstance(account_selections, dict)
+            or any(type(k) is not str or type(v) is not str for k, v in account_selections.items())
+            or not isinstance(native_boundaries, dict)
+            or any(type(k) is not str or type(v) is not int or v < 0 for k, v in native_boundaries.items())
+            or type(switch_sequence) is not int or switch_sequence < 0
+        ):
+            raise SessionError(f"session account selection is invalid: {path}")
         return cls(
             version=value["version"],
             session_id=value["session_id"],
@@ -380,6 +400,9 @@ class SessionMetadata:
             tool_allow=tool_allow,
             tool_deny=tool_deny,
             tool_allow_layers=tool_allow_layers,
+            account_selections=account_selections,
+            native_boundaries=native_boundaries,
+            switch_sequence=switch_sequence,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -406,6 +429,9 @@ class SessionMetadata:
             "project_id": self.project_id,
             "project_role": self.project_role,
             "parent_session_id": self.parent_session_id,
+            "account_selections": self.account_selections,
+            "native_boundaries": self.native_boundaries,
+            "switch_sequence": self.switch_sequence,
             "project_memory_offset": self.project_memory_offset,
             "project_memory_length": self.project_memory_length,
             "project_memory_digest": self.project_memory_digest,
