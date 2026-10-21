@@ -12,6 +12,9 @@ from .bootstrap import surface_shutdown_notifications
 class RuntimeCloseMixin:
     """Close every resource once, preserving the first cleanup error."""
 
+    def _detach_ui_notice_sinks(self) -> None:
+        self.loop.set_mcp_notice_sink(None)
+
     def _init_runtime_close(self) -> None:
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
@@ -92,13 +95,15 @@ class RuntimeCloseMixin:
             self._workspace_snapshot_store = None
             attempt(lambda: self.loop.set_background_event_sink(None))
             attempt(lambda: self.loop.set_background_wake_callback(None))
-            attempt(lambda: self.loop.set_mcp_notice_sink(None))
+            attempt(self._detach_ui_notice_sinks)
             attempt(lambda: self.loop.set_mcp_prompt_refresh(None))
             attempt(
                 lambda: self.loop.tool_registry.background_tasks.set_notice_sink(None)
             )
             if self._hooks is not None:
                 attempt(lambda: setattr(self._hooks, "notice_sink", None))
+            if self._history is not None:
+                attempt(lambda: self._history.set_notice_sink(None))
             self._active_session = None
             self._draft_session = None
             self._session = None

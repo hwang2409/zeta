@@ -185,6 +185,9 @@ def test_tui_run_replays_transcript_only_on_initial_start(
             async def ensure_mcp_servers(self) -> None:
                 pass
 
+            def set_mcp_notice_sink(self, sink: object) -> None:
+                del sink
+
         async def rebuild() -> bool:
             nonlocal replay_count
             replay_count += 1
@@ -266,6 +269,9 @@ def test_tui_run_releases_ui_ownership_before_restoring_terminal(
 
             async def activate(self) -> None:
                 pass
+
+            def set_mcp_notice_sink(self, sink: object) -> None:
+                del sink
 
         class Draft:
             async def flush_pending(self) -> None:
