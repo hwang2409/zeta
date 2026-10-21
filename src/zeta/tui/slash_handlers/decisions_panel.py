@@ -1,10 +1,10 @@
 """Prompt-toolkit lifecycle for the in-TUI decisions popup.
 
 ``TUIApp`` mixes this in. The mixin owns everything that touches live state: it
-scans open attention decisions across live sessions (off the event loop), feeds
+reads open attention decisions for the shown session (off the event loop), feeds
 the pure :class:`DecisionsPanel` view model, delivers a quick answer to the
 asking orchestrator's inbox, and starts a discussion fork and switches the TUI
-to it. The scan also drives the status-bar decisions count, which a bounded
+to it. The read also drives the status-bar decisions count, which a bounded
 poller keeps fresh while the app is open.
 """
 
@@ -51,6 +51,13 @@ class DecisionsMixin:
         return self._decisions_count
 
     @property
+    def _decisions_session_id(self) -> str:
+        fork_context = getattr(self, "_fork_context", None)
+        if fork_context is not None:
+            return fork_context.source_session_id
+        return self.loop.store.session_id
+
+    @property
     def decisions_panel_active(self) -> bool:
         return self._decisions_panel_open and self._full_screen_active()
 
@@ -58,14 +65,14 @@ class DecisionsMixin:
         del args
         from ...attention_decisions import open_decisions
 
-        items = open_decisions(self._home)
+        items = open_decisions(self._home, self._decisions_session_id)
         if not items:
             return "no open decisions"
         lines = ["open decisions:"]
         for item in items:
             lines.append(
                 f"  {item.record.title}  "
-                f"[{item.project_name} · {item.session_id[:8]}]"
+                f"[{item.project_name}]"
             )
         return "\n".join(lines)
 
@@ -91,7 +98,9 @@ class DecisionsMixin:
         from ...attention_decisions import open_decisions
 
         try:
-            items = await asyncio.to_thread(open_decisions, self._home)
+            items = await asyncio.to_thread(
+                open_decisions, self._home, self._decisions_session_id
+            )
         except OSError:
             return
         changed = len(items) != self._decisions_count
