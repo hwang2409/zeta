@@ -28,6 +28,7 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
             notification_wake, "persisted_ids", frozenset()
         ),
         owned_work=lambda: owned_work_descriptions(child_loop),
+        delivering_prompt_id=lambda: getattr(child_loop, "_delivering_prompt_id", None),
     )
     child_loop._terminal_transition_fence = fence
 
