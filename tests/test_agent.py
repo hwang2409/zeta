@@ -2788,7 +2788,11 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
 async def test_parallel_nested_lifecycle_events_survive_large_batch(
     tmp_path: Path,
 ) -> None:
-    backend = ParallelNestedReadBackend(44)
+    # Each concurrent child owns several session descriptors.  Keep a large
+    # batch under constrained CI limits without making the assertion depend on
+    # failed child setup.
+    count = 20 if os.sysconf("SC_OPEN_MAX") < 512 else 44
+    backend = ParallelNestedReadBackend(count)
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
         backend,
@@ -2812,7 +2816,7 @@ async def test_parallel_nested_lifecycle_events_survive_large_batch(
             StreamEventType.TOOL_EXECUTION_END,
         }
     ]
-    assert len(read_lifecycle) == 88
+    assert len(read_lifecycle) == count * 2
     errors = [
         event.error
         for event in events
@@ -6529,11 +6533,15 @@ class _TaskFinishGateBackend(CompletionBackend):
         *,
         mixed_child: bool = False,
         gate_delay: float = 0,
+        pause_before_gate: bool = False,
     ) -> None:
         self.command = command
         self.action = action
         self.mixed_child = mixed_child
         self.gate_delay = gate_delay
+        self.pause_before_gate = pause_before_gate
+        self.child_turn_paused = asyncio.Event()
+        self.release_child_turn = asyncio.Event()
         self.gate_seen = asyncio.Event()
         self.gate_delay_finished = asyncio.Event()
         self.gate_text = ""
@@ -6708,6 +6716,9 @@ class _TaskFinishGateBackend(CompletionBackend):
             else:
                 blocks = [TextContent("WAIT")]
         elif started:
+            if self.pause_before_gate:
+                self.child_turn_paused.set()
+                await self.release_child_turn.wait()
             blocks = [TextContent("premature child answer")]
         else:
             blocks = [TextContent("root complete")]
@@ -6815,11 +6826,11 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
     tmp_path: Path,
 ) -> None:
     backend = _TaskFinishGateBackend(
-        _python("import time; time.sleep(30)"), gate_delay=0.15
+        _python("import time; time.sleep(30)"), pause_before_gate=True
     )
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.5)
-    owner.finish_gate_task_timeout = 0.08
+    owner.finish_gate_task_timeout = 5
     loop = AgentLoop(
         backend,
         store,
@@ -6831,12 +6842,12 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
 
+    await asyncio.wait_for(backend.child_turn_paused.wait(), timeout=2)
+    owner.finish_gate_task_timeout = 0.08
+    backend.release_child_turn.set()
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
-    started = asyncio.get_running_loop().time()
     await asyncio.wait_for(run, timeout=2)
     notification = await _wait_completion(store)
-    elapsed = asyncio.get_running_loop().time() - started
-    assert elapsed < 0.2
     assert "finish-gate task safety bound expired" in notification.data["text"]
     assert notification.data.get("killed_task_ids")
     await loop.close()
