@@ -7,13 +7,14 @@ from pathlib import Path
 
 import httpx
 
-from ..accounts import AccountStore
+from ..accounts import AccountCredentialLockTimeoutError, AccountStore
 from ..core.login_flow import LoginError, LoginPortInUseError, run_login
 from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
 from .protocol import ProtocolError
 
 REQUESTS = ["login_start", "login_status", "login_cancel", "login_providers"]
+LOGIN_PUBLICATION_TIMEOUT_SECONDS = 60.0
 
 
 def failure(code: str, message: str) -> dict:
@@ -84,10 +85,16 @@ class Logins:
                     # The outer deadline covers the exchange as well as the callback.
                     timeout_seconds=self.timeout + 1,
                     on_authorization_url=url.set_result,
+                    publication_timeout_seconds=LOGIN_PUBLICATION_TIMEOUT_SECONDS,
                 )
             return {"state": "succeeded"}
         except TimeoutError:
             return failure("login_timeout", "Sign-in timed out. Log in again to retry.")
+        except AccountCredentialLockTimeoutError:
+            return failure(
+                "login_lock_timeout",
+                "Sign-in could not save credentials because the account is busy. Please try again.",
+            )
         except LoginPortInUseError as exc:
             provider_label = exc.provider.capitalize()
             return failure(

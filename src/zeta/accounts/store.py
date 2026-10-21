@@ -10,8 +10,13 @@ import re
 import stat
 import time
 import uuid
-from collections.abc import Iterator, Mapping
-from contextlib import ExitStack, asynccontextmanager, contextmanager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import (
+    AbstractContextManager,
+    ExitStack,
+    asynccontextmanager,
+    contextmanager,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -27,6 +32,10 @@ _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 class AccountError(RuntimeError):
     """A credential-safe account-store error."""
+
+
+class AccountCredentialLockTimeoutError(AccountError):
+    """Credential publication could not acquire its lifecycle lock in time."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,10 +176,20 @@ class AccountStore:
 
     @contextmanager
     def lifecycle_guard(
-        self, account: AccountId, *, wait: bool = True
+        self,
+        account: AccountId,
+        *,
+        wait: bool = True,
+        timeout: float | None = None,
     ) -> Iterator[int]:
         """Hold one account's stable lifecycle lock."""
 
+        if timeout is not None:
+            with _bounded_guard(
+                lambda: self.lifecycle_guard(account, wait=False), timeout
+            ) as home_fd:
+                yield home_fd
+            return
         with (
             self._home() as home_fd,
             self._lifecycle_guard(home_fd, account, wait=wait),
@@ -179,16 +198,50 @@ class AccountStore:
 
     @contextmanager
     def credential_guard(
-        self, account: AccountId, *, wait: bool = True
+        self,
+        account: AccountId,
+        *,
+        wait: bool = True,
+        timeout: float | None = None,
     ) -> Iterator[int]:
         """Hold registry then lifecycle locks for account publication."""
 
+        if timeout is not None:
+            with _bounded_guard(
+                lambda: self.credential_guard(account, wait=False), timeout
+            ) as home_fd:
+                yield home_fd
+            return
         with (
             self._home() as home_fd,
             self._lock_at(home_fd, ".accounts.lock", wait=wait),
             self._lifecycle_guard(home_fd, account, wait=wait),
         ):
             yield home_fd
+
+    def _recover_account(
+        self, home_fd: int, account: AccountId
+    ) -> OAuthTokens | None:
+        value = self._read_registry(home_fd)
+        tokens = _read_account_tokens(home_fd, account)
+        if str(account) not in value["accounts"] and tokens is not None:
+            self._register_account(home_fd, account, value)
+        return tokens
+
+    def _register_account(
+        self,
+        home_fd: int,
+        account: AccountId,
+        value: dict[str, Any] | None = None,
+    ) -> None:
+        value = value or self._read_registry(home_fd)
+        key = str(account)
+        value["accounts"][key] = {
+            "provider": account.provider,
+            "name": account.name,
+        }
+        value["defaults"].setdefault(account.provider, key)
+        self._write_registry(home_fd, value)
 
     def migrate(self) -> None:
         with (
@@ -210,9 +263,15 @@ class AccountStore:
             value = self._read_registry(home_fd)
             registered = str(account) in value["accounts"]
             legacy_exists = _exists_regular(home_fd, legacy_name)
+            staged = _read_account_tokens(home_fd, account)
             if registered:
-                with _open_account_directory(home_fd, account) as account_fd:
-                    _read_tokens(account_fd, "oauth.json")
+                if staged is None:
+                    raise AccountError("OAuth credentials are invalid; login required")
+                if legacy_exists:
+                    _unlink_legacy(home_fd, legacy_name)
+                return
+            if staged is not None:
+                self._register_account(home_fd, account, value)
                 if legacy_exists:
                     _unlink_legacy(home_fd, legacy_name)
                 return
@@ -305,16 +364,17 @@ class AccountCredentials:
         with self.store.lifecycle_guard(self.account) as home_fd:
             return _read_account_tokens(home_fd, self.account)
 
-    def save(self, tokens: OAuthTokens) -> None:
-        with self.store.credential_guard(self.account) as home_fd:
+    def save(
+        self, tokens: OAuthTokens, *, lock_timeout: float | None = None
+    ) -> None:
+        with self.store.credential_guard(
+            self.account, timeout=lock_timeout
+        ) as home_fd:
             self._publish(home_fd, tokens)
 
     def bootstrap(self) -> OAuthTokens | None:
         with self.store.credential_guard(self.account) as home_fd:
-            registered = (
-                str(self.account) in self.store._read_registry(home_fd)["accounts"]
-            )
-            tokens = _read_account_tokens(home_fd, self.account) if registered else None
+            tokens = self.store._recover_account(home_fd, self.account)
             if tokens is not None:
                 return tokens
             tokens = self._driver.bootstrap()
@@ -374,18 +434,19 @@ class AccountCredentials:
         self, client: httpx.AsyncClient, *, refresh: bool = False
     ) -> str:
         async with self._async_guard(registry=True) as home_fd:
-            registered = (
-                str(self.account) in self.store._read_registry(home_fd)["accounts"]
-            )
-            tokens = _read_account_tokens(home_fd, self.account) if registered else None
+            tokens = self.store._recover_account(home_fd, self.account)
             if tokens is None:
                 tokens = self._driver.bootstrap()
                 if tokens is None:
                     raise self._login_required_error()
                 self._publish(home_fd, tokens)
-            if refresh or not tokens.is_valid():
-                return await self._refresh_locked(home_fd, tokens, client)
-            return tokens.access_token
+            if not refresh and tokens.is_valid():
+                return tokens.access_token
+        async with self._async_guard(registry=False) as home_fd:
+            tokens = _read_account_tokens(home_fd, self.account)
+            if tokens is None:
+                raise self._login_required_error()
+            return await self._refresh_locked(home_fd, tokens, client)
 
     def _write(self, home_fd: int, tokens: OAuthTokens) -> None:
         with _account_directory(home_fd, self.account) as account_fd:
@@ -394,14 +455,7 @@ class AccountCredentials:
 
     def _publish(self, home_fd: int, tokens: OAuthTokens) -> None:
         self._write(home_fd, tokens)
-        value = self.store._read_registry(home_fd)
-        key = str(self.account)
-        value["accounts"][key] = {
-            "provider": self.account.provider,
-            "name": self.account.name,
-        }
-        value["defaults"].setdefault(self.account.provider, key)
-        self.store._write_registry(home_fd, value)
+        self.store._register_account(home_fd, self.account)
 
     def _login_required_error(self) -> RuntimeError:
         return self._driver.login_required_error(
@@ -410,33 +464,51 @@ class AccountCredentials:
 
     @asynccontextmanager
     async def _async_guard(self, *, registry: bool) -> Iterator[int]:
-        stack: ExitStack | None = None
-        deadline = time.monotonic() + OAUTH_REFRESH_TIMEOUT_SECONDS
-        while stack is None:
-            candidate = ExitStack()
-            try:
-                home_fd = await asyncio.to_thread(
-                    candidate.enter_context,
-                    (
-                        self.store.credential_guard(self.account, wait=False)
-                        if registry
-                        else self.store.lifecycle_guard(self.account, wait=False)
-                    ),
-                )
-            except AccountError as exc:
-                candidate.close()
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise self.auth_error_type(
-                        f"{self.provider_label} OAuth credential lock stalled"
-                    ) from exc
-                await asyncio.sleep(min(0.05, remaining))
-            else:
-                stack = candidate
+        stack = ExitStack()
+        guard = (
+            self.store.credential_guard(
+                self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            )
+            if registry
+            else self.store.lifecycle_guard(
+                self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            )
+        )
+        try:
+            home_fd = await asyncio.to_thread(stack.enter_context, guard)
+        except AccountCredentialLockTimeoutError as exc:
+            raise self.auth_error_type(
+                f"{self.provider_label} OAuth credential lock stalled"
+            ) from exc
         try:
             yield home_fd
         finally:
             await asyncio.shield(asyncio.to_thread(stack.close))
+
+
+@contextmanager
+def _bounded_guard(
+    guard: Callable[[], AbstractContextManager[int]], timeout: float
+) -> Iterator[int]:
+    deadline = time.monotonic() + timeout
+    while True:
+        stack = ExitStack()
+        try:
+            home_fd = stack.enter_context(guard())
+        except AccountError as exc:
+            stack.close()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AccountCredentialLockTimeoutError(
+                    "OAuth credential lock acquisition timed out"
+                ) from exc
+            time.sleep(min(0.05, remaining))
+        else:
+            break
+    try:
+        yield home_fd
+    finally:
+        stack.close()
 
 
 @contextmanager
@@ -540,6 +612,8 @@ def _verify_tokens(directory_fd: int, expected: OAuthTokens) -> None:
 def _read_account_tokens(home_fd: int, account: AccountId) -> OAuthTokens | None:
     try:
         with _open_account_directory(home_fd, account) as account_fd:
+            if not _exists(account_fd, "oauth.json"):
+                return None
             return _read_tokens(account_fd, "oauth.json")
     except FileNotFoundError:
         return None

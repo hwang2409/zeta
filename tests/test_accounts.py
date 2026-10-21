@@ -469,6 +469,133 @@ def test_refresh_after_migration_writes_the_account_credential(
     assert not (tmp_path / "anthropic-oauth.json").exists()
 
 
+@pytest.mark.parametrize("publication", ["bootstrap", "login"])
+def test_crash_between_credential_and_registry_publish_recovers_account(
+    publication: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = OAuthTokens("staged-access", "staged-refresh", 4_000_000_000)
+    credential = named_account_credentials(tmp_path, "anthropic")
+    bootstrap_calls = 0
+
+    def bootstrap() -> OAuthTokens:
+        nonlocal bootstrap_calls
+        bootstrap_calls += 1
+        return expected
+
+    monkeypatch.setattr(credential._driver, "bootstrap", bootstrap)
+    real_write_registry = AccountStore._write_registry
+
+    def crash(*args, **kwargs) -> None:
+        raise SystemExit("simulated process death")
+
+    monkeypatch.setattr(AccountStore, "_write_registry", crash)
+    with pytest.raises(SystemExit, match="simulated process death"):
+        if publication == "bootstrap":
+            credential.bootstrap()
+        else:
+            credential.save(expected)
+    monkeypatch.setattr(AccountStore, "_write_registry", real_write_registry)
+
+    def bootstrap_must_not_run() -> OAuthTokens:
+        raise AssertionError("bootstrap source was consulted during recovery")
+
+    monkeypatch.setattr(credential._driver, "bootstrap", bootstrap_must_not_run)
+
+    async def access() -> str:
+        async with httpx.AsyncClient() as client:
+            return await credential.access_token(client)
+
+    assert asyncio.run(access()) == expected.access_token
+    store = AccountStore(tmp_path)
+    assert store.list() == [AccountId("anthropic", "default")]
+    assert store.default("anthropic") == AccountId("anthropic", "default")
+    assert bootstrap_calls == (1 if publication == "bootstrap" else 0)
+
+
+def test_recovery_never_overwrites_a_corrupt_staged_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credential = named_account_credentials(tmp_path, "codex")
+    path = credential.path
+    path.parent.mkdir(parents=True)
+    corrupt = b"not valid oauth json\n"
+    path.write_bytes(corrupt)
+    monkeypatch.setattr(
+        credential._driver,
+        "bootstrap",
+        lambda: pytest.fail("bootstrap source was consulted during recovery"),
+    )
+
+    async def access() -> str:
+        async with httpx.AsyncClient() as client:
+            return await credential.access_token(client)
+
+    with pytest.raises(AccountError, match="credentials are invalid"):
+        asyncio.run(access())
+    assert path.read_bytes() == corrupt
+    assert not AccountStore(tmp_path).contains(AccountId("codex", "default"))
+
+
+def test_bootstrap_refresh_runs_without_the_registry_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expired = OAuthTokens("expired", "refresh", 1.0)
+    refreshed = OAuthTokens("fresh", "new-refresh", 4_000_000_000)
+    credential = named_account_credentials(tmp_path, "codex")
+    other = named_account_credentials(tmp_path, "codex", "other")
+    other.save(tokens())
+    monkeypatch.setattr(credential._driver, "bootstrap", lambda: expired)
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    refresh_done = threading.Event()
+    operations_done = threading.Event()
+    failures: list[BaseException] = []
+
+    async def refresh(*_args) -> OAuthTokens:
+        refresh_started.set()
+        await asyncio.to_thread(release_refresh.wait)
+        return refreshed
+
+    monkeypatch.setattr(credential, "refresh", refresh)
+
+    def resolve() -> None:
+        try:
+            async def access() -> None:
+                async with httpx.AsyncClient() as client:
+                    assert await credential.access_token(client) == refreshed.access_token
+
+            asyncio.run(access())
+        except Exception as exc:  # noqa: BLE001 - report thread failures in test
+            failures.append(exc)
+        finally:
+            refresh_done.set()
+
+    def mutate_registry() -> None:
+        try:
+            store = AccountStore(tmp_path)
+            assert AccountId("codex", "default") in store.list()
+            store.set_default(AccountId("codex", "other"))
+        except Exception as exc:  # noqa: BLE001 - report thread failures in test
+            failures.append(exc)
+        finally:
+            operations_done.set()
+
+    refresh_thread = threading.Thread(target=resolve)
+    refresh_thread.start()
+    assert refresh_started.wait(timeout=5)
+    registry_thread = threading.Thread(target=mutate_registry)
+    registry_thread.start()
+    try:
+        assert operations_done.wait(timeout=1), "registry remained locked during refresh"
+    finally:
+        release_refresh.set()
+        refresh_thread.join(timeout=5)
+        registry_thread.join(timeout=5)
+    assert refresh_done.is_set()
+    assert not failures
+    assert AccountStore(tmp_path).default("codex") == AccountId("codex", "other")
+
+
 def test_bootstrap_writes_credential_registry_row_and_default_together(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
