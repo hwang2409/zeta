@@ -3543,19 +3543,12 @@ def test_default_credential_store_honors_isolated_zeta_home(
 
     store = credential_store("codex", home=zeta_home)
     assert store is not None
-    store.path.parent.mkdir(parents=True)
-    store.path.write_text(
-        json.dumps(
-            {
-                "access_token": access_token(),
-                "refresh_token": "zeta-refresh",
-            }
-        )
-    )
+    expected = OAuthTokens(access_token(), "zeta-refresh", 4_000_000_000.0)
+    store.save(expected)
 
     assert store.path == zeta_home / "accounts" / "codex" / "default" / "oauth.json"
-    assert store.bootstrap() is None
-    assert store.read() is not None
+    assert store.bootstrap() == expected
+    assert store.read() == expected
 
 
 @pytest.mark.parametrize("codex_home", [None, ""])

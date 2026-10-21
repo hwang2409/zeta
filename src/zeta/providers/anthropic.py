@@ -17,7 +17,6 @@ from urllib.parse import urlencode
 
 import httpx
 
-from ..core.session import env_home
 from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
 from .anthropic_payload import (
     ANTHROPIC_MAX_BASE64_CHARACTERS,
@@ -210,15 +209,11 @@ class AnthropicCredentialStore(OAuthCredentialStore):
 
     def __init__(
         self,
-        path: str | Path | None = None,
+        path: str | Path,
         *,
         claude_credentials: str | Path | None = None,
         token_url: str = TOKEN_URL,
     ) -> None:
-        if path is None:
-            from ..accounts import AccountStore
-
-            path = AccountStore(env_home()).resolve_credential_path("anthropic")
         super().__init__(path, token_url=token_url)
         self.claude_credentials = (
             Path(claude_credentials) if claude_credentials is not None else None
@@ -459,7 +454,12 @@ class AnthropicBackend(CompletionBackend):
         self.max_tokens = max_tokens
         self.thinking_budget = thinking_budget
         self.base_url = base_url.rstrip("/")
-        self.token_store = token_store or AnthropicCredentialStore()
+        if token_store is None:
+            from .factory import credential_store
+
+            token_store = credential_store("claude")
+            assert token_store is not None
+        self.token_store = token_store
         self.client = client
         self.diagnostics_path = (
             Path(diagnostics_path)

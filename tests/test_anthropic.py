@@ -1898,7 +1898,8 @@ def test_default_claude_store_honors_isolated_zeta_home(
     claude_dir.mkdir(parents=True)
     (claude_dir / ".credentials.json").write_text("not zeta's file")
 
-    store = AnthropicCredentialStore()
+    store = credential_store("claude")
+    assert store is not None
 
     assert store.path == zeta_home / "accounts" / "anthropic" / "default" / "oauth.json"
     assert store.bootstrap() is None

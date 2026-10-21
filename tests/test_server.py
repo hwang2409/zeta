@@ -3397,6 +3397,7 @@ async def test_cross_provider_settings_reject_mid_turn_then_apply_when_idle(tmp_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", ["claude", "codex"])
 async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, monkeypatch, target):
+    from zeta.accounts import AccountCredentials
     from zeta.providers.anthropic import AnthropicCredentialStore
     from zeta.providers.auth import OAuthTokens
     from zeta.providers.codex import CodexCredentialStore
@@ -3431,7 +3432,7 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, mo
         assert response["result"] == {"model": model, "approval_mode": "deny"}
         assert runtime.provider == target
         assert runtime.loop.backend is not backend
-        assert isinstance(runtime.loop.backend.token_store, credential_type)
+        assert isinstance(runtime.loop.backend.token_store, AccountCredentials)
     finally:
         await _close(server, writer)
 

@@ -17,7 +17,7 @@ from ..codex import (
     DEFAULT_CODEX_REDIRECT_URI,
     CodexAuthError,
     CodexBackendError,
-    CodexCredentialStore,
+    CodexCredentialStore,  # noqa: F401 - public provider-module export
     CodexHTTPError,
     CodexStreamError,
     build_authorization_url,
@@ -173,7 +173,7 @@ class CodexBackend(CompletionBackend):
         *,
         model: str = DEFAULT_CODEX_MODEL,
         base_url: str = CODEX_API_URL,
-        token_store: CodexCredentialStore | None = None,
+        token_store: Any | None = None,
         client: httpx.AsyncClient | None = None,
         diagnostics_path: str | Path | None = None,
         stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
@@ -181,7 +181,12 @@ class CodexBackend(CompletionBackend):
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
-        self.token_store = token_store or CodexCredentialStore()
+        if token_store is None:
+            from .factory import credential_store
+
+            token_store = credential_store("codex")
+            assert token_store is not None
+        self.token_store = token_store
         self.client = client
         self.diagnostics_path = (
             Path(diagnostics_path)

@@ -12,7 +12,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from ..accounts import AccountId, AccountStore
+from ..accounts import AccountCredentials, AccountId, AccountStore
+from ..codex import CodexCredentialStore
 from ..config.settings import load_settings
 from ..core.session import env_home
 from ..core.slash import budget_for_model, effective_budget_for_model
@@ -25,8 +26,7 @@ from .anthropic import (
     AnthropicCredential,
     AnthropicCredentialStore,
 )
-from .auth import OAuthCredentialStore
-from .codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
+from .codex import DEFAULT_CODEX_MODEL, CodexBackend
 from .ollama import DEFAULT_OLLAMA_MODEL, OLLAMA_API_URL, OllamaBackend
 from .transport import DEFAULT_STREAM_STALL_RETRIES, DEFAULT_STREAM_STALL_SECONDS
 
@@ -44,18 +44,20 @@ def credential_store(
     *,
     home: str | Path | None = None,
     account: AccountId | None = None,
-) -> OAuthCredentialStore | None:
-    """Return the provider's OAuth store, or None when it needs no credentials."""
+) -> AccountCredentials | None:
+    """Return the account credential adapter, or None for credential-free providers."""
 
     if provider not in {"claude", "codex"}:
         return None
     auth_home = Path(home) if home is not None else env_home()
-    path = AccountStore(auth_home).resolve_credential_path(provider, account)
-    if provider == "claude":
-        return AnthropicCredentialStore(path)
-    if provider == "codex":
-        return CodexCredentialStore(path)
-    return None
+    registry = AccountStore(auth_home)
+    selected = registry.resolve_account(provider, account)
+    driver = (
+        AnthropicCredentialStore(auth_home / ".anthropic-bootstrap")
+        if provider == "claude"
+        else CodexCredentialStore(auth_home / ".codex-bootstrap")
+    )
+    return AccountCredentials(registry, selected, driver)
 
 
 def _anthropic_credential(auth_home: Path) -> AnthropicCredential:
@@ -148,11 +150,11 @@ def build_backend(
 
 
 def _require_credentials(
-    credential: AnthropicCredential | OAuthCredentialStore,
+    credential: AnthropicCredential | AccountCredentials,
 ) -> None:
     """Check local login availability without refreshing or sending a request."""
     if (
-        isinstance(credential, OAuthCredentialStore)
+        isinstance(credential, AccountCredentials)
         and credential.read() is None
         and credential.bootstrap() is None
     ):

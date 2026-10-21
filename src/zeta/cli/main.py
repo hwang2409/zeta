@@ -8,7 +8,6 @@ import copy
 import json
 import os
 import sys
-from dataclasses import replace
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
@@ -18,7 +17,6 @@ from ..core.commands.completion import completion_script
 from ..core.login_flow import run_login
 from ..core.session import SessionError, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
-from ..oauth import OAuthTokens
 from ..providers.login import build_login_provider, pkce_values
 from ..tui.app import create_app
 from ..tui.key_bindings import TerminalRenderError
@@ -385,14 +383,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-class _CredentialCapture:
-    def __init__(self) -> None:
-        self.tokens: OAuthTokens | None = None
-
-    def save(self, tokens: OAuthTokens) -> None:
-        self.tokens = tokens
-
-
 def _run_login(
     provider: str, account: str = "default", replace_existing: bool = False
 ) -> str | None:
@@ -400,32 +390,29 @@ def _run_login(
     store = AccountStore(home)
     account_id = AccountId(provider, account)
     with store.provider_login_lock(provider):
-        exists = store.contains(account_id)
-        if exists and not replace_existing:
-            if not sys.stdin.isatty() or input(
-                f"replace {account_id}? [y/N] "
-            ).lower() not in {"y", "yes"}:
-                raise AccountError(
-                    f"account {account_id} already exists; use --replace"
-                )
-            replace_existing = True
-        capture = _CredentialCapture()
-        provider_impl = replace(
-            build_login_provider(provider, home), credential_store=capture
+        if store.contains(account_id) and not replace_existing:
+            raise AccountError(f"account {account_id} already exists; use --replace")
+        return asyncio.run(
+            run_login(build_login_provider(provider, home, account), pkce_values)
         )
-        handle = asyncio.run(run_login(provider_impl, pkce_values))
-        if capture.tokens is None:
-            raise AccountError("login did not produce credentials")
-        store.ensure_account(account_id, capture.tokens, replace=replace_existing)
-        return handle
 
 
 def _handle_login(args: argparse.Namespace) -> int:
     try:
+        replace_existing = args.replace
+        account = AccountId(args.provider, args.account)
+        if AccountStore(env_home()).contains(account) and not replace_existing:
+            if not sys.stdin.isatty() or input(
+                f"replace {account}? [y/N] "
+            ).lower() not in {"y", "yes"}:
+                raise AccountError(
+                    f"account {account} already exists; use --replace"
+                )
+            replace_existing = True
         handle = (
             _run_login(args.provider)
-            if args.account == "default" and not args.replace
-            else _run_login(args.provider, args.account, args.replace)
+            if args.account == "default" and not replace_existing
+            else _run_login(args.provider, args.account, replace_existing)
         )
     except KeyboardInterrupt:
         print("login cancelled", file=sys.stderr)

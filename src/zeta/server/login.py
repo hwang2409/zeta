@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 
+from ..accounts import AccountStore
 from ..core.login_flow import LoginError, LoginPortInUseError, run_login
 from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
@@ -70,10 +71,15 @@ class Logins:
         return task.result() if task.done() else {"state": "pending"}
 
     async def _run(self, provider: str, url: asyncio.Future[str]) -> dict:
+        login_provider = "anthropic" if provider == "claude" else provider
+        lock = AccountStore(self.home).provider_login_lock(login_provider)
+        locked = False
         try:
+            await asyncio.to_thread(lock.__enter__)
+            locked = True
             async with asyncio.timeout(self.timeout):
                 await run_login(
-                    build_login_provider("anthropic" if provider == "claude" else provider, self.home),
+                    build_login_provider(login_provider, self.home),
                     pkce_values,
                     # The outer deadline covers the exchange as well as the callback.
                     timeout_seconds=self.timeout + 1,
@@ -95,6 +101,11 @@ class Logins:
             # Provider responses can contain tokens or callback codes. Do not
             # forward exception text to the wire or transcript.
             return failure("login_failed", "Could not complete sign-in. Please try again.")
+        finally:
+            if locked:
+                await asyncio.shield(
+                    asyncio.to_thread(lock.__exit__, None, None, None)
+                )
 
     async def close(self) -> None:
         for task in self.tasks.values():

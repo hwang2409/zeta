@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
+import os
+import stat
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,12 +14,15 @@ import pytest
 
 import zeta.accounts.store as account_store
 import zeta.cli.main as cli_main
+import zeta.oauth as oauth_module
+import zeta.server.login as server_login
 from zeta.accounts import AccountError, AccountId, AccountStore
 from zeta.agent.runner import resolve_child_backend
+from zeta.codex import CodexCredentialStore
 from zeta.oauth import OAuthTokens
-from zeta.providers.codex import CodexCredentialStore
 from zeta.providers.factory import build_backend, credential_store
 from zeta.runtime import unattended
+from zeta.server.login import Logins
 from zeta.tui import models as tui_models
 
 _SENTINEL = "token-text-must-not-escape"
@@ -429,6 +434,174 @@ def test_refresh_after_migration_writes_the_account_credential(
     )
     assert store.read() == fresh
     assert not (tmp_path / "anthropic-oauth.json").exists()
+
+
+def test_bootstrap_writes_credential_registry_row_and_default_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claude_home = tmp_path / ".claude"
+    claude_home.mkdir()
+    source = claude_home / ".credentials.json"
+    source.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "bootstrap-access",
+                    "refreshToken": "bootstrap-refresh",
+                    "expiresAt": 4_000_000_000,
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ZETA_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    store = credential_store("claude", home=tmp_path / "zeta")
+    assert store is not None
+
+    async def access() -> str:
+        async with httpx.AsyncClient() as client:
+            return await store.access_token(client)
+
+    assert asyncio.run(access()) == "bootstrap-access"
+    registry = AccountStore(tmp_path / "zeta")
+    assert registry.list() == [AccountId("anthropic", "default")]
+    assert registry.default("anthropic") == AccountId("anthropic", "default")
+
+
+def test_refresh_racing_replacement_login_keeps_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = AccountId("codex", "default")
+    expired = OAuthTokens("old-access", "old-refresh", 1.0)
+    stale = OAuthTokens("stale-refresh", "stale-refresh-token", 4_000_000_000)
+    replacement = OAuthTokens("replacement", "replacement-refresh", 4_000_000_000)
+    AccountStore(tmp_path).ensure_account(account, expired)
+    credential = credential_store("codex", home=tmp_path)
+    assert credential is not None
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    replacement_started = threading.Event()
+    replacement_done = threading.Event()
+
+    async def refresh(_refresh_token: str, _client: httpx.AsyncClient) -> OAuthTokens:
+        refresh_started.set()
+        await asyncio.to_thread(release_refresh.wait)
+        return stale
+
+    monkeypatch.setattr(credential, "refresh", refresh)
+
+    def replace_login() -> None:
+        replacement_started.set()
+        AccountStore(tmp_path).ensure_account(account, replacement, replace=True)
+        replacement_done.set()
+
+    async def race() -> None:
+        async with httpx.AsyncClient() as client:
+            refresh_task = asyncio.create_task(credential.access_token(client))
+            await asyncio.to_thread(refresh_started.wait)
+            replacement_thread = threading.Thread(target=replace_login)
+            replacement_thread.start()
+            await asyncio.to_thread(replacement_started.wait)
+            # Old code publishes replacement while refresh is paused. The shared
+            # lifecycle lock makes replacement wait until refresh publishes.
+            await asyncio.to_thread(replacement_done.wait, 0.2)
+            release_refresh.set()
+            await refresh_task
+            replacement_thread.join(timeout=5)
+            assert not replacement_thread.is_alive()
+
+    asyncio.run(race())
+    assert credential.read() == replacement
+    assert not list((tmp_path / "accounts").rglob(".oauth.json.lock"))
+
+
+def test_account_credential_read_rejects_symlink_and_hardlink(tmp_path: Path) -> None:
+    for kind in ("symlink", "hardlink"):
+        home = tmp_path / kind
+        account = AccountId("codex", "default")
+        registry = AccountStore(home)
+        registry.ensure_account(account, tokens())
+        path = registry.credential_path(account)
+        credential = credential_store("codex", home=home)
+        assert credential is not None
+        outside = home / "outside.json"
+        outside.write_text(json.dumps(tokens().to_dict()))
+        path.unlink()
+        if kind == "symlink":
+            path.symlink_to(outside)
+        else:
+            path.hardlink_to(outside)
+
+        with pytest.raises(RuntimeError):
+            credential.read()
+
+
+def test_account_credential_write_fsyncs_file_then_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = AccountId("codex", "default")
+    AccountStore(tmp_path).ensure_account(account, tokens())
+    credential = credential_store("codex", home=tmp_path)
+    assert credential is not None
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def observed_fsync(fd: int) -> None:
+        events.append("directory-fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file-fsync")
+        real_fsync(fd)
+
+    def observed_replace(*args, **kwargs) -> None:
+        events.append("replace")
+        real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(account_store.os, "fsync", observed_fsync)
+    monkeypatch.setattr(account_store.os, "replace", observed_replace)
+    monkeypatch.setattr(oauth_module.os, "fsync", observed_fsync)
+    monkeypatch.setattr(oauth_module.os, "replace", observed_replace)
+
+    credential.save(OAuthTokens("new", "new-refresh", 4_000_000_000))
+
+    assert events.index("file-fsync") < events.index("replace")
+    assert events.index("replace") < events.index("directory-fsync")
+
+
+def test_cli_and_serve_login_share_provider_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli_entered = threading.Event()
+    release_cli = threading.Event()
+    serve_entered = threading.Event()
+
+    async def cli_login(provider, _pkce_values):
+        cli_entered.set()
+        await asyncio.to_thread(release_cli.wait)
+        provider.credential_store.save(tokens())
+
+    async def serve_login(*args, **kwargs):
+        serve_entered.set()
+
+    monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
+    monkeypatch.setattr(cli_main, "run_login", cli_login)
+    monkeypatch.setattr(server_login, "run_login", serve_login)
+    cli_thread = threading.Thread(target=cli_main._run_login, args=("anthropic",))
+    cli_thread.start()
+    assert cli_entered.wait(timeout=5)
+    async def run_serve_login() -> dict:
+        return await Logins(tmp_path)._run(
+            "claude", asyncio.get_running_loop().create_future()
+        )
+
+    try:
+        result = asyncio.run(run_serve_login())
+    finally:
+        release_cli.set()
+        cli_thread.join(timeout=5)
+
+    assert not cli_thread.is_alive()
+    assert result["state"] == "failed"
+    assert not serve_entered.is_set()
 
 
 def test_accounts_default_invalid_input_is_a_command_error(

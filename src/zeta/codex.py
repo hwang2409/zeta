@@ -19,7 +19,6 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .core.session import env_home
 from .oauth import OAuthCredentialStore, OAuthTokens
 
 
@@ -202,15 +201,11 @@ class CodexCredentialStore(OAuthCredentialStore):
 
     def __init__(
         self,
-        path: str | Path | None = None,
+        path: str | Path,
         *,
         codex_auth: str | Path | None = None,
         token_url: str = CODEX_TOKEN_URL,
     ) -> None:
-        if path is None:
-            from .accounts import AccountStore
-
-            path = AccountStore(env_home()).resolve_credential_path("codex")
         super().__init__(path, token_url=token_url)
         if codex_auth is not None:
             self.codex_auth = Path(codex_auth)
