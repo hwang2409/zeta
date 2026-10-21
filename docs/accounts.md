@@ -53,6 +53,18 @@ the session's pinned account through the same resolver. explicit
 tui implementation is [`slash_handlers/__init__.py:148-166`](../src/zeta/tui/slash_handlers/__init__.py#L148-L166);
 the serve implementation is [`model_selection.py:37-72`](../src/zeta/server/model_selection.py#L37-L72).
 
+anthropic's current bootstrap behavior is preserved: when the zeta OAuth file is
+absent, `AnthropicCredentialStore.access_token()` calls `bootstrap()` and reads
+Claude Code `claude_credentials`/`.credentials.json` or `credentials.json`, and
+on macOS may read the `Claude Code-credentials` keychain item, before saving a
+valid result into its zeta OAuth file ([`providers/anthropic.py:140-188,230-250`](../src/zeta/providers/anthropic.py#L140-L188),
+[`oauth.py:569-581`](../src/zeta/oauth.py#L569-L581), `origin/main` at
+`8d050961` or later). in the account model, the first such resolution is a
+lifecycle-locked, atomic materialization of that credential as
+`anthropic:default`, including its registry row and global default; it then uses
+the normal account resolver. bootstrap failure remains a safe login-required
+error, and no bootstrap token is copied into metadata or usage state.
+
 ## identity and storage
 
 an `AccountId` is `(provider, name)`, displayed as `anthropic:work` or
@@ -72,9 +84,12 @@ and local name.
     codex/<name>/usage.json
 ```
 
-`accounts.json` contains the schema, display metadata, per-provider global
- defaults, per-account selection metadata, and a monotonic switch sequence.
-`oauth.json` contains only the existing four token fields. `usage.json` contains
+`accounts.json` contains the schema, display metadata, and one global default
+per provider. it is the sole owner of the account catalog and defaults. each
+session's `meta.json` is the sole owner of which account that session uses and
+of its per-provider native-context boundary; it also stores the session's
+monotonic switch sequence. `oauth.json` contains only the existing four token
+fields. `usage.json` contains
 the normalized snapshot and refresh-attempt state. files are `0600`; directories
 are `0700`. secrets, auth headers, authorization codes, provider bodies, and
 exception text never enter logs, notices, model input, transcripts, tool results,
@@ -89,24 +104,30 @@ copy. for each legacy `anthropic-oauth.json` or `codex-oauth.json`:
 1. lock the registry and provider account lifecycle in the documented order:
    migration lock, registry lock, then provider lifecycle lock. read and validate
    the legacy file with the hardened reader.
-2. create the destination account directory and copy the validated token data to
-   `accounts/<provider>/default/oauth.json` using an exclusive temporary file.
-   `fsync` the file, `fsync` the destination directory, and verify that the
-   destination is readable and has the expected token schema.
+2. create `accounts/`, then `accounts/<provider>/`, then
+   `accounts/<provider>/default/`, using pinned no-follow descriptors. after each
+   new directory entry, `fsync` its parent directory (including `accounts/` and
+   `accounts/<provider>/`) before continuing. create the destination
+   `oauth.json`, copy the validated token data with an exclusive temporary file,
+   `fsync` the file, `fsync` its directory, and verify it is readable with the
+   expected token schema.
 3. atomically write the registry row and global default, `fsync` the registry file,
    then `fsync` the registry directory. this committed row is the authority.
-4. unlink the legacy file only after the registry commit, then `fsync` the legacy
-   parent directory. a successful migration has one writable owner.
+4. only after every directory entry, the file, the registry, and the readability
+   check are durable, unlink the legacy file, then `fsync` its parent directory.
+   a successful migration has one writable owner.
 
 at every crash boundary recovery takes the migration lock, reads the committed
-registry, and chooses exactly one authority: a committed row points to the
-validated destination; without that row the validated destination is an
-uncommitted duplicate and the intact legacy file remains authoritative. recovery
-completes the registry commit from the duplicate, or removes only the duplicate
-after verifying the legacy source. it never deletes the only valid token. if the
-legacy source disappeared but the destination and registry are both durable,
-the committed registry remains authoritative. if they are not both durable,
-recovery fails closed with a repair message rather than guessing.
+registry, and chooses exactly one authority. a crash while creating directories
+or before the destination file is durable leaves the legacy file authoritative;
+partial empty directories are harmless and may be removed. a durable destination
+without a registry row is an uncommitted duplicate, so the intact legacy file
+remains authoritative and recovery either completes the registry commit after
+revalidating both copies or removes only the duplicate. a crash after the
+registry commit but before unlink leaves both copies and recovery keeps the
+registry destination. a crash after unlink but before its parent `fsync` leaves
+the durable registry destination authoritative; recovery fails closed if neither
+complete authority is provable. it never deletes the only valid token.
 
 if two zeta processes start migration, one owns the migration lock and the other
 waits, rereads the committed registry, and does not copy or retire a second time.
@@ -115,12 +136,26 @@ login does not silently overwrite a named account.
 ## locking and mutation rules
 
 one registry lock protects every registry read-modify-write: account creation,
-replacement metadata, logout, global default, and session-selection metadata.
-one per-account lifecycle lock covers login/replace, logout, token refresh, and
-migration of that account. one per-account usage lock covers snapshots and
-refresh-attempt state. lock ordering is registry lock before lifecycle lock before
-usage lock; no operation takes them in reverse order. lock files are durable
-`0600` files and use the same process-safe exclusive locking primitive.
+replacement metadata, logout, and global default. one per-session metadata
+transaction owns session selection and its switch sequence; it is not a registry
+mutation. one per-account lifecycle lock covers login/replace, logout, token
+refresh, and migration of that account. one per-account usage lock covers
+snapshots and refresh-attempt state. lock ordering is registry lock before
+lifecycle lock before usage lock; no operation takes them in reverse order.
+lifecycle and usage lock files live in `~/.zeta/account-locks/<provider>/<name>/`,
+not inside the deletable account directory, and are durable `0600` files using
+the same process-safe exclusive primitive.
+
+an explicit usage request acquires the stable lifecycle lock first, then the
+usage lock, checks and records the cooldown, resolves or refreshes the token,
+keeps both locks through the provider request and final `usage.json` write, and
+releases them in reverse order. replace or logout waits for that request, then
+invalidates the old account generation before changing or deleting credentials.
+a result is attributed only to the generation that issued it; a replaced or
+logged-out generation's in-flight result is discarded and cannot populate the
+replacement. after logout no token from the old generation may be reused. a
+process-death recovery treats an abandoned in-flight attempt as failed, keeps
+the prior snapshot, and permits the next cooldown-governed request.
 
 refresh-attempt state persists `last_started_at`, `last_finished_at`, outcome,
 and safe error class. the 60-second cooldown is checked and written under the
@@ -154,7 +189,11 @@ v1; remote revocation and rename are later work.
 
 v1 claims usage at a glance only after terms review and verified endpoint
 adapters. the official claude code and codex clients' subscription endpoints are
-called with the same subscription credential. zeta calls them only from explicit
+called with the same subscription credential. the exact candidate requests are
+`GET https://api.anthropic.com/api/oauth/usage` (Anthropic),
+`GET https://chatgpt.com/backend-api/wham/usage` (Codex ChatGPT backend), and
+`GET https://chatgpt.com/api/codex/usage` (Codex alternate backend), as pinned in
+[codex-usage-client] and [codex-usage-url]. zeta calls them only from explicit
 user action, never background polling, and applies the persisted cooldown above.
 if terms do not permit an endpoint, endpoint-backed v1 is not shippable; passive
 or partial display is a preview and must not be presented as the requested v1.
@@ -162,10 +201,18 @@ or partial display is a preview and must not be presented as the requested v1.
 before implementation, record redacted fixtures from real responses for every
 accepted provider source. each fixture records the exact field name, accepted
 scale, reset units, missing/null behavior, and exact exhaustion value. unsupported
-variants remain `unknown`; no guessed conversion is allowed. the codex client
-source verifies `x-codex-primary-used-percent`, `x-codex-secondary-used-percent`,
-the usage paths, and `x-codex-rate-limit-reached-type` (pinned sources in the
-original proposal). the anthropic endpoint probe established only that
+variants remain `unknown`; no guessed conversion is allowed. the codex client source verifies
+`x-codex-primary-used-percent`, `x-codex-secondary-used-percent`, their window
+and reset fields, the two usage paths, and
+`x-codex-rate-limit-reached-type` ([codex-rate-limit-parser],
+[codex-usage-client], [codex-usage-url], and [codex-usage-mapping]). the
+Anthropic public reports [anthropic-usage-endpoint] and
+[anthropic-usage-concurrency-report] establish the endpoint, OAuth beta header,
+and observed `five_hour`/`seven_day` fields and 429 risk; the local probe
+reported the same shape. the codex mappings and all normalized exhaustion
+values remain unverified until phase-2 redacted fixtures, even where the pinned
+client source shows the field names. the anthropic endpoint probe established
+only that
 `five_hour` and `seven_day` objects can contain numeric `utilization` and
 `resets_at`; their scale and exhaustion fields are unverified until a redacted
 fixture is recorded. anthropic response-header mappings are also unverified and
@@ -204,16 +251,19 @@ performs confirmed local logout, and `d` changes the global default. text and
 screen-reader output include percent values and absolute local reset times; color
 is not required.
 
-there are two selections: a global default per provider for new sessions, and a
-per-session selected account per provider. a resumed session keeps its selection.
+there are two selections: `accounts.json` owns the global default per provider
+for new sessions, and that session's `meta.json` owns its selected account per
+provider. on resume, the session metadata wins; the global default is consulted
+only when the session has no saved selection (for example, a new session).
 children and session-owned background memory calls pin the session selection at
 creation; later parent/default changes never retarget them. automations pin the
 approved account and require re-approval to change it. serve methods require
 `session_id` for a switch; list is account-scoped and never changes selection.
 
-switching persists selection and the native-context boundary atomically in session
-metadata before replacing an idle backend. the boundary is a monotonic sequence
-per provider. payload filtering rejects native artifacts older than the boundary:
+switching persists selection, the native-context boundary, and the per-session
+switch sequence atomically in session metadata before replacing an idle backend.
+the boundary is a monotonic sequence per provider. payload filtering rejects
+native artifacts older than the boundary:
 Anthropic thinking signatures/redacted thinking and Codex encrypted reasoning are
 never made eligible again by switching back. on `a → b → a`, the third selection
 gets a new boundary. if metadata persistence or backend construction fails,
@@ -255,3 +305,10 @@ none are required to implement this v1. the selected product behavior is current
 session plus an explicit global default for future sessions; live children and
 other sessions are never retargeted. terms approval and redacted provider
 fixtures are release gates, not product questions.
+
+[codex-rate-limit-parser]: https://github.com/openai/codex/blob/430a16799d90e296fb27b1e94f206023902b7e56/codex-rs/codex-api/src/rate_limits.rs#L15-L87
+[codex-usage-client]: https://github.com/openai/codex/blob/430a16799d90e296fb27b1e94f206023902b7e56/codex-rs/backend-client/src/client/rate_limit_resets.rs#L15-L70
+[codex-usage-url]: https://github.com/openai/codex/blob/430a16799d90e296fb27b1e94f206023902b7e56/codex-rs/backend-client/src/client/rate_limit_resets.rs#L100-L113
+[codex-usage-mapping]: https://github.com/openai/codex/blob/430a16799d90e296fb27b1e94f206023902b7e56/codex-rs/backend-client/src/client.rs#L615-L750
+[anthropic-usage-endpoint]: https://github.com/anthropics/claude-code/issues/31021
+[anthropic-usage-concurrency-report]: https://github.com/anthropics/claude-code/issues/31319
