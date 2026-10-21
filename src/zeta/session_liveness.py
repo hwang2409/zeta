@@ -50,14 +50,6 @@ def current_process_identity() -> ProcessIdentity:
     return _CURRENT_PROCESS
 
 
-def process_is_live(identity: ProcessIdentity) -> bool:
-    """Return whether the exact process, excluding PID reuse, is alive."""
-
-    if identity == current_process_identity():
-        return True
-    return bool(identity.started) and _process_started(identity.pid) == identity.started
-
-
 def session_is_live(session_dir: Path) -> bool:
     """Return whether another process holds the cooperative session lease."""
     try:

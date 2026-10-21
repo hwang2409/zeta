@@ -23,7 +23,6 @@ from prompt_toolkit.key_binding.vi_state import InputMode
 from rich.text import Text
 
 from ..core.abort import AbortSignal
-from ..core.approval import ApprovalRequest
 from ..core.process_env import subprocess_env
 from ..protocol.types import (
     MESSAGE_ORIGIN_METADATA,
@@ -239,9 +238,7 @@ class TurnConsumerMixin:
                     self._spinner_frame = 0
                     self._spinner_reset.set()
                     self._streaming = True
-                    self._compaction_shown = False
                 elif event.type is StreamEventType.COMPACTION_START:
-                    self._compaction_shown = True
                     self._loop_state = "compacting"
                 elif event.type is StreamEventType.COMPACTION_END:
                     self._loop_state = "streaming"
@@ -665,13 +662,6 @@ class ComposerAttachmentMixin:
         self._pending_attachment_tokens.clear()
         self._next_image_token = 1
 
-    def _undo_candidate_for_message(self, text: str, message: Message) -> UndoCandidate:
-        return UndoCandidate.from_message(
-            text,
-            message,
-            self._pending_attachment_tokens,
-            self._next_image_token,
-        )
 
     def _restore_composer(self, value: str) -> None:
         session = self._active_session or self._session
@@ -884,21 +874,8 @@ class SubmissionMixin:
             steer=steer,
         )
 
-    def _pending_approvals_for_submission(
-        self, submission_id: int
-    ) -> tuple[ApprovalRequest, ...]:
-        owners = self._submissions.approval_owners
-        return tuple(
-            request
-            for request in self.pending_approvals
-            if owners.get(request.key) == submission_id
-        )
 
-    def _preprocessing_wait_set(self) -> set[asyncio.Task[Any]]:
-        return set(self._submissions.preprocessing_tasks.values())
 
-    def _drain_preprocessing(self, done: set[asyncio.Task[Any]]) -> None:
-        del done
 
     def _set_pipeline_task(self, task: asyncio.Task[Any]) -> None:
         self._active_task = task

@@ -31,7 +31,6 @@ class MemoryPromptProjection:
 
     block: str
     omitted_count: int
-    omitted_by_kind: tuple[tuple[str, int], ...]
 
 
 def _is_current(entry: MemoryEntry, now: str) -> bool:
@@ -175,8 +174,7 @@ def render_entry_memory(
         # has ample room for this fixed overhead.
         block = _render(state, kinds, (), {})
         omitted = {}
-    ordered_omitted = tuple((kind.key, omitted.get(kind.key, 0)) for kind in kinds if omitted.get(kind.key, 0))
-    return MemoryPromptProjection(block, sum(omitted.values()), ordered_omitted)
+    return MemoryPromptProjection(block, sum(omitted.values()))
 
 
 __all__ = ["MEMORY_PROMPT_BYTE_CAP", "MemoryPromptProjection", "render_entry_memory"]

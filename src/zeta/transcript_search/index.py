@@ -359,12 +359,6 @@ def _split_utf8(value: str, max_bytes: int) -> list[str]:
     return chunks or [""]
 
 
-def dump_units(units: Iterable[TranscriptUnit]) -> str:
-    """Serialize units as stable JSONL for fixtures and diagnostics."""
-
-    return "".join(json.dumps(unit.to_dict(), sort_keys=True) + "\n" for unit in units)
-
-
 SCHEMA_VERSION = 4
 SANITIZER_VERSION = 2
 INDEX_FILENAME = "transcript-index.sqlite3"

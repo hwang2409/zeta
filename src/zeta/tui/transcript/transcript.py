@@ -241,7 +241,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._lazy_viewport = False
         self._mouse_coordinate_base = 0
         self._virtual_start: tuple[int, int] | None = None
-        self._virtual_lines: list[list[tuple[str, str]]] = []
         self._virtual_locations: list[tuple[_TranscriptUnit | None, int]] = []
         self._virtual_width = 0
         self._virtual_height = 0
@@ -663,9 +662,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._highlight_cache = None
         self._focus_search_match()
 
-    def search_backspace(self) -> None:
-        if self._search_query:
-            self.update_search(self._search_query[:-1])
 
     def end_search(self) -> None:
         self._search_active = False
@@ -1176,9 +1172,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
 
         return self._resolved_selection()
 
-    def clear_selection(self) -> None:
-        self._selection = None
-        self.copy_notice = None
 
     def mouse_handler(self, mouse_event: MouseEvent):
         """Scroll on the wheel; turn a left-button drag into a copied selection.

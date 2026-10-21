@@ -149,8 +149,7 @@ class AgentCatalog:
                     prompt_suffix="",
                     selection_guidance=description,
                     model=model,
-                    source=source,
-                    path=Path(path) if path is not None else None,
+                                path=Path(path) if path is not None else None,
                     agents_root=Path(agents_root) if agents_root is not None else None,
                     allow_delegation=allow_delegation,
                     accepts_follow_ups=accepts_follow_ups,
@@ -238,7 +237,6 @@ def _build_agent(
         prompt_suffix=document.body,
         selection_guidance=description,
         model=model if isinstance(model, str) else None,
-        source=source,
         path=document.entry_path.absolute(),
         agents_root=document.root,
         allow_delegation=allow_delegation,
@@ -259,7 +257,6 @@ def discover_agents(
     agents_dir = agents_dir or _agents_dir(root)
     return discover_markdown(
         agents_dir,
-        source=source,
         kind="agent",
         build=lambda document: _build_agent(document, source, notices),
         notices=notices,

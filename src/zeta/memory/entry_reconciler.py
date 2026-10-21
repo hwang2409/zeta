@@ -255,7 +255,7 @@ def _kind(value: object, state: MemoryState, index: int) -> str:
 
 
 def _expiry(
-    value: object, state: MemoryState, kind: str, now: str, index: int
+    value: object, now: str, index: int
 ) -> str | None:
     if value is None:
         return None
@@ -292,7 +292,7 @@ def _operation_expiry(
     valid_until: str | None,
 ) -> Any:
     if "expires_in_days" in raw:
-        return _expiry(raw["expires_in_days"], state, kind, now, index)
+        return _expiry(raw["expires_in_days"], now, index)
     if valid_until is not None:
         grace = 14 if kind == "commitments" else 0
         return (

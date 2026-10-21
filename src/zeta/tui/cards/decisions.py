@@ -91,9 +91,6 @@ class DecisionsPanel:
     def mode(self) -> str:
         return self._mode
 
-    @property
-    def answer_text(self) -> str:
-        return self._answer
 
     @property
     def selected(self) -> DecisionItem | None:

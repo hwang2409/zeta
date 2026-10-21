@@ -318,7 +318,7 @@ class SshTransport:
             remote_cwd = Path(self._home()) / "remote-workspaces" / session_id
             previous = _read_manifest(outgoing)
             _rewrite_cwd(outgoing, remote_cwd)
-            _append_resume_hint(outgoing, remote_cwd, previous)
+            _append_resume_hint(outgoing)
             _write_json(
                 outgoing / "transfer.json",
                 _make_manifest(outgoing, str(remote_cwd), previous=previous),

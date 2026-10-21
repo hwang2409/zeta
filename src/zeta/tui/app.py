@@ -310,7 +310,6 @@ class TUIApp(
             lambda mount: app._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )
         self._submissions = SubmissionPipeline(app)
-        self._compaction_shown = False
         self._turn_had_visible_output = False
         self._failed_turn: tuple[str, Message] | None = None
         self._active_session: PromptSession[str] | None = None
@@ -627,9 +626,6 @@ class TUIApp(
         else:
             self._composer_insertions.append(token)
 
-    def _abort_approval(self, request_id: str | tuple[str, str]) -> None:
-        if self._approval_policy is not None:
-            self._approval_policy.abort(request_id)
 
     def _copy_selection(self, text: str) -> str:
         """Put a finished mouse selection on both clipboards; describe the outcome."""
@@ -833,9 +829,6 @@ class TUIApp(
             return
         self._submissions.wake()
 
-    def _handle_resumed_tool_event(self, event: StreamEvent) -> None:
-        self._handle_tool_event(event)
-        self._invalidate_prompt()
 
     def _discard_tool_region(self) -> None:
         self._presenter.discard_tool_region()
@@ -1070,7 +1063,6 @@ class TUIApp(
                 composer_rows,
                 footer,
                 self._todo_widget,
-                self.loop.store,
                 agent_navigation=self._agent_navigation,
                 on_scroll_up=self._transcript.scroll_up,
                 on_scroll_down=self._transcript.scroll_down,

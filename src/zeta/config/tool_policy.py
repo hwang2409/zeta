@@ -98,10 +98,6 @@ def parse_tool_patterns(value: str | None, *, field: str) -> tuple[str, ...] | N
     return validate_tool_patterns(value.split(","), field=field)
 
 
-def is_exact_tool_name(pattern: str) -> bool:
-    return parse_tool_selector(pattern).exact
-
-
 def _selectors(patterns: Sequence[str]) -> tuple[ToolSelector, ...]:
     return tuple(parse_tool_selector(pattern) for pattern in patterns)
 

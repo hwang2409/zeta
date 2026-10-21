@@ -319,38 +319,6 @@ def discover_project_root(cwd: str | Path | None = None) -> Path | None:
     return discovery.primary_root if discovery.eligible else None
 
 
-def same_git_repository(left: str | Path, right: str | Path) -> bool:
-    """Return whether two checkouts share one sanitized Git common directory."""
-
-    common_dirs: list[Path] = []
-    for directory in (left, right):
-        try:
-            value = subprocess.run(
-                [
-                    "git",
-                    "-c",
-                    "core.fsmonitor=false",
-                    "-C",
-                    str(Path(directory).expanduser().resolve()),
-                    "rev-parse",
-                    "--path-format=absolute",
-                    "--git-common-dir",
-                ],
-                check=True,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                env=_git_env(),
-                timeout=_GIT_TIMEOUT,
-            ).stdout.strip()
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return False
-        if not value:
-            return False
-        common_dirs.append(Path(value).expanduser().resolve())
-    return common_dirs[0] == common_dirs[1]
-
-
 def discover_or_find_project(
     registry: ProjectRegistry, cwd: str | Path, user_home: Path
 ) -> Project | None:

@@ -316,7 +316,7 @@ async def test_token_growth_position_is_durable_and_ignores_provider_usage(
     runner, registry, project_id, _ = _runner(
         tmp_path, token_threshold=50, transcript_count=1
     )
-    runner.observe_tokens(1_000_000)
+    runner.activity()
     await runner.drain()
     assert not registry.memory_log(project_id)
 

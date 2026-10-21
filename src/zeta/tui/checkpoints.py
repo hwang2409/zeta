@@ -435,12 +435,6 @@ class CheckpointTranscriptMixin:
         )
         return True
 
-    def _run_after_startup_replay(
-        self, action: str, callback: Callable[..., Any], *args: Any
-    ) -> Any:
-        if self._reject_during_startup_replay(action):
-            return None
-        return callback(*args)
 
     def _defer_startup_runtime_event(self, event: StreamEvent) -> bool:
         if not self._startup_replay_active:
@@ -895,7 +889,7 @@ def _restore_workspace(
     if resolution.status == "damaged":
         return False, f"workspace restore failed: {resolution.reason}"
     try:
-        restored = snapshots.restore(target.id, cwd, force=forced)
+        restored = snapshots.restore(target.id, force=forced)
     except WorkspaceSnapshotError as exc:
         return False, f"workspace restore failed: {exc}"
     return True, (

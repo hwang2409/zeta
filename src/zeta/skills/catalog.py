@@ -134,8 +134,7 @@ class SkillCatalog:
                     description=description,
                     keywords=keywords,
                     path=Path(path),
-                    source=source,
-                    skills_root=Path(skills_root),
+                                skills_root=Path(skills_root),
                 )
             )
         return cls(tuple(skills))
@@ -329,13 +328,11 @@ def discover_skills(
             description=description,
             keywords=keywords,
             path=document.entry_path.absolute(),
-            source=source,
-            skills_root=document.root,
+                skills_root=document.root,
         )
 
     return discover_markdown(
         skills_dir,
-        source=source,
         kind="skill",
         build=build,
         notices=notices,

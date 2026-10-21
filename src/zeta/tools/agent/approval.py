@@ -187,7 +187,7 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
     ) -> ApprovalRequest | None:
         """Format a request exclusively from its captured execution binding."""
         binding = self._pending_bindings.get(tool_call.id)
-        binding_required = self._binding_required(tool_call, capability)
+        binding_required = self._binding_required(capability)
         if binding_required and binding is None:
             return None
         effective_cwd = binding.cwd if isinstance(binding, ApprovedCwdExecution) else None
@@ -205,7 +205,6 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
 
     def _binding_required(
         self,
-        tool_call: ToolCall,
         capability: ApprovalCapability | None,
     ) -> bool:
         return str(capability.binding) != "none"
@@ -356,7 +355,7 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         capability: ApprovalCapability,
     ) -> ApprovalDecision:
         """Consume the pre-approval object fact and bind it to this execution."""
-        binding_required = self._binding_required(tool_call, capability)
+        binding_required = self._binding_required(capability)
         captured = tool_call.id in self._pending_bindings
         binding = self._pending_bindings.pop(tool_call.id, None)
         if binding_required and (not captured or binding is None):

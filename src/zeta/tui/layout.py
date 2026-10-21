@@ -29,7 +29,6 @@ from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from rich.cells import cell_len
 from ..core.session import _preview_text
 from ..core.slash import context_window
-from ..core.store import ConversationStore
 from . import theme
 from .agent_card import AgentNavigation
 from .composer import status_formatted_text, vim_state_label
@@ -542,7 +541,6 @@ def full_screen_content(
     composer_rows: Sequence[AnyContainer],
     footer: AnyContainer,
     todo_widget: TodoWidget,
-    store: ConversationStore,
     *,
     agent_navigation: AgentNavigation | None = None,
     on_scroll_up: Callable[[], None],
