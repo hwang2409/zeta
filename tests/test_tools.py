@@ -44,14 +44,18 @@ def _niceness_command() -> str:
     return _python_command("import os; print(os.getpriority(os.PRIO_PROCESS, 0))")
 
 
-def _descendant_command(marker: Path, delay: float = 0.3) -> str:
+def _descendant_command(
+    marker: Path, delay: float = 0.3, started: Path | None = None
+) -> str:
     child = (
         "import pathlib,time; "
         f"time.sleep({delay}); pathlib.Path({str(marker)!r}).write_text('alive')"
     )
     parent = (
-        "import subprocess,sys,time; "
-        f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(5)"
+        "import pathlib,subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+        + (f"pathlib.Path({str(started)!r}).write_text('started'); " if started else "")
+        + "time.sleep(5)"
     )
     return _python_command(parent)
 
@@ -1628,17 +1632,22 @@ async def test_bash_fast_command_is_not_marked_timed_out(tmp_path: Path) -> None
 @pytest.mark.asyncio
 async def test_bash_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> None:
     marker = tmp_path / "cancel-child-alive"
+    started = tmp_path / "cancel-child-started"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
                 "bash-cancel",
                 "bash",
-                {"command": _descendant_command(marker), "timeout": 5},
+                {"command": _descendant_command(marker, started=started), "timeout": 5},
             )
         )
     )
-    await asyncio.sleep(0.05)
+    for _ in range(100):
+        if started.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert started.exists()
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):

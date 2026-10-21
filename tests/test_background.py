@@ -645,17 +645,22 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     tracked = []
+    tracked_ready = asyncio.Event()
     owner = loop._background_owner
     track_store = owner.track_store
-    owner.track_store = lambda child_store: (
-        tracked.append(child_store),
-        track_store(child_store),
-    )
+
+    def track(child_store):
+        tracked.append(child_store)
+        track_store(child_store)
+        if len(tracked) == 2:
+            tracked_ready.set()
+
+    owner.track_store = track
 
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
         await asyncio.wait_for(backend.completion_started.wait(), timeout=5)
-        assert len(tracked) == 2
+        await asyncio.wait_for(tracked_ready.wait(), timeout=5)
         os.fstat(tracked[0].directory_fd)
 
         backend.completion_gate.set()
