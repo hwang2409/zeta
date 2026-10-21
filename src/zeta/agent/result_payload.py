@@ -31,10 +31,6 @@ class ChildResultPayloadMixin:
         notice: str | None = None,
         notice_items: Sequence[str] | None = None,
         max_bytes: int | None = None,
-        report_status: str | None = None,
-        summary: str | None = None,
-        head_sha: str | None = None,
-        verdict: str | None = None,
     ) -> dict[str, object]:
         child_store = self._agent_child_stores.get(tool_call_id)
         path = (
@@ -77,10 +73,6 @@ class ChildResultPayloadMixin:
             canceled=result_status == "canceled",
             notice=notice,
             notice_items=notice_items,
-            report_status=report_status,
-            summary=summary,
-            head_sha=head_sha,
-            verdict=verdict,
             max_bytes=(
                 max_bytes
                 if max_bytes is not None

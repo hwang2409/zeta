@@ -23,9 +23,11 @@ from ..protocol.types import (
 )
 from .conversation_channel import ConversationChannel, recover_orphaned_questions
 from .receipt import (
+    MAX_AGENT_RESULT_BYTES,
     TerminalState,
     agent_stats,
     build_agent_receipt,
+    build_explicit_finish_receipt,
     receipt_tool_result,
 )
 
@@ -878,14 +880,23 @@ async def finish_background_child(
     marker_key: str | None = None,
     agent_instance_id: str | None = None,
     background_owner: BackgroundAgentOwner | None = None,
+    max_receipt_bytes: int | None = None,
 ) -> None:
     """Persist a background child result and publish its terminal card event."""
 
     status = "completed"
     notification_text = ""
+    explicit_finish_report: dict[str, object] | None = None
+    explicit_finish_content: dict[str, object] | None = None
     try:
         try:
             result = await child_task
+            report = result.get("explicitFinishReport")
+            if isinstance(report, dict):
+                explicit_finish_report = report
+            structured = result.get("structuredContent")
+            if isinstance(structured, dict):
+                explicit_finish_content = structured
             content = result.get("content")
             if (
                 isinstance(content, list)
@@ -962,34 +973,43 @@ async def finish_background_child(
             turns_used=child_turns(),
         )
         result_text = notification_text or "background child completed"
-        build_parameters = inspect.signature(build_result).parameters
-        build_kwargs: dict[str, object] = {}
-        if "stats" in build_parameters:
-            build_kwargs["stats"] = terminal_stats
-        if "notice" in build_parameters:
-            build_kwargs["notice"] = killed_task_notice
-        if "notice_items" in build_parameters:
-            build_kwargs["notice_items"] = killed_tasks or None
-        if build_kwargs:
-            terminal_payload = build_result(
-                result_text,
-                status != "completed",
-                status,
-                **build_kwargs,
-            )
-        elif "stats" in build_parameters:
-            terminal_payload = build_result(
-                result_text,
-                status != "completed",
-                status,
+        if explicit_finish_report is not None:
+            terminal_payload = build_explicit_finish_receipt(
+                explicit_finish_report,
                 terminal_stats,
+                structured_content=explicit_finish_content,
+                tool_call_id=tool_call.id,
+                max_bytes=max_receipt_bytes or MAX_AGENT_RESULT_BYTES,
             )
         else:
-            terminal_payload = build_result(
-                result_text,
-                status != "completed",
-                status,
-            )
+            build_parameters = inspect.signature(build_result).parameters
+            build_kwargs: dict[str, object] = {}
+            if "stats" in build_parameters:
+                build_kwargs["stats"] = terminal_stats
+            if "notice" in build_parameters:
+                build_kwargs["notice"] = killed_task_notice
+            if "notice_items" in build_parameters:
+                build_kwargs["notice_items"] = killed_tasks or None
+            if build_kwargs:
+                terminal_payload = build_result(
+                    result_text,
+                    status != "completed",
+                    status,
+                    **build_kwargs,
+                )
+            elif "stats" in build_parameters:
+                terminal_payload = build_result(
+                    result_text,
+                    status != "completed",
+                    status,
+                    terminal_stats,
+                )
+            else:
+                terminal_payload = build_result(
+                    result_text,
+                    status != "completed",
+                    status,
+                )
         payload_content = terminal_payload.get("content")
         if (
             isinstance(payload_content, list)
@@ -1000,6 +1020,16 @@ async def finish_background_child(
             notification_text = payload_content[0]["text"]
         else:
             notification_text = result_text
+        payload_structured = terminal_payload.get("structuredContent")
+        notification_report = None
+        if explicit_finish_report is not None and isinstance(payload_structured, dict):
+            notification_report = {
+                "status": payload_structured["report_status"],
+                "summary": payload_structured["summary"],
+            }
+            for key in ("head_sha", "verdict"):
+                if key in payload_structured:
+                    notification_report[key] = payload_structured[key]
         # Always replace the raw lifecycle result with the same bounded final
         # receipt delivered to notification/recovery consumers. The store
         # preserves the already-recorded terminal status and timestamp.
@@ -1031,6 +1061,7 @@ async def finish_background_child(
                 killed_task_ids=killed_task_metadata or None,
                 killed_task_count=killed_task_count or None,
                 killed_task_ids_truncated=killed_task_ids_truncated,
+                report=notification_report,
             )
         else:
             notification = notification_store.append_agent_notification(
@@ -1043,6 +1074,7 @@ async def finish_background_child(
                 killed_task_ids=killed_task_metadata or None,
                 killed_task_count=killed_task_count or None,
                 killed_task_ids_truncated=killed_task_ids_truncated,
+                report=notification_report,
             )
             if notification_store is not effective_parent_store:
                 effective_parent_store.append_agent_notification(
@@ -1055,6 +1087,7 @@ async def finish_background_child(
                     killed_task_ids=killed_task_metadata or None,
                     killed_task_count=killed_task_count or None,
                     killed_task_ids_truncated=killed_task_ids_truncated,
+                    report=notification_report,
                 )
             effective_parent_store.finish_agent_child(marker_key or tool_call.id)
         event_data: dict[str, object] = {"notification_id": notification.id}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -29,6 +30,25 @@ def valid_agent_stats(value: object) -> bool:
     )
 
 
+def _valid_explicit_finish_fields(data: Mapping[str, Any]) -> bool:
+    fields = {"report_status", "summary", "head_sha", "verdict"} & data.keys()
+    if not fields:
+        return True
+    head_sha = data.get("head_sha")
+    return (
+        data.get("report_status") in {"done", "blocked", "failed"}
+        and type(data.get("summary")) is str
+        and bool(data["summary"])
+        and len(data["summary"]) <= 8_000
+        and (
+            head_sha is None
+            or type(head_sha) is str
+            and re.fullmatch(r"[0-9a-f]{7,64}", head_sha) is not None
+        )
+        and data.get("verdict") in {None, "pass", "fail", "inconclusive"}
+    )
+
+
 def validate_agent_notification_data(data: Mapping[str, Any]) -> None:
     """Apply the shared append/load contract for an agent notification."""
 
@@ -46,5 +66,6 @@ def validate_agent_notification_data(data: Mapping[str, Any]) -> None:
         or ("stats" in data and not valid_agent_stats(data["stats"]))
         or ("display_only" in data and data["display_only"] is not True)
         or not valid_killed_task_fields(data)
+        or not _valid_explicit_finish_fields(data)
     ):
         raise ValueError("invalid agent notification")

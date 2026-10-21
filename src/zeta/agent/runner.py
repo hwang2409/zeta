@@ -83,6 +83,7 @@ async def consume_child(
     notification_turn: bool = False,
     finish_gate_state: FinishGateState | None = None,
     delivering_prompt_id: str | None = None,
+    explicit_finish_metadata: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
 
@@ -196,18 +197,24 @@ async def consume_child(
         )
         await consume_events(events)
         if explicit_report is not None:
-            report_status = explicit_report.get("status")
-            summary = explicit_report.get("summary")
-            status = "failed" if report_status == "failed" else "completed"
-            text = f"{report_status}: {summary}"
-            return terminal_result(
-                state=status,
-                text=text,
-                report_status=report_status,
-                summary=summary,
-                head_sha=explicit_report.get("head_sha"),
-                verdict=explicit_report.get("verdict"),
+            report_status = explicit_report["status"]
+            summary = explicit_report["summary"]
+            state: TerminalState = (
+                "failed" if report_status == "failed" else "completed"
             )
+            text = f"{report_status}: {summary}"
+            finish_lifecycle(state, text)
+            structured_content = {
+                "turns_used": child_turns(),
+                "child_session_path": child_path,
+                **(explicit_finish_metadata or {}),
+            }
+            return {
+                "content": [{"type": "text", "text": text}],
+                "isError": state == "failed",
+                "structuredContent": structured_content,
+                "explicitFinishReport": explicit_report,
+            }
         children = owned_children()
         tasks = owned_tasks()
         if (
@@ -773,10 +780,6 @@ async def run_agent_tool(
         notice: str | None = None,
         notice_items: Sequence[str] | None = None,
         max_bytes: int | None = None,
-        report_status: str | None = None,
-        summary: str | None = None,
-        head_sha: str | None = None,
-        verdict: str | None = None,
     ) -> dict[str, object]:
         payload = loop._child_result_payload(
             tool_call.id,
@@ -794,10 +797,6 @@ async def run_agent_tool(
             notice=notice,
             notice_items=notice_items,
             max_bytes=max_bytes,
-            report_status=report_status,
-            summary=summary,
-            head_sha=head_sha,
-            verdict=verdict,
         )
         if not background and state is not None:
             content = payload.get("content")
@@ -861,6 +860,12 @@ async def run_agent_tool(
                 loop.tool_registry, "max_output_chars", MAX_AGENT_RESULT_BYTES
             ),
             "receipt_components": receipt_components,
+            "explicit_finish_metadata": {
+                "child_instance_id": child_instance_id,
+                "description": description,
+                **({"agent_type": preset.name} if preset.name != "general" else {}),
+                **({"depth": child_depth} if child_depth != 1 else {}),
+            },
         }
         if follow_up_loop
         else {
@@ -968,6 +973,7 @@ async def run_agent_tool(
                     marker_key=child_marker_key,
                     agent_instance_id=loop.agent_instance_id,
                     background_owner=loop._background_owner,
+                    max_receipt_bytes=background_receipt_bytes,
                 )
             finally:
                 loop.notify_background_persisted()

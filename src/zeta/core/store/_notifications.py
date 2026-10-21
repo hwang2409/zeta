@@ -49,6 +49,7 @@ class NotificationStateMixin:
         killed_task_ids_truncated: bool = False,
         background_metadata: tuple[str, str] | None = None,
         display_only: bool = False,
+        report: dict[str, object] | None = None,
     ) -> dict[str, Any]:
         if (
             not child_instance_id
@@ -88,6 +89,11 @@ class NotificationStateMixin:
             data["killed_task_ids_truncated"] = killed_task_ids_truncated
         if background_metadata is not None:
             data["background_owner"], data["background_phase"] = background_metadata
+        if report is not None:
+            data["report_status"] = report["status"]
+            for key in ("summary", "head_sha", "verdict"):
+                if key in report:
+                    data[key] = report[key]
         if display_only:
             data["display_only"] = True
         validate_agent_notification_data(data)
@@ -294,6 +300,7 @@ class NotificationStateMixin:
         killed_task_ids_truncated: bool = False,
         background_metadata: tuple[str, str] | None = None,
         display_only: bool = False,
+        report: dict[str, object] | None = None,
     ) -> ConversationEntry:
         """Persist one agent-completion notification (legacy API)."""
         data = self._agent_notification_data(
@@ -308,6 +315,7 @@ class NotificationStateMixin:
             killed_task_ids_truncated=killed_task_ids_truncated,
             background_metadata=background_metadata,
             display_only=display_only,
+            report=report,
         )
         return self._append_row("notification", data)
 

@@ -8567,6 +8567,60 @@ def _explicit_finish_registry(
 
 
 @pytest.mark.asyncio
+async def test_explicit_finish_background_child_preserves_report_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = {
+        "status": "done",
+        "summary": "implemented the requested repair",
+        "head_sha": "abcdef0",
+        "verdict": "pass",
+    }
+    finish_call = ToolCall("finish-1", "finish", report)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_run_agent_call()]),
+            ScriptedTurn(tool_calls=[finish_call]),
+            ScriptedTurn([TextContent("ignored after finish")]),
+        ]
+    )
+    monkeypatch.setitem(
+        AGENT_PRESETS,
+        "run",
+        replace(AGENT_PRESETS["run"], explicit_finish=True),
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+    background_events: list[StreamEvent] = []
+    loop.set_background_event_sink(background_events.append)
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    notification = await _wait_for_notification(store, "completed")
+    terminal = next(
+        event
+        for event in background_events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+        and event.tool_call is not None
+        and event.tool_call.name == "agent"
+    )
+
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.structured_content is not None
+    expected = {
+        "report_status": report["status"],
+        "summary": report["summary"],
+        "head_sha": report["head_sha"],
+        "verdict": report["verdict"],
+    }
+    assert {
+        key: terminal.tool_result.structured_content[key] for key in expected
+    } == expected
+    assert {key: notification.data[key] for key in expected} == expected
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_explicit_finish_done_publishes_canonical_report(tmp_path: Path) -> None:
     store, registry, loop = _explicit_finish_registry(tmp_path)
     result = await registry.execute(
@@ -8663,6 +8717,100 @@ async def test_explicit_finish_no_tool_turn_enters_idle_without_request(
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_child_is_running_during_wake_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent_store = ConversationStore(tmp_path, session_id="parent")
+    child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
+    call = _run_agent_call()
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="run",
+        agent_type="run",
+        background=True,
+        child_instance_id="parent:1",
+        accepts_follow_ups=True,
+        explicit_finish=True,
+    )
+    child_store.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="run",
+        description="run",
+    )
+    owner = BackgroundAgentOwner(parent_store)
+    owner.conversation_channel.register_loop("parent:1")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.bind_session_store(child_store)
+    loop = SimpleNamespace(
+        explicit_finish=True,
+        agent_instance_id="parent:1",
+        _background_owner=owner,
+        notification_wake=SimpleNamespace(pending_message=lambda: None),
+        tool_registry=registry,
+    )
+    first_idle = asyncio.Event()
+    wake_started = asyncio.Event()
+    release_wake = asyncio.Event()
+    calls = 0
+
+    async def fake_consume(_loop, _prompt, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            wake_started.set()
+            await release_wake.wait()
+        kwargs["finish_lifecycle"]("idle", "WAIT")
+        if calls == 1:
+            first_idle.set()
+        return {
+            "content": [{"type": "text", "text": "WAIT"}],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", fake_consume)
+    task = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "work",
+            child_store=child_store,
+            child_turns=lambda: calls,
+            finish_lifecycle=lambda *_: {},
+        )
+    )
+    await asyncio.wait_for(first_idle.wait(), timeout=2)
+    first_idle_since = child_store.agent_lifecycle()["idle_since"]
+    assert send_to_run(
+        parent_store,
+        "parent:1",
+        "continue",
+        channel=owner.conversation_channel,
+    ) is None
+    await asyncio.wait_for(wake_started.wait(), timeout=2)
+    assert child_store.agent_lifecycle()["state"] == "running"
+
+    release_wake.set()
+    async def wait_for_new_idle() -> None:
+        while child_store.agent_lifecycle().get("idle_since") == first_idle_since:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_new_idle(), timeout=2)
+    assert child_store.agent_lifecycle()["state"] == "idle"
+    assert child_store.agent_lifecycle()["idle_since"] > first_idle_since
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    owner.conversation_channel.unregister_loop("parent:1")
+    await registry.close()
+    child_store.close()
+    parent_store.close()
 
 
 @pytest.mark.asyncio
@@ -8851,8 +8999,8 @@ async def test_provider_error_after_successful_finish_keeps_report(
         },
         error_message=str,
     )
-    assert result["structuredContent"]["report_status"] == "done"
-    assert result["structuredContent"]["summary"] == "kept"
+    assert result["explicitFinishReport"]["status"] == "done"
+    assert result["explicitFinishReport"]["summary"] == "kept"
     await registry.close()
     store.close()
 

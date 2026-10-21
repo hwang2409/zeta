@@ -21,7 +21,6 @@ from ...agent.receipt import (
     agent_stats,
     build_agent_progress,
     build_agent_receipt,
-    build_explicit_finish_receipt,
     encode_json,
     format_agent_stats,
     terminal_state,
@@ -894,10 +893,6 @@ def agent_result(
     notice: str | None = None,
     notice_items: Sequence[str] | None = None,
     max_bytes: int = MAX_AGENT_RESULT_BYTES,
-    report_status: str | None = None,
-    summary: str | None = None,
-    head_sha: str | None = None,
-    verdict: str | None = None,
 ) -> dict[str, object]:
     structured_content: dict[str, object] = {
         "turns_used": turns_used,
@@ -911,14 +906,6 @@ def agent_result(
         structured_content["child_instance_id"] = child_instance_id
     if description is not None:
         structured_content["description"] = description
-    if report_status is not None:
-        structured_content["report_status"] = report_status
-    if summary is not None:
-        structured_content["summary"] = summary
-    if head_sha is not None:
-        structured_content["head_sha"] = head_sha
-    if verdict is not None:
-        structured_content["verdict"] = verdict
     # Keep depth-one result payloads byte-compatible with the pre-nesting shape.
     if depth is not None and depth != 1:
         structured_content["depth"] = depth
@@ -938,22 +925,6 @@ def agent_result(
             tool_call_id=tool_call_id,
             max_bytes=max_bytes,
             include_stats=include_stats,
-        )
-    if report_status is not None and summary is not None:
-        report: dict[str, object] = {
-            "status": report_status,
-            "summary": summary,
-        }
-        if head_sha is not None:
-            report["head_sha"] = head_sha
-        if verdict is not None:
-            report["verdict"] = verdict
-        return build_explicit_finish_receipt(
-            report,
-            stats,
-            structured_content=structured_content,
-            tool_call_id=tool_call_id,
-            max_bytes=max_bytes,
         )
     state = terminal_state(error=error, canceled=canceled, status=status)
     return build_agent_receipt(

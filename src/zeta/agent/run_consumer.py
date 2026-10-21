@@ -23,6 +23,80 @@ if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
 
 
+def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -> None:
+    if getattr(child_loop, "explicit_finish", False):
+        child_store.update_agent_lifecycle(
+            state="running",
+            current_step="running follow-up",
+        )
+
+
+def _transition_idle(child_store: ConversationStore) -> None:
+    child_store.update_agent_lifecycle(
+        state="idle",
+        current_step="idle, waiting for follow-up",
+        idle_since=_now(),
+    )
+
+
+def _finalize_result(
+    result: dict[str, object],
+    *,
+    segment_reports: list[str],
+    receipt_components: dict[str, str] | None,
+    delivered_follow_up: bool,
+    child_store: ConversationStore,
+    child_turns: object,
+    tool_call_id: str,
+    max_receipt_bytes: int,
+) -> dict[str, object]:
+    if isinstance(result.get("explicitFinishReport"), dict):
+        return result
+    if segment_reports and receipt_components is not None:
+        receipt_components["report"] = segment_reports[
+            -2 if len(segment_reports) > 1 else -1
+        ]
+        if len(segment_reports) > 1:
+            receipt_components["reply"] = segment_reports[-1]
+    state: TerminalState = "failed" if result.get("isError") else "completed"
+    raw_text = ""
+    content = result.get("content")
+    if isinstance(content, list) and content and isinstance(content[0], dict):
+        raw_text = str(content[0].get("text", ""))
+    if not segment_reports and raw_text:
+        segment_reports.append(_without_agent_receipt_suffix(raw_text))
+    report = (
+        segment_reports[-2 if len(segment_reports) > 1 else -1]
+        if receipt_components is not None
+        and segment_reports
+        and (len(segment_reports) > 1 or delivered_follow_up)
+        else ""
+    )
+    reply = (
+        segment_reports[-1]
+        if segment_reports and len(segment_reports) > 1
+        else raw_text
+    )
+    return build_agent_receipt(
+        state,
+        reply,
+        agent_stats(
+            child_store.agent_lifecycle(),
+            status=state,
+            turns_used=child_turns() if callable(child_turns) else 0,
+        ),
+        structured_content=(
+            dict(result["structuredContent"])
+            if isinstance(result.get("structuredContent"), dict)
+            else None
+        ),
+        tool_call_id=tool_call_id,
+        max_bytes=max_receipt_bytes,
+        report=report,
+        reply=reply,
+    )
+
+
 async def consume_run(
     consume_child: Callable[..., Awaitable[dict[str, object]]],
     child_loop: AgentLoop,
@@ -54,11 +128,7 @@ async def consume_run(
             return {}
         idle = state == "idle"
         if idle:
-            child_store.update_agent_lifecycle(
-                state="idle",
-                current_step="idle, waiting for follow-up",
-                idle_since=_now(),
-            )
+            _transition_idle(child_store)
         return agent_stats(
             child_store.agent_lifecycle(),
             status="idle" if idle else "running",
@@ -73,52 +143,6 @@ async def consume_run(
     segment_reports: list[str] = []
     kwargs["record_report"] = segment_reports.append
     kwargs["finish_gate_state"] = FinishGateState()
-
-    def finalize(res: dict[str, object]) -> dict[str, object]:
-        if segment_reports and receipt_components is not None:
-            receipt_components["report"] = segment_reports[
-                -2 if len(segment_reports) > 1 else -1
-            ]
-            if len(segment_reports) > 1:
-                receipt_components["reply"] = segment_reports[-1]
-        state: TerminalState = "failed" if res.get("isError") else "completed"
-        raw_text = ""
-        content = res.get("content")
-        if isinstance(content, list) and content and isinstance(content[0], dict):
-            raw_text = str(content[0].get("text", ""))
-        if not segment_reports and raw_text:
-            segment_reports.append(_without_agent_receipt_suffix(raw_text))
-        report = (
-            segment_reports[-2 if len(segment_reports) > 1 else -1]
-            if receipt_components is not None
-            and segment_reports
-            and (len(segment_reports) > 1 or current_entry is not None)
-            else ""
-        )
-        reply = (
-            segment_reports[-1]
-            if segment_reports and len(segment_reports) > 1
-            else raw_text
-        )
-        receipt = build_agent_receipt(
-            state,
-            reply,
-            agent_stats(
-                child_store.agent_lifecycle(),
-                status=state,
-                turns_used=child_turns() if callable(child_turns) else 0,
-            ),
-            structured_content=(
-                dict(res["structuredContent"])
-                if isinstance(res.get("structuredContent"), dict)
-                else None
-            ),
-            tool_call_id=tool_call_id,
-            max_bytes=max_receipt_bytes,
-            report=report,
-            reply=reply,
-        )
-        return receipt
 
     idle_started: float | None = None
     safety_task: asyncio.Task[tuple[str, ...]] | None = None
@@ -149,6 +173,7 @@ async def consume_run(
             if pending:
                 current_entry = pending[0]
                 kwargs["delivering_prompt_id"] = current_entry.id
+                _transition_running(child_loop, child_store)
                 result = await consume_child(
                     child_loop,
                     current_entry.data["text"],
@@ -158,6 +183,7 @@ async def consume_run(
                 continue
             kwargs["delivering_prompt_id"] = None
             if child_loop.notification_wake.pending_message() is not None:
+                _transition_running(child_loop, child_store)
                 result = await consume_child(
                     child_loop,
                     "",
@@ -189,9 +215,27 @@ async def consume_run(
             pending = child_store.close_pending_queue_if_empty()
             if pending:
                 continue
-            terminal_result = finalize(result)
+            terminal_result = _finalize_result(
+                result,
+                segment_reports=segment_reports,
+                receipt_components=receipt_components,
+                delivered_follow_up=current_entry is not None,
+                child_store=child_store,
+                child_turns=child_turns,
+                tool_call_id=tool_call_id,
+                max_receipt_bytes=max_receipt_bytes,
+            )
             return terminal_result
-        terminal_result = finalize(result)
+        terminal_result = _finalize_result(
+            result,
+            segment_reports=segment_reports,
+            receipt_components=receipt_components,
+            delivered_follow_up=current_entry is not None,
+            child_store=child_store,
+            child_turns=child_turns,
+            tool_call_id=tool_call_id,
+            max_receipt_bytes=max_receipt_bytes,
+        )
         return terminal_result
     finally:
         if safety_task is not None and not safety_task.done():
