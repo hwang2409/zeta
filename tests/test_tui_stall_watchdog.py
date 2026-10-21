@@ -8,6 +8,8 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from zeta.diagnostics.tui_stalls import (
     TUIStallWatchdog,
     start_tui_stall_watchdog,
@@ -112,6 +114,37 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
         for stack in records[0]["stacks"]
         for frame in stack["frames"]
     )
+
+
+@pytest.mark.asyncio
+async def test_watchdog_close_leaves_no_default_executor_worker(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def before_probe() -> None:
+        entered.set()
+        release.wait(timeout=5)
+
+    watchdog = TUIStallWatchdog(
+        tmp_path / "tui-stalls.jsonl",
+        session_id="shutdown",
+        before_probe=before_probe,
+    )
+    loop = asyncio.get_running_loop()
+    watchdog.start(loop)
+    try:
+        assert entered.wait(timeout=5)
+        closing = asyncio.create_task(watchdog.close())
+        await asyncio.sleep(0)
+        closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        executor = getattr(loop, "_default_executor", None)
+        assert executor is None or not any(
+            thread.is_alive() for thread in executor._threads
+        )
+    finally:
+        release.set()
+        await watchdog.close()
 
 
 def test_idle_executor_worker_has_no_busy_samples(tmp_path: Path) -> None:

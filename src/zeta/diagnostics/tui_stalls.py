@@ -93,8 +93,11 @@ class TUIStallWatchdog:
         self._stop.set()
         thread = self._thread
         if thread is not None:
+            deadline = asyncio.get_running_loop().time() + 0.2
             try:
-                await asyncio.to_thread(thread.join, max(0.2, self.probe_interval * 4))
+                while thread.is_alive() and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.01)
+                thread.join(0)
             except Exception:  # noqa: BLE001, S110 - diagnostics cannot affect shutdown
                 pass
 

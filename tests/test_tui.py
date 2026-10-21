@@ -5047,6 +5047,30 @@ def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
     assert violations == []
 
 
+def test_sigint_key_uses_tui_interrupt_binding() -> None:
+    interrupted = []
+    bindings = build_key_bindings(
+        on_interrupt=lambda: interrupted.append(True),
+        on_exit=lambda: None,
+    )
+    binding = bindings.get_bindings_for_keys((Keys.SIGINT,))[-1]
+    event = Mock()
+    event.current_buffer.reset = Mock()
+    binding.handler(event)
+    assert interrupted == [True]
+    event.current_buffer.reset.assert_called_once_with()
+
+
+def test_mcp_mount_notice_is_suppressed_after_terminal_restore() -> None:
+    notices: list[object] = []
+    app = object.__new__(TUIApp)
+    app.loop = SimpleNamespace(
+        set_mcp_notice_sink=lambda sink: notices.append(sink),
+    )
+    app._detach_ui_notice_sinks()
+    assert notices == [None]
+
+
 def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
     bindings = build_key_bindings(
         on_interrupt=lambda: None,

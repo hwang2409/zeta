@@ -1183,6 +1183,7 @@ class TUIApp(
                     self._session = None
                     if isinstance(session, FullScreenPromptSession):
                         self._release_ui_ownership()
+                        self._detach_ui_notice_sinks()
                         session.restore_terminal()
                         self._terminal_restored = True
                 else:
@@ -1191,6 +1192,7 @@ class TUIApp(
                         await asyncio.gather(self._active_task, return_exceptions=True)
                     if isinstance(session, FullScreenPromptSession):
                         self._release_ui_ownership()
+                        self._detach_ui_notice_sinks()
                         session.restore_terminal()
                         self._active_session = None
                         self._terminal_restored = True
