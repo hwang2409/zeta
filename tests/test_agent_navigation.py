@@ -1196,12 +1196,13 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
         child_instance_id="root:worker",
     )
     notices: list[str] = []
+    loop = asyncio.get_running_loop()
     queued = asyncio.Event()
 
     def print_system(message: str) -> None:
         notices.append(message)
         if message.startswith("queued message for "):
-            queued.set()
+            loop.call_soon_threadsafe(queued.set)
 
     app._print_system = print_system
     app._agent_navigation.current_path = child
@@ -1214,8 +1215,8 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
     real_send = agent_runtime.send_to_run
 
     def send(*args: object, **kwargs: object) -> str | None:
-        started.set()
-        release.wait(2)
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(10)
         return real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
