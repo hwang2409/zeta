@@ -430,6 +430,58 @@ def test_child_question_notification_renders_question() -> None:
     assert "unavailable" not in rendered.plain
 
 
+def test_child_idle_notification_renders_one_line_notice() -> None:
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.tui import theme
+    from zeta.tui.render import render_agent_notification
+
+    rendered = render_agent_notification(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_idle",
+                "child_instance_id": "root:203",
+                "description": "finish PR #529\nwith\t\x1b[2J a long report",
+                "status": "child_idle",
+                "text": "the child's report is not shown in the notice",
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.style == theme.NOTICE
+    assert rendered.plain.startswith("◌ finish PR #529 with a long report · idle")
+    assert "the child's report" not in rendered.plain
+    assert "\n" not in rendered.plain
+    assert all(
+        not (ord(character) < 32 or 0x80 <= ord(character) <= 0x9F)
+        for character in rendered.plain
+    )
+    assert rendered.overflow == "ellipsis"
+    assert rendered.no_wrap is True
+
+
+def test_child_idle_notification_without_description_shows_error_line() -> None:
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.tui import theme
+    from zeta.tui.render import render_agent_notification
+
+    rendered = render_agent_notification(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_idle",
+                "status": "child_idle",
+                "text": "the child's report",
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.plain == "background agent notification unavailable"
+    assert rendered.style == theme.ERROR
+
+
 def test_child_question_withdrawn_notification_renders_text() -> None:
     from zeta.protocol.types import StreamEvent, StreamEventType
     from zeta.tui.render import render_agent_notification
