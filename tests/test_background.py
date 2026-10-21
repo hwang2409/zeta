@@ -430,6 +430,58 @@ def test_child_question_notification_renders_question() -> None:
     assert "unavailable" not in rendered.plain
 
 
+def test_child_idle_notification_renders_one_line_notice() -> None:
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.tui import theme
+    from zeta.tui.render import render_agent_notification
+
+    rendered = render_agent_notification(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_idle",
+                "child_instance_id": "root:203",
+                "description": "finish PR #529\nwith\t\x1b[2J a long report",
+                "status": "child_idle",
+                "text": "the child's report is not shown in the notice",
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.style == theme.NOTICE
+    assert rendered.plain.startswith("◌ finish PR #529 with a long report · idle")
+    assert "the child's report" not in rendered.plain
+    assert "\n" not in rendered.plain
+    assert all(
+        not (ord(character) < 32 or 0x80 <= ord(character) <= 0x9F)
+        for character in rendered.plain
+    )
+    assert rendered.overflow == "ellipsis"
+    assert rendered.no_wrap is True
+
+
+def test_child_idle_notification_without_description_shows_error_line() -> None:
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.tui import theme
+    from zeta.tui.render import render_agent_notification
+
+    rendered = render_agent_notification(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_idle",
+                "status": "child_idle",
+                "text": "the child's report",
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.plain == "background agent notification unavailable"
+    assert rendered.style == theme.ERROR
+
+
 def test_child_question_withdrawn_notification_renders_text() -> None:
     from zeta.protocol.types import StreamEvent, StreamEventType
     from zeta.tui.render import render_agent_notification
@@ -646,16 +698,33 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     tracked = []
     tracked_ready = asyncio.Event()
+    stores_released = asyncio.Event()
     owner = loop._background_owner
-    track_store = owner.track_store
+    track_stores = owner.track_store
+    release_stores = owner.release_unused_stores
 
     def track(child_store):
         tracked.append(child_store)
-        track_store(child_store)
+        track_stores(child_store)
         if len(tracked) == 2:
             tracked_ready.set()
 
+    def store_closed(child_store) -> bool:
+        try:
+            os.fstat(child_store.directory_fd)
+        except OSError:
+            return True
+        return False
+
+    def release() -> None:
+        release_stores()
+        if len(tracked) == 2 and all(
+            store_closed(child_store) for child_store in tracked
+        ):
+            stores_released.set()
+
     owner.track_store = track
+    owner.release_unused_stores = release
 
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
@@ -664,7 +733,7 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
         os.fstat(tracked[0].directory_fd)
 
         backend.completion_gate.set()
-        await asyncio.wait_for(owner.wait(), timeout=5)
+        await asyncio.wait_for(stores_released.wait(), timeout=5)
         for child_store in tracked:
             with pytest.raises(OSError):
                 os.fstat(child_store.directory_fd)

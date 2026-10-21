@@ -5447,6 +5447,67 @@ class RunBackend(CompletionBackend):
         )
 
 
+class FollowUpFinishBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.child_started = asyncio.Event()
+        self.release_child = asyncio.Event()
+        self.child_prompts: list[str] = []
+        self.finish_attempts = 0
+        self.finish_refused_recovery = False
+        self.last_finish_prompt = ""
+        self.replied_after_finish = False
+        self.finish_generated = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        if last_user == "start":
+            blocks = [ToolUseContent(_run_agent_call())]
+        elif not self.child_prompts:
+            self.child_prompts.append(last_user)
+            self.child_started.set()
+            await self.release_child.wait()
+            blocks = [TextContent("first pass done")]
+        elif self.finish_attempts and last_user == self.last_finish_prompt and not self.replied_after_finish:
+            self.replied_after_finish = True
+            blocks = [TextContent("continue")]
+        else:
+            self.child_prompts.append(last_user)
+            self.finish_attempts += 1
+            self.last_finish_prompt = last_user
+            self.replied_after_finish = False
+            self.finish_generated.set()
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        f"finish-{self.finish_attempts}",
+                        "finish",
+                        {"status": "done", "summary": "complete"},
+                    )
+                )
+            ]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 class WorkerBackend(RunBackend):
     async def complete(
         self,
@@ -5637,8 +5698,13 @@ async def test_consume_run_keeps_pending_entry_when_delivery_fails(
 
     monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
 
+    child_loop = SimpleNamespace(
+        explicit_finish=False,
+        _delivering_prompt_id=None,
+        notification_wake=SimpleNamespace(pending_message=lambda: None),
+    )
     result = await agent_runner.consume_run(
-        object(),  # child_loop is unused by the fake
+        child_loop,
         "initial",
         child_store=child_store,
     )
@@ -7155,10 +7221,10 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
             _python("import time; time.sleep(30)") + " --password=password-secret-789",
             "password-secret-789",
         ),
-        ("<'/tmp/password-secret' cat", "password-secret"),
-        ("3<'url-user:url-pass@example.com' cat", "url-user:url-pass@example.com"),
+        ("<'/tmp/password-secret' cat; sleep 30", "password-secret"),
+        ("3<'url-user:url-pass@example.com' cat; sleep 30", "url-user:url-pass@example.com"),
         (
-            "<<'heredoc-secret' cat\nbody\nheredoc-secret",
+            "<<'heredoc-secret' cat\nbody\nheredoc-secret\nsleep 30",
             "heredoc-secret",
         ),
     ],
@@ -7198,7 +7264,10 @@ async def test_killed_task_receipt_never_contains_command_secrets(
         if notifications and "background tasks killed on child completion" in notifications[-1].data.get("text", ""):
             break
         await asyncio.sleep(0.02)
+    assert notifications, "background-task cleanup notification was not recorded"
     notification = notifications[-1]
+    killed_task_ids = notification.data.get("killed_task_ids")
+    assert isinstance(killed_task_ids, list) and len(killed_task_ids) == 1
     text = notification.data["text"]
     assert "background tasks killed on child completion" in text
     task_id = notification.data["killed_task_ids"][0]
@@ -9746,6 +9815,69 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
     assert parent.agent_notifications()[0].data["kind"] == "child_idle"
     owner.cancel_subtree("root:1")
     await owner.wait()
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_accepts_from_a_delivered_follow_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FollowUpFinishBackend()
+    monkeypatch.setitem(AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True))
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    handle = _run_handle_from_receipt(store)
+    assert send_to_run(
+        store, handle, "first follow-up",
+        channel=loop._background_owner.conversation_channel,
+    ) is None
+    backend.release_child.set()
+    await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
+    await _wait_for_notification(store, "completed")
+
+    assert backend.finish_attempts == 1
+    assert backend.child_prompts[-1] == "first follow-up"
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_refuses_when_another_follow_up_is_queued(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FollowUpFinishBackend()
+    backend.finish_refused_recovery = True
+    monkeypatch.setitem(AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True))
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    handle = _run_handle_from_receipt(store)
+    channel = loop._background_owner.conversation_channel
+    assert send_to_run(store, handle, "first follow-up", channel=channel) is None
+    assert send_to_run(store, handle, "second follow-up", channel=channel) is None
+    child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
+    backend.release_child.set()
+    await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
+    await _wait_for_notification(store, "completed")
+
+    assert backend.finish_attempts == 2
+    child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+    assert any(
+        message.tool_result is not None
+        and message.tool_result.is_error
+        and "pending follow-up" in message.tool_result.content
+        for message in child_store.messages()
+    ), [
+        message.tool_result.content
+        for message in child_store.messages()
+        if message.tool_result is not None
+    ]
+    await loop.close()
 
 
 @pytest.mark.asyncio
