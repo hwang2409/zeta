@@ -45,12 +45,21 @@ def _niceness_command() -> str:
 
 
 def _descendant_command(
-    marker: Path, delay: float = 0.3, started: Path | None = None
+    marker: Path,
+    delay: float = 0.3,
+    started: Path | None = None,
+    release: Path | None = None,
 ) -> str:
-    child = (
-        "import pathlib,time; "
-        f"time.sleep({delay}); pathlib.Path({str(marker)!r}).write_text('alive')"
-    )
+    child = "import pathlib,time\n"
+    if release:
+        child += (
+            f"deadline=time.monotonic()+5\n"
+            f"while not pathlib.Path({str(release)!r}).exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
+        )
+    else:
+        child += f"time.sleep({delay})\n"
+    child += f"pathlib.Path({str(marker)!r}).write_text('alive')"
     parent = (
         "import pathlib,subprocess,sys,time; "
         f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
@@ -1472,16 +1481,31 @@ skill_catalog=SkillCatalog.empty(),
 @pytest.mark.asyncio
 async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     marker = tmp_path / "timeout-child-alive"
+    started = tmp_path / "timeout-child-started"
+    release = tmp_path / "timeout-child-release"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
-    result = await registry.execute(
-        ToolCall(
-            "bash-timeout",
-            "bash",
-            {"command": _descendant_command(marker), "timeout": 0.05},
+    execution = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "bash-timeout",
+                "bash",
+                {
+                    "command": _descendant_command(
+                        marker, delay=1, started=started, release=release
+                    ),
+                    "timeout": 0.5,
+                },
+            )
         )
     )
-    await asyncio.sleep(0.4)
+    for _ in range(100):
+        if started.exists():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("descendant did not start")
+    result = await execution
 
     assert result["isError"] is True
     assert "timed out after" in result["content"][0]["text"]
@@ -1489,6 +1513,12 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     assert result["structuredContent"]["error"]["tool"] == "bash"
     assert result["structuredContent"]["error"]["kind"] == "timeout"
     assert not marker.exists()
+
+    release.touch()
+    for _ in range(20):
+        if marker.exists():
+            pytest.fail("descendant survived timeout cleanup")
+        await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio
