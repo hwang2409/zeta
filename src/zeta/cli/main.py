@@ -275,9 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
     accounts_parser = commands.add_parser(
         "accounts", help="manage subscription accounts"
     )
-    accounts_parser.add_argument(
-        "action", nargs="?", choices=("default", "logout", "refresh")
-    )
+    accounts_parser.add_argument("action", nargs="?", choices=("default",))
     accounts_parser.add_argument("account", nargs="?")
     accounts_parser.add_argument("--json", action="store_true")
     from .inbox import add_subcommand as _add_inbox_subcommand
@@ -492,10 +490,6 @@ def main(argv: list[str] | None = None) -> int:
                     raise AccountError("default requires provider:name")
                 provider, name = args.account.split(":", 1)
                 store.set_default(AccountId(provider, name))
-            elif args.action == "logout":
-                raise AccountError("logout is deferred to phase 2")
-            elif args.action == "refresh":
-                raise AccountError("refresh is deferred to phase 2")
             else:
                 accounts = [str(item) for item in store.list()]
                 print(json.dumps(accounts) if args.json else "\n".join(accounts))

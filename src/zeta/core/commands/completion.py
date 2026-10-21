@@ -87,7 +87,7 @@ _zeta() {
                     _arguments '--account=[account name]:account:' '--replace[replace existing account]' '1:provider:(anthropic codex)'
                     ;;
                 accounts)
-                    _arguments '--json[print JSON]' '1:action:(default logout refresh)' '2:account:'
+                    _arguments '--json[print JSON]' '1:action:(default)' '2:account:'
                     ;;
                 serve)
                     _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]' '--auto-memory[enable automatic project memory]' '--no-auto-memory[disable automatic project memory]'
@@ -224,7 +224,7 @@ def bash_script() -> str:
             COMPREPLY=( $(compgen -W "anthropic codex --account --replace" -- "$cur") )
             ;;
         accounts)
-            COMPREPLY=( $(compgen -W "--json default logout refresh" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--json default" -- "$cur") )
             ;;
         serve)
             COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd --tools --disallowed-tools --require-tools --allow-hooks --auto-memory --no-auto-memory" -- "$cur") )
