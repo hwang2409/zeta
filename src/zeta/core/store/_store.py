@@ -79,7 +79,6 @@ from .runtime_lease import (
     close_store_leases,
 )
 
-
 class ConversationStore(
     AsyncDurableWritesMixin,
     ClientDeliveryMixin,
