@@ -251,14 +251,19 @@ performs confirmed local logout, and `d` changes the global default. text and
 screen-reader output include percent values and absolute local reset times; color
 is not required.
 
-there are two selections: `accounts.json` owns the global default per provider
-for new sessions, and that session's `meta.json` owns its selected account per
-provider. on resume, the session metadata wins; the global default is consulted
-only when the session has no saved selection (for example, a new session).
-children and session-owned background memory calls pin the session selection at
-creation; later parent/default changes never retarget them. automations pin the
-approved account and require re-approval to change it. serve methods require
-`session_id` for a switch; list is account-scoped and never changes selection.
+there are two selections: `accounts.json` owns the global default per provider,
+and that session's `meta.json` owns its selected account per provider. for every
+session without a saved selection, new or resumed, session load resolves the
+provider's current global default, saves it as the session's selection, and uses
+that selection from then on. changing the global default never changes a loaded
+session; only `/accounts` switch in that session does. if the default account no
+longer exists at load, fail with a clear error that names `/accounts`; do not
+silently choose another account. a resumed pre-rollout session therefore pins
+the default at its first load after rollout. children and session-owned
+background memory calls pin the session selection at creation; later
+parent/default changes never retarget them. automations pin the approved
+account and require re-approval to change it. serve methods require `session_id`
+for a switch; list is account-scoped and never changes selection.
 
 switching persists selection, the native-context boundary, and the per-session
 switch sequence atomically in session metadata before replacing an idle backend.
@@ -271,9 +276,10 @@ restore the prior backend and selection; do not report success. test resume and
 `a → b → a`.
 
 all backend creation uses one resolver with explicit auth mode: session account
-for interactive, child, automation, and memory calls; global default only at new
-session creation; API-key mode only when explicitly enabled. add attribution tests
-for primary, child, automation, and memory calls.
+for interactive, child, automation, and memory calls; the global-default fallback
+follows the session-load rule above; API-key mode only when explicitly enabled.
+add attribution tests for primary, child, automation, and memory calls, including
+resume of pre-rollout metadata without a saved selection.
 
 ## exhaustion recovery
 
