@@ -591,16 +591,6 @@ def render_agent_notification(event: StreamEvent) -> Text | None:
             overflow="ellipsis",
             no_wrap=True,
         )
-    if kind == "child_idle":
-        text = event.data.get("text")
-        if not isinstance(text, str):
-            return Text("background agent idle notification unavailable", style=theme.ERROR)
-        return Text(
-            _compact_notification_text(text, MAX_AGENT_NOTIFICATION_LINE),
-            style=theme.NOTICE,
-            overflow="ellipsis",
-            no_wrap=True,
-        )
     if kind == "task_exited":
         task_id = event.data.get("task_id", "?")
         if event.data.get("background_phase") == "session_shutdown":
