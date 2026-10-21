@@ -10,8 +10,6 @@ from typing import Any
 
 from ..config.settings import ResolvedConfig
 from ..config.tool_policy import ToolPolicy
-from ..context_eviction.summaries import EvictionSummaryWorker, SummaryCache
-from ..context_eviction.summary_provider import build_summary_provider
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.hooks import load_hooks_for_provider
 from ..core.project_context import ProjectContext, ProjectDiscovery
@@ -32,38 +30,6 @@ from .loop.skill_refresh import RuntimePrompt
 
 BackendBuilder = Callable[..., tuple[CompletionBackend, str]]
 BackgroundEventSink = Callable[[StreamEvent], None]
-
-
-def _create_eviction_summary_worker(
-    *,
-    loop: AgentLoop,
-    opened: OpenedSession,
-    config: ResolvedConfig,
-    backend_builder: BackendBuilder,
-    home: Path,
-    effective_budget: int,
-) -> EvictionSummaryWorker:
-    def build_backend() -> CompletionBackend:
-        summary_model = "gpt-5.6-luna"
-        summary_provider = provider_for_model(summary_model)
-        backend, _ = backend_builder(
-            summary_provider,
-            summary_model,
-            home=home,
-            stall_seconds=config.stream_stall_seconds,
-            stall_retries=0,
-            token_budget=effective_budget,
-        )
-        return backend
-
-    return EvictionSummaryWorker(
-        SummaryCache(
-            opened.store.session_dir,
-            directory_fd=opened.store.directory_fd,
-        ),
-        build_summary_provider(build_backend),
-        scan=loop.context_assembler.eviction_summary_candidates,
-    )
 
 
 def _runtime_prompt(context: ProjectContext) -> RuntimePrompt:
@@ -95,7 +61,6 @@ class RuntimeComposition:
     external_tools: ExternalToolDiscovery
     budget_pinned: bool
     memory_reconciler: AutoMemoryReconciler | None = None
-    eviction_summary_worker: EvictionSummaryWorker | None = None
 
 
 def compose_runtime(
@@ -337,33 +302,10 @@ def compose_runtime(
             )
             if resuming:
                 memory_reconciler.catch_up()
-        eviction_summary_worker = None
-        if (
-            config.eviction_summaries_enabled
-            and metadata.parent_session_id is None
-            and attention_fork is None
-        ):
-            eviction_summary_worker = _create_eviction_summary_worker(
-                loop=loop,
-                opened=opened,
-                config=config,
-                backend_builder=backend_builder,
-                home=home,
-                effective_budget=effective_budget,
-            )
-            summary_cache = eviction_summary_worker.cache
-            loop.eviction_summary_worker = eviction_summary_worker
-            loop.context_assembler.eviction_summary_cache = summary_cache
-            loop.context_assembler.eviction_summary_worker = eviction_summary_worker
-            if resuming:
-                eviction_summary_worker.activity()
         activity_callbacks = [
             callback
             for callback in (
                 memory_reconciler.activity if memory_reconciler is not None else None,
-                eviction_summary_worker.activity
-                if eviction_summary_worker is not None
-                else None,
             )
             if callback is not None
         ]
@@ -398,7 +340,6 @@ def compose_runtime(
             external_tools=external_tools,
             budget_pinned=budget_pinned,
             memory_reconciler=memory_reconciler,
-            eviction_summary_worker=eviction_summary_worker,
         )
         cleanup.pop_all()
         return composition
