@@ -331,7 +331,18 @@ def _canonical_notification_payload(
             if not isinstance(item, Mapping):
                 continue
             summary: dict[str, object] = {"kind": _one_line(item.get("kind"))}
-            for key in ("child_instance_id", "task_id", "status", "description"):
+            for key in (
+                "child_instance_id",
+                "task_id",
+                "status",
+                "description",
+                "report_status",
+                "head_sha",
+                "verdict",
+            ):
+                if value := _one_line(item.get(key)):
+                    summary[key] = value
+            for key in ("summary", "summary_sha256"):
                 if value := _one_line(item.get(key)):
                     summary[key] = value
             if type(exit_code := item.get("exit_code")) is int:

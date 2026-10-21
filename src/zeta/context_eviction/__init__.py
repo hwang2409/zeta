@@ -1056,9 +1056,23 @@ def _notification_receipt(message: Message, seq: int) -> Message:
         summary: dict[str, object] = {
             "kind": _one_line(raw.get("kind", "agent_completion"))
         }
-        for key in ("child_instance_id", "task_id", "status"):
+        for key in (
+            "child_instance_id",
+            "task_id",
+            "status",
+            "report_status",
+            "head_sha",
+            "verdict",
+        ):
             if compact := _one_line(raw.get(key)):
                 summary[key] = compact
+        finish_summary = raw.get("summary")
+        if isinstance(finish_summary, str):
+            compact_summary = " ".join(finish_summary.split())
+            if len(compact_summary) <= 160:
+                summary["summary"] = compact_summary
+            else:
+                summary["summary_sha256"] = _content_digest(finish_summary)[:16]
         exit_code = raw.get("exit_code")
         if type(exit_code) is int:
             summary["exit_code"] = exit_code

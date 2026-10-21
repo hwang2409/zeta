@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -35,6 +36,17 @@ _MAX_FULL_FALLBACK_BYTES = 16 * 1024 * 1024
 _BOUNDED_UNAVAILABLE = "child transcript unavailable: history exceeds bounded scan"
 _REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
 _LOGGER = logging.getLogger(__name__)
+
+
+def _read_agent_lifecycle(path: Path) -> dict[str, object] | None:
+    lifecycle_path = path / "agent_lifecycle.json"
+    lifecycle = live_agent_lifecycle(lifecycle_path)
+    if lifecycle is None:
+        try:
+            lifecycle = load_session_json(lifecycle_path)
+        except (ConversationIntegrityError, OSError, ValueError):
+            return None
+    return lifecycle if type(lifecycle) is dict else None
 
 
 class TodoStateNotWritten(Exception):
@@ -240,6 +252,7 @@ class AgentTranscriptTreeSnapshot:
 
     root: Path
     transcripts: tuple[tuple[Path, AgentTranscriptSnapshot], ...]
+    lifecycles: tuple[dict[str, object], ...] = ()
 
     def transcript(self, path: Path) -> AgentTranscriptSnapshot | None:
         return next(
@@ -321,7 +334,12 @@ class AgentTranscriptSource:
                     for child in _nested_child_paths(snapshot)
                     if child not in seen
                 )
-        return AgentTranscriptTreeSnapshot(self.path, tuple(projected))
+        lifecycles = tuple(
+            lifecycle
+            for path, _snapshot in projected
+            if (lifecycle := _read_agent_lifecycle(path)) is not None
+        )
+        return AgentTranscriptTreeSnapshot(self.path, tuple(projected), lifecycles)
 
     def _refresh_path(self, path: Path) -> AgentTranscriptSnapshot:
         if self._message_limit is not None:
@@ -389,10 +407,13 @@ class AgentTranscriptSource:
         )
 
     def _tree_snapshot(self) -> AgentTranscriptTreeSnapshot:
-        return AgentTranscriptTreeSnapshot(
-            self.path,
-            tuple(self._snapshots.items()),
+        items = tuple(self._snapshots.items())
+        lifecycles = tuple(
+            lifecycle
+            for path, _snapshot in items
+            if (lifecycle := _read_agent_lifecycle(path)) is not None
         )
+        return AgentTranscriptTreeSnapshot(self.path, items, lifecycles)
 
     def _log_refresh_error(self, error: Exception, *, traceback: bool) -> None:
         if self._refresh_error_logged:

@@ -23,6 +23,28 @@ if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
 
 
+_IDLE_NUDGE_SECONDS = 10 * 60
+_IDLE_NUDGE_LIMIT = 3
+_IDLE_NUDGE_PROMPT = (
+    "you have been idle for 10 minutes. call `finish` if the contract is complete, "
+    "call `ask_parent` if you are waiting on a decision, or continue the work."
+)
+
+
+async def _wait_for_idle_wake(
+    wait: Callable[[], Awaitable[None]], timeout: float | None
+) -> bool:
+    """Return true for an external wake and false for the nudge deadline."""
+    if timeout is None:
+        await wait()
+        return True
+    try:
+        await asyncio.wait_for(wait(), timeout=max(0.0, timeout))
+    except TimeoutError:
+        return False
+    return True
+
+
 def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -> None:
     if getattr(child_loop, "explicit_finish", False):
         child_store.update_agent_lifecycle(
@@ -122,6 +144,9 @@ async def consume_run(
     finish_lifecycle = kwargs.get("finish_lifecycle")
     child_turns = kwargs.get("child_turns")
     final_finish_lifecycle = finish_lifecycle
+    idle_clock = kwargs.pop("idle_clock", None) or asyncio.get_running_loop().time
+    idle_wait = kwargs.pop("idle_wait", None) or _wait_for_idle_wake
+    idle_nudge_seconds = kwargs.pop("idle_nudge_seconds", _IDLE_NUDGE_SECONDS)
 
     def keep_lifecycle_running(state: str, text: str) -> dict[str, object]:
         if not callable(child_turns):
@@ -145,6 +170,8 @@ async def consume_run(
     kwargs["finish_gate_state"] = FinishGateState()
 
     idle_started: float | None = None
+    safety_started: float | None = None
+    idle_nudges = 0
     idle_published = False
     safety_task: asyncio.Task[tuple[str, ...]] | None = None
     try:
@@ -158,8 +185,8 @@ async def consume_run(
                 and isinstance(structured, dict)
                 and structured.get("status") == "running"
             )
-            if idle and idle_started is None:
-                idle_started = asyncio.get_running_loop().time()
+            if idle and safety_started is None:
+                safety_started = asyncio.get_running_loop().time()
             # Ack only after a follow-up actually reached the child. A cancel or
             # backend error mid-consume_child leaves the prompt pending, so the
             # next run gets a chance to redeliver it instead of it silently gone.
@@ -221,7 +248,7 @@ async def consume_run(
                     for task in child_loop.tool_registry.background_tasks.snapshot()
                 )
                 if running_tasks and safety_task is None:
-                    elapsed = asyncio.get_running_loop().time() - idle_started
+                    elapsed = asyncio.get_running_loop().time() - safety_started
                     timeout = max(
                         0.0,
                         child_loop._background_owner.finish_gate_task_timeout - elapsed,
@@ -231,9 +258,42 @@ async def consume_run(
                             child_loop.tool_registry.background_tasks, timeout
                         )
                     )
-                await child_loop._background_owner.conversation_channel.wait(
-                    child_loop.agent_instance_id
+                fence = getattr(child_loop, "_terminal_transition_fence", None)
+                eligible = (
+                    await fence.idle_nudge_eligible()
+                    if fence is not None
+                    else not running_tasks
                 )
+                if eligible and idle_nudges < _IDLE_NUDGE_LIMIT:
+                    now = idle_clock()
+                    if idle_started is None:
+                        idle_started = now
+                    remaining = idle_nudge_seconds - (now - idle_started)
+                else:
+                    idle_started = None
+                    remaining = None
+                external_wake = await idle_wait(
+                    lambda: child_loop._background_owner.conversation_channel.wait(
+                        child_loop.agent_instance_id
+                    ),
+                    remaining,
+                )
+                if external_wake:
+                    idle_started = None
+                    continue
+                if fence is not None and not await fence.idle_nudge_eligible():
+                    idle_started = None
+                    continue
+                _transition_running(child_loop, child_store)
+                result = await consume_child(
+                    child_loop,
+                    _IDLE_NUDGE_PROMPT,
+                    origin=MessageOrigin.AGENT_PROMPT,
+                    **kwargs,
+                )
+                idle_nudges += 1
+                idle_started = None
+                idle_published = False
                 continue
             pending = child_store.close_pending_queue_if_empty()
             if pending:

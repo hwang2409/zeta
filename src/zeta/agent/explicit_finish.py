@@ -3,12 +3,42 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
 
 from .presets import AgentPreset
 
 if TYPE_CHECKING:
     from ..tools._shared.process import BackgroundTaskRegistry
+
+
+IDLE_CHILD_FD_FLOOR = 3
+IDLE_CHILD_WARNING_THRESHOLD = 16
+
+
+def idle_resource_usage(states: Iterable[Mapping[str, object]]) -> dict[str, object]:
+    """Return the known resource floor for one root agent tree."""
+
+    idle_count = sum(
+        1
+        for state in states
+        if isinstance(state, dict) and state.get("state") == "idle"
+    )
+    fd_floor = idle_count * IDLE_CHILD_FD_FLOOR
+    return {
+        "idle_child_count": idle_count,
+        "idle_child_fd_floor": fd_floor,
+        "idle_child_warning": idle_count > IDLE_CHILD_WARNING_THRESHOLD,
+    }
+
+
+def format_idle_resource_usage(usage: dict[str, object]) -> str:
+    """Format one stable status line for tools and agent cards."""
+
+    count = usage["idle_child_count"]
+    floor = usage["idle_child_fd_floor"]
+    warning = "; warning: more than 16 idle children" if usage["idle_child_warning"] else ""
+    return f"idle children: {count}; known fd floor: {floor}{warning}"
 
 
 def eligible(*, global_enabled: bool, preset: AgentPreset, background: bool) -> bool:
