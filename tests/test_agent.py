@@ -9261,6 +9261,8 @@ async def test_explicit_finish_child_ending_with_text_gets_one_immediate_reminde
         tool_registry=registry,
     )
 
+    idle_waiting = asyncio.Event()
+
     async def fake_consume(*args, **kwargs):
         nonlocal calls
         calls += 1
@@ -9271,6 +9273,11 @@ async def test_explicit_finish_child_ending_with_text_gets_one_immediate_reminde
             "structuredContent": {"status": "running"},
         }
 
+    async def wait_idle(_wake, _timeout):
+        idle_waiting.set()
+        await asyncio.Event().wait()
+        return True
+
     monkeypatch.setattr(agent_runner_module, "consume_child", fake_consume)
     task = asyncio.create_task(
         agent_runner_module.consume_run(
@@ -9279,9 +9286,10 @@ async def test_explicit_finish_child_ending_with_text_gets_one_immediate_reminde
             child_store=store,
             child_turns=lambda: 1,
             finish_lifecycle=lambda *_: {},
+            idle_wait=wait_idle,
         )
     )
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(idle_waiting.wait(), 2)
     assert calls == 2
     assert store.agent_lifecycle()["state"] == "idle"
     task.cancel()
