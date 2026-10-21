@@ -66,7 +66,13 @@ class AccountStore:
         self, directory_fd: int, name: str, *, wait: bool = True
     ) -> Iterator[None]:
         created = not _exists(directory_fd, name)
-        fd = open_session_file(directory_fd, name, os.O_RDWR | os.O_CREAT)
+        for attempt in range(3):
+            try:
+                fd = open_session_file(directory_fd, name, os.O_RDWR | os.O_CREAT)
+                break
+            except FileNotFoundError:
+                if attempt == 2:
+                    raise
         try:
             os.fchmod(fd, 0o600)
             if created:

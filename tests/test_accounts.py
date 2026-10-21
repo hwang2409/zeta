@@ -201,21 +201,13 @@ def test_migration_is_noop_when_already_migrated(tmp_path: Path) -> None:
 def test_account_files_are_0600_and_dirs_are_private(tmp_path: Path) -> None:
     store = AccountStore(tmp_path)
     store.ensure_account(AccountId("codex", "personal"), tokens())
+    with store.provider_login_lock("codex"):
+        pass
+    store.migrate()
 
-    directories = [
-        tmp_path / "accounts",
-        tmp_path / "accounts" / "codex",
-        tmp_path / "accounts" / "codex" / "personal",
-        tmp_path / "account-locks",
-        tmp_path / "account-locks" / "codex",
-    ]
-    files = [
-        store.registry,
-        store.registry_lock,
-        store.credential_path(AccountId("codex", "personal")),
-    ]
-    assert all(path.stat().st_mode & 0o777 == 0o700 for path in directories)
-    assert all(path.stat().st_mode & 0o777 == 0o600 for path in files)
+    paths = list(tmp_path.rglob("*"))
+    assert all(path.stat().st_mode & 0o777 == 0o700 for path in paths if path.is_dir())
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in paths if path.is_file())
 
 
 def test_no_token_text_in_errors_logs_or_registry(
@@ -228,7 +220,12 @@ def test_no_token_text_in_errors_logs_or_registry(
 
     assert _SENTINEL not in str(raised.value)
     assert _SENTINEL not in caplog.text
-    assert _SENTINEL not in store.registry.read_text()
+    metadata = [
+        path
+        for path in tmp_path.rglob("*")
+        if path.is_file() and path.name != "oauth.json"
+    ]
+    assert all(_SENTINEL not in path.read_text() for path in metadata)
 
 
 def test_concurrent_login_is_rejected_per_provider(tmp_path: Path) -> None:
