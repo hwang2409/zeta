@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import sys
+from dataclasses import replace
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
@@ -17,6 +18,7 @@ from ..core.commands.completion import completion_script
 from ..core.login_flow import run_login
 from ..core.session import SessionError, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
+from ..oauth import OAuthTokens
 from ..providers.login import build_login_provider, pkce_values
 from ..tui.app import create_app
 from ..tui.key_bindings import TerminalRenderError
@@ -263,13 +265,19 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command")
     login_parser = commands.add_parser("login", help="log in to an OAuth provider")
     login_parser.add_argument(
-        "provider", choices=("anthropic", "codex"), nargs="?", default="anthropic",
+        "provider",
+        choices=("anthropic", "codex"),
+        nargs="?",
+        default="anthropic",
     )
-    login_parser.add_argument("--provider", dest="provider_flag", choices=("anthropic", "codex"))
     login_parser.add_argument("--account", default="default")
     login_parser.add_argument("--replace", action="store_true")
-    accounts_parser = commands.add_parser("accounts", help="manage subscription accounts")
-    accounts_parser.add_argument("action", nargs="?", choices=("default", "logout", "refresh"))
+    accounts_parser = commands.add_parser(
+        "accounts", help="manage subscription accounts"
+    )
+    accounts_parser.add_argument(
+        "action", nargs="?", choices=("default", "logout", "refresh")
+    )
     accounts_parser.add_argument("account", nargs="?")
     accounts_parser.add_argument("--json", action="store_true")
     from .inbox import add_subcommand as _add_inbox_subcommand
@@ -379,16 +387,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_login(provider: str, account: str, replace: bool) -> str | None:
+class _CredentialCapture:
+    def __init__(self) -> None:
+        self.tokens: OAuthTokens | None = None
+
+    def save(self, tokens: OAuthTokens) -> None:
+        self.tokens = tokens
+
+
+def _run_login(
+    provider: str, account: str = "default", replace_existing: bool = False
+) -> str | None:
     home = env_home()
     store = AccountStore(home)
-    provider_impl = build_login_provider(provider, home, account=account)
-    handle = asyncio.run(run_login(provider_impl, pkce_values))
-    tokens = provider_impl.credential_store.read()
-    if tokens is None:
-        raise AccountError("login did not produce credentials")
-    store.ensure_account(AccountId(provider, account), tokens, replace=replace)
-    return handle
+    account_id = AccountId(provider, account)
+    with store.provider_login_lock(provider):
+        exists = store.contains(account_id)
+        if exists and not replace_existing:
+            if not sys.stdin.isatty() or input(
+                f"replace {account_id}? [y/N] "
+            ).lower() not in {"y", "yes"}:
+                raise AccountError(
+                    f"account {account_id} already exists; use --replace"
+                )
+            replace_existing = True
+        capture = _CredentialCapture()
+        provider_impl = replace(
+            build_login_provider(provider, home), credential_store=capture
+        )
+        handle = asyncio.run(run_login(provider_impl, pkce_values))
+        if capture.tokens is None:
+            raise AccountError("login did not produce credentials")
+        store.ensure_account(account_id, capture.tokens, replace=replace_existing)
+        return handle
 
 
 def _cleanup_ephemeral(app: object) -> None:
@@ -437,19 +468,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "login":
         try:
-            provider = args.provider or args.provider_flag
-            if provider is None:
-                parser.error("login requires a provider")
             handle = (
-                _run_login(provider)
+                _run_login(args.provider)
                 if args.account == "default" and not args.replace
-                else _run_login(provider, args.account, args.replace)
+                else _run_login(args.provider, args.account, args.replace)
             )
         except KeyboardInterrupt:
             print("login cancelled", file=sys.stderr)
             return 1
-        except Exception as exc:
+        except AccountError as exc:
             print(f"login failed: {exc}", file=sys.stderr)
+            return 1
+        except Exception:
+            print("login failed", file=sys.stderr)
             return 1
         print(f"logged in as {handle}" if handle else "ok")
         return 0
@@ -467,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise AccountError("refresh is deferred to phase 2")
             else:
                 accounts = [str(item) for item in store.list()]
-                print(json.dumps(accounts) if args.json else "\\n".join(accounts))
+                print(json.dumps(accounts) if args.json else "\n".join(accounts))
             return 0
         except AccountError as exc:
             print(str(exc), file=sys.stderr)

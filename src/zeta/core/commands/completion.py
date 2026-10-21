@@ -84,7 +84,7 @@ _zeta() {
         argument)
             case $command_name in
                 login)
-                    _arguments '--provider=[OAuth provider]:provider:(anthropic codex)' '--account=[account name]:account:' '--replace[replace existing account]' '1:provider:(anthropic codex)'
+                    _arguments '--account=[account name]:account:' '--replace[replace existing account]' '1:provider:(anthropic codex)'
                     ;;
                 accounts)
                     _arguments '--json[print JSON]' '1:action:(default logout refresh)' '2:account:'
@@ -221,7 +221,7 @@ def bash_script() -> str:
 
     case "$command" in
         login)
-            COMPREPLY=( $(compgen -W "--provider --account --replace" -- "$cur") )
+            COMPREPLY=( $(compgen -W "anthropic codex --account --replace" -- "$cur") )
             ;;
         accounts)
             COMPREPLY=( $(compgen -W "--json default logout refresh" -- "$cur") )

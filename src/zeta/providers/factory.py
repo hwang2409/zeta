@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from ..accounts import AccountId, AccountStore, resolve_account
 from ..config.settings import load_settings
 from ..core.session import env_home
 from ..core.slash import budget_for_model, effective_budget_for_model
@@ -84,16 +83,10 @@ def build_backend(
     require_credentials: bool = False,
     ollama_base_url: str | None = None,
     token_budget: int | None = None,
-    account: AccountId | None = None,
 ) -> tuple[CompletionBackend, str]:
     """Build a network provider backend and report the model it settled on."""
 
     auth_home = Path(home) if home is not None else env_home()
-    credential_home = None
-    if account is not None:
-        account_provider = "anthropic" if provider == "claude" else provider
-        selected = resolve_account(auth_home, account, account_provider)
-        credential_home = AccountStore(auth_home).credential_path(selected)
     stall_kwargs = {
         "stall_seconds": (
             DEFAULT_STREAM_STALL_SECONDS if stall_seconds is None else stall_seconds
@@ -103,11 +96,7 @@ def build_backend(
         ),
     }
     if provider == "claude":
-        credential = (
-            AnthropicCredentialStore(credential_home)
-            if credential_home is not None
-            else _anthropic_credential(auth_home)
-        )
+        credential = _anthropic_credential(auth_home)
         selected_model = model or DEFAULT_CLAUDE_MODEL
         if require_credentials:
             _require_credentials(credential)
@@ -118,7 +107,7 @@ def build_backend(
             **stall_kwargs,
         ), selected_model
     if provider == "codex":
-        credential = CodexCredentialStore(credential_home or (auth_home / "codex-oauth.json"))
+        credential = CodexCredentialStore(auth_home / "codex-oauth.json")
         if require_credentials:
             _require_credentials(credential)
         selected_model = model or DEFAULT_CODEX_MODEL
