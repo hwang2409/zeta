@@ -15,6 +15,7 @@ import zeta.providers.anthropic as anthropic_module
 import zeta.providers.codex as codex_module
 import zeta.providers.retry_policy as retry_policy_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.codex import CodexCredentialDriver
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
@@ -1992,6 +1993,9 @@ async def test_child_retries_response_failed_server_error(
                     encode({"signature": "fixture"}),
                 )
             )
+
+        def auth_headers(self, token: str) -> dict[str, str]:
+            return CodexCredentialDriver().auth_headers(token)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     child_backend = codex_module.CodexBackend(
