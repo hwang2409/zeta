@@ -13,9 +13,7 @@ class RuntimeCloseMixin:
     """Close every resource once, preserving the first cleanup error."""
 
     def _detach_ui_notice_sinks(self) -> None:
-        set_mcp_notice_sink = getattr(self.loop, "set_mcp_notice_sink", None)
-        if set_mcp_notice_sink is not None:
-            set_mcp_notice_sink(None)
+        self.loop.set_mcp_notice_sink(None)
 
     def _init_runtime_close(self) -> None:
         self._closed = False

@@ -1127,9 +1127,7 @@ class TUIApp(
                 self._begin_startup_replay()
             if self._history is not None:
                 self._history.set_notice_sink(self._handle_background_notice)
-            set_mcp_notice_sink = getattr(self.loop, "set_mcp_notice_sink", None)
-            if set_mcp_notice_sink is not None:
-                set_mcp_notice_sink(self._handle_background_notice)
+            self.loop.set_mcp_notice_sink(self._handle_background_notice)
             await self.loop.activate()
             session = session or self._session or self._make_session()
             self._active_session = session
