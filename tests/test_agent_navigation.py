@@ -1162,7 +1162,9 @@ async def test_child_send_double_enter_queues_once(
 
 
 @pytest.mark.asyncio
-async def test_enter_in_eligible_child_view_queues_for_child_not_main(tmp_path: Path) -> None:
+async def test_enter_in_eligible_child_view_queues_for_child_not_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Worker", agent_type="worker")
     child.joinpath("agent_lifecycle.json").write_text(
@@ -1194,15 +1196,36 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(tmp_path: 
         child_instance_id="root:worker",
     )
     notices: list[str] = []
-    app._print_system = notices.append
+    loop = asyncio.get_running_loop()
+    queued = asyncio.Event()
+
+    def print_system(message: str) -> None:
+        notices.append(message)
+        if message.startswith("queued message for "):
+            loop.call_soon_threadsafe(queued.set)
+
+    app._print_system = print_system
     app._agent_navigation.current_path = child
     app._agent_navigation.child_instance_id = lambda: "root:worker"
     assert app._agent_navigation.child_view_active
     session = app._make_session()
     app._active_session = session
+    started = asyncio.Event()
+    release = threading.Event()
+    real_send = agent_runtime.send_to_run
+
+    def send(*args: object, **kwargs: object) -> str | None:
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(10)
+        return real_send(*args, **kwargs)
+
+    monkeypatch.setattr(agent_runtime, "send_to_run", send)
     session.default_buffer.text = "follow up"
     assert app._submit_input(session.default_buffer.text) is False
-    await asyncio.sleep(0.1)
+    await asyncio.wait_for(started.wait(), timeout=2)
+    assert session.default_buffer.text == "follow up"
+    release.set()
+    await asyncio.wait_for(queued.wait(), timeout=2)
     assert session.default_buffer.text == ""
     assert [entry.data["text"] for entry in ConversationStore(child.parent, session_id=child.name).pending_prompts()] == ["follow up"]
     assert store.messages() == []

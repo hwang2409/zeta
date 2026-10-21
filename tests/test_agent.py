@@ -28,6 +28,7 @@ from zeta.agent.background import (
     finish_background_child,
     recover_agent_children,
 )
+from zeta.agent.finish_gate import FinishGateState
 from zeta.agent.notifications import NotificationWake
 from zeta.agent.presets import (
     AGENT_PRESETS,
@@ -1135,6 +1136,8 @@ class ConversationFinishGateBackend(CompletionBackend):
         self.gate_seen = asyncio.Event()
         self.question_published = asyncio.Event()
         self.release_grandchild = asyncio.Event()
+        self.notification_turn_started = asyncio.Event()
+        self.release_notification_turn = asyncio.Event()
         self.notification_turns = 0
         self.gate_turns = 0
         self.follow_up_seen = False
@@ -1217,6 +1220,8 @@ class ConversationFinishGateBackend(CompletionBackend):
             self.follow_up_seen = True
             blocks = [TextContent("child processed follow-up")]
         elif notification and len(gate_messages) == 1 and not handoff_done:
+            self.notification_turn_started.set()
+            await self.release_notification_turn.wait()
             self.notification_turns += 1
             blocks = [
                 ToolUseContent(
@@ -2117,6 +2122,7 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
     await asyncio.wait_for(backend.question_published.wait(), timeout=2)
+    await asyncio.wait_for(backend.notification_turn_started.wait(), timeout=2)
     child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
     assert send_to_run(
         store,
@@ -2124,6 +2130,7 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
         "queued follow-up",
         channel=loop._background_owner.conversation_channel,
     ) is None
+    backend.release_notification_turn.set()
 
     await _wait_for_notification(store, "completed")
     assert backend.notification_turns == 1
@@ -2381,6 +2388,44 @@ async def test_child_finish_gate_counts_model_turns_and_adopts_after_bound(
     backend.release_grandchild.set()
     await _wait_for_notification(store, "completed")
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_model_timeout_defers_task_exit_during_cancellation(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store, finish_gate_timeout=0.01)
+    task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=True)
+    registry = SimpleNamespace(snapshot=lambda: (task,))
+    child_loop = SimpleNamespace(
+        _background_owner=owner,
+        agent_instance_id="child-1",
+        tool_registry=SimpleNamespace(background_tasks=registry),
+    )
+    state = FinishGateState()
+    state.start(child_loop)
+
+    async def events() -> AsyncIterator[StreamEvent]:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            task.running = False
+            raise
+        if False:
+            yield StreamEvent(StreamEventType.MESSAGE_END)
+
+    async def consume(
+        stream: AsyncIterator[StreamEvent], control: object
+    ) -> None:
+        del control
+        async for _event in stream:
+            pass
+
+    result = await state.run_model_turn(child_loop, events(), consume)
+
+    assert result is None
+    store.close()
 
 
 @pytest.mark.asyncio
