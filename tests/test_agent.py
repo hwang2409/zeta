@@ -6609,7 +6609,7 @@ class _TaskFinishGateBackend(CompletionBackend):
         self.child_turn_paused = asyncio.Event()
         self.release_child_turn = asyncio.Event()
         self.gate_seen = asyncio.Event()
-        self.gate_delay_finished = asyncio.Event()
+        self.gate_delay_cancelled = asyncio.Event()
         self.gate_text = ""
         self.grandchild_started = asyncio.Event()
         self.release_grandchild = asyncio.Event()
@@ -6743,8 +6743,9 @@ class _TaskFinishGateBackend(CompletionBackend):
                 if self.gate_delay:
                     try:
                         await asyncio.sleep(self.gate_delay)
-                    finally:
-                        self.gate_delay_finished.set()
+                    except asyncio.CancelledError:
+                        self.gate_delay_cancelled.set()
+                        raise
             if self.action == "kill":
                 assert task_id is not None
                 blocks = [
@@ -6826,10 +6827,9 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
         f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
         "echo task-evidence"
     )
-    backend = _TaskFinishGateBackend(command)
+    backend = _TaskFinishGateBackend(command, gate_delay=1)
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.05)
-    owner.finish_gate_task_timeout = 0.5
     loop = AgentLoop(
         backend,
         store,
@@ -6842,7 +6842,7 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
     )
 
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
-    await asyncio.sleep(0.2)
+    await asyncio.wait_for(backend.gate_delay_cancelled.wait(), timeout=2)
     release.touch()
     await asyncio.wait_for(run, timeout=2)
     notification = await _wait_completion(store)
@@ -6863,7 +6863,6 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
     backend = _TaskFinishGateBackend(command, mixed_child=True, gate_delay=0.1)
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.05)
-    owner.finish_gate_task_timeout = 2
     loop = AgentLoop(
         backend,
         store,
@@ -6876,7 +6875,7 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
     )
 
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
-    await asyncio.wait_for(backend.gate_delay_finished.wait(), timeout=2)
+    await asyncio.wait_for(backend.gate_delay_cancelled.wait(), timeout=2)
     release.touch()
     await asyncio.wait_for(backend.task_output_read.wait(), timeout=10)
     notification = await _wait_completion(store, containing="task-evidence")
