@@ -16,13 +16,13 @@ from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
 from .._results import _spill_preview
 from .._shared.process import (
-    _child_priority_preexec,
     _kill_and_reap,
     create_subprocess_shell_in_fd,
     spawn_background,
     tool_subprocess_env,
 )
 from .._shared.sandbox import expand_user_path
+from .._shared.tool_spawn import create_tool_subprocess_shell
 from ..registry import (
     ToolExecutionContext,
     ToolRegistry,
@@ -251,10 +251,9 @@ async def _bash(
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    start_new_session=True,
                     pass_fds=(write_fd,),
                     env=tool_subprocess_env(),
-                    preexec_fn=_child_priority_preexec(registry.command_niceness),
+                    niceness=registry.command_niceness,
                 )
                 process = await spawn_background(
                     spawn,
@@ -265,16 +264,15 @@ async def _bash(
             finally:
                 os.close(cwd_fd)
         else:
-            spawn = asyncio.create_subprocess_shell(
+            spawn = create_tool_subprocess_shell(
                 command,
                 cwd=registry.cwd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
                 pass_fds=(write_fd,),
                 env=tool_subprocess_env(),
-                preexec_fn=_child_priority_preexec(registry.command_niceness),
+                niceness=registry.command_niceness,
             )
             process = await spawn_background(
                 spawn,

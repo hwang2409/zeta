@@ -15,7 +15,6 @@ import weakref
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import IO, Any, Literal
 
@@ -37,6 +36,7 @@ from .background_spawn import (
     create_subprocess_shell_in_fd,
     spawn_background,
 )
+from .tool_spawn import create_tool_subprocess_shell
 
 logger = logging.getLogger(__name__)
 
@@ -45,20 +45,6 @@ def tool_subprocess_env() -> dict[str, str]:
     """Return the scrubbed parent environment for a tool child."""
 
     return subprocess_env()
-
-
-def _child_priority_preexec(niceness: int) -> Callable[[], None] | None:
-    """Return a best-effort child-only priority adjustment."""
-
-    return partial(_lower_child_priority, niceness) if niceness else None
-
-
-def _lower_child_priority(niceness: int) -> None:
-    try:
-        current = os.getpriority(os.PRIO_PROCESS, 0)
-        os.setpriority(os.PRIO_PROCESS, 0, min(19, current + niceness))
-    except (AttributeError, OSError):
-        pass
 
 
 BACKGROUND_OUTPUT_LIMIT = 512 * 1024
@@ -360,12 +346,11 @@ class BackgroundTaskRegistry:
                     "stdin": asyncio.subprocess.PIPE,
                     "stdout": asyncio.subprocess.PIPE,
                     "stderr": asyncio.subprocess.STDOUT,
-                    "start_new_session": True,
                     "env": tool_subprocess_env(),
-                    "preexec_fn": _child_priority_preexec(self.command_niceness),
+                    "niceness": self.command_niceness,
                 }
                 if cwd_fd is None:
-                    spawn = asyncio.create_subprocess_shell(
+                    spawn = create_tool_subprocess_shell(
                         command, cwd=cwd, **spawn_kwargs
                     )
                 else:
