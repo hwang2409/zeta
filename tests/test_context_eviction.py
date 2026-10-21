@@ -3542,3 +3542,47 @@ async def test_invalid_view_falls_back_to_fresh_eviction(tmp_path: Path) -> None
     assert len(active_markers) == 1
     assert active_markers[0].id != marker.id
     assert marker.id in active_markers[0].data["replaces"]
+
+
+def test_persisted_reasoning_receipts_do_not_raise_the_eviction_floor() -> None:
+    sources = {
+        seq: Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("private"), TextContent(f"answer {seq}")],
+        )
+        for seq in (1, 2)
+    }
+    records = [
+        (
+            seq,
+            Message(
+                MessageRole.ASSISTANT,
+                [
+                    TextContent(f"answer {seq}"),
+                    TextContent(f"[assistant reasoning evicted · seq {seq}]"),
+                ],
+                metadata={"context_evicted": True, "source_seq": seq},
+            ),
+        )
+        for seq in (1, 2)
+    ]
+
+    def counter(message: Message) -> int:
+        return (
+            1
+            if message.metadata.get("eviction_range")
+            or message.metadata.get("eviction_receipt")
+            else 100
+        )
+
+    for _ in range(4):
+        result = evict_messages(
+            records,
+            fixed_tokens=0,
+            target_tokens=1,
+            token_counter=counter,
+            source_messages=sources,
+        )
+        assert result.reached_target is True
+        assert result.tokens_after <= 1
+        records = list(zip(result.source_seqs, result.messages, strict=True))

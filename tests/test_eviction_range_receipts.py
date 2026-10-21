@@ -1272,7 +1272,67 @@ def test_persisted_raw_call_eviction_respects_protection() -> None:
     )
 
 
-def test_persisted_reasoning_eviction_with_raw_text_is_not_replaced() -> None:
+def _persisted_hybrid(
+    seq: int = 1, *, metadata: dict[str, object] | None = None, tool_result=None
+) -> Message:
+    return Message(
+        MessageRole.ASSISTANT,
+        [
+            TextContent("keep this answer"),
+            TextContent(f"[assistant reasoning evicted · seq {seq}]"),
+        ],
+        tool_result=tool_result,
+        metadata=metadata
+        if metadata is not None
+        else {"context_evicted": True, "source_seq": seq},
+    )
+
+
+def test_unmarked_assistant_ending_in_marker_is_not_canonicalized() -> None:
+    message = _persisted_hybrid(metadata={})
+    result = evict_messages(
+        [(1, message)], fixed_tokens=0, target_tokens=1, source_messages={1: message}
+    )
+    assert result.messages[0].to_dict() == message.to_dict()
+
+
+def test_hybrid_with_mismatched_source_seq_is_not_canonicalized() -> None:
+    message = _persisted_hybrid(metadata={"context_evicted": True, "source_seq": 9})
+    result = evict_messages(
+        [(1, message)], fixed_tokens=0, target_tokens=1, source_messages={1: message}
+    )
+    assert result.messages[0].to_dict() == message.to_dict()
+
+
+def test_hybrid_with_extra_metadata_is_not_canonicalized() -> None:
+    message = _persisted_hybrid(
+        metadata={"context_evicted": True, "source_seq": 1, "provider": "native"}
+    )
+    result = evict_messages(
+        [(1, message)], fixed_tokens=0, target_tokens=1, source_messages={1: message}
+    )
+    assert result.messages[0].to_dict() == message.to_dict()
+
+
+def test_hybrid_with_tool_result_is_not_canonicalized_and_result_is_kept() -> None:
+    tool_result = ToolResult("call-1", "keep this result")
+    message = _persisted_hybrid(tool_result=tool_result)
+    result = evict_messages(
+        [(1, message)], fixed_tokens=0, target_tokens=1, source_messages={1: message}
+    )
+    assert result.messages[0].to_dict() == message.to_dict()
+    assert result.messages[0].tool_result is not None
+
+
+def test_short_hybrid_is_not_replaced_when_receipt_is_not_smaller() -> None:
+    message = _persisted_hybrid()
+    result = evict_messages(
+        [(1, message)], fixed_tokens=0, target_tokens=1, source_messages={1: message}
+    )
+    assert message_token_count(result.messages[0]) <= message_token_count(message)
+
+
+def test_persisted_reasoning_eviction_with_raw_text_is_canonicalized() -> None:
     source = Message(
         MessageRole.ASSISTANT,
         [
@@ -1298,7 +1358,10 @@ def test_persisted_reasoning_eviction_with_raw_text_is_not_replaced() -> None:
         source_messages={1: source},
     )
 
-    assert result.messages[0].to_dict() == persisted.to_dict()
+    assert result.messages[0].metadata["eviction_receipt"] == "tool_call"
+    assert result.messages[0].content[0].tool_call.arguments == {
+        "eviction_receipt": {"source_seq": 1}
+    }
 
 
 def test_persisted_raw_call_eviction_respects_size_guard() -> None:
@@ -1418,3 +1481,107 @@ def test_legacy_regeneration_keeps_larger_generated_receipt() -> None:
 
     assert result.messages[0].to_dict() == persisted.to_dict()
     assert result.items_evicted == 0
+
+
+def _counter(message: Message) -> int:
+    return (
+        1
+        if message.metadata.get("eviction_range")
+        or message.metadata.get("eviction_receipt")
+        else 100
+    )
+
+
+def test_persisted_reasoning_text_is_canonicalized_then_coarsely_folded() -> None:
+    sources = {
+        seq: Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("private"), TextContent(f"answer {seq}")],
+        )
+        for seq in (1, 2)
+    }
+    records = [
+        (
+            seq,
+            Message(
+                MessageRole.ASSISTANT,
+                [
+                    TextContent(f"answer {seq}"),
+                    TextContent(f"[assistant reasoning evicted · seq {seq}]"),
+                ],
+                metadata={"context_evicted": True, "source_seq": seq},
+            ),
+        )
+        for seq in (1, 2)
+    ]
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=_counter,
+        source_messages=sources,
+    )
+    assert result.reached_target is True
+    assert len(result.messages) == 1
+    assert result.messages[0].metadata.get("eviction_range") is True
+
+
+def test_persisted_reasoning_tool_call_is_canonicalized_then_coarsely_folded() -> None:
+    records = []
+    sources = {}
+    for seq in (1, 3):
+        call_id = f"read-{seq}"
+        sources[seq] = Message(
+            MessageRole.ASSISTANT,
+            [
+                ThinkingContent("private"),
+                TextContent(f"answer {seq}"),
+                ToolUseContent(ToolCall(call_id, "read", {"path": "raw.txt"})),
+            ],
+        )
+        sources[seq + 1] = Message(
+            MessageRole.TOOL_RESULT, tool_result=ToolResult(call_id, "raw output")
+        )
+        records.extend(
+            [
+                (
+                    seq,
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [
+                            TextContent(f"answer {seq}"),
+                            ToolUseContent(
+                                ToolCall(
+                                    call_id,
+                                    "read",
+                                    {"eviction_receipt": {"source_seq": seq}},
+                                )
+                            ),
+                            TextContent(f"[assistant reasoning evicted · seq {seq}]"),
+                        ],
+                        metadata={"context_evicted": True, "source_seq": seq},
+                    ),
+                ),
+                (
+                    seq + 1,
+                    _semantic_result_receipt(
+                        role=MessageRole.TOOL_RESULT,
+                        tool_name="read",
+                        tool_call_id=call_id,
+                        seq=seq + 1,
+                        digest="raw output",
+                        content_digest=f"digest-{seq}",
+                    ),
+                ),
+            ]
+        )
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=_counter,
+        source_messages=sources,
+    )
+    assert result.reached_target is True
+    assert len(result.messages) == 1
+    assert result.messages[0].metadata.get("eviction_range") is True

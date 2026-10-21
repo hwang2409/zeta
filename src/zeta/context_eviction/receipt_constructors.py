@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from ..protocol.types import (
     ContentBlock,
@@ -19,6 +19,41 @@ DIGEST_LIMIT = 440
 WORKFLOW_MESSAGE_LIMIT = 4
 RECEIPT_KIND_METADATA = "eviction_receipt"
 RECEIPT_FIELDS_METADATA = "eviction_receipt_fields"
+
+
+def _persisted_reasoning_receipt(
+    message: Message,
+    seq: int,
+    token_counter: Callable[[Message], int],
+) -> Message | None:
+    """Build a smaller receipt for a trusted persisted reasoning hybrid."""
+    if (
+        message.role is not MessageRole.ASSISTANT
+        or message.tool_result is not None
+        or set(message.metadata) != {"context_evicted", "source_seq"}
+        or message.metadata.get("context_evicted") is not True
+        or type(message.metadata.get("source_seq")) is not int
+        or message.metadata.get("source_seq") != seq
+        or not message.content
+    ):
+        return None
+    marker = f"[assistant reasoning evicted · seq {seq}]"
+    last = message.content[-1]
+    if not isinstance(last, TextContent) or last.text != marker:
+        return None
+    body = message.content[:-1]
+    tool_content = [block for block in body if isinstance(block, ToolUseContent)]
+    if tool_content and all(
+        isinstance(block, (TextContent, ToolUseContent)) for block in body
+    ):
+        replacement = _tool_call_receipt(
+            Message(message.role, tool_content, metadata=message.metadata), seq
+        )
+    elif body and all(isinstance(block, TextContent) for block in body):
+        replacement = _assistant_receipt(seq, "assistant text")
+    else:
+        return None
+    return replacement if token_counter(replacement) < token_counter(message) else None
 
 
 def _tool_call_receipt(
