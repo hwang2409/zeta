@@ -88,7 +88,12 @@ def render_all_kinds(state: MemoryState) -> dict[str, str]:
 
 def entry_value(entry: MemoryEntry) -> dict[str, object]:
     value = dataclasses.asdict(entry)
-    value["sources"] = [dataclasses.asdict(source) for source in entry.sources]
+    value["supersedes"] = list(entry.supersedes)
+    value["superseded_by"] = list(entry.superseded_by)
+    value["sources"] = [
+        {**dataclasses.asdict(source), "origins": list(source.origins)}
+        for source in entry.sources
+    ]
     return value
 
 
@@ -109,10 +114,12 @@ def inspect_value(
         key=lambda item: (item.updated_at, item.id),
         reverse=True,
     )[:inactive_limit]
+    schema = dataclasses.asdict(state.schema)
+    schema["kinds"] = [dataclasses.asdict(kind) for kind in state.schema.kinds]
     result: dict[str, object] = {
         "format": 2,
         "generation": state.generation,
-        "schema": dataclasses.asdict(state.schema),
+        "schema": schema,
         "entries": [],
         "entries_truncated": False,
         "inactive": [
