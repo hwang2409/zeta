@@ -958,7 +958,6 @@ def test_coarse_fold_compacted_tool_call_receipts_without_summaries() -> None:
         fixed_tokens=0,
         target_tokens=150,
         source_messages=dict(records),
-        summaries_enabled=False,
     )
 
     assert result.reached_target is True
@@ -1027,7 +1026,6 @@ def test_coarse_fallback_folds_compacted_tool_call_receipts() -> None:
         fixed_tokens=0,
         target_tokens=150,
         source_messages=dict(records),
-        summaries_enabled=False,
     )
 
     assert result.reached_target is True
