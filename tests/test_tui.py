@@ -5061,14 +5061,29 @@ def test_sigint_key_uses_tui_interrupt_binding() -> None:
     event.current_buffer.reset.assert_called_once_with()
 
 
-def test_mcp_mount_notice_is_suppressed_after_terminal_restore() -> None:
-    notices: list[object] = []
+@pytest.mark.asyncio
+async def test_mcp_mount_notice_is_suppressed_after_terminal_restore() -> None:
+    notices: list[str] = []
+    restored = asyncio.Event()
+    sink: Callable[[str], None] | None = notices.append
+
+    class Loop:
+        def set_mcp_notice_sink(self, value: Callable[[str], None] | None) -> None:
+            nonlocal sink
+            sink = value
+
+    async def mount_finishes_after_restore() -> None:
+        await restored.wait()
+        if sink is not None:
+            sink("late mount notice")
+
     app = object.__new__(TUIApp)
-    app.loop = SimpleNamespace(
-        set_mcp_notice_sink=lambda sink: notices.append(sink),
-    )
+    app.loop = Loop()
+    mount_task = asyncio.create_task(mount_finishes_after_restore())
     app._detach_ui_notice_sinks()
-    assert notices == [None]
+    restored.set()
+    await mount_task
+    assert notices == []
 
 
 def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
