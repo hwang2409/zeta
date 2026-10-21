@@ -3568,7 +3568,12 @@ def test_persisted_reasoning_receipts_do_not_raise_the_eviction_floor() -> None:
     ]
 
     def counter(message: Message) -> int:
-        return 1 if message.metadata.get("eviction_range") else 100
+        return (
+            1
+            if message.metadata.get("eviction_range")
+            or message.metadata.get("eviction_receipt")
+            else 100
+        )
 
     for _ in range(4):
         result = evict_messages(

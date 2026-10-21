@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from ..protocol.types import (
     ContentBlock,
@@ -21,9 +21,21 @@ RECEIPT_KIND_METADATA = "eviction_receipt"
 RECEIPT_FIELDS_METADATA = "eviction_receipt_fields"
 
 
-def _canonicalize_reasoning_hybrid(message: Message, seq: int) -> Message | None:
-    """Turn a trusted persisted reasoning hybrid into a receipt view."""
-    if message.role is not MessageRole.ASSISTANT or not message.content:
+def _persisted_reasoning_receipt(
+    message: Message,
+    seq: int,
+    token_counter: Callable[[Message], int],
+) -> Message | None:
+    """Build a smaller receipt for a trusted persisted reasoning hybrid."""
+    if (
+        message.role is not MessageRole.ASSISTANT
+        or message.tool_result is not None
+        or set(message.metadata) != {"context_evicted", "source_seq"}
+        or message.metadata.get("context_evicted") is not True
+        or type(message.metadata.get("source_seq")) is not int
+        or message.metadata.get("source_seq") != seq
+        or not message.content
+    ):
         return None
     marker = f"[assistant reasoning evicted · seq {seq}]"
     last = message.content[-1]
@@ -34,12 +46,14 @@ def _canonicalize_reasoning_hybrid(message: Message, seq: int) -> Message | None
     if tool_content and all(
         isinstance(block, (TextContent, ToolUseContent)) for block in body
     ):
-        return _tool_call_receipt(
+        replacement = _tool_call_receipt(
             Message(message.role, tool_content, metadata=message.metadata), seq
         )
-    if body and all(isinstance(block, TextContent) for block in body):
-        return _assistant_receipt(seq, "assistant text")
-    return None
+    elif body and all(isinstance(block, TextContent) for block in body):
+        replacement = _assistant_receipt(seq, "assistant text")
+    else:
+        return None
+    return replacement if token_counter(replacement) < token_counter(message) else None
 
 
 def _tool_call_receipt(

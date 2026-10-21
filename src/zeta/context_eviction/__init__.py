@@ -493,8 +493,11 @@ def _evict_persisted_records(
 ) -> tuple[list[tuple[int, Message]], set[int]]:
     """Evict eligible persisted rows again from their active-branch sources."""
 
-    from .persisted_hybrids import canonicalize
     from .range_receipts import _is_receipt_kind
+    from .receipt_constructors import (
+        RECEIPT_KIND_METADATA,
+        _persisted_reasoning_receipt,
+    )
 
     source_records = [
         (seq, source_messages[seq])
@@ -513,7 +516,15 @@ def _evict_persisted_records(
         unconsumed_source_seqs=protected,
     )
     generated_by_seq = dict(zip(generated.source_seqs, generated.messages, strict=True))
-    output, regenerated = canonicalize(records, allows=eligibility.allows)
+    output = list(records)
+    regenerated: set[int] = set()
+    for index, (seq, message) in enumerate(records):
+        if not eligibility.allows(seq) or message.metadata.get(RECEIPT_KIND_METADATA):
+            continue
+        replacement = _persisted_reasoning_receipt(message, seq, token_counter)
+        if replacement is not None:
+            output[index] = (seq, replacement)
+            regenerated.add(seq)
     result_indexes: dict[str, list[int]] = defaultdict(list)
     for index, (_, message) in enumerate(records):
         if message.tool_result is not None:
