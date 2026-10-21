@@ -79,7 +79,6 @@ from .runtime_lease import (
     close_store_leases,
 )
 
-
 class ConversationStore(
     AsyncDurableWritesMixin,
     ClientDeliveryMixin,
@@ -600,10 +599,7 @@ class ConversationStore(
                     validate_child_idle_notification_data(entry.data)
                 elif kind == PROJECT_INBOX_NOTIFICATION_KIND:
                     validate_project_inbox_notification_data(entry.data)
-                elif kind in {
-                    CHILD_QUESTION_NOTIFICATION_KIND,
-                    CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND,
-                }:
+                elif kind in {CHILD_QUESTION_NOTIFICATION_KIND, CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND}:
                     validate_child_question_notification_data(entry.data)
                 # Unknown notification kinds remain tolerated for forward compat.
             elif entry.type == "notification_ack":
@@ -939,7 +935,6 @@ class ConversationStore(
                 raise ValueError("compaction pinned message must be a user message")
             data["pinned_message"] = pinned_message.to_dict()
         return data
-
 
     def append_message_with_approval_requests(
         self,
