@@ -49,6 +49,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
+from tests.support.credentials import anthropic_credentials, codex_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
@@ -61,10 +62,9 @@ from zeta.diagnostics import tui_stalls as tui_stalls_module
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.providers.anthropic import (
     AnthropicBackend,
-    AnthropicCredentialStore,
     OAuthTokens,
 )
-from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
+from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend
 from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop import persistence as persistence_module
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
@@ -5844,7 +5844,7 @@ async def test_anthropic_redacted_thinking_reaches_tui_stream(tmp_path: Path) ->
             request=request,
         )
 
-    credentials = AnthropicCredentialStore(tmp_path / "zeta.json")
+    credentials = anthropic_credentials(tmp_path / "zeta.json")
     credentials.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     backend = AnthropicBackend(
@@ -5898,7 +5898,7 @@ async def test_codex_thought_blocks_reach_tui_as_separate_units(
 
     handler.served = False
 
-    credentials = CodexCredentialStore(tmp_path / "codex.json")
+    credentials = codex_credentials(tmp_path / "codex.json")
     credentials.save(OAuthTokens(_codex_access_token(), "refresh-fixture", 4_000_000_000))
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     output = StringIO()
@@ -5977,7 +5977,7 @@ async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
 
     handler.served = False
 
-    credentials = AnthropicCredentialStore(tmp_path / "zeta.json")
+    credentials = anthropic_credentials(tmp_path / "zeta.json")
     credentials.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     backend = AnthropicBackend(

@@ -304,6 +304,8 @@ class _CredentialDriver(Protocol):
         self, refresh_token: str, client: httpx.AsyncClient
     ) -> OAuthTokens: ...
 
+    def auth_headers(self, token: str) -> dict[str, str]: ...
+
 
 class AccountCredentials:
     """Own one account's credential lifecycle behind a provider-facing seam."""
@@ -368,7 +370,7 @@ class AccountCredentials:
         return await self._driver.refresh(refresh_token, client)
 
     def auth_headers(self, token: str) -> dict[str, str]:
-        return self._driver.auth_headers(token)  # type: ignore[attr-defined, no-any-return]
+        return self._driver.auth_headers(token)
 
     def beta_header(self) -> str:
         return self._driver.beta_header()  # type: ignore[attr-defined, no-any-return]

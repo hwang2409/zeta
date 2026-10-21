@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import multiprocessing
 import os
@@ -14,11 +15,12 @@ import pytest
 
 import zeta.accounts.store as account_store
 import zeta.cli.main as cli_main
+import zeta.codex as codex_module
 import zeta.oauth as oauth_module
+import zeta.providers.anthropic as anthropic_module
 import zeta.server.login as server_login
 from zeta.accounts import AccountError, AccountId, AccountStore
 from zeta.agent.runner import resolve_child_backend
-from zeta.codex import CodexCredentialStore
 from zeta.oauth import OAuthTokens
 from zeta.providers.factory import build_backend, credential_store
 from zeta.runtime import unattended
@@ -30,6 +32,71 @@ _SENTINEL = "token-text-must-not-escape"
 
 def tokens() -> OAuthTokens:
     return OAuthTokens(_SENTINEL, "refresh-secret", 9_999_999_999.0)
+
+
+def test_no_writable_credential_store_outside_account_credentials() -> None:
+    storage_methods = {"save", "access_token"}
+    driver_methods = {"read", *storage_methods}
+    assert not any(
+        inspect.isclass(value) and storage_methods <= set(dir(value))
+        for value in vars(oauth_module).values()
+    )
+    for module, driver_name in (
+        (anthropic_module, "AnthropicCredentialDriver"),
+        (codex_module, "CodexCredentialDriver"),
+    ):
+        driver = getattr(module, driver_name)
+        assert not driver_methods & set(dir(driver))
+        assert not any(isinstance(value, Path) for value in vars(driver()).values())
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_provider_driver_refresh_through_account_credentials_keeps_headers_and_rotation(
+    provider: str, tmp_path: Path
+) -> None:
+    account_provider = "anthropic" if provider == "claude" else provider
+    old = OAuthTokens("old-access", "old-refresh", 1.0)
+    store = AccountStore(tmp_path)
+    store.ensure_account(AccountId(account_provider, "default"), old)
+    credential = credential_store(provider, home=tmp_path)
+    assert credential is not None
+    credential._driver.token_url = "https://refresh.test/token"
+    requests: list[httpx.Request] = []
+
+    def refresh(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600,
+            },
+        )
+
+    async def run() -> str:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(refresh)) as client:
+            return await credential.refresh_token(client)
+
+    assert asyncio.run(run()) == "new-access"
+    request = requests.pop()
+    assert request.headers["accept"] == "application/json"
+    if provider == "claude":
+        assert request.headers["content-type"] == "application/json"
+        assert json.loads(request.content) == {
+            "grant_type": "refresh_token",
+            "client_id": anthropic_module.CLIENT_ID,
+            "refresh_token": "old-refresh",
+        }
+    else:
+        assert request.headers["content-type"] == "application/x-www-form-urlencoded"
+        assert request.content.decode() == (
+            "grant_type=refresh_token&refresh_token=old-refresh&client_id="
+            + codex_module.CODEX_CLIENT_ID
+        )
+    persisted = credential.read()
+    assert persisted is not None
+    assert persisted.refresh_token == "new-refresh"
 
 
 def _write_legacy(home: Path, provider: str) -> Path:
@@ -356,58 +423,6 @@ def test_migration_then_every_reader_uses_the_account_store(
         credential_store("claude", home=tmp_path),
     ]
     assert all(store.path == expected and store.read() == tokens() for store in stores)
-    assert not legacy.exists()
-
-
-def test_migration_vs_concurrent_refresh_keeps_the_fresh_token(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    expired = OAuthTokens("old-access", "old-refresh", 1.0)
-    fresh = OAuthTokens("fresh-access", "fresh-refresh", 9_999_999_999.0)
-    legacy = tmp_path / "codex-oauth.json"
-    legacy.write_text(json.dumps(expired.to_dict()))
-    refresh_locked = threading.Event()
-    release_refresh = threading.Event()
-    migration_waiting = threading.Event()
-    original_lock = account_store.credential_file_lock
-
-    def observed_migration_lock(path: Path):
-        migration_waiting.set()
-        return original_lock(path)
-
-    monkeypatch.setattr(
-        account_store, "credential_file_lock", observed_migration_lock
-    )
-    legacy_store = CodexCredentialStore(legacy)
-    result: list[str] = []
-
-    async def return_fresh(_refresh_token: str, _client: httpx.AsyncClient):
-        refresh_locked.set()
-        await asyncio.to_thread(release_refresh.wait)
-        return fresh
-
-    legacy_store.refresh = return_fresh
-
-    def refresh() -> None:
-        async def run() -> None:
-            async with httpx.AsyncClient() as client:
-                result.append(await legacy_store.access_token(client))
-
-        asyncio.run(run())
-
-    refresher = threading.Thread(target=refresh)
-    refresher.start()
-    assert refresh_locked.wait(timeout=5)
-    migration = threading.Thread(target=AccountStore(tmp_path).migrate)
-    migration.start()
-    assert migration_waiting.wait(timeout=5)
-    release_refresh.set()
-    refresher.join(timeout=5)
-    migration.join(timeout=5)
-
-    assert not migration.is_alive() and not refresher.is_alive()
-    assert result == [fresh.access_token]
-    assert credential_store("codex", home=tmp_path).read() == fresh
     assert not legacy.exists()
 
 

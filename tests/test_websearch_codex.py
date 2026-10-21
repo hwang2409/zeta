@@ -51,10 +51,9 @@ def install_codex_transport(
         return _REAL_ASYNC_CLIENT(*args, **kwargs)
 
     monkeypatch.setattr(codex.AccountCredentials, "access_token", access_token)
-    if hasattr(codex, "codex_request_headers"):
-        monkeypatch.setattr(codex, "codex_request_headers", lambda _token: {})
-    else:
-        monkeypatch.setattr(codex, "extract_account_id", lambda _token: "test")
+    monkeypatch.setattr(
+        codex.AccountCredentials, "auth_headers", lambda _store, _token: {}
+    )
     monkeypatch.setattr(codex.httpx, "AsyncClient", client_factory)
 
 

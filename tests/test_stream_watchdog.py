@@ -9,7 +9,6 @@ stall RETRY event; and headless/settings surface areas.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import io
 import json
 from collections.abc import AsyncIterator
@@ -18,11 +17,13 @@ from pathlib import Path
 import httpx
 import pytest
 
+import zeta.accounts.store as account_store
 import zeta.providers.anthropic as anthropic_module
-import zeta.providers.auth as auth_module
 import zeta.providers.codex as codex_module
 import zeta.providers.transport as transport_module
+from tests.support.credentials import anthropic_credentials, codex_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.accounts import AccountCredentials
 from zeta.config.settings import Settings, load_settings, resolve
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -36,11 +37,10 @@ from zeta.protocol.types import (
 )
 from zeta.providers.anthropic import (
     AnthropicBackend,
-    AnthropicCredentialStore,
     OAuthTokens,
 )
 from zeta.providers.anthropic_errors import AnthropicStreamError
-from zeta.providers.codex import CodexBackend, CodexCredentialStore
+from zeta.providers.codex import CodexBackend
 from zeta.providers.codex_errors import CodexStreamError
 from zeta.providers.transport import (
     DEFAULT_STREAM_STALL_RETRIES,
@@ -120,8 +120,8 @@ def _mock_client(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
-def _anthropic_store(path: Path) -> AnthropicCredentialStore:
-    store = AnthropicCredentialStore(path)
+def _anthropic_store(path: Path) -> AccountCredentials:
+    store = anthropic_credentials(path)
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     return store
 
@@ -543,8 +543,8 @@ def _codex_access_token() -> str:
     return f"{header}.{body}.sig"
 
 
-def _codex_store(path: Path) -> CodexCredentialStore:
-    store = CodexCredentialStore(path)
+def _codex_store(path: Path) -> AccountCredentials:
+    store = codex_credentials(path)
     store.save(OAuthTokens(_codex_access_token(), "refresh-fixture", 4_000_000_000))
     return store
 
@@ -595,17 +595,17 @@ async def test_provider_stalls_waiting_for_response_headers(
         await client.aclose()
 
 
-@pytest.mark.parametrize("store_type", [AnthropicCredentialStore, CodexCredentialStore])
+@pytest.mark.parametrize("store_type", [anthropic_credentials, codex_credentials])
 @pytest.mark.parametrize("method_name", ["access_token", "refresh_token"])
 async def test_oauth_refresh_network_wait_is_bounded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    store_type: type[AnthropicCredentialStore | CodexCredentialStore],
+    store_type,
     method_name: str,
 ) -> None:
     store = store_type(tmp_path / "oauth.json")
     store.save(OAuthTokens("expired-access", "refresh-fixture", 1))
-    monkeypatch.setattr(auth_module, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
 
     async def no_refresh_response(_request: httpx.Request) -> httpx.Response:
         await asyncio.Event().wait()
@@ -627,20 +627,13 @@ async def test_oauth_credential_lock_wait_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _codex_store(tmp_path / "codex.json")
-    monkeypatch.setattr(auth_module, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
     async with _mock_client(lambda _request: httpx.Response(500)) as client:
-        with store.lock_path.open("a+") as held:
-            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
-
-            original_flock = fcntl.flock
-
-            def reject_blocking_lock(fd: int, operation: int) -> None:
-                assert not operation & fcntl.LOCK_EX or operation & fcntl.LOCK_NB
-                original_flock(fd, operation)
-
-            monkeypatch.setattr(auth_module.fcntl, "flock", reject_blocking_lock)
-            with pytest.raises(store.auth_error_type, match="OAuth credential lock stalled"):
-                await asyncio.wait_for(store.access_token(client), timeout=0.5)
+        with (
+            store.store.lifecycle_guard(store.account),
+            pytest.raises(store.auth_error_type, match="OAuth credential lock stalled"),
+        ):
+            await asyncio.wait_for(store.access_token(client), timeout=0.5)
         assert await asyncio.wait_for(store.access_token(client), timeout=0.5) == (
             _codex_access_token()
         )

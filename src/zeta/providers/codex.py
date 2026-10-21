@@ -17,11 +17,10 @@ from ..codex import (
     DEFAULT_CODEX_REDIRECT_URI,
     CodexAuthError,
     CodexBackendError,
-    CodexCredentialStore,  # noqa: F401 - public provider-module export
+    CodexCredentialDriver,  # noqa: F401 - public provider-module export
     CodexHTTPError,
     CodexStreamError,
     build_authorization_url,
-    codex_request_headers,
     exchange_authorization_code,
     extract_account_id,
 )
@@ -264,7 +263,7 @@ class CodexBackend(CompletionBackend):
             # GPT-5.6 routes its cache without a payload key; keep session-id.
             if not self.model.startswith("gpt-5.6-"):
                 payload["prompt_cache_key"] = cache_key
-            headers = codex_request_headers(access_token)
+            headers = self.token_store.auth_headers(access_token)
             headers["session-id"] = cache_key
             stream_context = client.stream(
                 "POST", self.base_url, headers=headers, json=payload

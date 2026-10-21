@@ -16,6 +16,7 @@ import pytest
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.stream_diagnostics as diagnostics_module
 from zeta.core.context import ContextAssembler
+from tests.support.credentials import anthropic_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
@@ -26,7 +27,6 @@ from zeta.providers.anthropic import (
     AnthropicApiKeyCredential,
     AnthropicAuthError,
     AnthropicBackend,
-    AnthropicCredentialStore,
     AnthropicHTTPError,
     AnthropicStreamError,
     OAuthTokens,
@@ -288,7 +288,7 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     backend = AnthropicBackend(
@@ -362,7 +362,7 @@ async def test_anthropic_oauth_compat_is_opt_in_and_adds_only_oauth_headers(
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     monkeypatch.setenv("ZETA_ANTHROPIC_OAUTH_COMPAT", "1")
     client = client_for(handler)
@@ -397,7 +397,7 @@ async def test_anthropic_oauth_compat_without_user_text_omits_billing_block(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ZETA_ANTHROPIC_OAUTH_COMPAT", "1")
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     requests: list[httpx.Request] = []
 
@@ -431,7 +431,7 @@ async def test_agent_loop_sends_one_zeta_identity_after_oauth_spoof(
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     backend = AnthropicBackend(
@@ -465,7 +465,7 @@ async def test_stream_preserves_anthropic_cache_usage_fields(tmp_path: Path) -> 
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     events = [
@@ -506,7 +506,7 @@ async def test_401_refreshes_token_and_retries_once(
             )
         return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("stale-access", "refresh-test", 4_000_000_000))
 
     async def refresh_token(client: httpx.AsyncClient) -> str:
@@ -541,7 +541,7 @@ async def test_second_401_fails_loudly_without_a_retry_loop(
         requests.append(request)
         return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("stale-access", "refresh-test", 4_000_000_000))
 
     async def refresh_token(client: httpx.AsyncClient) -> str:
@@ -568,7 +568,7 @@ async def test_401_refresh_failure_propagates_without_retry(
         requests.append(request)
         return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("stale-access", "refresh-test", 4_000_000_000))
 
     async def refresh_token(client: httpx.AsyncClient) -> str:
@@ -675,7 +675,7 @@ async def test_persistent_503_bounded_total_requests(
 
     monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
     monkeypatch.setattr("zeta.runtime.loop._completion.asyncio.sleep", no_sleep)
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     loop = AgentLoop(
@@ -703,7 +703,7 @@ async def test_server_error_retries_without_refresh(
         requests.append(request)
         return httpx.Response(500, json={"error": {"message": "server"}}, request=request)
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
 
     async def refresh_token(client: httpx.AsyncClient) -> str:
@@ -745,7 +745,7 @@ async def test_each_retryable_status_retries_before_stream(
         sleeps.append(delay)
 
     monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     events = [
@@ -798,7 +798,7 @@ async def test_disconnect_after_headers_retries_before_first_event(
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     events = [
@@ -836,7 +836,7 @@ async def test_retry_after_controls_wait_and_notice(tmp_path: Path, monkeypatch:
         sleeps.append(delay)
 
     monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     events = [
@@ -880,7 +880,7 @@ async def test_stream_rate_limit_retry_notice_uses_429_label(
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     events = [
@@ -910,7 +910,7 @@ async def test_retry_exhaustion_records_class_only_diagnostic(
     monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
     monkeypatch.setattr(diagnostics_module, "fd_diagnostics", dict)
     diagnostics_path = tmp_path / "logs" / "stream-diagnostics.jsonl"
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicHTTPError, match="503"):
@@ -957,7 +957,7 @@ async def test_401_refresh_then_retryable_failure_uses_retry_budget(
         del delay
 
     monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("stale-access", "refresh-test", 4_000_000_000))
     monkeypatch.setattr(store, "refresh_token", refresh_token)
     client = client_for(handler)
@@ -988,7 +988,7 @@ async def test_non_retryable_status_fails_fast(
         del delay
 
     monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises((AnthropicHTTPError, AnthropicAuthError)):
@@ -1014,7 +1014,7 @@ async def test_ctrl_c_aborts_retry_wait(tmp_path: Path, monkeypatch: pytest.Monk
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(anthropic_module.asyncio, "sleep", abort_wait)
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(asyncio.CancelledError):
@@ -1056,7 +1056,7 @@ data: {"type":"message_stop"}
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     events = [
@@ -1077,7 +1077,9 @@ data: {"type":"message_stop"}
 
 
 @pytest.mark.asyncio
-async def test_expired_claude_login_refreshes_into_zeta_store(tmp_path: Path) -> None:
+async def test_expired_claude_login_refreshes_into_zeta_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     claude_path = tmp_path / "claude" / ".credentials.json"
     claude_path.parent.mkdir()
     claude_path.write_text(
@@ -1106,9 +1108,9 @@ async def test_expired_claude_login_refreshes_into_zeta_store(tmp_path: Path) ->
             request=request,
         )
 
-    store = AnthropicCredentialStore(
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_path.parent))
+    store = anthropic_credentials(
         tmp_path / "zeta" / "anthropic.json",
-        claude_credentials=claude_path,
         token_url="https://test.invalid/oauth/token",
     )
     client = client_for(handler)
@@ -1116,7 +1118,7 @@ async def test_expired_claude_login_refreshes_into_zeta_store(tmp_path: Path) ->
     assert await store.access_token(client) == "refreshed-access"
     assert len(token_requests) == 1
     assert store.read() is not None
-    assert oct((tmp_path / "zeta" / "anthropic.json").stat().st_mode & 0o777) == "0o600"
+    assert oct(store.path.stat().st_mode & 0o777) == "0o600"
     assert claude_path.read_text() == original_claude_credentials
     await client.aclose()
 
@@ -1461,7 +1463,7 @@ async def test_backend_caches_latest_conversation_block(tmp_path: Path) -> None:
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     backend = AnthropicBackend(
@@ -2040,7 +2042,7 @@ def test_claude_keychain_bootstrap_treats_invalid_output_as_missing(
     monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
     monkeypatch.setattr(anthropic_module.subprocess, "run", lambda *args, **kwargs: result)
 
-    assert AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap() is None
+    assert anthropic_credentials(tmp_path / "zeta.json").bootstrap() is None
 
 
 def test_claude_keychain_bootstrap_treats_timeout_as_missing(
@@ -2053,7 +2055,7 @@ def test_claude_keychain_bootstrap_treats_timeout_as_missing(
     monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
     monkeypatch.setattr(anthropic_module.subprocess, "run", run)
 
-    assert AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap() is None
+    assert anthropic_credentials(tmp_path / "zeta.json").bootstrap() is None
 
 
 def test_claude_file_bootstrap_wins_over_keychain(
@@ -2077,7 +2079,7 @@ def test_claude_file_bootstrap_wins_over_keychain(
         lambda *args, **kwargs: pytest.fail("keychain should not be queried"),
     )
 
-    assert AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap() == OAuthTokens(
+    assert anthropic_credentials(tmp_path / "zeta.json").bootstrap() == OAuthTokens(
         "file-access", "file-refresh", 4_000_000_000
     )
 
@@ -2165,7 +2167,7 @@ async def test_anthropic_sse_error_redacts_authorization_marker(tmp_path: Path) 
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicStreamError) as raised:
@@ -2201,7 +2203,7 @@ async def test_post_start_provider_error_salvages_once(tmp_path: Path) -> None:
         )
 
     diagnostics_path = tmp_path / "logs" / "stream-diagnostics.jsonl"
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     events: list[StreamEvent] = []
@@ -2256,7 +2258,7 @@ async def test_error_after_message_stop_is_ignored(tmp_path: Path) -> None:
         )
 
     diagnostics_path = tmp_path / "logs" / "stream-diagnostics.jsonl"
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     events = [
@@ -2287,7 +2289,7 @@ async def test_anthropic_sse_error_redacts_bearer_authorization(tmp_path: Path) 
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicStreamError) as raised:
@@ -2314,7 +2316,7 @@ async def test_anthropic_sse_error_redacts_multiline_authorization(
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicStreamError) as raised:
@@ -2442,7 +2444,7 @@ async def test_prestart_protocol_error_is_retried(
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     events = [
@@ -2490,7 +2492,7 @@ async def test_poststart_protocol_error_is_not_retried(
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     events: list[StreamEvent] = []
@@ -2597,7 +2599,7 @@ async def test_http_failure_is_typed(tmp_path: Path) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicHTTPError):
@@ -2612,7 +2614,7 @@ async def test_request_entry_transport_failure_is_typed(
     async def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("secret connection details", request=request)
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     async def no_sleep(delay: float) -> None:
@@ -2721,14 +2723,16 @@ async def test_network_eof_salvage_records_exception_and_headers(
         del delay
 
     monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with pytest.raises(AnthropicStreamError) as raised:
         [
             event
-            async for event in AnthropicBackend(client=Client(), token_store=store).complete(
-                [], []
-            )
+            async for event in AnthropicBackend(
+                client=Client(),
+                token_store=store,
+                diagnostics_path=tmp_path / "logs" / "stream-diagnostics.jsonl",
+            ).complete([], [])
         ]
     assert "peer closed" not in str(raised.value)
     record = json.loads(
@@ -2781,7 +2785,7 @@ async def test_anthropic_failure_persists_signed_empty_thinking_through_loop(
         def stream(self, method, url, *, headers, content):
             return Stream()
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = Client()
     backend = AnthropicBackend(client=client, token_store=store)
@@ -3213,7 +3217,7 @@ async def test_two_turn_replay_omits_empty_salvaged_text_block(tmp_path: Path) -
         )
 
     store = ConversationStore(tmp_path / "sessions")
-    token_store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    token_store = anthropic_credentials(tmp_path / "zeta.json")
     token_store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     loop = AgentLoop(
@@ -3245,7 +3249,7 @@ async def test_malformed_nested_sse_is_typed(tmp_path: Path) -> None:
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicStreamError):
@@ -3269,7 +3273,7 @@ async def test_concurrent_refreshes_share_rotating_token_lock(tmp_path: Path) ->
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json", token_url="https://test.invalid/token")
+    store = anthropic_credentials(tmp_path / "zeta.json", token_url="https://test.invalid/token")
     store.save(OAuthTokens("expired-access", "rotating-refresh", 1))
     client = client_for(handler)
 
@@ -3308,7 +3312,7 @@ async def test_cancellation_survives_failing_owned_client_cleanup(
         async def aclose(self):
             raise RuntimeError("cleanup failed")
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         task = asyncio.create_task(
@@ -3349,7 +3353,7 @@ async def test_cancellation_during_owned_client_close_is_not_swallowed(
             close_started.set()
             await never.wait()
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     async def consume() -> list[object]:
         return [event async for event in AnthropicBackend(token_store=store).complete([], [])]
@@ -3389,7 +3393,7 @@ async def test_consumer_aclose_suppresses_failing_stream_cleanup(
         async def aclose(self):
             raise RuntimeError("client cleanup failed")
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         stream = AnthropicBackend(token_store=store).complete([], [])
@@ -3423,7 +3427,7 @@ async def test_response_cleanup_cancellation_wins_over_stream_error(
         def stream(self, method, url, *, headers, content):
             return Stream()
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     task = asyncio.create_task(
         anext(AnthropicBackend(client=Client(), token_store=store).complete([], []))
@@ -3464,7 +3468,7 @@ async def test_client_cleanup_cancellation_wins_over_stream_error(
             cleanup_started.set()
             await never.wait()
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         task = asyncio.create_task(
@@ -3497,7 +3501,7 @@ async def test_response_cleanup_http_error_is_typed(tmp_path: Path) -> None:
         def stream(self, method, url, *, headers, content):
             return Stream()
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with pytest.raises(AnthropicHTTPError) as raised:
         [
@@ -3532,7 +3536,7 @@ async def test_client_cleanup_http_error_is_typed(tmp_path: Path) -> None:
         async def aclose(self):
             raise httpx.TimeoutException("client cleanup secret")
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         with pytest.raises(AnthropicHTTPError) as raised:
@@ -3610,7 +3614,7 @@ async def test_cancel_mid_thinking_drops_partial_block_before_resume(
             )
 
     store = ConversationStore(tmp_path / "sessions")
-    token_store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    token_store = anthropic_credentials(tmp_path / "zeta.json")
     token_store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     backend = AnthropicBackend(client=Client(), token_store=token_store)
     loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
@@ -3640,7 +3644,7 @@ async def _assert_malformed_stream_raises(tmp_path: Path, stream: str) -> None:
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicStreamError):
@@ -3657,12 +3661,16 @@ async def _collect_anthropic_events(tmp_path: Path, stream: str) -> list[StreamE
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     events = [
         event
-        async for event in AnthropicBackend(client=client, token_store=store).complete([], [])
+        async for event in AnthropicBackend(
+            client=client,
+            token_store=store,
+            diagnostics_path=tmp_path / "logs" / "stream-diagnostics.jsonl",
+        ).complete([], [])
     ]
     await client.aclose()
     return events
@@ -4005,7 +4013,7 @@ async def test_anthropic_stop_reason_persisted_on_assistant_message(
             request=request,
         )
 
-    credentials = AnthropicCredentialStore(tmp_path / "zeta.json")
+    credentials = anthropic_credentials(tmp_path / "zeta.json")
     credentials.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     backend = AnthropicBackend(

@@ -19,7 +19,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .oauth import OAuthCredentialStore, OAuthTokens
+from .oauth import OAuthTokens
 
 
 class CodexBackendError(RuntimeError):
@@ -192,40 +192,29 @@ def _extract_codex_tokens(value: Any) -> OAuthTokens:
     return OAuthTokens(access, refresh, expires_at)
 
 
-class CodexCredentialStore(OAuthCredentialStore):
-    """Owns zeta's Codex OAuth file and reads ~/.codex/auth.json only to bootstrap."""
+def _codex_auth_path() -> Path | None:
+    if codex_home := os.environ.get("CODEX_HOME"):
+        return Path(codex_home) / "auth.json"
+    if "ZETA_HOME" not in os.environ:
+        return Path.home() / ".codex" / "auth.json"
+    return None
+
+
+class CodexCredentialDriver:
+    """Read Codex bootstrap credentials and implement provider OAuth behavior."""
 
     auth_error_type = CodexAuthError
-    http_error_type = CodexHTTPError
     provider_label = "Codex"
 
-    def __init__(
-        self,
-        path: str | Path,
-        *,
-        codex_auth: str | Path | None = None,
-        token_url: str = CODEX_TOKEN_URL,
-    ) -> None:
-        super().__init__(path, token_url=token_url)
-        if codex_auth is not None:
-            self.codex_auth = Path(codex_auth)
-        elif codex_home := os.environ.get("CODEX_HOME"):
-            self.codex_auth = Path(codex_home) / "auth.json"
-        elif "ZETA_HOME" not in os.environ:
-            self.codex_auth = Path.home() / ".codex" / "auth.json"
-        else:
-            self.codex_auth = None
-
-    def _login_required_error(self) -> RuntimeError:
-        return CodexLoginRequiredError(
-            f"no {self.provider_label} OAuth login found; log in first"
-        )
+    def __init__(self, *, token_url: str = CODEX_TOKEN_URL) -> None:
+        self.token_url = token_url
 
     def bootstrap(self) -> OAuthTokens | None:
-        if self.codex_auth is None or not self.codex_auth.exists():
+        auth_path = _codex_auth_path()
+        if auth_path is None or not auth_path.exists():
             return None
         try:
-            with self.codex_auth.open() as handle:
+            with auth_path.open() as handle:
                 return _extract_codex_tokens(json.load(handle))
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise CodexAuthError("Codex credentials could not be read") from exc
@@ -272,6 +261,17 @@ class CodexCredentialStore(OAuthCredentialStore):
             time.time() + float(expires_in) - 300,
         )
 
+    def auth_headers(self, token: str) -> dict[str, str]:
+        return {
+            "accept": "text/event-stream",
+            "authorization": f"Bearer {token}",
+            "chatgpt-account-id": extract_account_id(token),
+            "content-type": "application/json",
+            "originator": "zeta",
+            "openai-beta": "responses=experimental",
+            "user-agent": "zeta/0.1",
+        }
+
 
 def extract_account_id(access_token: str) -> str:
     """Derive the ChatGPT account id from the access token claim."""
@@ -304,32 +304,17 @@ def _jwt_payload(access_token: str) -> Mapping[str, Any]:
     return payload
 
 
-def codex_request_headers(access_token: str) -> dict[str, str]:
-    """Build the common headers for a Codex Responses request."""
-
-    return {
-        "accept": "text/event-stream",
-        "authorization": f"Bearer {access_token}",
-        "chatgpt-account-id": extract_account_id(access_token),
-        "content-type": "application/json",
-        "originator": "zeta",
-        "openai-beta": "responses=experimental",
-        "user-agent": "zeta/0.1",
-    }
-
-
 __all__ = [
     "CODEX_API_URL",
     "DEFAULT_CODEX_MODEL",
     "DEFAULT_CODEX_REDIRECT_URI",
     "CodexAuthError",
     "CodexBackendError",
-    "CodexCredentialStore",
+    "CodexCredentialDriver",
     "CodexHTTPError",
     "CodexLoginRequiredError",
     "CodexStreamError",
     "build_authorization_url",
-    "codex_request_headers",
     "exchange_authorization_code",
     "extract_account_id",
 ]

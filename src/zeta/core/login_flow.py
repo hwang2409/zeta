@@ -20,7 +20,7 @@ import httpx
 TokenT = TypeVar("TokenT")
 
 
-class CredentialStore(Protocol[TokenT]):
+class CredentialSink(Protocol[TokenT]):
     """The part of a provider credential store used by login."""
 
     def save(self, tokens: TokenT) -> None:
@@ -43,7 +43,7 @@ class LoginProvider(Generic[TokenT]):
     callback_path: str
     build_authorization_url: BuildAuthorizationURL
     exchange_authorization_code: ExchangeAuthorizationCode[TokenT]
-    credential_store: CredentialStore[TokenT]
+    credential_store: CredentialSink[TokenT]
     token_handle: TokenHandle[TokenT]
 
 

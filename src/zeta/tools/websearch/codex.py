@@ -16,10 +16,9 @@ from ...codex import (
     CODEX_API_URL,
     DEFAULT_CODEX_MODEL,
     CodexBackendError,
-    CodexCredentialStore,
+    CodexCredentialDriver,
     CodexHTTPError,
     CodexStreamError,
-    codex_request_headers,
 )
 from ...core.abort import AbortSignal
 from ...core.session import env_home
@@ -122,7 +121,7 @@ async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
     store = AccountCredentials(
         registry,
         account,
-        CodexCredentialStore(registry.home / ".codex-bootstrap"),
+        CodexCredentialDriver(),
     )
     timeout = httpx.Timeout(CODEX_SEARCH_TIMEOUT)
     try:
@@ -130,7 +129,7 @@ async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
             # A deadline or caller cancellation stops this search, but shield lets a
             # rotating OAuth refresh finish and persist its replacement token.
             token = await asyncio.shield(_start_credential_task(store, timeout))
-            headers = codex_request_headers(token)
+            headers = store.auth_headers(token)
             payload = {
                 "model": CODEX_SEARCH_MODEL,
                 "store": False,

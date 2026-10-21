@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import fcntl
 import hashlib
@@ -11,14 +10,12 @@ import json
 import os
 import secrets
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote_plus
-
-import httpx
 
 DEFAULT_STREAM_STALL_SECONDS = 90.0
 
@@ -511,139 +508,3 @@ def credential_file_lock(path: str | Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-class OAuthCredentialStore:
-    """Own one zeta OAuth file and serialize refreshes across processes."""
-
-    auth_error_type: type[RuntimeError]
-    http_error_type: type[RuntimeError]
-    provider_label: str
-
-    def __init__(self, path: str | Path, *, token_url: str) -> None:
-        self.path = Path(path)
-        self.lock_path = self.path.with_name(f".{self.path.name}.lock")
-        self.token_url = token_url
-        self._async_refresh_lock = asyncio.Lock()
-
-    @contextmanager
-    def _lock(self) -> Iterator[None]:
-        with credential_file_lock(self.path):
-            yield
-
-    def read(self) -> OAuthTokens | None:
-        with self._lock():
-            return self._read_unlocked()
-
-    def _read_unlocked(self) -> OAuthTokens | None:
-        if not self.path.exists():
-            return None
-        try:
-            with self.path.open() as handle:
-                value = json.load(handle)
-            os.chmod(self.path, 0o600)
-            if not isinstance(value, Mapping):
-                raise TypeError
-            return OAuthTokens.from_mapping(value, error_type=self.auth_error_type)
-        except self.auth_error_type:
-            raise
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise self.auth_error_type(
-                f"zeta's {self.provider_label} OAuth store is invalid"
-            ) from exc
-
-    def save(self, tokens: OAuthTokens) -> None:
-        with self._lock():
-            self._save_unlocked(tokens)
-
-    def _save_unlocked(self, tokens: OAuthTokens) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
-        temporary = self.path.with_name(f".{self.path.name}.{secrets.token_hex(8)}.tmp")
-        try:
-            with temporary.open("w") as handle:
-                json.dump(tokens.to_dict(), handle, separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, self.path)
-            os.chmod(self.path, 0o600)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-    def _login_required_error(self) -> RuntimeError:
-        return self.auth_error_type(
-            f"no {self.provider_label} OAuth login found; log in first"
-        )
-
-    async def access_token(self, client: httpx.AsyncClient) -> str:
-        async with self._async_refresh_lock, self._async_refresh_lock_file():
-            tokens = self._read_unlocked()
-            from_bootstrap = tokens is None
-            if tokens is None:
-                tokens = self.bootstrap()
-                if tokens is None:
-                    raise self._login_required_error()
-            if tokens.is_valid():
-                if from_bootstrap:
-                    self._save_unlocked(tokens)
-                return tokens.access_token
-            return await self._refresh_unlocked(tokens, client)
-
-    async def refresh_token(self, client: httpx.AsyncClient) -> str:
-        async with self._async_refresh_lock, self._async_refresh_lock_file():
-            tokens = self._read_unlocked()
-            if tokens is None:
-                tokens = self.bootstrap()
-                if tokens is None:
-                    raise self._login_required_error()
-            return await self._refresh_unlocked(tokens, client)
-
-    async def _refresh_unlocked(
-        self, tokens: OAuthTokens, client: httpx.AsyncClient
-    ) -> str:
-        try:
-            refreshed = await asyncio.wait_for(
-                self.refresh(tokens.refresh_token, client),
-                timeout=OAUTH_REFRESH_TIMEOUT_SECONDS,
-            )
-        except TimeoutError as exc:
-            raise self.auth_error_type(
-                f"{self.provider_label} OAuth token refresh stalled"
-            ) from exc
-        self._save_unlocked(refreshed)
-        return refreshed.access_token
-
-    @asynccontextmanager
-    async def _async_refresh_lock_file(self) -> AsyncIterator[None]:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
-        handle = self.lock_path.open("a+")
-        try:
-            deadline = time.monotonic() + OAUTH_REFRESH_TIMEOUT_SECONDS
-            while True:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError as exc:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise self.auth_error_type(
-                            f"{self.provider_label} OAuth credential lock stalled"
-                        ) from exc
-                    await asyncio.sleep(min(0.05, remaining))
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()
-
-    def bootstrap(self) -> OAuthTokens | None:
-        raise NotImplementedError
-
-    async def refresh(
-        self, refresh_token: str, client: httpx.AsyncClient
-    ) -> OAuthTokens:
-        raise NotImplementedError

@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 
 from ..accounts import AccountCredentials, AccountId, AccountStore
-from ..codex import CodexCredentialStore
+from ..codex import CodexCredentialDriver
 from ..config.settings import load_settings
 from ..core.session import env_home
 from ..core.slash import budget_for_model, effective_budget_for_model
@@ -24,7 +24,7 @@ from .anthropic import (
     AnthropicAuthError,
     AnthropicBackend,
     AnthropicCredential,
-    AnthropicCredentialStore,
+    AnthropicCredentialDriver,
 )
 from .codex import DEFAULT_CODEX_MODEL, CodexBackend
 from .ollama import DEFAULT_OLLAMA_MODEL, OLLAMA_API_URL, OllamaBackend
@@ -53,9 +53,9 @@ def credential_store(
     registry = AccountStore(auth_home)
     selected = registry.resolve_account(provider, account)
     driver = (
-        AnthropicCredentialStore(auth_home / ".anthropic-bootstrap")
+        AnthropicCredentialDriver()
         if provider == "claude"
-        else CodexCredentialStore(auth_home / ".codex-bootstrap")
+        else CodexCredentialDriver()
     )
     return AccountCredentials(registry, selected, driver)
 
