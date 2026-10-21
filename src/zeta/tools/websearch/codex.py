@@ -11,16 +11,18 @@ from typing import Any
 
 import httpx
 
-from ...accounts import AccountCredentials
+from ...accounts import AccountCredentials, AccountStore
 from ...codex import (
     CODEX_API_URL,
     DEFAULT_CODEX_MODEL,
     CodexBackendError,
+    CodexCredentialStore,
     CodexHTTPError,
     CodexStreamError,
     codex_request_headers,
 )
 from ...core.abort import AbortSignal
+from ...core.session import env_home
 
 CODEX_SEARCH_MODEL = DEFAULT_CODEX_MODEL
 CODEX_SEARCH_TIMEOUT = 120.0
@@ -115,11 +117,13 @@ def _start_credential_task(
 
 
 async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
-    # Keep provider imports out of the web-search import path.
-    from ...providers.factory import credential_store
-
-    store = credential_store("codex")
-    assert store is not None
+    registry = AccountStore(env_home())
+    account = registry.resolve_account("codex")
+    store = AccountCredentials(
+        registry,
+        account,
+        CodexCredentialStore(registry.home / ".codex-bootstrap"),
+    )
     timeout = httpx.Timeout(CODEX_SEARCH_TIMEOUT)
     try:
         async with asyncio.timeout(CODEX_SEARCH_DEADLINE):

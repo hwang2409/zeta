@@ -4,10 +4,10 @@ from pathlib import Path
 
 import pytest
 
+from zeta.accounts import AccountCredentials
 from zeta.providers.anthropic import (
     AnthropicApiKeyCredential,
     AnthropicAuthError,
-    AnthropicCredentialStore,
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL
 from zeta.providers.factory import API_KEY_OPT_IN_VAR, build_backend
@@ -29,7 +29,7 @@ def test_bare_api_key_without_opt_in_still_uses_oauth(
 
     backend, model = build_backend("claude", None, home=tmp_path)
 
-    assert isinstance(backend.token_store, AnthropicCredentialStore)
+    assert isinstance(backend.token_store, AccountCredentials)
     assert model == "claude-sonnet-4-6"
 
 
@@ -68,4 +68,4 @@ def test_opt_in_value_must_be_exact(
 
     backend, _ = build_backend("claude", None, home=tmp_path)
 
-    assert isinstance(backend.token_store, AnthropicCredentialStore)
+    assert isinstance(backend.token_store, AccountCredentials)
