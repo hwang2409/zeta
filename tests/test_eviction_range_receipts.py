@@ -1272,7 +1272,7 @@ def test_persisted_raw_call_eviction_respects_protection() -> None:
     )
 
 
-def test_persisted_reasoning_eviction_with_raw_text_is_not_replaced() -> None:
+def test_persisted_reasoning_eviction_with_raw_text_is_canonicalized() -> None:
     source = Message(
         MessageRole.ASSISTANT,
         [
@@ -1298,7 +1298,10 @@ def test_persisted_reasoning_eviction_with_raw_text_is_not_replaced() -> None:
         source_messages={1: source},
     )
 
-    assert result.messages[0].to_dict() == persisted.to_dict()
+    assert result.messages[0].metadata["eviction_receipt"] == "tool_call"
+    assert result.messages[0].content[0].tool_call.arguments == {
+        "eviction_receipt": {"source_seq": 1}
+    }
 
 
 def test_persisted_raw_call_eviction_respects_size_guard() -> None:
@@ -1418,3 +1421,102 @@ def test_legacy_regeneration_keeps_larger_generated_receipt() -> None:
 
     assert result.messages[0].to_dict() == persisted.to_dict()
     assert result.items_evicted == 0
+
+
+def _counter(message: Message) -> int:
+    return 1 if message.metadata.get("eviction_range") else 100
+
+
+def test_persisted_reasoning_text_is_canonicalized_then_coarsely_folded() -> None:
+    sources = {
+        seq: Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("private"), TextContent(f"answer {seq}")],
+        )
+        for seq in (1, 2)
+    }
+    records = [
+        (
+            seq,
+            Message(
+                MessageRole.ASSISTANT,
+                [
+                    TextContent(f"answer {seq}"),
+                    TextContent(f"[assistant reasoning evicted · seq {seq}]"),
+                ],
+                metadata={"context_evicted": True, "source_seq": seq},
+            ),
+        )
+        for seq in (1, 2)
+    ]
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=_counter,
+        source_messages=sources,
+    )
+    assert result.reached_target is True
+    assert len(result.messages) == 1
+    assert result.messages[0].metadata.get("eviction_range") is True
+
+
+def test_persisted_reasoning_tool_call_is_canonicalized_then_coarsely_folded() -> None:
+    records = []
+    sources = {}
+    for seq in (1, 3):
+        call_id = f"read-{seq}"
+        sources[seq] = Message(
+            MessageRole.ASSISTANT,
+            [
+                ThinkingContent("private"),
+                TextContent(f"answer {seq}"),
+                ToolUseContent(ToolCall(call_id, "read", {"path": "raw.txt"})),
+            ],
+        )
+        sources[seq + 1] = Message(
+            MessageRole.TOOL_RESULT, tool_result=ToolResult(call_id, "raw output")
+        )
+        records.extend(
+            [
+                (
+                    seq,
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [
+                            TextContent(f"answer {seq}"),
+                            ToolUseContent(
+                                ToolCall(
+                                    call_id,
+                                    "read",
+                                    {"eviction_receipt": {"source_seq": seq}},
+                                )
+                            ),
+                            TextContent(f"[assistant reasoning evicted · seq {seq}]"),
+                        ],
+                        metadata={"context_evicted": True, "source_seq": seq},
+                    ),
+                ),
+                (
+                    seq + 1,
+                    _semantic_result_receipt(
+                        role=MessageRole.TOOL_RESULT,
+                        tool_name="read",
+                        tool_call_id=call_id,
+                        seq=seq + 1,
+                        digest="raw output",
+                        content_digest=f"digest-{seq}",
+                    ),
+                ),
+            ]
+        )
+    result = evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=_counter,
+        source_messages=sources,
+    )
+    assert result.reached_target is True
+    assert len(result.messages) == 1
+    assert result.messages[0].metadata.get("eviction_range") is True
