@@ -1132,6 +1132,8 @@ class ConversationFinishGateBackend(CompletionBackend):
         self.gate_seen = asyncio.Event()
         self.question_published = asyncio.Event()
         self.release_grandchild = asyncio.Event()
+        self.notification_turn_started = asyncio.Event()
+        self.release_notification_turn = asyncio.Event()
         self.notification_turns = 0
         self.gate_turns = 0
         self.follow_up_seen = False
@@ -1214,6 +1216,8 @@ class ConversationFinishGateBackend(CompletionBackend):
             self.follow_up_seen = True
             blocks = [TextContent("child processed follow-up")]
         elif notification and len(gate_messages) == 1 and not handoff_done:
+            self.notification_turn_started.set()
+            await self.release_notification_turn.wait()
             self.notification_turns += 1
             blocks = [
                 ToolUseContent(
@@ -2114,6 +2118,7 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
     await asyncio.wait_for(backend.question_published.wait(), timeout=2)
+    await asyncio.wait_for(backend.notification_turn_started.wait(), timeout=2)
     child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
     assert send_to_run(
         store,
@@ -2121,6 +2126,7 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
         "queued follow-up",
         channel=loop._background_owner.conversation_channel,
     ) is None
+    backend.release_notification_turn.set()
 
     await _wait_for_notification(store, "completed")
     assert backend.notification_turns == 1
