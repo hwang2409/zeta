@@ -70,6 +70,7 @@ class AccountStore:
         try:
             os.fchmod(fd, 0o600)
             if created:
+                os.fsync(fd)
                 _fsync_directory(directory_fd)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
@@ -153,6 +154,7 @@ class AccountStore:
                 raise AccountError(f"account {key} already exists; use --replace")
             with _account_directory(home_fd, account) as account_fd:
                 _write_tokens(account_fd, tokens)
+                _verify_tokens(account_fd, tokens)
             value["accounts"][key] = {
                 "provider": account.provider,
                 "name": account.name,
@@ -186,7 +188,7 @@ class AccountStore:
             tokens = _read_tokens(home_fd, legacy_name)
             with _account_directory(home_fd, account) as account_fd:
                 _write_tokens(account_fd, tokens)
-                _read_tokens(account_fd, "oauth.json")
+                _verify_tokens(account_fd, tokens)
             value["accounts"][str(account)] = {"provider": provider, "name": "default"}
             value["defaults"].setdefault(provider, str(account))
             self._write_registry(home_fd, value)
@@ -208,6 +210,8 @@ class AccountStore:
             accounts = dict(value["accounts"])
             defaults = dict(value["defaults"])
             for key, metadata in accounts.items():
+                if not isinstance(key, str):
+                    raise TypeError
                 account = AccountId(*key.split(":", 1))
                 if key != str(account) or metadata != {
                     "provider": account.provider,
@@ -216,7 +220,9 @@ class AccountStore:
                     raise ValueError
             for provider, key in defaults.items():
                 if (
-                    provider not in _PROVIDERS
+                    not isinstance(provider, str)
+                    or not isinstance(key, str)
+                    or provider not in _PROVIDERS
                     or key not in accounts
                     or not key.startswith(f"{provider}:")
                 ):
@@ -324,6 +330,11 @@ def _write_tokens(directory_fd: int, tokens: OAuthTokens) -> None:
     data = (json.dumps(tokens.to_dict(), separators=(",", ":")) + "\n").encode()
     _atomic_publish(directory_fd, "oauth.json", data)
     _fsync_directory(directory_fd)
+
+
+def _verify_tokens(directory_fd: int, expected: OAuthTokens) -> None:
+    if _read_tokens(directory_fd, "oauth.json") != expected:
+        raise AccountError("account credential verification failed")
 
 
 def _read_tokens(directory_fd: int, name: str) -> OAuthTokens:
