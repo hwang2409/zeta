@@ -6598,7 +6598,7 @@ class _TaskFinishGateBackend(CompletionBackend):
         action: str = "wait",
         *,
         mixed_child: bool = False,
-        gate_delay: float = 0,
+        gate_delay: bool = False,
         pause_before_gate: bool = False,
     ) -> None:
         self.command = command
@@ -6742,7 +6742,7 @@ class _TaskFinishGateBackend(CompletionBackend):
                 self.gate_seen.set()
                 if self.gate_delay:
                     try:
-                        await asyncio.sleep(self.gate_delay)
+                        await asyncio.Event().wait()
                     except asyncio.CancelledError:
                         self.gate_delay_cancelled.set()
                         raise
@@ -6827,7 +6827,7 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
         f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
         "echo task-evidence"
     )
-    backend = _TaskFinishGateBackend(command, gate_delay=1)
+    backend = _TaskFinishGateBackend(command, gate_delay=True)
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.05)
     loop = AgentLoop(
@@ -6860,7 +6860,7 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
         f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
         "echo task-evidence"
     )
-    backend = _TaskFinishGateBackend(command, mixed_child=True, gate_delay=0.1)
+    backend = _TaskFinishGateBackend(command, mixed_child=True, gate_delay=True)
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.05)
     loop = AgentLoop(

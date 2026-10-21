@@ -145,11 +145,10 @@ class _GatedFakeBackend(FakeBackend):
             for block in message.content
             if isinstance(block, TextContent)
         )
+        if gated:
+            self.completion_started.set()
+            await self.completion_gate.wait()
         async for event in super().complete(messages, tool_schemas):
-            if gated:
-                self.completion_started.set()
-                await self.completion_gate.wait()
-                gated = False
             yield event
 
 
