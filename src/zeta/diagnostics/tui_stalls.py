@@ -301,12 +301,26 @@ def _append_bounded_record(path: Path, encoded: bytes, max_bytes: int) -> None:
                 rotated = path.with_name(f"{path.name}.1")
                 rotated.unlink(missing_ok=True)
                 path.replace(rotated)
-            fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-            try:
-                if os.write(fd, encoded) != len(encoded):
-                    raise OSError("incomplete TUI diagnostic write")
-            finally:
-                os.close(fd)
+            if path.exists():
+                fd = os.open(path, os.O_APPEND | os.O_WRONLY, 0o600)
+                try:
+                    if os.write(fd, encoded) != len(encoded):
+                        raise OSError("incomplete TUI diagnostic write")
+                finally:
+                    os.close(fd)
+            else:
+                temporary = path.with_name(
+                    f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                )
+                fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                try:
+                    if os.write(fd, encoded) != len(encoded):
+                        raise OSError("incomplete TUI diagnostic write")
+                    os.chmod(temporary, 0o600)
+                    os.replace(temporary, path)
+                finally:
+                    os.close(fd)
+                    temporary.unlink(missing_ok=True)
             os.chmod(path, 0o600)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

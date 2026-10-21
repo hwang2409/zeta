@@ -11188,11 +11188,42 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
     assert terminal_calls == []
     log_path = tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl"
     deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and not log_path.exists():
+    records: list[str] = []
+    while time.monotonic() < deadline:
+        if log_path.exists():
+            records = log_path.read_text().splitlines()
+            if records:
+                break
         await asyncio.sleep(0.01)
-    records = log_path.read_text().splitlines()
     assert len(records) == 1
     assert "background failed" in json.loads(records[0])["traceback"]
+
+
+def test_tui_diagnostic_record_is_not_visible_before_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = {"traceback": "probe"}
+    path = tmp_path / "logs" / "tui-errors.jsonl"
+    write_started = threading.Event()
+    release_write = threading.Event()
+    real_write = tui_stalls_module.os.write
+
+    def delayed_write(fd: int, data: bytes) -> int:
+        write_started.set()
+        assert release_write.wait(1)
+        return real_write(fd, data)
+
+    monkeypatch.setattr(tui_stalls_module.os, "write", delayed_write)
+    worker = threading.Thread(
+        target=tui_stalls_module.write_tui_diagnostic, args=(path, record)
+    )
+    worker.start()
+    assert write_started.wait(1)
+    assert not path.exists()
+    release_write.set()
+    worker.join(1)
+    assert not worker.is_alive()
+    assert json.loads(path.read_text())["traceback"] == "probe"
 
 
 def test_tui_diagnostic_write_ignores_fd_exhaustion(
