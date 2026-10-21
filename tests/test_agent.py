@@ -8973,20 +8973,32 @@ async def test_no_immediate_reminder_while_child_owns_running_task_or_live_child
             description="owned child",
         )
     prompts: list[str] = []
+    idle_waiting = asyncio.Event()
 
     async def consume(_loop, prompt, **kwargs):
         prompts.append(prompt)
         return {
             "content": [{"type": "text", "text": "reply"}],
             "isError": False,
-            "structuredContent": {"status": "done"},
+            "structuredContent": {"status": "running"},
         }
 
+    async def wait_idle(_wake, _timeout):
+        idle_waiting.set()
+        await asyncio.Event().wait()
+        return True
+
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
-    await asyncio.wait_for(
-        agent_runner_module.consume_run(loop, "work", child_store=store), 2
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop, "work", child_store=store, idle_wait=wait_idle
+        )
     )
+    await asyncio.wait_for(idle_waiting.wait(), 2)
     assert prompts == ["work"]
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
     if owned_child is not None:
         owned_child.cancel()
         await asyncio.gather(owned_child, return_exceptions=True)
@@ -9057,6 +9069,7 @@ async def test_reminded_child_that_calls_finish_completes_with_report(
                 "content": [],
                 "isError": False,
                 "structuredContent": {"status": "done"},
+                "explicitFinishReport": loop._explicit_finish_report,
             }
         return {
             "content": [{"type": "text", "text": "reply"}],
@@ -9065,13 +9078,16 @@ async def test_reminded_child_that_calls_finish_completes_with_report(
         }
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
-    await agent_runner_module.consume_run(loop, "work", child_store=store)
-    assert prompts == ["work", run_consumer_module._IMMEDIATE_FINISH_REMINDER]
-    assert store.pending_prompt_queue.explicit_finish_report() == {
+    result = await agent_runner_module.consume_run(loop, "work", child_store=store)
+    expected = {
         "status": "done",
         "summary": "finished",
         "verdict": "pass",
     }
+    assert prompts == ["work", run_consumer_module._IMMEDIATE_FINISH_REMINDER]
+    assert result["explicitFinishReport"] == expected
+    assert loop._explicit_finish_report == expected
+    assert store.pending_prompt_queue.explicit_finish_report() == expected
     await registry.close()
     store.close()
 
