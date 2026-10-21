@@ -143,6 +143,7 @@ class ServerSlashSession:
                 opened.metadata.model
             ),
             mcp_summary=loop.mcp_summary,
+            explicit_finish=loop.explicit_finish,
             automatic_memory_failure=(
                 loop.memory_reconciler.last_failure.status_line()
                 if loop.memory_reconciler is not None

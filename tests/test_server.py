@@ -23,6 +23,7 @@ from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.core.store import ConversationStore
+from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
@@ -40,12 +41,31 @@ from zeta.protocol.types import (
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import ApprovalLifecycle
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
-from zeta.server.server import _approval_display_fields, _Client
+from zeta.server.server import (
+    NOTIFICATION_WIRE_EVENTS,
+    STREAM_EVENT_WIRE_EVENTS,
+    _approval_display_fields,
+    _Client,
+)
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 
 TIMEOUT = 3
+
+
+def test_every_durable_notification_kind_has_an_explicit_wire_event() -> None:
+    assert NOTIFICATION_KINDS
+    assert set(NOTIFICATION_WIRE_EVENTS) == set(NOTIFICATION_KINDS)
+    assert all(
+        event != "sub_agent_receipt" or kind == "agent_completion"
+        for kind, event in NOTIFICATION_WIRE_EVENTS.items()
+    )
+
+
+def test_every_stream_event_has_a_wire_mapping() -> None:
+    assert set(STREAM_EVENT_WIRE_EVENTS) == set(StreamEventType)
+    assert all(STREAM_EVENT_WIRE_EVENTS.values())
 
 
 def test_removed_fake_provider_has_clear_serve_error(tmp_path: Path) -> None:
@@ -2757,8 +2777,8 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
 
 @pytest.mark.asyncio
 async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None:
-    # S7: live notification events dispatch task_exited as task_exit_notification
-    # and every other kind (including unknown) as sub_agent_receipt.
+    # Known notification kinds have explicit events; unknown kinds retain the
+    # legacy sub_agent_receipt fallback.
     backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
     server = ZetaServer(
         home=tmp_path,

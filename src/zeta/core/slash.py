@@ -536,6 +536,7 @@ class SlashStatus:
     model_window: int | None = None
     mcp_summary: str = "mcp: 0 mounted, 0 failed"
     automatic_memory_failure: str | None = None
+    explicit_finish: bool = False
 
 
 class SlashSession(Protocol):
@@ -925,6 +926,7 @@ def _format_status(status: SlashStatus) -> str:
         f"model: {status.model}",
         f"vim_mode: {'on' if status.vim_mode else 'off'}",
         f"plan_mode: {'on' if status.plan_mode else 'off'}",
+        f"explicit_finish: {'on' if status.explicit_finish else 'off'}",
         f"retained_tail: {status.retained_tail}",
         f"tokens_used_this_session: {status.tokens_used_this_session + child_tokens}",
         f"tokens_in_current_context: {context_tokens}",

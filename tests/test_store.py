@@ -20,6 +20,11 @@ from zeta.core.store import (
     ConversationIntegrityError,
     ConversationStore,
 )
+from zeta.core.store._validation import (
+    NOTIFICATION_KINDS,
+    NOTIFICATION_VALIDATORS,
+    validate_notification_data,
+)
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -36,6 +41,67 @@ def message(role: MessageRole, text: str) -> Message:
     if role is MessageRole.USER:
         return with_message_origin(message, MessageOrigin.USER)
     return message
+
+
+def test_every_notification_kind_has_a_validator() -> None:
+    payloads = {
+        "agent_completion": {
+            "origin": "notification",
+            "kind": "agent_completion",
+            "child_instance_id": "root:1",
+            "child_session_path": "/sessions/root/agents/1",
+            "description": "worker",
+            "status": "completed",
+            "text": "done",
+        },
+        "child_idle": {
+            "origin": "notification",
+            "kind": "child_idle",
+            "child_instance_id": "root:1",
+            "child_session_path": "/sessions/root/agents/1",
+            "description": "worker",
+            "status": "child_idle",
+            "text": "waiting",
+        },
+        "task_exited": {
+            "origin": "notification",
+            "kind": "task_exited",
+            "task_id": "task-1",
+            "headline": "command finished",
+            "exit_code": 0,
+        },
+        "project_inbox": {
+            "origin": "notification",
+            "kind": "project_inbox",
+            "status": "new",
+            "project_id": "project-1",
+            "message_ids": ["message-1"],
+            "text": "new project message",
+        },
+        "child_question": {
+            "origin": "notification",
+            "kind": "child_question",
+            "child_instance_id": "root:1",
+            "question_id": "question-1",
+            "description": "worker",
+            "status": "pending",
+            "question": "continue?",
+            "text": "worker asks a question",
+        },
+        "child_question_withdrawn": {
+            "origin": "notification",
+            "kind": "child_question_withdrawn",
+            "child_instance_id": "root:1",
+            "question_id": "question-1",
+            "description": "worker",
+            "status": "withdrawn",
+            "text": "question withdrawn",
+        },
+    }
+
+    assert set(NOTIFICATION_VALIDATORS) == set(NOTIFICATION_KINDS) == set(payloads)
+    for kind in NOTIFICATION_KINDS:
+        validate_notification_data(payloads[kind])
 
 
 def test_non_indexed_store_avoids_receipt_prewrite_fstat(

@@ -17,15 +17,6 @@ PROJECT_INBOX_NOTIFICATION_KIND = "project_inbox"
 CHILD_QUESTION_NOTIFICATION_KIND = "child_question"
 CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND = "child_question_withdrawn"
 
-NOTIFICATION_KINDS = (
-    AGENT_COMPLETION_NOTIFICATION_KIND,
-    CHILD_IDLE_NOTIFICATION_KIND,
-    TASK_EXITED_NOTIFICATION_KIND,
-    PROJECT_INBOX_NOTIFICATION_KIND,
-    CHILD_QUESTION_NOTIFICATION_KIND,
-    CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND,
-)
-
 
 def valid_agent_stats(value: object) -> bool:
     if type(value) is not dict:
@@ -205,3 +196,25 @@ def validate_agent_notification_data(data: Mapping[str, Any]) -> None:
         or not _valid_explicit_finish_fields(data)
     ):
         raise ValueError("invalid agent notification")
+
+
+NOTIFICATION_VALIDATORS = {
+    AGENT_COMPLETION_NOTIFICATION_KIND: validate_agent_notification_data,
+    CHILD_IDLE_NOTIFICATION_KIND: validate_child_idle_notification_data,
+    TASK_EXITED_NOTIFICATION_KIND: validate_task_exited_notification_data,
+    PROJECT_INBOX_NOTIFICATION_KIND: validate_project_inbox_notification_data,
+    CHILD_QUESTION_NOTIFICATION_KIND: validate_child_question_notification_data,
+    CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND: validate_child_question_notification_data,
+}
+NOTIFICATION_KINDS = tuple(NOTIFICATION_VALIDATORS)
+
+
+def validate_notification_data(data: Mapping[str, Any]) -> None:
+    """Validate one notification with a known durable kind."""
+
+    kind = data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
+    try:
+        validator = NOTIFICATION_VALIDATORS[kind]
+    except (KeyError, TypeError):
+        raise ValueError("unknown notification kind") from None
+    validator(data)

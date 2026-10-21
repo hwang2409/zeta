@@ -60,17 +60,10 @@ from ._pending_prompts import (
 )
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
-    CHILD_IDLE_NOTIFICATION_KIND,
-    CHILD_QUESTION_NOTIFICATION_KIND,
-    CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
-    PROJECT_INBOX_NOTIFICATION_KIND,
+    NOTIFICATION_KINDS,
     TASK_EXITED_NOTIFICATION_KIND,
-    validate_agent_notification_data,
-    validate_child_idle_notification_data,
-    validate_child_question_notification_data,
-    validate_project_inbox_notification_data,
-    validate_task_exited_notification_data,
+    validate_notification_data,
     validate_terminal_transition_data,
 )
 from .runtime_lease import (
@@ -590,16 +583,9 @@ class ConversationStore(
                     raise ValueError("invalid approval resolution")
             elif entry.type == "notification":
                 kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
-                if kind == TASK_EXITED_NOTIFICATION_KIND:
-                    validate_task_exited_notification_data(entry.data)
-                elif kind == AGENT_COMPLETION_NOTIFICATION_KIND:
-                    validate_agent_notification_data(entry.data)
-                elif kind == CHILD_IDLE_NOTIFICATION_KIND:
-                    validate_child_idle_notification_data(entry.data)
-                elif kind == PROJECT_INBOX_NOTIFICATION_KIND:
-                    validate_project_inbox_notification_data(entry.data)
-                elif kind in {CHILD_QUESTION_NOTIFICATION_KIND, CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND}:
-                    validate_child_question_notification_data(entry.data)
+                if kind in NOTIFICATION_KINDS:
+                    validate_notification_data(entry.data)
+                # Unknown kinds remain readable for forward compatibility.
             elif entry.type == "notification_ack":
                 notification_id = entry.data.get("notification_id")
                 if type(notification_id) is not str or not notification_id:

@@ -424,6 +424,7 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
 skill_catalog=SkillCatalog.empty(),
     )
     await loop.context_assembler.assemble()
+    loop.explicit_finish = True
     loop.context_assembler.record_usage(
         {
             "total_tokens": 321,
@@ -457,6 +458,7 @@ skill_catalog=SkillCatalog.empty(),
     assert f"provider: {app.provider}" in output
     assert f"model: {app.model}" in output
     assert "vim_mode: on" in output
+    assert "explicit_finish: on" in output
     assert f"retained_tail: {loop.context_assembler.retained_tail}" in output
     assert (
         f"tokens_used_this_session: {loop.context_assembler.tokens_used_this_session}"

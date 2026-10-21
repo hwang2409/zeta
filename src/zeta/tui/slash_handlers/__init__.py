@@ -128,6 +128,7 @@ class SlashHandlerMixin:
             compaction_history=compaction_history_data,
             model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
             mcp_summary=self.loop.mcp_summary,
+            explicit_finish=self.loop.explicit_finish,
             automatic_memory_failure=(
                 self.loop.memory_reconciler.last_failure.status_line()
                 if self.loop.memory_reconciler is not None

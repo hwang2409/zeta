@@ -46,6 +46,37 @@ from .turn_context import PendingTurnContexts
 # Echoed user text stays well inside the 1 MiB frame after JSON escaping.
 USER_MESSAGE_MAX_BYTES = 262_144
 
+NOTIFICATION_WIRE_EVENTS = {
+    "agent_completion": "sub_agent_receipt",
+    "child_idle": "child_idle",
+    "task_exited": "task_exit_notification",
+    "project_inbox": "project_inbox_notification",
+    "child_question": "child_question",
+    "child_question_withdrawn": "child_question_withdrawn",
+}
+
+# Custom projections below still use this exhaustive runtime-to-wire contract.
+STREAM_EVENT_WIRE_EVENTS = {
+    StreamEventType.AGENT_START: "agent_start",
+    StreamEventType.TURN_START: "turn_start",
+    StreamEventType.COMPACTION_START: "compaction_start",
+    StreamEventType.COMPACTION_END: "compaction_end",
+    StreamEventType.MESSAGE_START: "message_start",
+    StreamEventType.MESSAGE_UPDATE: "assistant_delta",
+    StreamEventType.MESSAGE_END: "assistant_message",
+    StreamEventType.RETRY: "retry",
+    StreamEventType.ASSISTANT_RESET: "assistant_reset",
+    StreamEventType.TOOL_APPROVAL_START: "approval_request",
+    StreamEventType.TOOL_APPROVAL_END: "approval_end",
+    StreamEventType.TOOL_EXECUTION_START: "tool_start",
+    StreamEventType.TOOL_EXECUTION_UPDATE: "tool_output",
+    StreamEventType.TOOL_EXECUTION_END: "tool_end",
+    StreamEventType.AGENT_NOTIFICATION: "notification_by_kind",
+    StreamEventType.TURN_END: "turn_end",
+    StreamEventType.AGENT_END: "agent_end",
+    StreamEventType.ERROR: "error",
+}
+
 
 class ZetaServer:
     """Serve one local client over a Unix socket or localhost TCP."""
@@ -981,13 +1012,9 @@ class _Client:
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
             notification = dict(event.data)
-            event_name = {
-                "task_exited": "task_exit_notification",
-                "project_inbox": "project_inbox_notification",
-                "child_question": "child_question",
-                "child_question_withdrawn": "child_question_withdrawn",
-                "child_idle": "child_idle",
-            }.get(notification.get("kind", "agent_completion"), "sub_agent_receipt")
+            event_name = NOTIFICATION_WIRE_EVENTS.get(
+                notification.get("kind", "agent_completion"), "sub_agent_receipt"
+            )
             await self._notify(event_name, session_id, data=notification)
             return
         if kind is StreamEventType.ERROR:
@@ -1016,7 +1043,9 @@ class _Client:
             return
         if foreground and kind is StreamEventType.AGENT_END:
             state.turn_finished()
-        await self._notify(kind.value, session_id, data=dict(event.data))
+        await self._notify(
+            STREAM_EVENT_WIRE_EVENTS[kind], session_id, data=dict(event.data)
+        )
 
     def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
         """Schedule child events from the loop's synchronous sink."""

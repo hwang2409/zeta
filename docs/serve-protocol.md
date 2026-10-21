@@ -469,15 +469,17 @@ work. The result contains `cleared`, the number of removed messages.
 ### `status`
 
 Params: none. The result contains `session` (full metadata or `null`), `state`
-(`idle`, `running`, or `tool`), `pending_approvals`, `usage`, and
-`compaction_markers`. Each pending approval has `request_id`, `tool_call`, and `delegated`. Delegated approvals also have `agent_instance_id`, the child agent instance that owns the approval.
+(`idle`, `running`, or `tool`), `explicit_finish`, `pending_approvals`, `usage`,
+and `compaction_markers`. Each pending approval has `request_id`, `tool_call`,
+and `delegated`. Delegated approvals also have `agent_instance_id`, the child
+agent instance that owns the approval.
 
 ```json
 {"jsonrpc":"2.0","id":9,"method":"status","params":{}}
 ```
 
 ```json
-{"jsonrpc":"2.0","id":9,"result":{"session":null,"state":"idle","pending_approvals":[],"usage":{},"compaction_markers":0}}
+{"jsonrpc":"2.0","id":9,"result":{"session":null,"state":"idle","explicit_finish":false,"pending_approvals":[],"usage":{},"compaction_markers":0}}
 ```
 
 ### `ping`
@@ -549,7 +551,10 @@ call ID.
 
 `usage` carries the provider usage object. `compaction_start` and
 `compaction_end` carry loop `data`; the latter can include `token_count`.
-`sub_agent_receipt` carries the existing agent completion notification `data` object. `project_inbox_notification`, `child_question`, `child_question_withdrawn`, and `child_idle` carry their durable notification `data` object with the matching kind.
+`sub_agent_receipt` carries agent completion notifications and unknown future kinds.
+`task_exit_notification`, `project_inbox_notification`, `child_question`,
+`child_question_withdrawn`, and `child_idle` carry their durable notification
+`data` object with the matching known kind.
 
 ### reconnecting sessions and background completions
 
