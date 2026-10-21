@@ -543,7 +543,9 @@ def test_bootstrap_refresh_runs_without_the_registry_lock(
     refreshed = OAuthTokens("fresh", "new-refresh", 4_000_000_000)
     credential = named_account_credentials(tmp_path, "codex")
     other = named_account_credentials(tmp_path, "codex", "other")
+    another = named_account_credentials(tmp_path, "codex", "another")
     other.save(tokens())
+    another.save(tokens())
     monkeypatch.setattr(credential._driver, "bootstrap", lambda: expired)
     refresh_started = threading.Event()
     release_refresh = threading.Event()
@@ -574,7 +576,7 @@ def test_bootstrap_refresh_runs_without_the_registry_lock(
         try:
             store = AccountStore(tmp_path)
             assert AccountId("codex", "default") in store.list()
-            store.set_default(AccountId("codex", "other"))
+            store.set_default(AccountId("codex", "another"))
         except Exception as exc:  # noqa: BLE001 - report thread failures in test
             failures.append(exc)
         finally:
@@ -593,7 +595,7 @@ def test_bootstrap_refresh_runs_without_the_registry_lock(
         registry_thread.join(timeout=5)
     assert refresh_done.is_set()
     assert not failures
-    assert AccountStore(tmp_path).default("codex") == AccountId("codex", "other")
+    assert AccountStore(tmp_path).default("codex") == AccountId("codex", "another")
 
 
 def test_bootstrap_writes_credential_registry_row_and_default_together(
