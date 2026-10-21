@@ -7158,7 +7158,7 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
         ("<'/tmp/password-secret' cat; sleep 30", "password-secret"),
         ("3<'url-user:url-pass@example.com' cat; sleep 30", "url-user:url-pass@example.com"),
         (
-            "<<'heredoc-secret' cat\nbody\nheredoc-secret; sleep 30",
+            "<<'heredoc-secret' cat\nbody\nheredoc-secret\nsleep 30",
             "heredoc-secret",
         ),
     ],
@@ -7198,7 +7198,10 @@ async def test_killed_task_receipt_never_contains_command_secrets(
         if notifications and "background tasks killed on child completion" in notifications[-1].data.get("text", ""):
             break
         await asyncio.sleep(0.02)
+    assert notifications, "background-task cleanup notification was not recorded"
     notification = notifications[-1]
+    killed_task_ids = notification.data.get("killed_task_ids")
+    assert isinstance(killed_task_ids, list) and len(killed_task_ids) == 1
     text = notification.data["text"]
     assert "background tasks killed on child completion" in text
     task_id = notification.data["killed_task_ids"][0]
