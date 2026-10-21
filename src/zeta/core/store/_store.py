@@ -644,6 +644,14 @@ class ConversationStore(
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
+    @staticmethod
+    def _validate_notification_write(entry_type: str, data: Mapping[str, Any]) -> None:
+        if entry_type != "notification":
+            return
+        kind = data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
+        if kind not in NOTIFICATION_KINDS:
+            raise ValueError(f"unknown notification kind: {kind!r}")
+
     def _append_row(
         self,
         entry_type: str,
@@ -681,6 +689,7 @@ class ConversationStore(
         next_seq = self._entries[-1].seq + 1 if self._entries else 1
         entries: list[ConversationEntry] = []
         for index, (entry_type, data) in enumerate(rows):
+            self._validate_notification_write(entry_type, data)
             entry_id = uuid.uuid4().hex
             if entry_id in prior_ids:
                 raise ConversationIntegrityError(
@@ -730,6 +739,7 @@ class ConversationStore(
         deadline: float | None = None,
         copy_data: bool = True,
     ) -> ConversationEntry:
+        self._validate_notification_write(entry_type, data)
         prior_ids = {entry.id for entry in self._entries}
         if parent_id is not None and parent_id not in prior_ids:
             raise ConversationIntegrityError(f"missing prior parent {parent_id}")

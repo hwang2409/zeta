@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
 import os
 import shlex
@@ -13,6 +15,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from textwrap import dedent
 from types import SimpleNamespace
 from typing import Any
 
@@ -65,6 +68,82 @@ def test_every_durable_notification_kind_has_an_explicit_wire_event() -> None:
 def test_every_stream_event_has_a_wire_mapping() -> None:
     assert set(STREAM_EVENT_WIRE_EVENTS) == set(StreamEventType)
     assert all(STREAM_EVENT_WIRE_EVENTS.values())
+
+
+def test_server_sends_only_wire_map_event_names() -> None:
+    tree = ast.parse(dedent(inspect.getsource(_Client)))
+    literal_notifications = [
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_notify"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ]
+
+    assert literal_notifications == []
+
+
+@pytest.mark.asyncio
+async def test_protocol_1_1_client_receives_sub_agent_receipt_for_known_kinds(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        hello = (
+            await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        )[-1]["result"]
+        assert hello["protocol_version"] == "1.1"
+        assert server._client is not None
+        for kind in NOTIFICATION_KINDS:
+            await server._client._event(
+                StreamEvent(
+                    StreamEventType.AGENT_NOTIFICATION,
+                    data={"kind": kind},
+                ),
+                session_id="session",
+            )
+        events = [(await _read(reader))["params"]["event"] for _ in NOTIFICATION_KINDS]
+
+        assert events == ["sub_agent_receipt"] * len(NOTIFICATION_KINDS)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_protocol_1_2_client_receives_explicit_notification_events(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        hello = (
+            await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        )[-1]["result"]
+        assert hello["protocol_version"] == "1.2"
+        assert server._client is not None
+        for kind in (*NOTIFICATION_KINDS, "future_kind"):
+            await server._client._event(
+                StreamEvent(
+                    StreamEventType.AGENT_NOTIFICATION,
+                    data={"kind": kind},
+                ),
+                session_id="session",
+            )
+        events = [
+            (await _read(reader))["params"]["event"]
+            for _ in (*NOTIFICATION_KINDS, "future_kind")
+        ]
+
+        assert events == [
+            *(NOTIFICATION_WIRE_EVENTS[kind] for kind in NOTIFICATION_KINDS),
+            "sub_agent_receipt",
+        ]
+    finally:
+        await _close(server, writer)
 
 
 def test_removed_fake_provider_has_clear_serve_error(tmp_path: Path) -> None:
@@ -2752,7 +2831,15 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
             "text": "legacy done",
         },
     )
-    store._append_row("notification", {"kind": "monitor_alert", "text": "heads up"})
+    unknown = store.append_child_idle_notification(
+        "future-child",
+        child_session_path="agents/future",
+        description="future notification",
+        text="heads up",
+    )
+    assert unknown is not None
+    loaded = next(entry for entry in store._entries if entry.id == unknown.id)
+    loaded.data["kind"] = "monitor_alert"  # Simulate a future kind loaded from disk.
     try:
         history = (
             await _request(
@@ -2776,8 +2863,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
 
 @pytest.mark.asyncio
 async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None:
-    # Known notification kinds have explicit events; unknown kinds retain the
-    # legacy sub_agent_receipt fallback.
+    # Protocol 1.2 gives known notification kinds explicit events.
     backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
     server = ZetaServer(
         home=tmp_path,
@@ -2797,14 +2883,13 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
         status="completed",
         text="child done",
     )
-    store._append_row("notification", {"kind": "monitor_alert", "text": "heads up"})
     try:
         writer.close()
         await writer.wait_closed()
         await asyncio.sleep(0.05)
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         frames = await _request(
-            reader, writer, 4, "hello", {"protocol_version": "1.0"}
+            reader, writer, 4, "hello", {"protocol_version": "1.2"}
         )
         frames += await _frames_until_event(reader, "turn_end")
         events = [
@@ -2820,7 +2905,7 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
         assert task_events[0]["data"]["kind"] == "task_exited"
         assert {
             e["data"].get("kind", "agent_completion") for e in receipt_events
-        } == {"agent_completion", "monitor_alert"}
+        } == {"agent_completion"}
         assert len(backend.calls) == 1
     finally:
         await _close(server, writer)

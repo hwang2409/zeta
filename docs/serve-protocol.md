@@ -1,8 +1,15 @@
 # zeta serve protocol
 
-This document defines protocol version `1.1` (with `1.0` compatibility). It is the contract for native
-clients. The transport is newline-delimited UTF-8 JSON. Each line is one
-JSON-RPC 2.0 object. Frames are limited to 1 MiB.
+This document defines protocol version `1.2` (with `1.0` and `1.1`
+compatibility). It is the contract for native clients. The transport is
+newline-delimited UTF-8 JSON. Each line is one JSON-RPC 2.0 object. Frames are
+limited to 1 MiB.
+
+## version history
+
+- `1.2` adds explicit wire event names for known durable notification kinds.
+- `1.1` adds the session extensions and optional feature negotiation below.
+- `1.0` is the legacy base protocol.
 
 The server accepts one client. A second connection receives a JSON-RPC error
 with code `-32001`, then closes. The server uses a Unix socket by default:
@@ -12,17 +19,18 @@ socket. `zeta serve --port N` selects `127.0.0.1:N`.
 ## handshake
 
 The first request must be `hello`. `protocol_version` is required and must be
-`1.0` or `1.1`. A new client sends `protocol_version: "1.0"` plus
-`client_version: "1.1"` so old servers accept the handshake. A new server returns
-`1.1` for that request, or for an explicit `protocol_version: "1.1"`. A legacy
-hello without the extra field receives `1.0` and only the legacy capabilities.
+`1.0`, `1.1`, or `1.2`. A new client sends `protocol_version: "1.0"` plus
+`client_version: "1.2"` so old servers accept the handshake. A 1.2 server returns
+`1.2` for that request, or the requested version for an explicit `1.1` or `1.2`.
+A legacy hello without the extra field receives `1.0` and only the legacy
+capabilities.
 The frontend client gates all extensions on the returned version; it never sends extension
 requests to a 1.0 server. A mismatch returns `-32002` with `requested` and `supported` fields, then closes
 the connection. Clients must not send other requests before `hello`.
 
-A 1.1 client can also send `features`, an array of optional feature names
-(see [optional features](#optional-features-11)). When the negotiated version
-is `1.1` and the request had `features`, the result has
+A 1.1 or 1.2 client can also send `features`, an array of optional feature
+names (see [optional features](#optional-features-11)). When the negotiated
+version is `1.1` or `1.2` and the request had `features`, the result has
 `capabilities.features`: the requested names that the server supports, in the
 server's order. A client uses a feature only when this echo contains its name.
 Old servers ignore `features` and do not return the key, so a client that
@@ -551,10 +559,12 @@ call ID.
 
 `usage` carries the provider usage object. `compaction_start` and
 `compaction_end` carry loop `data`; the latter can include `token_count`.
-`sub_agent_receipt` carries agent completion notifications and unknown future kinds.
-`task_exit_notification`, `project_inbox_notification`, `child_question`,
-`child_question_withdrawn`, and `child_idle` carry their durable notification
-`data` object with the matching known kind.
+On protocol 1.0 and 1.1, `sub_agent_receipt` carries every durable notification
+kind. On protocol 1.2, `sub_agent_receipt` carries agent completion notifications
+and unknown future kinds; `task_exit_notification`,
+`project_inbox_notification`, `child_question`, `child_question_withdrawn`, and
+`child_idle` carry their durable notification `data` object with the matching
+known kind.
 
 ### reconnecting sessions and background completions
 
@@ -734,6 +744,7 @@ Event fields are:
 | `approval_request` | `event`, `request_id: string`, `tool_call: ToolCall`, `delegated: boolean` | `session_id`, `agent_instance_id: string` (delegated only) |
 | `approval_end` | `event`, `request_id: string`, `tool_call: ToolCall`, `data: object` | `session_id` |
 | `sub_agent_receipt` | `event`, `data: object` | `session_id` |
+| `task_exit_notification` | `event`, `data: object` | `session_id` |
 | `project_inbox_notification` | `event`, `data: object` | `session_id` |
 | `child_question` | `event`, `data: object` | `session_id` |
 | `child_question_withdrawn` | `event`, `data: object` | `session_id` |
@@ -972,9 +983,9 @@ negotiate a feature sees the behavior from before the feature existed.
 | `turn_context` | adds `set_turn_context` for one-shot context on the next server-started turn |
 | `delivery_id` | `send` and `steer` accept durable idempotency IDs; adds `delivery_status` |
 
-Features keep the protocol version at `1.1`. A version bump would make a new
-client that sends `client_version: "1.2"` negotiate `1.0` with a 1.1 server and
-lose every 1.1 extension. Per-feature negotiation has no such failure mode.
+These features are available on protocol 1.1 and 1.2. A 1.2 client that sends
+`client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
+work without the extensions when it connects to that older server.
 
 ### Session preview metadata
 

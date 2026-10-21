@@ -104,6 +104,56 @@ def test_every_notification_kind_has_a_validator() -> None:
         validate_notification_data(payloads[kind])
 
 
+def test_store_rejects_unknown_notification_kind_on_write(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+
+    with pytest.raises(ValueError, match="unknown notification kind"):
+        store._append_row(
+            "notification",
+            {"kind": "future_kind", "text": "future notification"},
+        )
+
+
+def test_store_reads_persisted_unknown_notification_kind_without_crash(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_task_notification(
+        task_id="task-1",
+        command="command finished",
+        exit_code=0,
+        output_tail="done",
+    )
+    persisted = store.path.read_text(encoding="utf-8").replace(
+        '"kind":"task_exited"',
+        '"kind":"future_kind"',
+    )
+    store.path.write_text(persisted, encoding="utf-8")
+
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    assert reopened.agent_notifications(pending_only=False)[0].data["kind"] == "future_kind"
+
+
+def test_task_notification_rejects_non_string_output_tail(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+
+    with pytest.raises(ConversationIntegrityError) as raised:
+        store._append_row(
+            "notification",
+            {
+                "origin": "notification",
+                "kind": "task_exited",
+                "task_id": "task-1",
+                "headline": "command finished",
+                "exit_code": 0,
+                "output_tail": 7,
+            },
+        )
+
+    assert str(raised.value.__cause__) == "invalid task notification"
+
+
 def test_non_indexed_store_avoids_receipt_prewrite_fstat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

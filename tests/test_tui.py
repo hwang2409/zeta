@@ -1427,16 +1427,121 @@ async def test_default_registered_tools_render_start_and_end(tmp_path: Path) -> 
         await registry.close()
 
 
-def test_conditional_session_tools_render_generically() -> None:
-    for name in (
-        "finish",
-        "agent_handoff",
-        "ask_parent",
-        "resolve_attention",
-        "inbox",
-        "automation",
-    ):
-        _assert_tool_contract(name)
+@pytest.mark.asyncio
+async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> None:
+    from zeta.agent.explicit_finish import register_handoff
+    from zeta.runtime.unattended import build_unattended_loop
+    from zeta.tools.ask_parent import register_ask_parent
+    from zeta.tools.finish import register as register_finish
+    from zeta.tools.resolve_attention import register_fork
+
+    stores = [
+        ConversationStore(tmp_path, session_id=f"tool-contract-{index}")
+        for index in range(5)
+    ]
+    top_level = ToolRegistry(
+        tmp_path,
+        session_store=stores[0],
+        skill_catalog=SkillCatalog.empty(),
+        project_id="project-1",
+        project_registry=SimpleNamespace(),
+    )
+    foreground_child = top_level.clone_for_session(
+        stores[1],
+        exclude_names={"inbox", "request_attention", "resolve_attention"},
+    )
+    background_child = top_level.clone_for_session(
+        stores[2],
+        exclude_names={"inbox", "request_attention", "resolve_attention"},
+    )
+    register_ask_parent(
+        background_child,
+        channel=SimpleNamespace(publish_question=lambda **_kwargs: None),
+        child_instance_id="root:1",
+    )
+    explicit_child = top_level.clone_for_session(
+        stores[3],
+        exclude_names={"inbox", "request_attention", "resolve_attention"},
+    )
+    register_ask_parent(
+        explicit_child,
+        channel=SimpleNamespace(publish_question=lambda **_kwargs: None),
+        child_instance_id="root:2",
+    )
+    child_loop = SimpleNamespace(
+        tool_registry=explicit_child,
+        store=stores[3],
+        notification_wake=SimpleNamespace(
+            pending_message=lambda: None,
+            has_undelivered_claim=False,
+            persisted_ids=frozenset(),
+        ),
+        _background_owner=SimpleNamespace(),
+        agent_instance_id="root:2",
+        _explicit_finish_report=None,
+    )
+    register_finish(explicit_child, child_loop=child_loop)
+    register_handoff(child_loop)
+    attention_fork = ToolRegistry(
+        tmp_path,
+        session_store=stores[4],
+        skill_catalog=SkillCatalog.empty(),
+    )
+    attention_fork.unregister("request_attention")
+    register_fork(attention_fork)
+    automation_session = SessionManager(tmp_path / "automation").create(
+        provider="codex",
+        model="fake",
+        cwd=tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        system_prompt="system",
+    )
+    automation_loop = build_unattended_loop(
+        automation_session,
+        home=tmp_path / "automation",
+        allow=(),
+        backend=FakeBackend([]),
+    )
+    registries = {
+        "top-level": top_level,
+        "serve": top_level,
+        "foreground child": foreground_child,
+        "background child": background_child,
+        "background child with explicit finish": explicit_child,
+        "attention fork": attention_fork,
+        "automation": automation_loop.tool_registry,
+    }
+    try:
+        runtime_names = set().union(
+            *(registry.registered_names for registry in registries.values())
+        )
+        for mode, registry in registries.items():
+            assert registry.registered_names, mode
+            for name in registry.registered_names:
+                _assert_tool_contract(name)
+
+        source_names: set[str] = set()
+        source_root = Path(__file__).parents[1] / "src" / "zeta"
+        for path in source_root.rglob("*.py"):
+            if "tests" in path.parts:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"register", "register_session_tool"}
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                ):
+                    source_names.add(node.args[0].value)
+        assert source_names <= runtime_names
+    finally:
+        for registry in set(registries.values()) - {automation_loop.tool_registry}:
+            await registry.close()
+        await automation_loop.close()
+        automation_session.store.close()
 
 
 @pytest.mark.asyncio

@@ -22,10 +22,16 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
-from . import abort_scope, ergonomics, login, model_selection, slash_commands
+from . import (
+    abort_scope,
+    ergonomics,
+    event_contract,
+    login,
+    model_selection,
+    slash_commands,
+)
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
 from .delivery import DeliveryRequests, TurnOutcome
-from .event_contract import NOTIFICATION_WIRE_EVENTS, STREAM_EVENT_WIRE_EVENTS
 from .model_inputs import PendingModelInputs
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
@@ -36,10 +42,10 @@ from .project_requests import (
 from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
-    PROTOCOL_VERSION,
     FrameCodec,
     ProtocolError,
     bounded,
+    negotiate_protocol_version,
 )
 from .runtime import BackendFactory, ServerRuntime
 from .turn_context import PendingTurnContexts
@@ -353,11 +359,11 @@ class _Client:
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
         if method in login.REQUESTS:
-            if self.protocol_version != "1.1":
+            if self.protocol_version == "1.0":
                 raise ProtocolError(-32601, "login is unavailable on this server")
             return await self.logins.request(method, params)
         if method in ergonomics.EXTENSION_REQUESTS:
-            if self.protocol_version != "1.1":
+            if self.protocol_version == "1.0":
                 raise ProtocolError(-32601, "request requires protocol 1.1")
             return await self._ergonomics(method, params)
         if method == "ping":
@@ -432,22 +438,15 @@ class _Client:
         if self.handshaken:
             raise ProtocolError(-32600, "hello may only be sent once")
         version = params.get("protocol_version")
-        if version not in ("1.0", PROTOCOL_VERSION):
-            raise ProtocolError(
-                -32002,
-                "unsupported protocol version",
-                {"requested": version, "supported": [PROTOCOL_VERSION]},
-            )
+        client_version = params.get("client_version")
+        self.protocol_version = negotiate_protocol_version(version, client_version)
         requested = params.get("features")
         if requested is not None and (
             not isinstance(requested, list)
             or not all(isinstance(item, str) for item in requested)
         ):
             raise ProtocolError(-32602, "features must be an array of strings")
-        self.protocol_version = (
-            PROTOCOL_VERSION if version == PROTOCOL_VERSION or params.get("client_version") == PROTOCOL_VERSION else "1.0"
-        )
-        extended = self.protocol_version == PROTOCOL_VERSION
+        extended = self.protocol_version != "1.0"
         accepted = [item for item in FEATURES if item in (requested or ())] if extended else []
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
@@ -504,7 +503,7 @@ class _Client:
 
         if "user_message_event" in self.features:
             await self._notify(
-                "user_message",
+                event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.USER_MESSAGE],
                 self.server.runtime.session_id,
                 text=bounded(text, USER_MESSAGE_MAX_BYTES),
                 mode=mode,
@@ -652,7 +651,7 @@ class _Client:
             before_cancel=mark_canceled,
         )
         if aborted:
-            await self._notify("turn_aborted", session_id)
+            await self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.TURN_ABORTED], session_id)
         return {"aborted": aborted}
 
     def _session_snapshot(self) -> dict[str, object] | None:
@@ -728,7 +727,7 @@ class _Client:
         except Exception as exc:  # noqa: BLE001 - serialize all turn failures
             outcome = TurnOutcome.FAILED
             await self._notify(
-                "error",
+                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
                 session_id,
                 error={"code": "server_error", "message": str(exc)},
                 data={},
@@ -777,7 +776,7 @@ class _Client:
         except Exception as exc:  # noqa: BLE001 - serialize all turn failures
             outcome = TurnOutcome.FAILED
             await self._notify(
-                "error",
+                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
                 session_id,
                 error={"code": "server_error", "message": str(exc)},
                 data={},
@@ -859,6 +858,7 @@ class _Client:
             and state.session_id == session_id
         )
         kind = event.type
+        wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
         if kind not in {
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,
@@ -874,7 +874,7 @@ class _Client:
                 stream_kind = str(getattr(event.content, "type", "content"))
             if delta:
                 await self._notify(
-                    "assistant_delta",
+                    wire_event,
                     session_id,
                     delta=bounded(delta),
                     kind=stream_kind,
@@ -886,19 +886,19 @@ class _Client:
             usage = event.data.get("usage")
             if foreground and isinstance(usage, Mapping) and usage:
                 state.usage.update(usage)
-                await self._notify("usage", session_id, usage=dict(usage))
+                await self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.USAGE], session_id, usage=dict(usage))
             if event.message is not None:
                 wire_message = event.message.to_dict()
                 # Codex keeps encrypted replay items in assistant metadata.
                 # They are server-only and may contain raw reasoning text.
                 wire_message.pop("metadata", None)
                 await self._notify(
-                    "assistant_message", session_id, message=wire_message
+                    wire_event, session_id, message=wire_message
                 )
             return
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
             await self._notify(
-                "tool_output",
+                wire_event,
                 session_id,
                 tool_call=_tool_call(event),
                 output=bounded(event.delta or _data_text(event.data)),
@@ -909,7 +909,7 @@ class _Client:
             if foreground:
                 state.tool_started()
             await self._notify(
-                "tool_start",
+                wire_event,
                 session_id,
                 tool_call=_tool_call(event),
                 data=dict(event.data),
@@ -919,7 +919,7 @@ class _Client:
             if foreground:
                 state.tool_finished()
             await self._notify(
-                "tool_end",
+                wire_event,
                 session_id,
                 tool_call=_tool_call(event),
                 tool_result=(
@@ -963,7 +963,7 @@ class _Client:
                 # harness-owned execution facts.  Never offer an approval based
                 # only on the provider-controlled ToolCall.
                 await self._notify(
-                    "error",
+                    event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
                     session_id,
                     error={
                         "code": "approval_context_missing",
@@ -973,7 +973,7 @@ class _Client:
                 )
                 return
             await self._notify(
-                "approval_request",
+                wire_event,
                 session_id,
                 **self._approvals.observe(request),
                 **_approval_display_fields(request),
@@ -981,8 +981,8 @@ class _Client:
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
             notification = dict(event.data)
-            event_name = NOTIFICATION_WIRE_EVENTS.get(
-                notification.get("kind", "agent_completion"), "sub_agent_receipt"
+            event_name = event_contract.notification_wire_event(
+                notification.get("kind", "agent_completion"), self.protocol_version
             )
             await self._notify(event_name, session_id, data=notification)
             return
@@ -994,26 +994,26 @@ class _Client:
             login_provider = None
             if (foreground and event.error is not None and event.error.provider_error
                     and (event.error.code == "auth_error" or event.error.status_code == 401)
-                    and self.protocol_version == "1.1"):
+                    and self.protocol_version != "1.0"):
                 login_provider = self.server.runtime.metadata.provider
             if foreground and event.error is not None:
                 recovered = model_selection.recover(self.server.runtime, event.error)
-                if self.protocol_version == "1.1":
+                if self.protocol_version != "1.0":
                     error = recovered
             await self._notify(
-                "error", session_id, error=error, data={**event.data, **({"login_provider": login_provider} if login_provider else {})},
+                wire_event, session_id, error=error, data={**event.data, **({"login_provider": login_provider} if login_provider else {})},
             )
             return
         if kind is StreamEventType.COMPACTION_START:
-            await self._notify("compaction_start", session_id, data=dict(event.data))
+            await self._notify(wire_event, session_id, data=dict(event.data))
             return
         if kind is StreamEventType.COMPACTION_END:
-            await self._notify("compaction_end", session_id, data=dict(event.data))
+            await self._notify(wire_event, session_id, data=dict(event.data))
             return
         if foreground and kind is StreamEventType.AGENT_END:
             state.turn_finished()
         await self._notify(
-            STREAM_EVENT_WIRE_EVENTS[kind], session_id, data=dict(event.data)
+            wire_event, session_id, data=dict(event.data)
         )
 
     def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
@@ -1028,7 +1028,7 @@ class _Client:
         """Publish updates only when the client negotiated the optional feature."""
         if not self._closed and "memory_updated" in self.features:
             asyncio.create_task(
-                self._notify("memory_updated", session_id, message=message)
+                self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.MEMORY_UPDATED], session_id, message=message)
             )
 
     async def _notify(
@@ -1063,7 +1063,7 @@ class _Client:
             {**item.to_dict(), "first_message_preview": previews.get(item.session_id, "")}
             for item in metadata
         ]
-        if self.protocol_version != "1.1":
+        if self.protocol_version == "1.0":
             for item in sessions:
                 item.pop("name", None)
         page: list[dict[str, Any]] = []
@@ -1096,7 +1096,8 @@ class _Client:
         if payload is None:
             return
         try:
-            await self._notify("approval_end", session_id, **payload)
+            event = event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.TOOL_APPROVAL_END]
+            await self._notify(event, session_id, **payload)
         except (ConnectionError, OSError):
             if not suppress_write_errors:
                 raise

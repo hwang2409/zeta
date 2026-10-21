@@ -171,6 +171,7 @@ def validate_task_exited_notification_data(data: Mapping[str, Any]) -> None:
         or type(data.get("headline")) is not str
         or not data["headline"]
         or type(data.get("exit_code")) not in {int, type(None)}
+        or type(data.get("output_tail", "")) is not str
     ):
         raise ValueError("invalid task notification")
 
