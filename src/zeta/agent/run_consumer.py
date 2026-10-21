@@ -185,6 +185,7 @@ async def consume_run(
             if pending:
                 current_entry = pending[0]
                 kwargs["delivering_prompt_id"] = current_entry.id
+                child_loop._delivering_prompt_id = current_entry.id
                 _transition_running(child_loop, child_store)
                 result = await consume_child(
                     child_loop,
@@ -195,6 +196,7 @@ async def consume_run(
                 idle_published = False
                 continue
             kwargs["delivering_prompt_id"] = None
+            child_loop._delivering_prompt_id = None
             if child_loop.notification_wake.pending_message() is not None:
                 _transition_running(child_loop, child_store)
                 result = await consume_child(

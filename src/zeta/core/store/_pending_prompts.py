@@ -101,6 +101,7 @@ class PendingPromptQueue:
         report: dict[str, object],
         *,
         persisted_notification_ids: frozenset[str] = frozenset(),
+        delivering_prompt_id: str | None = None,
     ) -> str | None:
         """Atomically close admission and persist one accepted finish report."""
         with self._store._append_lock():
@@ -112,7 +113,9 @@ class PendingPromptQueue:
                     if transition.data["action"] == "finish"
                     else "child is canceled"
                 )
-            if self._pending_unlocked():
+            if any(
+                entry.id != delivering_prompt_id for entry in self._pending_unlocked()
+            ):
                 return "pending follow-up must be read before finish"
             pending_notifications = [
                 entry
