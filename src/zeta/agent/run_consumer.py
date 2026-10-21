@@ -10,7 +10,7 @@ from ..core.checkpoints import _now
 from ..core.store import ConversationStore
 from ..protocol.types import MessageOrigin
 from ..tools.agent import agent_stats
-from .explicit_finish import kill_tasks_after_deadline
+from .explicit_finish import IdleNudgeLifecycle, kill_tasks_after_deadline
 from .finish_gate import FinishGateState
 from .receipt import (
     MAX_AGENT_RESULT_BYTES,
@@ -23,26 +23,10 @@ if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
 
 
-_IDLE_NUDGE_SECONDS = 10 * 60
-_IDLE_NUDGE_LIMIT = 3
 _IDLE_NUDGE_PROMPT = (
     "you have been idle for 10 minutes. call `finish` if the contract is complete, "
     "call `ask_parent` if you are waiting on a decision, or continue the work."
 )
-
-
-async def _wait_for_idle_wake(
-    wait: Callable[[], Awaitable[None]], timeout: float | None
-) -> bool:
-    """Return true for an external wake and false for the nudge deadline."""
-    if timeout is None:
-        await wait()
-        return True
-    try:
-        await asyncio.wait_for(wait(), timeout=max(0.0, timeout))
-    except TimeoutError:
-        return False
-    return True
 
 
 def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -> None:
@@ -144,9 +128,11 @@ async def consume_run(
     finish_lifecycle = kwargs.get("finish_lifecycle")
     child_turns = kwargs.get("child_turns")
     final_finish_lifecycle = finish_lifecycle
-    idle_clock = kwargs.pop("idle_clock", None) or asyncio.get_running_loop().time
-    idle_wait = kwargs.pop("idle_wait", None) or _wait_for_idle_wake
-    idle_nudge_seconds = kwargs.pop("idle_nudge_seconds", _IDLE_NUDGE_SECONDS)
+    idle_lifecycle = IdleNudgeLifecycle(
+        clock=kwargs.pop("idle_clock", None) or asyncio.get_running_loop().time,
+        wait=kwargs.pop("idle_wait", None),
+        nudge_seconds=kwargs.pop("idle_nudge_seconds", None),
+    )
 
     def keep_lifecycle_running(state: str, text: str) -> dict[str, object]:
         if not callable(child_turns):
@@ -169,9 +155,7 @@ async def consume_run(
     kwargs["record_report"] = segment_reports.append
     kwargs["finish_gate_state"] = FinishGateState()
 
-    idle_started: float | None = None
     safety_started: float | None = None
-    idle_nudges = 0
     idle_published = False
     safety_task: asyncio.Task[tuple[str, ...]] | None = None
     try:
@@ -258,31 +242,13 @@ async def consume_run(
                             child_loop.tool_registry.background_tasks, timeout
                         )
                     )
-                fence = getattr(child_loop, "_terminal_transition_fence", None)
-                eligible = (
-                    await fence.idle_nudge_eligible()
-                    if fence is not None
-                    else not running_tasks
-                )
-                if eligible and idle_nudges < _IDLE_NUDGE_LIMIT:
-                    now = idle_clock()
-                    if idle_started is None:
-                        idle_started = now
-                    remaining = idle_nudge_seconds - (now - idle_started)
-                else:
-                    idle_started = None
-                    remaining = None
-                external_wake = await idle_wait(
+                action = await idle_lifecycle.wait_for_idle_action(
                     lambda: child_loop._background_owner.conversation_channel.wait(
                         child_loop.agent_instance_id
                     ),
-                    remaining,
+                    child_loop._terminal_transition_fence,
                 )
-                if external_wake:
-                    idle_started = None
-                    continue
-                if fence is not None and not await fence.idle_nudge_eligible():
-                    idle_started = None
+                if action == "external_input":
                     continue
                 _transition_running(child_loop, child_store)
                 result = await consume_child(
@@ -291,8 +257,6 @@ async def consume_run(
                     origin=MessageOrigin.AGENT_PROMPT,
                     **kwargs,
                 )
-                idle_nudges += 1
-                idle_started = None
                 idle_published = False
                 continue
             pending = child_store.close_pending_queue_if_empty()
