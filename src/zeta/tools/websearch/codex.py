@@ -21,7 +21,6 @@ from ...codex import (
     codex_request_headers,
 )
 from ...core.abort import AbortSignal
-from ...providers.factory import credential_store
 
 CODEX_SEARCH_MODEL = DEFAULT_CODEX_MODEL
 CODEX_SEARCH_TIMEOUT = 120.0
@@ -116,6 +115,9 @@ def _start_credential_task(
 
 
 async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
+    # Keep provider imports out of the web-search import path.
+    from ...providers.factory import credential_store
+
     store = credential_store("codex")
     assert store is not None
     timeout = httpx.Timeout(CODEX_SEARCH_TIMEOUT)

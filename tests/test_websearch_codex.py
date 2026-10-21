@@ -50,7 +50,7 @@ def install_codex_transport(
         kwargs["transport"] = httpx.MockTransport(handler)
         return _REAL_ASYNC_CLIENT(*args, **kwargs)
 
-    monkeypatch.setattr(codex.CodexCredentialStore, "access_token", access_token)
+    monkeypatch.setattr(codex.AccountCredentials, "access_token", access_token)
     if hasattr(codex, "codex_request_headers"):
         monkeypatch.setattr(codex, "codex_request_headers", lambda _token: {})
     else:
@@ -465,7 +465,7 @@ async def test_codex_deadline_covers_credential_acquisition(monkeypatch, registr
         await asyncio.sleep(0.05)
         return "test-token"
 
-    monkeypatch.setattr(codex.CodexCredentialStore, "access_token", slow_access_token)
+    monkeypatch.setattr(codex.AccountCredentials, "access_token", slow_access_token)
     monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.001)
     calls = install_ddg_result(monkeypatch)
 
@@ -498,7 +498,7 @@ async def test_concurrent_searches_share_one_credential_acquisition(
             if active_acquisitions == 0:
                 acquisitions_finished.set()
 
-    monkeypatch.setattr(codex.CodexCredentialStore, "access_token", slow_access_token)
+    monkeypatch.setattr(codex.AccountCredentials, "access_token", slow_access_token)
     monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.01)
     ddg_calls = install_ddg_result(monkeypatch)
 
@@ -539,7 +539,7 @@ async def test_inflight_acquisition_cleared_after_completion(monkeypatch, regist
             first_finished.set()
         return "test-token"
 
-    monkeypatch.setattr(codex.CodexCredentialStore, "access_token", access_token)
+    monkeypatch.setattr(codex.AccountCredentials, "access_token", access_token)
     monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.001)
     install_ddg_result(monkeypatch)
 
@@ -574,7 +574,7 @@ async def test_codex_deadline_does_not_cancel_token_refresh(monkeypatch, registr
             refresh_cancelled = True
             raise
 
-    monkeypatch.setattr(codex.CodexCredentialStore, "access_token", slow_access_token)
+    monkeypatch.setattr(codex.AccountCredentials, "access_token", slow_access_token)
     monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.001)
     install_ddg_result(monkeypatch)
 
@@ -608,7 +608,7 @@ async def test_codex_user_abort_during_credential_acquisition_no_fallback(
             refresh_cancelled = True
             raise
 
-    monkeypatch.setattr(codex.CodexCredentialStore, "access_token", slow_access_token)
+    monkeypatch.setattr(codex.AccountCredentials, "access_token", slow_access_token)
     calls = install_ddg_result(monkeypatch)
     task = asyncio.create_task(
         websearch._websearch(registry, {"query": "zeta"}, AbortSignal())
