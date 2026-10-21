@@ -1128,13 +1128,14 @@ def _compose_child_system_prompt(
 
     composed = compose_system_prompt(system_prompt, preset.preamble)
     body = load_agent(preset)
-    additions = [text for text in (body, _EXPLICIT_FINISH_GUIDANCE if explicit_finish else "") if text]
-    if not additions:
+    if explicit_finish:
+        body = f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}" if body else _EXPLICIT_FINISH_GUIDANCE
+    if not body:
         return composed
     if isinstance(composed, Message):
         return Message(
             MessageRole.SYSTEM,
-            [*composed.content, *(TextContent(text) for text in additions)],
+            [*composed.content, TextContent(body)],
             metadata=dict(composed.metadata),
         )
-    return composed + "\n\n" + "\n\n".join(additions)
+    return composed + "\n\n" + body
