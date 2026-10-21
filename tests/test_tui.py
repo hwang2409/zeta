@@ -56,6 +56,7 @@ from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
+from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.diagnostics import tui_stalls as tui_stalls_module
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.providers.anthropic import (
@@ -68,7 +69,7 @@ from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop import persistence as persistence_module
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
-from zeta.tools import ToolStreamPublisher
+from zeta.tools import ToolRegistry, ToolStreamPublisher
 from zeta.tools._shared.process import BackgroundTaskShutdownNotice
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
@@ -116,6 +117,7 @@ from zeta.tui import theme
 from zeta.tui.bootstrap import surface_shutdown_notifications
 from zeta.tui.cards import markdown as markdown_module
 from zeta.tui.cards.base import compact_tool_card, failure_status
+from zeta.tui.cards.tool import TOOL_CARD_REGISTRY
 from zeta.tui.layout import (
     QueuedPanel,
     composer_content_width,
@@ -125,11 +127,15 @@ from zeta.tui.layout import (
     queued_panel,
 )
 from zeta.tui.render import (
+    STREAM_EVENTS_HANDLED_ELSEWHERE,
+    STREAM_EVENTS_HIDDEN,
+    STREAM_EVENTS_RENDERED,
     _render_tool_output,
     format_status,
     format_thought,
     infer_language,
     is_retryable_error,
+    render_agent_notification,
     render_agent_progress,
     render_agent_receipt,
     render_code,
@@ -1298,6 +1304,320 @@ def terminal_plain(renderable: object) -> str:
     output = StringIO()
     _test_console(output).print(renderable)
     return Text.from_ansi(output.getvalue()).plain.removesuffix("\n")
+
+
+def _notification_payloads() -> dict[str, dict[str, object]]:
+    return {
+        "agent_completion": {
+            "origin": "notification",
+            "kind": "agent_completion",
+            "child_instance_id": "root:1",
+            "child_session_path": "/sessions/root/agents/1",
+            "description": "worker",
+            "status": "completed",
+            "text": "done",
+        },
+        "child_idle": {
+            "origin": "notification",
+            "kind": "child_idle",
+            "child_instance_id": "root:1",
+            "child_session_path": "/sessions/root/agents/1",
+            "description": "worker",
+            "status": "child_idle",
+            "text": "waiting",
+        },
+        "task_exited": {
+            "origin": "notification",
+            "kind": "task_exited",
+            "task_id": "task-1",
+            "headline": "command finished",
+            "exit_code": 0,
+        },
+        "project_inbox": {
+            "origin": "notification",
+            "kind": "project_inbox",
+            "status": "new",
+            "project_id": "project-1",
+            "message_ids": ["message-1"],
+            "text": "new project message",
+        },
+        "child_question": {
+            "origin": "notification",
+            "kind": "child_question",
+            "child_instance_id": "root:1",
+            "question_id": "question-1",
+            "description": "worker",
+            "status": "pending",
+            "question": "continue?",
+            "text": "worker asks a question",
+        },
+        "child_question_withdrawn": {
+            "origin": "notification",
+            "kind": "child_question_withdrawn",
+            "child_instance_id": "root:1",
+            "question_id": "question-1",
+            "description": "worker",
+            "status": "withdrawn",
+            "text": "question withdrawn",
+        },
+    }
+
+
+def test_every_durable_notification_kind_has_non_error_rendering() -> None:
+    payloads = _notification_payloads()
+
+    assert set(payloads) == set(NOTIFICATION_KINDS)
+    for kind in NOTIFICATION_KINDS:
+        event = StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=payloads[kind])
+        rendered = render_agent_notification(event)
+        assert rendered is not None, kind
+        assert "unavailable" not in renderable_plain(rendered).lower(), kind
+        assert render_event(event) is not None, kind
+
+
+def _tool_contract_events(name: str) -> tuple[StreamEvent, StreamEvent, StreamEvent]:
+    call = ToolCall(
+        f"{name}-1",
+        name,
+        {
+            "path": "sample.txt",
+            "command": "printf sample",
+            "content": "sample",
+            "items": [],
+            "name": "sample",
+            "query": "sample",
+            "prompt": "sample",
+            "description": f"{name} sample",
+        },
+    )
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    success = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "contract result"),
+    )
+    error = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "contract error", is_error=True),
+    )
+    return start, success, error
+
+
+def _assert_tool_contract(name: str) -> None:
+    start, success, error = _tool_contract_events(name)
+    rendered = [render_event(event) for event in (start, success, error)]
+    assert all(item is not None for item in rendered), name
+    plain = [terminal_plain(item).lower() for item in rendered]
+    assert name.lower() in plain[0], name
+    assert "sample" in plain[0], name
+    assert "contract result" in plain[1] or name.lower() in plain[1], name
+    assert "contract error" in plain[2], name
+    assert any(marker in plain[2] for marker in ("error", "failed", "denied")), name
+
+
+@pytest.mark.asyncio
+async def test_default_registered_tools_render_start_and_end(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        assert registry.registered_names
+        for name in registry.registered_names:
+            _assert_tool_contract(name)
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> None:
+    from zeta.agent.explicit_finish import register_handoff
+    from zeta.runtime.unattended import build_unattended_loop
+    from zeta.tools.ask_parent import register_ask_parent
+    from zeta.tools.finish import register as register_finish
+    from zeta.tools.resolve_attention import register_fork
+
+    stores = [
+        ConversationStore(tmp_path, session_id=f"tool-contract-{index}")
+        for index in range(5)
+    ]
+    top_level = ToolRegistry(
+        tmp_path,
+        session_store=stores[0],
+        skill_catalog=SkillCatalog.empty(),
+        project_id="project-1",
+        project_registry=SimpleNamespace(),
+    )
+    foreground_child = top_level.clone_for_session(
+        stores[1],
+        exclude_names={"inbox", "request_attention", "resolve_attention"},
+    )
+    background_child = top_level.clone_for_session(
+        stores[2],
+        exclude_names={"inbox", "request_attention", "resolve_attention"},
+    )
+    register_ask_parent(
+        background_child,
+        channel=SimpleNamespace(publish_question=lambda **_kwargs: None),
+        child_instance_id="root:1",
+    )
+    explicit_child = top_level.clone_for_session(
+        stores[3],
+        exclude_names={"inbox", "request_attention", "resolve_attention"},
+    )
+    register_ask_parent(
+        explicit_child,
+        channel=SimpleNamespace(publish_question=lambda **_kwargs: None),
+        child_instance_id="root:2",
+    )
+    child_loop = SimpleNamespace(
+        tool_registry=explicit_child,
+        store=stores[3],
+        notification_wake=SimpleNamespace(
+            pending_message=lambda: None,
+            has_undelivered_claim=False,
+            persisted_ids=frozenset(),
+        ),
+        _background_owner=SimpleNamespace(),
+        agent_instance_id="root:2",
+        _explicit_finish_report=None,
+    )
+    register_finish(explicit_child, child_loop=child_loop)
+    register_handoff(child_loop)
+    attention_fork = ToolRegistry(
+        tmp_path,
+        session_store=stores[4],
+        skill_catalog=SkillCatalog.empty(),
+    )
+    attention_fork.unregister("request_attention")
+    register_fork(attention_fork)
+    automation_session = SessionManager(tmp_path / "automation").create(
+        provider="codex",
+        model="fake",
+        cwd=tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        system_prompt="system",
+    )
+    automation_loop = build_unattended_loop(
+        automation_session,
+        home=tmp_path / "automation",
+        allow=(),
+        backend=FakeBackend([]),
+    )
+    registries = {
+        "top-level": top_level,
+        "serve": top_level,
+        "foreground child": foreground_child,
+        "background child": background_child,
+        "background child with explicit finish": explicit_child,
+        "attention fork": attention_fork,
+        "automation": automation_loop.tool_registry,
+    }
+    try:
+        runtime_names = set().union(
+            *(registry.registered_names for registry in registries.values())
+        )
+        for mode, registry in registries.items():
+            assert registry.registered_names, mode
+            for name in registry.registered_names:
+                _assert_tool_contract(name)
+
+        source_names: set[str] = set()
+        source_root = Path(__file__).parents[1] / "src" / "zeta"
+        for path in source_root.rglob("*.py"):
+            if "tests" in path.parts:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"register", "register_session_tool"}
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                ):
+                    source_names.add(node.args[0].value)
+        assert source_names <= runtime_names
+    finally:
+        for registry in set(registries.values()) - {automation_loop.tool_registry}:
+            await registry.close()
+        await automation_loop.close()
+        automation_session.store.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_card_registry_only_names_real_or_supported_alias_tools(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        assert set(TOOL_CARD_REGISTRY) <= registry.registered_names | {"exec"}
+    finally:
+        await registry.close()
+
+
+def test_generic_tool_card_surfaces_structured_only_result() -> None:
+    call = ToolCall("future-1", "future_tool", {"query": "sample"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "",
+                structured_content={"answer": "structured result"},
+            ),
+        )
+    )
+
+    assert rendered is not None
+    assert '"answer":"structured result"' in terminal_plain(rendered)
+
+
+def test_every_stream_event_has_one_tui_owner() -> None:
+    owners = (
+        STREAM_EVENTS_RENDERED,
+        STREAM_EVENTS_HANDLED_ELSEWHERE,
+        STREAM_EVENTS_HIDDEN,
+    )
+
+    assert set().union(*owners) == set(StreamEventType)
+    assert sum(len(owner) for owner in owners) == len(set(StreamEventType))
+
+
+def test_scrollback_stream_events_render() -> None:
+    call = ToolCall("contract-1", "future_tool", {"query": "sample"})
+    fixtures = {
+        StreamEventType.MESSAGE_END: StreamEvent(
+            StreamEventType.MESSAGE_END, data={"truncated": True}
+        ),
+        StreamEventType.RETRY: StreamEvent(
+            StreamEventType.RETRY, data={"text": "retrying"}
+        ),
+        StreamEventType.AGENT_NOTIFICATION: StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data=_notification_payloads()["agent_completion"],
+        ),
+        StreamEventType.TOOL_EXECUTION_START: StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START, tool_call=call
+        ),
+        StreamEventType.TOOL_EXECUTION_UPDATE: StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE, delta="output"
+        ),
+        StreamEventType.TOOL_EXECUTION_END: StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "done"),
+        ),
+        StreamEventType.ERROR: StreamEvent(
+            StreamEventType.ERROR, error=ErrorInfo("backend_error", "failed")
+        ),
+    }
+
+    assert set(fixtures) == set(STREAM_EVENTS_RENDERED)
+    for kind in STREAM_EVENTS_RENDERED:
+        rendered = render_event(fixtures[kind])
+        assert rendered is not None, kind
+        assert "unavailable" not in terminal_plain(rendered).lower(), kind
 
 
 def test_render_event_compacts_tool_call_and_result() -> None:

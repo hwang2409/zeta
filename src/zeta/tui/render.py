@@ -521,6 +521,33 @@ def _notification_stats(data: dict[str, Any]) -> list[str]:
     return parts
 
 
+# Every stream event is owned by scrollback, another TUI component, or is hidden
+# by design. Keep this exhaustive when adding a StreamEventType member.
+STREAM_EVENTS_RENDERED = frozenset({
+    StreamEventType.MESSAGE_END,
+    StreamEventType.RETRY,
+    StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.TOOL_EXECUTION_START,
+    StreamEventType.TOOL_EXECUTION_UPDATE,
+    StreamEventType.TOOL_EXECUTION_END,
+    StreamEventType.ERROR,
+})
+STREAM_EVENTS_HANDLED_ELSEWHERE = frozenset({
+    StreamEventType.AGENT_START,
+    StreamEventType.TURN_START,
+    StreamEventType.COMPACTION_START,
+    StreamEventType.COMPACTION_END,
+    StreamEventType.MESSAGE_START,
+    StreamEventType.MESSAGE_UPDATE,
+    StreamEventType.TOOL_APPROVAL_START,
+    StreamEventType.TOOL_APPROVAL_END,
+    StreamEventType.ASSISTANT_RESET,
+    StreamEventType.TURN_END,
+    StreamEventType.AGENT_END,
+})
+STREAM_EVENTS_HIDDEN = frozenset()
+
+
 def render_agent_notification(event: StreamEvent) -> Text | None:
     """Render durable notifications unless a tool card or prior TUI owns them."""
     if event.data.get("tui_presented") is True:

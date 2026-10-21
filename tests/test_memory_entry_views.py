@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import io
 import json
 from pathlib import Path
@@ -26,6 +27,7 @@ from zeta.project_memory_history import _MEMORY_MIRROR_HEADER
 from zeta.project_registry import ProjectRegistry
 from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
+from zeta.tools._validation import validate_tool_result
 from zeta.tools.project import _inspect_project
 
 
@@ -128,6 +130,19 @@ async def test_project_inspect_reads_fixture_format_two_state(tmp_path: Path) ->
     assert memory["format"] == 2
     assert memory["entries"][0]["id"] == state_id
     assert memory["entries"][0]["text"] == "Automatic state"
+
+
+def test_project_inspect_v2_memory_is_json_shaped(tmp_path: Path) -> None:
+    _, registry, project_id, _, _ = _fixture(tmp_path)
+    project = registry.show_project(project_id)
+    tool_registry = SimpleNamespace(
+        project_registry=registry,
+        project_id=project_id,
+        cwd=Path(project.canonical_integration_root),
+    )
+    result = asyncio.run(_inspect_project(tool_registry, {"action": "inspect"}))
+    validate_tool_result(result)
+    json.dumps(result["structuredContent"])
 
 
 def test_resolve_command_is_atomic_and_undo_restores_batch(tmp_path: Path) -> None:
