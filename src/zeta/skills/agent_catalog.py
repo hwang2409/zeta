@@ -238,6 +238,7 @@ def _build_agent(
         selection_guidance=description,
         model=model if isinstance(model, str) else None,
         path=document.entry_path.absolute(),
+        source=source,
         agents_root=document.root,
         allow_delegation=allow_delegation,
         accepts_follow_ups=accepts_follow_ups,
