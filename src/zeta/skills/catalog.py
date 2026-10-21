@@ -134,7 +134,8 @@ class SkillCatalog:
                     description=description,
                     keywords=keywords,
                     path=Path(path),
-                                skills_root=Path(skills_root),
+                    source=source,
+                    skills_root=Path(skills_root),
                 )
             )
         return cls(tuple(skills))
