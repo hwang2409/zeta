@@ -426,6 +426,11 @@ async def _build_child_loop(
                 {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
             )
 
+        explicit_finish = explicit_finish_eligible(
+            global_enabled=loop.explicit_finish,
+            preset=preset,
+            background=follow_up_loop,
+        )
         child_loop = AgentLoop(
             child_backend,
             child_store,
@@ -439,6 +444,7 @@ async def _build_child_loop(
                     _child_base_system_prompt, loop, cwd_override, child_registry
                 ),
                 preset,
+                explicit_finish=explicit_finish,
             ),
             agent_catalog=child_registry.agent_catalog,
             skip_mcp_mount=True,
@@ -450,11 +456,7 @@ async def _build_child_loop(
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
         )
-        child_loop.explicit_finish = explicit_finish_eligible(
-            global_enabled=loop.explicit_finish,
-            preset=preset,
-            background=follow_up_loop,
-        )
+        child_loop.explicit_finish = explicit_finish
         child_loop.one_shot = getattr(loop, "one_shot", False)
         if child_loop.explicit_finish:
             register_finish(child_registry, child_loop=child_loop)
@@ -1107,19 +1109,32 @@ def _child_base_system_prompt(
     return context.system_prompt
 
 
+_EXPLICIT_FINISH_GUIDANCE = (
+    "With explicit finish enabled, this run ends only when you call the `finish` "
+    "tool with `status` and `summary` (plus `verdict` and `head_sha` when they "
+    "apply). Ending a turn without calling `finish` leaves you idle for "
+    "follow-ups; call it when the contract's exit criteria are met or when you "
+    "are blocked."
+)
+
+
 def _compose_child_system_prompt(
-    system_prompt: str | Message, preset: AgentPreset
+    system_prompt: str | Message,
+    preset: AgentPreset,
+    *,
+    explicit_finish: bool = False,
 ) -> str | Message:
     """Apply the preset preamble and custom body to the child prompt."""
 
     composed = compose_system_prompt(system_prompt, preset.preamble)
     body = load_agent(preset)
-    if not body:
+    additions = [text for text in (body, _EXPLICIT_FINISH_GUIDANCE if explicit_finish else "") if text]
+    if not additions:
         return composed
     if isinstance(composed, Message):
         return Message(
             MessageRole.SYSTEM,
-            [*composed.content, TextContent(body)],
+            [*composed.content, *(TextContent(text) for text in additions)],
             metadata=dict(composed.metadata),
         )
-    return f"{composed}\n\n{body}"
+    return composed + "\n\n" + "\n\n".join(additions)

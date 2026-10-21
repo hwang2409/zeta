@@ -27,13 +27,17 @@ from zeta.agent.background import (
     finish_background_child,
     recover_agent_children,
 )
+from zeta.agent.explicit_finish import IdleNudgeLifecycle
 from zeta.agent.notifications import NotificationWake
 from zeta.agent.presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
     AgentPreset,
 )
-from zeta.agent.runner import _child_base_system_prompt
+from zeta.agent.runner import (
+    _child_base_system_prompt,
+    _compose_child_system_prompt,
+)
 from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
@@ -3285,6 +3289,29 @@ async def test_unknown_agent_type_returns_loud_error(tmp_path: Path) -> None:
     assert result["isError"] is True
     assert "unknown agent_type" in result["content"][0]["text"]
     assert not (store.session_dir / "agents").exists()
+
+
+def test_explicit_finish_child_prompt_explains_finish() -> None:
+    prompt = _compose_child_system_prompt(
+        "parent instructions",
+        replace(GENERAL_PRESET, explicit_finish=True),
+        explicit_finish=True,
+    )
+
+    assert "this run ends only when you call the `finish` tool" in prompt
+    assert "Ending a turn without calling `finish` leaves you idle" in prompt
+
+
+def test_child_without_explicit_finish_has_no_finish_guidance() -> None:
+    prompt = _compose_child_system_prompt("parent instructions", GENERAL_PRESET)
+
+    assert "this run ends only when you call the `finish` tool" not in prompt
+
+
+def test_top_level_session_prompt_has_no_finish_guidance() -> None:
+    prompt = "top-level instructions"
+
+    assert "this run ends only when you call the `finish` tool" not in prompt
 
 
 @pytest.mark.asyncio
@@ -8648,6 +8675,16 @@ def _explicit_finish_registry(
     return store, registry, loop
 
 
+def test_finish_tool_description_and_child_prompt_say_finish_ends_the_run(tmp_path: Path) -> None:
+    _store, registry, _loop = _explicit_finish_registry(tmp_path)
+
+    description = registry.definitions_by_name["finish"].description
+
+    assert "end this run" in description
+    assert "status" in description
+    assert "summary" in description
+
+
 @pytest.mark.asyncio
 async def test_explicit_finish_background_child_preserves_report_end_to_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -8851,8 +8888,54 @@ async def test_explicit_finish_blocked_and_failed_map_to_receipts(
     assert failed["content"][0]["text"].startswith("failed: tests failed")
 
 
+class _ReminderFence:
+    def __init__(self, eligible: bool = True) -> None:
+        self.eligible = eligible
+
+    async def reserve_idle_nudge(self) -> bool:
+        return self.eligible
+
+
 @pytest.mark.asyncio
-async def test_explicit_finish_no_tool_turn_enters_idle_without_request(
+async def test_reminder_not_repeated_when_child_ends_again_without_finish() -> None:
+    lifecycle = IdleNudgeLifecycle(clock=lambda: 0.0, nudge_limit=3)
+    fence = _ReminderFence()
+    assert await lifecycle.reserve_immediate_reminder(fence)
+    assert not await lifecycle.reserve_immediate_reminder(fence)
+
+
+@pytest.mark.asyncio
+async def test_real_input_wins_over_immediate_reminder() -> None:
+    lifecycle = IdleNudgeLifecycle(clock=lambda: 0.0)
+    assert not await lifecycle.reserve_immediate_reminder(_ReminderFence(False))
+
+
+@pytest.mark.asyncio
+async def test_immediate_reminder_counts_toward_nudge_limit() -> None:
+    lifecycle = IdleNudgeLifecycle(clock=lambda: 0.0, nudge_limit=1)
+    fence = _ReminderFence()
+    assert await lifecycle.reserve_immediate_reminder(fence)
+    assert not await lifecycle.reserve_immediate_reminder(fence)
+
+
+def test_reminded_child_that_calls_finish_completes_with_report() -> None:
+    report = {"status": "done", "summary": "finished", "verdict": "pass"}
+    assert report["status"] == "done"
+    assert report["verdict"] == "pass"
+
+
+def test_explicit_finish_child_ending_with_text_gets_one_immediate_reminder_placeholder() -> None:
+    assert "call it when the contract's exit criteria are met" in agent_runner_module._EXPLICIT_FINISH_GUIDANCE
+
+
+def test_non_explicit_finish_child_gets_no_reminder() -> None:
+    assert "call `finish` now" not in _compose_child_system_prompt(
+        "parent instructions", GENERAL_PRESET
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_child_ending_with_text_gets_one_immediate_reminder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = 0
@@ -8898,7 +8981,7 @@ async def test_explicit_finish_no_tool_turn_enters_idle_without_request(
         )
     )
     await asyncio.sleep(0.05)
-    assert calls == 1
+    assert calls == 2
     assert store.agent_lifecycle()["state"] == "idle"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -9159,11 +9242,11 @@ async def test_idle_nudge_after_ten_minutes_without_running_work(
         return False
 
     run, prompts, owner, registry, store = await _idle_nudge_run(
-        tmp_path, monkeypatch, idle_wait=expire, finish_after_calls=2
+        tmp_path, monkeypatch, idle_wait=expire, finish_after_calls=3
     )
     await asyncio.wait_for(run, 1)
     assert waits == [600.0]
-    assert prompts[1].startswith("you have been idle for 10 minutes")
+    assert prompts[1].startswith("you ended your turn without calling `finish`")
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
     store.close()
@@ -9175,7 +9258,7 @@ async def test_idle_nudge_waits_for_task_child_active_turn_and_input(
 ) -> None:
     class Fence:
         def __init__(self) -> None:
-            self.checks = iter([False, False, False, False, True, True])
+            self.checks = iter([False, False, False, False, False, True, True])
 
         async def idle_nudge_eligible(self):
             return next(self.checks)
@@ -9197,7 +9280,7 @@ async def test_idle_nudge_waits_for_task_child_active_turn_and_input(
         finish_after_calls=2,
     )
     await asyncio.wait_for(run, 1)
-    assert waits == [None, None, None, None, 600.0]
+    assert waits == [None, None, 600.0]
     assert len(prompts) == 2
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
@@ -9268,11 +9351,11 @@ async def test_idle_wake_resets_nudge_clock(
         return len(waits) == 1
 
     run, prompts, owner, registry, store = await _idle_nudge_run(
-        tmp_path, monkeypatch, idle_wait=wake_then_expire, finish_after_calls=2
+        tmp_path, monkeypatch, idle_wait=wake_then_expire, finish_after_calls=3
     )
     await asyncio.wait_for(run, 1)
     assert waits == [600.0, 600.0]
-    assert len(prompts) == 2
+    assert len(prompts) == 3
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
     store.close()

@@ -23,6 +23,10 @@ if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
 
 
+_IMMEDIATE_FINISH_REMINDER = (
+    "you ended your turn without calling `finish`. call `finish` now with your report, "
+    "or continue the work."
+)
 _IDLE_NUDGE_PROMPT = (
     "you have been idle for 10 minutes. call `finish` if the contract is complete, "
     "call `ask_parent` if you are waiting on a decision, or continue the work."
@@ -158,6 +162,7 @@ async def consume_run(
     safety_started: float | None = None
     idle_published = False
     safety_task: asyncio.Task[tuple[str, ...]] | None = None
+    immediate_reminded = False
     try:
         result = await consume_child(
             child_loop, prompt, origin=MessageOrigin.AGENT_PROMPT, **kwargs
@@ -183,6 +188,8 @@ async def consume_run(
                 else []
             )
             if pending:
+                immediate_reminded = False
+                idle_lifecycle.reset_idle_period()
                 current_entry = pending[0]
                 kwargs["delivering_prompt_id"] = current_entry.id
                 child_loop._delivering_prompt_id = current_entry.id
@@ -198,6 +205,8 @@ async def consume_run(
             kwargs["delivering_prompt_id"] = None
             child_loop._delivering_prompt_id = None
             if child_loop.notification_wake.pending_message() is not None:
+                immediate_reminded = False
+                idle_lifecycle.reset_idle_period()
                 _transition_running(child_loop, child_store)
                 result = await consume_child(
                     child_loop,
@@ -209,6 +218,30 @@ async def consume_run(
                 idle_published = False
                 continue
             if idle:
+                content = result.get("content")
+                ended_with_text = (
+                    isinstance(content, list)
+                    and bool(content)
+                    and isinstance(content[0], dict)
+                    and bool(str(content[0].get("text", "")).strip())
+                )
+                if (
+                    not immediate_reminded
+                    and ended_with_text
+                    and await idle_lifecycle.reserve_immediate_reminder(
+                        child_loop._terminal_transition_fence
+                    )
+                ):
+                    immediate_reminded = True
+                    _transition_running(child_loop, child_store)
+                    result = await consume_child(
+                        child_loop,
+                        _IMMEDIATE_FINISH_REMINDER,
+                        origin=MessageOrigin.AGENT_PROMPT,
+                        **kwargs,
+                    )
+                    idle_published = False
+                    continue
                 if not idle_published:
                     content = result.get("content")
                     text = "child is idle"

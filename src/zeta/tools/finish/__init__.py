@@ -83,7 +83,10 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
     registry.register_session_tool(
         "finish",
         finish,
-        description="Declare that this background agent contract is complete.",
+        description=(
+            "Call finish to end this run and report the contract result with status "
+            "and summary; include verdict and head_sha when they apply."
+        ),
         parameters={
             "type": "object",
             "properties": {
