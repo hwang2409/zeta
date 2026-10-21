@@ -6860,7 +6860,7 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
         f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
         "echo task-evidence"
     )
-    backend = _TaskFinishGateBackend(command, mixed_child=True, gate_delay=0.1)
+    backend = _TaskFinishGateBackend(command, mixed_child=True, gate_delay=1)
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.05)
     loop = AgentLoop(
