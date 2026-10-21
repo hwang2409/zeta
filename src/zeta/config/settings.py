@@ -79,7 +79,6 @@ _TOP_KEYS = frozenset(
         "auto_project",
         "memory",
         "inbox",
-        "eviction_summaries",
         "commands",
         "tools",
         "disallowed_tools",
@@ -103,7 +102,6 @@ _PROJECT_SAFE_KEYS = frozenset(
 )
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
 _INBOX_KEYS = frozenset({"enabled"})
-_EVICTION_SUMMARY_KEYS = frozenset({"enabled"})
 _COMMAND_KEYS = frozenset({"command_niceness"})
 _AGENTS_KEYS = frozenset({"explicit_finish"})
 _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
@@ -128,7 +126,6 @@ class Settings:
     ollama_base_url: str | None = None
     auto_project: bool | None = None
     inbox_enabled: bool | None = None
-    eviction_summaries_enabled: bool | None = None
     agents_explicit_finish: bool | None = None
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
@@ -160,7 +157,6 @@ class ResolvedConfig:
     workspace_snapshot_cap: int | None = None
     auto_project: bool = True
     inbox_enabled: bool = True
-    eviction_summaries_enabled: bool = False
     agents_explicit_finish: bool = False
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
@@ -287,7 +283,6 @@ def resolve(
         workspace_snapshot_cap=settings.workspace_snapshot_cap,
         auto_project=settings.auto_project is not False,
         inbox_enabled=settings.inbox_enabled is not False,
-        eviction_summaries_enabled=settings.eviction_summaries_enabled is True,
         agents_explicit_finish=settings.agents_explicit_finish is True,
         tool_allow=settings.tool_allow if cli_allow is None else cli_allow,
         tool_deny=settings.tool_deny if cli_deny is None else cli_deny,
@@ -499,12 +494,6 @@ def _validate(
     )
     auto_project = _validated_bool(data, "auto_project", notices)
     inbox_enabled = _validated_inbox(data, notices)
-    eviction_table = data.get("eviction_summaries", {})
-    if not isinstance(eviction_table, Mapping) or set(eviction_table) - _EVICTION_SUMMARY_KEYS:
-        raise SettingsError("invalid eviction_summaries settings")
-    eviction_summaries_enabled = eviction_table.get("enabled")
-    if eviction_summaries_enabled is not None and type(eviction_summaries_enabled) is not bool:
-        raise SettingsError("eviction_summaries.enabled must be a boolean")
     agents_table = data.get("agents", {})
     if not isinstance(agents_table, Mapping) or set(agents_table) - _AGENTS_KEYS:
         raise SettingsError("invalid agents settings")
@@ -556,7 +545,6 @@ def _validate(
         ollama_base_url=ollama_base_url,
         auto_project=auto_project,
         inbox_enabled=inbox_enabled,
-        eviction_summaries_enabled=eviction_summaries_enabled,
         agents_explicit_finish=agents_explicit_finish,
         tool_allow=tool_allow,
         tool_deny=tool_deny or (),
