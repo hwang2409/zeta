@@ -9402,11 +9402,16 @@ async def test_explicit_finish_cancel_wins_before_acceptance(tmp_path: Path) -> 
 
     store = ConversationStore(tmp_path)
     fence = TerminalTransitionFence(store)
+    cancel_won = asyncio.Event()
+
+    async def finish_after_cancel() -> str | None:
+        await cancel_won.wait()
+        return await fence.accept_finish({"status": "done", "summary": "late"})
+
+    finish_task = asyncio.create_task(finish_after_cancel())
     assert await fence.cancel() is True
-    assert (
-        await fence.accept_finish({"status": "done", "summary": "late"})
-        == "child is canceled"
-    )
+    cancel_won.set()
+    assert await finish_task == "child is canceled"
 
 
 @pytest.mark.asyncio
@@ -9418,8 +9423,16 @@ async def test_explicit_finish_cancel_after_acceptance_keeps_report(
     store = ConversationStore(tmp_path)
     report = {"status": "blocked", "summary": "need approval"}
     fence = TerminalTransitionFence(store)
-    assert await fence.accept_finish(report) is None
+    finish_accepted = asyncio.Event()
+
+    async def accept_finish() -> None:
+        assert await fence.accept_finish(report) is None
+        finish_accepted.set()
+
+    finish_task = asyncio.create_task(accept_finish())
+    await finish_accepted.wait()
     assert await fence.cancel() is False
+    await finish_task
     assert store.pending_prompt_queue.explicit_finish_report() == report
 
 
