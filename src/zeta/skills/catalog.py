@@ -328,7 +328,8 @@ def discover_skills(
             description=description,
             keywords=keywords,
             path=document.entry_path.absolute(),
-                skills_root=document.root,
+            source=source,
+            skills_root=document.root,
         )
 
     return discover_markdown(
