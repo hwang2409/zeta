@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
+from tests.support.fake_backend import FakeBackend
 from zeta.attention_decisions import DecisionItem, open_decisions
 from zeta.attention_forks import (
     create_discussion_fork,
@@ -12,13 +16,20 @@ from zeta.attention_forks import (
     release_discussion_fork,
 )
 from zeta.attention_records import AttentionStore
+from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
+from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.skills import SkillCatalog
+from zeta.tools.registry import ToolRegistry
+from zeta.tools.resolve_attention import register_fork
 from zeta.tui.agent_card import AgentNavigation
+from zeta.tui.app import TUIApp
 from zeta.tui.cards.decisions import DecisionsPanel
 from zeta.tui.overlay import OverlayControl
 from zeta.tui.render import format_status
+from zeta.tui.slash_handlers.decisions_panel import DecisionsMixin
 
 
 def _plain(lines: list[list[tuple[str, str]]]) -> str:
@@ -66,10 +77,94 @@ def test_status_bar_shows_main_indicator_during_discussion() -> None:
     assert "◆ main" not in hidden
 
 
-# -- scan across live sessions ---------------------------------------------
+# -- session-scoped scan ----------------------------------------------------
 
 
-def test_open_decisions_lists_live_open_items_from_two_sessions(tmp_path: Path) -> None:
+def _decisions_app(home: Path, opened) -> TUIApp:
+    return TUIApp(
+        AgentLoop(
+            FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()
+        ),
+        provider="codex",
+        model="fake",
+        zeta_home=home,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+
+
+@pytest.mark.asyncio
+async def test_decisions_tick_counts_only_current_root_session(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = _session(tmp_path, project.project_id)
+    other = _session(tmp_path, project.project_id)
+    _request(current, project.project_id, "Current", "This one.")
+    _request(other, project.project_id, "Other", "Not this one.")
+
+    app = _decisions_app(tmp_path, current)
+    child = ConversationStore(
+        current.store.session_dir / "agents", session_id="child"
+    )
+    app._agent_navigation.current_path = child.session_dir
+    await app._decisions_tick()
+
+    assert app.decisions_count == 1
+
+    await app.loop.tool_registry.close()
+    child.close()
+    current.store.close()
+    other.store.close()
+
+
+@pytest.mark.asyncio
+async def test_decisions_tick_clears_after_resolve_attention(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = _session(tmp_path, project.project_id)
+    other = _session(tmp_path, project.project_id)
+    _request(other, project.project_id, "Other", "Not this one.")
+    anchor = current.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
+    )
+    record = _request(
+        current,
+        project.project_id,
+        "Current",
+        "This one.",
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+    )
+    app = _decisions_app(tmp_path, current)
+    await app._decisions_tick()
+    assert app.decisions_count == 1
+
+    fork_id = create_discussion_fork(tmp_path, current.store.session_id, record.id)
+    fork = manager.open(fork_id)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=fork.store,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=manager.project_registry,
+        tool_allow=fork.metadata.tool_allow,
+    )
+    register_fork(registry)
+    result = await registry.definitions_by_name["resolve_attention"].handler(
+        {"decision": "Use SQLite."}
+    )
+    assert result["isError"] is False
+
+    await app._decisions_tick()
+    assert app.decisions_count == 0
+
+    await registry.close()
+    fork.store.close()
+    await app.loop.tool_registry.close()
+    current.store.close()
+    other.store.close()
+
+
+def test_open_decisions_lists_live_open_items_for_one_session(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "git")
     first = _session(tmp_path, project.project_id)
@@ -81,19 +176,59 @@ def test_open_decisions_lists_live_open_items_from_two_sessions(tmp_path: Path) 
     )
     _request(second, project.project_id, "Pick region", "Where to deploy.")
 
-    items = open_decisions(tmp_path)
-    titles = {item.record.title for item in items}
-    assert titles == {"Pick DB", "Pick region"}
-    assert {item.session_id for item in items} == {
-        first.store.session_id,
-        second.store.session_id,
-    }
-    assert all(item.project_name == "alpha" for item in items)
+    first_items = open_decisions(tmp_path, first.store.session_id)
+    assert {item.record.title for item in first_items} == {"Pick DB"}
+    assert all(item.project_name == "alpha" for item in first_items)
+
+    second_items = open_decisions(tmp_path, second.store.session_id)
+    assert {item.record.title for item in second_items} == {"Pick region"}
 
     first.store.close()
     second.store.close()
     # A closed (not live) session no longer contributes a pending decision.
-    assert open_decisions(tmp_path) == ()
+    assert open_decisions(tmp_path, first.store.session_id) == ()
+
+
+def test_decisions_slash_lists_only_current_session(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = _session(tmp_path, project.project_id)
+    other = _session(tmp_path, project.project_id)
+    _request(current, project.project_id, "Current", "This one.")
+    _request(other, project.project_id, "Other", "Not this one.")
+
+    app = SimpleNamespace(
+        _home=tmp_path,
+        _decisions_session_id=current.store.session_id,
+        loop=current,
+    )
+    output = DecisionsMixin.slash_decisions(app, "")
+    assert "Current" in output
+    assert "Other" not in output
+    assert current.store.session_id[:8] not in output
+
+    current.store.close()
+    other.store.close()
+
+
+def test_discussion_fork_decisions_use_source_session(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    source = _session(tmp_path, project.project_id)
+    other = _session(tmp_path, project.project_id)
+    record = _request(source, project.project_id, "Source", "Discuss this.")
+    _request(other, project.project_id, "Other", "Not this one.")
+    app = SimpleNamespace(
+        _fork_context=SimpleNamespace(source_session_id=source.store.session_id),
+        loop=SimpleNamespace(store=SimpleNamespace(session_id="fork")),
+    )
+    session_id = DecisionsMixin._decisions_session_id.fget(app)
+    assert session_id == source.store.session_id
+    assert [item.record.title for item in open_decisions(tmp_path, session_id)] == [
+        record.title
+    ]
+    source.store.close()
+    other.store.close()
 
 
 # -- popup rendering --------------------------------------------------------
