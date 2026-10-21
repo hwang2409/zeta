@@ -5062,29 +5062,79 @@ def test_sigint_key_uses_tui_interrupt_binding() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_mount_notice_is_suppressed_after_terminal_restore() -> None:
-    notices: list[str] = []
-    restored = asyncio.Event()
-    sink: Callable[[str], None] | None = notices.append
+async def test_mcp_mount_notice_is_suppressed_after_terminal_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skip_mcp_mount=True,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    notices: list[object] = []
+    app._handle_background_notice = notices.append
 
-    class Loop:
-        def set_mcp_notice_sink(self, value: Callable[[str], None] | None) -> None:
-            nonlocal sink
-            sink = value
+    with create_pipe_input() as pipe:
+        session = _display_session(app, pipe, True)
+        original_restore = session.restore_terminal
 
-    async def mount_finishes_after_restore() -> None:
-        await restored.wait()
-        if sink is not None:
-            sink("late mount notice")
+        def restore_terminal() -> None:
+            original_restore()
+            sink = app.loop._mcp_notice_sink
+            if sink is not None:
+                sink("late mount notice")
 
-    app = object.__new__(TUIApp)
-    app.loop = Loop()
-    mount_task = asyncio.create_task(mount_finishes_after_restore())
-    app._detach_ui_notice_sinks()
-    restored.set()
-    await mount_task
+        monkeypatch.setattr(session, "restore_terminal", restore_terminal)
+        run_task = asyncio.create_task(app.run(session))
+        await wait_until(lambda: app._input_loop_active)
+        pipe.send_text("\\x04")
+        await asyncio.wait_for(run_task, timeout=2)
+
     assert notices == []
 
+
+@pytest.mark.asyncio
+async def test_mcp_notices_suppressed_while_suspended_for_fork_and_rendered_after_resume(
+    tmp_path: Path,
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skip_mcp_mount=True,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    notices: list[object] = []
+    app._handle_background_notice = notices.append
+
+    with create_pipe_input() as pipe:
+        first = _display_session(app, pipe, True)
+        first_task = asyncio.create_task(app.run(first))
+        await wait_until(lambda: app._input_loop_active)
+        app.request_open_fork("discussion")
+        await asyncio.wait_for(first_task, timeout=2)
+        sink = app.loop._mcp_notice_sink
+        assert sink is None
+        if sink is not None:
+            sink("while suspended")
+        assert notices == []
+        app.take_open_fork()
+
+        resumed = _display_session(app, pipe, True)
+        resumed_task = asyncio.create_task(app.run(resumed, resume_ui=True))
+        await wait_until(lambda: app._input_loop_active)
+        assert app.loop._mcp_notice_sink is not None
+        app.loop._mcp_notice_sink("after resume")
+        assert notices == ["after resume"]
+        pipe.send_text("\\x04")
+        await asyncio.wait_for(resumed_task, timeout=2)
 
 def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
     bindings = build_key_bindings(
