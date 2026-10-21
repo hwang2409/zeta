@@ -140,6 +140,50 @@ class ConversationChannel:
         self.wake(child_instance_id)
         return None
 
+    def publish_idle(
+        self,
+        *,
+        child_instance_id: str,
+        child_session_path: str,
+        description: str,
+        text: str,
+    ) -> ConversationEntry | None:
+        """Persist one nonterminal idle notice and wake the direct parent."""
+
+        parent_store, parent_id = self._live_parent(child_instance_id)
+        question_id = next(
+            (
+                entry.data.get("question_id")
+                for entry in reversed(parent_store.agent_notifications())
+                if entry.data.get("kind") == "child_question"
+                and entry.data.get("child_instance_id") == child_instance_id
+            ),
+            None,
+        )
+        notification = self._root_store.append_child_idle_notification(
+            child_instance_id,
+            child_session_path=child_session_path,
+            description=description,
+            text=text,
+            ask_parent_question_id=(
+                question_id if isinstance(question_id, str) else None
+            ),
+            display_only=self._root_store is not parent_store,
+        )
+        if self._root_store is not parent_store:
+            parent_store.append_child_idle_notification(
+                child_instance_id,
+                child_session_path=child_session_path,
+                description=description,
+                text=text,
+                ask_parent_question_id=(
+                    question_id if isinstance(question_id, str) else None
+                ),
+            )
+        if notification is not None:
+            self.wake(parent_id)
+        return notification
+
     def publish_completion(
         self,
         *,

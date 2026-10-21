@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ...agent.explicit_finish import owned_work_descriptions
+from ...agent.terminal_fence import TerminalTransitionFence
 from ..registry import AbortSignal, ToolExecutionContext, ToolRegistry, text_block
 
 _STATUSES = {"done", "blocked", "failed"}
@@ -15,6 +16,17 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
     """Register the finish tool on one eligible child loop."""
     if child_loop is None:
         return
+
+    notification_wake = child_loop.notification_wake
+    fence = TerminalTransitionFence(
+        registry._session_store,
+        notification_pending=lambda: (
+            notification_wake.pending_message() is not None
+            or getattr(notification_wake, "has_claimed", False)
+        ),
+        owned_work=lambda: owned_work_descriptions(child_loop),
+    )
+    child_loop._terminal_transition_fence = fence
 
     registry.set_execution_guard(
         lambda _name: (
@@ -49,19 +61,14 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
             return _error("verdict must be pass, fail, or inconclusive")
         if child_loop._explicit_finish_report is not None:
             return _error("child is finishing")
-        work = owned_work_descriptions(child_loop)
-        if work:
-            shown = ", ".join(work[:16])
-            if len(work) > 16:
-                shown += f", … (+{len(work) - 16} more)"
-            return _error(
-                "finish refused; wait, cancel, or hand off owned work first: " + shown
-            )
         report = {"status": status, "summary": summary.strip()}
         if head_sha is not None:
             report["head_sha"] = head_sha
         if verdict is not None:
             report["verdict"] = verdict
+        refusal = await fence.accept_finish(report)
+        if refusal is not None:
+            return _error("finish refused; " + refusal)
         child_loop._explicit_finish_report = report
         return {
             "content": [text_block("finish accepted; no more work or prose is needed")],

@@ -25,6 +25,7 @@ from zeta.agent.background import (
     BackgroundAgentOwner,
     adopt_agent_children,
     finish_background_child,
+    recover_agent_children,
 )
 from zeta.agent.presets import (
     AGENT_PRESETS,
@@ -9203,3 +9204,299 @@ async def test_setting_off_preserves_legacy_finish_gate(
     loop._background_owner.unregister("root:1:1")
     await registry.close()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
+    tmp_path: Path,
+) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    child = ConversationStore(tmp_path / "child")
+    owner = BackgroundAgentOwner(parent)
+    wake = asyncio.Event()
+    owner.conversation_channel.set_root_wake(wake.set)
+    child_task = asyncio.create_task(asyncio.Event().wait())
+    owner.register(
+        "root:1",
+        child_task.cancel,
+        child_task,
+        parent_store=parent,
+        active_store=child,
+        parent_instance_id=None,
+        description="review",
+    )
+    owner.conversation_channel.publish_idle(
+        child_instance_id="root:1",
+        child_session_path=str(child.session_dir),
+        description="review",
+        text="WAIT",
+    )
+    await asyncio.wait_for(wake.wait(), timeout=1)
+    parent.register_agent_child(
+        _run_agent_call(),
+        child_session_path=str(child.session_dir),
+        description="review",
+        background=True,
+        child_instance_id="root:1",
+        accepts_follow_ups=True,
+        explicit_finish=True,
+    )
+    assert (
+        owner.conversation_channel.publish_follow_up(
+            parent, "root:1", "approved", commit_timeout=1
+        )
+        is None
+    )
+    assert child.pending_prompts()[0].data["text"] == "approved"
+    owner.cancel_subtree("root:1")
+    await owner.wait()
+
+
+def test_idle_notification_wakes_waiting_parent_without_polling(tmp_path: Path) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    child = ConversationStore(tmp_path / "child")
+    owner = BackgroundAgentOwner(parent)
+    woke: list[bool] = []
+    owner.conversation_channel.set_root_wake(lambda: woke.append(True))
+    parent.append_child_question(
+        child_instance_id="root:1", question_id="q1", question="approve?"
+    )
+    owner.conversation_channel.publish_idle(
+        child_instance_id="root:1",
+        child_session_path=str(child.session_dir),
+        description="review",
+        text="x" * 20_000,
+    )
+    notice = parent.agent_notifications()[-1]
+    assert notice.data["kind"] == "child_idle"
+    assert notice.data["status"] == "child_idle"
+    assert notice.data["ask_parent_question_id"] == "q1"
+    assert len(notice.data["text"]) <= 10_000
+    assert woke == [True]
+
+
+def test_child_idle_then_terminal_receipt_is_appended_and_delivered_once(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_child_idle_notification(
+        "root:1", child_session_path="/child", description="review", text="WAIT"
+    )
+    first, appended = store.append_agent_notification_if_absent(
+        "root:1",
+        child_session_path="/child",
+        description="review",
+        status="completed",
+        text="done",
+    )
+    again, appended_again = store.append_agent_notification_if_absent(
+        "root:1",
+        child_session_path="/child",
+        description="review",
+        status="completed",
+        text="duplicate",
+    )
+    assert appended is True and appended_again is False and first.id == again.id
+    assert [item.data["kind"] for item in store.agent_notifications()] == [
+        "child_idle",
+        "agent_completion",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "root")
+    parent = ConversationStore(tmp_path / "parent")
+    grandchild = ConversationStore(tmp_path / "grandchild")
+    owner = BackgroundAgentOwner(root)
+    parent_task = asyncio.create_task(asyncio.Event().wait())
+    grandchild_task = asyncio.create_task(asyncio.Event().wait())
+    owner.register(
+        "root:1",
+        parent_task.cancel,
+        parent_task,
+        parent_store=root,
+        active_store=parent,
+        parent_instance_id=None,
+        description="parent",
+    )
+    owner.register(
+        "root:1:1",
+        grandchild_task.cancel,
+        grandchild_task,
+        parent_store=parent,
+        active_store=grandchild,
+        parent_instance_id="root:1",
+        description="grandchild",
+    )
+    owner.conversation_channel.register_loop("root:1")
+    parent_wake = asyncio.create_task(owner.conversation_channel.wait("root:1"))
+    owner.conversation_channel.publish_idle(
+        child_instance_id="root:1:1",
+        child_session_path=str(grandchild.session_dir),
+        description="grandchild",
+        text="WAIT",
+    )
+    await asyncio.wait_for(parent_wake, timeout=1)
+    assert parent.agent_notifications()[0].data["kind"] == "child_idle"
+    owner.cancel_subtree("root:1")
+    await owner.wait()
+
+
+@pytest.mark.asyncio
+async def test_reviewer_follow_up_committed_at_finish_boundary_is_read(
+    tmp_path: Path,
+) -> None:
+    store, registry, _loop = _explicit_finish_registry(tmp_path)
+    store.pending_prompt_queue.append(
+        "review this first", origin=MessageOrigin.AGENT_SEND
+    )
+    refused = await registry.execute(
+        ToolCall("finish-1", "finish", {"status": "done", "summary": "done"})
+    )
+    assert refused["isError"] is True
+    store.acknowledge_pending_prompt(store.pending_prompts()[0].id)
+    accepted = await registry.execute(
+        ToolCall("finish-2", "finish", {"status": "done", "summary": "done"})
+    )
+    assert accepted["isError"] is False
+    with pytest.raises(PendingPromptsClosedError):
+        store.pending_prompt_queue.append("too late", origin=MessageOrigin.AGENT_SEND)
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_task_or_child_notification_rejects_finish(
+    tmp_path: Path,
+) -> None:
+    store, registry, _loop = _explicit_finish_registry(tmp_path)
+    store.append_task_notification(task_id="t1", command="true", exit_code=0)
+    refused = await registry.execute(
+        ToolCall("finish-1", "finish", {"status": "done", "summary": "done"})
+    )
+    assert refused["isError"] is True
+    assert "pending notification" in refused["content"][0]["text"]
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_fence_serializes_finish_idle_nudge_cancel_and_recovery(
+    tmp_path: Path,
+) -> None:
+    from zeta.agent.terminal_fence import TerminalTransitionFence
+
+    store = ConversationStore(tmp_path)
+    fence = TerminalTransitionFence(store)
+    assert await fence.idle_nudge_eligible() is True
+    assert await fence.accept_finish({"status": "done", "summary": "done"}) is None
+    assert await fence.cancel() is False
+    assert await fence.recover() == {"status": "done", "summary": "done"}
+    assert await fence.idle_nudge_eligible() is False
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_cancel_wins_before_acceptance(tmp_path: Path) -> None:
+    from zeta.agent.terminal_fence import TerminalTransitionFence
+
+    store = ConversationStore(tmp_path)
+    fence = TerminalTransitionFence(store)
+    assert await fence.cancel() is True
+    assert (
+        await fence.accept_finish({"status": "done", "summary": "late"})
+        == "child is canceled"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_cancel_after_acceptance_keeps_report(
+    tmp_path: Path,
+) -> None:
+    from zeta.agent.terminal_fence import TerminalTransitionFence
+
+    store = ConversationStore(tmp_path)
+    report = {"status": "blocked", "summary": "need approval"}
+    fence = TerminalTransitionFence(store)
+    assert await fence.accept_finish(report) is None
+    assert await fence.cancel() is False
+    assert store.pending_prompt_queue.explicit_finish_report() == report
+
+
+def test_events_after_terminal_state_emit_no_second_receipt(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification_if_absent(
+        "root:1",
+        child_session_path="/child",
+        description="review",
+        status="completed",
+        text="done",
+    )
+    store.append_child_idle_notification(
+        "root:1", child_session_path="/child", description="review", text="late"
+    )
+    _entry, appended = store.append_agent_notification_if_absent(
+        "root:1",
+        child_session_path="/child",
+        description="review",
+        status="canceled",
+        text="late cancel",
+    )
+    assert appended is False
+    assert (
+        len(
+            [
+                item
+                for item in store.agent_notifications()
+                if item.data.get("kind") == "agent_completion"
+            ]
+        )
+        == 1
+    )
+
+
+def test_finish_recovery_after_durable_acceptance_publishes_report_once(
+    tmp_path: Path,
+) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
+    call = _run_agent_call()
+    parent.register_agent_child(
+        call,
+        child_session_path=str(child.session_dir),
+        description="review",
+        background=True,
+        child_instance_id="root:1",
+        accepts_follow_ups=True,
+        explicit_finish=True,
+    )
+    child.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="review",
+    )
+    child.pending_prompt_queue.accept_explicit_finish(
+        {"status": "done", "summary": "recovered", "head_sha": "abcdef0"}
+    )
+    loop = SimpleNamespace(store=parent, _background_owner=BackgroundAgentOwner(parent))
+    recover_agent_children(loop)
+    notices = [
+        item
+        for item in parent.agent_notifications(pending_only=False)
+        if item.data.get("kind") == "agent_completion"
+    ]
+    assert len(notices) == 1
+    assert notices[0].data["summary"] == "recovered"
+    recover_agent_children(loop)
+    assert (
+        len(
+            [
+                item
+                for item in parent.agent_notifications(pending_only=False)
+                if item.data.get("kind") == "agent_completion"
+            ]
+        )
+        == 1
+    )

@@ -20,7 +20,7 @@ from .agent_progress import (
 from .checkpoints import ConversationIntegrityError, _now
 from .session_files import child_directory, write_session_json
 
-_AGENT_STATES = {"running", "idle", "completed", "canceled", "failed"}
+_AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
 
 
 def _lifecycle_elapsed(
@@ -443,7 +443,7 @@ class AgentStateMixin:
             raise ValueError("agent lifecycle turns must be nonnegative")
         if tool_calls is not None and (type(tool_calls) is not int or tool_calls < 0):
             raise ValueError("agent lifecycle tool calls must be nonnegative")
-        if state is not None and state not in {"running", "idle"}:
+        if state is not None and state not in {"running", "idle", "finishing"}:
             raise ValueError("agent lifecycle live state is invalid")
         if idle_since is not None and not isinstance(idle_since, str):
             raise ValueError("agent lifecycle idle timestamp is invalid")
@@ -475,7 +475,7 @@ class AgentStateMixin:
     ) -> None:
         """Persist a terminal child state and its final result text."""
 
-        if state not in _AGENT_STATES - {"running", "idle"} or not final_result:
+        if state not in {"completed", "canceled", "failed"} or not final_result:
             raise ValueError("invalid terminal agent lifecycle")
         if turns_used is not None and (type(turns_used) is not int or turns_used < 0):
             raise ValueError("agent lifecycle turns must be nonnegative")

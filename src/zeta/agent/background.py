@@ -30,6 +30,7 @@ from .receipt import (
     build_explicit_finish_receipt,
     receipt_tool_result,
 )
+from .terminal_fence import TerminalTransitionFence
 
 
 def finish_gate_message(
@@ -510,9 +511,16 @@ def _recover_nested_children(
                     "child_instance_id", f"{store.session_id}:{child_path.name}"
                 )
                 terminal = child_store.agent_lifecycle() if child_store else None
+                accepted_report = (
+                    TerminalTransitionFence(child_store).accepted_report()
+                    if child_store
+                    else None
+                )
                 reason = (
                     "finished"
-                    if terminal and terminal.get("state") == "completed"
+                    if accepted_report is not None
+                    or terminal
+                    and terminal.get("state") == "completed"
                     else "canceled"
                 )
                 store.close_child_questions(child_instance_id, reason=reason)
@@ -543,11 +551,18 @@ def _recover_nested_children(
                     lifecycle_text = (
                         lifecycle.get("final_result") if lifecycle else None
                     )
-                    notification_status = {
-                        "completed": "completed",
-                        "failed": "error",
-                        "canceled": "canceled",
-                    }.get(lifecycle_state, "canceled")
+                    notification_status = (
+                        "error"
+                        if accepted_report is not None
+                        and accepted_report["status"] == "failed"
+                        else "completed"
+                        if accepted_report is not None
+                        else {
+                            "completed": "completed",
+                            "failed": "error",
+                            "canceled": "canceled",
+                        }.get(lifecycle_state, "canceled")
+                    )
                     notification_text = (
                         lifecycle_text
                         if type(lifecycle_text) is str and lifecycle_text
@@ -565,10 +580,18 @@ def _recover_nested_children(
                         status=notification_status,
                         turns_used=marker.get("turns_used", 0),
                     )
-                    notification_result = build_agent_receipt(
-                        notification_state,
-                        notification_text,
-                        notification_stats,
+                    notification_result = (
+                        build_explicit_finish_receipt(
+                            accepted_report,
+                            notification_stats,
+                            tool_call_id=tool_call.id,
+                        )
+                        if accepted_report is not None
+                        else build_agent_receipt(
+                            notification_state,
+                            notification_text,
+                            notification_stats,
+                        )
                     )
                     notification_text = notification_result["content"][0]["text"]
                     appended, created = (
@@ -579,6 +602,7 @@ def _recover_nested_children(
                             status=notification_status,
                             text=notification_text,
                             stats=notification_stats,
+                            report=accepted_report,
                         )
                     )
                     notification_index[child_instance_id] = appended
@@ -606,6 +630,7 @@ def _recover_nested_children(
                         status=notification_status,
                         text=notification_text,
                         stats=notification_stats,
+                        report=accepted_report,
                     )
                     store_notification_index[child_instance_id] = appended
                     notification_status = appended.data["status"]
@@ -686,9 +711,16 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                     "child_instance_id", f"{loop.store.session_id}:{child_path.name}"
                 )
                 terminal = child_store.agent_lifecycle() if child_store else None
+                accepted_report = (
+                    TerminalTransitionFence(child_store).accepted_report()
+                    if child_store
+                    else None
+                )
                 reason = (
                     "finished"
-                    if terminal and terminal.get("state") == "completed"
+                    if accepted_report is not None
+                    or terminal
+                    and terminal.get("state") == "completed"
                     else "canceled"
                 )
                 loop.store.close_child_questions(child_instance_id, reason=reason)
@@ -717,11 +749,18 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                     )
                     terminal_state = lifecycle.get("state") if lifecycle else None
                     terminal_text = lifecycle.get("final_result") if lifecycle else None
-                    recovered_status = {
-                        "completed": "completed",
-                        "failed": "error",
-                        "canceled": "canceled",
-                    }.get(terminal_state, "canceled")
+                    recovered_status = (
+                        "error"
+                        if accepted_report is not None
+                        and accepted_report["status"] == "failed"
+                        else "completed"
+                        if accepted_report is not None
+                        else {
+                            "completed": "completed",
+                            "failed": "error",
+                            "canceled": "canceled",
+                        }.get(terminal_state, "canceled")
+                    )
                     recovered_text = (
                         terminal_text
                         if type(terminal_text) is str and terminal_text
@@ -750,10 +789,18 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                         if lifecycle
                         else False
                     )
-                    recovered_result = build_agent_receipt(
-                        recovered_state,
-                        recovered_text,
-                        recovered_stats,
+                    recovered_result = (
+                        build_explicit_finish_receipt(
+                            accepted_report,
+                            recovered_stats,
+                            tool_call_id=tool_call.id,
+                        )
+                        if accepted_report is not None
+                        else build_agent_receipt(
+                            recovered_state,
+                            recovered_text,
+                            recovered_stats,
+                        )
                     )
                     recovered_text = recovered_result["content"][0]["text"]
                     appended, created = (
@@ -767,6 +814,7 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                             killed_task_ids=recovered_killed_ids,
                             killed_task_count=recovered_killed_count,
                             killed_task_ids_truncated=recovered_killed_truncated,
+                            report=accepted_report,
                         )
                     )
                     notification_index[child_instance_id] = appended
@@ -788,6 +836,7 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                             killed_task_ids=recovered_killed_ids,
                             killed_task_count=recovered_killed_count,
                             killed_task_ids_truncated=recovered_killed_truncated,
+                            report=accepted_report,
                         )
                         store_notification_index[child_instance_id] = appended
                         recovered_status = appended.data["status"]
@@ -803,6 +852,13 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                         ):
                             child_store.mark_agent_canceled(tool_call.id)
                         else:
+                            if accepted_report is not None and lifecycle is not None:
+                                child_store.finish_agent_lifecycle(
+                                    "failed"
+                                    if accepted_report["status"] == "failed"
+                                    else "completed",
+                                    final_result=recovered_text,
+                                )
                             child_store.finish_agent_parent()
                 elif child_store is not None:
                     if notification.data["status"] == "canceled":
@@ -886,7 +942,7 @@ async def finish_background_child(
 
     status = "completed"
     notification_text = ""
-    explicit_finish_report: dict[str, object] | None = None
+    explicit_finish_report = TerminalTransitionFence(child_store).accepted_report()
     explicit_finish_content: dict[str, object] | None = None
     try:
         try:
@@ -907,14 +963,34 @@ async def finish_background_child(
                 notification_text = content[0]["text"]
             else:
                 notification_text = "background child returned no text"
-            if result.get("isError") is True:
+            if explicit_finish_report is not None:
+                status = (
+                    "error"
+                    if explicit_finish_report["status"] == "failed"
+                    else "completed"
+                )
+            elif result.get("isError") is True:
                 status = "error"
         except asyncio.CancelledError:
-            status = "canceled"
-            notification_text = "background child canceled"
+            if explicit_finish_report is None:
+                status = "canceled"
+                notification_text = "background child canceled"
+            else:
+                status = (
+                    "error"
+                    if explicit_finish_report["status"] == "failed"
+                    else "completed"
+                )
         except Exception as exc:  # noqa: BLE001 - child failures become receipts
-            status = "error"
-            notification_text = f"agent error: {error_message(exc)}"
+            if explicit_finish_report is None:
+                status = "error"
+                notification_text = f"agent error: {error_message(exc)}"
+            else:
+                status = (
+                    "error"
+                    if explicit_finish_report["status"] == "failed"
+                    else "completed"
+                )
         # Closing the child after its final turn terminates any task it still
         # owns and returns task ids for the parent receipt.
         killed_tasks = list(await close_child() or ())

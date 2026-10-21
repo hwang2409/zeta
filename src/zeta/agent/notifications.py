@@ -80,6 +80,12 @@ class NotificationWake:
         self._foreground_retry_requested = False
         self._plain_retry_pending = False
 
+    @property
+    def has_claimed(self) -> bool:
+        """Return whether a live turn owns uncommitted notification input."""
+
+        return bool(self._claimed_ids)
+
     def pending_message(self) -> Message | None:
         entries = [
             entry
