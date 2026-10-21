@@ -6533,11 +6533,15 @@ class _TaskFinishGateBackend(CompletionBackend):
         *,
         mixed_child: bool = False,
         gate_delay: float = 0,
+        pause_before_gate: bool = False,
     ) -> None:
         self.command = command
         self.action = action
         self.mixed_child = mixed_child
         self.gate_delay = gate_delay
+        self.pause_before_gate = pause_before_gate
+        self.child_turn_paused = asyncio.Event()
+        self.release_child_turn = asyncio.Event()
         self.gate_seen = asyncio.Event()
         self.gate_delay_finished = asyncio.Event()
         self.gate_text = ""
@@ -6712,6 +6716,9 @@ class _TaskFinishGateBackend(CompletionBackend):
             else:
                 blocks = [TextContent("WAIT")]
         elif started:
+            if self.pause_before_gate:
+                self.child_turn_paused.set()
+                await self.release_child_turn.wait()
             blocks = [TextContent("premature child answer")]
         else:
             blocks = [TextContent("root complete")]
@@ -6819,11 +6826,11 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
     tmp_path: Path,
 ) -> None:
     backend = _TaskFinishGateBackend(
-        _python("import time; time.sleep(30)"), gate_delay=0.15
+        _python("import time; time.sleep(30)"), pause_before_gate=True
     )
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.5)
-    owner.finish_gate_task_timeout = 0.08
+    owner.finish_gate_task_timeout = 5
     loop = AgentLoop(
         backend,
         store,
@@ -6835,10 +6842,10 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
 
+    await asyncio.wait_for(backend.child_turn_paused.wait(), timeout=2)
+    owner.finish_gate_task_timeout = 0.08
+    backend.release_child_turn.set()
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
-    # The model turn is deliberately held longer than the task bound.  The
-    # gate must not expire while this pre-gate work is still in progress.
-    await asyncio.wait_for(backend.gate_delay_finished.wait(), timeout=2)
     await asyncio.wait_for(run, timeout=2)
     notification = await _wait_completion(store)
     assert "finish-gate task safety bound expired" in notification.data["text"]
