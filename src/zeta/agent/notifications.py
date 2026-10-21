@@ -86,6 +86,18 @@ class NotificationWake:
 
         return bool(self._claimed_ids)
 
+    @property
+    def has_undelivered_claim(self) -> bool:
+        """Return whether claimed input is not yet durable in the current turn."""
+
+        return any(item not in self._persisted_ids for item in self._claimed_ids)
+
+    @property
+    def persisted_ids(self) -> frozenset[str]:
+        """Return notification ids durable in the current turn."""
+
+        return frozenset(self._persisted_ids)
+
     def pending_message(self) -> Message | None:
         entries = [
             entry

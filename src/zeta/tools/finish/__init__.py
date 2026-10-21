@@ -22,7 +22,10 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
         registry._session_store,
         notification_pending=lambda: (
             notification_wake.pending_message() is not None
-            or getattr(notification_wake, "has_claimed", False)
+            or getattr(notification_wake, "has_undelivered_claim", False)
+        ),
+        persisted_notification_ids=lambda: getattr(
+            notification_wake, "persisted_ids", frozenset()
         ),
         owned_work=lambda: owned_work_descriptions(child_loop),
     )

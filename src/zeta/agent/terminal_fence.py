@@ -16,10 +16,12 @@ class TerminalTransitionFence:
         store: ConversationStore,
         *,
         notification_pending: Callable[[], bool] = lambda: False,
+        persisted_notification_ids: Callable[[], frozenset[str]] = frozenset,
         owned_work: Callable[[], tuple[str, ...]] = tuple,
     ) -> None:
         self._store = store
         self._notification_pending = notification_pending
+        self._persisted_notification_ids = persisted_notification_ids
         self._owned_work = owned_work
         self._lock = asyncio.Lock()
 
@@ -32,7 +34,10 @@ class TerminalTransitionFence:
                 return "wait, cancel, or hand off owned work first: " + shown
             if self._notification_pending():
                 return "pending notification must be read before finish"
-            reason = self._store.pending_prompt_queue.accept_explicit_finish(report)
+            reason = self._store.pending_prompt_queue.accept_explicit_finish(
+                report,
+                persisted_notification_ids=self._persisted_notification_ids(),
+            )
             if reason is None:
                 self._store.update_agent_lifecycle(
                     state="finishing", current_step="finishing"

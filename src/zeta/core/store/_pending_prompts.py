@@ -95,7 +95,12 @@ class PendingPromptQueue:
             if not self._queue_closed_unlocked():
                 self._store._append_row_unlocked("pending_queue_closed", {})
 
-    def accept_explicit_finish(self, report: dict[str, object]) -> str | None:
+    def accept_explicit_finish(
+        self,
+        report: dict[str, object],
+        *,
+        persisted_notification_ids: frozenset[str] = frozenset(),
+    ) -> str | None:
         """Atomically close admission and persist one accepted finish report."""
         with self._store._append_lock():
             self._store._load()
@@ -112,6 +117,7 @@ class PendingPromptQueue:
                 entry
                 for notification_id, entry in self._store._active_notifications.items()
                 if notification_id not in self._store._active_notification_acks
+                and notification_id not in persisted_notification_ids
                 and entry.data.get("display_only") is not True
             ]
             if pending_notifications:

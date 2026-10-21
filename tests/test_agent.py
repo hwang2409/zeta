@@ -27,6 +27,7 @@ from zeta.agent.background import (
     finish_background_child,
     recover_agent_children,
 )
+from zeta.agent.notifications import NotificationWake
 from zeta.agent.presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
@@ -8543,7 +8544,7 @@ class _ExplicitFinishLoop:
         self.agent_depth = 1
         self.explicit_finish = True
         self._explicit_finish_report = None
-        self.notification_wake = SimpleNamespace(pending_message=lambda: None)
+        self.notification_wake = NotificationWake(registry._session_store)
 
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
@@ -8618,6 +8619,105 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
         key: terminal.tool_result.structured_content[key] for key in expected
     } == expected
     assert {key: notification.data[key] for key in expected} == expected
+    await loop.close()
+
+
+@pytest.mark.parametrize("wake_kind", ["task", "child"])
+@pytest.mark.asyncio
+async def test_child_finishes_during_notification_turn_that_woke_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wake_kind: str,
+) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self) -> None:
+            self.child_replied = asyncio.Event()
+            self.finish_sent = False
+
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            last_user = next(
+                (
+                    block.text
+                    for message in reversed(messages)
+                    if message.role is MessageRole.USER
+                    for block in message.content
+                    if isinstance(block, TextContent)
+                ),
+                "",
+            )
+            notification = any(
+                message.metadata.get("zeta_event") == "agent_notifications"
+                for message in messages
+            )
+            if last_user == "start":
+                blocks = [ToolUseContent(_run_agent_call())]
+            elif notification and not self.finish_sent:
+                self.finish_sent = True
+                blocks = [
+                    ToolUseContent(
+                        ToolCall(
+                            "finish-1",
+                            "finish",
+                            {"status": "done", "summary": f"read {wake_kind} notice"},
+                        )
+                    )
+                ]
+            elif last_user == "work the big task":
+                self.child_replied.set()
+                blocks = [TextContent("WAIT")]
+            else:
+                blocks = [TextContent("parent continued")]
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            for block in blocks:
+                yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    monkeypatch.setitem(
+        AGENT_PRESETS,
+        "run",
+        replace(AGENT_PRESETS["run"], explicit_finish=True),
+    )
+    backend = Backend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.child_replied.wait(), timeout=2)
+    await _wait_for_notification(store, "child_idle")
+    handle = _run_handle_from_receipt(store)
+    marker = store.agent_children()[handle]
+    child_path = Path(marker["child_session_path"])
+    child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+
+    if wake_kind == "task":
+        child_store.append_task_notification(
+            task_id="task-1", command="true", exit_code=0
+        )
+    else:
+        child_store.append_agent_notification_if_absent(
+            f"{handle}:1",
+            child_session_path=str(child_path / "agents" / "1"),
+            description="direct child",
+            status="completed",
+            text="direct child completed",
+        )
+    child_store.close()
+    loop._background_owner.conversation_channel.wake(handle)
+
+    notification = await _wait_for_notification(store, "completed")
+    completions = [
+        item
+        for item in store.agent_notifications(pending_only=False)
+        if item.data.get("kind") == "agent_completion"
+        and item.data.get("child_instance_id") == handle
+    ]
+    assert len(completions) == 1
+    assert notification.data["summary"] == f"read {wake_kind} notice"
     await loop.close()
 
 
@@ -9371,13 +9471,45 @@ async def test_reviewer_follow_up_committed_at_finish_boundary_is_read(
 async def test_pending_task_or_child_notification_rejects_finish(
     tmp_path: Path,
 ) -> None:
-    store, registry, _loop = _explicit_finish_registry(tmp_path)
+    store, registry, loop = _explicit_finish_registry(tmp_path)
     store.append_task_notification(task_id="t1", command="true", exit_code=0)
-    refused = await registry.execute(
+    pending_task = await registry.execute(
         ToolCall("finish-1", "finish", {"status": "done", "summary": "done"})
     )
-    assert refused["isError"] is True
-    assert "pending notification" in refused["content"][0]["text"]
+    assert pending_task["isError"] is True
+    assert "pending notification" in pending_task["content"][0]["text"]
+    store.acknowledge_agent_notifications(
+        [store.agent_notifications()[0].id]
+    )
+
+    store.append_agent_notification_if_absent(
+        "root:1:1",
+        child_session_path="/child",
+        description="child",
+        status="completed",
+        text="child completed",
+    )
+    pending_child = await registry.execute(
+        ToolCall("finish-2", "finish", {"status": "done", "summary": "done"})
+    )
+    assert pending_child["isError"] is True
+
+    assert loop.notification_wake.schedule() is True
+    reserved = await registry.execute(
+        ToolCall("finish-3", "finish", {"status": "done", "summary": "done"})
+    )
+    assert reserved["isError"] is True
+
+    message = loop.notification_wake.begin(notification=True)
+    assert message is not None
+    loop.notification_wake.commit_persisted(message)
+    assert loop.notification_wake.pending_message() is None
+    assert loop.notification_wake.has_undelivered_claim is False
+    delivered = await registry.execute(
+        ToolCall("finish-4", "finish", {"status": "done", "summary": "done"})
+    )
+    assert delivered["isError"] is False, delivered
+    await loop.notification_wake.finish(success=True)
     await registry.close()
 
 

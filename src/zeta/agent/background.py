@@ -6,6 +6,7 @@ import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
 from contextlib import ExitStack, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -478,6 +479,78 @@ def _sync_agent_notification(
     return notification
 
 
+@dataclass(frozen=True)
+class _BackgroundTerminal:
+    status: str
+    text: str
+    stats: dict[str, object]
+    payload: dict[str, object]
+    killed_task_ids: object = None
+    killed_task_count: object = None
+    killed_task_ids_truncated: object = False
+
+
+def _background_terminal(
+    *,
+    lifecycle: dict[str, object] | None,
+    report: dict[str, object] | None,
+    turns_used: int,
+    tool_call_id: str,
+    fallback_text: str,
+    structured_content: dict[str, object] | None = None,
+    max_bytes: int = MAX_AGENT_RESULT_BYTES,
+) -> _BackgroundTerminal:
+    """Build one canonical terminal result for live and recovered children."""
+
+    lifecycle_state = lifecycle.get("state") if lifecycle else None
+    status = (
+        "error"
+        if report is not None and report["status"] == "failed"
+        else "completed"
+        if report is not None
+        else {
+            "completed": "completed",
+            "failed": "error",
+            "canceled": "canceled",
+        }.get(lifecycle_state, "canceled")
+    )
+    text = (
+        lifecycle.get("final_result") if lifecycle is not None else None
+    )
+    if type(text) is not str or not text:
+        text = fallback_text
+    stats = agent_stats(lifecycle, status=status, turns_used=turns_used)
+    state: TerminalState = (
+        "completed"
+        if status == "completed"
+        else "canceled"
+        if status == "canceled"
+        else "failed"
+    )
+    payload = (
+        build_explicit_finish_receipt(
+            report,
+            stats,
+            structured_content=structured_content,
+            tool_call_id=tool_call_id,
+            max_bytes=max_bytes,
+        )
+        if report is not None
+        else build_agent_receipt(state, text, stats)
+    )
+    return _BackgroundTerminal(
+        status=status,
+        text=payload["content"][0]["text"],
+        stats=stats,
+        payload=payload,
+        killed_task_ids=lifecycle.get("killed_task_ids") if lifecycle else None,
+        killed_task_count=lifecycle.get("killed_task_count") if lifecycle else None,
+        killed_task_ids_truncated=(
+            lifecycle.get("killed_task_ids_truncated", False) if lifecycle else False
+        ),
+    )
+
+
 def _recover_nested_children(
     store: ConversationStore,
     notification_store: ConversationStore,
@@ -547,53 +620,18 @@ def _recover_nested_children(
                         if child_store is not None
                         else None
                     )
-                    lifecycle_state = lifecycle.get("state") if lifecycle else None
-                    lifecycle_text = (
-                        lifecycle.get("final_result") if lifecycle else None
-                    )
-                    notification_status = (
-                        "error"
-                        if accepted_report is not None
-                        and accepted_report["status"] == "failed"
-                        else "completed"
-                        if accepted_report is not None
-                        else {
-                            "completed": "completed",
-                            "failed": "error",
-                            "canceled": "canceled",
-                        }.get(lifecycle_state, "canceled")
-                    )
-                    notification_text = (
-                        lifecycle_text
-                        if type(lifecycle_text) is str and lifecycle_text
-                        else "background child canceled when the parent session exited"
-                    )
-                    notification_state: TerminalState = (
-                        "completed"
-                        if notification_status == "completed"
-                        else "canceled"
-                        if notification_status == "canceled"
-                        else "failed"
-                    )
-                    notification_stats = agent_stats(
-                        lifecycle,
-                        status=notification_status,
+                    terminal = _background_terminal(
+                        lifecycle=lifecycle,
+                        report=accepted_report,
                         turns_used=marker.get("turns_used", 0),
+                        tool_call_id=tool_call.id,
+                        fallback_text=(
+                            "background child canceled when the parent session exited"
+                        ),
                     )
-                    notification_result = (
-                        build_explicit_finish_receipt(
-                            accepted_report,
-                            notification_stats,
-                            tool_call_id=tool_call.id,
-                        )
-                        if accepted_report is not None
-                        else build_agent_receipt(
-                            notification_state,
-                            notification_text,
-                            notification_stats,
-                        )
-                    )
-                    notification_text = notification_result["content"][0]["text"]
+                    notification_status = terminal.status
+                    notification_text = terminal.text
+                    notification_stats = terminal.stats
                     appended, created = (
                         notification_store.append_agent_notification_if_absent(
                             child_instance_id,
@@ -748,61 +786,21 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                         else None
                     )
                     terminal_state = lifecycle.get("state") if lifecycle else None
-                    terminal_text = lifecycle.get("final_result") if lifecycle else None
-                    recovered_status = (
-                        "error"
-                        if accepted_report is not None
-                        and accepted_report["status"] == "failed"
-                        else "completed"
-                        if accepted_report is not None
-                        else {
-                            "completed": "completed",
-                            "failed": "error",
-                            "canceled": "canceled",
-                        }.get(terminal_state, "canceled")
-                    )
-                    recovered_text = (
-                        terminal_text
-                        if type(terminal_text) is str and terminal_text
-                        else "background child canceled when the parent session exited"
-                    )
-                    recovered_state: TerminalState = (
-                        "completed"
-                        if recovered_status == "completed"
-                        else "canceled"
-                        if recovered_status == "canceled"
-                        else "failed"
-                    )
-                    recovered_stats = agent_stats(
-                        lifecycle,
-                        status=recovered_status,
+                    terminal = _background_terminal(
+                        lifecycle=lifecycle,
+                        report=accepted_report,
                         turns_used=marker.get("turns_used", 0),
+                        tool_call_id=tool_call.id,
+                        fallback_text=(
+                            "background child canceled when the parent session exited"
+                        ),
                     )
-                    recovered_killed_ids = (
-                        lifecycle.get("killed_task_ids") if lifecycle else None
-                    )
-                    recovered_killed_count = (
-                        lifecycle.get("killed_task_count") if lifecycle else None
-                    )
-                    recovered_killed_truncated = (
-                        lifecycle.get("killed_task_ids_truncated", False)
-                        if lifecycle
-                        else False
-                    )
-                    recovered_result = (
-                        build_explicit_finish_receipt(
-                            accepted_report,
-                            recovered_stats,
-                            tool_call_id=tool_call.id,
-                        )
-                        if accepted_report is not None
-                        else build_agent_receipt(
-                            recovered_state,
-                            recovered_text,
-                            recovered_stats,
-                        )
-                    )
-                    recovered_text = recovered_result["content"][0]["text"]
+                    recovered_status = terminal.status
+                    recovered_text = terminal.text
+                    recovered_stats = terminal.stats
+                    recovered_killed_ids = terminal.killed_task_ids
+                    recovered_killed_count = terminal.killed_task_count
+                    recovered_killed_truncated = terminal.killed_task_ids_truncated
                     appended, created = (
                         notification_store.append_agent_notification_if_absent(
                             child_instance_id,
@@ -1055,13 +1053,18 @@ async def finish_background_child(
         )
         result_text = notification_text or "background child completed"
         if explicit_finish_report is not None:
-            terminal_payload = build_explicit_finish_receipt(
-                explicit_finish_report,
-                terminal_stats,
-                structured_content=explicit_finish_content,
+            explicit_terminal = _background_terminal(
+                lifecycle=child_store.agent_lifecycle(),
+                report=explicit_finish_report,
+                turns_used=child_turns(),
                 tool_call_id=tool_call.id,
+                fallback_text=result_text,
+                structured_content=explicit_finish_content,
                 max_bytes=max_receipt_bytes or MAX_AGENT_RESULT_BYTES,
             )
+            status = explicit_terminal.status
+            terminal_stats = explicit_terminal.stats
+            terminal_payload = explicit_terminal.payload
         else:
             build_parameters = inspect.signature(build_result).parameters
             build_kwargs: dict[str, object] = {}
