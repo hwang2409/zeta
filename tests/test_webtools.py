@@ -947,7 +947,6 @@ async def test_websearch_parses_saved_duckduckgo_fixture(
     assert result["isError"] is False
     assert result["structuredContent"] == {
         "backend": "duckduckgo",
-        "codex_failure": "no Codex OAuth login found; log in first",
         "results": [
             {
                 "title": "First result",
