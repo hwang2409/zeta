@@ -153,6 +153,7 @@ class ConversationChannel:
         killed_task_ids: list[str] | None,
         killed_task_count: int | None,
         killed_task_ids_truncated: bool,
+        report: dict[str, object] | None = None,
     ) -> ConversationEntry:
         """Persist a child completion for its recipients, then wake its parent."""
 
@@ -168,6 +169,7 @@ class ConversationChannel:
             killed_task_count=killed_task_count,
             killed_task_ids_truncated=killed_task_ids_truncated,
             display_only=self._root_store is not parent_store,
+            report=report,
         )
         if self._root_store is not parent_store:
             parent_store.append_agent_notification(
@@ -180,6 +182,7 @@ class ConversationChannel:
                 killed_task_ids=killed_task_ids,
                 killed_task_count=killed_task_count,
                 killed_task_ids_truncated=killed_task_ids_truncated,
+                report=report,
             )
         parent_store.finish_agent_child(marker_key)
         self.wake(parent_id)

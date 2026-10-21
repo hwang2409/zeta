@@ -285,6 +285,7 @@ class ToolRegistry:
         self._todo_store = session_store
         self.sent_message_tracker: Any = None
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
+        self._execution_guard: Callable[[str], str | None] | None = None
         self.spills = SpillStore(
             session_dir=session_store.session_dir
             if session_store is not None
@@ -647,6 +648,13 @@ class ToolRegistry:
     ) -> None:
         self._agent_runner = runner
 
+    def set_execution_guard(
+        self, guard: Callable[[str], str | None] | None
+    ) -> None:
+        """Reject tool calls after a session-level terminal transition."""
+
+        self._execution_guard = guard
+
     def clone_for_session(
         self,
         store: ConversationStore,
@@ -688,6 +696,7 @@ class ToolRegistry:
             if callable(register_registry):
                 register_registry(clone)
         clone._session_store = store
+        clone._execution_guard = None
         clone._todo_store = store
         clone.sent_message_tracker = None
         clone.spills = SpillStore(
@@ -917,6 +926,10 @@ class ToolRegistry:
             )
             return _apply_error_governance(normalized, tool_call.name)
 
+        if self._execution_guard is not None:
+            rejection = self._execution_guard(tool_call.name)
+            if rejection is not None:
+                return await finalize(_error_result(rejection, kind="terminal_transition"))
         if _boundary_signal is not None and _signal_is_set(_boundary_signal):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, _boundary_signal, _scope_signal

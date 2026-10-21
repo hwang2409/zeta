@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -172,6 +173,8 @@ def _validate_schema(value: Any, schema: Mapping[str, Any], path: str) -> None:
             raise ValueError(f"{path} is too short")
         if "maxLength" in schema and len(value) > schema["maxLength"]:
             raise ValueError(f"{path} is too long")
+        if "pattern" in schema and re.fullmatch(schema["pattern"], value) is None:
+            raise ValueError(f"{path} does not match the required pattern")
     if type(value) in {int, float} and type(value) is not bool:
         if "minimum" in schema and value < schema["minimum"]:
             raise ValueError(f"{path} is below the minimum")
@@ -249,6 +252,7 @@ _SCHEMA_KEYS = {
     "items",
     "minLength",
     "maxLength",
+    "pattern",
     "minimum",
     "exclusiveMinimum",
     "maximum",
@@ -297,6 +301,14 @@ def _validate_schema_definition(schema: Mapping[str, Any], path: str) -> None:
     enum = schema.get("enum")
     if enum is not None and type(enum) is not list:
         raise ValueError(f"schema enum must be an array at {path}")
+    pattern = schema.get("pattern")
+    if pattern is not None:
+        if type(pattern) is not str:
+            raise ValueError(f"schema pattern must be a string at {path}")
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"schema pattern is invalid at {path}") from exc
     for key in (
         "minLength",
         "maxLength",

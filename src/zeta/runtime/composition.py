@@ -292,6 +292,7 @@ def compose_runtime(
             project_registry=manager.project_registry,
             **loop_kwargs,
         )
+        loop.explicit_finish = config.agents_explicit_finish
         loop.post_stream_provider_retry = post_stream_provider_retry
         loop.manager = manager
         loop.session_metadata = metadata

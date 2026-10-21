@@ -26,6 +26,7 @@ class AgentPreset:
     agents_root: Path | None = field(default=None, compare=False)
     allow_delegation: bool = True
     accepts_follow_ups: bool = False
+    explicit_finish: bool = False
 
     @property
     def description(self) -> str:

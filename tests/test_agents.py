@@ -504,3 +504,17 @@ async def test_custom_agent_model_selects_the_child_backend(
         "resolve_attention",
     }
     await loop.close()
+
+
+def test_explicit_finish_requires_global_and_profile_opt_in() -> None:
+    from dataclasses import replace
+
+    from zeta.agent.explicit_finish import eligible
+    from zeta.agent.presets import AgentPreset
+
+    profile = AgentPreset(name="worker", tool_names=None, preamble="", selection_guidance="worker", accepts_follow_ups=True, explicit_finish=True)
+    assert eligible(global_enabled=True, preset=profile, background=True) is True
+    assert eligible(global_enabled=False, preset=profile, background=True) is False
+    assert eligible(global_enabled=True, preset=replace(profile, explicit_finish=False), background=True) is False
+    assert eligible(global_enabled=True, preset=replace(profile, accepts_follow_ups=False), background=True) is False
+    assert eligible(global_enabled=True, preset=profile, background=False) is False

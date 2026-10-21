@@ -2076,3 +2076,26 @@ async def test_registry_setup_ignores_corrupt_background_state(
     assert registry.background_tasks.running_count == 0
     assert path.read_bytes() == payload
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_task_safety_deadline_kills_and_wakes(tmp_path: Path) -> None:
+    from zeta.agent.explicit_finish import kill_tasks_after_deadline
+    from zeta.tools._shared.process import BackgroundTaskRegistry
+
+    wake = asyncio.Event()
+    store = ConversationStore(tmp_path)
+    registry = BackgroundTaskRegistry(
+        notification_store=store, notification_callback=wake.set
+    )
+    task_id, _ = await registry.start(
+        _python("import time; time.sleep(60)"), tmp_path
+    )
+    killed = await kill_tasks_after_deadline(registry, 0.01)
+    await asyncio.wait_for(wake.wait(), timeout=1)
+    event = store.agent_notifications()[0]
+    assert killed == (task_id,)
+    assert event.data["task_id"] == task_id
+    assert event.data["background_phase"] == "task_kill"
+    await registry.close()
+    store.close()

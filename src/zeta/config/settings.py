@@ -87,6 +87,7 @@ _TOP_KEYS = frozenset(
         "allow_external_tools",
         # Parsed by zeta.remote_sync; global only.
         "remotes",
+        "agents",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -104,6 +105,7 @@ _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
 _INBOX_KEYS = frozenset({"enabled"})
 _EVICTION_SUMMARY_KEYS = frozenset({"enabled"})
 _COMMAND_KEYS = frozenset({"command_niceness"})
+_AGENTS_KEYS = frozenset({"explicit_finish"})
 _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
 
 
@@ -127,6 +129,7 @@ class Settings:
     auto_project: bool | None = None
     inbox_enabled: bool | None = None
     eviction_summaries_enabled: bool | None = None
+    agents_explicit_finish: bool | None = None
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
@@ -158,6 +161,7 @@ class ResolvedConfig:
     auto_project: bool = True
     inbox_enabled: bool = True
     eviction_summaries_enabled: bool = False
+    agents_explicit_finish: bool = False
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
@@ -284,6 +288,7 @@ def resolve(
         auto_project=settings.auto_project is not False,
         inbox_enabled=settings.inbox_enabled is not False,
         eviction_summaries_enabled=settings.eviction_summaries_enabled is True,
+        agents_explicit_finish=settings.agents_explicit_finish is True,
         tool_allow=settings.tool_allow if cli_allow is None else cli_allow,
         tool_deny=settings.tool_deny if cli_deny is None else cli_deny,
         tool_allow_layers=(
@@ -500,6 +505,12 @@ def _validate(
     eviction_summaries_enabled = eviction_table.get("enabled")
     if eviction_summaries_enabled is not None and type(eviction_summaries_enabled) is not bool:
         raise SettingsError("eviction_summaries.enabled must be a boolean")
+    agents_table = data.get("agents", {})
+    if not isinstance(agents_table, Mapping) or set(agents_table) - _AGENTS_KEYS:
+        raise SettingsError("invalid agents settings")
+    agents_explicit_finish = agents_table.get("explicit_finish")
+    if agents_explicit_finish is not None and type(agents_explicit_finish) is not bool:
+        raise SettingsError("agents.explicit_finish must be a boolean")
     allow_hooks = _validated_bool(data, "allow_hooks", notices)
     allow_external_tools = _validated_bool(data, "allow_external_tools", notices)
     memory = data.get("memory", {})
@@ -546,6 +557,7 @@ def _validate(
         auto_project=auto_project,
         inbox_enabled=inbox_enabled,
         eviction_summaries_enabled=eviction_summaries_enabled,
+        agents_explicit_finish=agents_explicit_finish,
         tool_allow=tool_allow,
         tool_deny=tool_deny or (),
         tool_allow_layers=() if tool_allow is None else (tool_allow,),
