@@ -77,17 +77,6 @@ class EvictionResult:
     source_seqs: tuple[int, ...] = field(default=(), compare=False)
 
 
-def normalize_receipt(message: Message) -> Message:
-    """Restore the exact deterministic receipt kept in metadata."""
-    value = message.metadata.get("eviction_deterministic_receipt")
-    if not isinstance(value, Mapping):
-        return message
-    try:
-        return Message.from_dict(value)
-    except (KeyError, TypeError, ValueError):
-        return message
-
-
 def normalize_evicted_tool_result(message: Message) -> Message:
     """Drop legacy display-only copies from a persisted eviction receipt."""
     result = message.tool_result
@@ -156,7 +145,6 @@ def _evict_deterministic(
     any transformation.
     """
 
-    records = [(seq, normalize_receipt(message)) for seq, message in records]
     messages = [message for _, message in records]
     before = fixed_tokens + sum(token_counter(message) for message in messages)
     changed: set[int] = set()
