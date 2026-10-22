@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import fcntl
 import hashlib
 import io
@@ -426,11 +427,34 @@ def error_body_excerpt(body: bytes, *, limit: int = 300) -> str:
     return " ".join(text.split())[:limit]
 
 
+def _jwt_payload(token: str | None) -> Mapping[str, Any]:
+    if not token:
+        return {}
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+        return payload if isinstance(payload, Mapping) else {}
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return {}
+
+
 @dataclass(frozen=True, slots=True)
 class OAuthTokens:
     access_token: str
     refresh_token: str
     expires_at: float
+    email: str | None = None
+    workspace: str | None = None
+
+    def __post_init__(self) -> None:
+        profile = _jwt_payload(self.access_token).get(
+            "https://api.openai.com/profile"
+        )
+        if not self.email and isinstance(profile, Mapping):
+            object.__setattr__(self, "email", _first_string(profile, "email"))
 
     @classmethod
     def from_mapping(
@@ -450,15 +474,21 @@ class OAuthTokens:
             raise error_type("OAuth expiry is invalid")
         if expires_at > 100_000_000_000:
             expires_at /= 1000
-        return cls(access_token, refresh_token, float(expires_at))
+        email, workspace = _display_metadata(value)
+        return cls(access_token, refresh_token, float(expires_at), email, workspace)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "version": 1,
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
             "expires_at": self.expires_at,
         }
+        if self.email:
+            value["email"] = self.email
+        if self.workspace:
+            value["workspace"] = self.workspace
+        return value
 
     def is_valid(self, *, skew: float = 60) -> bool:
         return self.expires_at > time.time() + skew
@@ -483,6 +513,22 @@ def build_pkce_parameters() -> PKCEParameters:
         challenge=base64.urlsafe_b64encode(challenge).decode("ascii").rstrip("="),
         state=secrets.token_urlsafe(32),
     )
+
+
+def _display_metadata(value: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    account = value.get("account")
+    organization = value.get("organization")
+    identity = _jwt_payload(_first_string(value, "id_token", "idToken"))
+    email = _first_string(value, "email") or _first_string(identity, "email")
+    workspace = _first_string(
+        value, "workspace", "organization_name"
+    ) or _first_string(identity, "workspace", "organization_name")
+    if isinstance(account, Mapping):
+        email = email or _first_string(account, "email_address")
+        workspace = workspace or _first_string(account, "workspace", "name")
+    if isinstance(organization, Mapping):
+        workspace = workspace or _first_string(organization, "name")
+    return email, workspace
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:

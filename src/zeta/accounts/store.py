@@ -32,6 +32,40 @@ _PROVIDERS = {"anthropic", "codex"}
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 
+def _account_label(value: str) -> str:
+    if type(value) is not str:
+        raise ValueError("invalid account label")
+    label = value.lower()
+    if not _SLUG.fullmatch(label):
+        raise ValueError("invalid account label")
+    return label
+
+
+def _registry_reference_index(value: Mapping[str, Any]) -> dict[tuple[str, str], AccountId]:
+    accounts = value["accounts"]
+    labels = value["labels"]
+    references: dict[tuple[str, str], AccountId] = {}
+    for key, metadata in accounts.items():
+        if not isinstance(key, str) or not isinstance(metadata, Mapping):
+            raise TypeError
+        account = AccountId(*key.split(":", 1))
+        if key != str(account) or metadata != {
+            "provider": account.provider,
+            "name": account.name,
+        }:
+            raise ValueError
+        label = labels.get(key, account.name)
+        if _account_label(label) != label:
+            raise ValueError
+        for reference in {account.name, label}:
+            previous = references.setdefault((account.provider, reference), account)
+            if previous != account:
+                raise ValueError
+    if set(labels) - set(accounts):
+        raise ValueError
+    return references
+
+
 class AccountError(RuntimeError):
     """A credential-safe account-store error."""
 
@@ -53,6 +87,16 @@ class AccountId:
 
     def __str__(self) -> str:
         return f"{self.provider}:{self.name}"
+
+
+@dataclass(frozen=True, slots=True)
+class AccountDisplay:
+    account: AccountId
+    label: str
+    detail: str | None = None
+
+    def __str__(self) -> str:
+        return f"{self.account.provider}:{self.label}"
 
 
 class AccountStore:
@@ -138,10 +182,31 @@ class AccountStore:
                 for key in self._read_registry(home_fd)["accounts"]
             ]
 
+    def list_display(self) -> list[AccountDisplay]:
+        result = []
+        with self._home() as home_fd:
+            value = self._read_registry(home_fd)
+            for key in value["accounts"]:
+                account = AccountId(*key.split(":", 1))
+                tokens = _read_account_tokens(home_fd, account)
+                details = (
+                    tuple(filter(None, (tokens.email, tokens.workspace)))
+                    if tokens
+                    else ()
+                )
+                result.append(
+                    AccountDisplay(
+                        account,
+                        value["labels"].get(key, account.name),
+                        " · ".join(details) or None,
+                    )
+                )
+        return result
+
     def default(self, provider: str) -> AccountId | None:
         if provider not in _PROVIDERS:
             raise ValueError("invalid account provider")
-        with self._home() as home_fd, self._registry_guard(home_fd):
+        with self._home() as home_fd:
             value = self._read_registry(home_fd)["defaults"].get(provider)
             return AccountId(*value.split(":", 1)) if value else None
 
@@ -156,6 +221,48 @@ class AccountStore:
                 raise AccountError(f"account {account} does not exist; use /accounts")
             value["defaults"][account.provider] = str(account)
             self._write_registry(home_fd, value)
+
+    def rename(self, account: AccountId, new_label: str) -> str:
+        label = _account_label(new_label)
+        with self._home() as home_fd, self._registry_guard(home_fd):
+            value = self._read_registry(home_fd)
+            key = str(account)
+            if key not in value["accounts"]:
+                raise AccountError(f"account {account} does not exist")
+            if value["labels"].get(key, account.name) == label:
+                return "account label unchanged"
+            self._check_reference_available(value, account, label)
+            if label == account.name:
+                value["labels"].pop(key, None)
+            else:
+                value["labels"][key] = label
+            self._write_registry(home_fd, value)
+        return f"renamed {account} to {account.provider}:{label}"
+
+    def resolve_qualified_reference(self, value: str) -> AccountId:
+        try:
+            provider, reference = value.split(":", 1)
+        except (AttributeError, ValueError) as exc:
+            raise AccountError("account reference must be provider:name") from exc
+        return self.resolve_reference(provider, reference)
+
+    def resolve_reference(self, provider: str, name_or_label: str) -> AccountId:
+        reference = AccountId(provider, name_or_label)
+        with self._home() as home_fd, self._registry_guard(home_fd):
+            resolved = _registry_reference_index(self._read_registry(home_fd)).get(
+                (provider, reference.name)
+            )
+        if resolved is not None:
+            return resolved
+        raise AccountError(f"account {reference} does not exist")
+
+    @staticmethod
+    def _check_reference_available(
+        value: dict[str, Any], account: AccountId, label: str
+    ) -> None:
+        owner = _registry_reference_index(value).get((account.provider, label))
+        if owner is not None and owner != account:
+            raise AccountError(f"account {account.provider}:{label} already exists")
 
     def credential_path(self, account: AccountId) -> Path:
         return self.accounts / account.provider / account.name / "oauth.json"
@@ -257,6 +364,7 @@ class AccountStore:
         value: dict[str, Any] | None = None,
     ) -> None:
         value = value or self._read_registry(home_fd)
+        self._check_reference_available(value, account, account.name)
         key = str(account)
         value["accounts"][key] = {
             "provider": account.provider,
@@ -313,26 +421,26 @@ class AccountStore:
         try:
             raw = _read_optional(home_fd, "accounts.json")
             if raw is None:
-                return {"version": 1, "accounts": {}, "defaults": {}}
+                return {"version": 1, "accounts": {}, "defaults": {}, "labels": {}}
             value = json.loads(raw)
             if (
                 not isinstance(value, Mapping)
                 or value.get("version") != 1
                 or not isinstance(value.get("accounts"), Mapping)
                 or not isinstance(value.get("defaults"), Mapping)
+                or not isinstance(value.get("labels", {}), Mapping)
             ):
                 raise ValueError
             accounts = dict(value["accounts"])
             defaults = dict(value["defaults"])
-            for key, metadata in accounts.items():
-                if not isinstance(key, str):
-                    raise TypeError
-                account = AccountId(*key.split(":", 1))
-                if key != str(account) or metadata != {
-                    "provider": account.provider,
-                    "name": account.name,
-                }:
-                    raise ValueError
+            labels = dict(value.get("labels", {}))
+            normalized = {
+                "version": 1,
+                "accounts": accounts,
+                "defaults": defaults,
+                "labels": labels,
+            }
+            _registry_reference_index(normalized)
             for provider, key in defaults.items():
                 if (
                     not isinstance(provider, str)
@@ -342,16 +450,31 @@ class AccountStore:
                     or not key.startswith(f"{provider}:")
                 ):
                     raise ValueError
-            return {"version": 1, "accounts": accounts, "defaults": defaults}
+            return normalized
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise AccountError("accounts.json is invalid; use /accounts") from exc
 
     def _write_registry(self, home_fd: int, value: dict[str, Any]) -> None:
+        try:
+            _registry_reference_index(value)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AccountError("accounts.json is invalid; use /accounts") from exc
         data = (
             json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n"
         ).encode()
         _atomic_publish(home_fd, "accounts.json", data)
         _fsync_directory(home_fd)
+
+
+def rename_account_command(store: AccountStore, args: str) -> str:
+    requested = args.split()
+    if len(requested) != 3 or requested[0] != "rename":
+        return "usage: /accounts [rename provider:old new-label]"
+    try:
+        account = store.resolve_qualified_reference(requested[1])
+        return store.rename(account, requested[2])
+    except (AccountError, OSError, ValueError) as exc:
+        return f"account unchanged: {exc}"
 
 
 class _CredentialDriver(Protocol):
@@ -455,6 +578,14 @@ class AccountCredentials:
             raise self.auth_error_type(
                 f"{self.provider_label} OAuth token refresh stalled"
             ) from exc
+        if not refreshed.email or not refreshed.workspace:
+            refreshed = OAuthTokens(
+                refreshed.access_token,
+                refreshed.refresh_token,
+                refreshed.expires_at,
+                refreshed.email or tokens.email,
+                refreshed.workspace or tokens.workspace,
+            )
         self._write(home_fd, refreshed)
         return refreshed.access_token
 
@@ -482,7 +613,9 @@ class AccountCredentials:
             _verify_tokens(account_fd, tokens)
 
     def _publish(self, home_fd: int, tokens: OAuthTokens) -> None:
-        registered = str(self.account) in self.store._read_registry(home_fd)["accounts"]
+        value = self.store._read_registry(home_fd)
+        self.store._check_reference_available(value, self.account, self.account.name)
+        registered = str(self.account) in value["accounts"]
         if registered:
             self._write(home_fd, tokens)
             return
@@ -491,7 +624,7 @@ class AccountCredentials:
             _write_publication_pending(account_fd, self.account, credential)
             _write_token_bytes(account_fd, credential)
             _verify_tokens(account_fd, tokens)
-        self.store._register_account(home_fd, self.account)
+        self.store._register_account(home_fd, self.account, value)
         with _open_account_directory(home_fd, self.account) as account_fd:
             _delete_publication_pending(account_fd)
 

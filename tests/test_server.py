@@ -13,6 +13,8 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
@@ -21,13 +23,15 @@ from typing import Any
 
 import pytest
 
+from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.accounts import AccountId
+from zeta.accounts import AccountId, AccountStore
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
+from zeta.oauth import OAuthTokens
 from zeta.protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
@@ -4636,6 +4640,95 @@ async def test_slash_extensions_reject_legacy_clients(tmp_path: Path) -> None:
             )[-1]["error"]
             assert error["code"] == -32601
     finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_accounts_label_command(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, "codex", "work").save(
+        OAuthTokens("access", "refresh", 9_999_999_999)
+    )
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        result = (
+            await _request(
+                reader,
+                writer,
+                "accounts-label",
+                "slash_run",
+                {
+                    "session_id": sid,
+                    "text": "/accounts rename codex:work henry",
+                },
+            )
+        )[-1]["result"]
+        assert result == {
+            "kind": "output",
+            "text": "renamed codex:work to codex:henry",
+        }
+        assert AccountStore(home).resolve_reference("codex", "henry") == account
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_accounts_panel_does_not_block_on_held_lifecycle_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, "codex", "work").save(
+        OAuthTokens("access", "refresh", 9_999_999_999)
+    )
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_lifecycle_lock() -> None:
+        with AccountStore(home).lifecycle_guard(account):
+            locked.set()
+            release.wait(1)
+
+    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder.start()
+    assert locked.wait(1)
+    publisher_waiting = threading.Event()
+    original_lifecycle_guard = AccountStore._lifecycle_guard
+
+    @contextmanager
+    def waiting_lifecycle_guard(store, home_fd, guarded_account, *, wait=True):
+        publisher_waiting.set()
+        with original_lifecycle_guard(store, home_fd, guarded_account, wait=wait):
+            yield
+
+    monkeypatch.setattr(AccountStore, "_lifecycle_guard", waiting_lifecycle_guard)
+    publisher = threading.Thread(
+        target=lambda: named_account_credentials(home, "codex", "work").save(
+            OAuthTokens("new-access", "new-refresh", 9_999_999_999)
+        )
+    )
+    publisher.start()
+    assert publisher_waiting.wait(1)
+    try:
+        response = await asyncio.wait_for(
+            _request(
+                reader,
+                writer,
+                "accounts-list",
+                "slash_run",
+                {"session_id": sid, "text": "/accounts"},
+            ),
+            0.25,
+        )
+        assert response[-1]["result"]["kind"] == "output"
+    finally:
+        release.set()
+        holder.join()
+        publisher.join()
         await _close(server, writer)
 
 

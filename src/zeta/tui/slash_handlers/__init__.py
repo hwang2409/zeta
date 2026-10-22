@@ -11,7 +11,8 @@ from pathlib import Path
 
 from prompt_toolkit.enums import EditingMode
 
-from ...accounts import AccountError
+from ...accounts import AccountError, SessionAccountContext
+from ...accounts.store import AccountDisplay, rename_account_command
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
 from ...core.session import SessionError, env_home, normalize_session_name
@@ -171,11 +172,32 @@ class SlashHandlerMixin:
     def model_picker_active(self) -> bool:
         return self._model_picker is not None
 
+    def _show_accounts_picker(
+        self, context: SessionAccountContext, displays: list[AccountDisplay]
+    ) -> str:
+        defaults = {
+            provider: account
+            for provider in ("anthropic", "codex")
+            if (account := context.store.default(provider)) is not None
+        }
+        self._dismiss_accounts_picker()
+        picker = AccountsPicker(
+            tuple(item.account for item in displays),
+            context.snapshot(),
+            defaults,
+            {item.account: item.detail for item in displays if item.detail},
+            {item.account: item.label for item in displays},
+        )
+        self._accounts_picker = picker
+        self._accounts_picker_unit = self._presenter.print_unit(picker.render())
+        self._invalidate_prompt()
+        return ""
+
     def slash_accounts(self, args: str) -> str:
         """List named accounts and open the current-session switcher."""
 
-        if args.strip():
-            return "usage: /accounts"
+        if args.split():
+            return rename_account_command(self.loop.account_context.store, args)
         if self.active or self.pending_approvals:
             return "accounts unavailable: cannot switch while a turn or approval is active"
         context = getattr(self.loop, "account_context", None)
@@ -183,20 +205,10 @@ class SlashHandlerMixin:
             return "accounts unavailable for this session"
         if context.switching_unavailable is not None:
             return context.switching_unavailable
-        accounts = tuple(context.store.list())
-        if not accounts:
+        displays = context.store.list_display()
+        if not displays:
             return "no accounts; run zeta login <provider> --account <name>"
-        defaults = {
-            provider: account
-            for provider in ("anthropic", "codex")
-            if (account := context.store.default(provider)) is not None
-        }
-        self._dismiss_accounts_picker()
-        picker = AccountsPicker(accounts, context.snapshot(), defaults)
-        self._accounts_picker = picker
-        self._accounts_picker_unit = self._presenter.print_unit(picker.render())
-        self._invalidate_prompt()
-        return ""
+        return self._show_accounts_picker(context, displays)
 
     @property
     def accounts_picker_active(self) -> bool:
@@ -230,6 +242,17 @@ class SlashHandlerMixin:
             return
         picker.defaults[account.provider] = account
         self._repaint_accounts_picker()
+
+    def accounts_picker_rename(self) -> None:
+        picker = self._accounts_picker
+        session = self._active_session
+        if picker is None or session is None:
+            return
+        account = picker.highlighted
+        self._dismiss_accounts_picker()
+        session.default_buffer.reset()
+        session.default_buffer.insert_text(f"/accounts rename {account} ")
+        self._invalidate_prompt()
 
     def accounts_picker_select(self) -> None:
         picker = self._accounts_picker

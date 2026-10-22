@@ -11,7 +11,7 @@ from rich.text import Text
 from ...accounts import AccountId
 from .. import theme
 
-HINT = "↑/↓ move · enter switch · d set default · esc cancel"
+HINT = "↑/↓ move · enter switch · d set default · n rename · esc cancel"
 
 
 @dataclass
@@ -19,6 +19,8 @@ class AccountsPicker:
     accounts: tuple[AccountId, ...]
     selected: dict[str, AccountId]
     defaults: dict[str, AccountId]
+    details: dict[AccountId, str] | None = None
+    labels: dict[AccountId, str] | None = None
     index: int = 0
 
     @property
@@ -32,10 +34,16 @@ class AccountsPicker:
         rows: list[Text] = [Text("select an account", style=theme.COMMAND)]
         for position, account in enumerate(self.accounts):
             highlighted = position == self.index
+            label = (self.labels or {}).get(account, account.name)
             line = Text.assemble(
                 ("❯ " if highlighted else "  ", theme.ACCENT),
-                (str(account), theme.COMMAND if highlighted else theme.BODY),
+                (
+                    f"{account.provider}:{label}",
+                    theme.COMMAND if highlighted else theme.BODY,
+                ),
             )
+            if self.details and (detail := self.details.get(account)):
+                line.append(f"  {detail}", style=theme.DIM)
             markers = []
             if self.selected.get(account.provider) == account:
                 markers.append("current")

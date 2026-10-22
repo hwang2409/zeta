@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import contextmanager
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
@@ -95,6 +96,7 @@ from zeta.tui.composer import (
     build_key_bindings,
     parse_input,
 )
+from zeta.tui.slash_handlers.accounts_picker import AccountsPicker
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -12077,3 +12079,77 @@ def test_accounts_command_lists_and_switches(tmp_path: Path) -> None:
         "codex": "codex:second"
     }
     opened.store.close()
+
+
+def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, "codex", "work").save(
+        OAuthTokens("access", "refresh", 9_999_999_999, email="henry@example.com")
+    )
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    context = SessionAccountContext.load(home, manager, opened.metadata)
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = Mock()
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_lifecycle_lock() -> None:
+        with AccountStore(home).lifecycle_guard(account):
+            locked.set()
+            release.wait(1)
+
+    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder.start()
+    assert locked.wait(1)
+    publisher_waiting = threading.Event()
+    original_lifecycle_guard = AccountStore._lifecycle_guard
+
+    @contextmanager
+    def waiting_lifecycle_guard(store, home_fd, guarded_account, *, wait=True):
+        publisher_waiting.set()
+        with original_lifecycle_guard(store, home_fd, guarded_account, wait=wait):
+            yield
+
+    monkeypatch.setattr(AccountStore, "_lifecycle_guard", waiting_lifecycle_guard)
+    publisher = threading.Thread(
+        target=lambda: named_account_credentials(home, "codex", "work").save(
+            OAuthTokens("new-access", "new-refresh", 9_999_999_999)
+        )
+    )
+    publisher.start()
+    assert publisher_waiting.wait(1)
+    started = time.monotonic()
+    try:
+        assert app.slash_accounts("") == ""
+        assert time.monotonic() - started < 0.15
+    finally:
+        release.set()
+        holder.join()
+        publisher.join()
+        opened.store.close()
+
+
+def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    picker = AccountsPicker(
+        (account,),
+        {"codex": account},
+        {"codex": account},
+        {account: "henry@example.com"},
+        {account: "henry"},
+    )
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=80).print(picker.render())
+    plain = Text.from_ansi(output.getvalue()).plain
+
+    assert "codex:henry" in plain
+    assert "henry@example.com" in plain
+    assert "n rename" in plain

@@ -2,7 +2,7 @@
 
 ## status
 
-design only. no implementation is part of this document.
+phase 1 account storage, selection, mutable display labels, and offline identity display are implemented. usage and exhaustion recovery remain later work.
 
 ## problem and v1 outcome
 
@@ -31,8 +31,9 @@ explicit mode, and ollama has no oauth store ([`factory.py:41-73`](../src/zeta/p
 
 `zeta login` currently builds a provider-specific browser pkce flow and stores one
 credential path per provider ([`providers/login.py:50-73`](../src/zeta/providers/login.py#L50-L73)).
-the oauth record has `version`, `access_token`, `refresh_token`, and `expires_at`;
-account metadata and usage must never contain token fields. the shared oauth store
+the oauth record has `version`, `access_token`, `refresh_token`, `expires_at`,
+and optional offline `email` or `workspace` display metadata; account metadata
+and usage must never contain token fields. the shared oauth store
 refreshes and atomically replaces its file ([`oauth.py:499-605`](../src/zeta/oauth.py#L499-L605)).
 The account store must use the stricter session-file pattern: pinned parent,
 `O_NOFOLLOW | O_NONBLOCK`, regular-file and link-count checks, same-directory
@@ -67,34 +68,51 @@ error, and no bootstrap token is copied into metadata or usage state.
 
 ## identity and storage
 
-an `AccountId` is `(provider, name)`, displayed as `anthropic:work` or
-`codex:personal`. provider is `anthropic` or `codex`. name is a lower-case,
-case-insensitive slug of 1–32 ascii letters, digits, `_`, or `-`; `.` and `..`
-are invalid. provider-returned email, workspace, or account id is display
-metadata only. one account owns one oauth token set, lifecycle lock, usage state,
-and local name.
+an `AccountId` is the immutable `(provider, id)` stored by sessions and
+automations. provider is `anthropic` or `codex`. the id and mutable display label
+use lower-case, case-insensitive slugs of 1–32 ascii letters, digits, `_`, or
+`-`; `.` and `..` are invalid. rows display `provider:label`. labels are unique
+per provider across both ids and labels, so a reference is never ambiguous.
+provider-returned email, workspace, or account id is display metadata only. one
+account owns one oauth token set, lifecycle lock, usage state, immutable id, and
+mutable label.
 
 ```text
 ~/.zeta/
   accounts.json
   accounts/
-    anthropic/<name>/oauth.json
-    anthropic/<name>/usage.json
-    codex/<name>/oauth.json
-    codex/<name>/usage.json
+    anthropic/<id>/oauth.json
+    anthropic/<id>/usage.json
+    codex/<id>/oauth.json
+    codex/<id>/usage.json
 ```
 
-`accounts.json` contains the schema, display metadata, and one global default
-per provider. it is the sole owner of the account catalog and defaults. each
+`accounts.json` contains the schema and one global default per provider. it is
+the sole owner of the account catalog and defaults. provider email or workspace
+is retained only when it is already present in the OAuth response and is shown
+as optional display metadata; it is never an account identifier. each
 session's `meta.json` is the sole owner of which account that session uses and
 of its per-provider native-context boundary; it also stores the session's
-monotonic switch sequence. `oauth.json` contains only the existing four token
-fields. `usage.json` contains
+monotonic switch sequence. `oauth.json` contains the token fields plus optional
+`email` and `workspace` display fields. `usage.json` contains
 the normalized snapshot and refresh-attempt state. files are `0600`; directories
 are `0700`. secrets, auth headers, authorization codes, provider bodies, and
 exception text never enter logs, notices, model input, transcripts, tool results,
 or serve responses. serve login already uses fixed safe error messages
 ([`server/login.py:72-97`](../src/zeta/server/login.py#L72-L97)).
+
+## labels
+
+`zeta login <provider>` asks for a display label; the first account for that
+provider offers `default`. an explicit label is available with `--account`, and
+replacing an existing label requires `--replace`. the immutable id is derived
+from the label when the account is created.
+
+`zeta accounts rename <provider>:<id-or-label> <new-label>` and `n` in
+`/accounts` change only the registry label. credential and lock directories,
+global defaults, saved session pins, and approved automation revisions keep the
+same immutable `AccountId`. command arguments and `--account` accept either the
+id or label.
 
 ## crash-safe legacy migration
 
@@ -182,9 +200,8 @@ zeta accounts logout anthropic:work
 saved selection at load (see the session-load rule above). `switch` is reserved for
 an attached tui or serve session and always targets that session. there is no
 legacy `--provider` alias. one login flow per provider is allowed at a time;
-adding another account is sequential. an existing account requires confirmation
-in a terminal and `--replace` in non-interactive use. logout is local only in
-v1; remote revocation and rename are later work.
+adding another account is sequential. an existing account requires `--replace`.
+logout is local only in v1; remote revocation is later work.
 
 ## usage sources and verification gate
 

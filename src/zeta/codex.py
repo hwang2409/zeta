@@ -161,7 +161,17 @@ async def exchange_authorization_code(
     expires_in = value.get("expires_in", value.get("expiresIn"))
     if not access or not refresh or type(expires_in) not in {int, float}:
         raise CodexAuthError("Codex OAuth code response is invalid")
-    return OAuthTokens(access, refresh, time.time() + float(expires_in) - 300)
+    identity = _first_string(value, "id_token", "idToken")
+    claims = _jwt_payload(identity) if identity else {}
+    email = _first_string(claims, "email")
+    workspace = _first_string(claims, "organization_name", "workspace")
+    return OAuthTokens(
+        access,
+        refresh,
+        time.time() + float(expires_in) - 300,
+        email,
+        workspace,
+    )
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:

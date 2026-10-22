@@ -13,10 +13,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..accounts.store import rename_account_command
 from ..core.commands.custom_commands import CustomCommand
 from ..core.project_context import discover_repo_root
 from ..core.slash import (
     MODEL_CONTEXT_WINDOWS,
+    SlashCommand,
     SlashCommandRegistry,
     SlashStatus,
     compaction_history,
@@ -151,6 +153,20 @@ class ServerSlashSession:
                 else None
             ),
         )
+
+    def slash_accounts(self, args: str) -> str:
+        """List accounts or change one display label."""
+
+        context = getattr(self._runtime.loop, "account_context", None)
+        if context is None:
+            return "accounts unavailable for this session"
+        if args.split():
+            return rename_account_command(context.store, args)
+        displays = context.store.list_display()
+        return "\n".join(
+            str(item) + (f"  {item.detail}" if item.detail else "")
+            for item in displays
+        ) or "no accounts"
 
     def slash_model(self, args: str) -> str:
         """Switch models directly, or report the current model to the client."""
@@ -338,6 +354,9 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
         zeta_home=runtime.home,
         project_dir=project_dir,
         skill_catalog=catalog,
+        extra_commands=(
+            SlashCommand("accounts", lambda session, args: session.slash_accounts(args), "list or label accounts"),
+        ),
     )
 
 
@@ -370,8 +389,11 @@ async def run_command(
         raise ProtocolError(-32602, "text must name a command")
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
-    if (name == "vim" and tail.strip().lower() in {"on", "off", "toggle"}) or name == "compact" or (
-        name == "model" and tail.strip()
+    if (
+        (name == "vim" and tail.strip().lower() in {"on", "off", "toggle"})
+        or name == "compact"
+        or (name == "model" and tail.strip())
+        or (name == "accounts" and tail.strip())
     ):
         # Guard mutation-capable dispatch on the same seam session-mutation
         # RPCs use. Without this, `/compact` or `/model <name>` could edit
