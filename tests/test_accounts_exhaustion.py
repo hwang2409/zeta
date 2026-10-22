@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from tests.support.credentials import named_account_credentials
 from zeta.accounts import AccountId, AccountStore
@@ -99,3 +103,30 @@ def test_switch_never_replays_failed_request() -> None:
 def test_child_limit_failure_never_switches_parent() -> None:
     limit = SubscriptionLimit(ACCOUNT, NOW + timedelta(hours=1), 10080)
     assert limit.recovery_event(frozen=True, alternatives=(AccountId("codex", "other"),))["action"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_limit_recovery_does_not_block_event_loop_while_usage_lock_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.accounts.session import SessionAccountContext
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_recovery(_self: object, _failure: object) -> None:
+        entered.set()
+        release.wait(timeout=2)
+
+    monkeypatch.setattr(SessionAccountContext, "_subscription_limit_event", blocking_recovery)
+    context = SessionAccountContext.__new__(SessionAccountContext)
+    task = asyncio.create_task(context.subscription_limit_event(object()))
+    await asyncio.sleep(0)
+    assert entered.wait(timeout=1)
+    ticks = 0
+    for _ in range(3):
+        await asyncio.sleep(0)
+        ticks += 1
+    assert ticks == 3
+    release.set()
+    await task

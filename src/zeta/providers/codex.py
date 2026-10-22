@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
 
+from ..accounts.exhaustion import classify_subscription_limit
 from ..codex import (
     CODEX_API_URL,
     DEFAULT_CODEX_MODEL,
@@ -278,14 +279,12 @@ class CodexBackend(CompletionBackend):
             try:
                 if response.status_code >= 400:
                     body = await _read_error_body(response)
-                    failure = _http_error(response.status_code, body, response.headers)
-                    account = getattr(self.token_store, "account", None)
-                    if account is not None:
-                        from ..accounts.exhaustion import classify_subscription_limit
-
-                        limit = classify_subscription_limit("codex", account, failure)
-                        if limit is not None:
-                            failure.subscription_limit = limit
+                    failure = _http_error(
+                        response.status_code,
+                        body,
+                        response.headers,
+                        account=getattr(self.token_store, "account", None),
+                    )
                     raise failure
                 async for event in _decode_response(
                     response,
@@ -356,6 +355,8 @@ def _http_error(
     status_code: int,
     body: bytes,
     headers: Mapping[str, str] | None = None,
+    *,
+    account: Any = None,
 ) -> CodexBackendError:
     error_type = CodexAuthError if status_code in {401, 403} else CodexHTTPError
     excerpt = error_body_excerpt(body)
@@ -372,6 +373,10 @@ def _http_error(
         retry_after=retry_after,
         response_body=body,
     )
+    if account is not None:
+        limit = classify_subscription_limit("codex", account, error)
+        if limit is not None:
+            error.subscription_limit = limit
     if status_code == 400:
         try:
             payload = json.loads(body)

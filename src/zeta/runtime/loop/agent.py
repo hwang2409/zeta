@@ -981,7 +981,7 @@ class AgentLoop(
                 limit_data = None
                 account_context = getattr(self, "account_context", None)
                 if account_context is not None:
-                    limit_data = account_context.subscription_limit_event(source)
+                    limit_data = await account_context.subscription_limit_event(source)
                 if limit_data is not None:
                     local_reset = limit_data["reset_local"]
                     provider_error = replace(

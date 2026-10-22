@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -178,7 +179,10 @@ class SessionAccountContext:
         self._pins = {**self._pins, account.provider: account}
         self._switch_sequences = dict(self.metadata.account_switch_sequences)
 
-    def subscription_limit_event(self, failure: object) -> dict[str, object] | None:
+    async def subscription_limit_event(self, failure: object) -> dict[str, object] | None:
+        return await asyncio.to_thread(self._subscription_limit_event, failure)
+
+    def _subscription_limit_event(self, failure: object) -> dict[str, object] | None:
         provider = self._active_provider
         if provider is None or api_key_mode(provider):
             return None
