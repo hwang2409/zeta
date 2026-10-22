@@ -33,31 +33,37 @@ class AccountsPicker:
     def move(self, delta: int) -> None:
         self.index = (self.index + delta) % len(self.accounts)
 
+    def _render_account_row(self, account: AccountId, position: int) -> list[Text]:
+        highlighted = position == self.index
+        label = (self.labels or {}).get(account, account.name)
+        line = Text.assemble(
+            ("❯ " if highlighted else "  ", theme.ACCENT),
+            (
+                f"{account.provider}:{label}",
+                theme.COMMAND if highlighted else theme.BODY,
+            ),
+        )
+        if self.details and (detail := self.details.get(account)):
+            line.append(f"  {detail}", style=theme.DIM)
+        markers = []
+        if self.selected.get(account.provider) == account:
+            markers.append("● current")
+        if self.defaults.get(account.provider) == account:
+            markers.append("★ default")
+        if markers:
+            line.append(f"  {'  '.join(markers)}", style=theme.DIM)
+        rows = [line]
+        if self.usages and (usage := self.usages.get(account)):
+            rows.extend(
+                Text(f"    {usage_line}", style=theme.DIM)
+                for usage_line in format_usage_lines(usage)
+            )
+        return rows
+
     def render(self) -> Panel:
         rows: list[Text] = [Text("select an account", style=theme.COMMAND)]
         for position, account in enumerate(self.accounts):
-            highlighted = position == self.index
-            label = (self.labels or {}).get(account, account.name)
-            line = Text.assemble(
-                ("❯ " if highlighted else "  ", theme.ACCENT),
-                (
-                    f"{account.provider}:{label}",
-                    theme.COMMAND if highlighted else theme.BODY,
-                ),
-            )
-            if self.details and (detail := self.details.get(account)):
-                line.append(f"  {detail}", style=theme.DIM)
-            markers = []
-            if self.selected.get(account.provider) == account:
-                markers.append("● current")
-            if self.defaults.get(account.provider) == account:
-                markers.append("★ default")
-            if markers:
-                line.append(f"  {'  '.join(markers)}", style=theme.DIM)
-            rows.append(line)
-            if self.usages and (usage := self.usages.get(account)):
-                for usage_line in format_usage_lines(usage):
-                    rows.append(Text(f"    {usage_line}", style=theme.DIM))
+            rows.extend(self._render_account_row(account, position))
         if self.refreshing:
             rows.append(Text("refreshing stale accounts…", style=theme.DIM))
         rows.append(Text(HINT, style=theme.AFFORDANCE))

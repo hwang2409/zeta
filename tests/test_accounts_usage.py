@@ -5,6 +5,7 @@ import base64
 import json
 import math
 import os
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from zeta.accounts.usage import (
     UsageSnapshot,
     UsageWindow,
     normalize_usage,
+    read_usage,
     usage_freshness,
 )
 from zeta.oauth import OAuthTokens
@@ -172,6 +174,94 @@ def test_refresh_is_sequential_one_request_per_account_and_respects_cooldown(
         "https://api.anthropic.com/api/oauth/usage",
         "https://chatgpt.com/backend-api/wham/usage",
     ]
+
+
+def test_refresh_has_total_deadline_and_releases_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = AccountStore(tmp_path)
+    account = AccountId("anthropic", "work")
+    _seed(store, account)
+    monkeypatch.setattr("zeta.accounts.usage.REQUEST_TIMEOUT_SECONDS", 0.05)
+
+    class Drip(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                yield b"x"
+                await asyncio.sleep(0.02)
+
+        async def aclose(self) -> None:
+            pass
+
+    usage = AccountUsage(
+        store,
+        clock=lambda: NOW,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=Drip())
+        ),
+    )
+    started = time.monotonic()
+    result = asyncio.run(usage.refresh_stale())[account]
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2
+    assert result.error == "usage request failed"
+    with store.lifecycle_guard(account):
+        pass
+
+
+def _write_in_flight(store: AccountStore, account: AccountId, started: datetime) -> None:
+    store._write_usage_bytes(
+        account,
+        (
+            json.dumps(
+                {
+                    "version": 1,
+                    "captured_at": NOW.isoformat(),
+                    "source": "usage_endpoint",
+                    "windows": [
+                        {
+                            "kind": "five_hour",
+                            "used_percent": 1,
+                            "window_minutes": 300,
+                            "resets_at": "2026-10-22T18:00:00Z",
+                        }
+                    ],
+                    "last_started_at": started.isoformat(),
+                    "last_finished_at": None,
+                    "outcome": "in_flight",
+                    "last_error": None,
+                }
+            )
+            + "\n"
+        ).encode(),
+    )
+
+
+def test_abandoned_in_flight_attempt_shows_safe_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = AccountStore(tmp_path)
+    account = AccountId("anthropic", "work")
+    _seed(store, account)
+    monkeypatch.setattr("zeta.accounts.usage.REQUEST_TIMEOUT_SECONDS", 0.05)
+    _write_in_flight(store, account, NOW - timedelta(seconds=2))
+
+    state = read_usage(store, account, now=NOW)
+    assert state.error == "usage request failed"
+
+
+def test_active_in_flight_attempt_is_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = AccountStore(tmp_path)
+    account = AccountId("anthropic", "work")
+    _seed(store, account)
+    monkeypatch.setattr("zeta.accounts.usage.REQUEST_TIMEOUT_SECONDS", 15)
+    _write_in_flight(store, account, NOW)
+
+    state = read_usage(store, account, now=NOW)
+    assert state.error is None
 
 
 def test_freshness_now_stale_unknown() -> None:

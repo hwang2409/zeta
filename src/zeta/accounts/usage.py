@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from collections.abc import Callable, Mapping
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 FRESH_FOR = timedelta(minutes=15)
 REFRESH_COOLDOWN = timedelta(seconds=60)
 REQUEST_TIMEOUT_SECONDS = 15.0
+IN_FLIGHT_GRACE_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +168,14 @@ def read_usage(store: AccountStore, account: AccountId, *, now: datetime | None 
             "usage request failed",
         }:
             raise ValueError
+        if (
+            outcome == "in_flight"
+            and attempt is not None
+            and now - attempt > timedelta(
+                seconds=REQUEST_TIMEOUT_SECONDS + IN_FLIGHT_GRACE_SECONDS
+            )
+        ):
+            error = "usage request failed"
         return UsageState(snapshot, usage_freshness(snapshot, now), error, attempt)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return UsageState(None, "usage unknown", "invalid usage response")
@@ -223,7 +233,9 @@ class AccountUsage:
             self._write(account, state.snapshot, now, None, "in_flight")
             error: str | None = None
             try:
-                response = await self._request(account, home_fd, client)
+                response = await asyncio.wait_for(
+                    self._request(account, home_fd, client), REQUEST_TIMEOUT_SECONDS
+                )
                 if response.status_code in {401, 403}:
                     error = "authentication failed"
                 elif response.status_code == 429:
@@ -302,12 +314,6 @@ def format_usage_lines(state: UsageState) -> tuple[str, ...]:
     if state.snapshot is None:
         lines = ["usage unknown"]
     else:
-        labels = {
-            "five_hour": "5h",
-            "seven_day": "7d",
-            "primary": "primary",
-            "secondary": "secondary",
-        }
         now = datetime.now().astimezone()
         lines = []
         for window in state.snapshot.windows:
@@ -319,12 +325,20 @@ def format_usage_lines(state: UsageState) -> tuple[str, ...]:
             )
             percent = f"{window.used_percent:g}%"
             lines.append(
-                f"{labels[window.kind]} {percent} · resets {reset_text}"
+                f"{_window_label(window)} {percent} · resets {reset_text}"
             )
         lines.append(state.freshness)
     if state.error:
         lines.append(f"refresh failed: {state.error}")
     return tuple(lines)
+
+
+def _window_label(window: UsageWindow) -> str:
+    if window.window_minutes % (24 * 60) == 0:
+        return f"{window.window_minutes // (24 * 60)}d"
+    if window.window_minutes % 60 == 0:
+        return f"{window.window_minutes // 60}h"
+    return f"{window.window_minutes}m"
 
 
 def usage_json(state: UsageState) -> dict[str, object]:

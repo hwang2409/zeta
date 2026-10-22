@@ -58,6 +58,7 @@ from tests.support.credentials import (
 )
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import AccountId, AccountStore, AccountUsage, SessionAccountContext
+from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
@@ -12136,6 +12137,23 @@ def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
         holder.join()
         publisher.join()
         opened.store.close()
+
+
+def test_accounts_panel_labels_codex_primary_as_seven_day() -> None:
+    account = AccountId("codex", "work")
+    state = UsageState(
+        UsageSnapshot(
+            datetime.now(UTC),
+            "usage_endpoint",
+            (UsageWindow("primary", 6, 10_080, datetime.now(UTC)),),
+        ),
+        "now",
+    )
+    picker = AccountsPicker((account,), {}, {}, usages={account: state})
+    output = StringIO()
+    _test_console(output).print(picker.render())
+
+    assert "7d 6%" in output.getvalue()
 
 
 @pytest.mark.asyncio
