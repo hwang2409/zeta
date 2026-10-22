@@ -5962,7 +5962,8 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
     finish_calls = 0
 
     async def fake_consume_child(child_loop, prompt, **kwargs):
-        del child_loop, kwargs
+        del child_loop
+        await _ack_fake_delivery(child_store, kwargs)
         prompts.append(prompt)
         return {
             "content": [
@@ -9097,6 +9098,16 @@ async def test_explicit_finish_blocked_and_failed_map_to_receipts(
     assert failed["content"][0]["text"].startswith("failed: tests failed")
 
 
+async def _ack_fake_delivery(
+    store: ConversationStore, kwargs: dict[str, object]
+) -> None:
+    prompt_id = kwargs.get("delivering_prompt_id")
+    if isinstance(prompt_id, str):
+        await store.acknowledge_pending_prompt_messages(
+            [], prompt_ids=(prompt_id,)
+        )
+
+
 def _reminder_loop(tmp_path: Path) -> tuple[ConversationStore, ToolRegistry, _ExplicitFinishLoop]:
     store, registry, loop = _explicit_finish_registry(tmp_path)
     store.start_agent_lifecycle(
@@ -9128,6 +9139,7 @@ async def test_real_input_wins_over_immediate_reminder(
     loop._terminal_transition_fence.reserve_idle_nudge = reserve
 
     async def consume(_loop, prompt, **kwargs):
+        await _ack_fake_delivery(store, kwargs)
         calls.append(prompt)
         return {
             "content": [{"type": "text", "text": "reply"}],
@@ -9177,6 +9189,7 @@ async def test_no_immediate_reminder_while_child_owns_running_task_or_live_child
     idle_waiting = asyncio.Event()
 
     async def consume(_loop, prompt, **kwargs):
+        await _ack_fake_delivery(store, kwargs)
         prompts.append(prompt)
         return {
             "content": [{"type": "text", "text": "reply"}],
@@ -9217,6 +9230,7 @@ async def test_reminder_not_repeated_when_child_ends_again_without_finish(
     release_idle = asyncio.Event()
 
     async def consume(_loop, prompt, **kwargs):
+        await _ack_fake_delivery(store, kwargs)
         prompts.append(prompt)
         return {
             "content": [{"type": "text", "text": "reply"}],
@@ -9252,6 +9266,7 @@ async def test_reminded_child_that_calls_finish_completes_with_report(
     prompts: list[str] = []
 
     async def consume(_loop, prompt, **kwargs):
+        await _ack_fake_delivery(store, kwargs)
         prompts.append(prompt)
         if prompt == run_consumer_module._IMMEDIATE_FINISH_REMINDER:
             result = await registry.execute(
@@ -9318,6 +9333,7 @@ async def test_cancel_or_accepted_finish_racing_reminder_admission(
         return True
 
     async def consume(_loop, prompt, **kwargs):
+        await _ack_fake_delivery(store, kwargs)
         prompts.append(prompt)
         return {
             "content": [{"type": "text", "text": "reply"}],
@@ -9382,6 +9398,7 @@ async def test_immediate_reminder_counts_toward_nudge_limit(
         return True
 
     async def consume(_loop, prompt, **kwargs):
+        await _ack_fake_delivery(store, kwargs)
         prompts.append(prompt)
         return {
             "content": [{"type": "text", "text": "reply"}],
@@ -9419,6 +9436,7 @@ async def test_non_explicit_finish_child_gets_no_reminder(
     prompts: list[str] = []
 
     async def consume(_loop, prompt, **kwargs):
+        await _ack_fake_delivery(store, kwargs)
         prompts.append(prompt)
         return {
             "content": [{"type": "text", "text": "reply"}],
@@ -9544,6 +9562,7 @@ async def test_idle_child_is_running_during_wake_turn(
 
     async def fake_consume(_loop, _prompt, **kwargs):
         nonlocal calls
+        await _ack_fake_delivery(child_store, kwargs)
         calls += 1
         if calls == 2:
             wake_started.set()
@@ -9580,7 +9599,10 @@ async def test_idle_child_is_running_during_wake_turn(
 
     release_wake.set()
     async def wait_for_new_idle() -> None:
-        while child_store.agent_lifecycle().get("idle_since") == first_idle_since:
+        while (
+            child_store.agent_lifecycle().get("state") != "idle"
+            or child_store.agent_lifecycle().get("idle_since") == first_idle_since
+        ):
             await asyncio.sleep(0)
 
     await asyncio.wait_for(wait_for_new_idle(), timeout=2)
@@ -9630,6 +9652,7 @@ async def test_idle_child_wakes_for_task_and_child_completion_only(
     turns: list[MessageOrigin] = []
 
     async def fake_consume(_loop, _prompt, *, origin, **kwargs):
+        await _ack_fake_delivery(store, kwargs)
         turns.append(origin)
         if kwargs.get("notification_turn"):
             for entry in store.agent_notifications():
@@ -9716,6 +9739,7 @@ async def _idle_nudge_run(
     prompts: list[str] = []
 
     async def fake_consume(_loop, prompt, **kwargs):
+        await _ack_fake_delivery(store, kwargs)
         prompts.append(prompt)
         done = finish_after_calls is not None and len(prompts) >= finish_after_calls
         if not done:
