@@ -126,46 +126,51 @@ class FinishGateState:
     ) -> FinishGateResult | None:
         owner = child_loop._background_owner
         loop = asyncio.get_running_loop()
-        tasks_were_running = bool(self.owned_tasks(child_loop))
+        task_registry = child_loop.tool_registry.background_tasks
+        task_running_at_entry = bool(self.owned_tasks(child_loop))
+        task_start_generation = task_registry.task_start_generation
         deadline = loop.time() + owner.finish_gate_timeout
         if self.task_outlived_child_bound:
             deadline = self._task_deadline()
-        elif tasks_were_running:
+        elif task_running_at_entry:
             deadline = min(deadline, self._task_deadline())
         try:
             async with asyncio.timeout_at(deadline):
-                await consume_events(events, self.control)
+                try:
+                    await consume_events(events, self.control)
+                finally:
+                    close = getattr(events, "aclose", None)
+                    if close is not None:
+                        await close()
         except TimeoutError:
-            return self._model_timeout_result(
-                child_loop, tasks_were_running=tasks_were_running
+            task_existed = (
+                task_running_at_entry
+                or task_registry.task_start_generation != task_start_generation
             )
-        finally:
-            close = getattr(events, "aclose", None)
-            if close is not None:
-                await close()
-        return self._model_turn_result(
-            child_loop, tasks_were_running=tasks_were_running
+            return self._model_timeout_result(child_loop, task_existed=task_existed)
+        task_existed = (
+            task_running_at_entry
+            or task_registry.task_start_generation != task_start_generation
         )
+        return self._model_turn_result(task_existed=task_existed)
 
     def _model_timeout_result(
-        self, child_loop: AgentLoop, *, tasks_were_running: bool
+        self, child_loop: AgentLoop, *, task_existed: bool
     ) -> FinishGateResult | None:
         tasks = self.owned_tasks(child_loop)
         if tasks and asyncio.get_running_loop().time() >= self._task_deadline():
             return _task_safety_expired()
-        if tasks or tasks_were_running:
+        if task_existed:
             return None
         return _model_bound_expired()
 
-    def _model_turn_result(
-        self, child_loop: AgentLoop, *, tasks_were_running: bool
-    ) -> FinishGateResult | None:
+    def _model_turn_result(self, *, task_existed: bool) -> FinishGateResult | None:
         control = self._control()
         if control.handoff is not None:
             return FinishGateResult("handed_off", handoff=control.handoff)
         if control.turns < control.max_turns:
             return None
-        if self.owned_tasks(child_loop) or tasks_were_running:
+        if task_existed:
             self.turns_exhausted_with_task = True
             return None
         return FinishGateResult(

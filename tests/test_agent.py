@@ -2421,7 +2421,7 @@ async def test_finish_gate_model_timeout_defers_task_exit_during_cancellation(
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.01)
     task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=True)
-    registry = SimpleNamespace(snapshot=lambda: (task,))
+    registry = SimpleNamespace(snapshot=lambda: (task,), task_start_generation=1)
     child_loop = SimpleNamespace(
         _background_owner=owner,
         agent_instance_id="child-1",
@@ -2459,7 +2459,7 @@ async def test_finish_gate_turn_cap_defers_task_exit_during_stream_close(
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store, finish_gate_max_turns=1)
     task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=True)
-    registry = SimpleNamespace(snapshot=lambda: (task,))
+    registry = SimpleNamespace(snapshot=lambda: (task,), task_start_generation=1)
     child_loop = SimpleNamespace(
         _background_owner=owner,
         agent_instance_id="child-1",
@@ -2498,6 +2498,99 @@ async def test_finish_gate_turn_cap_defers_task_exit_during_stream_close(
 
 
 @pytest.mark.asyncio
+async def test_finish_gate_counts_task_started_and_exited_during_model_step(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store, finish_gate_max_turns=1)
+    task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=False)
+    registry = SimpleNamespace(snapshot=lambda: (task,), task_start_generation=0)
+    child_loop = SimpleNamespace(
+        _background_owner=owner,
+        agent_instance_id="child-1",
+        tool_registry=SimpleNamespace(background_tasks=registry),
+    )
+    state = FinishGateState()
+    state.start(child_loop)
+
+    class Events:
+        def __aiter__(self) -> AsyncIterator[StreamEvent]:
+            return self
+
+        async def __anext__(self) -> StreamEvent:
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            task.running = False
+
+    async def consume(
+        stream: AsyncIterator[StreamEvent], control: FinishGateControl | None
+    ) -> None:
+        del stream
+        task.running = True
+        registry.task_start_generation += 1
+        assert control is not None
+        assert control.turn_ended()
+
+    result = await state.run_model_turn(child_loop, Events(), consume)
+
+    assert result is None
+    assert state.turns_exhausted_with_task
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_task_deadline_bounds_stream_close(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(
+        store, finish_gate_timeout=1, finish_gate_task_timeout=0.03
+    )
+    task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=True)
+    registry = SimpleNamespace(snapshot=lambda: (task,), task_start_generation=1)
+    child_loop = SimpleNamespace(
+        _background_owner=owner,
+        agent_instance_id="child-1",
+        tool_registry=SimpleNamespace(background_tasks=registry),
+    )
+    state = FinishGateState()
+    state.start(child_loop)
+    close_started = asyncio.Event()
+    close_cancelled = asyncio.Event()
+
+    class Events:
+        def __aiter__(self) -> AsyncIterator[StreamEvent]:
+            return self
+
+        async def __anext__(self) -> StreamEvent:
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            close_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                close_cancelled.set()
+                raise
+
+    async def consume(
+        stream: AsyncIterator[StreamEvent], control: FinishGateControl | None
+    ) -> None:
+        del stream, control
+
+    started = asyncio.get_running_loop().time()
+    result = await asyncio.wait_for(
+        state.run_model_turn(child_loop, Events(), consume), timeout=0.15
+    )
+
+    assert close_started.is_set()
+    assert close_cancelled.is_set()
+    assert asyncio.get_running_loop().time() - started < 0.15
+    assert result is not None
+    assert result.outcome == "task_safety_expired"
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_finish_gate_uses_task_deadline_to_deliver_late_task_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2505,7 +2598,7 @@ async def test_finish_gate_uses_task_deadline_to_deliver_late_task_exit(
     owner = BackgroundAgentOwner(
         store, finish_gate_timeout=0.01, finish_gate_task_timeout=10
     )
-    registry = SimpleNamespace(snapshot=tuple)
+    registry = SimpleNamespace(snapshot=tuple, task_start_generation=0)
     child_loop = SimpleNamespace(
         _background_owner=owner,
         agent_instance_id="child-1",

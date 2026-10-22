@@ -83,11 +83,13 @@ async def test_real_background_producers_preserve_owner_on_start_and_exit(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     notices = []
     registry.background_tasks.set_notice_sink(notices.append)
+    assert registry.background_tasks.task_start_generation == 0
     result = await registry.execute(
         ToolCall("start", tool_name, arguments),
         _background=background,
     )
     task_id = result["structuredContent"]["task_id"]
+    assert registry.background_tasks.task_start_generation == 1
     await _wait_for_exit(registry.background_tasks, task_id)
     lifecycle = [notice for notice in notices if notice.task_id == task_id]
     assert [notice.phase for notice in lifecycle] == ["started", "natural_exit"]
