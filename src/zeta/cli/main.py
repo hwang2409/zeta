@@ -406,20 +406,24 @@ def _run_login(
         )
 
 
+def _login_label(args: argparse.Namespace) -> str:
+    if args.account is not None:
+        return args.account
+    if not sys.stdin.isatty():
+        raise AccountError("account label required; use --account <label>")
+    store = AccountStore(env_home())
+    store.migrate()
+    first = not any(item.provider == args.provider for item in store.list())
+    prompt = "account label [default]: " if first else "account label: "
+    label = input(prompt).strip() or ("default" if first else "")
+    if not label:
+        raise AccountError("account label is required")
+    return label
+
+
 def _handle_login(args: argparse.Namespace) -> int:
     try:
-        account_label = args.account
-        if account_label is None:
-            if not sys.stdin.isatty():
-                raise AccountError("account label required; use --account <label>")
-            store = AccountStore(env_home())
-            store.migrate()
-            first = not any(item.provider == args.provider for item in store.list())
-            prompt = "account label [default]: " if first else "account label: "
-            account_label = input(prompt).strip() or ("default" if first else "")
-            if not account_label:
-                raise AccountError("account label is required")
-        handle = _run_login(args.provider, account_label, args.replace)
+        handle = _run_login(args.provider, _login_label(args), args.replace)
     except KeyboardInterrupt:
         print("login cancelled", file=sys.stderr)
         return 1
@@ -431,6 +435,45 @@ def _handle_login(args: argparse.Namespace) -> int:
         return 1
     print(f"logged in as {handle}" if handle else "ok")
     return 0
+
+
+def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
+    accounts = store.list_display()
+    if as_json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "account": str(item),
+                        "id": str(item.account),
+                        "detail": item.detail,
+                    }
+                    for item in accounts
+                ]
+            )
+        )
+        return
+    print(
+        "\n".join(
+            str(item) + (f"  {item.detail}" if item.detail else "")
+            for item in accounts
+        )
+    )
+
+
+def _run_accounts_action(store: AccountStore, args: argparse.Namespace) -> None:
+    if args.action == "default":
+        if not args.account:
+            raise AccountError("default requires provider:name")
+        store.set_default(store.resolve_qualified_reference(args.account))
+        return
+    if args.action == "rename":
+        if not args.account or not args.new_label:
+            raise AccountError("rename requires provider:old and a new label")
+        account = store.resolve_qualified_reference(args.account)
+        print(store.rename(account, args.new_label))
+        return
+    _print_accounts(store, as_json=args.json)
 
 
 def _handle_accounts(args: argparse.Namespace) -> int:
@@ -445,42 +488,10 @@ def _handle_accounts(args: argparse.Namespace) -> int:
                 replace=args.replace,
             )
         )
-    store = AccountStore(env_home())
     try:
+        store = AccountStore(env_home())
         store.migrate()
-        if args.action == "default":
-            if not args.account or ":" not in args.account:
-                raise AccountError("default requires provider:name")
-            provider, name = args.account.split(":", 1)
-            store.set_default(store.resolve_reference(provider, name))
-        elif args.action == "rename":
-            if not args.account or ":" not in args.account or not args.new_label:
-                raise AccountError("rename requires provider:old and a new label")
-            provider, name = args.account.split(":", 1)
-            print(store.rename(store.resolve_reference(provider, name), args.new_label))
-        else:
-            accounts = store.list_display()
-            if args.json:
-                print(
-                    json.dumps(
-                        [
-                            {
-                                "account": str(item),
-                                "id": str(item.account),
-                                "detail": item.detail,
-                            }
-                            for item in accounts
-                        ]
-                    )
-                )
-            else:
-                print(
-                    "\n".join(
-                        str(item)
-                        + (f"  {item.detail}" if item.detail else "")
-                        for item in accounts
-                    )
-                )
+        _run_accounts_action(store, args)
         return 0
     except (AccountError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

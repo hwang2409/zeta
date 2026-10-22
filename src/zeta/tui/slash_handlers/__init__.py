@@ -171,21 +171,22 @@ class SlashHandlerMixin:
     def model_picker_active(self) -> bool:
         return self._model_picker is not None
 
+    def _rename_account(self, args: str) -> str:
+        requested = args.split()
+        if len(requested) != 3 or requested[0] != "rename":
+            return "usage: /accounts [rename provider:old new-label]"
+        try:
+            store = self.loop.account_context.store
+            account = store.resolve_qualified_reference(requested[1])
+            return store.rename(account, requested[2])
+        except (AccountError, OSError, ValueError) as exc:
+            return f"account unchanged: {exc}"
+
     def slash_accounts(self, args: str) -> str:
         """List named accounts and open the current-session switcher."""
 
-        requested = args.split()
-        if requested:
-            if len(requested) != 3 or requested[0] != "rename":
-                return "usage: /accounts [rename provider:old new-label]"
-            try:
-                provider, reference = requested[1].split(":", 1)
-                store = self.loop.account_context.store
-                account = store.resolve_reference(provider, reference)
-                message = store.rename(account, requested[2])
-            except (AccountError, OSError, ValueError) as exc:
-                return f"account unchanged: {exc}"
-            return message
+        if args.split():
+            return self._rename_account(args)
         if self.active or self.pending_approvals:
             return "accounts unavailable: cannot switch while a turn or approval is active"
         context = getattr(self.loop, "account_context", None)

@@ -34,10 +34,11 @@ class AccountsPicker:
         rows: list[Text] = [Text("select an account", style=theme.COMMAND)]
         for position, account in enumerate(self.accounts):
             highlighted = position == self.index
+            label = (self.labels or {}).get(account, account.name)
             line = Text.assemble(
                 ("❯ " if highlighted else "  ", theme.ACCENT),
                 (
-                    f"{account.provider}:{self.labels.get(account, account.name) if self.labels else account.name}",
+                    f"{account.provider}:{label}",
                     theme.COMMAND if highlighted else theme.BODY,
                 ),
             )

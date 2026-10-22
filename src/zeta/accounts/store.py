@@ -41,6 +41,32 @@ def _account_label(value: str) -> str:
     return label
 
 
+def _registry_account(key: object, metadata: object) -> tuple[AccountId, str]:
+    if not isinstance(key, str) or not isinstance(metadata, Mapping):
+        raise TypeError
+    account = AccountId(*key.split(":", 1))
+    label = metadata.get("label", account.name)
+    if (
+        key != str(account)
+        or metadata.get("provider") != account.provider
+        or metadata.get("name") != account.name
+        or set(metadata) - {"provider", "name", "label"}
+        or _account_label(label) != label
+    ):
+        raise ValueError
+    return account, label
+
+
+def _validate_unique_references(accounts: dict[str, Any]) -> None:
+    references: dict[tuple[str, str], str] = {}
+    for key, metadata in accounts.items():
+        account, label = _registry_account(key, metadata)
+        for reference in {account.name, label}:
+            owner = references.setdefault((account.provider, reference), str(account))
+            if owner != str(account):
+                raise ValueError
+
+
 class AccountError(RuntimeError):
     """A credential-safe account-store error."""
 
@@ -211,6 +237,13 @@ class AccountStore:
             metadata["label"] = label
             self._write_registry(home_fd, value)
         return f"renamed {account} to {account.provider}:{label}"
+
+    def resolve_qualified_reference(self, value: str) -> AccountId:
+        try:
+            provider, reference = value.split(":", 1)
+        except (AttributeError, ValueError) as exc:
+            raise AccountError("account reference must be provider:name") from exc
+        return self.resolve_reference(provider, reference)
 
     def resolve_reference(self, provider: str, name_or_label: str) -> AccountId:
         reference = AccountId(provider, name_or_label)
@@ -406,33 +439,7 @@ class AccountStore:
                 raise ValueError
             accounts = dict(value["accounts"])
             defaults = dict(value["defaults"])
-            references: dict[tuple[str, str], str] = {}
-            for key, metadata in accounts.items():
-                if not isinstance(key, str):
-                    raise TypeError
-                account = AccountId(*key.split(":", 1))
-                expected = {
-                    "provider": account.provider,
-                    "name": account.name,
-                }
-                if key != str(account) or not isinstance(metadata, Mapping):
-                    raise ValueError
-                label = metadata.get("label", account.name)
-                if (
-                    any(
-                        metadata.get(field) != expected_value
-                        for field, expected_value in expected.items()
-                    )
-                    or set(metadata) - {"provider", "name", "label"}
-                    or _account_label(label) != label
-                ):
-                    raise ValueError
-                for reference in {account.name, label}:
-                    owner = references.setdefault(
-                        (account.provider, reference), str(account)
-                    )
-                    if owner != str(account):
-                        raise ValueError
+            _validate_unique_references(accounts)
             for provider, key in defaults.items():
                 if (
                     not isinstance(provider, str)

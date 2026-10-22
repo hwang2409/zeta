@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..accounts import AccountError
+from ..accounts import AccountError, AccountStore
 from ..core.commands.custom_commands import CustomCommand
 from ..core.project_context import discover_repo_root
 from ..core.slash import (
@@ -154,27 +154,30 @@ class ServerSlashSession:
             ),
         )
 
+    @staticmethod
+    def _rename_account(store: AccountStore, args: str) -> str:
+        requested = args.split()
+        if len(requested) != 3 or requested[0] != "rename":
+            return "usage: /accounts [rename provider:old new-label]"
+        try:
+            account = store.resolve_qualified_reference(requested[1])
+            return store.rename(account, requested[2])
+        except (AccountError, OSError, ValueError) as exc:
+            return f"account unchanged: {exc}"
+
     def slash_accounts(self, args: str) -> str:
         """List accounts or change one display label."""
 
         context = getattr(self._runtime.loop, "account_context", None)
         if context is None:
             return "accounts unavailable for this session"
-        requested = args.split()
-        if not requested:
-            displays = context.store.list_display()
-            return "\n".join(
-                str(item) + (f"  {item.detail}" if item.detail else "")
-                for item in displays
-            ) or "no accounts"
-        if len(requested) != 3 or requested[0] != "rename":
-            return "usage: /accounts [rename provider:old new-label]"
-        try:
-            provider, reference = requested[1].split(":", 1)
-            account = context.store.resolve_reference(provider, reference)
-            return context.store.rename(account, requested[2])
-        except (AccountError, OSError, ValueError) as exc:
-            return f"account unchanged: {exc}"
+        if args.split():
+            return self._rename_account(context.store, args)
+        displays = context.store.list_display()
+        return "\n".join(
+            str(item) + (f"  {item.detail}" if item.detail else "")
+            for item in displays
+        ) or "no accounts"
 
     def slash_model(self, args: str) -> str:
         """Switch models directly, or report the current model to the client."""
