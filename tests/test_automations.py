@@ -2146,6 +2146,7 @@ async def test_run_pins_account_recorded_at_approval(tmp_path: Path) -> None:
 
     with SQLiteStore(tmp_path) as store:
         state = store.draft(job)
+        assert state.job.account == "codex:first"
         store.approve(job.name, state.revision, None, START)
         assert store.get(job.name).job.account == "codex:first"
         accounts.set_default(second)

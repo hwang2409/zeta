@@ -11,7 +11,7 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, Self
@@ -182,6 +182,10 @@ class SQLiteStore:
                 os.close(descriptor)
 
     def draft(self, job: Job, *, source: str = "tool") -> JobState:
+        provider = account_provider(job.provider)
+        if provider is not None and job.account is None and not api_key_mode(job.provider):
+            account = AccountStore(self.home).resolve_account(job.provider)
+            job = replace(job, account=str(account))
         document = json.dumps(job.document(), sort_keys=True)
         with self._transaction():
             row = self.db.execute(
@@ -265,19 +269,12 @@ class SQLiteStore:
                 raise ValueError("draft changed; inspect and approve the new revision")
             if state.enabled:
                 raise ValueError("automation is already armed")
-            provider = account_provider(state.job.provider)
             if (
-                provider is not None
+                account_provider(state.job.provider) is not None
                 and state.job.account is None
                 and not api_key_mode(state.job.provider)
             ):
-                account = AccountStore(self.home).resolve_account(state.job.provider)
-                document = state.job.document()
-                document["account"] = str(account)
-                self.db.execute(
-                    "UPDATE revisions SET document=? WHERE name=? AND revision=?",
-                    (json.dumps(document, sort_keys=True), name, revision),
-                )
+                raise ValueError("draft has no pinned account; create a new revision")
             self.db.execute(
                 """UPDATE jobs SET enabled=1, approved_at=?, recipient=?, inbox_target_ids=?,
                 last_run=?, last_check=?, last_due=NULL WHERE name=? AND revision=?""",
