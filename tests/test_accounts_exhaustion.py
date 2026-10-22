@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import inspect
 import json
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
+import zeta.providers.codex as codex_module
+import zeta.providers.transport as transport_module
 from tests.support.credentials import named_account_credentials
-from zeta.accounts import AccountId, AccountStore
+from zeta.accounts import AccountId, AccountStore, AccountUsage, SessionAccountContext
 from zeta.accounts.exhaustion import (
     SubscriptionLimit,
     classify_subscription_limit,
@@ -24,8 +30,13 @@ from zeta.accounts.usage import (
     read_usage,
     record_subscription_limit,
 )
+from zeta.core.loop import AgentLoop
+from zeta.core.session import SessionManager
 from zeta.oauth import OAuthTokens
+from zeta.protocol.types import MessageOrigin, MessageRole, StreamEventType, TextContent
+from zeta.providers.codex import CodexBackend
 from zeta.providers.retry_policy import ProviderRetryBudget
+from zeta.skills import SkillCatalog
 
 FIXTURE = Path(__file__).parent / "fixtures/usage/codex_responses_429_usage_limit_reached.json"
 NOW = datetime(2026, 10, 22, 16, 0, tzinfo=UTC)
@@ -105,28 +116,179 @@ def test_child_limit_failure_never_switches_parent() -> None:
     assert limit.recovery_event(frozen=True, alternatives=(AccountId("codex", "other"),))["action"] == "none"
 
 
+def _codex_token(account_id: str) -> str:
+    def encode(value: object) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+    return ".".join(
+        (
+            encode({"alg": "none"}),
+            encode(
+                {
+                    "exp": 4_000_000_000,
+                    "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+                }
+            ),
+            encode({"signature": "fixture"}),
+        )
+    )
+
+
+def _account_context(
+    tmp_path: Path,
+) -> tuple[SessionAccountContext, object, AccountId, AccountId]:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        named_account_credentials(home, account.provider, account.name).save(
+            OAuthTokens(_codex_token(account.name), "refresh", 4_000_000_000)
+        )
+    store = AccountStore(home)
+    store.set_default(first)
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    context = SessionAccountContext.load(home, manager, opened.metadata)
+    return context, opened, first, second
+
+
+@pytest.mark.asyncio
+async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, first, second = _account_context(tmp_path)
+    now = datetime.now(UTC)
+    snapshot = UsageSnapshot(
+        now,
+        "usage_endpoint",
+        (UsageWindow("primary", 25, 10_080, now + timedelta(days=1)),),
+    )
+    AccountUsage(context.store)._write(
+        second, snapshot, now, None, "succeeded", finished=now
+    )
+    payload = json.loads(FIXTURE.read_text())
+    payload.pop("_fixture")
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(429, json=payload, request=request)
+
+    async def fail_retry_sleep(_delay: float) -> None:
+        raise AssertionError("classified account limit must not wait to retry")
+
+    retry_provider_completion = transport_module.retry_provider_completion
+
+    def completion_without_retry_sleep(*args: object, **kwargs: object):
+        kwargs["sleep"] = fail_retry_sleep
+        return retry_provider_completion(*args, **kwargs)
+
+    monkeypatch.setattr(
+        codex_module, "retry_provider_completion", completion_without_retry_sleep
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend = CodexBackend(
+        client=client,
+        token_store=named_account_credentials(context.home, "codex", "first"),
+        base_url="https://test.invalid/codex/responses",
+    )
+    loop = AgentLoop(backend, opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = context.manager
+    loop.session_metadata = context.metadata
+    loop.account_context = context
+    try:
+        events = [
+            event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)
+        ]
+        assert requests == 1
+        assert not any(
+            isinstance(block, TextContent) and block.text
+            for message in opened.store.messages()
+            if message.role is MessageRole.ASSISTANT
+            for block in message.content
+        )
+        types = [event.type for event in events]
+        assert types.count(StreamEventType.ACCOUNT_LIMIT) == 1
+        assert types.index(StreamEventType.ACCOUNT_LIMIT) < types.index(
+            StreamEventType.ERROR
+        )
+        assert types.index(StreamEventType.ACCOUNT_LIMIT) < types.index(
+            StreamEventType.AGENT_END
+        )
+        limit_event = next(
+            event for event in events if event.type is StreamEventType.ACCOUNT_LIMIT
+        )
+        assert limit_event.data["alternative"] == str(second)
+        assert limit_event.data["action"] == "switch"
+        persisted = read_usage(context.store, first)
+        assert persisted.snapshot is not None
+        assert persisted.snapshot.windows == (
+            UsageWindow(
+                "primary",
+                100.0,
+                payload["error"]["limit_window_minutes"],
+                datetime.fromtimestamp(payload["error"]["resets_at"], UTC),
+            ),
+        )
+
+        boundary = opened.store.replay()[-1].seq
+        context.switch_active(
+            loop, second, "codex", loop.backend.model, boundary=boundary
+        )
+        assert requests == 1
+        assert context.resolve("codex") == second
+    finally:
+        await client.aclose()
+        opened.store.close()
+
+
 @pytest.mark.asyncio
 async def test_limit_recovery_does_not_block_event_loop_while_usage_lock_held(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    from zeta.accounts.session import SessionAccountContext
-
+    context, opened, first, _second = _account_context(tmp_path)
     entered = threading.Event()
     release = threading.Event()
 
-    def blocking_recovery(_self: object, _failure: object) -> None:
-        entered.set()
-        release.wait(timeout=2)
+    def hold_usage_lock() -> None:
+        with context.store.usage_guard(first):
+            entered.set()
+            assert release.wait(timeout=5)
 
-    monkeypatch.setattr(SessionAccountContext, "_subscription_limit_event", blocking_recovery)
-    context = SessionAccountContext.__new__(SessionAccountContext)
-    task = asyncio.create_task(context.subscription_limit_event(object()))
-    await asyncio.sleep(0)
-    assert entered.wait(timeout=1)
+    holder = threading.Thread(target=hold_usage_lock)
+    holder.start()
+    assert await asyncio.to_thread(entered.wait, 1)
+
+    payload = json.loads(FIXTURE.read_text())
+    failure = _failure(429, {"error": payload["error"]})
+
+    async def recover() -> object:
+        result = context.subscription_limit_event(failure)
+        return await result if inspect.isawaitable(result) else result
+
+    recovery = asyncio.create_task(recover())
+
+    def release_later() -> None:
+        time.sleep(0.25)
+        release.set()
+
+    releaser = threading.Thread(target=release_later)
+    releaser.start()
     ticks = 0
-    for _ in range(3):
-        await asyncio.sleep(0)
-        ticks += 1
-    assert ticks == 3
-    release.set()
-    await task
+    while not release.is_set():
+        await asyncio.sleep(0.01)
+        if not release.is_set():
+            ticks += 1
+    result = await asyncio.wait_for(recovery, 5)
+    holder.join(timeout=1)
+    releaser.join(timeout=1)
+    try:
+        assert ticks >= 3
+        assert result is not None
+        persisted = read_usage(context.store, first)
+        assert persisted.snapshot is not None
+        assert persisted.snapshot.windows[0].used_percent == 100
+    finally:
+        release.set()
+        opened.store.close()
