@@ -454,9 +454,8 @@ class TUIApp(
                     "text-area.prompt": _prompt_style_with_background(
                         f"fg:{theme.ACCENT} bold", theme.COMPOSER_FILL
                     ),
-                    # The slash-command menu: prompt-toolkit's default is gray
-                    # on gray, unreadable on a dark terminal. Rows sit on the
-                    # palette's highlight background; the current row takes
+                    # Prompt-toolkit's gray default is unreadable on a dark terminal.
+                    # Rows use the highlight background; the current row takes
                     # the accent so the pick is unmistakable.
                     "completion-menu": _prompt_style_with_background(
                         f"fg:{theme.BODY}", theme.MENU_BG, background_first=True
@@ -545,6 +544,7 @@ class TUIApp(
             on_picker_cancel=lambda: app._picker_cancel(),
             on_picker_default=lambda: app.accounts_picker_default(),
             on_picker_rename=lambda: app.accounts_picker_rename(),
+            on_picker_refresh=lambda: app.accounts_picker_refresh(),
             picker_active=lambda: app._picker_active,
             on_agent_list_down=lambda: app._focus_agent_list(),
             agent_list_active=lambda: app._agent_navigation.list_focused(),

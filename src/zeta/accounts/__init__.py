@@ -8,6 +8,7 @@ from .store import (
     AccountId,
     AccountStore,
 )
+from .usage import AccountUsage
 
 __all__ = [
     "AccountCredentialLockTimeoutError",
@@ -15,6 +16,7 @@ __all__ = [
     "AccountError",
     "AccountId",
     "AccountStore",
+    "AccountUsage",
     "SessionAccountContext",
     "account_provider",
     "api_key_mode",

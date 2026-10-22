@@ -362,6 +362,7 @@ def build_key_bindings(
     on_picker_cancel: Callable[[], None] | None = None,
     on_picker_default: Callable[[], None] | None = None,
     on_picker_rename: Callable[[], None] | None = None,
+    on_picker_refresh: Callable[[], None] | None = None,
     picker_active: Callable[[], bool] | None = None,
     on_agent_list_down: Callable[[], None] | None = None,
     agent_list_active: Callable[[], bool] | None = None,
@@ -1180,18 +1181,21 @@ def build_key_bindings(
             on_picker_cancel()
 
         if on_picker_default is not None:
-
             @bindings.add("d", filter=picking & ~panel_mode, eager=True)
             def picker_default(event: KeyPressEvent) -> None:
                 del event
                 on_picker_default()
 
         if on_picker_rename is not None:
-
             @bindings.add("n", filter=picking & ~panel_mode, eager=True)
             def picker_rename(event: KeyPressEvent) -> None:
                 del event
                 on_picker_rename()
+
+        if on_picker_refresh is not None:
+            @bindings.add("r", filter=picking & ~panel_mode, eager=True)
+            def picker_refresh(_event: KeyPressEvent) -> None:
+                on_picker_refresh()
 
     @bindings.add(*resolved_keys["open-editor"], filter=interactions_enabled & ~panel_mode, eager=True)
     def open_external_editor(event: KeyPressEvent) -> None:

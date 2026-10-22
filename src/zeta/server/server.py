@@ -536,8 +536,8 @@ class _Client:
             return ergonomics.catalog(runtime)
         if method == "session_settings":
             return ergonomics.settings(runtime)
-        if method == "slash_list":
-            return await slash_commands.list_commands(runtime)
+        if method in slash_commands.READ_REQUESTS:
+            return await slash_commands.read_request(method, runtime, self._require_idle)
         await self._require_idle()
         if method == "slash_run":
             register = self._model_inputs.registrar(runtime.session_id, enabled="model_input_ids" in self.features)
@@ -573,6 +573,7 @@ class _Client:
             if not current or current[-1].id != head:
                 store.switch_to_branch(head)
         return ergonomics.tree(runtime)
+
     async def _approval(
         self, method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:

@@ -11,7 +11,8 @@ import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from ..accounts import AccountError, AccountId, AccountStore
+from ..accounts import AccountError, AccountId, AccountStore, AccountUsage
+from ..accounts.usage import format_usage_lines, usage_json
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.login_flow import run_login
@@ -274,7 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
         "accounts", help="manage subscription accounts"
     )
     accounts_parser.add_argument(
-        "action", nargs="?", choices=("default", "login", "rename")
+        "action", nargs="?", choices=("default", "login", "refresh", "rename")
     )
     accounts_parser.add_argument("account", nargs="?")
     accounts_parser.add_argument("new_label", nargs="?")
@@ -447,18 +448,22 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
                         "account": str(item),
                         "id": str(item.account),
                         "detail": item.detail,
+                        "default": store.default(item.account.provider) == item.account,
+                        "usage": usage_json(item.usage),
                     }
                     for item in accounts
                 ]
             )
         )
         return
-    print(
-        "\n".join(
-            str(item) + (f"  {item.detail}" if item.detail else "")
-            for item in accounts
+    lines: list[str] = []
+    for item in accounts:
+        marker = "  ★ default" if store.default(item.account.provider) == item.account else ""
+        lines.append(
+            str(item) + (f"  {item.detail}" if item.detail else "") + marker
         )
-    )
+        lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
+    print("\n".join(lines))
 
 
 def _run_accounts_action(store: AccountStore, args: argparse.Namespace) -> None:
@@ -466,6 +471,10 @@ def _run_accounts_action(store: AccountStore, args: argparse.Namespace) -> None:
         if not args.account:
             raise AccountError("default requires provider:name")
         store.set_default(store.resolve_qualified_reference(args.account))
+        return
+    if args.action == "refresh":
+        asyncio.run(AccountUsage(store).refresh_stale())
+        _print_accounts(store, as_json=args.json)
         return
     if args.action == "rename":
         if not args.account or not args.new_label:

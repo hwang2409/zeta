@@ -9,11 +9,12 @@ themselves as such rather than half-executing.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..accounts.store import rename_account_command
+from ..accounts.usage import format_usage_lines
 from ..core.commands.custom_commands import CustomCommand
 from ..core.project_context import discover_repo_root
 from ..core.slash import (
@@ -30,7 +31,7 @@ from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
-from . import ergonomics
+from . import accounts, ergonomics
 from .model_selection import apply as apply_settings
 from .protocol import ProtocolError
 from .runtime import ServerRuntime
@@ -163,10 +164,11 @@ class ServerSlashSession:
         if args.split():
             return rename_account_command(context.store, args)
         displays = context.store.list_display()
-        return "\n".join(
-            str(item) + (f"  {item.detail}" if item.detail else "")
-            for item in displays
-        ) or "no accounts"
+        lines: list[str] = []
+        for item in displays:
+            lines.append(str(item) + (f"  {item.detail}" if item.detail else ""))
+            lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
+        return "\n".join(lines) or "no accounts"
 
     def slash_model(self, args: str) -> str:
         """Switch models directly, or report the current model to the client."""
@@ -358,6 +360,19 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
             SlashCommand("accounts", lambda session, args: session.slash_accounts(args), "list or label accounts"),
         ),
     )
+
+
+READ_REQUESTS = {"slash_list", *accounts.REQUEST_METHODS}
+
+
+async def read_request(
+    method: str,
+    runtime: ServerRuntime,
+    require_idle: Callable[[], Awaitable[None]],
+) -> dict[str, object]:
+    if method == "slash_list":
+        return await list_commands(runtime)
+    return await accounts.request(method, runtime, require_idle)
 
 
 async def list_commands(runtime: ServerRuntime) -> dict[str, object]:

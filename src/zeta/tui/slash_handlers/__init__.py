@@ -6,12 +6,13 @@ cap. ``TUIApp`` mixes these in, so they run against its attributes.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 from prompt_toolkit.enums import EditingMode
 
-from ...accounts import AccountError, SessionAccountContext
+from ...accounts import AccountError, AccountUsage, SessionAccountContext
 from ...accounts.store import AccountDisplay, rename_account_command
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
@@ -187,6 +188,7 @@ class SlashHandlerMixin:
             defaults,
             {item.account: item.detail for item in displays if item.detail},
             {item.account: item.label for item in displays},
+            {item.account: item.usage for item in displays},
         )
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())
@@ -229,6 +231,37 @@ class SlashHandlerMixin:
         if unit is not None:
             self._accounts_picker_unit = self._transcript.replace(unit, picker.render())
         self._invalidate_prompt()
+
+    def accounts_picker_refresh(self) -> None:
+        picker = self._accounts_picker
+        if picker is None or picker.refreshing:
+            return
+        picker.refreshing = True
+        self._repaint_accounts_picker()
+
+        async def refresh() -> None:
+            try:
+                await asyncio.to_thread(
+                    lambda: asyncio.run(
+                        AccountUsage(self.loop.account_context.store).refresh_stale()
+                    )
+                )
+            except (AccountError, OSError, RuntimeError, ValueError):
+                current = self._accounts_picker
+                if current is not None:
+                    current.refreshing = False
+                    self._repaint_accounts_picker()
+                self._print_system("account usage refresh failed")
+                return
+            current = self._accounts_picker
+            if current is None:
+                return
+            current.refreshing = False
+            displays = self.loop.account_context.store.list_display()
+            current.usages = {item.account: item.usage for item in displays}
+            self._repaint_accounts_picker()
+
+        asyncio.create_task(refresh())
 
     def accounts_picker_default(self) -> None:
         picker = self._accounts_picker
