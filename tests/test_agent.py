@@ -30,7 +30,7 @@ from zeta.agent.background import (
     finish_background_child,
     recover_agent_children,
 )
-from zeta.agent.finish_gate import FinishGateState
+from zeta.agent.finish_gate import FinishGateControl, FinishGateState
 from zeta.agent.notifications import NotificationWake
 from zeta.agent.presets import (
     AGENT_PRESETS,
@@ -2449,6 +2449,51 @@ async def test_finish_gate_model_timeout_defers_task_exit_during_cancellation(
     result = await state.run_model_turn(child_loop, events(), consume)
 
     assert result is None
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_turn_cap_defers_task_exit_during_stream_close(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store, finish_gate_max_turns=1)
+    task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=True)
+    registry = SimpleNamespace(snapshot=lambda: (task,))
+    child_loop = SimpleNamespace(
+        _background_owner=owner,
+        agent_instance_id="child-1",
+        tool_registry=SimpleNamespace(background_tasks=registry),
+    )
+    state = FinishGateState()
+    state.start(child_loop)
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def events() -> AsyncIterator[StreamEvent]:
+        try:
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+        finally:
+            close_started.set()
+            await release_close.wait()
+
+    async def consume(
+        stream: AsyncIterator[StreamEvent], control: FinishGateControl | None
+    ) -> None:
+        await anext(stream)
+        assert control is not None
+        assert control.turn_ended()
+
+    model_turn = asyncio.create_task(
+        state.run_model_turn(child_loop, events(), consume)
+    )
+    await asyncio.wait_for(close_started.wait(), timeout=2)
+    task.running = False
+    release_close.set()
+    result = await asyncio.wait_for(model_turn, timeout=2)
+
+    assert result is None
+    assert state.turns_exhausted_with_task
     store.close()
 
 

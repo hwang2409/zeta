@@ -141,7 +141,9 @@ class FinishGateState:
             close = getattr(events, "aclose", None)
             if close is not None:
                 await close()
-        return self._model_turn_result(child_loop)
+        return self._model_turn_result(
+            child_loop, tasks_were_running=tasks_were_running
+        )
 
     def _model_timeout_result(
         self, child_loop: AgentLoop, *, tasks_were_running: bool
@@ -153,13 +155,15 @@ class FinishGateState:
             return None
         return _model_bound_expired()
 
-    def _model_turn_result(self, child_loop: AgentLoop) -> FinishGateResult | None:
+    def _model_turn_result(
+        self, child_loop: AgentLoop, *, tasks_were_running: bool
+    ) -> FinishGateResult | None:
         control = self._control()
         if control.handoff is not None:
             return FinishGateResult("handed_off", handoff=control.handoff)
         if control.turns < control.max_turns:
             return None
-        if self.owned_tasks(child_loop):
+        if self.owned_tasks(child_loop) or tasks_were_running:
             self.turns_exhausted_with_task = True
             return None
         return FinishGateResult(
