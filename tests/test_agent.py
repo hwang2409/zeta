@@ -2421,7 +2421,9 @@ async def test_finish_gate_model_timeout_defers_task_exit_during_cancellation(
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.01)
     task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=True)
-    registry = SimpleNamespace(snapshot=lambda: (task,), task_start_generation=1)
+    registry = SimpleNamespace(
+        snapshot=lambda: (task,), task_start_generation=1, running_count=1
+    )
     child_loop = SimpleNamespace(
         _background_owner=owner,
         agent_instance_id="child-1",
@@ -2435,6 +2437,7 @@ async def test_finish_gate_model_timeout_defers_task_exit_during_cancellation(
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             task.running = False
+            registry.running_count = 0
             raise
         if False:
             yield StreamEvent(StreamEventType.MESSAGE_END)
@@ -2459,7 +2462,9 @@ async def test_finish_gate_turn_cap_defers_task_exit_during_stream_close(
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store, finish_gate_max_turns=1)
     task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=True)
-    registry = SimpleNamespace(snapshot=lambda: (task,), task_start_generation=1)
+    registry = SimpleNamespace(
+        snapshot=lambda: (task,), task_start_generation=1, running_count=1
+    )
     child_loop = SimpleNamespace(
         _background_owner=owner,
         agent_instance_id="child-1",
@@ -2489,6 +2494,7 @@ async def test_finish_gate_turn_cap_defers_task_exit_during_stream_close(
     )
     await asyncio.wait_for(close_started.wait(), timeout=2)
     task.running = False
+    registry.running_count = 0
     release_close.set()
     result = await asyncio.wait_for(model_turn, timeout=2)
 
@@ -2504,7 +2510,9 @@ async def test_finish_gate_counts_task_started_and_exited_during_model_step(
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store, finish_gate_max_turns=1)
     task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=False)
-    registry = SimpleNamespace(snapshot=lambda: (task,), task_start_generation=0)
+    registry = SimpleNamespace(
+        snapshot=lambda: (task,), task_start_generation=0, running_count=0
+    )
     child_loop = SimpleNamespace(
         _background_owner=owner,
         agent_instance_id="child-1",
@@ -2522,12 +2530,14 @@ async def test_finish_gate_counts_task_started_and_exited_during_model_step(
 
         async def aclose(self) -> None:
             task.running = False
+            registry.running_count = 0
 
     async def consume(
         stream: AsyncIterator[StreamEvent], control: FinishGateControl | None
     ) -> None:
         del stream
         task.running = True
+        registry.running_count = 1
         registry.task_start_generation += 1
         assert control is not None
         assert control.turn_ended()
@@ -2546,7 +2556,9 @@ async def test_finish_gate_task_deadline_bounds_stream_close(tmp_path: Path) -> 
         store, finish_gate_timeout=1, finish_gate_task_timeout=0.03
     )
     task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=True)
-    registry = SimpleNamespace(snapshot=lambda: (task,), task_start_generation=1)
+    registry = SimpleNamespace(
+        snapshot=lambda: (task,), task_start_generation=1, running_count=1
+    )
     child_loop = SimpleNamespace(
         _background_owner=owner,
         agent_instance_id="child-1",
@@ -2598,7 +2610,9 @@ async def test_finish_gate_uses_task_deadline_to_deliver_late_task_exit(
     owner = BackgroundAgentOwner(
         store, finish_gate_timeout=0.01, finish_gate_task_timeout=10
     )
-    registry = SimpleNamespace(snapshot=tuple, task_start_generation=0)
+    registry = SimpleNamespace(
+        snapshot=tuple, task_start_generation=0, running_count=0
+    )
     child_loop = SimpleNamespace(
         _background_owner=owner,
         agent_instance_id="child-1",

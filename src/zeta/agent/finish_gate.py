@@ -147,7 +147,10 @@ class FinishGateState:
                 task_running_at_entry
                 or task_registry.task_start_generation != task_start_generation
             )
-            return self._model_timeout_result(child_loop, task_existed=task_existed)
+            return self._model_timeout_result(
+                task_existed=task_existed,
+                task_running=task_registry.running_count > 0,
+            )
         task_existed = (
             task_running_at_entry
             or task_registry.task_start_generation != task_start_generation
@@ -155,10 +158,9 @@ class FinishGateState:
         return self._model_turn_result(task_existed=task_existed)
 
     def _model_timeout_result(
-        self, child_loop: AgentLoop, *, task_existed: bool
+        self, *, task_existed: bool, task_running: bool
     ) -> FinishGateResult | None:
-        tasks = self.owned_tasks(child_loop)
-        if tasks and asyncio.get_running_loop().time() >= self._task_deadline():
+        if task_running and asyncio.get_running_loop().time() >= self._task_deadline():
             return _task_safety_expired()
         if task_existed:
             return None
