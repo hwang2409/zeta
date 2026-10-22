@@ -5834,7 +5834,12 @@ async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
             )
         )[-1]["result"]
         assert response == {"account": "codex:second", "replay": False}
-        assert server.runtime.loop.account_context.resolve("codex") == second
+        assert (
+            await asyncio.to_thread(
+                server.runtime.loop.account_context.resolve, "codex"
+            )
+            == second
+        )
     finally:
         await _close(server, writer)
 
