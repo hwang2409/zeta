@@ -170,7 +170,7 @@ async def consume_child(
                     tool_result=event.tool_result,
                     depth=lifecycle_depth(event.tool_call),
                 )
-                if child_loop._yield_for_pending_prompt:
+                if getattr(child_loop, "_yield_for_pending_prompt", False):
                     child_loop._yield_for_pending_prompt = False
                     final_message = Message(
                         MessageRole.ASSISTANT,
