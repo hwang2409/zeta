@@ -260,6 +260,60 @@ async def test_switch_apply_is_infallible_no_split_when_backend_build_fails(
 
 
 @pytest.mark.asyncio
+async def test_switch_commit_sees_concurrent_writer_converges_to_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, _first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    third = AccountId("codex", "third")
+    await asyncio.to_thread(
+        named_account_credentials(context.home, third.provider, third.name).save,
+        OAuthTokens(_codex_token(third.name), "refresh", 4_000_000_000),
+    )
+    first_backend = object()
+    second_backend = object()
+    third_backend = object()
+    backends = {second: second_backend, third: third_backend}
+    loop = _switch_loop(first_backend)
+    assert context.manager is not None
+    commit = SessionAccountContext._commit_to_disk
+
+    def concurrent_commit(self, *args: object, **kwargs: object):
+        external = context.manager.read_metadata(context.metadata.session_id)
+        context.manager.record_account_selection(
+            external, second, boundary=7, switched=True
+        )
+        monkeypatch.setattr(
+            context.manager,
+            "_write_unlocked",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("persist failed")
+            ),
+        )
+        return commit(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionAccountContext, "_commit_to_disk", concurrent_commit)
+    await context.switch_active(
+        loop,
+        third,
+        boundary=9,
+        provider="codex",
+        build_backend=backends.__getitem__,
+    )
+
+    persisted = context.manager.read_metadata(context.metadata.session_id)
+    assert (
+        context.account_state_unknown
+        or context.metadata.to_dict() == persisted.to_dict()
+    )
+    if not context.account_state_unknown:
+        assert context.snapshot()["codex"] == second
+        assert loop.backend is second_backend
+    opened.store.close()
+
+
+@pytest.mark.asyncio
 async def test_switch_persist_failure_keeps_old_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -195,7 +195,12 @@ class ServerRuntime:
         self._post_stream_provider_retry = False
 
     def backend_for_model(
-        self, provider: str, model: str, *, token_budget: int | None = None
+        self,
+        provider: str,
+        model: str,
+        *,
+        token_budget: int | None = None,
+        account: AccountId | None = None,
     ) -> CompletionBackend:
         config = self._config(provider, model)
         if token_budget is None:
@@ -210,7 +215,9 @@ class ServerRuntime:
             )
         token_budget = effective_budget_for_model(provider, model, token_budget)
         credential_kwargs: dict[str, object] = {}
-        if self._state is not None:
+        if account is not None:
+            credential_kwargs["account"] = account
+        elif self._state is not None:
             credential_kwargs = self._state.loop.account_context.backend_kwargs(provider)
             credential_kwargs.pop("home", None)
         backend, _ = self._build_backend(

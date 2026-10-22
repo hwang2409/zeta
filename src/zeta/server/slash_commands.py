@@ -180,7 +180,7 @@ class ServerSlashSession:
             return f"model: {runtime.model} (open Settings to switch)"
         mode = runtime.policy.default.value if runtime.policy else "ask"
         try:
-            await asyncio.to_thread(apply_settings, runtime, requested, mode)
+            await apply_settings(runtime, requested, mode)
         except ValueError as exc:
             return f"model unchanged: {exc}"
         except (OSError, RuntimeError) as exc:

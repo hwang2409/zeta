@@ -557,7 +557,7 @@ class _Client:
             mode = _required_string(params, "approval_mode")
             if model not in ergonomics.catalog(runtime)["models"] or mode not in {"ask", "allow", "deny"}:
                 raise ProtocolError(-32602, "invalid model or approval mode")
-            await asyncio.to_thread(model_selection.apply, runtime, model, mode)
+            await model_selection.apply(runtime, model, mode)
             return ergonomics.settings(runtime)
         if method == "set_compaction":
             _required_string(params, "mode")
@@ -883,7 +883,7 @@ class _Client:
             return
         if kind is StreamEventType.MESSAGE_END:
             if foreground and not event.data.get("truncated"):
-                model_selection.confirm(self.server.runtime)
+                await model_selection.confirm(self.server.runtime)
             usage = event.data.get("usage")
             if foreground and isinstance(usage, Mapping) and usage:
                 state.usage.update(usage)

@@ -3132,14 +3132,15 @@ async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, 
     try:
         with monkeypatch.context() as patch:
             if failure == "backend":
-                original = runtime.loop.set_model
+                original = runtime.loop.prepare_backend_state
 
-                def fail_model(model):
-                    original(model)
-                    if model == "gpt-5.6-sol":
-                        raise OSError("partial backend change")
+                def fail_model(backend):
+                    state = original(backend)
+                    if backend.model == "gpt-5.6-sol":
+                        raise OSError("target backend failed")
+                    return state
 
-                patch.setattr(runtime.loop, "set_model", fail_model)
+                patch.setattr(runtime.loop, "prepare_backend_state", fail_model)
             elif failure == "metadata":
                 import zeta.core.session as session_module
                 original = session_module.os.replace
@@ -3347,7 +3348,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(tmp_path, mon
             if failure == "metadata":
                 def fail_metadata(*args, **kwargs):
                     raise OSError("metadata persistence failed")
-                patch.setattr(runtime.manager, "record_session_settings", fail_metadata)
+                patch.setattr(runtime.manager, "_write_unlocked", fail_metadata)
             response = (await _request(reader, writer, 3, "set_settings", {
                 "session_id": sid, "model": "gpt-5.4", "approval_mode": "deny",
             }))[-1]
@@ -3822,7 +3823,7 @@ async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, v
         assert "model_fallback" not in created["session"]
         runtime = server.runtime
         sid = runtime.session_id
-        await asyncio.to_thread(model_selection.apply, runtime, "gpt-5.4", "ask")
+        await model_selection.apply(runtime, "gpt-5.4", "ask")
         assert runtime.metadata.model_fallback is not None
         resumed = (await _request(reader, writer, 3, "resume", {"session_id": sid}))[-1]["result"]
         status = (await _request(reader, writer, 4, "status"))[-1]["result"]
@@ -3895,7 +3896,7 @@ async def test_mcp_auth_failure_does_not_revert_model(tmp_path, monkeypatch):
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
         runtime = server.runtime
-        await asyncio.to_thread(model_selection.apply, runtime, "gpt-5.4", "ask")
+        await model_selection.apply(runtime, "gpt-5.4", "ask")
         fallback = runtime.metadata.model_fallback
 
         async def fail_mcp_setup():
@@ -5709,6 +5710,118 @@ async def test_resume_missing_session_structured_error(tmp_path: Path) -> None:
         await _close(server, writer)
 
 @pytest.mark.asyncio
+async def test_model_selection_respects_unknown_account_fence(
+    tmp_path: Path,
+) -> None:
+    from tests.support.credentials import named_account_credentials
+    from tests.support.server_backend import ServerFakeBackend
+    from zeta.accounts import AccountError
+    from zeta.oauth import OAuthTokens
+    from zeta.server import model_selection
+
+    token = OAuthTokens("access", "refresh", 9_999_999_999.0)
+    await asyncio.to_thread(named_account_credentials(tmp_path, "codex").save, token)
+    await asyncio.to_thread(
+        named_account_credentials(tmp_path, "anthropic").save, token
+    )
+    builds: list[tuple[str, str]] = []
+
+    def backend_factory(provider, model, _home):
+        builds.append((provider, model))
+        return ServerFakeBackend(model=model), model
+
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="codex",
+        model="gpt-5.4",
+        backend_factory=backend_factory,
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        runtime = server.runtime
+        context = runtime.loop.account_context
+        await asyncio.to_thread(
+            runtime.manager.record_session_settings,
+            runtime.metadata,
+            model="claude-sonnet-4-6",
+            approval_mode="ask",
+            budget=runtime.metadata.compaction_budget,
+            provider="claude",
+        )
+        assert runtime.metadata.provider == "claude"
+        assert context.active_provider == "codex"
+        context._account_state_unknown = True
+        before = len(builds)
+
+        with pytest.raises(AccountError, match="state is unknown"):
+            await model_selection.apply(
+                runtime, "claude-sonnet-4-6", "ask"
+            )
+
+        assert len(builds) == before
+        assert context.account_state_unknown
+        assert runtime.metadata.provider == "claude"
+        assert context.active_provider == "codex"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_model_selection_uses_account_transition(
+    tmp_path: Path,
+) -> None:
+    from tests.support.credentials import named_account_credentials
+    from tests.support.server_backend import ServerFakeBackend
+    from zeta.oauth import OAuthTokens
+
+    token = OAuthTokens("access", "refresh", 9_999_999_999.0)
+    await asyncio.to_thread(named_account_credentials(tmp_path, "codex").save, token)
+    await asyncio.to_thread(
+        named_account_credentials(tmp_path, "anthropic").save, token
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="codex",
+        model="gpt-5.4",
+        backend_factory=lambda _p, m, _h: (ServerFakeBackend(model=m), m),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        runtime = server.runtime
+        persisted_before = await asyncio.to_thread(
+            runtime.manager.read_metadata, runtime.session_id
+        )
+        assert runtime.metadata.to_storage_dict() == persisted_before.to_storage_dict()
+        response = await _request(
+            reader,
+            writer,
+            3,
+            "set_settings",
+            {
+                "session_id": runtime.session_id,
+                "model": "claude-sonnet-4-6",
+                "approval_mode": "ask",
+            },
+        )
+
+        assert response[-1]["result"]["model"] == "claude-sonnet-4-6"
+        assert runtime.metadata.provider == "claude"
+        assert runtime.loop.account_context.active_provider == "anthropic"
+        persisted = await asyncio.to_thread(
+            runtime.manager.read_metadata, runtime.session_id
+        )
+        assert persisted.to_dict() == runtime.metadata.to_dict()
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_cross_provider_model_change_updates_account_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5757,16 +5870,14 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         )
         runtime.loop.store.append_message(native)
 
-        await asyncio.to_thread(
-            model_selection.apply, runtime, "claude-sonnet-4-6", "ask"
-        )
+        await model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
         assert runtime.loop.account_context.active_provider == "anthropic"
         assert runtime.loop.account_context.switch_sequence == 1
         assert runtime.loop._account_safe_context([native])[0].content == [
             ThinkingContent("codex"),
             TextContent("answer"),
         ]
-        await asyncio.to_thread(model_selection.apply, runtime, "gpt-5.4", "ask")
+        await model_selection.apply(runtime, "gpt-5.4", "ask")
         assert runtime.loop.account_context.active_provider == "codex"
         assert runtime.loop.account_context.switch_sequence == 1
         assert runtime.loop._account_safe_context([native])[0].content == native.content
@@ -5778,13 +5889,11 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         )
         monkeypatch.setattr(
             runtime.manager,
-            "record_session_settings",
+            "_write_unlocked",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
         )
-        with pytest.raises(OSError, match="write failed"):
-            await asyncio.to_thread(
-                model_selection.apply, runtime, "claude-sonnet-4-6", "ask"
-            )
+        with pytest.raises(OSError, match="settings were not persisted"):
+            await model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
         assert (
             runtime.loop.backend,
             runtime.loop.account_context.active_provider,

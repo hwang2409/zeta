@@ -897,63 +897,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
-    def record_session_settings(
-        self,
-        metadata: SessionMetadata,
-        *,
-        model: str,
-        approval_mode: str,
-        budget: int,
-        provider: str,
-        model_fallback: tuple[str, str, int] | None = None,
-    ) -> None:
-        """Persist active-session settings together, without changing global config."""
-        if (
-            approval_mode not in {"ask", "allow", "deny"}
-            or not model.strip()
-            or budget <= 0
-        ):
-            raise SessionError("invalid session settings")
-        expected = (
-            metadata.provider,
-            metadata.model,
-            metadata.approval_mode,
-            metadata.compaction_budget,
-            metadata.budget_pinned,
-            metadata.model_fallback,
-        )
-
-        def update(item: SessionMetadata) -> SessionMetadata:
-            if (
-                item.provider,
-                item.model,
-                item.approval_mode,
-                item.compaction_budget,
-                item.budget_pinned,
-                item.model_fallback,
-            ) != expected:
-                raise SessionError("session settings changed before commit")
-            if item.model != model or item.provider != provider:
-                item.override_audit.append(
-                    {
-                        "at": _now(),
-                        "provider": {"from": item.provider, "to": provider}
-                        if item.provider != provider
-                        else None,
-                        "model": {"from": item.model, "to": model}
-                        if item.model != model
-                        else None,
-                    }
-                )
-            item.provider = provider
-            item.model = model
-            item.approval_mode = approval_mode
-            item.model_fallback = model_fallback
-            item.compaction_budget = budget
-            return self._touch(item)
-
-        self._copy_metadata(metadata, self._mutate(metadata.session_id, update))
-
     def record_vim_mode(self, metadata: SessionMetadata, *, enabled: bool) -> None:
         """Persist the composer editing mode with optimistic concurrency."""
 
