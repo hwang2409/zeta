@@ -102,7 +102,7 @@ async def test_ordinary_agent_send_is_not_consumed_as_question_answer(
             break
         await asyncio.sleep(0.01)
 
-    assert send_to_run(
+    assert await send_to_run(
         parent,
         handle,
         "Proceed",

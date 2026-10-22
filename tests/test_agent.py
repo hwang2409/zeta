@@ -10305,12 +10305,12 @@ async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
         accepts_follow_ups=True,
         explicit_finish=True,
     )
-    assert (
-        owner.conversation_channel.publish_follow_up(
-            parent, "root:1", "approved", commit_timeout=1
-        )
-        is None
-    )
+    assert await send_to_run(
+        parent,
+        "root:1",
+        "approved",
+        channel=owner.conversation_channel,
+    ) is None
     assert child.pending_prompts()[0].data["text"] == "approved"
     owner.cancel_subtree("root:1")
     await owner.wait()

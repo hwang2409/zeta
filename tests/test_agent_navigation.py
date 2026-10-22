@@ -920,11 +920,10 @@ async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
     started = asyncio.Event()
     release = asyncio.Event()
 
-    def reject(*args: object, **kwargs: object) -> str:
+    async def reject(*args: object, **kwargs: object) -> str:
         del args, kwargs
         started.set()
-        while not release.is_set():
-            threading.Event().wait(0.001)
+        await release.wait()
         return "child finished"
 
     monkeypatch.setattr(agent_runtime, "send_to_run", reject)
@@ -946,7 +945,7 @@ async def test_child_send_exception_preserves_text_and_shows_notice(
 ) -> None:
     app, store, _child, session, notices = _child_send_app(tmp_path)
 
-    def fail(*args: object, **kwargs: object) -> None:
+    async def fail(*args: object, **kwargs: object) -> None:
         del args, kwargs
         raise RuntimeError("send failed")
 
@@ -969,10 +968,10 @@ async def test_child_send_success_keeps_same_text_typed_after_edit(
     release = threading.Event()
     real_send = agent_runtime.send_to_run
 
-    def send(*args: object, **kwargs: object) -> str | None:
+    async def send(*args: object, **kwargs: object) -> str | None:
         started.set()
-        release.wait(5)
-        return real_send(*args, **kwargs)
+        await asyncio.to_thread(release.wait, 5)
+        return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
     buffer = session.default_buffer
@@ -1002,10 +1001,10 @@ async def test_close_waits_for_in_flight_child_send_outcome(
     release = threading.Event()
     real_send = agent_runtime.send_to_run
 
-    def send(*args: object, **kwargs: object) -> str | None:
+    async def send(*args: object, **kwargs: object) -> str | None:
         started.set()
-        release.wait(5)
-        return real_send(*args, **kwargs)
+        await asyncio.to_thread(release.wait, 5)
+        return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
     session.default_buffer.text = "at exit"
@@ -1031,11 +1030,13 @@ def test_send_to_run_ends_within_its_deadline_when_the_append_lock_is_held(
     result: list[str | None] = []
     worker = threading.Thread(
         target=lambda: result.append(
-            agent_runtime.send_to_run(
-                store,
-                "root:worker",
-                "blocked",
-                channel=app.loop._background_owner.conversation_channel,
+            asyncio.run(
+                agent_runtime.send_to_run(
+                    store,
+                    "root:worker",
+                    "blocked",
+                    channel=app.loop._background_owner.conversation_channel,
+                )
             )
         ),
         daemon=True,
@@ -1052,14 +1053,17 @@ def test_send_to_run_ends_within_its_deadline_when_the_append_lock_is_held(
 
 
 @pytest.mark.parametrize("missing", ["conversation", "session"])
-def test_send_to_run_rejects_a_missing_child_cleanly(tmp_path: Path, missing: str) -> None:
+@pytest.mark.asyncio
+async def test_send_to_run_rejects_a_missing_child_cleanly(
+    tmp_path: Path, missing: str
+) -> None:
     app, store, child, _session, _notices = _child_send_app(tmp_path)
     child.close()
     if missing == "conversation":
         (child.session_dir / "conversation.jsonl").unlink()
     else:
         shutil.rmtree(child.session_dir)
-    result = agent_runtime.send_to_run(
+    result = await agent_runtime.send_to_run(
         store,
         "root:worker",
         "anyone there",
@@ -1075,11 +1079,13 @@ def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Path) ->
     result: list[str | None] = []
     worker = threading.Thread(
         target=lambda: result.append(
-            agent_runtime.send_to_run(
-                store,
-                "root:worker",
-                "while locked",
-                channel=app.loop._background_owner.conversation_channel,
+            asyncio.run(
+                agent_runtime.send_to_run(
+                    store,
+                    "root:worker",
+                    "while locked",
+                    channel=app.loop._background_owner.conversation_channel,
+                )
             )
         ),
         daemon=True,
@@ -1104,10 +1110,10 @@ async def test_child_send_finishing_after_its_session_left_does_not_touch_ui(
     release = threading.Event()
     real_send = agent_runtime.send_to_run
 
-    def send(*args: object, **kwargs: object) -> str | None:
+    async def send(*args: object, **kwargs: object) -> str | None:
         started.set()
-        release.wait(5)
-        return real_send(*args, **kwargs)
+        await asyncio.to_thread(release.wait, 5)
+        return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
     session.default_buffer.text = "during exit"
@@ -1140,13 +1146,12 @@ async def test_child_send_double_enter_queues_once(
     calls = 0
     real_send = agent_runtime.send_to_run
 
-    def send(*args: object, **kwargs: object) -> str | None:
+    async def send(*args: object, **kwargs: object) -> str | None:
         nonlocal calls
         calls += 1
         started.set()
-        while not release.is_set():
-            threading.Event().wait(0.001)
-        return real_send(*args, **kwargs)
+        await release.wait()
+        return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
     session.default_buffer.text = "once"
@@ -1214,10 +1219,10 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
     release = threading.Event()
     real_send = agent_runtime.send_to_run
 
-    def send(*args: object, **kwargs: object) -> str | None:
-        loop.call_soon_threadsafe(started.set)
-        assert release.wait(10)
-        return real_send(*args, **kwargs)
+    async def send(*args: object, **kwargs: object) -> str | None:
+        started.set()
+        assert await asyncio.to_thread(release.wait, 10)
+        return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
     session.default_buffer.text = "follow up"
