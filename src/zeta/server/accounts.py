@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from ..accounts import AccountId, AccountStore, AccountUsage, account_provider
 from ..accounts.usage import usage_json
@@ -13,6 +14,23 @@ from .protocol import ProtocolError
 from .runtime import ServerRuntime
 
 REQUEST_METHODS = {"account_list", "account_refresh", "account_switch"}
+
+
+async def run_owned_switch(owner: Any, operation: Awaitable[object]) -> object:
+    task = asyncio.create_task(operation)
+    owner._account_switch_task = task
+    try:
+        return await task
+    finally:
+        owner._account_switch_task = None
+
+
+async def cancel_owned_switch(owner: Any) -> None:
+    task = getattr(owner, "_account_switch_task", None)
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    owner._account_switch_task = None
 
 
 async def migrate(home: Path) -> None:

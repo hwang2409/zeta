@@ -641,49 +641,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             )
         return current
 
-    def record_account_selection(
-        self,
-        metadata: SessionMetadata,
-        account: Any,
-        *,
-        boundary: int,
-        switched: bool = False,
-        lock_timeout: float | None = None,
-    ) -> None:
-        """Persist one provider selection and its native-context boundary atomically."""
-
-        def update(item: SessionMetadata) -> SessionMetadata:
-            return self._apply_account_selection(
-                item, account, boundary=boundary, switched=switched
-            )
-
-        current = self._mutate(
-            metadata.session_id, update, lock_timeout=lock_timeout
-        )
-        self._copy_metadata(metadata, current)
-
-    @classmethod
-    def _apply_account_selection(
-        cls,
-        metadata: SessionMetadata,
-        account: Any,
-        *,
-        boundary: int,
-        switched: bool,
-    ) -> SessionMetadata:
-        provider = account.provider
-        metadata.selected_accounts[provider] = str(account)
-        metadata.native_context_boundaries[provider] = (
-            max(boundary, metadata.native_context_boundaries.get(provider, 0) + 1)
-            if switched
-            else boundary
-        )
-        if switched:
-            metadata.account_switch_sequences[provider] = (
-                metadata.account_switch_sequences.get(provider, 0) + 1
-            )
-        return cls._touch(metadata)
-
     def read_metadata(
         self, session_id: str, *, lock_timeout: float | None = None
     ) -> SessionMetadata:

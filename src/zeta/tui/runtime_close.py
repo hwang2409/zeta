@@ -27,7 +27,7 @@ class RuntimeCloseMixin:
         await asyncio.shield(self._close_task)
 
     async def _cancel_account_switch(self) -> None:
-        task = self._account_switch_task
+        task = getattr(self, "_account_switch_task", None)
         if task is None or task.done():
             return
         task.cancel()

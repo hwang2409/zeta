@@ -232,7 +232,6 @@ class _Client:
         self._close_lock = asyncio.Lock()
         self._closed = False
         self._turn_task: asyncio.Task[None] | None = None
-        self._account_switch_task: asyncio.Task[object] | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._read_buffer = bytearray()
         self._model_inputs = PendingModelInputs()
@@ -335,15 +334,7 @@ class _Client:
             if self._closed:
                 return
             await self._terminate_pending_approvals(suppress_write_errors=True)
-            if (
-                self._account_switch_task is not None
-                and not self._account_switch_task.done()
-            ):
-                self._account_switch_task.cancel()
-                await asyncio.gather(
-                    self._account_switch_task, return_exceptions=True
-                )
-            self._account_switch_task = None
+            await accounts.cancel_owned_switch(self)
             if self._turn_task is not None and not self._turn_task.done():
                 loop = self.server.runtime.loop
                 if loop is not None:
@@ -358,7 +349,6 @@ class _Client:
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
             self._closed = True
-
     async def _dispatch(
         self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> object:
@@ -375,13 +365,6 @@ class _Client:
         if method in ergonomics.EXTENSION_REQUESTS:
             if self.protocol_version == "1.0":
                 raise ProtocolError(-32601, "request requires protocol 1.1")
-            if method == "account_switch":
-                task = asyncio.create_task(self._ergonomics(method, params))
-                self._account_switch_task = task
-                try:
-                    return await task
-                finally:
-                    self._account_switch_task = None
             return await self._ergonomics(method, params)
         if method == "ping":
             if "ping" not in self.features:
@@ -554,7 +537,7 @@ class _Client:
         if method == "session_settings":
             return ergonomics.settings(runtime)
         if method in slash_commands.READ_REQUESTS:
-            return await slash_commands.read_request(method, runtime, self._require_idle, params)
+            return await slash_commands.read_request(method, runtime, self._require_idle, params, self)
         await self._require_idle()
         if method == "slash_run":
             register = self._model_inputs.registrar(runtime.session_id, enabled="model_input_ids" in self.features)

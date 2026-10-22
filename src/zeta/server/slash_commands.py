@@ -371,10 +371,14 @@ async def read_request(
     runtime: ServerRuntime,
     require_idle: Callable[[], Awaitable[None]],
     params: dict[str, object],
+    owner: object,
 ) -> dict[str, object]:
     if method == "slash_list":
         return await list_commands(runtime)
-    return await accounts.request(method, runtime, require_idle, params)
+    operation = accounts.request(method, runtime, require_idle, params)
+    if method == "account_switch":
+        return await accounts.run_owned_switch(owner, operation)
+    return await operation
 
 
 async def list_commands(runtime: ServerRuntime) -> dict[str, object]:
