@@ -1,0 +1,159 @@
+{
+  "_fixture": {
+    "date": "2026-10-22",
+    "endpoint": "https://api.anthropic.com/api/oauth/usage",
+    "http_status": 200
+  },
+  "response": {
+    "amber_cistern": null,
+    "amber_cistern_offer": null,
+    "amber_gauge": null,
+    "amber_ladder": null,
+    "brass_thimble": null,
+    "cedar_ember": null,
+    "cinder_cove": null,
+    "copper_kite": null,
+    "extra_usage": {
+      "credits_ever_enabled": true,
+      "currency": "<redacted>",
+      "daily": null,
+      "decimal_places": 2,
+      "disabled_reason": "<redacted>",
+      "is_enabled": false,
+      "monthly_limit": 2000,
+      "spend_limit_reached": false,
+      "used_credits": 0.0,
+      "user_disabled": false,
+      "utilization": 0.0,
+      "weekly": null
+    },
+    "five_hour": {
+      "limit_dollars": null,
+      "locked_reason": null,
+      "remaining_dollars": null,
+      "resets_at": "2026-10-22T18:49:59.770796+00:00",
+      "used_dollars": null,
+      "utilization": 3.0
+    },
+    "granite_teacup": null,
+    "harbor_lantern": null,
+    "iguana_necktie": null,
+    "juniper_tide": null,
+    "limits": [
+      {
+        "group": "<redacted>",
+        "is_active": false,
+        "kind": "<redacted>",
+        "percent": 3,
+        "resets_at": "2026-10-22T18:49:59.770796+00:00",
+        "scope": null,
+        "severity": "<redacted>"
+      },
+      {
+        "group": "<redacted>",
+        "is_active": true,
+        "kind": "<redacted>",
+        "percent": 21,
+        "resets_at": "2026-10-28T14:59:59.770826+00:00",
+        "scope": null,
+        "severity": "<redacted>"
+      },
+      {
+        "group": "<redacted>",
+        "is_active": false,
+        "kind": "<redacted>",
+        "percent": 0,
+        "resets_at": "2026-10-28T15:00:00+00:00",
+        "scope": {
+          "model": {
+            "display_name": "<redacted>",
+            "id": null
+          },
+          "surface": null
+        },
+        "severity": "<redacted>"
+      }
+    ],
+    "member_dashboard_available": false,
+    "nimbus_quill": null,
+    "omelette_promotional": null,
+    "seven_day": {
+      "limit_dollars": null,
+      "locked_reason": null,
+      "remaining_dollars": null,
+      "resets_at": "2026-10-28T14:59:59.770826+00:00",
+      "used_dollars": null,
+      "utilization": 21.0
+    },
+    "seven_day_breakdown": {
+      "as_of": "<redacted>",
+      "rows": [
+        {
+          "display_name": "<redacted>",
+          "key": "<redacted>",
+          "percent": 91
+        },
+        {
+          "display_name": "<redacted>",
+          "key": "<redacted>",
+          "percent": 9
+        },
+        {
+          "display_name": "<redacted>",
+          "key": "<redacted>",
+          "percent": 0
+        },
+        {
+          "display_name": "<redacted>",
+          "key": "<redacted>",
+          "percent": 0
+        }
+      ],
+      "window_started_at": "<redacted>"
+    },
+    "seven_day_cowork": null,
+    "seven_day_oauth_apps": null,
+    "seven_day_omelette": null,
+    "seven_day_opus": null,
+    "seven_day_sonnet": null,
+    "spend": {
+      "auto_reload": null,
+      "balance": null,
+      "can_purchase_credits": false,
+      "can_toggle": false,
+      "cap": {
+        "credits": null,
+        "money": {
+          "amount_minor": 2000,
+          "currency": "<redacted>",
+          "exponent": 2
+        }
+      },
+      "disabled_reason": "<redacted>",
+      "disclaimer": "<redacted>",
+      "enabled": false,
+      "limit": {
+        "amount_minor": 2000,
+        "currency": "<redacted>",
+        "exponent": 2
+      },
+      "percent": 0,
+      "severity": "<redacted>",
+      "used": {
+        "amount_minor": 0,
+        "currency": "<redacted>",
+        "exponent": 2
+      }
+    },
+    "starry_waterfall": null,
+    "tangelo": null,
+    "wattle_ember": null,
+    "weekly_scoped_shares": [
+      {
+        "allowance_percent_of_weekly": 50,
+        "limit_index": 2,
+        "used_percent_of_weekly": 0
+      }
+    ]
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "_fixture": {
+    "date": "2026-10-22",
+    "endpoint": "https://chatgpt.com/backend-api/wham/usage",
+    "http_status": 200
+  },
+  "response": {
+    "account_id": "<redacted>",
+    "additional_rate_limits": null,
+    "code_review_rate_limit": null,
+    "credits": {
+      "approx_cloud_messages": [
+        0,
+        0
+      ],
+      "approx_local_messages": [
+        0,
+        0
+      ],
+      "balance": "<redacted>",
+      "has_credits": false,
+      "overage_limit_reached": false,
+      "unlimited": false
+    },
+    "email": "<redacted>",
+    "model_usage": {
+      "gpt-6-astra": {
+        "available": true,
+        "available_at": null,
+        "credits_would_enable": false
+      }
+    },
+    "plan_type": "<redacted>",
+    "promo": null,
+    "rate_limit": {
+      "allowed": true,
+      "limit_reached": false,
+      "primary_window": {
+        "limit_window_seconds": 604800,
+        "reset_after_seconds": 573727,
+        "reset_at": 1793251485,
+        "used_percent": 6
+      },
+      "secondary_window": null
+    },
+    "rate_limit_reached_type": null,
+    "rate_limit_reset_credits": {
+      "applicable_available_count": 0,
+      "available_count": 0
+    },
+    "spend_control": {
+      "individual_limit": null,
+      "reached": false
+    },
+    "user_id": "<redacted>"
+  }
+}

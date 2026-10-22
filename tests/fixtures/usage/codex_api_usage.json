@@ -1,0 +1,8 @@
+{
+  "_fixture": {
+    "date": "2026-10-22",
+    "endpoint": "https://chatgpt.com/api/codex/usage",
+    "http_status": 404
+  },
+  "response": null
+}

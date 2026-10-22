@@ -219,7 +219,34 @@ or partial display is a preview and must not be presented as the requested v1.
 before implementation, record redacted fixtures from real responses for every
 accepted provider source. each fixture records the exact field name, accepted
 scale, reset units, missing/null behavior, and exact exhaustion value. unsupported
-variants remain `unknown`; no guessed conversion is allowed. the codex client source verifies
+variants remain `unknown`; no guessed conversion is allowed.
+
+The 2026-10-22 release-gate fixtures in `tests/fixtures/usage/` verified these
+sources:
+
+- Anthropic `GET /api/oauth/usage` returned HTTP 200. `five_hour` and
+  `seven_day` each contain `utilization` on a 0–100 percent scale and
+  `resets_at` as an ISO 8601 timestamp with an offset. Both windows were present
+  in the observed response; nullable optional fields are ignored, while a
+  missing/null window or value is unknown and is not displayed. No exhausted
+  response was observed, so no exhaustion value is verified.
+- Codex `GET /backend-api/wham/usage` returned HTTP 200. Under `rate_limit`,
+  `primary_window` and nullable `secondary_window` contain `used_percent` on a
+  0–100 scale, `limit_window_seconds` and `reset_after_seconds` in seconds, and
+  `reset_at` as Unix epoch seconds. The observed `secondary_window` was null and
+  is omitted. The response also contained `allowed`, `limit_reached`, and
+  nullable `rate_limit_reached_type`; the observed non-exhausted values were
+  `true`, `false`, and null, so no exhausted value is verified.
+- Codex `GET /api/codex/usage` returned HTTP 404. Its shape remains unknown and
+  it is not a usage source.
+
+The verified adapters therefore show Anthropic five-hour/seven-day windows and
+Codex primary/secondary windows when each complete window is present. A missing,
+null, malformed, non-finite, or out-of-range value makes that window unknown.
+Refresh attempts have a persisted 60-second per-account cooldown, including
+failed attempts.
+
+the codex client source verifies
 `x-codex-primary-used-percent`, `x-codex-secondary-used-percent`, their window
 and reset fields, the two usage paths, and
 `x-codex-rate-limit-reached-type` ([codex-rate-limit-parser],
