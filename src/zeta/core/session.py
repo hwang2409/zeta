@@ -123,6 +123,9 @@ class SessionMetadata:
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
+    selected_accounts: dict[str, str] = field(default_factory=dict)
+    account_switch_sequences: dict[str, int] = field(default_factory=dict)
+    native_context_boundaries: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def new(
@@ -257,6 +260,33 @@ class SessionMetadata:
         raw_tool_allow = value.get("tool_allow")
         raw_tool_deny = value.get("tool_deny", [])
         raw_tool_allow_layers = value.get("tool_allow_layers")
+        selected_accounts = value.get("selected_accounts", {})
+        account_switch_sequences = value.get("account_switch_sequences", {})
+        native_context_boundaries = value.get("native_context_boundaries", {})
+        if (
+            type(selected_accounts) is not dict
+            or any(
+                provider not in {"anthropic", "codex"}
+                or type(account) is not str
+                or not account.startswith(f"{provider}:")
+                for provider, account in selected_accounts.items()
+            )
+            or type(account_switch_sequences) is not dict
+            or any(
+                provider not in {"anthropic", "codex"}
+                or type(sequence) is not int
+                or sequence < 0
+                for provider, sequence in account_switch_sequences.items()
+            )
+            or type(native_context_boundaries) is not dict
+            or any(
+                provider not in {"anthropic", "codex"}
+                or type(boundary) is not int
+                or boundary < 0
+                for provider, boundary in native_context_boundaries.items()
+            )
+        ):
+            raise SessionError(f"session account selection is invalid: {path}")
         try:
             tool_allow = validate_tool_patterns(raw_tool_allow, field="tool_allow")
             tool_deny = validate_tool_patterns(raw_tool_deny, field="tool_deny")
@@ -380,6 +410,9 @@ class SessionMetadata:
             tool_allow=tool_allow,
             tool_deny=tool_deny,
             tool_allow_layers=tool_allow_layers,
+            selected_accounts=dict(selected_accounts),
+            account_switch_sequences=dict(account_switch_sequences),
+            native_context_boundaries=dict(native_context_boundaries),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -413,6 +446,9 @@ class SessionMetadata:
             "prompt_components": self.prompt_components,
             "tool_allow": list(self.tool_allow) if self.tool_allow is not None else None,
             "tool_deny": list(self.tool_deny),
+            "selected_accounts": self.selected_accounts,
+            "account_switch_sequences": self.account_switch_sequences,
+            "native_context_boundaries": self.native_context_boundaries,
             **(
                 {
                     "tool_allow_layers": [
@@ -598,6 +634,36 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 self.project_registry.root, previous_project_id, current.session_id
             )
         return current
+
+    def record_account_selection(
+        self,
+        metadata: SessionMetadata,
+        account: Any,
+        *,
+        boundary: int,
+        switched: bool = False,
+    ) -> None:
+        """Persist one provider selection and its native-context boundary atomically."""
+
+        provider = account.provider
+        value = str(account)
+
+        def update(item: SessionMetadata) -> SessionMetadata:
+            item.selected_accounts[provider] = value
+            item.native_context_boundaries[provider] = (
+                max(boundary, item.native_context_boundaries.get(provider, 0) + 1)
+                if switched
+                else boundary
+            )
+            if switched:
+                item.account_switch_sequences[provider] = (
+                    item.account_switch_sequences.get(provider, 0) + 1
+                )
+            return self._touch(item)
+
+        current = self._mutate(metadata.session_id, update)
+        self._copy_metadata(metadata, current)
+
     def read_metadata(self, session_id: str) -> SessionMetadata:
         """Read validated metadata without opening or repairing the conversation."""
         self._validate_id(session_id)

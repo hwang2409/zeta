@@ -259,12 +259,21 @@ async def _websearch(
     arguments: dict[str, Any],
     abort_signal: AbortSignal,
 ) -> StructuredToolResult:
-    del registry
     query = arguments["query"]
     max_results = arguments.get("max_results", 8)
     codex_reason: str | None = None
     try:
-        hosted = await codex.search(query, abort_signal)
+        account = registry.selected_accounts.get("codex")
+        hosted = await (
+            codex.search(
+                query,
+                abort_signal,
+                account=account,
+                home=registry.account_home,
+            )
+            if account is not None
+            else codex.search(query, abort_signal)
+        )
     except CodexLoginRequiredError:
         hosted = None
     except Exception as exc:

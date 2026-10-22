@@ -230,6 +230,8 @@ class ToolRegistry:
         tool_allow_layers: Sequence[Sequence[str]] = (),
         required_tool_names: Sequence[str] | None = None,
         image_policy: ImagePolicy = ANTHROPIC_IMAGE_POLICY,
+        selected_accounts: Mapping[str, Any] | None = None,
+        account_home: Path | None = None,
     ) -> None:
         """Create a registry with a shared tool-output limit.
 
@@ -241,6 +243,8 @@ class ToolRegistry:
         if enforce_approvals and approval_policy is None:
             raise ValueError("enforced approvals require a policy")
         self.image_policy = image_policy
+        self.selected_accounts = dict(selected_accounts or {})
+        self.account_home = account_home
         self.tool_policy = ToolPolicy.create(
             tool_allow, tool_deny, allow_layers=tool_allow_layers
         )
@@ -679,6 +683,7 @@ class ToolRegistry:
             clone._cwd_fd = os.dup(self._cwd_fd)
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
+        clone.selected_accounts = dict(self.selected_accounts)
         clone._mcp_excluded_names = frozenset(exclude_names)
         clone._tools = {
             name: _copy_definition(definition, clone)

@@ -60,7 +60,9 @@ def credential_store(
     return AccountCredentials(registry, selected, driver)
 
 
-def _anthropic_credential(auth_home: Path) -> AnthropicCredential:
+def _anthropic_credential(
+    auth_home: Path, account: AccountId | None = None
+) -> AnthropicCredential:
     """Pick Claude's credential source, defaulting to subscription OAuth.
 
     API-key auth is opt-in only: it exists for evaluation/automation (see
@@ -69,7 +71,7 @@ def _anthropic_credential(auth_home: Path) -> AnthropicCredential:
     """
 
     if os.environ.get(API_KEY_OPT_IN_VAR) != "1":
-        credential = credential_store("claude", home=auth_home)
+        credential = credential_store("claude", home=auth_home, account=account)
         assert credential is not None
         return credential
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -92,6 +94,7 @@ def build_backend(
     require_credentials: bool = False,
     ollama_base_url: str | None = None,
     token_budget: int | None = None,
+    account: AccountId | None = None,
 ) -> tuple[CompletionBackend, str]:
     """Build a network provider backend and report the model it settled on."""
 
@@ -105,7 +108,7 @@ def build_backend(
         ),
     }
     if provider == "claude":
-        credential = _anthropic_credential(auth_home)
+        credential = _anthropic_credential(auth_home, account)
         selected_model = model or DEFAULT_CLAUDE_MODEL
         if require_credentials:
             _require_credentials(credential)
@@ -116,7 +119,7 @@ def build_backend(
             **stall_kwargs,
         ), selected_model
     if provider == "codex":
-        credential = credential_store("codex", home=auth_home)
+        credential = credential_store("codex", home=auth_home, account=account)
         assert credential is not None
         if require_credentials:
             _require_credentials(credential)

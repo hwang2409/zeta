@@ -97,6 +97,7 @@ from .render import (
 )
 from .runtime_close import RuntimeCloseMixin
 from .slash_handlers import SlashHandlerMixin
+from .slash_handlers.accounts_picker import AccountsPicker
 from .slash_handlers.command_runtime import CommandRuntimeMixin
 from .slash_handlers.decisions_panel import DecisionsMixin
 from .slash_handlers.fork_view import ForkViewMixin
@@ -139,6 +140,11 @@ def _tui_slash_commands() -> tuple[SlashCommand, ...]:
             "/always [key] — allow this tool/action for the running session",
         ),
         SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]"),
+        SlashCommand(
+            "accounts",
+            lambda app, args: app.slash_accounts(args),
+            "list accounts and switch this session",
+        ),
         SlashCommand(
             "permissions",
             lambda app, args: app.slash_permissions(args),
@@ -288,6 +294,8 @@ class TUIApp(
         self._model_catalog_task: asyncio.Task[None] | None = None
         self._model_picker: ModelPicker | None = None
         self._model_picker_unit: Any = None
+        self._accounts_picker: AccountsPicker | None = None
+        self._accounts_picker_unit: Any = None
         self._zeta_home: Path | None = (
             Path(zeta_home).resolve() if zeta_home is not None else None
         )
@@ -537,10 +545,11 @@ class TUIApp(
             on_plan_toggle=lambda: app.toggle_plan_mode(),
             on_scroll_up=self._transcript.scroll_up,
             on_scroll_down=self._transcript.scroll_down,
-            on_picker_move=lambda delta: app.model_picker_move(delta),
-            on_picker_select=lambda: app.model_picker_select(),
-            on_picker_cancel=lambda: app.model_picker_cancel(),
-            picker_active=lambda: app.model_picker_active,
+            on_picker_move=lambda delta: app._picker_move(delta),
+            on_picker_select=lambda: app._picker_select(),
+            on_picker_cancel=lambda: app._picker_cancel(),
+            on_picker_default=lambda: app.accounts_picker_default(),
+            picker_active=lambda: app._picker_active,
             on_agent_list_down=lambda: app._focus_agent_list(),
             agent_list_active=lambda: app._agent_navigation.list_focused(),
             on_agent_list_move=lambda delta: (

@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from ...accounts import AccountCredentials, AccountStore
+from ...accounts import AccountCredentials, AccountId, AccountStore
 from ...codex import (
     CODEX_API_URL,
     DEFAULT_CODEX_MODEL,
@@ -115,9 +115,24 @@ def _start_credential_task(
     return task
 
 
-async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
-    registry = AccountStore(env_home())
-    account = registry.resolve_account("codex")
+async def search(
+    query: str,
+    abort_signal: AbortSignal,
+    *,
+    account: AccountId | None = None,
+    home: Path | None = None,
+) -> CodexSearchResult:
+    registry = AccountStore(home or env_home())
+    selected = account or registry.resolve_account("codex")
+    return await _search_with_account(query, abort_signal, selected, registry)
+
+
+async def _search_with_account(
+    query: str,
+    abort_signal: AbortSignal,
+    account: AccountId,
+    registry: AccountStore,
+) -> CodexSearchResult:
     store = AccountCredentials(
         registry,
         account,

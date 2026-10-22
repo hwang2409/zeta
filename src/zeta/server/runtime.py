@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..accounts import AccountId
 from ..config.settings import load_settings
 from ..config.settings import resolve as resolve_settings
 from ..core.approval import ApprovalPolicy
@@ -88,6 +89,7 @@ def default_backend(
     require_credentials: bool = False,
     ollama_base_url: str | None = None,
     token_budget: int | None = None,
+    account: AccountId | None = None,
 ) -> tuple[CompletionBackend, str]:
     if provider == "fake":
         raise ValueError(REMOVED_PROVIDER_ERROR)
@@ -100,6 +102,8 @@ def default_backend(
         "require_credentials": require_credentials,
         "token_budget": token_budget,
     }
+    if account is not None:
+        kwargs["account"] = account
     if ollama_base_url is not None:
         kwargs["ollama_base_url"] = ollama_base_url
     return build_backend(provider, model, **kwargs)
@@ -205,6 +209,14 @@ class ServerRuntime:
                 config.token_budget,
             )
         token_budget = effective_budget_for_model(provider, model, token_budget)
+        account = None
+        if self._state is not None and provider in {"claude", "anthropic", "codex"}:
+            account = self._state.loop.account_resolver.resolve(provider)
+            if account.provider in self._state.metadata.selected_accounts:
+                self._state.loop.selected_accounts[account.provider] = account
+                self._state.loop.tool_registry.selected_accounts[account.provider] = account
+            else:
+                account = None
         backend, _ = self._build_backend(
             provider,
             model,
@@ -213,6 +225,7 @@ class ServerRuntime:
             stall_retries=config.stream_stall_retries,
             require_credentials=True,
             token_budget=token_budget,
+            account=account,
         )
         return backend
 
@@ -468,6 +481,7 @@ class ServerRuntime:
         require_credentials: bool = False,
         ollama_base_url: str | None = None,
         token_budget: int | None = None,
+        account: AccountId | None = None,
     ) -> tuple[CompletionBackend, str]:
         if self.backend_factory is not None:
             return self.backend_factory(provider, model, home)
@@ -484,6 +498,8 @@ class ServerRuntime:
             "require_credentials": require_credentials,
             "token_budget": token_budget,
         }
+        if account is not None:
+            kwargs["account"] = account
         if ollama_base_url is not None:
             kwargs["ollama_base_url"] = ollama_base_url
         return default_backend(provider, model, home, **kwargs)

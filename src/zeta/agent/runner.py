@@ -328,9 +328,22 @@ def resolve_child_backend(
         provider = provider_for_model(model)
     except ValueError as exc:
         return None, f"agent error: {exc}"
+    selected_accounts = getattr(loop, "selected_accounts", {})
+    account_provider = "anthropic" if provider == "claude" else provider
+    account = selected_accounts.get(account_provider)
+    resolver = getattr(loop, "account_resolver", None)
+    if account is None and resolver is not None and account_provider in {"anthropic", "codex"}:
+        account = resolver.resolve(provider)
+        selected_accounts[account_provider] = account
+        loop.tool_registry.selected_accounts[account_provider] = account
     # Check credentials up front: the alternative is a child that spawns, burns a
     # turn, and dies on an auth error the parent cannot act on.
-    store = credential_store(provider)
+    account_kwargs: dict[str, object] = {}
+    if (account_home := getattr(loop, "account_home", None)) is not None:
+        account_kwargs["home"] = account_home
+    if account is not None:
+        account_kwargs["account"] = account
+    store = credential_store(provider, **account_kwargs)
     if store is not None:
         tokens = store.read() or store.bootstrap()
         if tokens is None:
@@ -342,11 +355,12 @@ def resolve_child_backend(
         child_budget = effective_budget_for_model(
             provider, model, loop.context_assembler.token_budget
         )
-        backend, _ = build_backend(
-            provider,
-            model,
-            token_budget=child_budget,
-        )
+        backend_kwargs: dict[str, object] = {"token_budget": child_budget}
+        if account_home is not None:
+            backend_kwargs["home"] = account_home
+        if account is not None:
+            backend_kwargs["account"] = account
+        backend, _ = build_backend(provider, model, **backend_kwargs)
     except (OSError, RuntimeError, ValueError) as exc:
         return None, f"agent error: could not start {provider} backend: {exc}"
     return backend, None
