@@ -574,7 +574,7 @@ class SlashSession(Protocol):
 
     def slash_decisions(self, args: str) -> str: ...
 
-    def slash_send(self, args: str) -> str: ...
+    def slash_send(self, args: str) -> str | Awaitable[str]: ...
 
     def slash_tools(self, args: str) -> str: ...
 
@@ -1078,7 +1078,7 @@ def _run_decisions(session: SlashSession, args: str) -> str:
     return session.slash_decisions(args)
 
 
-def _run_send(session: SlashSession, args: str) -> str:
+def _run_send(session: SlashSession, args: str) -> str | Awaitable[str]:
     return session.slash_send(args)
 
 

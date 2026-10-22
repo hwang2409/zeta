@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 from ...protocol.types import Message, MessageOrigin
@@ -23,6 +24,20 @@ class PendingPromptsClosedError(RuntimeError):
 
 class PendingPromptCommitTimeoutError(TimeoutError):
     """Raised when a pending-prompt commit misses its pre-write deadline."""
+
+
+class PendingPromptLoopThreadLockError(RuntimeError):
+    """Raised before pending-prompt acknowledgement can block an event loop."""
+
+
+def _require_off_loop_ack_lock() -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise PendingPromptLoopThreadLockError(
+        "pending-prompt acknowledgement lock requested on an asyncio event-loop thread"
+    )
 
 
 class PendingPromptQueue:
@@ -67,6 +82,7 @@ class PendingPromptQueue:
             return self._pending_unlocked()
 
     def acknowledge(self, prompt_id: str) -> None:
+        _require_off_loop_ack_lock()
         with self._store._append_lock():
             self._store._load()
             branch = self._store.replay()
@@ -83,9 +99,12 @@ class PendingPromptQueue:
                     "pending_prompt_ack", {"prompt_id": prompt_id}
                 )
 
-    def acknowledge_messages(self, messages: list[Message]) -> None:
+    def acknowledge_messages(
+        self, messages: list[Message], *, prompt_ids: Iterable[str] = ()
+    ) -> None:
         """Consume pending prompts included in one provider context."""
-        prompt_ids = {
+        _require_off_loop_ack_lock()
+        prompt_ids = set(prompt_ids) | {
             prompt_id
             for message in messages
             if isinstance(

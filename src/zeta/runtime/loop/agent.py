@@ -18,6 +18,7 @@ from ...agent.background import (
 from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.durable import durable_message
 from ...agent.notifications import AgentNotificationMixin, NotificationWake
+from ...agent.pending_delivery import PendingDelivery
 from ...agent.plan_mode import (
     PLAN_MODE_POLICY,
     plan_mode_messages,
@@ -747,6 +748,7 @@ class AgentLoop(
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
+        pending_delivery: PendingDelivery | None = None,
         system_message: Message | None = None,
         on_persisted: Callable[[], None] | None = None,
         notification_turn: bool = False,
@@ -890,7 +892,7 @@ class AgentLoop(
                     provider_retry_budget,
                 )
 
-                pending_prompt_context = any(
+                pending_prompt_context = pending_delivery is not None or any(
                     PENDING_PROMPT_ID_METADATA in message.metadata
                     for message in context_messages
                 )
@@ -906,6 +908,12 @@ class AgentLoop(
                         ),
                         (
                             partial(
+                                pending_delivery.acknowledge,
+                                self.store,
+                                context_messages,
+                            )
+                            if pending_delivery is not None
+                            else partial(
                                 self.store.acknowledge_pending_prompt_messages,
                                 context_messages,
                             )

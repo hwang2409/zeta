@@ -21,7 +21,6 @@ from ..core.project_context import (
 from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
-from ..core.store._pending_prompts import PENDING_PROMPT_ID_METADATA
 from ..media.image_policy import image_policy_for_provider
 from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
@@ -52,6 +51,7 @@ from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
 from .finish_gate import FinishGateControl, FinishGateState, run_finish_gate
+from .pending_delivery import PendingDelivery
 from .presets import (
     GENERAL_PRESET,
     RUN_PRESET,
@@ -201,36 +201,24 @@ async def consume_child(
         )
 
     try:
-        user_message = None
-        persist_user_message = True
-        if delivering_prompt_id is not None:
-            user_message = next(
-                (
-                    message
-                    for message in reversed(child_loop.store.messages())
-                    if message.metadata.get(PENDING_PROMPT_ID_METADATA)
-                    == delivering_prompt_id
-                ),
-                None,
+        delivery = (
+            PendingDelivery.resume(
+                child_loop.store, delivering_prompt_id, prompt, origin
             )
-            persist_user_message = user_message is None
-            if user_message is None:
-                user_message = Message(
-                    MessageRole.USER,
-                    [TextContent(prompt)],
-                    metadata={
-                        "zeta.origin": origin.value,
-                        PENDING_PROMPT_ID_METADATA: delivering_prompt_id,
-                    },
-                )
+            if delivering_prompt_id is not None
+            else None
+        )
         events = (
             child_loop.run_notification_turn()
             if notification_turn
             else child_loop.run_turn(
                 prompt,
                 origin=origin,
-                user_message=user_message,
-                persist_user_message=persist_user_message,
+                user_message=delivery.message if delivery is not None else None,
+                persist_user_message=(
+                    delivery.persist_message if delivery is not None else True
+                ),
+                pending_delivery=delivery,
             )
         )
         try:

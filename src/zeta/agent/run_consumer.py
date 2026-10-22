@@ -175,12 +175,7 @@ async def consume_run(
             )
             if idle and safety_started is None:
                 safety_started = asyncio.get_running_loop().time()
-            # Ack only after a follow-up actually reached the child. A cancel or
-            # backend error mid-consume_child leaves the prompt pending, so the
-            # next run gets a chance to redeliver it instead of it silently gone.
-            if current_entry is not None:
-                child_store.acknowledge_pending_prompt(current_entry.id)
-                current_entry = None
+            current_entry = None
             pending = (
                 child_store.close_pending_queue_if_empty()
                 if child_store.pending_prompts()

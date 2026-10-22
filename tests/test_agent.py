@@ -16,11 +16,11 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
+import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
 import zeta.runtime.execution as execution_module
 import zeta.runtime.loop.agent as agent_loop_module
-import zeta.tools.agent_send as agent_send_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.background import (
     BackgroundAgentOwner,
@@ -48,6 +48,7 @@ from zeta.core.store import (
     ConversationStore,
     PendingPromptsClosedError,
 )
+from zeta.core.store._pending_prompts import PendingPromptLoopThreadLockError
 from zeta.mcp import MCPMount
 from zeta.protocol.types import (
     CompletionBackend,
@@ -2145,7 +2146,7 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
     await asyncio.wait_for(backend.question_published.wait(), timeout=2)
     await asyncio.wait_for(backend.notification_turn_started.wait(), timeout=2)
     child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
-    assert send_to_run(
+    assert await send_to_run(
         store,
         child_handle,
         "queued follow-up",
@@ -2185,7 +2186,7 @@ async def test_follow_up_wakes_worker_waiting_in_finish_gate(
     backend.release_gate_turn.set()
     await asyncio.wait_for(waiting_for_follow_up.wait(), timeout=10)
     child_handle = next(iter(store.agent_children()))
-    assert send_to_run(
+    assert await send_to_run(
         store,
         child_handle,
         "follow-up while waiting",
@@ -2207,7 +2208,7 @@ async def test_follow_up_between_gate_turns_is_delivered_once(tmp_path: Path) ->
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.gate_started.wait(), timeout=2)
     child_handle = next(iter(store.agent_children()))
-    assert send_to_run(
+    assert await send_to_run(
         store,
         child_handle,
         "follow-up between gate turns",
@@ -2253,7 +2254,7 @@ async def test_pending_follow_up_is_processed_before_finish_gate_timeout(
         # whether the follow-up arrives before an artificially tiny deadline.
         await asyncio.wait_for(waiting_for_follow_up.wait(), timeout=10)
         child_handle = next(iter(store.agent_children()))
-        assert send_to_run(
+        assert await send_to_run(
             store,
             child_handle,
             "follow-up before bound",
@@ -5718,7 +5719,12 @@ class CapturePromptBackend(CompletionBackend):
     ) -> AsyncIterator[StreamEvent]:
         del tool_schemas
         self.prompt_count = sum(
-            message.metadata.get("zeta.pending_prompt_id") is not None
+            message.role is MessageRole.USER
+            and any(
+                isinstance(block, TextContent)
+                and block.text in {"retry follow-up", "legacy follow-up"}
+                for block in message.content
+            )
             for message in messages
         )
         reply = Message(MessageRole.ASSISTANT, [TextContent("done")])
@@ -6045,14 +6051,16 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
 
     started = threading.Event()
     release = threading.Event()
-    original_send = agent_send_module.send_to_run
+    original_commit = pending_delivery_module._commit_follow_up
 
-    def blocked_send(*args, **kwargs):
+    def blocked_commit(*args, **kwargs):
         started.set()
         release.wait(timeout=2)
-        return original_send(*args, **kwargs)
+        return original_commit(*args, **kwargs)
 
-    monkeypatch.setattr(agent_send_module, "send_to_run", blocked_send)
+    monkeypatch.setattr(
+        pending_delivery_module, "_commit_follow_up", blocked_commit
+    )
     registry = ToolRegistry(
         tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
     )
@@ -6207,7 +6215,7 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
     )
     assert child_store.close_pending_queue_if_empty() == []
 
-    error = send_to_run(
+    error = await send_to_run(
         store,
         handle,
         "too late",
@@ -6269,7 +6277,7 @@ async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> N
     # The model queues follow-ups by the child_instance_id it saw in the tool
     # result, not by the provider tool_call.id, so round-trip that handle.
     handle = _run_handle_from_receipt(store)
-    assert send_to_run(
+    assert await send_to_run(
         store,
         handle,
         "also check the tests",
@@ -6305,7 +6313,7 @@ async def test_a_follow_up_reaches_a_worker_at_its_next_turn(tmp_path: Path) -> 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
     handle = _run_handle_from_receipt(store)
-    assert send_to_run(
+    assert await send_to_run(
         store,
         handle,
         "also check the tests",
@@ -6334,21 +6342,23 @@ async def test_a_run_with_an_empty_queue_finishes_normally(tmp_path: Path) -> No
     await loop.close()
 
 
-def test_send_to_run_rejects_unknown_and_finished_runs(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_send_to_run_rejects_unknown_and_finished_runs(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
     channel = BackgroundAgentOwner(store).conversation_channel
-    error = send_to_run(store, "run-1", "hello", channel=channel)
+    error = await send_to_run(store, "run-1", "hello", channel=channel)
     assert error is not None and "no live run" in error
 
-    assert send_to_run(store, "", "hello", channel=channel) == (
+    assert await send_to_run(store, "", "hello", channel=channel) == (
         "child_instance_id must be a nonempty string"
     )
-    error = send_to_run(store, "run-1", "  ", channel=channel)
+    error = await send_to_run(store, "run-1", "  ", channel=channel)
     assert error == "message must be a nonempty string"
 
 
-def test_send_to_run_rejects_non_run_children(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_send_to_run_rejects_non_run_children(tmp_path: Path) -> None:
     """A queued prompt would rot: only consume_run drains the queue."""
 
     store = ConversationStore(tmp_path)
@@ -6366,7 +6376,7 @@ def test_send_to_run_rejects_non_run_children(tmp_path: Path) -> None:
         child_instance_id="sess:1",
     )
 
-    error = send_to_run(
+    error = await send_to_run(
         store,
         "sess:1",
         "hello",
@@ -6428,11 +6438,11 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     assert handle in listing
     assert "run-1" not in listing
 
-    assert commands.slash_send("nonsense") == (
+    assert await commands.slash_send("nonsense") == (
         "use /send <run-id> <message>; /runs lists the live ones"
     )
-    assert "no live run" in commands.slash_send("bogus-id hello")
-    assert f"queued for {handle}" in commands.slash_send(
+    assert "no live run" in await commands.slash_send("bogus-id hello")
+    assert f"queued for {handle}" in await commands.slash_send(
         f"{handle} also check the tests"
     )
 
@@ -7160,7 +7170,7 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
     owner.finish_gate_task_timeout = 1
     child_handle = next(iter(store.agent_children()))
-    assert send_to_run(
+    assert await send_to_run(
         store,
         child_handle,
         "follow-up while task runs",
@@ -8812,7 +8822,7 @@ async def test_run_followup_message_row_origin_is_agent_send(tmp_path: Path) -> 
     handle = _run_handle_from_receipt(store)
     marker = store.agent_children()[handle]
     child_path = Path(str(marker["child_session_path"]))
-    assert send_to_run(
+    assert await send_to_run(
         store,
         handle,
         "also check the tests",
@@ -9559,7 +9569,7 @@ async def test_idle_child_is_running_during_wake_turn(
     )
     await asyncio.wait_for(first_idle.wait(), timeout=2)
     first_idle_since = child_store.agent_lifecycle()["idle_since"]
-    assert send_to_run(
+    assert await send_to_run(
         parent_store,
         "parent:1",
         "continue",
@@ -10539,6 +10549,169 @@ async def test_ask_parent_answer_does_not_block_finish(
 
 
 @pytest.mark.asyncio
+async def test_follow_up_ack_never_takes_store_lock_on_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard_store = ConversationStore(tmp_path, session_id="guard")
+    guarded = await asyncio.to_thread(guard_store.append_pending_prompt, "guarded")
+    with pytest.raises(PendingPromptLoopThreadLockError):
+        guard_store.acknowledge_pending_prompt(guarded.id)
+
+    backend = FollowUpFinishBackend()
+    backend.pause_before_finish = True
+    monkeypatch.setitem(
+        AGENT_PRESETS,
+        "run",
+        replace(AGENT_PRESETS["run"], explicit_finish=True),
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    handle = _run_handle_from_receipt(store)
+    await _send_follow_up(loop, handle, "first follow-up")
+    backend.release_child.set()
+    await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
+    backend.release_finish.set()
+    await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
+    await _wait_for_notification(store, "completed")
+
+    assert backend.finish_attempts == 1
+    await loop.close()
+    guard_store.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_legacy_interrupted_send_row_delivers_once(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="child")
+    pending = store.pending_prompt_queue.append(
+        "legacy follow-up", origin=MessageOrigin.AGENT_SEND
+    )
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("legacy follow-up")]),
+            MessageOrigin.AGENT_SEND,
+        )
+    )
+    backend = CapturePromptBackend()
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    result = await agent_runner_module.consume_child(
+        loop,
+        "legacy follow-up",
+        origin=MessageOrigin.AGENT_SEND,
+        child_path=str(store.session_dir),
+        publish=lambda _: None,
+        child_turns=lambda: 0,
+        update_turns=lambda _: None,
+        update_step=lambda _: None,
+        update_tool_calls=lambda _: None,
+        finish_lifecycle=lambda *_: {},
+        publish_lifecycle=lambda *a, **k: None,
+        child_result=lambda text, **kw: {
+            "content": [{"text": text}],
+            "isError": kw.get("state") == "failed",
+            "structuredContent": kw,
+        },
+        error_message=str,
+        delivering_prompt_id=pending.id,
+    )
+
+    user_rows = [
+        message
+        for message in store.messages()
+        if message.role is MessageRole.USER
+        and any(
+            isinstance(block, TextContent) and block.text == "legacy follow-up"
+            for block in message.content
+        )
+    ]
+    assert result["isError"] is False
+    assert len(user_rows) == 1
+    assert backend.prompt_count == 1
+    assert store.pending_prompts() == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_child_composer_answer_closes_matching_question(
+    tmp_path: Path,
+) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
+    loop = AgentLoop(
+        FakeBackend([]), parent, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    handle = "parent:1"
+    parent.register_agent_child(
+        _run_agent_call(),
+        child_session_path=str(child.session_dir),
+        description="run",
+        agent_type="run",
+        background=True,
+        child_instance_id=handle,
+        accepts_follow_ups=True,
+    )
+    question = parent.append_child_question(
+        child_instance_id=handle, question_id="q-composer", question="approve?"
+    )
+    commands = _RunCommands(loop)
+    commands._agent_navigation = SimpleNamespace(
+        child_view_active=True, child_instance_id=lambda: handle
+    )
+    commands._active_session = None
+    commands._ui_generation = 0
+    commands._print_system = lambda _text: None
+
+    assert commands._send_to_child("Re q-composer: approved") is False
+    await asyncio.wait_for(commands._child_send_tasks[handle][0], timeout=2)
+
+    assert question.id not in {entry.id for entry in parent.agent_notifications()}
+    assert [entry.data["text"] for entry in child.pending_prompts()] == [
+        "Re q-composer: approved"
+    ]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_send_answer_closes_matching_question(tmp_path: Path) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
+    loop = AgentLoop(
+        FakeBackend([]), parent, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    handle = "parent:1"
+    parent.register_agent_child(
+        _run_agent_call(),
+        child_session_path=str(child.session_dir),
+        description="run",
+        agent_type="run",
+        background=True,
+        child_instance_id=handle,
+        accepts_follow_ups=True,
+    )
+    question = parent.append_child_question(
+        child_instance_id=handle, question_id="q-slash", question="approve?"
+    )
+    commands = _RunCommands(loop)
+
+    result = commands.slash_send(f"{handle} Re q-slash: approved")
+    if asyncio.iscoroutine(result):
+        result = await result
+
+    assert result.startswith(f"queued for {handle}")
+    assert question.id not in {entry.id for entry in parent.agent_notifications()}
+    assert [entry.data["text"] for entry in child.pending_prompts()] == [
+        "Re q-slash: approved"
+    ]
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_follow_up_not_acknowledged_by_retry_notice_before_provider_event(
     tmp_path: Path,
 ) -> None:
@@ -10661,7 +10834,9 @@ async def test_reviewer_follow_up_committed_at_finish_boundary_is_read(
         ToolCall("finish-1", "finish", {"status": "done", "summary": "done"})
     )
     assert refused["isError"] is True
-    store.acknowledge_pending_prompt(store.pending_prompts()[0].id)
+    await asyncio.to_thread(
+        store.acknowledge_pending_prompt, store.pending_prompts()[0].id
+    )
     accepted = await registry.execute(
         ToolCall("finish-2", "finish", {"status": "done", "summary": "done"})
     )

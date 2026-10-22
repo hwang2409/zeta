@@ -16,6 +16,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from .pending_delivery import PendingDelivery
 
 WakeState = Literal["idle", "scheduled", "running"]
 
@@ -264,6 +265,7 @@ class AgentNotificationMixin:
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
+        pending_delivery: PendingDelivery | None = None,
     ) -> AsyncIterator[StreamEvent]:
         return self._run_turn(
             user_text,
@@ -271,6 +273,7 @@ class AgentNotificationMixin:
             user_message=user_message,
             persist_user_message=persist_user_message,
             abort_signal=abort_signal,
+            pending_delivery=pending_delivery,
         )
 
     async def _run_turn(
@@ -281,6 +284,7 @@ class AgentNotificationMixin:
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
+        pending_delivery: PendingDelivery | None = None,
         notification_turn: bool = False,
         turn_context: str | None = None,
         on_turn_context_persisted: Callable[[], None] | None = None,
@@ -306,6 +310,7 @@ class AgentNotificationMixin:
             user_message=user_message,
             persist_user_message=persist_user_message,
             abort_signal=abort_signal,
+            pending_delivery=pending_delivery,
             system_message=system_message,
             on_persisted=system_message_persisted,
             notification_turn=notification_turn,
