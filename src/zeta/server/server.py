@@ -13,8 +13,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..accounts import AccountUsage
-from ..accounts.usage import usage_json
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
 from ..protocol.types import (
@@ -538,18 +536,9 @@ class _Client:
             return ergonomics.catalog(runtime)
         if method == "session_settings":
             return ergonomics.settings(runtime)
-        if method == "slash_list":
-            return await slash_commands.list_commands(runtime)
-        if method == "account_list":
-            return self._account_list(runtime)
+        if method in slash_commands.READ_REQUESTS:
+            return await slash_commands.read_request(method, runtime, self._require_idle)
         await self._require_idle()
-        if method == "account_refresh":
-            await asyncio.to_thread(
-                lambda: asyncio.run(
-                    AccountUsage(runtime.loop.account_context.store).refresh_stale()
-                )
-            )
-            return self._account_list(runtime)
         if method == "slash_run":
             register = self._model_inputs.registrar(runtime.session_id, enabled="model_input_ids" in self.features)
             return await slash_commands.run_command(
@@ -584,27 +573,6 @@ class _Client:
             if not current or current[-1].id != head:
                 store.switch_to_branch(head)
         return ergonomics.tree(runtime)
-
-    @staticmethod
-    def _account_list(runtime: ServerRuntime) -> dict[str, object]:
-        context = getattr(runtime.loop, "account_context", None)
-        if context is None:
-            raise ProtocolError(-32005, "accounts unavailable for this session")
-        selected = context.snapshot()
-        displays = context.store.list_display()
-        return {
-            "accounts": [
-                {
-                    "account": str(item.account),
-                    "label": item.label,
-                    "detail": item.detail,
-                    "current": selected.get(item.account.provider) == item.account,
-                    "default": context.store.default(item.account.provider) == item.account,
-                    "usage": usage_json(item.usage),
-                }
-                for item in displays
-            ]
-        }
 
     async def _approval(
         self, method: str, request_id: str, scope: str = "once"

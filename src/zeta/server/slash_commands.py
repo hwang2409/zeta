@@ -9,7 +9,7 @@ themselves as such rather than half-executing.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,7 +31,7 @@ from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
-from . import ergonomics
+from . import accounts, ergonomics
 from .model_selection import apply as apply_settings
 from .protocol import ProtocolError
 from .runtime import ServerRuntime
@@ -360,6 +360,19 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
             SlashCommand("accounts", lambda session, args: session.slash_accounts(args), "list or label accounts"),
         ),
     )
+
+
+READ_REQUESTS = {"slash_list", *accounts.REQUEST_METHODS}
+
+
+async def read_request(
+    method: str,
+    runtime: ServerRuntime,
+    require_idle: Callable[[], Awaitable[None]],
+) -> dict[str, object]:
+    if method == "slash_list":
+        return await list_commands(runtime)
+    return await accounts.request(method, runtime, require_idle)
 
 
 async def list_commands(runtime: ServerRuntime) -> dict[str, object]:
