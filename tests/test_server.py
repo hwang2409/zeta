@@ -5728,15 +5728,19 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
         runtime = server.runtime
-        await asyncio.to_thread(
-            runtime.loop.account_context.switch,
+        await runtime.loop.account_context.switch_active(
+            runtime.loop,
             AccountId("codex", "default"),
             boundary=0,
+            provider=runtime.metadata.provider,
+            build_backend=lambda _account: None,
         )
-        await asyncio.to_thread(
-            runtime.loop.account_context.switch,
+        await runtime.loop.account_context.switch_active(
+            runtime.loop,
             AccountId("anthropic", "default"),
             boundary=0,
+            provider=runtime.metadata.provider,
+            build_backend=lambda _account: None,
         )
         native = Message(
             MessageRole.ASSISTANT,
