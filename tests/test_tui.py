@@ -95,6 +95,7 @@ from zeta.tui.composer import (
     build_key_bindings,
     parse_input,
 )
+from zeta.tui.slash_handlers.accounts_picker import AccountsPicker
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -12077,3 +12078,20 @@ def test_accounts_command_lists_and_switches(tmp_path: Path) -> None:
         "codex": "codex:second"
     }
     opened.store.close()
+
+
+def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    picker = AccountsPicker(
+        (account,),
+        {"codex": account},
+        {"codex": account},
+        {account: "henry@example.com"},
+    )
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=80).print(picker.render())
+    plain = Text.from_ansi(output.getvalue()).plain
+
+    assert "codex:work" in plain
+    assert "henry@example.com" in plain
+    assert "n rename" in plain

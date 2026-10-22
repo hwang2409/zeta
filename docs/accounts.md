@@ -2,7 +2,7 @@
 
 ## status
 
-design only. no implementation is part of this document.
+phase 1 account storage, selection, labels, rename, and offline identity display are implemented. usage and exhaustion recovery remain later work.
 
 ## problem and v1 outcome
 
@@ -31,8 +31,9 @@ explicit mode, and ollama has no oauth store ([`factory.py:41-73`](../src/zeta/p
 
 `zeta login` currently builds a provider-specific browser pkce flow and stores one
 credential path per provider ([`providers/login.py:50-73`](../src/zeta/providers/login.py#L50-L73)).
-the oauth record has `version`, `access_token`, `refresh_token`, and `expires_at`;
-account metadata and usage must never contain token fields. the shared oauth store
+the oauth record has `version`, `access_token`, `refresh_token`, `expires_at`,
+and optional offline `email` or `workspace` display metadata; account metadata
+and usage must never contain token fields. the shared oauth store
 refreshes and atomically replaces its file ([`oauth.py:499-605`](../src/zeta/oauth.py#L499-L605)).
 The account store must use the stricter session-file pattern: pinned parent,
 `O_NOFOLLOW | O_NONBLOCK`, regular-file and link-count checks, same-directory
@@ -84,17 +85,35 @@ and local name.
     codex/<name>/usage.json
 ```
 
-`accounts.json` contains the schema, display metadata, and one global default
-per provider. it is the sole owner of the account catalog and defaults. each
+`accounts.json` contains the schema and one global default per provider. it is
+the sole owner of the account catalog and defaults. provider email or workspace
+is retained only when it is already present in the OAuth response and is shown
+as optional display metadata; it is never an account identifier. each
 session's `meta.json` is the sole owner of which account that session uses and
 of its per-provider native-context boundary; it also stores the session's
-monotonic switch sequence. `oauth.json` contains only the existing four token
-fields. `usage.json` contains
+monotonic switch sequence. `oauth.json` contains the token fields plus optional
+`email` and `workspace` display fields. `usage.json` contains
 the normalized snapshot and refresh-attempt state. files are `0600`; directories
 are `0700`. secrets, auth headers, authorization codes, provider bodies, and
 exception text never enter logs, notices, model input, transcripts, tool results,
 or serve responses. serve login already uses fixed safe error messages
 ([`server/login.py:72-97`](../src/zeta/server/login.py#L72-L97)).
+
+## labels and rename
+
+an account's local `name` is its user-visible label. `zeta login <provider>` asks
+for a label; the first account for that provider offers `default`. an explicit
+label is available with `--account`, and replacing an existing label requires
+`--replace`.
+
+`zeta accounts rename <provider>:<old> <new>` and `n` in `/accounts` rename a
+label. rename refuses while the account lifecycle lock is held or a live session
+pins the account. otherwise it moves the credential and lock directories,
+updates the registry and global default, and rewrites saved session pins. a
+durable rename journal completes an interrupted move before the account catalog
+is read, so recovery keeps one usable credential. approved automation revisions
+are immutable: they remain pinned to the old id and fail with the existing
+re-draft guidance.
 
 ## crash-safe legacy migration
 

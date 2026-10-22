@@ -1266,3 +1266,148 @@ def test_api_key_mode_skips_named_accounts(
         "system · this session uses an API key; account switching is unavailable"
     )
     opened.store.close()
+
+
+def test_rename_moves_credentials_default_and_saved_pins(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    old = AccountId("codex", "work")
+    new = AccountId("codex", "henry")
+    named_account_credentials(home, "codex", "work").save(tokens())
+    AccountStore(home).set_default(old)
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    manager.record_account_selection(opened.metadata, old, boundary=0)
+    opened.store.close()
+
+    message = AccountStore(home).rename(old, "henry")
+
+    store = AccountStore(home)
+    assert store.list() == [new]
+    assert store.default("codex") == new
+    assert store.credential_path(new).exists()
+    assert not store.credential_path(old).exists()
+    assert manager.read_metadata(opened.metadata.session_id).selected_accounts == {
+        "codex": "codex:henry"
+    }
+    assert "automation" in message and "re-draft" in message
+
+
+def test_rename_rejects_existing_or_invalid_label(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path)
+    named_account_credentials(tmp_path, "codex", "work").save(tokens())
+    named_account_credentials(tmp_path, "codex", "other").save(tokens())
+
+    with pytest.raises(AccountError, match="already exists"):
+        store.rename(AccountId("codex", "work"), "other")
+    with pytest.raises(ValueError, match="invalid account id"):
+        store.rename(AccountId("codex", "work"), "Not Valid")
+
+
+def test_rename_refuses_while_account_in_use(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path)
+    account = AccountId("codex", "work")
+    named_account_credentials(tmp_path, "codex", "work").save(tokens())
+
+    with (
+        store.lifecycle_guard(account),
+        pytest.raises(AccountError, match="in use"),
+    ):
+        store.rename(account, "henry")
+
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    manager.record_account_selection(opened.metadata, account, boundary=0)
+    with pytest.raises(AccountError, match="live session"):
+        store.rename(account, "henry")
+    opened.store.close()
+
+
+def test_rename_crash_leaves_one_usable_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = AccountStore(tmp_path)
+    old = AccountId("codex", "work")
+    new = AccountId("codex", "henry")
+    named_account_credentials(tmp_path, "codex", "work").save(tokens())
+    real_write = store._write_registry
+
+    def crash_after_move(home_fd: int, value: dict[str, object]) -> None:
+        if str(new) in value["accounts"]:  # type: ignore[operator]
+            raise OSError("simulated crash")
+        real_write(home_fd, value)
+
+    monkeypatch.setattr(store, "_write_registry", crash_after_move)
+    with pytest.raises(OSError, match="simulated crash"):
+        store.rename(old, "henry")
+    monkeypatch.undo()
+
+    recovered = AccountStore(tmp_path)
+    assert recovered.list() == [new]
+    assert recovered.credential_path(new).exists()
+    assert not recovered.credential_path(old).exists()
+    assert named_account_credentials(tmp_path, "codex", "henry").read() == tokens()
+
+
+def test_rename_leaves_approved_automation_pinned_with_redraft_message(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(tmp_path)
+    old = AccountId("codex", "work")
+    named_account_credentials(tmp_path, "codex", "work").save(tokens())
+    approved = tmp_path / "automations" / "job" / "approved.json"
+    approved.parent.mkdir(parents=True)
+    approved.write_text(json.dumps({"account": str(old)}))
+
+    message = store.rename(old, "henry")
+
+    assert json.loads(approved.read_text())["account"] == str(old)
+    assert "approved automation" in message
+    assert "re-draft" in message
+
+
+def test_list_shows_email_metadata_when_present_offline(tmp_path: Path) -> None:
+    parsed = OAuthTokens.from_mapping(
+        {
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_at": 9_999_999_999,
+            "account": {"email": "claude@example.com"},
+        },
+        error_type=RuntimeError,
+    )
+    assert parsed.email == "claude@example.com"
+    codex = OAuthTokens(
+        "access", "refresh", 9_999_999_999, email="henry@example.com"
+    )
+    anthropic = OAuthTokens(
+        "access", "refresh", 9_999_999_999, workspace="Acme"
+    )
+    named_account_credentials(tmp_path, "codex", "work").save(codex)
+    named_account_credentials(tmp_path, "anthropic", "team").save(anthropic)
+
+    listed = AccountStore(tmp_path).list_display()
+
+    assert [(str(item.account), item.detail) for item in listed] == [
+        ("anthropic:team", "Acme"),
+        ("codex:work", "henry@example.com"),
+    ]
+
+
+def test_login_prompts_for_label_and_rejects_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
+    monkeypatch.setattr(cli_main.sys.stdin, "isatty", lambda: True)
+    labels = iter(["work", "work"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(labels))
+    called: list[str] = []
+
+    def login(provider: str, account: str, replace_existing: bool = False) -> None:
+        called.append(account)
+        named_account_credentials(tmp_path, provider, account).save(tokens())
+
+    monkeypatch.setattr(cli_main, "_run_login", login)
+    assert cli_main.main(["login", "codex"]) == 0
+    assert cli_main.main(["accounts", "login", "codex"]) == 1
+    assert called == ["work"]
+    assert "already exists" in capsys.readouterr().err

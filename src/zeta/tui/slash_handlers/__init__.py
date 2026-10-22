@@ -11,7 +11,7 @@ from pathlib import Path
 
 from prompt_toolkit.enums import EditingMode
 
-from ...accounts import AccountError
+from ...accounts import AccountError, AccountId
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
 from ...core.session import SessionError, env_home, normalize_session_name
@@ -174,8 +174,16 @@ class SlashHandlerMixin:
     def slash_accounts(self, args: str) -> str:
         """List named accounts and open the current-session switcher."""
 
-        if args.strip():
-            return "usage: /accounts"
+        requested = args.split()
+        if requested:
+            if len(requested) != 3 or requested[0] != "rename":
+                return "usage: /accounts [rename provider:old new-label]"
+            try:
+                old = AccountId(*requested[1].split(":", 1))
+                message = self.loop.account_context.store.rename(old, requested[2])
+            except (AccountError, OSError, ValueError) as exc:
+                return f"account unchanged: {exc}"
+            return message
         if self.active or self.pending_approvals:
             return "accounts unavailable: cannot switch while a turn or approval is active"
         context = getattr(self.loop, "account_context", None)
@@ -183,7 +191,8 @@ class SlashHandlerMixin:
             return "accounts unavailable for this session"
         if context.switching_unavailable is not None:
             return context.switching_unavailable
-        accounts = tuple(context.store.list())
+        displays = context.store.list_display()
+        accounts = tuple(item.account for item in displays)
         if not accounts:
             return "no accounts; run zeta login <provider> --account <name>"
         defaults = {
@@ -192,7 +201,12 @@ class SlashHandlerMixin:
             if (account := context.store.default(provider)) is not None
         }
         self._dismiss_accounts_picker()
-        picker = AccountsPicker(accounts, context.snapshot(), defaults)
+        picker = AccountsPicker(
+            accounts,
+            context.snapshot(),
+            defaults,
+            {item.account: item.detail for item in displays if item.detail},
+        )
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())
         self._invalidate_prompt()
@@ -230,6 +244,17 @@ class SlashHandlerMixin:
             return
         picker.defaults[account.provider] = account
         self._repaint_accounts_picker()
+
+    def accounts_picker_rename(self) -> None:
+        picker = self._accounts_picker
+        session = self._active_session
+        if picker is None or session is None:
+            return
+        account = picker.highlighted
+        self._dismiss_accounts_picker()
+        session.default_buffer.reset()
+        session.default_buffer.insert_text(f"/accounts rename {account} ")
+        self._invalidate_prompt()
 
     def accounts_picker_select(self) -> None:
         picker = self._accounts_picker

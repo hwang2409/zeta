@@ -268,14 +268,18 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default="anthropic",
     )
-    login_parser.add_argument("--account", default="default")
+    login_parser.add_argument("--account")
     login_parser.add_argument("--replace", action="store_true")
     accounts_parser = commands.add_parser(
         "accounts", help="manage subscription accounts"
     )
-    accounts_parser.add_argument("action", nargs="?", choices=("default",))
+    accounts_parser.add_argument(
+        "action", nargs="?", choices=("default", "login", "rename")
+    )
     accounts_parser.add_argument("account", nargs="?")
+    accounts_parser.add_argument("new_label", nargs="?")
     accounts_parser.add_argument("--json", action="store_true")
+    accounts_parser.add_argument("--replace", action="store_true")
     from .inbox import add_subcommand as _add_inbox_subcommand
     from .project import add_subcommand as _add_project_subcommand
     from .session import add_subcommand as _add_session_subcommand
@@ -401,21 +405,24 @@ def _run_login(
 def _handle_login(args: argparse.Namespace) -> int:
     try:
         replace_existing = args.replace
-        account = AccountId(args.provider, args.account)
         store = AccountStore(env_home())
         store.migrate()
+        account_name = args.account
+        if account_name is None:
+            if not sys.stdin.isatty():
+                raise AccountError("account label required; use --account <label>")
+            first = not any(item.provider == args.provider for item in store.list())
+            prompt = "account label [default]: " if first else "account label: "
+            account_name = input(prompt).strip() or ("default" if first else "")
+            if not account_name:
+                raise AccountError("account label is required")
+        account = AccountId(args.provider, account_name)
         if store.contains(account) and not replace_existing:
-            if not sys.stdin.isatty() or input(
-                f"replace {account}? [y/N] "
-            ).lower() not in {"y", "yes"}:
-                raise AccountError(
-                    f"account {account} already exists; use --replace"
-                )
-            replace_existing = True
+            raise AccountError(f"account {account} already exists; use --replace")
         handle = (
             _run_login(args.provider)
-            if args.account == "default" and not replace_existing
-            else _run_login(args.provider, args.account, replace_existing)
+            if account_name == "default" and not replace_existing
+            else _run_login(args.provider, account_name, replace_existing)
         )
     except KeyboardInterrupt:
         print("login cancelled", file=sys.stderr)
@@ -431,6 +438,17 @@ def _handle_login(args: argparse.Namespace) -> int:
 
 
 def _handle_accounts(args: argparse.Namespace) -> int:
+    if args.action == "login":
+        if args.account not in {"anthropic", "codex"}:
+            print("login requires anthropic or codex", file=sys.stderr)
+            return 1
+        return _handle_login(
+            argparse.Namespace(
+                provider=args.account,
+                account=args.new_label,
+                replace=args.replace,
+            )
+        )
     store = AccountStore(env_home())
     try:
         store.migrate()
@@ -439,9 +457,30 @@ def _handle_accounts(args: argparse.Namespace) -> int:
                 raise AccountError("default requires provider:name")
             provider, name = args.account.split(":", 1)
             store.set_default(AccountId(provider, name))
+        elif args.action == "rename":
+            if not args.account or ":" not in args.account or not args.new_label:
+                raise AccountError("rename requires provider:old and a new label")
+            provider, name = args.account.split(":", 1)
+            print(store.rename(AccountId(provider, name), args.new_label))
         else:
-            accounts = [str(item) for item in store.list()]
-            print(json.dumps(accounts) if args.json else "\n".join(accounts))
+            accounts = store.list_display()
+            if args.json:
+                print(
+                    json.dumps(
+                        [
+                            {"account": str(item.account), "detail": item.detail}
+                            for item in accounts
+                        ]
+                    )
+                )
+            else:
+                print(
+                    "\n".join(
+                        str(item.account)
+                        + (f"  {item.detail}" if item.detail else "")
+                        for item in accounts
+                    )
+                )
         return 0
     except (AccountError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

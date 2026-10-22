@@ -25,8 +25,15 @@ from typing import Any, Protocol
 
 import httpx
 
-from ..core.session_files import child_directory, open_session_file
+from ..core.checkpoints import load_session_json
+from ..core.session_files import (
+    child_directory,
+    open_session_file,
+    session_directory,
+    write_session_json,
+)
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens, credential_file_lock
+from ..session_liveness import session_is_live
 
 _PROVIDERS = {"anthropic", "codex"}
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
@@ -53,6 +60,12 @@ class AccountId:
 
     def __str__(self) -> str:
         return f"{self.provider}:{self.name}"
+
+
+@dataclass(frozen=True, slots=True)
+class AccountDisplay:
+    account: AccountId
+    detail: str | None = None
 
 
 class AccountStore:
@@ -133,29 +146,150 @@ class AccountStore:
 
     def list(self) -> list[AccountId]:
         with self._home() as home_fd, self._registry_guard(home_fd):
+            self._recover_rename(home_fd)
             return [
                 AccountId(*key.split(":", 1))
                 for key in self._read_registry(home_fd)["accounts"]
             ]
 
+    def list_display(self) -> list[AccountDisplay]:
+        result = []
+        for account in self.list():
+            with self.lifecycle_guard(account) as home_fd:
+                tokens = _read_account_tokens(home_fd, account)
+            detail = (tokens.email or tokens.workspace) if tokens else None
+            result.append(AccountDisplay(account, detail))
+        return result
+
     def default(self, provider: str) -> AccountId | None:
         if provider not in _PROVIDERS:
             raise ValueError("invalid account provider")
         with self._home() as home_fd, self._registry_guard(home_fd):
+            self._recover_rename(home_fd)
             value = self._read_registry(home_fd)["defaults"].get(provider)
             return AccountId(*value.split(":", 1)) if value else None
 
     def contains(self, account: AccountId) -> bool:
         with self._home() as home_fd, self._registry_guard(home_fd):
+            self._recover_rename(home_fd)
             return str(account) in self._read_registry(home_fd)["accounts"]
 
     def set_default(self, account: AccountId) -> None:
         with self._home() as home_fd, self._registry_guard(home_fd):
+            self._recover_rename(home_fd)
             value = self._read_registry(home_fd)
             if str(account) not in value["accounts"]:
                 raise AccountError(f"account {account} does not exist; use /accounts")
             value["defaults"][account.provider] = str(account)
             self._write_registry(home_fd, value)
+
+    def rename(self, account: AccountId, new_name: str) -> str:
+        replacement = AccountId(account.provider, new_name)
+        if replacement == account:
+            return "account label unchanged"
+        with self._home() as home_fd, self._registry_guard(home_fd):
+            self._recover_rename(home_fd)
+            value = self._read_registry(home_fd)
+            if str(account) not in value["accounts"]:
+                raise AccountError(f"account {account} does not exist")
+            if str(replacement) in value["accounts"]:
+                raise AccountError(f"account {replacement} already exists")
+            try:
+                guard = self._lifecycle_guard(home_fd, account, wait=False)
+                guard.__enter__()
+            except AccountError as exc:
+                raise AccountError(f"account {account} is in use") from exc
+            try:
+                self._refuse_live_session_pin(account)
+                _atomic_publish(
+                    home_fd,
+                    ".account-rename.json",
+                    json.dumps(
+                        {"old": str(account), "new": str(replacement)},
+                        separators=(",", ":"),
+                    ).encode(),
+                )
+                self._finish_rename(home_fd, account, replacement)
+            finally:
+                guard.__exit__(None, None, None)
+        return (
+            f"renamed {account} to {replacement}; approved automation revisions "
+            "remain pinned to the old account and must be re-drafted"
+        )
+
+    def _recover_rename(self, home_fd: int) -> None:
+        raw = _read_optional(home_fd, ".account-rename.json")
+        if raw is None:
+            return
+        try:
+            value = json.loads(raw)
+            old = AccountId(*value["old"].split(":", 1))
+            new = AccountId(*value["new"].split(":", 1))
+        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AccountError("account rename recovery is invalid") from exc
+        self._finish_rename(home_fd, old, new)
+
+    def _finish_rename(
+        self, home_fd: int, old: AccountId, new: AccountId
+    ) -> None:
+        with child_directory(home_fd, "accounts") as accounts_fd, child_directory(
+            accounts_fd, old.provider
+        ) as provider_fd:
+            _rename_directory_entry(provider_fd, old.name, new.name)
+        self._rewrite_saved_pins(old, new)
+        value = self._read_registry(home_fd)
+        metadata = value["accounts"].pop(str(old), None)
+        if metadata is not None:
+            value["accounts"][str(new)] = {
+                "provider": new.provider,
+                "name": new.name,
+            }
+            if value["defaults"].get(old.provider) == str(old):
+                value["defaults"][old.provider] = str(new)
+            self._write_registry(home_fd, value)
+        with child_directory(home_fd, "account-locks") as locks_fd, child_directory(
+            locks_fd, old.provider
+        ) as provider_fd:
+            _rename_directory_entry(provider_fd, old.name, new.name)
+        try:
+            os.unlink(".account-rename.json", dir_fd=home_fd)
+        except FileNotFoundError:
+            pass
+        _fsync_directory(home_fd)
+
+    def _refuse_live_session_pin(self, account: AccountId) -> None:
+        sessions = self.home / "sessions"
+        if not sessions.exists():
+            return
+        for directory in sessions.iterdir():
+            if not directory.is_dir() or not session_is_live(directory):
+                continue
+            try:
+                value = json.loads((directory / "meta.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if value.get("selected_accounts", {}).get(account.provider) == str(account):
+                raise AccountError(f"account {account} is pinned by a live session")
+
+    def _rewrite_saved_pins(self, old: AccountId, new: AccountId) -> None:
+        sessions = self.home / "sessions"
+        if not sessions.exists():
+            return
+        for directory in sessions.iterdir():
+            if not directory.is_dir():
+                continue
+            try:
+                with session_directory(sessions, directory.name) as (_, session_fd):
+                    fd = open_session_file(session_fd, "meta.json", os.O_RDONLY)
+                    with os.fdopen(fd, "rb") as handle:
+                        value = load_session_json(handle.read())
+                    selected = value.get("selected_accounts", {})
+                    if selected.get(old.provider) != str(old):
+                        continue
+                    selected[old.provider] = str(new)
+                    write_session_json(session_fd, "meta.json", value)
+            except (FileNotFoundError, OSError, ValueError):
+                continue
 
     def credential_path(self, account: AccountId) -> Path:
         return self.accounts / account.provider / account.name / "oauth.json"
@@ -455,6 +589,14 @@ class AccountCredentials:
             raise self.auth_error_type(
                 f"{self.provider_label} OAuth token refresh stalled"
             ) from exc
+        if not refreshed.email and not refreshed.workspace:
+            refreshed = OAuthTokens(
+                refreshed.access_token,
+                refreshed.refresh_token,
+                refreshed.expires_at,
+                tokens.email,
+                tokens.workspace,
+            )
         self._write(home_fd, refreshed)
         return refreshed.access_token
 
@@ -780,6 +922,19 @@ def _exists(directory_fd: int, name: str) -> bool:
     except FileNotFoundError:
         return False
     return True
+
+
+def _rename_directory_entry(directory_fd: int, old: str, new: str) -> None:
+    old_exists = _exists(directory_fd, old)
+    new_exists = _exists(directory_fd, new)
+    if old_exists and new_exists:
+        raise AccountError("account rename has conflicting directories")
+    if old_exists:
+        info = os.stat(old, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise AccountError("account rename source is invalid")
+        os.rename(old, new, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        _fsync_directory(directory_fd)
 
 
 def _file_mtime_ns(directory_fd: int, name: str) -> int:
