@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .exhaustion import classify_subscription_limit, recovery_alternatives
 from .store import AccountError, AccountId, AccountStore
+from .usage import read_usage, record_subscription_limit
 
 if TYPE_CHECKING:
     from ..core.session import SessionManager, SessionMetadata
@@ -174,6 +177,45 @@ class SessionAccountContext:
         )
         self._pins = {**self._pins, account.provider: account}
         self._switch_sequences = dict(self.metadata.account_switch_sequences)
+
+    def subscription_limit_event(self, failure: object) -> dict[str, object] | None:
+        provider = self._active_provider
+        if provider is None or api_key_mode(provider):
+            return None
+        account = self.resolve(provider)
+        limit = classify_subscription_limit(provider, account, failure)
+        if limit is None:
+            return None
+        failure.subscription_limit = limit  # type: ignore[attr-defined]
+        now = datetime.now(UTC)
+        state = limit.usage_state(now)
+        assert state.snapshot is not None
+        record_subscription_limit(self.store, account, state.snapshot, now)
+        states = {
+            item: read_usage(self.store, item, now=now)
+            for item in self.store.list()
+            if item.provider == provider
+        }
+        alternatives = recovery_alternatives(account, states, now)
+        return limit.recovery_event(frozen=self._frozen, alternatives=alternatives)
+
+    def switch_active(
+        self, loop: Any, account: AccountId, provider: str, model: str, *, boundary: int
+    ) -> None:
+        from ..providers.factory import build_backend
+
+        current_provider = account_provider(provider)
+        backend = None
+        if account.provider == current_provider:
+            backend, _ = build_backend(
+                provider,
+                model,
+                token_budget=loop.context_assembler.token_budget,
+                **{**self.backend_kwargs(provider), "account": account},
+            )
+        self.switch(account, boundary=boundary)
+        if backend is not None:
+            self.activate(loop, backend, provider)
 
     def activate(self, loop: Any, backend: Any, provider: str) -> tuple[Any, str | None]:
         previous = (loop.backend, self._active_provider)

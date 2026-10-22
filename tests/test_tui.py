@@ -1632,6 +1632,14 @@ def test_scrollback_stream_events_render() -> None:
             StreamEventType.AGENT_NOTIFICATION,
             data=_notification_payloads()["agent_completion"],
         ),
+        StreamEventType.ACCOUNT_LIMIT: StreamEvent(
+            StreamEventType.ACCOUNT_LIMIT,
+            data={
+                "account": "codex:work",
+                "resets_at": "2026-10-27T18:31:48Z",
+                "action": "accounts",
+            },
+        ),
         StreamEventType.TOOL_EXECUTION_START: StreamEvent(
             StreamEventType.TOOL_EXECUTION_START, tool_call=call
         ),
@@ -12275,3 +12283,62 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
     assert "codex:henry" in plain
     assert "henry@example.com" in plain
     assert "n rename" in plain
+
+
+def _limit_tui(tmp_path: Path) -> tuple[TUIApp, SessionAccountContext, ConversationStore]:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        named_account_credentials(home, account.provider, account.name).save(
+            OAuthTokens(account.name, "refresh", 9_999_999_999)
+        )
+    AccountStore(home).set_default(first)
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    context = SessionAccountContext.load(home, manager, opened.metadata)
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = Mock()
+    return app, context, opened.store
+
+
+def test_limit_notice_renders_and_switch_key_switches_session(tmp_path: Path) -> None:
+    app, context, store = _limit_tui(tmp_path)
+    event = StreamEvent(
+        StreamEventType.ACCOUNT_LIMIT,
+        data={
+            "account": "codex:first",
+            "resets_at": "2026-10-27T18:31:48Z",
+            "action": "switch",
+            "alternative": "codex:second",
+        },
+    )
+    assert "codex:first" in renderable_plain(render_event(event))
+    app._handle_account_limit(event)
+    assert app._accounts_picker is not None
+    assert app._accounts_picker.accounts == (AccountId("codex", "second"),)
+    app.accounts_picker_select()
+    assert context.resolve("codex") == AccountId("codex", "second")
+    store.close()
+
+
+def test_limit_without_single_alternative_opens_accounts(tmp_path: Path) -> None:
+    app, _, store = _limit_tui(tmp_path)
+    app._handle_account_limit(
+        StreamEvent(
+            StreamEventType.ACCOUNT_LIMIT,
+            data={
+                "account": "codex:first",
+                "resets_at": "2026-10-27T18:31:48Z",
+                "action": "accounts",
+                "alternative": None,
+            },
+        )
+    )
+    assert app._accounts_picker is not None
+    assert len(app._accounts_picker.accounts) == 2
+    store.close()

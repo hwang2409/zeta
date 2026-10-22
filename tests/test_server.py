@@ -5748,3 +5748,60 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         ) == previous
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        named_account_credentials(home, account.provider, account.name).save(
+            OAuthTokens(account.name, "refresh", 9_999_999_999)
+        )
+    AccountStore(home).set_default(first)
+    client = object.__new__(_Client)
+    client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    async def ignore_stale_approvals(_session_id: str | None) -> None:
+        return None
+
+    client._notify = notify
+    client._end_stale_approvals = ignore_stale_approvals
+    limit_data = {
+        "account": "codex:first",
+        "resets_at": "2026-10-27T18:31:48Z",
+        "reset_local": "oct 27 18:31 pdt",
+        "window_minutes": 10080,
+        "action": "switch",
+        "alternative": "codex:second",
+    }
+    await client._event(
+        StreamEvent(StreamEventType.ACCOUNT_LIMIT, data=limit_data),
+        session_id="session",
+    )
+    assert notifications == [("account_limit", {"data": limit_data})]
+
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        response = (
+            await _request(
+                reader,
+                writer,
+                "accounts-switch",
+                "account_switch",
+                {"session_id": sid, "account": "codex:second"},
+            )
+        )[-1]["result"]
+        assert response == {"account": "codex:second", "replay": False}
+        assert server.runtime.loop.account_context.resolve("codex") == second
+    finally:
+        await _close(server, writer)

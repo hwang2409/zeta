@@ -740,6 +740,7 @@ Event fields are:
 | `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
 | `assistant_message` | `event`, `message: Message` | `session_id` |
 | `assistant_reset` (feature `assistant_reset`) | `event` | `session_id`, `data: object` |
+| `account_limit` | `event`, `data: object` | `session_id` |
 | `memory_updated` (feature `memory_updated`) | `event`, `session_id: string`, `message: string` | none |
 | `usage` | `event`, `usage: Usage` | `session_id` |
 | `tool_start` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
@@ -900,6 +901,13 @@ error code and message. Provider status and origin remain internal.
   sequentially, with the persisted 60-second per-account cooldown. Provider
   work runs off the server event loop. The response has the same shape as
   `account_list`, including safe per-account failures and preserved snapshots.
+- `account_switch`: takes `session_id` and `account` (`provider:name`), requires
+  an idle session, and switches only that session through the native-context
+  boundary. Its response contains the selected `account` and `replay: false`.
+  The client uses this after an `account_limit` event; Zeta never retries the
+  failed request. `account_limit.data` contains `account`, UTC `resets_at`,
+  absolute local `reset_local`, `window_minutes`, `action` (`switch`,
+  `accounts`, or `none`), and an optional single `alternative`.
 - `set_settings`: takes `model` from that catalog and `approval_mode` (`ask`,
   `allow`, or `deny`). Both persist atomically in session metadata and apply to
   future completions. Explicit approval tool rules retain precedence. Invalid

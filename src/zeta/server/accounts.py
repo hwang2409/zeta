@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 
-from ..accounts import AccountUsage
+from ..accounts import AccountId, AccountUsage
 from ..accounts.usage import usage_json
 from .protocol import ProtocolError
 from .runtime import ServerRuntime
 
-REQUEST_METHODS = {"account_list", "account_refresh"}
+REQUEST_METHODS = {"account_list", "account_refresh", "account_switch"}
 
 
 def list_accounts(runtime: ServerRuntime) -> dict[str, object]:
@@ -38,11 +38,24 @@ async def request(
     method: str,
     runtime: ServerRuntime,
     require_idle: Callable[[], Awaitable[None]],
+    params: dict[str, object],
 ) -> dict[str, object]:
     if method == "account_list":
         return list_accounts(runtime)
     await require_idle()
-    return await refresh_accounts(runtime)
+    if method == "account_refresh":
+        return await refresh_accounts(runtime)
+    raw = params.get("account")
+    if not isinstance(raw, str) or ":" not in raw:
+        raise ProtocolError(-32602, "account must be provider:name")
+    account = AccountId(*raw.split(":", 1))
+    loop = runtime.loop
+    entries = loop.store.replay()
+    boundary = entries[-1].seq if entries else 0
+    loop.account_context.switch_active(
+        loop, account, runtime.metadata.provider, loop.backend.model, boundary=boundary
+    )
+    return {"account": str(account), "replay": False}
 
 
 async def refresh_accounts(runtime: ServerRuntime) -> dict[str, object]:

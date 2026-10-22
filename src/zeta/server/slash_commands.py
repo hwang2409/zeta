@@ -369,10 +369,11 @@ async def read_request(
     method: str,
     runtime: ServerRuntime,
     require_idle: Callable[[], Awaitable[None]],
+    params: dict[str, object],
 ) -> dict[str, object]:
     if method == "slash_list":
         return await list_commands(runtime)
-    return await accounts.request(method, runtime, require_idle)
+    return await accounts.request(method, runtime, require_idle, params)
 
 
 async def list_commands(runtime: ServerRuntime) -> dict[str, object]:

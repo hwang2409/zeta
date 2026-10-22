@@ -44,6 +44,7 @@ EXTENSION_REQUESTS = [
     "slash_run",
     "account_list",
     "account_refresh",
+    "account_switch",
 ]
 MAX_IMAGE_BYTES = 512 * 1024
 IMAGE_EXTENSIONS = {

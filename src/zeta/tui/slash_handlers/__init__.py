@@ -29,8 +29,7 @@ from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
-from ...protocol.types import MessageOrigin
-from ...providers.factory import build_backend
+from ...protocol.types import MessageOrigin, StreamEvent
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -212,6 +211,14 @@ class SlashHandlerMixin:
             return "no accounts; run zeta login <provider> --account <name>"
         return self._show_accounts_picker(context, displays)
 
+    def _handle_account_limit(self, event: StreamEvent) -> None:
+        context = self.loop.account_context
+        displays = context.store.list_display()
+        alternative = event.data.get("alternative")
+        if event.data.get("action") == "switch" and isinstance(alternative, str):
+            displays = [item for item in displays if str(item.account) == alternative]
+        self._show_accounts_picker(context, displays)
+
     @property
     def accounts_picker_active(self) -> bool:
         return self._accounts_picker is not None
@@ -294,20 +301,11 @@ class SlashHandlerMixin:
         account = picker.highlighted
         context = self.loop.account_context
         try:
-            backend = None
-            current_provider = "anthropic" if self.provider == "claude" else self.provider
-            if account.provider == current_provider:
-                backend, _ = build_backend(
-                    self.provider,
-                    self.model,
-                    token_budget=self.loop.context_assembler.token_budget,
-                    **{**context.backend_kwargs(self.provider), "account": account},
-                )
             entries = self.loop.store.replay()
             boundary = entries[-1].seq if entries else 0
-            context.switch(account, boundary=boundary)
-            if backend is not None:
-                context.activate(self.loop, backend, self.provider)
+            context.switch_active(
+                self.loop, account, self.provider, self.model, boundary=boundary
+            )
         except (AccountError, OSError, RuntimeError, ValueError) as exc:
             self._print_system(f"account unchanged: {exc}")
             return

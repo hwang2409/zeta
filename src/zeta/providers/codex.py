@@ -278,7 +278,15 @@ class CodexBackend(CompletionBackend):
             try:
                 if response.status_code >= 400:
                     body = await _read_error_body(response)
-                    raise _http_error(response.status_code, body, response.headers)
+                    failure = _http_error(response.status_code, body, response.headers)
+                    account = getattr(self.token_store, "account", None)
+                    if account is not None:
+                        from ..accounts.exhaustion import classify_subscription_limit
+
+                        limit = classify_subscription_limit("codex", account, failure)
+                        if limit is not None:
+                            failure.subscription_limit = limit
+                    raise failure
                 async for event in _decode_response(
                     response,
                     self.stall_seconds,
@@ -362,6 +370,7 @@ def _http_error(
         f"Codex HTTP request failed ({status_code}){detail}",
         status_code=status_code,
         retry_after=retry_after,
+        response_body=body,
     )
     if status_code == 400:
         try:

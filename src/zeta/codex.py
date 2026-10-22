@@ -53,10 +53,12 @@ class CodexHTTPError(CodexBackendError):
         *,
         status_code: int | None = None,
         retry_after: float | None = None,
+        response_body: bytes | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retry_after = retry_after
+        self.response_body = response_body
 
 
 class CodexStreamError(CodexBackendError):
