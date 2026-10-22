@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import shlex
@@ -112,7 +113,9 @@ async def slash(args: str, *, home: Path, cwd: str) -> str:
             store.disable(parts[1])
             return f"{parts[1]} disabled."
         if parts[0] == "import" and len(parts) == 2:
-            return import_jobs(store, Path(parts[1]), cwd=cwd, home=home)
+            return await asyncio.to_thread(
+                import_jobs, store, Path(parts[1]), cwd=cwd, home=home
+            )
         if len(parts) == 3 and parts[0] == "webhook" and parts[1] in {
             "url",
             "show-secret",

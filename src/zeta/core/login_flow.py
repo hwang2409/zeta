@@ -231,7 +231,7 @@ async def run_login(
                 redirect_uri,
             )
         if publication_timeout_seconds is None:
-            provider.credential_store.save(tokens)
+            await asyncio.to_thread(provider.credential_store.save, tokens)
         else:
             cancel_publication = threading.Event()
             publication = asyncio.create_task(

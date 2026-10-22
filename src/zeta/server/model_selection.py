@@ -5,6 +5,8 @@ Keep a durable fallback until the selected model completes its first response.
 This uses the existing protocol 1.1 settings RPC and ordinary error events.
 """
 
+import asyncio
+
 from ..core.approval import ApprovalDecision
 from ..core.slash import resolve_session_budget
 from ..models.catalog import provider_for_model
@@ -87,6 +89,10 @@ def entitlement_error(error: ErrorInfo) -> bool:
         error.status_code in {400, 401, 403, 404}
         or error.code in {"auth_error", "model_not_found", "permission_denied"}
     )
+
+
+async def recover_async(runtime: ServerRuntime, info: ErrorInfo) -> dict:
+    return await asyncio.to_thread(recover, runtime, info)
 
 
 def recover(runtime: ServerRuntime, info: ErrorInfo) -> dict:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from io import StringIO
 from pathlib import Path
 
@@ -174,7 +175,7 @@ async def test_runtime_blocks_user_tool_import_in_restricted_session(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
 
-    app = create_app(
+    app = await asyncio.to_thread(create_app,
         build_parser().parse_args(
             ["--provider", "codex", "--tools", "remote__*"]
         )

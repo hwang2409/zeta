@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from html.parser import HTMLParser
 from typing import Any, TypedDict
@@ -264,11 +265,12 @@ async def _websearch(
     codex_reason: str | None = None
     try:
         context = registry.account_context
-        hosted = await (
-            codex.search(query, abort_signal, **context.backend_kwargs("codex"))
+        account_kwargs = (
+            await asyncio.to_thread(context.backend_kwargs, "codex")
             if context is not None
-            else codex.search(query, abort_signal)
+            else {}
         )
+        hosted = await codex.search(query, abort_signal, **account_kwargs)
     except CodexLoginRequiredError:
         hosted = None
     except Exception as exc:

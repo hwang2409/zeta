@@ -332,7 +332,8 @@ class ServerRuntime:
             cwd_project=cwd_project,
             inbox_enabled=config.inbox_enabled,
         )
-        composition = self._compose(
+        composition = await asyncio.to_thread(
+            self._compose,
             cwd=session_cwd,
             config=config,
             provider=config.provider,
@@ -389,7 +390,8 @@ class ServerRuntime:
             context = resumed_prompt.context
             skill_catalog = resumed_prompt.skill_catalog
             agent_catalog = resumed_prompt.agent_catalog
-            composition = self._compose(
+            composition = await asyncio.to_thread(
+                self._compose,
                 cwd=session_cwd,
                 config=config,
                 provider=opened.metadata.provider,

@@ -129,11 +129,11 @@ async def test_resume_intersects_and_persists_invocation_tool_policy(
     home.mkdir()
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    first = create_app(build_parser().parse_args(["--provider", "codex"]))
+    first = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
     session_id = first.loop.store.session_id
     await first.close()
 
-    narrowed = create_app(
+    narrowed = await asyncio.to_thread(create_app,
         build_parser().parse_args(
             [
                 "--resume",
@@ -158,7 +158,7 @@ async def test_resume_intersects_and_persists_invocation_tool_policy(
     finally:
         await narrowed.close()
 
-    resumed = create_app(
+    resumed = await asyncio.to_thread(create_app,
         build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     try:
@@ -179,7 +179,7 @@ async def test_resume_intersects_persisted_policy_with_ambient_policy(
     home.mkdir()
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    first = create_app(
+    first = await asyncio.to_thread(create_app,
         build_parser().parse_args(
             [
                 "--provider",
@@ -197,7 +197,7 @@ async def test_resume_intersects_persisted_policy_with_ambient_policy(
         'tools = ["bash"]\ndisallowed_tools = []\n', encoding="utf-8"
     )
 
-    resumed = create_app(
+    resumed = await asyncio.to_thread(create_app,
         build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     try:
@@ -619,7 +619,7 @@ async def test_mcp_start_failure_with_allowlist_does_not_advertise_builtins(
     args = build_parser().parse_args(
         ["--provider", "codex", "--tools", "remote__*", "-p", "go"]
     )
-    app = create_app(args)
+    app = await asyncio.to_thread(create_app, args)
     try:
         await app.loop.activate()
         await app.loop.ensure_mcp_servers()

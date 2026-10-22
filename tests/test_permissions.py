@@ -63,7 +63,8 @@ async def test_permissions_shows_effective_policy_without_changing_it(
         cli_auto_memory=False,
     )
     backend = FakeBackend([])
-    composition = compose_runtime(
+    composition = await asyncio.to_thread(
+        compose_runtime,
         home=home,
         cwd=project,
         manager=SessionManager(home),

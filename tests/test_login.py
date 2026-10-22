@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import errno
 import http.server
 import os
@@ -136,7 +137,9 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
         monkeypatch.setattr(provider_login, "exchange_codex_authorization_code", exchange)
         monkeypatch.setattr(provider_login, "extract_account_id", lambda access_token: "account")
 
-    production_provider = provider_login.build_login_provider(provider, tmp_path)
+    production_provider = await asyncio.to_thread(
+        provider_login.build_login_provider, provider, tmp_path
+    )
     result = await run_login(
         replace(production_provider, callback_port=0),
         lambda: ("verifier", "challenge", "state"),
@@ -148,12 +151,13 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
         assert result is None
     else:
         assert result == "account"
-    store = credential_store(
+    store = await asyncio.to_thread(
+        credential_store,
         "claude" if provider == "anthropic" else provider,
         home=tmp_path,
     )
     assert store is not None
-    assert store.read() == expected
+    assert await asyncio.to_thread(store.read) == expected
     expected_redirect_uri = {
         "anthropic": "http://localhost:53692/callback",
         "codex": "http://localhost:1455/auth/callback",

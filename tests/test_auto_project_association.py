@@ -640,7 +640,7 @@ async def test_project_init_rebinds_runtime_child_and_approval(
     monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(plain)
-    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
     try:
         assert app.loop.root_project_id is None
         assert "project: plain" in app.slash_project("init")

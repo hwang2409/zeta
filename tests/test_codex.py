@@ -3789,7 +3789,9 @@ async def test_expired_codex_token_refreshes_under_shared_store_lock(tmp_path: P
     store = codex_credentials(
         tmp_path / "codex.json", token_url="https://test.invalid/token"
     )
-    store.save(OAuthTokens(access_token(), "rotating-refresh", 1))
+    await asyncio.to_thread(
+        store.save, OAuthTokens(access_token(), "rotating-refresh", 1)
+    )
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     assert await asyncio.gather(store.access_token(client), store.access_token(client)) == [
         access_token("refreshed-account"),
@@ -3816,11 +3818,13 @@ async def test_codex_refresh_keeps_existing_token_when_response_does_not_rotate(
     store = codex_credentials(
         tmp_path / "codex.json", token_url="https://test.invalid/token"
     )
-    store.save(OAuthTokens(access_token(), "non-rotating-refresh", 1))
+    await asyncio.to_thread(
+        store.save, OAuthTokens(access_token(), "non-rotating-refresh", 1)
+    )
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
     assert await store.access_token(client) == access_token("refreshed-account")
-    refreshed = store.read()
+    refreshed = await asyncio.to_thread(store.read)
     assert refreshed is not None
     assert refreshed.refresh_token == "non-rotating-refresh"
     await client.aclose()
