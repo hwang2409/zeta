@@ -5520,20 +5520,24 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         runtime.loop.account_context.switch(
             AccountId("anthropic", "default"), boundary=0
         )
-        runtime.loop.store.append_message(
-            Message(
-                MessageRole.ASSISTANT,
-                [ThinkingContent("codex", "encrypted"), TextContent("answer")],
-                metadata={"account_provider": "codex", "account_switch_sequence": 1},
-            )
+        native = Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("codex", "encrypted"), TextContent("answer")],
+            metadata={"account_provider": "codex", "account_switch_sequence": 1},
         )
+        runtime.loop.store.append_message(native)
 
         model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
         assert runtime.loop.account_context.active_provider == "anthropic"
         assert runtime.loop.account_context.switch_sequence == 1
+        assert runtime.loop._account_safe_context([native])[0].content == [
+            ThinkingContent("codex"),
+            TextContent("answer"),
+        ]
         model_selection.apply(runtime, "gpt-5.4", "ask")
         assert runtime.loop.account_context.active_provider == "codex"
         assert runtime.loop.account_context.switch_sequence == 1
+        assert runtime.loop._account_safe_context([native])[0].content == native.content
 
         previous = (
             runtime.loop.backend,
