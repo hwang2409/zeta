@@ -388,42 +388,38 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run_login(
-    provider: str, account: str = "default", replace_existing: bool = False
+    provider: str, label: str = "default", replace_existing: bool = False
 ) -> str | None:
     home = env_home()
     store = AccountStore(home)
-    account_id = AccountId(provider, account)
     with store.provider_login_lock(provider):
         store.migrate()
-        if store.contains(account_id) and not replace_existing:
-            raise AccountError(f"account {account_id} already exists; use --replace")
+        try:
+            account = store.resolve_reference(provider, label)
+        except AccountError:
+            account = AccountId(provider, label)
+        else:
+            if not replace_existing:
+                raise AccountError(f"account {provider}:{label} already exists; use --replace")
         return asyncio.run(
-            run_login(build_login_provider(provider, home, account), pkce_values)
+            run_login(build_login_provider(provider, home, account.name), pkce_values)
         )
 
 
 def _handle_login(args: argparse.Namespace) -> int:
     try:
-        replace_existing = args.replace
-        store = AccountStore(env_home())
-        store.migrate()
-        account_name = args.account
-        if account_name is None:
+        account_label = args.account
+        if account_label is None:
             if not sys.stdin.isatty():
                 raise AccountError("account label required; use --account <label>")
+            store = AccountStore(env_home())
+            store.migrate()
             first = not any(item.provider == args.provider for item in store.list())
             prompt = "account label [default]: " if first else "account label: "
-            account_name = input(prompt).strip() or ("default" if first else "")
-            if not account_name:
+            account_label = input(prompt).strip() or ("default" if first else "")
+            if not account_label:
                 raise AccountError("account label is required")
-        account = AccountId(args.provider, account_name)
-        if store.contains(account) and not replace_existing:
-            raise AccountError(f"account {account} already exists; use --replace")
-        handle = (
-            _run_login(args.provider)
-            if account_name == "default" and not replace_existing
-            else _run_login(args.provider, account_name, replace_existing)
-        )
+        handle = _run_login(args.provider, account_label, args.replace)
     except KeyboardInterrupt:
         print("login cancelled", file=sys.stderr)
         return 1
@@ -456,19 +452,23 @@ def _handle_accounts(args: argparse.Namespace) -> int:
             if not args.account or ":" not in args.account:
                 raise AccountError("default requires provider:name")
             provider, name = args.account.split(":", 1)
-            store.set_default(AccountId(provider, name))
+            store.set_default(store.resolve_reference(provider, name))
         elif args.action == "rename":
             if not args.account or ":" not in args.account or not args.new_label:
                 raise AccountError("rename requires provider:old and a new label")
             provider, name = args.account.split(":", 1)
-            print(store.rename(AccountId(provider, name), args.new_label))
+            print(store.rename(store.resolve_reference(provider, name), args.new_label))
         else:
             accounts = store.list_display()
             if args.json:
                 print(
                     json.dumps(
                         [
-                            {"account": str(item.account), "detail": item.detail}
+                            {
+                                "account": str(item),
+                                "id": str(item.account),
+                                "detail": item.detail,
+                            }
                             for item in accounts
                         ]
                     )
@@ -476,7 +476,7 @@ def _handle_accounts(args: argparse.Namespace) -> int:
             else:
                 print(
                     "\n".join(
-                        str(item.account)
+                        str(item)
                         + (f"  {item.detail}" if item.detail else "")
                         for item in accounts
                     )

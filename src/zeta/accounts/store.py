@@ -25,18 +25,20 @@ from typing import Any, Protocol
 
 import httpx
 
-from ..core.checkpoints import load_session_json
-from ..core.session_files import (
-    child_directory,
-    open_session_file,
-    session_directory,
-    write_session_json,
-)
+from ..core.session_files import child_directory, open_session_file
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens, credential_file_lock
-from ..session_liveness import session_is_live
 
 _PROVIDERS = {"anthropic", "codex"}
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
+
+
+def _account_label(value: str) -> str:
+    if type(value) is not str:
+        raise ValueError("invalid account label")
+    label = value.lower()
+    if not _SLUG.fullmatch(label):
+        raise ValueError("invalid account label")
+    return label
 
 
 class AccountError(RuntimeError):
@@ -65,7 +67,11 @@ class AccountId:
 @dataclass(frozen=True, slots=True)
 class AccountDisplay:
     account: AccountId
+    label: str
     detail: str | None = None
+
+    def __str__(self) -> str:
+        return f"{self.account.provider}:{self.label}"
 
 
 class AccountStore:
@@ -146,7 +152,6 @@ class AccountStore:
 
     def list(self) -> list[AccountId]:
         with self._home() as home_fd, self._registry_guard(home_fd):
-            self._recover_rename(home_fd)
             return [
                 AccountId(*key.split(":", 1))
                 for key in self._read_registry(home_fd)["accounts"]
@@ -154,142 +159,84 @@ class AccountStore:
 
     def list_display(self) -> list[AccountDisplay]:
         result = []
-        for account in self.list():
-            with self.lifecycle_guard(account) as home_fd:
+        with self._home() as home_fd:
+            with self._registry_guard(home_fd):
+                accounts = self._read_registry(home_fd)["accounts"]
+            for key, metadata in accounts.items():
+                account = AccountId(*key.split(":", 1))
                 tokens = _read_account_tokens(home_fd, account)
-            detail = (tokens.email or tokens.workspace) if tokens else None
-            result.append(AccountDisplay(account, detail))
+                details = (
+                    tuple(filter(None, (tokens.email, tokens.workspace)))
+                    if tokens
+                    else ()
+                )
+                result.append(
+                    AccountDisplay(
+                        account,
+                        metadata.get("label", account.name),
+                        " · ".join(details) or None,
+                    )
+                )
         return result
 
     def default(self, provider: str) -> AccountId | None:
         if provider not in _PROVIDERS:
             raise ValueError("invalid account provider")
         with self._home() as home_fd, self._registry_guard(home_fd):
-            self._recover_rename(home_fd)
             value = self._read_registry(home_fd)["defaults"].get(provider)
             return AccountId(*value.split(":", 1)) if value else None
 
     def contains(self, account: AccountId) -> bool:
         with self._home() as home_fd, self._registry_guard(home_fd):
-            self._recover_rename(home_fd)
             return str(account) in self._read_registry(home_fd)["accounts"]
 
     def set_default(self, account: AccountId) -> None:
         with self._home() as home_fd, self._registry_guard(home_fd):
-            self._recover_rename(home_fd)
             value = self._read_registry(home_fd)
             if str(account) not in value["accounts"]:
                 raise AccountError(f"account {account} does not exist; use /accounts")
             value["defaults"][account.provider] = str(account)
             self._write_registry(home_fd, value)
 
-    def rename(self, account: AccountId, new_name: str) -> str:
-        replacement = AccountId(account.provider, new_name)
-        if replacement == account:
-            return "account label unchanged"
+    def rename(self, account: AccountId, new_label: str) -> str:
+        label = _account_label(new_label)
         with self._home() as home_fd, self._registry_guard(home_fd):
-            self._recover_rename(home_fd)
             value = self._read_registry(home_fd)
-            if str(account) not in value["accounts"]:
+            metadata = value["accounts"].get(str(account))
+            if metadata is None:
                 raise AccountError(f"account {account} does not exist")
-            if str(replacement) in value["accounts"]:
-                raise AccountError(f"account {replacement} already exists")
-            try:
-                guard = self._lifecycle_guard(home_fd, account, wait=False)
-                guard.__enter__()
-            except AccountError as exc:
-                raise AccountError(f"account {account} is in use") from exc
-            try:
-                self._refuse_live_session_pin(account)
-                _atomic_publish(
-                    home_fd,
-                    ".account-rename.json",
-                    json.dumps(
-                        {"old": str(account), "new": str(replacement)},
-                        separators=(",", ":"),
-                    ).encode(),
-                )
-                self._finish_rename(home_fd, account, replacement)
-            finally:
-                guard.__exit__(None, None, None)
-        return (
-            f"renamed {account} to {replacement}; approved automation revisions "
-            "remain pinned to the old account and must be re-drafted"
-        )
-
-    def _recover_rename(self, home_fd: int) -> None:
-        raw = _read_optional(home_fd, ".account-rename.json")
-        if raw is None:
-            return
-        try:
-            value = json.loads(raw)
-            old = AccountId(*value["old"].split(":", 1))
-            new = AccountId(*value["new"].split(":", 1))
-        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise AccountError("account rename recovery is invalid") from exc
-        self._finish_rename(home_fd, old, new)
-
-    def _finish_rename(
-        self, home_fd: int, old: AccountId, new: AccountId
-    ) -> None:
-        with child_directory(home_fd, "accounts") as accounts_fd, child_directory(
-            accounts_fd, old.provider
-        ) as provider_fd:
-            _rename_directory_entry(provider_fd, old.name, new.name)
-        self._rewrite_saved_pins(old, new)
-        value = self._read_registry(home_fd)
-        metadata = value["accounts"].pop(str(old), None)
-        if metadata is not None:
-            value["accounts"][str(new)] = {
-                "provider": new.provider,
-                "name": new.name,
-            }
-            if value["defaults"].get(old.provider) == str(old):
-                value["defaults"][old.provider] = str(new)
+            if metadata.get("label", account.name) == label:
+                return "account label unchanged"
+            self._check_reference_available(value, account, label)
+            metadata["label"] = label
             self._write_registry(home_fd, value)
-        with child_directory(home_fd, "account-locks") as locks_fd, child_directory(
-            locks_fd, old.provider
-        ) as provider_fd:
-            _rename_directory_entry(provider_fd, old.name, new.name)
-        try:
-            os.unlink(".account-rename.json", dir_fd=home_fd)
-        except FileNotFoundError:
-            pass
-        _fsync_directory(home_fd)
+        return f"renamed {account} to {account.provider}:{label}"
 
-    def _refuse_live_session_pin(self, account: AccountId) -> None:
-        sessions = self.home / "sessions"
-        if not sessions.exists():
-            return
-        for directory in sessions.iterdir():
-            if not directory.is_dir() or not session_is_live(directory):
-                continue
-            try:
-                value = json.loads((directory / "meta.json").read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            if value.get("selected_accounts", {}).get(account.provider) == str(account):
-                raise AccountError(f"account {account} is pinned by a live session")
+    def resolve_reference(self, provider: str, name_or_label: str) -> AccountId:
+        reference = AccountId(provider, name_or_label)
+        with self._home() as home_fd, self._registry_guard(home_fd):
+            accounts = self._read_registry(home_fd)["accounts"]
+            if str(reference) in accounts:
+                return reference
+            for key, metadata in accounts.items():
+                account = AccountId(*key.split(":", 1))
+                if (
+                    account.provider == provider
+                    and metadata.get("label", account.name) == reference.name
+                ):
+                    return account
+        raise AccountError(f"account {reference} does not exist")
 
-    def _rewrite_saved_pins(self, old: AccountId, new: AccountId) -> None:
-        sessions = self.home / "sessions"
-        if not sessions.exists():
-            return
-        for directory in sessions.iterdir():
-            if not directory.is_dir():
+    @staticmethod
+    def _check_reference_available(
+        value: dict[str, Any], account: AccountId, label: str
+    ) -> None:
+        for key, metadata in value["accounts"].items():
+            other = AccountId(*key.split(":", 1))
+            if other.provider != account.provider or other == account:
                 continue
-            try:
-                with session_directory(sessions, directory.name) as (_, session_fd):
-                    fd = open_session_file(session_fd, "meta.json", os.O_RDONLY)
-                    with os.fdopen(fd, "rb") as handle:
-                        value = load_session_json(handle.read())
-                    selected = value.get("selected_accounts", {})
-                    if selected.get(old.provider) != str(old):
-                        continue
-                    selected[old.provider] = str(new)
-                    write_session_json(session_fd, "meta.json", value)
-            except (FileNotFoundError, OSError, ValueError):
-                continue
+            if label in {other.name, metadata.get("label", other.name)}:
+                raise AccountError(f"account {account.provider}:{label} already exists")
 
     def credential_path(self, account: AccountId) -> Path:
         return self.accounts / account.provider / account.name / "oauth.json"
@@ -395,6 +342,7 @@ class AccountStore:
         value["accounts"][key] = {
             "provider": account.provider,
             "name": account.name,
+            "label": account.name,
         }
         value["defaults"].setdefault(account.provider, key)
         self._write_registry(home_fd, value)
@@ -458,15 +406,33 @@ class AccountStore:
                 raise ValueError
             accounts = dict(value["accounts"])
             defaults = dict(value["defaults"])
+            references: dict[tuple[str, str], str] = {}
             for key, metadata in accounts.items():
                 if not isinstance(key, str):
                     raise TypeError
                 account = AccountId(*key.split(":", 1))
-                if key != str(account) or metadata != {
+                expected = {
                     "provider": account.provider,
                     "name": account.name,
-                }:
+                }
+                if key != str(account) or not isinstance(metadata, Mapping):
                     raise ValueError
+                label = metadata.get("label", account.name)
+                if (
+                    any(
+                        metadata.get(field) != expected_value
+                        for field, expected_value in expected.items()
+                    )
+                    or set(metadata) - {"provider", "name", "label"}
+                    or _account_label(label) != label
+                ):
+                    raise ValueError
+                for reference in {account.name, label}:
+                    owner = references.setdefault(
+                        (account.provider, reference), str(account)
+                    )
+                    if owner != str(account):
+                        raise ValueError
             for provider, key in defaults.items():
                 if (
                     not isinstance(provider, str)
@@ -589,13 +555,13 @@ class AccountCredentials:
             raise self.auth_error_type(
                 f"{self.provider_label} OAuth token refresh stalled"
             ) from exc
-        if not refreshed.email and not refreshed.workspace:
+        if not refreshed.email or not refreshed.workspace:
             refreshed = OAuthTokens(
                 refreshed.access_token,
                 refreshed.refresh_token,
                 refreshed.expires_at,
-                tokens.email,
-                tokens.workspace,
+                refreshed.email or tokens.email,
+                refreshed.workspace or tokens.workspace,
             )
         self._write(home_fd, refreshed)
         return refreshed.access_token
@@ -922,19 +888,6 @@ def _exists(directory_fd: int, name: str) -> bool:
     except FileNotFoundError:
         return False
     return True
-
-
-def _rename_directory_entry(directory_fd: int, old: str, new: str) -> None:
-    old_exists = _exists(directory_fd, old)
-    new_exists = _exists(directory_fd, new)
-    if old_exists and new_exists:
-        raise AccountError("account rename has conflicting directories")
-    if old_exists:
-        info = os.stat(old, dir_fd=directory_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(info.st_mode):
-            raise AccountError("account rename source is invalid")
-        os.rename(old, new, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-        _fsync_directory(directory_fd)
 
 
 def _file_mtime_ns(directory_fd: int, name: str) -> int:

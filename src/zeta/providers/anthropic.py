@@ -17,7 +17,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .auth import OAuthTokens, error_body_excerpt
+from .auth import OAuthTokens, _display_metadata, error_body_excerpt
 from .anthropic_payload import (
     ANTHROPIC_MAX_BASE64_CHARACTERS,
     ANTHROPIC_MAX_IMAGE_DIMENSION,
@@ -355,15 +355,7 @@ def _tokens_from_response(value: Any, fallback_refresh: str | None) -> OAuthToke
         raise ValueError("token response is incomplete")
     if type(expires_in) not in {int, float}:
         raise ValueError("token response expiry is invalid")
-    account = value.get("account")
-    organization = value.get("organization")
-    email = _first_string(value, "email")
-    workspace = _first_string(value, "workspace", "organization_name")
-    if isinstance(account, Mapping):
-        email = email or _first_string(account, "email_address", "email")
-        workspace = workspace or _first_string(account, "workspace", "name")
-    if isinstance(organization, Mapping):
-        workspace = workspace or _first_string(organization, "name")
+    email, workspace = _display_metadata(value)
     return OAuthTokens(
         access_token,
         refresh_token or fallback_refresh or "",

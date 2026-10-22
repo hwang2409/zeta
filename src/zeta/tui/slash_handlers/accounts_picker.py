@@ -20,6 +20,7 @@ class AccountsPicker:
     selected: dict[str, AccountId]
     defaults: dict[str, AccountId]
     details: dict[AccountId, str] | None = None
+    labels: dict[AccountId, str] | None = None
     index: int = 0
 
     @property
@@ -35,7 +36,10 @@ class AccountsPicker:
             highlighted = position == self.index
             line = Text.assemble(
                 ("❯ " if highlighted else "  ", theme.ACCENT),
-                (str(account), theme.COMMAND if highlighted else theme.BODY),
+                (
+                    f"{account.provider}:{self.labels.get(account, account.name) if self.labels else account.name}",
+                    theme.COMMAND if highlighted else theme.BODY,
+                ),
             )
             if self.details and (detail := self.details.get(account)):
                 line.append(f"  {detail}", style=theme.DIM)

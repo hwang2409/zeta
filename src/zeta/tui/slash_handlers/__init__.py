@@ -11,7 +11,7 @@ from pathlib import Path
 
 from prompt_toolkit.enums import EditingMode
 
-from ...accounts import AccountError, AccountId
+from ...accounts import AccountError
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
 from ...core.session import SessionError, env_home, normalize_session_name
@@ -179,8 +179,10 @@ class SlashHandlerMixin:
             if len(requested) != 3 or requested[0] != "rename":
                 return "usage: /accounts [rename provider:old new-label]"
             try:
-                old = AccountId(*requested[1].split(":", 1))
-                message = self.loop.account_context.store.rename(old, requested[2])
+                provider, reference = requested[1].split(":", 1)
+                store = self.loop.account_context.store
+                account = store.resolve_reference(provider, reference)
+                message = store.rename(account, requested[2])
             except (AccountError, OSError, ValueError) as exc:
                 return f"account unchanged: {exc}"
             return message
@@ -206,6 +208,7 @@ class SlashHandlerMixin:
             context.snapshot(),
             defaults,
             {item.account: item.detail for item in displays if item.detail},
+            {item.account: item.label for item in displays},
         )
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())

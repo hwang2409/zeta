@@ -474,18 +474,7 @@ class OAuthTokens:
             raise error_type("OAuth expiry is invalid")
         if expires_at > 100_000_000_000:
             expires_at /= 1000
-        account = value.get("account")
-        organization = value.get("organization")
-        identity = _jwt_payload(_first_string(value, "id_token", "idToken"))
-        email = _first_string(value, "email") or _first_string(identity, "email")
-        workspace = _first_string(
-            value, "workspace", "organization_name"
-        ) or _first_string(identity, "workspace", "organization_name")
-        if isinstance(account, Mapping):
-            email = email or _first_string(account, "email_address", "email")
-            workspace = workspace or _first_string(account, "workspace", "name")
-        if isinstance(organization, Mapping):
-            workspace = workspace or _first_string(organization, "name")
+        email, workspace = _display_metadata(value)
         return cls(access_token, refresh_token, float(expires_at), email, workspace)
 
     def to_dict(self) -> dict[str, Any]:
@@ -524,6 +513,22 @@ def build_pkce_parameters() -> PKCEParameters:
         challenge=base64.urlsafe_b64encode(challenge).decode("ascii").rstrip("="),
         state=secrets.token_urlsafe(32),
     )
+
+
+def _display_metadata(value: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    account = value.get("account")
+    organization = value.get("organization")
+    identity = _jwt_payload(_first_string(value, "id_token", "idToken"))
+    email = _first_string(value, "email") or _first_string(identity, "email")
+    workspace = _first_string(
+        value, "workspace", "organization_name"
+    ) or _first_string(identity, "workspace", "organization_name")
+    if isinstance(account, Mapping):
+        email = email or _first_string(account, "email_address")
+        workspace = workspace or _first_string(account, "workspace", "name")
+    if isinstance(organization, Mapping):
+        workspace = workspace or _first_string(organization, "name")
+    return email, workspace
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:

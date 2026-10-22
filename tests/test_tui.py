@@ -12080,6 +12080,42 @@ def test_accounts_command_lists_and_switches(tmp_path: Path) -> None:
     opened.store.close()
 
 
+def test_accounts_panel_does_not_block_on_held_lifecycle_lock(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, "codex", "work").save(
+        OAuthTokens("access", "refresh", 9_999_999_999, email="henry@example.com")
+    )
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    context = SessionAccountContext.load(home, manager, opened.metadata)
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = Mock()
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_lifecycle_lock() -> None:
+        with AccountStore(home).lifecycle_guard(account):
+            locked.set()
+            release.wait(1)
+
+    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder.start()
+    assert locked.wait(1)
+    started = time.monotonic()
+    try:
+        assert app.slash_accounts("") == ""
+        assert time.monotonic() - started < 0.15
+    finally:
+        release.set()
+        holder.join()
+        opened.store.close()
+
+
 def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
     account = AccountId("codex", "work")
     picker = AccountsPicker(
@@ -12087,11 +12123,12 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
         {"codex": account},
         {"codex": account},
         {account: "henry@example.com"},
+        {account: "henry"},
     )
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(picker.render())
     plain = Text.from_ansi(output.getvalue()).plain
 
-    assert "codex:work" in plain
+    assert "codex:henry" in plain
     assert "henry@example.com" in plain
     assert "n rename" in plain

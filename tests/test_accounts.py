@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import stat
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +31,8 @@ from zeta.accounts import (
     SessionAccountContext,
 )
 from zeta.agent.runner import resolve_child_backend
+from zeta.automations.models import parse_job
+from zeta.automations.store import SQLiteStore
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -1304,101 +1307,138 @@ def test_api_key_mode_skips_named_accounts(
     opened.store.close()
 
 
-def test_rename_moves_credentials_default_and_saved_pins(tmp_path: Path) -> None:
+def test_label_is_display_only_and_id_stays_stable(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    old = AccountId("codex", "work")
-    new = AccountId("codex", "henry")
+    account = AccountId("codex", "work")
     named_account_credentials(home, "codex", "work").save(tokens())
-    AccountStore(home).set_default(old)
+    store = AccountStore(home)
+    store.set_default(account)
     manager = SessionManager(home)
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
-    manager.record_account_selection(opened.metadata, old, boundary=0)
+    manager.record_account_selection(opened.metadata, account, boundary=0)
     opened.store.close()
+    job = parse_job(
+        "stable-account",
+        {
+            "prompt": "test",
+            "trigger": {"kind": "schedule", "cron": "0 8 * * 1-5"},
+            "servers": [],
+            "allow": [],
+            "provider": "codex",
+            "model": "offline",
+            "cwd": str(tmp_path),
+        },
+    )
+    with SQLiteStore(home) as automations:
+        revision = automations.draft(job)
+        automations.approve(job.name, revision.revision, None, datetime.now(UTC))
+        assert automations.get(job.name).job.account == str(account)
+    credential = store.credential_path(account)
+    credential_inode = credential.stat().st_ino
 
-    message = AccountStore(home).rename(old, "henry")
+    with store.lifecycle_guard(account):
+        assert store.rename(account, "henry") == "renamed codex:work to codex:henry"
 
-    store = AccountStore(home)
-    assert store.list() == [new]
-    assert store.default("codex") == new
-    assert store.credential_path(new).exists()
-    assert not store.credential_path(old).exists()
+    assert store.list() == [account]
+    assert store.default("codex") == account
+    assert store.resolve_reference("codex", "henry") == account
+    assert store.resolve_reference("codex", "work") == account
+    assert [(item.label, item.account) for item in store.list_display()] == [
+        ("henry", account)
+    ]
+    assert credential.stat().st_ino == credential_inode
     assert manager.read_metadata(opened.metadata.session_id).selected_accounts == {
-        "codex": "codex:henry"
+        "codex": "codex:work"
     }
-    assert "automation" in message and "re-draft" in message
+    with SQLiteStore(home) as automations:
+        assert automations.get(job.name).job.account == str(account)
+    assert named_account_credentials(home, "codex", "work").read() == tokens()
+    assert not (home / ".account-rename.json").exists()
 
 
-def test_rename_rejects_existing_or_invalid_label(tmp_path: Path) -> None:
+def test_label_unique_across_ids_and_labels(tmp_path: Path) -> None:
     store = AccountStore(tmp_path)
+    work = AccountId("codex", "work")
+    personal = AccountId("codex", "personal")
     named_account_credentials(tmp_path, "codex", "work").save(tokens())
-    named_account_credentials(tmp_path, "codex", "other").save(tokens())
+    named_account_credentials(tmp_path, "codex", "personal").save(tokens())
 
     with pytest.raises(AccountError, match="already exists"):
-        store.rename(AccountId("codex", "work"), "other")
-    with pytest.raises(ValueError, match="invalid account id"):
-        store.rename(AccountId("codex", "work"), "Not Valid")
+        store.rename(work, "personal")
+    store.rename(personal, "home")
+    with pytest.raises(AccountError, match="already exists"):
+        store.rename(work, "home")
+    with pytest.raises(ValueError, match="invalid account label"):
+        store.rename(work, "Not Valid")
 
 
-def test_rename_refuses_while_account_in_use(tmp_path: Path) -> None:
-    store = AccountStore(tmp_path)
-    account = AccountId("codex", "work")
-    named_account_credentials(tmp_path, "codex", "work").save(tokens())
-
-    with (
-        store.lifecycle_guard(account),
-        pytest.raises(AccountError, match="in use"),
-    ):
-        store.rename(account, "henry")
-
-    manager = SessionManager(tmp_path)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
-    manager.record_account_selection(opened.metadata, account, boundary=0)
-    with pytest.raises(AccountError, match="live session"):
-        store.rename(account, "henry")
-    opened.store.close()
-
-
-def test_rename_crash_leaves_one_usable_account(
+def test_cli_resolves_label_or_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = AccountStore(tmp_path)
-    old = AccountId("codex", "work")
-    new = AccountId("codex", "henry")
+    account = AccountId("codex", "work")
     named_account_credentials(tmp_path, "codex", "work").save(tokens())
-    real_write = store._write_registry
-
-    def crash_after_move(home_fd: int, value: dict[str, object]) -> None:
-        if str(new) in value["accounts"]:  # type: ignore[operator]
-            raise OSError("simulated crash")
-        real_write(home_fd, value)
-
-    monkeypatch.setattr(store, "_write_registry", crash_after_move)
-    with pytest.raises(OSError, match="simulated crash"):
-        store.rename(old, "henry")
-    monkeypatch.undo()
-
-    recovered = AccountStore(tmp_path)
-    assert recovered.list() == [new]
-    assert recovered.credential_path(new).exists()
-    assert not recovered.credential_path(old).exists()
-    assert named_account_credentials(tmp_path, "codex", "henry").read() == tokens()
-
-
-def test_rename_leaves_approved_automation_pinned_with_redraft_message(
-    tmp_path: Path,
-) -> None:
     store = AccountStore(tmp_path)
-    old = AccountId("codex", "work")
-    named_account_credentials(tmp_path, "codex", "work").save(tokens())
-    approved = tmp_path / "automations" / "job" / "approved.json"
-    approved.parent.mkdir(parents=True)
-    approved.write_text(json.dumps({"account": str(old)}))
+    store.rename(account, "henry")
+    monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
 
-    message = store.rename(old, "henry")
+    assert cli_main.main(["accounts", "default", "codex:henry"]) == 0
+    assert store.default("codex") == account
+    assert cli_main.main(["accounts", "default", "codex:work"]) == 0
+    assert store.default("codex") == account
 
-    assert json.loads(approved.read_text())["account"] == str(old)
-    assert "approved automation" in message
-    assert "re-draft" in message
+
+def test_refresh_keeps_workspace_when_response_has_only_email(tmp_path: Path) -> None:
+    credential = named_account_credentials(tmp_path, "anthropic")
+    credential.save(
+        OAuthTokens("old-access", "old-refresh", 1.0, workspace="Existing workspace")
+    )
+
+    async def refresh(_refresh_token: str, _client: httpx.AsyncClient) -> OAuthTokens:
+        return OAuthTokens(
+            "new-access", "new-refresh", 9_999_999_999.0, email="new@example.com"
+        )
+
+    credential.refresh = refresh  # type: ignore[method-assign]
+
+    async def run() -> None:
+        async with httpx.AsyncClient() as client:
+            await credential.refresh_token(client)
+
+    asyncio.run(run())
+    assert credential.read() == OAuthTokens(
+        "new-access",
+        "new-refresh",
+        9_999_999_999.0,
+        email="new@example.com",
+        workspace="Existing workspace",
+    )
+
+
+def test_refresh_keeps_email_when_response_has_only_workspace(tmp_path: Path) -> None:
+    credential = named_account_credentials(tmp_path, "anthropic")
+    credential.save(
+        OAuthTokens("old-access", "old-refresh", 1.0, email="old@example.com")
+    )
+
+    async def refresh(_refresh_token: str, _client: httpx.AsyncClient) -> OAuthTokens:
+        return OAuthTokens(
+            "new-access", "new-refresh", 9_999_999_999.0, workspace="New workspace"
+        )
+
+    credential.refresh = refresh  # type: ignore[method-assign]
+
+    async def run() -> None:
+        async with httpx.AsyncClient() as client:
+            await credential.refresh_token(client)
+
+    asyncio.run(run())
+    assert credential.read() == OAuthTokens(
+        "new-access",
+        "new-refresh",
+        9_999_999_999.0,
+        email="old@example.com",
+        workspace="New workspace",
+    )
 
 
 def test_codex_email_from_access_token_profile_claim(tmp_path: Path) -> None:
@@ -1464,11 +1504,11 @@ def test_login_prompts_for_label_and_rejects_duplicate(
     monkeypatch.setattr("builtins.input", lambda _prompt: next(labels))
     called: list[str] = []
 
-    def login(provider: str, account: str, replace_existing: bool = False) -> None:
-        called.append(account)
-        named_account_credentials(tmp_path, provider, account).save(tokens())
+    async def login(provider, _pkce_values) -> None:
+        called.append(provider.credential_store.account.name)
+        provider.credential_store.save(tokens())
 
-    monkeypatch.setattr(cli_main, "_run_login", login)
+    monkeypatch.setattr(cli_main, "run_login", login)
     assert cli_main.main(["login", "codex"]) == 0
     assert cli_main.main(["accounts", "login", "codex"]) == 1
     assert called == ["work"]

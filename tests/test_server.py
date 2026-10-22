@@ -21,13 +21,15 @@ from typing import Any
 
 import pytest
 
+from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.accounts import AccountId
+from zeta.accounts import AccountId, AccountStore
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
+from zeta.oauth import OAuthTokens
 from zeta.protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
@@ -4635,6 +4637,37 @@ async def test_slash_extensions_reject_legacy_clients(tmp_path: Path) -> None:
                 )
             )[-1]["error"]
             assert error["code"] == -32601
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_accounts_label_command(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, "codex", "work").save(
+        OAuthTokens("access", "refresh", 9_999_999_999)
+    )
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        result = (
+            await _request(
+                reader,
+                writer,
+                "accounts-label",
+                "slash_run",
+                {
+                    "session_id": sid,
+                    "text": "/accounts rename codex:work henry",
+                },
+            )
+        )[-1]["result"]
+        assert result == {
+            "kind": "output",
+            "text": "renamed codex:work to codex:henry",
+        }
+        assert AccountStore(home).resolve_reference("codex", "henry") == account
     finally:
         await _close(server, writer)
 

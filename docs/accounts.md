@@ -2,7 +2,7 @@
 
 ## status
 
-phase 1 account storage, selection, labels, rename, and offline identity display are implemented. usage and exhaustion recovery remain later work.
+phase 1 account storage, selection, mutable display labels, and offline identity display are implemented. usage and exhaustion recovery remain later work.
 
 ## problem and v1 outcome
 
@@ -68,21 +68,23 @@ error, and no bootstrap token is copied into metadata or usage state.
 
 ## identity and storage
 
-an `AccountId` is `(provider, name)`, displayed as `anthropic:work` or
-`codex:personal`. provider is `anthropic` or `codex`. name is a lower-case,
-case-insensitive slug of 1–32 ascii letters, digits, `_`, or `-`; `.` and `..`
-are invalid. provider-returned email, workspace, or account id is display
-metadata only. one account owns one oauth token set, lifecycle lock, usage state,
-and local name.
+an `AccountId` is the immutable `(provider, id)` stored by sessions and
+automations. provider is `anthropic` or `codex`. the id and mutable display label
+use lower-case, case-insensitive slugs of 1–32 ascii letters, digits, `_`, or
+`-`; `.` and `..` are invalid. rows display `provider:label`. labels are unique
+per provider across both ids and labels, so a reference is never ambiguous.
+provider-returned email, workspace, or account id is display metadata only. one
+account owns one oauth token set, lifecycle lock, usage state, immutable id, and
+mutable label.
 
 ```text
 ~/.zeta/
   accounts.json
   accounts/
-    anthropic/<name>/oauth.json
-    anthropic/<name>/usage.json
-    codex/<name>/oauth.json
-    codex/<name>/usage.json
+    anthropic/<id>/oauth.json
+    anthropic/<id>/usage.json
+    codex/<id>/oauth.json
+    codex/<id>/usage.json
 ```
 
 `accounts.json` contains the schema and one global default per provider. it is
@@ -99,21 +101,18 @@ exception text never enter logs, notices, model input, transcripts, tool results
 or serve responses. serve login already uses fixed safe error messages
 ([`server/login.py:72-97`](../src/zeta/server/login.py#L72-L97)).
 
-## labels and rename
+## labels
 
-an account's local `name` is its user-visible label. `zeta login <provider>` asks
-for a label; the first account for that provider offers `default`. an explicit
-label is available with `--account`, and replacing an existing label requires
-`--replace`.
+`zeta login <provider>` asks for a display label; the first account for that
+provider offers `default`. an explicit label is available with `--account`, and
+replacing an existing label requires `--replace`. the immutable id is derived
+from the label when the account is created.
 
-`zeta accounts rename <provider>:<old> <new>` and `n` in `/accounts` rename a
-label. rename refuses while the account lifecycle lock is held or a live session
-pins the account. otherwise it moves the credential and lock directories,
-updates the registry and global default, and rewrites saved session pins. a
-durable rename journal completes an interrupted move before the account catalog
-is read, so recovery keeps one usable credential. approved automation revisions
-are immutable: they remain pinned to the old id and fail with the existing
-re-draft guidance.
+`zeta accounts rename <provider>:<id-or-label> <new-label>` and `n` in
+`/accounts` change only the registry label. credential and lock directories,
+global defaults, saved session pins, and approved automation revisions keep the
+same immutable `AccountId`. command arguments and `--account` accept either the
+id or label.
 
 ## crash-safe legacy migration
 
@@ -201,9 +200,8 @@ zeta accounts logout anthropic:work
 saved selection at load (see the session-load rule above). `switch` is reserved for
 an attached tui or serve session and always targets that session. there is no
 legacy `--provider` alias. one login flow per provider is allowed at a time;
-adding another account is sequential. an existing account requires confirmation
-in a terminal and `--replace` in non-interactive use. logout is local only in
-v1; remote revocation and rename are later work.
+adding another account is sequential. an existing account requires `--replace`.
+logout is local only in v1; remote revocation is later work.
 
 ## usage sources and verification gate
 
