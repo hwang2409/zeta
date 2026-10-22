@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from ...automations.authoring import listing, resolve_job, show
 from ...automations.services import resolve_inbox_grants
 from ...automations.store import SQLiteStore
@@ -42,7 +44,7 @@ async def _automation(
                     model=model,
                 )
                 resolve_inbox_grants(job, SessionManager(home).project_registry)
-                state = store.draft(job)
+                state = await asyncio.to_thread(store.draft, job)
                 text = (
                     show(store, name)
                     + f"\nSaved inert draft r{state.revision}. The human must run /automations approve {name}."

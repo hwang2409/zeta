@@ -482,7 +482,7 @@ async def test_project_instructions_opens_editor_once_in_tui(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.setenv("EDITOR", str(editor))
     monkeypatch.chdir(root)
-    app = create_app(_args())
+    app = await asyncio.to_thread(create_app, _args())
     session = app._make_session()
     app._active_session = session
     app._install_full_screen_layout(session)
@@ -521,7 +521,7 @@ async def test_project_instructions_editor_failure_prints_notice(
         monkeypatch.setenv("EDITOR", editor)
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(root)
-    app = create_app(_args())
+    app = await asyncio.to_thread(create_app, _args())
     session = app._make_session()
     app._active_session = session
     app._install_full_screen_layout(session)
@@ -1172,7 +1172,7 @@ async def test_resume_rebuilds_current_skill_catalog_for_prompt_and_tool(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
 
-    first = create_app(_args())
+    first = await asyncio.to_thread(create_app, _args())
     session_id = first.loop.store.session_id
     (skills_dir / "second.md").write_text(
         "---\nname: second\ndescription: second skill\n---\n\nsecond body\n",
@@ -1180,7 +1180,7 @@ async def test_resume_rebuilds_current_skill_catalog_for_prompt_and_tool(
     )
     first.loop.store.close()
 
-    resumed = create_app(
+    resumed = await asyncio.to_thread(create_app,
         build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
@@ -1323,7 +1323,7 @@ async def test_completed_turn_refreshes_recency_off_loop_and_flushes_on_close(
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    first = create_app(_args())
+    first = await asyncio.to_thread(create_app, _args())
     session_id = first.loop.store.session_id
     first.loop.store.close()
     manager = SessionManager(home)
@@ -1354,7 +1354,7 @@ async def test_completed_turn_refreshes_recency_off_loop_and_flushes_on_close(
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
     monkeypatch.setattr(SessionManager, "refresh_recency", record_refresh)
     event_loop_thread = threading.get_ident()
-    app = create_app(_args("--resume", session_id))
+    app = await asyncio.to_thread(create_app, _args("--resume", session_id))
     app._invalidate_prompt = lambda: None
     write_threads.clear()
 
@@ -1417,7 +1417,7 @@ async def test_close_does_not_wait_for_busy_recency_lock(
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    first = create_app(_args())
+    first = await asyncio.to_thread(create_app, _args())
     session_id = first.loop.store.session_id
     model = first.model
     first.loop.store.close()
@@ -1428,7 +1428,7 @@ async def test_close_does_not_wait_for_busy_recency_lock(
         return backend, model
 
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
-    app = create_app(_args("--resume", session_id))
+    app = await asyncio.to_thread(create_app, _args("--resume", session_id))
     app._invalidate_prompt = lambda: None
     manager = SessionManager(home)
     timed_out = False
@@ -1452,7 +1452,7 @@ async def test_recency_refresh_does_not_overwrite_newer_metadata(
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    first = create_app(_args())
+    first = await asyncio.to_thread(create_app, _args())
     session_id = first.loop.store.session_id
     model = first.model
     first.loop.store.close()
@@ -1463,7 +1463,7 @@ async def test_recency_refresh_does_not_overwrite_newer_metadata(
         return backend, model
 
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
-    app = create_app(_args("--resume", session_id))
+    app = await asyncio.to_thread(create_app, _args("--resume", session_id))
     app._invalidate_prompt = lambda: None
 
     await app._consume_turn("hello")
@@ -1501,7 +1501,7 @@ async def test_removed_browser_tool_session_loads_renders_and_resumes(
     monkeypatch.setenv("ZETA_BROWSER", "1")
     monkeypatch.setenv("ZETA_STALL_TRACE", "1")
     monkeypatch.setenv("ZETA_CACHE_TRACE", "1")
-    first = create_app(_args())
+    first = await asyncio.to_thread(create_app, _args())
     session_id = first.loop.store.session_id
     transcript_path = first.loop.store.path
     first.loop.store.close()
@@ -1509,7 +1509,7 @@ async def test_removed_browser_tool_session_loads_renders_and_resumes(
     with transcript_path.open("ab") as transcript:
         transcript.write(fixture.read_bytes())
 
-    resumed = create_app(
+    resumed = await asyncio.to_thread(create_app,
         build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     try:
@@ -2119,7 +2119,7 @@ async def test_forced_override_commits_after_first_successful_request(
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None)
-    first = create_app(_args())
+    first = await asyncio.to_thread(create_app, _args())
     session_id = first.loop.store.session_id
     backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
 
@@ -2128,7 +2128,7 @@ async def test_forced_override_commits_after_first_successful_request(
         return backend, "claude-sonnet-4-6"
 
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
-    app = create_app(
+    app = await asyncio.to_thread(create_app,
         build_parser().parse_args(
             [
                 "--resume",
@@ -2166,7 +2166,7 @@ async def test_invalid_model_keeps_forced_override_uncommitted(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    first = create_app(_args())
+    first = await asyncio.to_thread(create_app, _args())
     session_id = first.loop.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     backend = FakeBackend([])
@@ -2176,7 +2176,7 @@ async def test_invalid_model_keeps_forced_override_uncommitted(
         return backend, "definitely-not-a-claude-model"
 
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
-    app = create_app(
+    app = await asyncio.to_thread(create_app,
         build_parser().parse_args(
             [
                 "--resume",
@@ -2277,7 +2277,7 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
     )
     opened.store.close()
 
-    app = create_app(
+    app = await asyncio.to_thread(create_app,
         build_parser().parse_args(
             ["--resume", opened.store.session_id, "--provider", "codex"]
         )
@@ -2778,7 +2778,7 @@ async def test_summary_success_commits_override_before_main_failure(
 
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
-    app = create_app(
+    app = await asyncio.to_thread(create_app,
         build_parser().parse_args(
             [
                 "--resume",
@@ -3283,7 +3283,7 @@ async def _install_legacy_summary_fixture(
 ) -> tuple[Path, str]:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    first = create_app(build_parser().parse_args(["--provider", "codex"]))
+    first = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
     session_id = first.loop.store.session_id
     session_dir = home / "sessions" / session_id
     await first.close()
@@ -3301,7 +3301,7 @@ async def test_legacy_summary_marker_fixture_loads_and_resumes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, session_id = await _install_legacy_summary_fixture(tmp_path, monkeypatch)
-    resumed = create_app(build_parser().parse_args(["--resume", session_id]))
+    resumed = await asyncio.to_thread(create_app, build_parser().parse_args(["--resume", session_id]))
     try:
         messages = await resumed.loop.context_assembler.assemble()
         rendered = "\n".join(
@@ -3322,7 +3322,7 @@ async def test_tui_resume_renders_legacy_summary_marker_fixture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, session_id = await _install_legacy_summary_fixture(tmp_path, monkeypatch)
-    resumed = create_app(build_parser().parse_args(["--resume", session_id]))
+    resumed = await asyncio.to_thread(create_app, build_parser().parse_args(["--resume", session_id]))
     resumed._active_session = resumed._make_session()
     try:
         await resumed._rebuild_transcript_async()

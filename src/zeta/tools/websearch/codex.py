@@ -207,7 +207,7 @@ async def search(
     home: Path | None = None,
 ) -> CodexSearchResult:
     registry = AccountStore(home or env_home())
-    selected = account or registry.resolve_account("codex")
+    selected = account or await asyncio.to_thread(registry.resolve_account, "codex")
     return await _search_with_account(query, abort_signal, selected, registry)
 
 

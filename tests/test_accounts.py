@@ -12,6 +12,7 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -27,6 +28,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import (
     AccountError,
     AccountId,
+    AccountLoopThreadLockError,
     AccountStore,
     SessionAccountContext,
 )
@@ -51,9 +53,81 @@ from zeta.server.login import Logins
 from zeta.skills import SkillCatalog
 from zeta.tools import websearch
 from zeta.tools.websearch import codex as websearch_codex
+from zeta.tui import bootstrap as tui_bootstrap
 from zeta.tui import models as tui_models
 
 _SENTINEL = "token-text-must-not-escape"
+
+
+@pytest.mark.asyncio
+async def test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_block_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credential = named_account_credentials(tmp_path, "codex")
+    await asyncio.to_thread(credential.save, tokens())
+    monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
+    ticks = 0
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        async with credential._async_guard(registry=False):
+            with pytest.raises(AccountError):
+                await asyncio.wait_for(
+                    asyncio.to_thread(credential_store, "codex", home=tmp_path),
+                    timeout=0.25,
+                )
+            assert ticks > 1
+    finally:
+        stop.set()
+        await ticker_task
+
+
+def test_resolve_account_does_not_migrate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legacy = _write_legacy(tmp_path, "codex")
+    store = AccountStore(tmp_path)
+    monkeypatch.setattr(store, "migrate", Mock(side_effect=AssertionError("migrated")))
+
+    assert store.resolve_account("codex") == AccountId("codex", "default")
+    assert legacy.exists()
+
+    calls = 0
+    original_migrate = AccountStore.migrate
+
+    def migrate_once(self: AccountStore) -> None:
+        nonlocal calls
+        calls += 1
+        original_migrate(self)
+
+    monkeypatch.setattr(AccountStore, "migrate", migrate_once)
+    monkeypatch.setattr(tui_bootstrap, "env_home", lambda: tmp_path)
+    sentinel = object()
+    monkeypatch.setattr(
+        tui_bootstrap, "_create_app_with_root", lambda *_args: sentinel
+    )
+
+    assert tui_bootstrap.create_app(SimpleNamespace(no_session=False)) is sentinel
+    assert calls == 1
+    assert not legacy.exists()
+
+
+@pytest.mark.asyncio
+async def test_blocking_account_lock_on_loop_thread_raises(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path)
+    with (
+        store._home() as home_fd,
+        pytest.raises(AccountLoopThreadLockError, match="event-loop thread"),
+        store._lock_at(home_fd, ".accounts.lock"),
+    ):
+        pass
 
 
 def tokens() -> OAuthTokens:
@@ -473,7 +547,7 @@ def test_named_login_registers_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def complete_login(provider, _pkce_values):
-        provider.credential_store.save(tokens())
+        await asyncio.to_thread(provider.credential_store.save, tokens())
 
     monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
     monkeypatch.setattr(cli_main, "run_login", complete_login)
@@ -508,7 +582,7 @@ def test_login_then_runtime_reads_the_new_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def complete_login(provider, _pkce_values):
-        provider.credential_store.save(tokens())
+        await asyncio.to_thread(provider.credential_store.save, tokens())
 
     monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
     monkeypatch.setattr(cli_main, "run_login", complete_login)
@@ -527,6 +601,7 @@ def test_migration_then_every_reader_uses_the_account_store(
 ) -> None:
     legacy = _write_legacy(tmp_path, "anthropic")
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    AccountStore(tmp_path).migrate()
 
     primary, _ = build_backend("claude", None, home=tmp_path)
     automation, _ = unattended.build_backend("claude", None, home=tmp_path)
@@ -576,6 +651,7 @@ def test_refresh_after_migration_writes_the_account_credential(
     expired = OAuthTokens("old-access", "old-refresh", 1.0)
     fresh = OAuthTokens("fresh-access", "fresh-refresh", 9_999_999_999.0)
     (tmp_path / "anthropic-oauth.json").write_text(json.dumps(expired.to_dict()))
+    AccountStore(tmp_path).migrate()
     store = credential_store("claude", home=tmp_path)
 
     async def return_fresh(_refresh_token: str, _client: httpx.AsyncClient):
@@ -924,7 +1000,7 @@ def test_cli_and_serve_login_share_provider_lock(
     async def cli_login(provider, _pkce_values):
         cli_entered.set()
         await asyncio.to_thread(release_cli.wait)
-        provider.credential_store.save(tokens())
+        await asyncio.to_thread(provider.credential_store.save, tokens())
 
     async def serve_login(*args, **kwargs):
         serve_entered.set()
@@ -1156,12 +1232,18 @@ async def test_grandchild_inherits_child_snapshot_not_global_default(
     home = tmp_path / "home"
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
-    named_account_credentials(home, "codex", "first").save(tokens())
-    named_account_credentials(home, "codex", "second").save(tokens())
-    AccountStore(home).set_default(first)
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "first").save, tokens()
+    )
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "second").save, tokens()
+    )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
     opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
-    resolver = SessionAccountContext.load(home, manager, opened.metadata)
+    resolver = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
     parent = AgentLoop(
         FakeBackend([]),
         opened.store,
@@ -1172,8 +1254,10 @@ async def test_grandchild_inherits_child_snapshot_not_global_default(
     parent.tool_registry.account_context = resolver
 
     async def consume_child(child_loop: AgentLoop, _prompt: str, **_kwargs: object):
-        AccountStore(home).set_default(second)
-        grandchild, error = resolve_child_backend(child_loop, "gpt-5.6-luna")
+        await asyncio.to_thread(AccountStore(home).set_default, second)
+        grandchild, error = await asyncio.to_thread(
+            resolve_child_backend, child_loop, "gpt-5.6-luna"
+        )
         assert error is None
         assert grandchild.token_store.account == first
         return {"content": [{"type": "text", "text": "done"}], "isError": False}
@@ -1186,7 +1270,7 @@ async def test_grandchild_inherits_child_snapshot_not_global_default(
         result = await parent._run_agent_tool(
             call, call.arguments, AbortGenerationRegistry().new_generation(), None
         )
-        assert result["isError"] is False
+        assert result["isError"] is False, result
     finally:
         await parent.close()
         opened.store.close()
@@ -1204,12 +1288,18 @@ async def test_live_child_websearch_ignores_later_parent_switch(
     home = tmp_path / "home"
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
-    named_account_credentials(home, "codex", "first").save(tokens())
-    named_account_credentials(home, "codex", "second").save(tokens())
-    AccountStore(home).set_default(first)
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "first").save, tokens()
+    )
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "second").save, tokens()
+    )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
     opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
-    resolver = SessionAccountContext.load(home, manager, opened.metadata)
+    resolver = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
     parent = AgentLoop(
         FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty(),
         agent_catalog=discover_packaged_agents(),
@@ -1223,7 +1313,7 @@ async def test_live_child_websearch_ignores_later_parent_switch(
         return websearch_codex.CodexSearchResult("answer", [])
 
     async def consume_child(child_loop: AgentLoop, _prompt: str, **_kwargs: object):
-        resolver.switch(second, boundary=0)
+        await asyncio.to_thread(resolver.switch, second, boundary=0)
         await websearch._websearch(
             child_loop.tool_registry,
             {"query": "query"},
@@ -1303,7 +1393,7 @@ def test_api_key_mode_skips_named_accounts(
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
     rendered: list[object] = []
     app._presenter.print_unit = rendered.append
-    app._handle_slash_output(app.slash_accounts(""))
+    app._handle_slash_output(asyncio.run(app.slash_accounts("")))
     assert rendered[0].plain == (
         "system · this session uses an API key; account switching is unavailable"
     )
@@ -1591,7 +1681,7 @@ def test_login_prompts_for_label_and_rejects_duplicate(
 
     async def login(provider, _pkce_values) -> None:
         called.append(provider.credential_store.account.name)
-        provider.credential_store.save(tokens())
+        await asyncio.to_thread(provider.credential_store.save, tokens())
 
     monkeypatch.setattr(cli_main, "run_login", login)
     assert cli_main.main(["login", "codex"]) == 0

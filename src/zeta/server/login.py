@@ -46,7 +46,7 @@ class Logins:
 
     async def request(self, method: str, params: dict) -> dict:
         if method == "login_providers":
-            return self.providers()
+            return await asyncio.to_thread(self.providers)
         provider = params.get("provider")
         if provider not in ("claude", "codex"):
             raise ProtocolError(-32602, "unsupported login provider")

@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from ..accounts import AccountStore
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
 from ..protocol.types import (
@@ -110,6 +111,7 @@ class ZetaServer:
         return str(self.socket_path)
 
     async def start(self) -> None:
+        await asyncio.to_thread(AccountStore(self.home).migrate)
         if self.port is None:
             self._prepare_socket_path()
             self._server = await asyncio.start_unix_server(
@@ -557,7 +559,7 @@ class _Client:
             mode = _required_string(params, "approval_mode")
             if model not in ergonomics.catalog(runtime)["models"] or mode not in {"ask", "allow", "deny"}:
                 raise ProtocolError(-32602, "invalid model or approval mode")
-            model_selection.apply(runtime, model, mode)
+            await asyncio.to_thread(model_selection.apply, runtime, model, mode)
             return ergonomics.settings(runtime)
         if method == "set_compaction":
             _required_string(params, "mode")
@@ -998,7 +1000,9 @@ class _Client:
                     and self.protocol_version != "1.0"):
                 login_provider = self.server.runtime.metadata.provider
             if foreground and event.error is not None:
-                recovered = model_selection.recover(self.server.runtime, event.error)
+                recovered = await asyncio.to_thread(
+                    model_selection.recover, self.server.runtime, event.error
+                )
                 if self.protocol_version != "1.0":
                     error = recovered
             await self._notify(

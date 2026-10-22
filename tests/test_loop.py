@@ -5,6 +5,7 @@ import time
 import warnings
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -1896,7 +1897,7 @@ async def test_metadata_only_provider_events_are_retry_safe(
 
 
 @pytest.mark.asyncio
-async def test_child_retries_response_failed_server_error(
+async def test_child_backend_build_runs_off_loop_and_retries_server_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     requests = 0
@@ -2001,10 +2002,17 @@ async def test_child_retries_response_failed_server_error(
     child_backend = codex_module.CodexBackend(
         client=client, token_store=TokenStore(), diagnostics_path=None
     )
+    resolved_off_loop = False
+
+    def resolve_child_backend(_loop, _model):
+        nonlocal resolved_off_loop
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        resolved_off_loop = True
+        return child_backend, None
+
     monkeypatch.setattr(
-        agent_runner_module,
-        "resolve_child_backend",
-        lambda _loop, _model: (child_backend, None),
+        agent_runner_module, "resolve_child_backend", resolve_child_backend
     )
     loop = AgentLoop(
         FakeBackend([]),
@@ -2012,6 +2020,7 @@ async def test_child_retries_response_failed_server_error(
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
     )
+    loop.account_context = SimpleNamespace(child_snapshot=lambda _provider: None)
     call = ToolCall(
         "agent-1",
         "agent",
@@ -2027,6 +2036,7 @@ async def test_child_retries_response_failed_server_error(
         call, call.arguments, AbortSignal(), None
     )
 
+    assert resolved_off_loop
     assert requests == 2, result
     assert result["isError"] is False
     assert result["content"][0]["text"].startswith("done")

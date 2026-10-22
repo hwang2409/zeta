@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ..accounts import AccountStore
 from .runner import run_claimed
 from .store import SQLiteStore
 from .tick import tick
@@ -66,6 +67,7 @@ async def serve(
 ) -> None:
     if interval <= 0:
         raise ValueError("daemon interval must be positive")
+    await asyncio.to_thread(AccountStore(home).migrate)
     stopped = stop or asyncio.Event()
     wake = asyncio.Event()
     loop = asyncio.get_running_loop()

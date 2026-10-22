@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 
-from ..accounts import AccountId
+from ..accounts import AccountId, AccountStore
 from ..config.settings import ResolvedConfig, SettingsError
 from ..config.settings import resolve as resolve_settings
 from ..core.project_context import (
@@ -241,6 +241,7 @@ def format_picker_row(index: int, preview: SessionPreview) -> str:
 
 def create_app(args: argparse.Namespace) -> TUIApp:
     home = env_home()
+    AccountStore(home).migrate()
     ephemeral = bool(getattr(args, "no_session", False))
     ephemeral_root: Path | None = None
     if ephemeral:
