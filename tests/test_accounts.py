@@ -504,7 +504,13 @@ def test_migration_then_every_reader_uses_the_account_store(
             json=lambda: {"data": []},
         ),
     )
-    assert tui_models.load_model_catalog("claude", home=tmp_path) == frozenset()
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    context = SessionAccountContext.load(tmp_path, manager, opened.metadata)
+    assert tui_models.load_model_catalog(
+        "claude", account_context=context
+    ) == frozenset()
+    opened.store.close()
 
     expected = AccountStore(tmp_path).credential_path(
         AccountId("anthropic", "default")
@@ -1219,9 +1225,14 @@ def test_model_catalog_uses_session_pinned_account(
         )
 
     monkeypatch.setattr(tui_models.httpx, "get", request)
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    manager.record_account_selection(opened.metadata, session_account, boundary=0)
+    context = SessionAccountContext.load(tmp_path, manager, opened.metadata)
     assert tui_models.load_model_catalog(
-        "claude", home=tmp_path, account=session_account
+        "claude", account_context=context
     ) == frozenset({"claude-sonnet-4-6"})
+    opened.store.close()
     assert requests[0].headers["authorization"] == f"Bearer {_SENTINEL}"
 
 

@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from ..accounts import AccountId
+from ..accounts import SessionAccountContext
 from ..core.session import env_home
 from ..models.catalog import PROVIDER_MODELS
 from ..providers.factory import credential_store
@@ -103,8 +103,7 @@ def _load_codex_model_catalog() -> frozenset[str] | None:
 def load_model_catalog(
     provider: str,
     *,
-    home: str | Path | None = None,
-    account: AccountId | None = None,
+    account_context: SessionAccountContext | None = None,
 ) -> frozenset[str] | None:
     """Load a provider catalog, returning None when it cannot be obtained."""
 
@@ -113,7 +112,15 @@ def load_model_catalog(
     if provider != "claude":
         return None
 
-    auth_home = Path(home) if home is not None else env_home()
+    if account_context is not None and account_context.auth_mode == "api-key":
+        return None
+    backend_kwargs = (
+        {"home": env_home()}
+        if account_context is None
+        else account_context.backend_kwargs(provider)
+    )
+    auth_home = Path(backend_kwargs["home"])
+    account = backend_kwargs.get("account")
     try:
         token_store = credential_store("claude", home=auth_home, account=account)
         assert token_store is not None

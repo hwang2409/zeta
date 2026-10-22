@@ -76,9 +76,7 @@ def _valid_memory_digest(value: object) -> bool:
     return type(value) is str and _MEMORY_DIGEST.match(value) is not None
 
 
-def _account_metadata(
-    value: Mapping[str, Any], path: Path
-) -> tuple[dict[str, str], dict[str, int], dict[str, int]]:
+def _account_metadata(value: Mapping[str, Any], path: Path) -> tuple[dict[str, str], dict[str, int], dict[str, int]]:
     selected = value.get("selected_accounts", {})
     sequences = value.get("account_switch_sequences", {})
     boundaries = value.get("native_context_boundaries", {})
@@ -104,7 +102,6 @@ def _account_metadata(
     ):
         raise SessionError(f"session account selection is invalid: {path}")
     return selected, sequences, boundaries
-
 
 def env_home() -> Path:
     """Return zeta's home, honoring the test and local override."""

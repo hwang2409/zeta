@@ -130,8 +130,11 @@ class SessionAccountContext:
 
     def backend_kwargs(self, provider: str) -> dict[str, object]:
         result: dict[str, object] = {"home": self.home}
-        if account_provider(provider) is not None and not api_key_mode(provider):
-            result["account"] = self.resolve(provider)
+        canonical = account_provider(provider)
+        if canonical is not None and not api_key_mode(provider):
+            self.resolve(provider)
+            if (account := self._pins.get(canonical)) is not None:
+                result["account"] = account
         return result
 
     def snapshot(self) -> dict[str, AccountId]:
@@ -142,17 +145,17 @@ class SessionAccountContext:
         canonical = account_provider(provider or "")
         if canonical is not None:
             needed.add(canonical)
+        child_pins = self.snapshot()
         for name in needed:
             source = "claude" if name == "anthropic" else name
             if not api_key_mode(source):
-                selected = self.resolve(source)
-                self._pins.setdefault(name, selected)
+                child_pins[name] = self.resolve(source)
         return SessionAccountContext(
             self.home,
             self.store,
             None,
             self.metadata,
-            self.snapshot(),
+            child_pins,
             _frozen=True,
             _active_provider=canonical,
             _switch_sequences=dict(self._switch_sequences),
