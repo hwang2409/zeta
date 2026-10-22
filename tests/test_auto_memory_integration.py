@@ -8,11 +8,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.config.settings import load_settings, resolve
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import OpenedSession, SessionManager
 from zeta.core.slash import create_slash_registry
+from zeta.memory.reconciler import ReconciliationResponse
+from zeta.oauth import OAuthTokens
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
@@ -24,6 +27,7 @@ from zeta.protocol.types import (
     ToolSchema,
     with_message_origin,
 )
+from zeta.providers.factory import build_backend
 from zeta.runtime.composition import RuntimeComposition, compose_runtime
 from zeta.server.server import _Client
 from zeta.skills import SkillCatalog
@@ -129,6 +133,53 @@ def test_memory_slash_command_dispatches_log_and_undo() -> None:
     assert registry.dispatch(session, "/memory log") == "memory:log"
     assert registry.dispatch(session, "/memory undo") == "memory:undo"
     assert calls == ["log", "undo"]
+
+
+@pytest.mark.asyncio
+async def test_memory_reconciliation_builds_backend_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home.mkdir()
+    named_account_credentials(home, "codex").save(
+        OAuthTokens("access", "refresh", 9_999_999_999.0)
+    )
+    (home / "settings.toml").write_text(
+        '[memory]\nmodel = "gpt-5.6-luna"\n', encoding="utf-8"
+    )
+    config = _resolve(home)
+    manager = SessionManager(home)
+    project = manager.project_registry.create_project("demo", "scope", workspace)
+    manager.project_registry.initialize_memory(project.project_id)
+
+    async def no_network(*_args: object, **_kwargs: object) -> ReconciliationResponse:
+        return ReconciliationResponse('{"changes": []}', {})
+
+    monkeypatch.setattr(
+        "zeta.runtime.composition.complete_reconciliation", no_network
+    )
+    composition = await asyncio.to_thread(
+        compose_runtime,
+        home=home,
+        cwd=workspace,
+        manager=manager,
+        config=config,
+        provider="codex",
+        model="gpt-5.6-luna",
+        project_context=ProjectContext("system", ()),
+        backend_builder=build_backend,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+        auto_project=False,
+        project_id=project.project_id,
+    )
+    try:
+        assert composition.memory_reconciler is not None
+        await composition.memory_reconciler.invoke("prompt")
+    finally:
+        await composition.loop.close()
 
 
 @pytest.mark.asyncio
