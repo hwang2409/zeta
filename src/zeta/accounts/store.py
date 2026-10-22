@@ -407,12 +407,20 @@ class AccountStore:
         self._write_registry(home_fd, value)
 
     def migrate(self) -> None:
-        with (
-            self._home() as home_fd,
-            self._lock_at(home_fd, ".accounts-migration.lock"),
-        ):
-            for provider in ("anthropic", "codex"):
-                self._migrate_provider(home_fd, provider)
+        with self._home() as home_fd:
+            if not any(
+                _exists(home_fd, name)
+                for name in (
+                    "anthropic-oauth.json",
+                    "codex-oauth.json",
+                    "accounts.json",
+                    "accounts",
+                )
+            ):
+                return
+            with self._lock_at(home_fd, ".accounts-migration.lock"):
+                for provider in ("anthropic", "codex"):
+                    self._migrate_provider(home_fd, provider)
 
     def _migrate_provider(self, home_fd: int, provider: str) -> None:
         account = AccountId(provider, "default")

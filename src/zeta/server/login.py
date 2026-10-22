@@ -88,9 +88,12 @@ class Logins:
                 )[0]
                 locked = not isinstance(result, BaseException)
                 raise
+            login = await asyncio.to_thread(
+                build_login_provider, login_provider, self.home
+            )
             async with asyncio.timeout(self.timeout):
                 await run_login(
-                    build_login_provider(login_provider, self.home),
+                    login,
                     pkce_values,
                     # The outer deadline covers the exchange as well as the callback.
                     timeout_seconds=self.timeout + 1,

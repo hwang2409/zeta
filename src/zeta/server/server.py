@@ -1,5 +1,3 @@
-"""Newline-delimited JSON-RPC server for native zeta frontends."""
-
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +11,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..accounts import AccountStore
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
 from ..protocol.types import (
@@ -25,6 +22,7 @@ from ..protocol.types import (
 )
 from . import (
     abort_scope,
+    accounts,
     ergonomics,
     event_contract,
     login,
@@ -111,7 +109,7 @@ class ZetaServer:
         return str(self.socket_path)
 
     async def start(self) -> None:
-        await asyncio.to_thread(AccountStore(self.home).migrate)
+        await accounts.migrate(self.home)
         if self.port is None:
             self._prepare_socket_path()
             self._server = await asyncio.start_unix_server(
@@ -1000,9 +998,7 @@ class _Client:
                     and self.protocol_version != "1.0"):
                 login_provider = self.server.runtime.metadata.provider
             if foreground and event.error is not None:
-                recovered = await asyncio.to_thread(
-                    model_selection.recover, self.server.runtime, event.error
-                )
+                recovered = await model_selection.recover_async(self.server.runtime, event.error)
                 if self.protocol_version != "1.0":
                     error = recovered
             await self._notify(

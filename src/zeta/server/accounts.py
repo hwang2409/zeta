@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
-from ..accounts import AccountUsage
+from ..accounts import AccountStore, AccountUsage
 from ..accounts.usage import usage_json
 from .protocol import ProtocolError
 from .runtime import ServerRuntime
 
 REQUEST_METHODS = {"account_list", "account_refresh"}
+
+
+async def migrate(home: Path) -> None:
+    await asyncio.to_thread(AccountStore(home).migrate)
 
 
 def list_accounts(runtime: ServerRuntime) -> dict[str, object]:

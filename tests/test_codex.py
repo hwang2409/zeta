@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import concurrent.futures
 import http.server
 import json
 import multiprocessing
@@ -600,9 +599,7 @@ def client_for(stream: str):
 
 def store_for(path: Path, token: str | None = None) -> AccountCredentials:
     store = codex_credentials(path)
-    tokens = OAuthTokens(token or access_token(), "refresh-fixture", 4_000_000_000)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        executor.submit(store.save, tokens).result()
+    store.save(OAuthTokens(token or access_token(), "refresh-fixture", 4_000_000_000))
     return store
 
 

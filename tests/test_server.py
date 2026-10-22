@@ -3429,9 +3429,11 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, mo
         assert runtime.metadata.to_dict() == before
         assert runtime.loop.backend is backend
         assert "result" in (await _request(reader, writer, 4, "status"))[-1]
-        credential = credential_store(target, home=tmp_path)
+        credential = await asyncio.to_thread(credential_store, target, home=tmp_path)
         assert credential is not None
-        credential.save(OAuthTokens("test-access", "test-refresh", 4_000_000_000))
+        await asyncio.to_thread(
+            credential.save, OAuthTokens("test-access", "test-refresh", 4_000_000_000)
+        )
         response = (await _request(reader, writer, 5, "set_settings", {
             "session_id": runtime.session_id, "model": model, "approval_mode": "deny",
         }))[-1]
@@ -3812,7 +3814,7 @@ async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, v
         assert "model_fallback" not in created["session"]
         runtime = server.runtime
         sid = runtime.session_id
-        model_selection.apply(runtime, "gpt-5.4", "ask")
+        await asyncio.to_thread(model_selection.apply, runtime, "gpt-5.4", "ask")
         assert runtime.metadata.model_fallback is not None
         resumed = (await _request(reader, writer, 3, "resume", {"session_id": sid}))[-1]["result"]
         status = (await _request(reader, writer, 4, "status"))[-1]["result"]
@@ -3885,7 +3887,7 @@ async def test_mcp_auth_failure_does_not_revert_model(tmp_path, monkeypatch):
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
         runtime = server.runtime
-        model_selection.apply(runtime, "gpt-5.4", "ask")
+        await asyncio.to_thread(model_selection.apply, runtime, "gpt-5.4", "ask")
         fallback = runtime.metadata.model_fallback
 
         async def fail_mcp_setup():
