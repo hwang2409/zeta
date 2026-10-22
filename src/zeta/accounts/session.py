@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +23,7 @@ if TYPE_CHECKING:
 
 
 ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS = OAUTH_REFRESH_TIMEOUT_SECONDS
+logger = logging.getLogger(__name__)
 
 
 async def _shielded(operation: Any) -> Any:
@@ -54,6 +57,28 @@ class AccountListSnapshot:
     defaults: dict[str, AccountId]
 
 
+class CommittedAccount(StrEnum):
+    OLD = "old"
+    NEW = "new"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAccountState:
+    metadata: SessionMetadata
+    pins: dict[str, AccountId]
+    switch_sequences: dict[str, int]
+    active_provider: str | None
+    backend_state: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _UnknownAccountState:
+    provider: str
+    old_selection: str | None
+    new: _PreparedAccountState
+
+
 @dataclass(slots=True)
 class SessionAccountContext:
     """Resolve credentials and keep provider transitions local to one session."""
@@ -66,6 +91,8 @@ class SessionAccountContext:
     _frozen: bool = False
     _active_provider: str | None = None
     _switch_sequences: dict[str, int] = field(default_factory=dict)
+    _account_state_unknown: bool = False
+    _unknown_state: _UnknownAccountState | None = field(default=None, init=False, repr=False)
     _switch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
     @classmethod
@@ -118,6 +145,10 @@ class SessionAccountContext:
     @property
     def active_provider(self) -> str | None:
         return self._active_provider
+
+    @property
+    def account_state_unknown(self) -> bool:
+        return self._account_state_unknown
 
     @property
     def switch_sequence(self) -> int:
@@ -216,99 +247,159 @@ class SessionAccountContext:
         build_backend: Callable[[AccountId], Any],
     ) -> None:
         async with self._switch_lock:
-            backend = await asyncio.to_thread(
-                self._prepare, account, build_backend
+            if self._account_state_unknown:
+                raise AccountError(
+                    "session account state is unknown; retry /accounts after the next turn"
+                )
+            new = await asyncio.to_thread(
+                self._prepare,
+                loop,
+                account,
+                boundary,
+                provider,
+                build_backend,
             )
             await _shielded(
-                self._commit(
-                    loop,
-                    account,
-                    backend,
-                    boundary=boundary,
-                    provider=provider,
-                )
+                self._commit_and_apply(loop, account, boundary, new)
             )
 
+    async def _commit_and_apply(
+        self,
+        loop: Any,
+        account: AccountId,
+        boundary: int,
+        new: _PreparedAccountState,
+    ) -> None:
+        committed, metadata = await asyncio.to_thread(
+            self._commit_to_disk, account, boundary
+        )
+        if committed is CommittedAccount.UNKNOWN:
+            self._account_state_unknown = True
+            old = self._pins.get(account.provider)
+            self._unknown_state = _UnknownAccountState(
+                account.provider, str(old) if old is not None else None, new
+            )
+            return
+        if committed is CommittedAccount.NEW:
+            assert metadata is not None
+            self._apply(loop, self._state_from_metadata(new, metadata))
+
     def _prepare(
-        self, account: AccountId, build_backend: Callable[[AccountId], Any]
-    ) -> Any:
+        self,
+        loop: Any,
+        account: AccountId,
+        boundary: int,
+        provider: str,
+        build_backend: Callable[[AccountId], Any],
+    ) -> _PreparedAccountState:
         if self.switching_unavailable is not None:
             raise AccountError(self.switching_unavailable)
         if self._frozen:
             raise AccountError("child account snapshots cannot be changed")
         if not self.store.contains(account):
             raise AccountError(f"account {account} does not exist; use /accounts")
-        return build_backend(account)
-
-    async def _commit(
-        self,
-        loop: Any,
-        account: AccountId,
-        backend: Any,
-        *,
-        boundary: int,
-        provider: str,
-    ) -> None:
         assert self.manager is not None
-        old_metadata = copy.deepcopy(self.metadata)
-        old_pins = dict(self._pins)
-        old_sequences = dict(self._switch_sequences)
-        old_backend = loop.backend
-        old_provider = self._active_provider
+        metadata = self.manager._apply_account_selection(
+            copy.deepcopy(self.metadata), account, boundary=boundary, switched=True
+        )
+        backend = build_backend(account)
+        backend_state = (
+            loop.current_backend_state()
+            if backend is None
+            else loop.prepare_backend_state(backend)
+        )
+        new = _PreparedAccountState(
+            metadata,
+            {**self._pins, account.provider: account},
+            dict(metadata.account_switch_sequences),
+            account_provider(provider),
+            backend_state,
+        )
+        return new
 
-        def restore() -> None:
-            self.manager._copy_metadata(self.metadata, old_metadata)
-            self._pins = old_pins
-            self._switch_sequences = old_sequences
-            self.restore(loop, (old_backend, old_provider))
-
-        try:
-            metadata = self.manager._apply_account_selection(
-                copy.deepcopy(self.metadata),
-                account,
-                boundary=boundary,
-                switched=True,
+    def _commit_to_disk(
+        self, account: AccountId, boundary: int
+    ) -> tuple[CommittedAccount, SessionMetadata | None]:
+        assert self.manager is not None
+        session_id = self.metadata.session_id
+        with self.manager._metadata_lock(
+            session_id, timeout=ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS
+        ) as directory_fd:
+            assert directory_fd is not None
+            current = self.manager._read(session_id, directory_fd=directory_fd)
+            old_selection = current.selected_accounts.get(account.provider)
+            updated = self.manager._apply_account_selection(
+                current, account, boundary=boundary, switched=True
             )
-            self.manager._copy_metadata(self.metadata, metadata)
-            self._pins = {**self._pins, account.provider: account}
-            self._switch_sequences = dict(metadata.account_switch_sequences)
-            if backend is not None:
-                self.activate(loop, backend, provider)
-        except BaseException:
-            restore()
-            raise
-
-        def persist() -> None:
-            assert self.manager is not None
-            self.manager.record_account_selection(
-                self.metadata,
-                account,
-                boundary=boundary,
-                switched=True,
-                lock_timeout=ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS,
-            )
-
-        try:
-            await asyncio.to_thread(persist)
-        except BaseException:
             try:
-                on_disk = await asyncio.to_thread(
+                self.manager._write_unlocked(updated, directory_fd=directory_fd)
+            except BaseException as exc:  # noqa: BLE001 - authoritative reread decides
+                logger.debug("account selection write reported failure: %s", exc)
+            try:
+                on_disk = self.manager._read(session_id, directory_fd=directory_fd)
+            except BaseException:  # noqa: BLE001 - disk outcome cannot be proven
+                return CommittedAccount.UNKNOWN, None
+        selected = on_disk.selected_accounts.get(account.provider)
+        if selected == str(account):
+            return CommittedAccount.NEW, on_disk
+        if selected == old_selection:
+            return CommittedAccount.OLD, on_disk
+        return CommittedAccount.UNKNOWN, None
+
+    @staticmethod
+    def _state_from_metadata(
+        state: _PreparedAccountState, metadata: SessionMetadata
+    ) -> _PreparedAccountState:
+        return _PreparedAccountState(
+            metadata,
+            {
+                provider: AccountId(*value.split(":", 1))
+                for provider, value in metadata.selected_accounts.items()
+            },
+            dict(metadata.account_switch_sequences),
+            state.active_provider,
+            state.backend_state,
+        )
+
+    def _apply(self, loop: Any, state: _PreparedAccountState) -> None:
+        for name in self.metadata.__slots__:
+            setattr(self.metadata, name, getattr(state.metadata, name))
+        self._pins = state.pins
+        self._switch_sequences = state.switch_sequences
+        self._active_provider = state.active_provider
+        loop.apply_backend_state(state.backend_state)
+        self._account_state_unknown = False
+        self._unknown_state = None
+
+    async def ensure_account_state(self, loop: Any) -> None:
+        if not self._account_state_unknown:
+            return
+        async with self._switch_lock:
+            if not self._account_state_unknown:
+                return
+            recovery = self._unknown_state
+            assert recovery is not None and self.manager is not None
+            try:
+                metadata = await asyncio.to_thread(
                     self.manager.read_metadata,
                     self.metadata.session_id,
                     lock_timeout=ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS,
                 )
-            except BaseException:  # noqa: BLE001 - rollback includes cancellation
-                restore()
-            else:
-                if on_disk.selected_accounts.get(account.provider) == str(account):
-                    self.manager._copy_metadata(self.metadata, on_disk)
-                    self._pins = {**self._pins, account.provider: account}
-                    self._switch_sequences = dict(
-                        on_disk.account_switch_sequences
-                    )
-                else:
-                    restore()
-            raise
+                provider = recovery.provider
+                selected = metadata.selected_accounts.get(provider)
+                if selected == recovery.old_selection:
+                    self._account_state_unknown = False
+                    self._unknown_state = None
+                    return
+                if selected != recovery.new.metadata.selected_accounts.get(provider):
+                    raise ValueError("disk account does not match either prepared state")
+            except Exception as exc:
+                raise AccountError(
+                    "session account state is unknown; open /accounts before retrying"
+                ) from exc
+            self._apply(
+                loop, self._state_from_metadata(recovery.new, metadata)
+            )
 
     async def subscription_limit_event(self, failure: object) -> dict[str, object] | None:
         return await asyncio.to_thread(self._subscription_limit_event, failure)

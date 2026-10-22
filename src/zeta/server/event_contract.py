@@ -55,6 +55,7 @@ STREAM_EVENT_WIRE_EVENTS = {
     StreamEventType.TOOL_EXECUTION_END: "tool_end",
     StreamEventType.AGENT_NOTIFICATION: "notification_by_kind",
     StreamEventType.ACCOUNT_LIMIT: "account_limit",
+    StreamEventType.ACCOUNT_STATE_UNKNOWN: "account_state_unknown",
     StreamEventType.TURN_END: "turn_end",
     StreamEventType.AGENT_END: "agent_end",
     StreamEventType.ERROR: "error",

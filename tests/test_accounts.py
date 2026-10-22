@@ -1134,7 +1134,9 @@ async def test_switch_changes_only_current_session_not_other_sessions_or_live_ch
     )
     child_accounts = current_resolver.snapshot()
     loop = SimpleNamespace(backend=None)
-    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
+    loop.current_backend_state = lambda: loop.backend
+    loop.prepare_backend_state = lambda backend: backend
+    loop.apply_backend_state = lambda backend: setattr(loop, "backend", backend)
 
     await current_resolver.switch_active(
         loop,
@@ -1249,7 +1251,9 @@ def test_account_switch_filters_stale_native_artifacts(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("next")])])
     loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
     loop.account_context = SimpleNamespace(
-        active_provider="codex", switch_sequence=1
+        active_provider="codex",
+        switch_sequence=1,
+        account_state_unknown=False,
     )
 
     async def run() -> None:

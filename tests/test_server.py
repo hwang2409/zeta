@@ -76,6 +76,13 @@ def test_every_stream_event_has_a_wire_mapping() -> None:
     assert all(STREAM_EVENT_WIRE_EVENTS.values())
 
 
+def test_serve_maps_account_state_unknown() -> None:
+    assert (
+        STREAM_EVENT_WIRE_EVENTS[StreamEventType.ACCOUNT_STATE_UNKNOWN]
+        == "account_state_unknown"
+    )
+
+
 def test_server_sends_only_wire_map_event_names() -> None:
     tree = ast.parse(dedent(inspect.getsource(_Client)))
     literal_notifications = [
@@ -5913,7 +5920,11 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
         assert ticks > 1
         release.set()
         response = await asyncio.wait_for(request_task, 5)
-        assert response[-1]["result"] == {"account": str(second), "replay": False}
+        assert response[-1]["result"] == {
+            "account": str(second),
+            "replay": False,
+            "account_state": "ready",
+        }
     finally:
         release.set()
         stop.set()

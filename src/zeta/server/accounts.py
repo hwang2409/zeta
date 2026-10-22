@@ -96,7 +96,11 @@ async def request(
         provider=provider,
         build_backend=prepare_backend,
     )
-    return {"account": str(account), "replay": False}
+    return {
+        "account": str(account),
+        "replay": False,
+        "account_state": "unknown" if context.account_state_unknown else "ready",
+    }
 
 
 async def refresh_accounts(runtime: ServerRuntime) -> dict[str, object]:

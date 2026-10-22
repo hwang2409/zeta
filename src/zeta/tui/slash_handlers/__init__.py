@@ -36,11 +36,12 @@ from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
-from ...protocol.types import MessageOrigin, StreamEvent
+from ...protocol.types import MessageOrigin, StreamEvent, StreamEventType
 from ...providers.factory import build_backend
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
+from ..render import render_event
 from .accounts_picker import AccountsPicker
 from .model_picker import ModelPicker
 from .permissions import format_permissions, revoke_permissions
@@ -355,7 +356,12 @@ class SlashHandlerMixin:
             finally:
                 self._account_switch_task = None
             self._dismiss_accounts_picker()
-            self._print_system(f"account: {account}")
+            if context.account_state_unknown:
+                self._presenter.print_unit(
+                    render_event(StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN))
+                )
+            else:
+                self._print_system(f"account: {account}")
 
         task = asyncio.create_task(switch())
         self._account_switch_task = task

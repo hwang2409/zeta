@@ -91,6 +91,11 @@ from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
 )
+from ..backend_state import (
+    PreparedBackendState,
+    apply_backend_state,
+    prepare_backend_state,
+)
 from ._completion import (
     ProviderAttemptState,
     _error_info,
@@ -335,13 +340,19 @@ class AgentLoop(
             for message in messages
         ]
 
+    def prepare_backend_state(self, backend: CompletionBackend) -> PreparedBackendState:
+        return prepare_backend_state(self, backend)
+
+    def current_backend_state(self) -> PreparedBackendState:
+        return PreparedBackendState(self.backend, self.context_assembler.token_budget)
+
+    def apply_backend_state(self, state: PreparedBackendState) -> None:
+        apply_backend_state(self, state)
+
     def set_backend(self, backend: CompletionBackend) -> None:
         """Replace the provider backend used by subsequent completions."""
 
-        self.backend = backend
-        self.context_assembler.backend = backend
-        self.context_assembler.compaction_policy.backend = backend
-        self.set_token_budget(self.context_assembler.token_budget)
+        self.apply_backend_state(self.prepare_backend_state(backend))
 
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
@@ -851,6 +862,10 @@ class AgentLoop(
             provider_retry_usage: dict[str, Any] | None = None
             attempt_state = ProviderAttemptState()
             try:
+                account_context = getattr(self, "account_context", None)
+                if account_context is not None and account_context.account_state_unknown:
+                    yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
+                    await account_context.ensure_account_state(self)
                 if retrying_context or self.context_assembler.needs_compaction():
                     yield StreamEvent(
                         StreamEventType.COMPACTION_START,

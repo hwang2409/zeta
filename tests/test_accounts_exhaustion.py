@@ -18,7 +18,13 @@ import zeta.providers.transport as transport_module
 import zeta.server.accounts as server_accounts
 import zeta.tui.slash_handlers as tui_slash_handlers
 from tests.support.credentials import named_account_credentials
-from zeta.accounts import AccountId, AccountStore, AccountUsage, SessionAccountContext
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.accounts import (
+    AccountId,
+    AccountStore,
+    AccountUsage,
+    SessionAccountContext,
+)
 from zeta.accounts.exhaustion import (
     SubscriptionLimit,
     classify_subscription_limit,
@@ -156,6 +162,15 @@ def _account_context(
     return context, opened, first, second
 
 
+def _switch_loop(backend: object) -> SimpleNamespace:
+    loop = SimpleNamespace(backend=backend)
+    loop.current_backend_state = lambda: loop.backend
+    loop.prepare_backend_state = lambda prepared: prepared
+    loop.apply_backend_state = lambda prepared: setattr(loop, "backend", prepared)
+    loop.set_backend = lambda prepared: setattr(loop, "backend", prepared)
+    return loop
+
+
 def _assert_switch_state(
     context: SessionAccountContext,
     account: AccountId,
@@ -188,8 +203,7 @@ async def test_switch_cancelled_during_prepare_changes_nothing(
     release = threading.Event()
     finished = threading.Event()
     first_backend = object()
-    loop = SimpleNamespace(backend=first_backend)
-    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
+    loop = _switch_loop(first_backend)
 
     def build_backend(_account: AccountId) -> object:
         entered.set()
@@ -218,24 +232,21 @@ async def test_switch_cancelled_during_prepare_changes_nothing(
 
 
 @pytest.mark.asyncio
-async def test_switch_apply_failure_restores_old_state(tmp_path: Path) -> None:
+async def test_switch_apply_is_infallible_no_split_when_backend_build_fails(
+    tmp_path: Path,
+) -> None:
     context, opened, first, second = await asyncio.to_thread(
         _account_context, tmp_path
     )
     first_backend = object()
+    loop = _switch_loop(first_backend)
+
     second_backend = object()
-    loop = SimpleNamespace(backend=first_backend)
-    failed = False
+    loop.prepare_backend_state = lambda _backend: (_ for _ in ()).throw(
+        RuntimeError("build failed")
+    )
 
-    def set_backend(backend: object) -> None:
-        nonlocal failed
-        loop.backend = backend
-        if backend is second_backend and not failed:
-            failed = True
-            raise RuntimeError("apply failed")
-
-    loop.set_backend = set_backend
-    with pytest.raises(RuntimeError, match="apply failed"):
+    with pytest.raises(RuntimeError, match="build failed"):
         await context.switch_active(
             loop,
             second,
@@ -249,7 +260,7 @@ async def test_switch_apply_failure_restores_old_state(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_switch_persist_failure_restores_old_state(
+async def test_switch_persist_failure_keeps_old_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     context, opened, first, second = await asyncio.to_thread(
@@ -257,36 +268,28 @@ async def test_switch_persist_failure_restores_old_state(
     )
     first_backend = object()
     second_backend = object()
-    loop = SimpleNamespace(backend=first_backend)
-    applied: list[object] = []
-
-    def set_backend(backend: object) -> None:
-        applied.append(backend)
-        loop.backend = backend
-
-    loop.set_backend = set_backend
-
-    def fail_persist(*_args: object, **_kwargs: object) -> None:
-        raise OSError("persist failed")
+    loop = _switch_loop(first_backend)
 
     assert context.manager is not None
-    monkeypatch.setattr(context.manager, "record_account_selection", fail_persist)
-    with pytest.raises(OSError, match="persist failed"):
-        await context.switch_active(
-            loop,
-            second,
-            boundary=3,
-            provider="codex",
-            build_backend=lambda _account: second_backend,
-        )
+    monkeypatch.setattr(
+        context.manager,
+        "_write_unlocked",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("persist failed")),
+    )
+    await context.switch_active(
+        loop,
+        second,
+        boundary=3,
+        provider="codex",
+        build_backend=lambda _account: second_backend,
+    )
 
     _assert_switch_state(context, first, first_backend, loop, sequence=0)
-    assert applied == [second_backend, first_backend]
     opened.store.close()
 
 
 @pytest.mark.asyncio
-async def test_switch_persist_published_then_failed_keeps_new_state(
+async def test_switch_persist_raises_reread_new_applies_new(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     context, opened, _first, second = await asyncio.to_thread(
@@ -294,30 +297,134 @@ async def test_switch_persist_published_then_failed_keeps_new_state(
     )
     first_backend = object()
     second_backend = object()
-    loop = SimpleNamespace(backend=first_backend)
-    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
+    loop = _switch_loop(first_backend)
     assert context.manager is not None
-    persist = context.manager.record_account_selection
+    persist = context.manager._write_unlocked
 
     def publish_then_fail(*args: object, **kwargs: object) -> None:
         persist(*args, **kwargs)
         raise OSError("published then failed")
 
-    monkeypatch.setattr(
-        context.manager, "record_account_selection", publish_then_fail
+    monkeypatch.setattr(context.manager, "_write_unlocked", publish_then_fail)
+    await context.switch_active(
+        loop,
+        second,
+        boundary=3,
+        provider="codex",
+        build_backend=lambda _account: second_backend,
     )
-    with pytest.raises(OSError, match="published then failed"):
-        await context.switch_active(
-            loop,
-            second,
-            boundary=3,
-            provider="codex",
-            build_backend=lambda _account: second_backend,
-        )
 
     _assert_switch_state(
         context, second, second_backend, loop, sequence=1, boundary=3
     )
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_switch_persist_raises_reread_fails_marks_unknown_and_blocks_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    first_backend = FakeBackend([])
+    second_backend = FakeBackend([])
+    loop = AgentLoop(first_backend, opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = context.manager
+    loop.session_metadata = context.metadata
+    loop.account_context = context
+    assert context.manager is not None
+
+    monkeypatch.setattr(
+        context.manager,
+        "_write_unlocked",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("persist failed")),
+    )
+    read = context.manager._read
+    reads = 0
+
+    def fail_reread(*args: object, **kwargs: object):
+        nonlocal reads
+        reads += 1
+        if reads >= 2:
+            raise OSError("reread failed")
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr(context.manager, "_read", fail_reread)
+    await context.switch_active(
+        loop,
+        second,
+        boundary=3,
+        provider="codex",
+        build_backend=lambda _account: second_backend,
+    )
+
+    assert context.account_state_unknown
+    events = [
+        event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)
+    ]
+    assert any(
+        event.type is StreamEventType.ACCOUNT_STATE_UNKNOWN for event in events
+    )
+    error = next(event for event in events if event.type is StreamEventType.ERROR)
+    assert error.error is not None and "/accounts" in error.error.message
+    assert first_backend.calls == []
+    assert second_backend.calls == []
+    assert loop.backend is first_backend
+    assert context.snapshot()["codex"] == first
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_account_state_rederives_from_disk_on_next_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, _first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    first_backend = FakeBackend([])
+    second_backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
+    loop = AgentLoop(first_backend, opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = context.manager
+    loop.session_metadata = context.metadata
+    loop.account_context = context
+    assert context.manager is not None
+    persist = context.manager._write_unlocked
+    read = context.manager._read
+    reads = 0
+
+    def publish_then_fail(*args: object, **kwargs: object) -> None:
+        persist(*args, **kwargs)
+        raise OSError("published then failed")
+
+    def fail_once(*args: object, **kwargs: object):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise OSError("reread failed")
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr(context.manager, "_write_unlocked", publish_then_fail)
+    monkeypatch.setattr(context.manager, "_read", fail_once)
+    await context.switch_active(
+        loop,
+        second,
+        boundary=3,
+        provider="codex",
+        build_backend=lambda _account: second_backend,
+    )
+    assert context.account_state_unknown
+
+    events = [
+        event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)
+    ]
+
+    assert any(
+        event.type is StreamEventType.ACCOUNT_STATE_UNKNOWN for event in events
+    )
+    assert len(second_backend.calls) == 1
+    assert not context.account_state_unknown
+    _assert_switch_state(context, second, second_backend, loop, sequence=1, boundary=3)
     opened.store.close()
 
 
@@ -332,17 +439,16 @@ async def test_switch_cancel_during_commit_converges_then_reraises(
     release = threading.Event()
     first_backend = object()
     second_backend = object()
-    loop = SimpleNamespace(backend=first_backend)
-    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
+    loop = _switch_loop(first_backend)
     assert context.manager is not None
-    persist = context.manager.record_account_selection
+    persist = context.manager._write_unlocked
 
     def blocked_persist(*args: object, **kwargs: object) -> None:
         entered.set()
         assert release.wait(5)
         persist(*args, **kwargs)
 
-    monkeypatch.setattr(context.manager, "record_account_selection", blocked_persist)
+    monkeypatch.setattr(context.manager, "_write_unlocked", blocked_persist)
     task = asyncio.create_task(
         context.switch_active(
             loop,
@@ -353,7 +459,7 @@ async def test_switch_cancel_during_commit_converges_then_reraises(
         )
     )
     assert await asyncio.to_thread(entered.wait, 1)
-    assert loop.backend is second_backend
+    assert loop.backend is first_backend
     task.cancel()
     release.set()
     with pytest.raises(asyncio.CancelledError):
@@ -373,8 +479,7 @@ async def test_overlapping_switches_are_serialized(tmp_path: Path) -> None:
     first_entered = threading.Event()
     second_entered = threading.Event()
     release_first = threading.Event()
-    loop = SimpleNamespace(backend=object())
-    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
+    loop = _switch_loop(object())
     backends = {first: object(), second: object()}
 
     def build_backend(account: AccountId) -> object:
@@ -447,7 +552,9 @@ async def test_account_switch_never_replays_transcript(
         context_assembler=SimpleNamespace(token_budget=100_000),
         store=opened.store,
     )
-    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
+    loop.current_backend_state = lambda: loop.backend
+    loop.prepare_backend_state = lambda backend: backend
+    loop.apply_backend_state = lambda backend: setattr(loop, "backend", backend)
     app = SimpleNamespace(
         _accounts_picker=SimpleNamespace(highlighted=second),
         _account_switch_task=None,
@@ -471,7 +578,11 @@ async def test_account_switch_never_replays_transcript(
         idle,
         {"account": str(first)},
     )
-    assert response == {"account": str(first), "replay": False}
+    assert response == {
+        "account": str(first),
+        "replay": False,
+        "account_state": "ready",
+    }
     assert context.snapshot()["codex"] == first
     opened.store.close()
 

@@ -1641,6 +1641,9 @@ def test_scrollback_stream_events_render() -> None:
                 "action": "accounts",
             },
         ),
+        StreamEventType.ACCOUNT_STATE_UNKNOWN: StreamEvent(
+            StreamEventType.ACCOUNT_STATE_UNKNOWN
+        ),
         StreamEventType.TOOL_EXECUTION_START: StreamEvent(
             StreamEventType.TOOL_EXECUTION_START, tool_call=call
         ),
@@ -12256,7 +12259,10 @@ async def test_tui_session_account_switch_runs_store_off_loop() -> None:
         _accounts_picker=SimpleNamespace(highlighted=account),
         _account_switch_task=None,
         loop=SimpleNamespace(
-            account_context=SimpleNamespace(switch_active=checked_switch_active),
+            account_context=SimpleNamespace(
+                switch_active=checked_switch_active,
+                account_state_unknown=False,
+            ),
             store=SimpleNamespace(active_branch_head_sequence=lambda: 0),
             context_assembler=SimpleNamespace(token_budget=100_000),
         ),
@@ -12496,6 +12502,12 @@ def _limit_tui(tmp_path: Path) -> tuple[TUIApp, SessionAccountContext, Conversat
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
     app._presenter.print_unit = Mock()
     return app, context, opened.store
+
+
+def test_tui_renders_account_state_unknown() -> None:
+    rendered = render_event(StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN))
+    assert "account state unknown" in renderable_plain(rendered)
+    assert "/accounts" in renderable_plain(rendered)
 
 
 @pytest.mark.asyncio
