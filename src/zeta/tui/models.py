@@ -12,7 +12,7 @@ import httpx
 
 from ..core.session import env_home
 from ..models.catalog import PROVIDER_MODELS
-from ..providers.anthropic import AnthropicCredentialStore
+from ..providers.factory import credential_store
 
 
 MODEL_CATALOGS = {
@@ -111,7 +111,8 @@ def load_model_catalog(
 
     auth_home = Path(home) if home is not None else env_home()
     try:
-        token_store = AnthropicCredentialStore(auth_home / "anthropic-oauth.json")
+        token_store = credential_store("claude", home=auth_home)
+        assert token_store is not None
         tokens = token_store.read() or token_store.bootstrap()
         if tokens is None or not tokens.is_valid():
             return None

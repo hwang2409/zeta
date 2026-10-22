@@ -12,6 +12,8 @@ import httpx
 import pytest
 
 import zeta.providers.codex as codex_module
+from tests.support.credentials import codex_credentials
+from zeta.accounts import AccountCredentials
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.slash import SlashStatus, _format_status
@@ -32,7 +34,6 @@ from zeta.providers.codex import (
     DEFAULT_CODEX_MODEL,
     CodexAuthError,
     CodexBackend,
-    CodexCredentialStore,
     CodexHTTPError,
     CodexStreamError,
     build_responses_payload,
@@ -596,8 +597,8 @@ def client_for(stream: str):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
-def store_for(path: Path, token: str | None = None) -> CodexCredentialStore:
-    store = CodexCredentialStore(path)
+def store_for(path: Path, token: str | None = None) -> AccountCredentials:
+    store = codex_credentials(path)
     store.save(OAuthTokens(token or access_token(), "refresh-fixture", 4_000_000_000))
     return store
 
@@ -3496,7 +3497,7 @@ def test_extract_account_id_ignores_account_id_outside_access_claim() -> None:
 
 @pytest.mark.asyncio
 async def test_bootstrap_reads_codex_store_without_writing_codex_auth(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     auth_path = tmp_path / "auth.json"
     auth_path.write_text(
@@ -3512,13 +3513,12 @@ async def test_bootstrap_reads_codex_store_without_writing_codex_auth(
         )
     )
     original = auth_path.read_text()
-    store = CodexCredentialStore(
-        tmp_path / "zeta" / "codex.json", codex_auth=auth_path
-    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    store = codex_credentials(tmp_path / "zeta" / "codex.json")
     client = client_for(sse(message_stream()))
     assert await store.access_token(client) == access_token()
     assert auth_path.read_text() == original
-    assert oct((tmp_path / "zeta" / "codex.json").stat().st_mode & 0o777) == "0o600"
+    assert oct(store.path.stat().st_mode & 0o777) == "0o600"
     await client.aclose()
 
 
@@ -3543,19 +3543,12 @@ def test_default_credential_store_honors_isolated_zeta_home(
 
     store = credential_store("codex", home=zeta_home)
     assert store is not None
-    zeta_home.mkdir()
-    store.path.write_text(
-        json.dumps(
-            {
-                "access_token": access_token(),
-                "refresh_token": "zeta-refresh",
-            }
-        )
-    )
+    expected = OAuthTokens(access_token(), "zeta-refresh", 4_000_000_000.0)
+    store.save(expected)
 
-    assert store.path == zeta_home / "codex-oauth.json"
-    assert store.bootstrap() is None
-    assert store.read() is not None
+    assert store.path == zeta_home / "accounts" / "codex" / "default" / "oauth.json"
+    assert store.bootstrap() == expected
+    assert store.read() == expected
 
 
 @pytest.mark.parametrize("codex_home", [None, ""])
@@ -3591,9 +3584,10 @@ def test_default_credential_store_bootstraps_codex_auth_without_zeta_home(
 
 
 def test_bootstrap_requires_refresh_when_jwt_expiry_is_missing_or_past(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     auth_path = tmp_path / "auth.json"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     header, _, signature = access_token().split(".")
     for name, payload in (
         ("missing", {"https://api.openai.com/auth": {"chatgpt_account_id": "a"}}),
@@ -3604,7 +3598,7 @@ def test_bootstrap_requires_refresh_when_jwt_expiry_is_missing_or_past(
         auth_path.write_text(
             json.dumps({"tokens": {"access_token": token, "refresh_token": "refresh"}})
         )
-        store = CodexCredentialStore(tmp_path / f"{name}.json", codex_auth=auth_path)
+        store = codex_credentials(tmp_path / f"{name}.json")
         assert store.bootstrap() is not None
         assert store.bootstrap().expires_at <= 1
 
@@ -3622,7 +3616,7 @@ def _refresh_process(
     async def run() -> None:
         client = httpx.AsyncClient()
         try:
-            token = await CodexCredentialStore(path, token_url=token_url).access_token(client)
+            token = await codex_credentials(path, token_url=token_url).access_token(client)
             results.put(token)
         finally:
             await client.aclose()
@@ -3638,14 +3632,14 @@ def _refresh_lock_probe_process(
     hold: bool,
 ) -> None:
     async def run() -> None:
-        store = CodexCredentialStore(path)
+        store = codex_credentials(path)
         if hold:
-            async with store._async_refresh_lock_file():
+            async with store._async_guard(registry=False):
                 results.put("holding")
                 await asyncio.to_thread(release.wait)
             return
         await asyncio.to_thread(start.wait)
-        lock = store._async_refresh_lock_file()
+        lock = store._async_guard(registry=False)
         try:
             await asyncio.wait_for(lock.__aenter__(), timeout=2)
         except TimeoutError:
@@ -3654,7 +3648,7 @@ def _refresh_lock_probe_process(
             results.put("unexpectedly acquired")
             await lock.__aexit__(None, None, None)
         await asyncio.to_thread(release.wait)
-        async with store._async_refresh_lock_file():
+        async with store._async_guard(registry=False):
             results.put("acquired")
 
     asyncio.run(run())
@@ -3727,7 +3721,7 @@ def test_expired_codex_token_refreshes_once_across_two_processes(tmp_path: Path)
     thread.start()
     try:
         path = tmp_path / "codex.json"
-        CodexCredentialStore(path).save(OAuthTokens(access_token(), "refresh", 1))
+        codex_credentials(path).save(OAuthTokens(access_token(), "refresh", 1))
         context = multiprocessing.get_context("spawn")
         results = context.Queue()
         ready = context.Queue()
@@ -3792,7 +3786,7 @@ async def test_expired_codex_token_refreshes_under_shared_store_lock(tmp_path: P
             request=request,
         )
 
-    store = CodexCredentialStore(
+    store = codex_credentials(
         tmp_path / "codex.json", token_url="https://test.invalid/token"
     )
     store.save(OAuthTokens(access_token(), "rotating-refresh", 1))
@@ -3819,7 +3813,7 @@ async def test_codex_refresh_keeps_existing_token_when_response_does_not_rotate(
             request=request,
         )
 
-    store = CodexCredentialStore(
+    store = codex_credentials(
         tmp_path / "codex.json", token_url="https://test.invalid/token"
     )
     store.save(OAuthTokens(access_token(), "non-rotating-refresh", 1))

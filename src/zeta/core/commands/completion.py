@@ -14,7 +14,7 @@ _zeta() {
     local context state line command_index command_name token
     local -a commands session_verbs automation_verbs project_verbs project_index_verbs webhook_verbs mcp_verbs original_words
     typeset -A opt_args
-    commands=(login serve session project inbox automation mcp stalls completion)
+    commands=(login accounts serve session project inbox automation mcp stalls completion)
     session_verbs=(list rename delete export push pull)
     automation_verbs=(list show approve disable import daemon webhook)
     project_verbs=(create init discover list show memory index)
@@ -84,7 +84,10 @@ _zeta() {
         argument)
             case $command_name in
                 login)
-                    _arguments '--provider=[OAuth provider]:provider:(anthropic codex)'
+                    _arguments '--account=[account name]:account:' '--replace[replace existing account]' '1:provider:(anthropic codex)'
+                    ;;
+                accounts)
+                    _arguments '--json[print JSON]' '1:action:(default)' '2:account:'
                     ;;
                 serve)
                     _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]' '--auto-memory[enable automatic project memory]' '--no-auto-memory[disable automatic project memory]'
@@ -218,7 +221,10 @@ def bash_script() -> str:
 
     case "$command" in
         login)
-            COMPREPLY=( $(compgen -W "--provider" -- "$cur") )
+            COMPREPLY=( $(compgen -W "anthropic codex --account --replace" -- "$cur") )
+            ;;
+        accounts)
+            COMPREPLY=( $(compgen -W "--json default" -- "$cur") )
             ;;
         serve)
             COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd --tools --disallowed-tools --require-tools --allow-hooks --auto-memory --no-auto-memory" -- "$cur") )

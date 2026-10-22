@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from ..accounts import AccountCredentials, AccountId, AccountStore
+from ..codex import CodexCredentialDriver
 from ..config.settings import load_settings
 from ..core.session import env_home
 from ..core.slash import budget_for_model, effective_budget_for_model
@@ -22,10 +24,9 @@ from .anthropic import (
     AnthropicAuthError,
     AnthropicBackend,
     AnthropicCredential,
-    AnthropicCredentialStore,
+    AnthropicCredentialDriver,
 )
-from .auth import OAuthCredentialStore
-from .codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
+from .codex import DEFAULT_CODEX_MODEL, CodexBackend
 from .ollama import DEFAULT_OLLAMA_MODEL, OLLAMA_API_URL, OllamaBackend
 from .transport import DEFAULT_STREAM_STALL_RETRIES, DEFAULT_STREAM_STALL_SECONDS
 
@@ -42,15 +43,21 @@ def credential_store(
     provider: str,
     *,
     home: str | Path | None = None,
-) -> OAuthCredentialStore | None:
-    """Return the provider's OAuth store, or None when it needs no credentials."""
+    account: AccountId | None = None,
+) -> AccountCredentials | None:
+    """Return the account credential adapter, or None for credential-free providers."""
 
+    if provider not in {"claude", "codex"}:
+        return None
     auth_home = Path(home) if home is not None else env_home()
-    if provider == "claude":
-        return AnthropicCredentialStore(auth_home / "anthropic-oauth.json")
-    if provider == "codex":
-        return CodexCredentialStore(auth_home / "codex-oauth.json")
-    return None
+    registry = AccountStore(auth_home)
+    selected = registry.resolve_account(provider, account)
+    driver = (
+        AnthropicCredentialDriver()
+        if provider == "claude"
+        else CodexCredentialDriver()
+    )
+    return AccountCredentials(registry, selected, driver)
 
 
 def _anthropic_credential(auth_home: Path) -> AnthropicCredential:
@@ -62,7 +69,9 @@ def _anthropic_credential(auth_home: Path) -> AnthropicCredential:
     """
 
     if os.environ.get(API_KEY_OPT_IN_VAR) != "1":
-        return AnthropicCredentialStore(auth_home / "anthropic-oauth.json")
+        credential = credential_store("claude", home=auth_home)
+        assert credential is not None
+        return credential
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise AnthropicAuthError(
@@ -107,7 +116,8 @@ def build_backend(
             **stall_kwargs,
         ), selected_model
     if provider == "codex":
-        credential = CodexCredentialStore(auth_home / "codex-oauth.json")
+        credential = credential_store("codex", home=auth_home)
+        assert credential is not None
         if require_credentials:
             _require_credentials(credential)
         selected_model = model or DEFAULT_CODEX_MODEL
@@ -140,11 +150,11 @@ def build_backend(
 
 
 def _require_credentials(
-    credential: AnthropicCredential | OAuthCredentialStore,
+    credential: AnthropicCredential | AccountCredentials,
 ) -> None:
     """Check local login availability without refreshing or sending a request."""
     if (
-        isinstance(credential, OAuthCredentialStore)
+        isinstance(credential, AccountCredentials)
         and credential.read() is None
         and credential.bootstrap() is None
     ):

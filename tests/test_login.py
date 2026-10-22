@@ -25,12 +25,11 @@ from zeta.cli.main import build_parser
 from zeta.core import login_flow
 from zeta.core.login_flow import LoginError, LoginProvider, run_login
 from zeta.providers import login as provider_login
-from zeta.providers.anthropic import AnthropicCredentialStore
 from zeta.providers.auth import OAuthTokens
-from zeta.providers.codex import CodexCredentialStore
 from zeta.providers.codex import (
     build_authorization_url as build_codex_authorization_url,
 )
+from zeta.providers.factory import credential_store
 
 
 @dataclass
@@ -112,7 +111,6 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
         return expected
 
     if provider == "anthropic":
-        store = AnthropicCredentialStore(tmp_path / "anthropic-oauth.json")
         real_builder = provider_login.build_anthropic_authorization_url
 
         def build_url_for_anthropic(
@@ -126,7 +124,6 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
         monkeypatch.setattr(provider_login, "build_anthropic_authorization_url", build_url_for_anthropic)
         monkeypatch.setattr(provider_login, "exchange_anthropic_authorization_code", exchange)
     else:
-        store = CodexCredentialStore(tmp_path / "codex-oauth.json")
         real_builder = provider_login.build_codex_authorization_url
 
         def build_url_for_codex(state: str, challenge: str, redirect_uri: str) -> str:
@@ -151,6 +148,11 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
         assert result is None
     else:
         assert result == "account"
+    store = credential_store(
+        "claude" if provider == "anthropic" else provider,
+        home=tmp_path,
+    )
+    assert store is not None
     assert store.read() == expected
     expected_redirect_uri = {
         "anthropic": "http://localhost:53692/callback",

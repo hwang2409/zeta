@@ -11,6 +11,7 @@ import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from ..accounts import AccountError, AccountId, AccountStore
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.login_flow import run_login
@@ -262,11 +263,19 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command")
     login_parser = commands.add_parser("login", help="log in to an OAuth provider")
     login_parser.add_argument(
-        "--provider",
+        "provider",
         choices=("anthropic", "codex"),
+        nargs="?",
         default="anthropic",
-        help="OAuth provider (default: anthropic)",
     )
+    login_parser.add_argument("--account", default="default")
+    login_parser.add_argument("--replace", action="store_true")
+    accounts_parser = commands.add_parser(
+        "accounts", help="manage subscription accounts"
+    )
+    accounts_parser.add_argument("action", nargs="?", choices=("default",))
+    accounts_parser.add_argument("account", nargs="?")
+    accounts_parser.add_argument("--json", action="store_true")
     from .inbox import add_subcommand as _add_inbox_subcommand
     from .project import add_subcommand as _add_project_subcommand
     from .session import add_subcommand as _add_session_subcommand
@@ -374,10 +383,69 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_login(provider: str) -> str | None:
-    return asyncio.run(
-        run_login(build_login_provider(provider, env_home()), pkce_values)
-    )
+def _run_login(
+    provider: str, account: str = "default", replace_existing: bool = False
+) -> str | None:
+    home = env_home()
+    store = AccountStore(home)
+    account_id = AccountId(provider, account)
+    with store.provider_login_lock(provider):
+        store.migrate()
+        if store.contains(account_id) and not replace_existing:
+            raise AccountError(f"account {account_id} already exists; use --replace")
+        return asyncio.run(
+            run_login(build_login_provider(provider, home, account), pkce_values)
+        )
+
+
+def _handle_login(args: argparse.Namespace) -> int:
+    try:
+        replace_existing = args.replace
+        account = AccountId(args.provider, args.account)
+        store = AccountStore(env_home())
+        store.migrate()
+        if store.contains(account) and not replace_existing:
+            if not sys.stdin.isatty() or input(
+                f"replace {account}? [y/N] "
+            ).lower() not in {"y", "yes"}:
+                raise AccountError(
+                    f"account {account} already exists; use --replace"
+                )
+            replace_existing = True
+        handle = (
+            _run_login(args.provider)
+            if args.account == "default" and not replace_existing
+            else _run_login(args.provider, args.account, replace_existing)
+        )
+    except KeyboardInterrupt:
+        print("login cancelled", file=sys.stderr)
+        return 1
+    except (AccountError, ValueError) as exc:
+        print(f"login failed: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        print("login failed", file=sys.stderr)
+        return 1
+    print(f"logged in as {handle}" if handle else "ok")
+    return 0
+
+
+def _handle_accounts(args: argparse.Namespace) -> int:
+    store = AccountStore(env_home())
+    try:
+        store.migrate()
+        if args.action == "default":
+            if not args.account or ":" not in args.account:
+                raise AccountError("default requires provider:name")
+            provider, name = args.account.split(":", 1)
+            store.set_default(AccountId(provider, name))
+        else:
+            accounts = [str(item) for item in store.list()]
+            print(json.dumps(accounts) if args.json else "\n".join(accounts))
+        return 0
+    except (AccountError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 def _cleanup_ephemeral(app: object) -> None:
@@ -425,16 +493,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "login":
-        try:
-            handle = _run_login(args.provider)
-        except KeyboardInterrupt:
-            print("login cancelled", file=sys.stderr)
-            return 1
-        except Exception as exc:
-            print(f"login failed: {exc}", file=sys.stderr)
-            return 1
-        print(f"logged in as {handle}" if handle else "ok")
-        return 0
+        return _handle_login(args)
+    if args.command == "accounts":
+        return _handle_accounts(args)
     if args.command == "mcp":
         from ..core.project_context import discover_repo_root
         from ..mcp.management import MCPManagementError, MCPManagementService

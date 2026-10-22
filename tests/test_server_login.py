@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import threading
 from dataclasses import replace
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
 from tests.test_server import _close, _connect, _request
+from zeta.accounts import AccountStore
 from zeta.core.login_flow import LoginPortInUseError
 from zeta.providers import anthropic
 from zeta.providers import login as providers
@@ -176,6 +179,169 @@ async def test_login_failures_release_listener_and_allow_retry(tmp_path, monkeyp
             assert retry["state"] == "pending"
     finally:
         await _close(server, writer)
+
+
+async def test_serve_login_publication_does_not_block_event_loop(
+    tmp_path, monkeypatch
+):
+    expected = OAuthTokens("access", "refresh", 4_000_000_000)
+    callback_ran = threading.Event()
+    exchange_started = threading.Event()
+    release_lock = threading.Event()
+    lock_ready = threading.Event()
+    callback_before_release: list[bool] = []
+    captured = {}
+
+    def build(state, _challenge, redirect):
+        captured.update(state=state, redirect=redirect)
+        return "https://authorize.invalid/"
+
+    async def exchange(*_args):
+        exchange_started.set()
+        asyncio.get_running_loop().call_soon(callback_ran.set)
+        return expected
+
+    monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
+    monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
+    provider = replace(
+        providers.build_login_provider("anthropic", tmp_path / "zeta"),
+        callback_port=0,
+    )
+    monkeypatch.setattr(server_login, "build_login_provider", lambda *_args: provider)
+    monkeypatch.setattr(server_login, "LOGIN_PUBLICATION_TIMEOUT_SECONDS", 0.05)
+
+    def hold_lifecycle_lock() -> None:
+        with provider.credential_store.store.lifecycle_guard(
+            provider.credential_store.account
+        ):
+            lock_ready.set()
+            if not exchange_started.wait(timeout=5):
+                callback_before_release.append(False)
+                return
+            callback_before_release.append(callback_ran.wait(timeout=1))
+            if callback_before_release[-1]:
+                release_lock.wait()
+
+    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder.start()
+    assert lock_ready.wait(timeout=5)
+    manager = Logins(tmp_path / "zeta")
+    url = asyncio.get_running_loop().create_future()
+    task = asyncio.create_task(manager._run("claude", url))
+    try:
+        await asyncio.wait_for(url, 3)
+        assert await callback(
+            captured["redirect"], {"code": "synthetic", "state": captured["state"]}
+        ) == 200
+        result = await asyncio.wait_for(task, 3)
+    finally:
+        release_lock.set()
+        holder.join(timeout=5)
+
+    assert not holder.is_alive()
+    assert callback_before_release == [True]
+    assert result == {
+        "state": "failed",
+        "error": {
+            "code": "login_lock_timeout",
+            "message": "Sign-in could not save credentials because the account is busy. Please try again.",
+        },
+    }
+
+
+async def test_cancelled_serve_login_never_publishes_and_releases_locks(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "zeta"
+    old = OAuthTokens("old-access", "old-refresh", 4_000_000_000)
+    new = OAuthTokens("new-access", "new-refresh", 4_000_000_000)
+    exchanged = iter((old, new))
+    captured: list[dict[str, str]] = []
+    save_entered = threading.Event()
+    save_finished = threading.Event()
+    lock_ready = threading.Event()
+    release_lock = threading.Event()
+    published: list[OAuthTokens] = []
+
+    def build(state, _challenge, redirect):
+        captured.append({"state": state, "redirect": redirect})
+        return "https://authorize.invalid/"
+
+    async def exchange(*_args):
+        return next(exchanged)
+
+    provider = replace(
+        providers.build_login_provider("anthropic", home),
+        callback_port=0,
+        build_authorization_url=build,
+        exchange_authorization_code=exchange,
+    )
+    real_save = provider.credential_store.save
+    real_publish = provider.credential_store._publish
+
+    def observed_save(*args, **kwargs):
+        save_entered.set()
+        try:
+            return real_save(*args, **kwargs)
+        finally:
+            save_finished.set()
+
+    def observed_publish(home_fd, value):
+        published.append(value)
+        return real_publish(home_fd, value)
+
+    monkeypatch.setattr(provider.credential_store, "save", observed_save)
+    monkeypatch.setattr(provider.credential_store, "_publish", observed_publish)
+    monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
+    monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
+    monkeypatch.setattr(server_login, "build_login_provider", lambda *_args: provider)
+
+    def hold_lifecycle_lock() -> None:
+        with provider.credential_store.store.lifecycle_guard(
+            provider.credential_store.account
+        ):
+            lock_ready.set()
+            release_lock.wait()
+
+    fd_before = len(os.listdir("/dev/fd"))
+    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder.start()
+    assert lock_ready.wait(timeout=5)
+    manager = Logins(home)
+    first_url = asyncio.get_running_loop().create_future()
+    first = asyncio.create_task(manager._run("claude", first_url))
+    try:
+        await asyncio.wait_for(first_url, 3)
+        assert await callback(
+            captured[0]["redirect"],
+            {"code": "first", "state": captured[0]["state"]},
+        ) == 200
+        assert await asyncio.to_thread(save_entered.wait, 5)
+        first.cancel()
+        assert not first.done()
+        release_lock.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert await asyncio.to_thread(save_finished.wait, 5)
+
+        second_url = asyncio.get_running_loop().create_future()
+        second = asyncio.create_task(manager._run("claude", second_url))
+        await asyncio.wait_for(second_url, 3)
+        assert await callback(
+            captured[1]["redirect"],
+            {"code": "second", "state": captured[1]["state"]},
+        ) == 200
+        assert await asyncio.wait_for(second, 3) == {"state": "succeeded"}
+    finally:
+        release_lock.set()
+        holder.join(timeout=5)
+
+    assert not holder.is_alive()
+    assert published == [new]
+    assert provider.credential_store.read() == new
+    with AccountStore(home).provider_login_lock("anthropic"):
+        pass
+    assert len(os.listdir("/dev/fd")) == fd_before
 
 
 async def test_login_port_conflict_has_specific_failure(tmp_path, monkeypatch):

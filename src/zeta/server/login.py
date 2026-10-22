@@ -7,12 +7,14 @@ from pathlib import Path
 
 import httpx
 
+from ..accounts import AccountCredentialLockTimeoutError, AccountStore
 from ..core.login_flow import LoginError, LoginPortInUseError, run_login
 from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
 from .protocol import ProtocolError
 
 REQUESTS = ["login_start", "login_status", "login_cancel", "login_providers"]
+LOGIN_PUBLICATION_TIMEOUT_SECONDS = 60.0
 
 
 def failure(code: str, message: str) -> dict:
@@ -70,18 +72,39 @@ class Logins:
         return task.result() if task.done() else {"state": "pending"}
 
     async def _run(self, provider: str, url: asyncio.Future[str]) -> dict:
+        login_provider = "anthropic" if provider == "claude" else provider
+        lock = AccountStore(self.home).provider_login_lock(login_provider)
+        locked = False
+        acquisition = asyncio.create_task(asyncio.to_thread(lock.__enter__))
         try:
+            try:
+                await asyncio.shield(acquisition)
+                locked = True
+            except asyncio.CancelledError:
+                result = (
+                    await asyncio.shield(
+                        asyncio.gather(acquisition, return_exceptions=True)
+                    )
+                )[0]
+                locked = not isinstance(result, BaseException)
+                raise
             async with asyncio.timeout(self.timeout):
                 await run_login(
-                    build_login_provider("anthropic" if provider == "claude" else provider, self.home),
+                    build_login_provider(login_provider, self.home),
                     pkce_values,
                     # The outer deadline covers the exchange as well as the callback.
                     timeout_seconds=self.timeout + 1,
                     on_authorization_url=url.set_result,
+                    publication_timeout_seconds=LOGIN_PUBLICATION_TIMEOUT_SECONDS,
                 )
             return {"state": "succeeded"}
         except TimeoutError:
             return failure("login_timeout", "Sign-in timed out. Log in again to retry.")
+        except AccountCredentialLockTimeoutError:
+            return failure(
+                "login_lock_timeout",
+                "Sign-in could not save credentials because the account is busy. Please try again.",
+            )
         except LoginPortInUseError as exc:
             provider_label = exc.provider.capitalize()
             return failure(
@@ -95,6 +118,11 @@ class Logins:
             # Provider responses can contain tokens or callback codes. Do not
             # forward exception text to the wire or transcript.
             return failure("login_failed", "Could not complete sign-in. Please try again.")
+        finally:
+            if locked:
+                await asyncio.shield(
+                    asyncio.to_thread(lock.__exit__, None, None, None)
+                )
 
     async def close(self) -> None:
         for task in self.tasks.values():

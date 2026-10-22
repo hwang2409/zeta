@@ -17,8 +17,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from ..core.session import env_home
-from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
+from .auth import OAuthTokens, error_body_excerpt
 from .anthropic_payload import (
     ANTHROPIC_MAX_BASE64_CHARACTERS,
     ANTHROPIC_MAX_IMAGE_DIMENSION,
@@ -124,7 +123,7 @@ def build_billing_header_value(message_text: str) -> str | None:
 
 def _oauth_compat_enabled(credential: AnthropicCredential) -> bool:
     return (
-        isinstance(credential, AnthropicCredentialStore)
+        not isinstance(credential, AnthropicApiKeyCredential)
         and os.environ.get("ZETA_ANTHROPIC_OAUTH_COMPAT") == "1"
     )
 
@@ -191,7 +190,7 @@ def _extract_claude_tokens(value: Any) -> OAuthTokens:
 class AnthropicCredential(Protocol):
     """What AnthropicBackend needs from a Claude credential source.
 
-    Subscription OAuth (AnthropicCredentialStore) and opt-in API-key auth
+    Subscription OAuth and opt-in API-key auth
     (AnthropicApiKeyCredential) both implement this so the request path stays
     ignorant of which one it was handed.
     """
@@ -205,35 +204,21 @@ class AnthropicCredential(Protocol):
     def beta_header(self) -> str: ...
 
 
-class AnthropicCredentialStore(OAuthCredentialStore):
-    """Owns zeta's OAuth file and reads Claude credentials only for bootstrap."""
-
-    def __init__(
-        self,
-        path: str | Path | None = None,
-        *,
-        claude_credentials: str | Path | None = None,
-        token_url: str = TOKEN_URL,
-    ) -> None:
-        super().__init__(
-            path or env_home() / "anthropic-oauth.json",
-            token_url=token_url,
-        )
-        self.claude_credentials = (
-            Path(claude_credentials) if claude_credentials is not None else None
-        )
+class AnthropicCredentialDriver:
+    """Read Claude bootstrap credentials and implement provider OAuth behavior."""
 
     auth_error_type = AnthropicAuthError
     http_error_type = AnthropicHTTPError
     provider_label = "Claude"
 
+    def login_required_error(self, message: str) -> AnthropicAuthError:
+        return AnthropicAuthError(message)
+
+    def __init__(self, *, token_url: str = TOKEN_URL) -> None:
+        self.token_url = token_url
+
     def bootstrap(self) -> OAuthTokens | None:
-        candidates = (
-            (self.claude_credentials,)
-            if self.claude_credentials is not None
-            else _credential_candidates()
-        )
-        for candidate in candidates:
+        for candidate in _credential_candidates():
             if not candidate.exists():
                 continue
             try:
@@ -458,7 +443,12 @@ class AnthropicBackend(CompletionBackend):
         self.max_tokens = max_tokens
         self.thinking_budget = thinking_budget
         self.base_url = base_url.rstrip("/")
-        self.token_store = token_store or AnthropicCredentialStore()
+        if token_store is None:
+            from .factory import credential_store
+
+            token_store = credential_store("claude")
+            assert token_store is not None
+        self.token_store = token_store
         self.client = client
         self.diagnostics_path = (
             Path(diagnostics_path)

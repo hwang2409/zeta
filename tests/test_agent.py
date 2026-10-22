@@ -5049,7 +5049,7 @@ class _ValidTokens:
         return True
 
 
-class _FakeCredentialStore:
+class _FakeCredentials:
     """Stand in for an OAuth store without touching the real credential files."""
 
     def __init__(self, tokens: object | None) -> None:
@@ -5080,7 +5080,7 @@ def _stub_backend_factory(
     monkeypatch.setattr("zeta.agent.runner.build_backend", build)
     monkeypatch.setattr(
         "zeta.agent.runner.credential_store",
-        lambda provider, **kwargs: _FakeCredentialStore(
+        lambda provider, **kwargs: _FakeCredentials(
             _ValidTokens() if tokens is None else tokens
         ),
     )
@@ -5356,12 +5356,12 @@ def test_resolve_child_backend_accepts_bootstrapped_login(
         parent, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()
     )
 
-    class BootstrapStore(_FakeCredentialStore):
+    class BootstrapCredentials(_FakeCredentials):
         def bootstrap(self) -> object:
             return _ValidTokens()
 
     monkeypatch.setattr(
-        "zeta.agent.runner.credential_store", lambda provider: BootstrapStore(None)
+        "zeta.agent.runner.credential_store", lambda provider: BootstrapCredentials(None)
     )
     monkeypatch.setattr(
         "zeta.agent.runner.build_backend",
@@ -5378,7 +5378,7 @@ async def test_agent_reports_a_missing_provider_login(
     _stub_backend_factory(monkeypatch, child_backend, tokens=None)
     monkeypatch.setattr(
         "zeta.agent.runner.credential_store",
-        lambda provider, **kwargs: _FakeCredentialStore(None),
+        lambda provider, **kwargs: _FakeCredentials(None),
     )
     backend = FakeBackend([ScriptedTurn(tool_calls=[_model_agent_call()])])
     store = ConversationStore(tmp_path)

@@ -3397,14 +3397,16 @@ async def test_cross_provider_settings_reject_mid_turn_then_apply_when_idle(tmp_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", ["claude", "codex"])
 async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, monkeypatch, target):
-    from zeta.providers.anthropic import AnthropicCredentialStore
+    from zeta.accounts import AccountCredentials
+    from zeta.codex import CodexCredentialDriver
+    from zeta.providers.anthropic import AnthropicCredentialDriver
     from zeta.providers.auth import OAuthTokens
-    from zeta.providers.codex import CodexCredentialStore
+    from zeta.providers.factory import credential_store
 
     monkeypatch.delenv("ZETA_ALLOW_API_KEY", raising=False)
     monkeypatch.delenv("ZETA_TEST_SCRIPTED_PROVIDER")
-    monkeypatch.setattr(AnthropicCredentialStore, "bootstrap", lambda self: None)
-    monkeypatch.setattr(CodexCredentialStore, "bootstrap", lambda self: None)
+    monkeypatch.setattr(AnthropicCredentialDriver, "bootstrap", lambda self: None)
+    monkeypatch.setattr(CodexCredentialDriver, "bootstrap", lambda self: None)
     source, source_model, model = ("claude", "claude-sonnet-4-6", "gpt-5.4") if target == "codex" else ("codex", "gpt-5.4", "claude-sonnet-4-6")
     server = ZetaServer(home=tmp_path, port=0, provider=source, model=source_model)
     reader, writer = await _connect(server)
@@ -3422,16 +3424,16 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, mo
         assert runtime.metadata.to_dict() == before
         assert runtime.loop.backend is backend
         assert "result" in (await _request(reader, writer, 4, "status"))[-1]
-        credential_type = AnthropicCredentialStore if target == "claude" else CodexCredentialStore
-        credential_path = "anthropic-oauth.json" if target == "claude" else "codex-oauth.json"
-        credential_type(tmp_path / credential_path).save(OAuthTokens("test-access", "test-refresh", 4_000_000_000))
+        credential = credential_store(target, home=tmp_path)
+        assert credential is not None
+        credential.save(OAuthTokens("test-access", "test-refresh", 4_000_000_000))
         response = (await _request(reader, writer, 5, "set_settings", {
             "session_id": runtime.session_id, "model": model, "approval_mode": "deny",
         }))[-1]
         assert response["result"] == {"model": model, "approval_mode": "deny"}
         assert runtime.provider == target
         assert runtime.loop.backend is not backend
-        assert isinstance(runtime.loop.backend.token_store, credential_type)
+        assert isinstance(runtime.loop.backend.token_store, AccountCredentials)
     finally:
         await _close(server, writer)
 

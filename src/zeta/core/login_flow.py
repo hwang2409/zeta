@@ -20,10 +20,16 @@ import httpx
 TokenT = TypeVar("TokenT")
 
 
-class CredentialStore(Protocol[TokenT]):
+class CredentialSink(Protocol[TokenT]):
     """The part of a provider credential store used by login."""
 
-    def save(self, tokens: TokenT) -> None:
+    def save(
+        self,
+        tokens: TokenT,
+        *,
+        lock_timeout: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         """Persist tokens."""
 
 
@@ -43,7 +49,7 @@ class LoginProvider(Generic[TokenT]):
     callback_path: str
     build_authorization_url: BuildAuthorizationURL
     exchange_authorization_code: ExchangeAuthorizationCode[TokenT]
-    credential_store: CredentialStore[TokenT]
+    credential_store: CredentialSink[TokenT]
     token_handle: TokenHandle[TokenT]
 
 
@@ -169,6 +175,7 @@ async def run_login(
     timeout_seconds: float = 300,
     output: TextIO | None = None,
     on_authorization_url: Callable[[str], None] | None = None,
+    publication_timeout_seconds: float | None = None,
 ) -> str | None:
     """Run one provider login and return its optional account handle."""
 
@@ -223,7 +230,26 @@ async def run_login(
                 verifier,
                 redirect_uri,
             )
-        provider.credential_store.save(tokens)
+        if publication_timeout_seconds is None:
+            provider.credential_store.save(tokens)
+        else:
+            cancel_publication = threading.Event()
+            publication = asyncio.create_task(
+                asyncio.to_thread(
+                    provider.credential_store.save,
+                    tokens,
+                    lock_timeout=publication_timeout_seconds,
+                    cancel_event=cancel_publication,
+                )
+            )
+            try:
+                await asyncio.shield(publication)
+            except asyncio.CancelledError:
+                cancel_publication.set()
+                await asyncio.shield(
+                    asyncio.gather(publication, return_exceptions=True)
+                )
+                raise
         return provider.token_handle(tokens)
     finally:
         # Cancellation can arrive after exchange, while shutdown is running.
