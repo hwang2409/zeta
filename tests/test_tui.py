@@ -487,7 +487,7 @@ async def _background_event_transcript_count(
 
             app._print = fail_output
             app._print_unit = fail_output
-        pipe.send_text("\x04")
+        app.request_exit()
         await running
 
     resumed = ""
@@ -556,6 +556,32 @@ async def _background_event_transcript_count(
         )
     visible = terminal + "\n" + resumed if event == "session_shutdown" else combined
     return visible.count(needle), visible
+
+
+@pytest.mark.asyncio
+async def test_request_exit_wakes_active_full_screen_prompt(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path),
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+        ),
+        provider="codex",
+        model="offline",
+    )
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(input=pipe, output=DummyOutput())
+        running = asyncio.create_task(app.run(session))
+        await wait_until(lambda: app._input_loop_active)
+        app.request_exit()
+        try:
+            assert session.app.future is not None and session.app.future.done()
+        finally:
+            if session.app.future is not None and not session.app.future.done():
+                session.app.exit(exception=EOFError())
+            await running
 
 
 @pytest.mark.asyncio

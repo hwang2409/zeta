@@ -417,6 +417,11 @@ class CheckpointTranscriptMixin:
     def request_exit(self) -> None:
         self._exit_requested = True
         self.abort_active()
+        session = self._active_session
+        if session is not None:
+            future = session.app.future
+            if future is not None and not future.done():
+                session.app.exit(exception=EOFError())
 
     def _begin_startup_replay(self) -> None:
         """Gate presenter mutations while the durable transcript is rebuilt."""
