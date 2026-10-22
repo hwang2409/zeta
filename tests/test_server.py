@@ -5846,7 +5846,11 @@ async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
                 {"session_id": sid, "account": "codex:second"},
             )
         )[-1]["result"]
-        assert response == {"account": "codex:second", "replay": False}
+        assert response == {
+            "account": "codex:second",
+            "replay": False,
+            "account_state": "ready",
+        }
         assert (
             await asyncio.to_thread(
                 server.runtime.loop.account_context.resolve, "codex"
@@ -5956,24 +5960,26 @@ async def test_serve_shutdown_with_switch_lock_held_exits_bounded(
     assert server.runtime.opened is not None
     manager = server.runtime.manager
     lock_held = threading.Event()
-    persist_entered = threading.Event()
+    commit_entered = threading.Event()
     release = threading.Event()
-    persist = manager.record_account_selection
-
-    def observed_persist(*args: object, **kwargs: object) -> None:
-        persist_entered.set()
-        persist(*args, **kwargs)
-
-    monkeypatch.setattr(manager, "record_account_selection", observed_persist)
+    metadata_lock = manager._metadata_lock
 
     def hold_metadata_lock() -> None:
-        with manager._metadata_lock(server.runtime.opened.metadata.session_id):
+        with metadata_lock(server.runtime.opened.metadata.session_id):
             lock_held.set()
             assert release.wait(5)
 
     holder = threading.Thread(target=hold_metadata_lock)
     holder.start()
     assert await asyncio.to_thread(lock_held.wait, 1)
+
+    @contextmanager
+    def observed_metadata_lock(*args: object, **kwargs: object):
+        commit_entered.set()
+        with metadata_lock(*args, **kwargs) as directory_fd:
+            yield directory_fd
+
+    monkeypatch.setattr(manager, "_metadata_lock", observed_metadata_lock)
     request_task = asyncio.create_task(
         _request(
             reader,
@@ -5984,7 +5990,7 @@ async def test_serve_shutdown_with_switch_lock_held_exits_bounded(
         )
     )
     try:
-        assert await asyncio.to_thread(persist_entered.wait, 1)
+        assert await asyncio.to_thread(commit_entered.wait, 1)
         client = server._client
         assert client is not None and client._account_switch_task is not None
         await asyncio.wait_for(server.close(), 1)

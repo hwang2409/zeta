@@ -12201,28 +12201,30 @@ async def test_tui_shutdown_with_switch_lock_held_exits_bounded(
         lambda *_args, **_kwargs: (object(), "offline"),
     )
     lock_held = threading.Event()
-    persist_entered = threading.Event()
+    commit_entered = threading.Event()
     release = threading.Event()
-    persist = manager.record_account_selection
-
-    def observed_persist(*args: object, **kwargs: object) -> None:
-        persist_entered.set()
-        persist(*args, **kwargs)
-
-    monkeypatch.setattr(manager, "record_account_selection", observed_persist)
+    metadata_lock = manager._metadata_lock
 
     def hold_metadata_lock() -> None:
-        with manager._metadata_lock(opened.metadata.session_id):
+        with metadata_lock(opened.metadata.session_id):
             lock_held.set()
             assert release.wait(5)
 
     holder = threading.Thread(target=hold_metadata_lock)
     holder.start()
     assert await asyncio.to_thread(lock_held.wait, 1)
+
+    @contextmanager
+    def observed_metadata_lock(*args: object, **kwargs: object):
+        commit_entered.set()
+        with metadata_lock(*args, **kwargs) as directory_fd:
+            yield directory_fd
+
+    monkeypatch.setattr(manager, "_metadata_lock", observed_metadata_lock)
     task = app.accounts_picker_select()
     assert task is not None
     try:
-        assert await asyncio.to_thread(persist_entered.wait, 1)
+        assert await asyncio.to_thread(commit_entered.wait, 1)
         await asyncio.wait_for(app.close(), 1)
         assert task.done()
     finally:
