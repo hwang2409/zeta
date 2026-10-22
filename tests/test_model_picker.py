@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit import PromptSession
@@ -51,6 +52,10 @@ def _plain(panel: Panel) -> str:
     return output.getvalue()
 
 
+async def _accept_model_change(model: str) -> SimpleNamespace:
+    return SimpleNamespace(model=model)
+
+
 def _app(
     tmp_path: Path,
     *,
@@ -68,6 +73,7 @@ def _app(
         ),
         provider=provider,
         model=model,
+        on_model_change=_accept_model_change,
         console=Console(file=output, force_terminal=False, width=100),
         history_path=tmp_path / "history",
         model_catalog_loader=loader or (lambda provider: None),
@@ -80,7 +86,9 @@ def _app(
 def test_known_models_merges_static_table_and_live_catalog() -> None:
     merged = known_models("claude", frozenset({"claude-opus-4-1-20250805"}))
 
-    assert merged == tuple(sorted({*PROVIDER_MODELS["claude"], "claude-opus-4-1-20250805"}))
+    assert merged == tuple(
+        sorted({*PROVIDER_MODELS["claude"], "claude-opus-4-1-20250805"})
+    )
     assert known_models("codex") == tuple(sorted(PROVIDER_MODELS["codex"]))
     assert known_models("ollama") == ("qwen3:4b", "qwen3:4b-instruct")
 
@@ -91,12 +99,18 @@ def test_match_models_is_a_case_insensitive_substring_filter() -> None:
     assert match_models("nope", known_models("claude")) == ()
 
 
-def test_model_without_arguments_opens_a_picker_on_the_current_model(
+@pytest.mark.asyncio
+async def test_model_without_arguments_opens_a_picker_on_the_current_model(
     tmp_path: Path,
 ) -> None:
     app, output = _app(tmp_path)
 
-    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model") == ""
+    assert (
+        await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+            app, "/model"
+        )
+        == ""
+    )
 
     picker = app._model_picker
     assert picker is not None
@@ -112,10 +126,18 @@ def test_model_without_arguments_opens_a_picker_on_the_current_model(
     assert "enter select · esc cancel" in rendered
 
 
-def test_model_substring_with_several_matches_narrows_the_picker(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_model_substring_with_several_matches_narrows_the_picker(
+    tmp_path: Path,
+) -> None:
     app, output = _app(tmp_path)
 
-    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model opus") == ""
+    assert (
+        await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+            app, "/model opus"
+        )
+        == ""
+    )
 
     picker = app._model_picker
     assert picker is not None
@@ -126,30 +148,41 @@ def test_model_substring_with_several_matches_narrows_the_picker(tmp_path: Path)
     assert 'matching "opus"' in output.getvalue()
 
 
-def test_model_unique_substring_switches_directly(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_model_unique_substring_switches_directly(tmp_path: Path) -> None:
     app, _ = _app(tmp_path, provider="codex", model="gpt-5.6-luna")
 
-    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
-        app, "/model terra"
+    assert (
+        await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+            app, "/model terra"
+        )
     ).startswith("model: gpt-5.6-terra")
     assert app.model == "gpt-5.6-terra"
     assert app._model_picker is None
 
 
-def test_model_exact_name_bypasses_the_picker(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_model_exact_name_bypasses_the_picker(tmp_path: Path) -> None:
     app, _ = _app(tmp_path)
 
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-opus-4-8")
+    output = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model claude-opus-4-8")
 
     assert output.startswith("model: claude-opus-4-8")
     assert app.model == "claude-opus-4-8"
     assert app._model_picker is None
 
 
-def test_model_name_matching_nothing_is_still_used_as_typed(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_model_name_matching_nothing_is_still_used_as_typed(
+    tmp_path: Path,
+) -> None:
     app, _ = _app(tmp_path)
 
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-brand-new")
+    output = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model claude-brand-new")
 
     assert output == (
         "model: claude-brand-new (model catalog unavailable for claude — using anyway)"
@@ -164,7 +197,9 @@ async def test_picker_does_not_open_while_a_turn_is_active(tmp_path: Path) -> No
     app._active_task = asyncio.create_task(asyncio.sleep(1))
 
     try:
-        output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
+        output = await create_slash_registry(
+            skill_catalog=SkillCatalog.empty()
+        ).dispatch_async(app, "/model")
     finally:
         app._active_task.cancel()
         await asyncio.gather(app._active_task, return_exceptions=True)
@@ -180,7 +215,9 @@ async def test_picker_navigation_wraps_and_select_switches_the_model(
     tmp_path: Path,
 ) -> None:
     app, output = _app(tmp_path, provider="codex", model="gpt-5.6-luna")
-    create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
+    await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+        app, "/model"
+    )
     picker = app._model_picker
     assert picker is not None and picker.selected == "gpt-5.6-luna"
 
@@ -200,14 +237,17 @@ async def test_picker_navigation_wraps_and_select_switches_the_model(
         await app.loop.close()
 
 
-def test_picker_cancel_removes_the_card_and_its_spacer_in_full_screen(
+@pytest.mark.asyncio
+async def test_picker_cancel_removes_the_card_and_its_spacer_in_full_screen(
     tmp_path: Path,
 ) -> None:
     app, _ = _app(tmp_path, full_screen=True)
     app._print_system("hello")
     before = len(app._transcript._units)
 
-    create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
+    await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+        app, "/model"
+    )
 
     assert len(app._transcript._units) == before + 2
     assert app._model_picker_unit is app._transcript._units[-1]
@@ -222,9 +262,12 @@ def test_picker_cancel_removes_the_card_and_its_spacer_in_full_screen(
     assert len(app._transcript._units) == before
 
 
-def test_picker_moves_repaint_the_card_in_full_screen(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_picker_moves_repaint_the_card_in_full_screen(tmp_path: Path) -> None:
     app, _ = _app(tmp_path, provider="codex", model="gpt-5.6-luna", full_screen=True)
-    create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
+    await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+        app, "/model"
+    )
     unit = app._model_picker_unit
     assert "❯ gpt-5.6-luna" in _plain(unit.value)
 
@@ -239,7 +282,9 @@ async def test_open_picker_folds_in_the_catalog_when_it_arrives(tmp_path: Path) 
     dated = "claude-opus-4-1-20250805"
     app, _ = _app(tmp_path, loader=lambda provider: frozenset({dated}))
 
-    create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model opus")
+    await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+        app, "/model opus"
+    )
     picker = app._model_picker
     assert picker is not None and dated not in picker.choices
 
@@ -255,7 +300,9 @@ async def test_open_picker_folds_in_the_catalog_when_it_arrives(tmp_path: Path) 
 @pytest.mark.asyncio
 async def test_any_other_submission_dismisses_an_open_picker(tmp_path: Path) -> None:
     app, output = _app(tmp_path, provider="codex", model="offline")
-    create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
+    await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+        app, "/model"
+    )
     assert app._model_picker is not None
 
     app._submit_input("/name")
@@ -363,7 +410,10 @@ def test_slash_completer_offers_model_names_after_model() -> None:
     assert partial[0].start_position == -2
 
     everything = list(completer.get_completions(Document("/model "), event))
-    assert [item.text for item in everything] == ["claude-opus-4-8", "claude-sonnet-4-6"]
+    assert [item.text for item in everything] == [
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+    ]
     assert [item.display_meta_text for item in everything] == ["", "current"]
 
     assert list(completer.get_completions(Document("/model a b"), event)) == []
