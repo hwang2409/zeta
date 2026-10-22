@@ -117,7 +117,9 @@ def test_gpt56_plan_mode_advertises_stable_tools_with_server_allowlist(
     marked = plan_mode_messages([loop.context_assembler.system_prompt])[0]
     assert "bash" not in marked.metadata["zeta_allowed_tools"]
     assert not loop.plan_mode_allows(ToolCall("bash-call", "bash", {}))
-    loop.set_model("gpt-5.5")
+    loop.apply_backend_state(
+        loop.prepare_backend_state(CodexBackend(model="gpt-5.5"))
+    )
     assert "bash" not in schema_names(loop._active_tool_schemas())
 
 

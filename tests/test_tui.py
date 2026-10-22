@@ -65,6 +65,7 @@ from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
+from zeta.core.slash import budget_for_model
 from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.diagnostics import tui_stalls as tui_stalls_module
@@ -12009,12 +12010,29 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
     loop.context_assembler.backend = backend
     loop.context_assembler.compaction_policy.backend = backend
 
-    def persist_model_and_effective_budget(selected: str) -> None:
-        manager.record_override(opened.metadata, provider=None, model=selected)
-        manager.record_budget(
-            opened.metadata,
-            budget=loop.context_assembler.token_budget,
-            pinned=True,
+    context = SessionAccountContext.load(
+        manager.home, manager, opened.metadata
+    )
+    loop.account_context = context
+
+    async def persist_model_and_effective_budget(selected: str):
+        def prepare(metadata):
+            budget = min(metadata.compaction_budget, budget_for_model("ollama", selected))
+            return manager._apply_session_settings(
+                metadata,
+                model=selected,
+                approval_mode=metadata.approval_mode or "ask",
+                budget=budget,
+                provider="ollama",
+                model_fallback=metadata.model_fallback,
+            )
+
+        return await context.switch_model(
+            loop,
+            prepare=prepare,
+            build_backend=lambda metadata: OllamaBackend(
+                model=metadata.model, token_budget=metadata.compaction_budget
+            ),
         )
 
     app = TUIApp(
@@ -12025,7 +12043,9 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
         console=Console(file=StringIO(), force_terminal=False),
     )
     try:
-        assert app.slash_model(model).startswith(f"model: {model}")
+        assert (await app.slash_model(model)).startswith(f"model: {model}")
+        backend = loop.backend
+        assert isinstance(backend, OllamaBackend)
         payloads: list[dict] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -12048,6 +12068,126 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
     finally:
         await loop.close()
         opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_model_command_respects_unknown_fence_and_uses_transition(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "home")
+    opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    context = SessionAccountContext.load(
+        manager.home, manager, opened.metadata, validate=False
+    )
+    loop = AgentLoop(
+        FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()
+    )
+    loop.account_context = context
+    calls = 0
+    transition = SessionAccountContext.switch_model
+
+    async def switch_model(selected: str):
+        nonlocal calls
+        calls += 1
+
+        def prepare(metadata):
+            return manager._apply_session_settings(
+                metadata,
+                model=selected,
+                approval_mode=metadata.approval_mode or "ask",
+                budget=metadata.compaction_budget,
+                provider="codex",
+                model_fallback=metadata.model_fallback,
+            )
+
+        return await transition(
+            context,
+            loop,
+            prepare=prepare,
+            build_backend=lambda _metadata: FakeBackend([]),
+        )
+
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="gpt-5.6-luna",
+        on_model_change=switch_model,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    context._mark_unknown(lambda _metadata: FakeBackend([]))
+
+    output = await app._slash_commands.dispatch_async(app, "/model gpt-5.4")
+
+    assert calls == 1
+    assert output is not None and str(output).startswith("model unchanged:")
+    assert app.model == "gpt-5.6-luna"
+    assert manager.read_metadata(opened.metadata.session_id).model == "gpt-5.6-luna"
+    await loop.close()
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_model_command_does_no_lock_work_on_loop(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "home")
+    opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    context = SessionAccountContext.load(
+        manager.home, manager, opened.metadata, validate=False
+    )
+    loop = AgentLoop(
+        FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()
+    )
+    loop.account_context = context
+
+    async def switch_model(selected: str):
+        def prepare(metadata):
+            return manager._apply_session_settings(
+                metadata,
+                model=selected,
+                approval_mode=metadata.approval_mode or "ask",
+                budget=metadata.compaction_budget,
+                provider="codex",
+                model_fallback=metadata.model_fallback,
+            )
+
+        return await context.switch_model(
+            loop,
+            prepare=prepare,
+            build_backend=lambda _metadata: FakeBackend([]),
+        )
+
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="gpt-5.6-luna",
+        on_model_change=switch_model,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    lock_held = threading.Event()
+
+    def hold_metadata_lock() -> None:
+        with manager._metadata_lock(opened.metadata.session_id) as directory_fd:
+            assert directory_fd is not None
+            lock_held.set()
+            time.sleep(0.25)
+
+    holder = threading.Thread(target=hold_metadata_lock)
+    holder.start()
+    assert await asyncio.to_thread(lock_held.wait, 1)
+    event_loop = asyncio.get_running_loop()
+    started = event_loop.time()
+    callback_delays: list[float] = []
+    event_loop.call_later(
+        0.01, lambda: callback_delays.append(event_loop.time() - started)
+    )
+
+    output = await app._slash_commands.dispatch_async(app, "/model gpt-5.4")
+
+    assert output is not None and str(output).startswith("model: gpt-5.4")
+    assert callback_delays and callback_delays[0] < 0.05
+    await asyncio.to_thread(holder.join, 1)
+    assert not holder.is_alive()
+    await loop.close()
+    opened.store.close()
 
 
 @pytest.mark.asyncio

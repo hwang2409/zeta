@@ -27,7 +27,6 @@ from ...core.session import SessionError, env_home, normalize_session_name
 from ...core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashStatus,
-    budget_for_model,
     compaction_history,
 )
 from ...core.todo import todo_count_tuple
@@ -378,7 +377,7 @@ class SlashHandlerMixin:
         if unit is not None:
             self._transcript.remove(unit, leading_blank=True)
 
-    def slash_model(self, args: str) -> str:
+    async def slash_model(self, args: str) -> str:
         """Pick a model from a card, or switch straight to a named one."""
 
         requested = args.strip()
@@ -401,7 +400,7 @@ class SlashHandlerMixin:
                 requested = matches[0]
             elif matches:
                 return self._open_model_picker(matches, query=requested)
-        return self._switch_model(requested)
+        return await self._switch_model(requested)
 
     def _open_model_picker(self, choices: tuple[str, ...], *, query: str) -> str:
         """Draw the picker card; its keys take over while the composer is empty."""
@@ -466,7 +465,7 @@ class SlashHandlerMixin:
         self._model_picker = picker.with_choices(choices)
         self._repaint_model_picker()
 
-    def _switch_model(self, model: str) -> str:
+    async def _switch_model(self, model: str) -> str:
         try:
             _validate_model_name(self.provider, model)
         except ValueError as exc:
@@ -481,20 +480,26 @@ class SlashHandlerMixin:
             )
         else:
             catalog_warning = None
-        previous = self.model
+        if model == self.model:
+            return f"model: {model}"
+        if self._on_model_change is None:
+            return "model unchanged: model transition is unavailable"
+        previous_budget = self.loop.context_assembler.token_budget
         try:
-            self.loop.set_model(model)
-            if self._on_model_change is not None:
-                self._on_model_change(model)
+            authoritative = await self._on_model_change(model)
         except Exception as exc:
-            self.loop.set_model(previous)
             return f"model unchanged: {exc}"
-        self.model = model
-        budget_note = self._retune_budget_for_model()
+        self.model = authoritative.model
+        current_budget = self.loop.context_assembler.token_budget
+        budget_note = (
+            f"context budget {previous_budget:,} -> {current_budget:,}"
+            if current_budget != previous_budget
+            else None
+        )
         notes = [note for note in (catalog_warning, budget_note) if note]
         if notes:
-            return f"model: {model} ({'; '.join(notes)})"
-        return f"model: {model}"
+            return f"model: {self.model} ({'; '.join(notes)})"
+        return f"model: {self.model}"
 
     def slash_plan(self, args: str) -> str | ModelInputEnvelope:
         """Toggle plan mode or submit a prompt while entering it."""
@@ -578,23 +583,6 @@ class SlashHandlerMixin:
         """Toggle plan mode from the keyboard, reporting the same notice."""
 
         self._print_system(self.slash_plan("toggle"))
-
-    def _retune_budget_for_model(self) -> str | None:
-        """Track the new model's context window unless the budget is pinned."""
-
-        if self._on_budget_change is None:
-            return None
-        budget = budget_for_model(self.provider, self.model)
-        assembler = self.loop.context_assembler
-        if budget == assembler.token_budget:
-            return None
-        previous = assembler.token_budget
-        try:
-            self._on_budget_change(budget)
-        except Exception as exc:
-            return f"context budget unchanged: {exc}"
-        self.loop.set_token_budget(budget)
-        return f"context budget {previous:,} -> {budget:,}"
 
     def slash_tools(self, args: str) -> str:
         """List registered tools or trust pending project tools."""

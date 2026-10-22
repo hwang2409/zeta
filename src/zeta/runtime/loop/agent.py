@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import shlex
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+    Sequence,
+)
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -170,7 +178,7 @@ class AgentLoop(
         runtime_prompt: RuntimePrompt | None = None,
         token_budget: int = 200_000,
         retained_tail: int = 8,
-        on_completion_success: Callable[[], None] | None = None,
+        on_completion_success: Callable[[], Awaitable[None] | None] | None = None,
         on_plan_mode_change: Callable[[bool], None] | None = None,
         hooks: HookManager | None = None,
         skip_mcp_mount: bool = False,
@@ -349,20 +357,6 @@ class AgentLoop(
     def apply_backend_state(self, state: PreparedBackendState) -> None:
         apply_backend_state(self, state)
 
-    def set_backend(self, backend: CompletionBackend) -> None:
-        """Replace the provider backend used by subsequent completions."""
-
-        self.apply_backend_state(self.prepare_backend_state(backend))
-
-    def set_model(self, model: str) -> None:
-        """Set the model used by subsequent provider completions."""
-        if not model.strip():
-            raise ValueError("model must be a nonempty name")
-        if hasattr(self.backend, "model"):
-            self.backend.model = model
-        else:
-            self._model = model
-        self.set_token_budget(self.context_assembler.token_budget)
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
         provider = getattr(self.backend, "provider", None)
@@ -1052,7 +1046,9 @@ class AgentLoop(
             retrying_context = False
             retrying_provider = False
             if completion_succeeded and self.on_completion_success is not None:
-                self.on_completion_success()
+                completion_result = self.on_completion_success()
+                if inspect.isawaitable(completion_result):
+                    await completion_result
             if assistant_message is None and partial_blocks:
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
             if assistant_message is None:

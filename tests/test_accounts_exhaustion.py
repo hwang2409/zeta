@@ -39,7 +39,7 @@ from zeta.accounts.usage import (
     record_subscription_limit,
 )
 from zeta.core.loop import AgentLoop
-from zeta.core.session import SessionManager
+from zeta.core.session import SessionError, SessionManager
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
 from zeta.protocol.types import MessageOrigin, MessageRole, StreamEventType, TextContent
@@ -521,6 +521,146 @@ async def test_switch_cancel_during_commit_converges_then_reraises(
 
     _assert_switch_state(
         context, second, second_backend, loop, sequence=1, boundary=1
+    )
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_writer_cannot_change_disk_between_commit_and_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, _first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    third = AccountId("codex", "third")
+    await asyncio.to_thread(
+        named_account_credentials(context.home, third.provider, third.name).save,
+        OAuthTokens(_codex_token(third.name), "refresh", 4_000_000_000),
+    )
+    assert context.manager is not None
+    other_manager = SessionManager(context.home)
+    other_metadata = await asyncio.to_thread(
+        other_manager.read_metadata, context.metadata.session_id
+    )
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+
+    def write_third() -> None:
+        writer_started.set()
+        other_manager.record_account_selection(
+            other_metadata, third, boundary=9, switched=True
+        )
+        writer_finished.set()
+
+    original_apply = SessionAccountContext._apply
+
+    def apply_while_writer_waits(
+        self: SessionAccountContext, *args: object, **kwargs: object
+    ) -> None:
+        writer = threading.Thread(target=write_third)
+        writer.start()
+        assert writer_started.wait(1)
+        assert not writer_finished.wait(0.1)
+        original_apply(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionAccountContext, "_apply", apply_while_writer_waits)
+    await context.switch_active(
+        _switch_loop(object()),
+        second,
+        boundary=3,
+        provider="codex",
+        build_backend=lambda _account: object(),
+    )
+    assert await asyncio.to_thread(writer_finished.wait, 1)
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_recovery_holds_lock_through_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, _first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    assert context.manager is not None
+    other_manager = SessionManager(context.home)
+    other_metadata = await asyncio.to_thread(
+        other_manager.read_metadata, context.metadata.session_id
+    )
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+
+    def write_second() -> None:
+        writer_started.set()
+        other_manager.record_account_selection(
+            other_metadata, second, boundary=5, switched=True
+        )
+        writer_finished.set()
+
+    original_apply = SessionAccountContext._apply
+
+    def apply_while_writer_waits(
+        self: SessionAccountContext, *args: object, **kwargs: object
+    ) -> None:
+        writer = threading.Thread(target=write_second)
+        writer.start()
+        assert writer_started.wait(1)
+        assert not writer_finished.wait(0.1)
+        original_apply(self, *args, **kwargs)
+
+    context._mark_unknown(lambda _metadata: object())
+    monkeypatch.setattr(SessionAccountContext, "_apply", apply_while_writer_waits)
+    await context.ensure_account_state(_switch_loop(object()))
+    assert await asyncio.to_thread(writer_finished.wait, 1)
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_commit_returns_releases_metadata_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, _first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    other = SessionManager(context.home)
+    reader_errors: list[BaseException] = []
+    original_apply = SessionAccountContext._apply
+
+    def apply_then_cancel(
+        self: SessionAccountContext, *args: object, **kwargs: object
+    ) -> None:
+        def read_while_apply_is_pending() -> None:
+            try:
+                other.read_metadata(
+                    context.metadata.session_id, lock_timeout=0.05
+                )
+            except BaseException as exc:  # noqa: BLE001 - captured across thread
+                reader_errors.append(exc)
+
+        reader = threading.Thread(target=read_while_apply_is_pending)
+        reader.start()
+        reader.join(1)
+        assert not reader.is_alive()
+        assert isinstance(reader_errors[0], SessionError)
+        original_apply(self, *args, **kwargs)
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+
+    monkeypatch.setattr(SessionAccountContext, "_apply", apply_then_cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await context.switch_active(
+            _switch_loop(object()),
+            second,
+            boundary=3,
+            provider="codex",
+            build_backend=lambda _account: object(),
+        )
+
+    await asyncio.to_thread(
+        other.read_metadata,
+        context.metadata.session_id,
+        lock_timeout=0.2,
     )
     opened.store.close()
 

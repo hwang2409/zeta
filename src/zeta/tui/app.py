@@ -33,7 +33,7 @@ from ..core.project_context import (
     load_project_context,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_project_context
     project_instructions_editor_command,
 )
-from ..core.session import env_home
+from ..core.session import SessionMetadata, env_home
 from ..core.slash import (
     SlashCommand,
     SlashStatus,
@@ -193,7 +193,7 @@ class TUIApp(
         draft_path: str | Path | None = None,
         approval_policy: ApprovalPolicy | None = None,
         context_files: Sequence[str] = (),
-        on_model_change: Callable[[str], None] | None = None,
+        on_model_change: Callable[[str], Awaitable[SessionMetadata]] | None = None,
         vim_mode: bool = True,
         on_vim_mode_change: Callable[[bool], None] | None = None,
         on_budget_change: Callable[[int], None] | None = None,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,7 +75,7 @@ def compose_runtime(
     project_context: ProjectContext,
     backend_builder: BackendBuilder,
     opened: OpenedSession | None = None,
-    on_completion_success: Callable[[], None] | None = None,
+    on_completion_success: Callable[[], Awaitable[None] | None] | None = None,
     on_plan_mode_change: Callable[[bool], None] | None = None,
     max_turns: int | None = None,
     background_event_sink: BackgroundEventSink | None = None,
