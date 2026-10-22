@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..accounts import AccountError, AccountStore
+from ..accounts.store import rename_account_command
 from ..core.commands.custom_commands import CustomCommand
 from ..core.project_context import discover_repo_root
 from ..core.slash import (
@@ -154,17 +154,6 @@ class ServerSlashSession:
             ),
         )
 
-    @staticmethod
-    def _rename_account(store: AccountStore, args: str) -> str:
-        requested = args.split()
-        if len(requested) != 3 or requested[0] != "rename":
-            return "usage: /accounts [rename provider:old new-label]"
-        try:
-            account = store.resolve_qualified_reference(requested[1])
-            return store.rename(account, requested[2])
-        except (AccountError, OSError, ValueError) as exc:
-            return f"account unchanged: {exc}"
-
     def slash_accounts(self, args: str) -> str:
         """List accounts or change one display label."""
 
@@ -172,7 +161,7 @@ class ServerSlashSession:
         if context is None:
             return "accounts unavailable for this session"
         if args.split():
-            return self._rename_account(context.store, args)
+            return rename_account_command(context.store, args)
         displays = context.store.list_display()
         return "\n".join(
             str(item) + (f"  {item.detail}" if item.detail else "")

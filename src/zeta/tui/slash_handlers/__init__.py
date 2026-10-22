@@ -12,7 +12,7 @@ from pathlib import Path
 from prompt_toolkit.enums import EditingMode
 
 from ...accounts import AccountError, SessionAccountContext
-from ...accounts.store import AccountDisplay
+from ...accounts.store import AccountDisplay, rename_account_command
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
 from ...core.session import SessionError, env_home, normalize_session_name
@@ -172,17 +172,6 @@ class SlashHandlerMixin:
     def model_picker_active(self) -> bool:
         return self._model_picker is not None
 
-    def _rename_account(self, args: str) -> str:
-        requested = args.split()
-        if len(requested) != 3 or requested[0] != "rename":
-            return "usage: /accounts [rename provider:old new-label]"
-        try:
-            store = self.loop.account_context.store
-            account = store.resolve_qualified_reference(requested[1])
-            return store.rename(account, requested[2])
-        except (AccountError, OSError, ValueError) as exc:
-            return f"account unchanged: {exc}"
-
     def _show_accounts_picker(
         self, context: SessionAccountContext, displays: list[AccountDisplay]
     ) -> str:
@@ -208,7 +197,7 @@ class SlashHandlerMixin:
         """List named accounts and open the current-session switcher."""
 
         if args.split():
-            return self._rename_account(args)
+            return rename_account_command(self.loop.account_context.store, args)
         if self.active or self.pending_approvals:
             return "accounts unavailable: cannot switch while a turn or approval is active"
         context = getattr(self.loop, "account_context", None)

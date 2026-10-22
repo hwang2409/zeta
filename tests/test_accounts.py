@@ -1356,6 +1356,88 @@ def test_label_is_display_only_and_id_stays_stable(tmp_path: Path) -> None:
     assert not (home / ".account-rename.json").exists()
 
 
+def _read_registry_with_548_rules(path: Path) -> dict[str, object]:
+    value = json.loads(path.read_text())
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != 1
+        or not isinstance(value.get("accounts"), dict)
+        or not isinstance(value.get("defaults"), dict)
+    ):
+        raise ValueError
+    accounts = dict(value["accounts"])
+    defaults = dict(value["defaults"])
+    for key, metadata in accounts.items():
+        account = AccountId(*key.split(":", 1))
+        if key != str(account) or metadata != {
+            "provider": account.provider,
+            "name": account.name,
+        }:
+            raise ValueError
+    for provider, key in defaults.items():
+        if (
+            provider not in {"anthropic", "codex"}
+            or key not in accounts
+            or not key.startswith(f"{provider}:")
+        ):
+            raise ValueError
+    return {"version": 1, "accounts": accounts, "defaults": defaults}
+
+
+def test_registry_written_by_head_is_readable_by_548_reader(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    named_account_credentials(tmp_path, "codex", "work").save(tokens())
+    store = AccountStore(tmp_path)
+    store.rename(account, "main")
+
+    value = _read_registry_with_548_rules(store.registry)
+    accounts = value["accounts"]
+    defaults = value["defaults"]
+    assert [AccountId(*key.split(":", 1)) for key in accounts] == [account]
+    assert AccountId(*defaults["codex"].split(":", 1)) == account
+    resolved = AccountId("codex", "work") if "codex:work" in accounts else None
+    assert resolved == account
+
+
+def test_login_publish_rejects_label_claimed_during_oauth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work = AccountId("codex", "work")
+    named_account_credentials(tmp_path, "codex", "work").save(tokens())
+    monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
+    oauth_started = threading.Event()
+    publish = threading.Event()
+    failures: list[BaseException] = []
+
+    async def login(provider, _pkce_values) -> None:
+        oauth_started.set()
+        await asyncio.to_thread(publish.wait)
+        provider.credential_store.save(tokens())
+
+    monkeypatch.setattr(cli_main, "run_login", login)
+
+    def run_login() -> None:
+        try:
+            cli_main._run_login("codex", "new")
+        except AccountError as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=run_login)
+    thread.start()
+    assert oauth_started.wait(1)
+    AccountStore(tmp_path).rename(work, "new")
+    publish.set()
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], AccountError)
+    store = AccountStore(tmp_path)
+    assert store.resolve_reference("codex", "new") == work
+    assert store.list() == [work]
+    assert not store.credential_path(AccountId("codex", "new")).exists()
+
+
 def test_label_unique_across_ids_and_labels(tmp_path: Path) -> None:
     store = AccountStore(tmp_path)
     work = AccountId("codex", "work")
