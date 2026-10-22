@@ -5788,10 +5788,11 @@ async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
     for account in (first, second):
-        named_account_credentials(home, account.provider, account.name).save(
-            OAuthTokens(account.name, "refresh", 9_999_999_999)
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
         )
-    AccountStore(home).set_default(first)
+    await asyncio.to_thread(AccountStore(home).set_default, first)
     client = object.__new__(_Client)
     client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
     notifications: list[tuple[str, dict[str, object]]] = []
