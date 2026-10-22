@@ -290,16 +290,20 @@ class AccountStore:
                 if staged is None:
                     raise AccountError("OAuth credentials are invalid; login required")
                 if legacy_exists:
+                    with _open_account_directory(home_fd, account) as account_fd:
+                        if _file_mtime_ns(home_fd, legacy_name) > _file_mtime_ns(
+                            account_fd, "oauth.json"
+                        ):
+                            tokens = _read_tokens(home_fd, legacy_name)
+                            _stage_account_tokens(account_fd, account, tokens)
+                            _delete_publication_pending(account_fd)
                     _unlink_legacy(home_fd, legacy_name)
                 return
             if not legacy_exists:
                 return
             tokens = _read_tokens(home_fd, legacy_name)
             with _account_directory(home_fd, account) as account_fd:
-                credential = _token_bytes(tokens)
-                _write_publication_pending(account_fd, account, credential)
-                _write_token_bytes(account_fd, credential)
-                _verify_tokens(account_fd, tokens)
+                _stage_account_tokens(account_fd, account, tokens)
             self._register_account(home_fd, account, value)
             with _open_account_directory(home_fd, account) as account_fd:
                 _delete_publication_pending(account_fd)
@@ -645,6 +649,15 @@ def _write_token_bytes(directory_fd: int, credential: bytes) -> None:
     _fsync_directory(directory_fd)
 
 
+def _stage_account_tokens(
+    account_fd: int, account: AccountId, tokens: OAuthTokens
+) -> None:
+    credential = _token_bytes(tokens)
+    _write_publication_pending(account_fd, account, credential)
+    _write_token_bytes(account_fd, credential)
+    _verify_tokens(account_fd, tokens)
+
+
 def _publication_record(account: AccountId, credential: bytes) -> dict[str, str]:
     return {
         "provider": account.provider,
@@ -767,6 +780,14 @@ def _exists(directory_fd: int, name: str) -> bool:
     except FileNotFoundError:
         return False
     return True
+
+
+def _file_mtime_ns(directory_fd: int, name: str) -> int:
+    fd = open_session_file(directory_fd, name, os.O_RDONLY)
+    try:
+        return os.fstat(fd).st_mtime_ns
+    finally:
+        os.close(fd)
 
 
 def _exists_regular(directory_fd: int, name: str) -> bool:

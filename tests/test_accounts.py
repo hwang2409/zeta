@@ -322,6 +322,26 @@ def test_migration_is_noop_when_already_migrated(tmp_path: Path) -> None:
     )
 
 
+def test_migration_does_not_delete_legacy_file_newer_than_migrated_copy(
+    tmp_path: Path,
+) -> None:
+    _write_legacy(tmp_path, "codex")
+    store = AccountStore(tmp_path)
+    store.migrate()
+    destination = store.credential_path(AccountId("codex", "default"))
+    destination_mtime = destination.stat().st_mtime_ns
+    newer = OAuthTokens("newer-access", "newer-refresh", 10_000_000_000.0)
+    legacy = tmp_path / "codex-oauth.json"
+    legacy.write_text(json.dumps(newer.to_dict()))
+    newer_mtime = destination_mtime + 1_000_000_000
+    os.utime(legacy, ns=(newer_mtime, newer_mtime))
+
+    store.migrate()
+
+    assert json.loads(destination.read_text()) == newer.to_dict()
+    assert not legacy.exists()
+
+
 def test_account_files_are_0600_and_dirs_are_private(tmp_path: Path) -> None:
     store = AccountStore(tmp_path)
     named_account_credentials(tmp_path, "codex", "personal").save(tokens())
