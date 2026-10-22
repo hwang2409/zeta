@@ -11,7 +11,8 @@ from pathlib import Path
 
 from prompt_toolkit.enums import EditingMode
 
-from ...accounts import AccountError
+from ...accounts import AccountError, SessionAccountContext
+from ...accounts.store import AccountDisplay
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
 from ...core.session import SessionError, env_home, normalize_session_name
@@ -182,6 +183,27 @@ class SlashHandlerMixin:
         except (AccountError, OSError, ValueError) as exc:
             return f"account unchanged: {exc}"
 
+    def _show_accounts_picker(
+        self, context: SessionAccountContext, displays: list[AccountDisplay]
+    ) -> str:
+        defaults = {
+            provider: account
+            for provider in ("anthropic", "codex")
+            if (account := context.store.default(provider)) is not None
+        }
+        self._dismiss_accounts_picker()
+        picker = AccountsPicker(
+            tuple(item.account for item in displays),
+            context.snapshot(),
+            defaults,
+            {item.account: item.detail for item in displays if item.detail},
+            {item.account: item.label for item in displays},
+        )
+        self._accounts_picker = picker
+        self._accounts_picker_unit = self._presenter.print_unit(picker.render())
+        self._invalidate_prompt()
+        return ""
+
     def slash_accounts(self, args: str) -> str:
         """List named accounts and open the current-session switcher."""
 
@@ -195,26 +217,9 @@ class SlashHandlerMixin:
         if context.switching_unavailable is not None:
             return context.switching_unavailable
         displays = context.store.list_display()
-        accounts = tuple(item.account for item in displays)
-        if not accounts:
+        if not displays:
             return "no accounts; run zeta login <provider> --account <name>"
-        defaults = {
-            provider: account
-            for provider in ("anthropic", "codex")
-            if (account := context.store.default(provider)) is not None
-        }
-        self._dismiss_accounts_picker()
-        picker = AccountsPicker(
-            accounts,
-            context.snapshot(),
-            defaults,
-            {item.account: item.detail for item in displays if item.detail},
-            {item.account: item.label for item in displays},
-        )
-        self._accounts_picker = picker
-        self._accounts_picker_unit = self._presenter.print_unit(picker.render())
-        self._invalidate_prompt()
-        return ""
+        return self._show_accounts_picker(context, displays)
 
     @property
     def accounts_picker_active(self) -> bool:
