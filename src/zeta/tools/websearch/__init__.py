@@ -264,6 +264,9 @@ async def _websearch(
     codex_reason: str | None = None
     try:
         account = registry.selected_accounts.get("codex")
+        if account is None and registry.account_resolver is not None:
+            account = registry.account_resolver("codex")
+            registry.selected_accounts["codex"] = account
         hosted = await (
             codex.search(
                 query,
@@ -271,7 +274,7 @@ async def _websearch(
                 account=account,
                 home=registry.account_home,
             )
-            if account is not None
+            if account is not None or registry.account_home is not None
             else codex.search(query, abort_signal)
         )
     except CodexLoginRequiredError:

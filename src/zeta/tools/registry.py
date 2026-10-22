@@ -232,6 +232,7 @@ class ToolRegistry:
         image_policy: ImagePolicy = ANTHROPIC_IMAGE_POLICY,
         selected_accounts: Mapping[str, Any] | None = None,
         account_home: Path | None = None,
+        account_resolver: Callable[[str], Any] | None = None,
     ) -> None:
         """Create a registry with a shared tool-output limit.
 
@@ -245,6 +246,7 @@ class ToolRegistry:
         self.image_policy = image_policy
         self.selected_accounts = dict(selected_accounts or {})
         self.account_home = account_home
+        self.account_resolver = account_resolver
         self.tool_policy = ToolPolicy.create(
             tool_allow, tool_deny, allow_layers=tool_allow_layers
         )

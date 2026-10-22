@@ -64,6 +64,7 @@ def build_unattended_loop(
         command_niceness=load_settings(home=home).settings.command_niceness,
         selected_accounts=selected_accounts,
         account_home=home,
+        account_resolver=resolver.resolve,
     )
     loop = AgentLoop(
         backend,

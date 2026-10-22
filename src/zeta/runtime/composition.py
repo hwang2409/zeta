@@ -253,6 +253,7 @@ def compose_runtime(
             image_policy=image_policy_for_provider(provider),
             selected_accounts=selected_accounts,
             account_home=home,
+            account_resolver=account_resolver.resolve,
             required_tool_names=tuple(
                 dict.fromkeys(
                     (

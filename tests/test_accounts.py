@@ -45,6 +45,7 @@ from zeta.providers.factory import build_backend, credential_store
 from zeta.runtime import unattended
 from zeta.server.login import Logins
 from zeta.skills import SkillCatalog
+from zeta.tools import websearch
 from zeta.tools.websearch import codex as websearch_codex
 from zeta.tui import models as tui_models
 
@@ -1030,11 +1031,29 @@ def test_every_backend_path_uses_session_resolver(
     manager = SessionManager(home)
     opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
     manager.record_account_selection(opened.metadata, anthropic, boundary=0)
-    manager.record_account_selection(opened.metadata, codex, boundary=0)
     resolver = SessionAccountResolver.load(home, manager, opened.metadata)
     selected = resolver.snapshot()
 
     primary, _ = build_backend("claude", None, home=home, account=selected["anthropic"])
+    captured: list[tuple[AccountId | None, Path | None]] = []
+
+    async def capture(_query, _signal, *, account=None, home=None):
+        captured.append((account, home))
+        return websearch_codex.CodexSearchResult("answer", [])
+
+    monkeypatch.setattr(websearch.codex, "search", capture)
+    registry = SimpleNamespace(
+        selected_accounts=selected,
+        account_home=home,
+        account_resolver=resolver.resolve,
+    )
+    asyncio.run(
+        websearch._websearch(
+            registry,
+            {"query": "query"},
+            SimpleNamespace(aborted=False),
+        )
+    )
     loop = SimpleNamespace(
         backend=primary,
         context_assembler=SimpleNamespace(token_budget=200_000),
@@ -1042,25 +1061,15 @@ def test_every_backend_path_uses_session_resolver(
         account_home=home,
     )
     child, error = resolve_child_backend(loop, "gpt-5.6-luna")
-    captured: list[AccountId] = []
-
-    async def capture(_query, _signal, account, _registry):
-        captured.append(account)
-
-    monkeypatch.setattr(websearch_codex, "_search_with_account", capture)
-    asyncio.run(
-        websearch_codex.search(
-            "query",
-            SimpleNamespace(aborted=False),
-            account=selected["codex"],
-            home=home,
-        )
-    )
 
     assert primary.token_store.account == anthropic
     assert error is None
     assert child.token_store.account == codex
-    assert captured == [codex]
+    assert captured == [(codex, home)]
+    assert manager.read_metadata(opened.metadata.session_id).selected_accounts == {
+        "anthropic": "anthropic:work",
+        "codex": "codex:personal",
+    }
     opened.store.close()
 
 
