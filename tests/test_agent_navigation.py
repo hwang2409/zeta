@@ -934,7 +934,7 @@ async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
     await asyncio.sleep(0.05)
     assert session.default_buffer.text == "keep me"
     assert any("child finished" in notice for notice in notices)
-    assert child.pending_prompts() == []
+    assert await asyncio.to_thread(child.pending_prompts) == []
     assert store.messages() == []
     await app.close()
 
@@ -982,11 +982,11 @@ async def test_child_send_success_keeps_same_text_typed_after_edit(
     buffer.text = "same"
     release.set()
     for _ in range(100):
-        if child.pending_prompts():
+        if await asyncio.to_thread(child.pending_prompts):
             break
         await asyncio.sleep(0.01)
     await asyncio.sleep(0.05)
-    assert [entry.data["text"] for entry in child.pending_prompts()] == ["same"]
+    assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == ["same"]
     assert buffer.text == "same"
     assert store.messages() == []
     await app.close()
@@ -1016,7 +1016,7 @@ async def test_close_waits_for_in_flight_child_send_outcome(
     notices_before_release = list(notices)
     release.set()
     await asyncio.wait_for(closing, 5)
-    assert [entry.data["text"] for entry in child.pending_prompts()] == ["at exit"]
+    assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == ["at exit"]
     assert store.messages() == []
     assert notices == notices_before_release
 
@@ -1125,10 +1125,10 @@ async def test_child_send_finishing_after_its_session_left_does_not_touch_ui(
     notices_before = list(notices)
     release.set()
     for _ in range(100):
-        if child.pending_prompts() and not app._child_send_tasks:
+        if await asyncio.to_thread(child.pending_prompts) and not app._child_send_tasks:
             break
         await asyncio.sleep(0.01)
-    assert [entry.data["text"] for entry in child.pending_prompts()] == ["during exit"]
+    assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == ["during exit"]
     assert session.default_buffer.text == "during exit"
     assert notices == notices_before
     assert store.messages() == []
@@ -1161,7 +1161,7 @@ async def test_child_send_double_enter_queues_once(
     release.set()
     await asyncio.sleep(0.05)
     assert calls == 1
-    assert len(child.pending_prompts()) == 1
+    assert len(await asyncio.to_thread(child.pending_prompts)) == 1
     assert store.messages() == []
     await app.close()
 
@@ -1232,7 +1232,7 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
     release.set()
     await asyncio.wait_for(queued.wait(), timeout=2)
     assert session.default_buffer.text == ""
-    assert [entry.data["text"] for entry in ConversationStore(child.parent, session_id=child.name).pending_prompts()] == ["follow up"]
+    assert [entry.data["text"] for entry in await asyncio.to_thread(ConversationStore(child.parent, session_id=child.name).pending_prompts)] == ["follow up"]
     assert store.messages() == []
     assert "queued message for root:worker" in notices
     await app.close()
@@ -1278,7 +1278,7 @@ async def test_enter_in_ineligible_child_view_keeps_text_and_does_not_submit(
     assert app._agent_navigation.child_view_active
     assert app._submit_input(session.default_buffer.text) is False
     assert session.default_buffer.text == "keep this"
-    assert ConversationStore(child.parent, session_id=child.name).pending_prompts() == []
+    assert await asyncio.to_thread(ConversationStore(child.parent, session_id=child.name).pending_prompts) == []
     assert not any(message.role is MessageRole.USER for message in store.messages())
     assert any("return to main" in notice for notice in notices)
     await app.close()

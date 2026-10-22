@@ -1354,7 +1354,7 @@ async def _wait_for_pending_prompt_count(
     store: ConversationStore, expected: int
 ) -> None:
     for _ in range(100):
-        if len(store.pending_prompts()) == expected:
+        if len(await asyncio.to_thread(store.pending_prompts)) == expected:
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"pending prompt count did not reach {expected}")
@@ -5900,6 +5900,32 @@ def test_close_pending_queue_if_empty_locks_out_new_prompts(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_pending_store_lock_rejects_event_loop_thread(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="run")
+    prompt = await asyncio.to_thread(store.append_pending_prompt, "queued")
+    report = {"status": "done", "summary": "done"}
+    operations = (
+        lambda: store.pending_prompt_queue.append("another"),
+        store.pending_prompt_queue.pending,
+        lambda: store.pending_prompt_queue.acknowledge(prompt.id),
+        lambda: store.pending_prompt_queue.acknowledge_messages(
+            [], prompt_ids=(prompt.id,)
+        ),
+        store.pending_prompt_queue.close_if_empty,
+        store.pending_prompt_queue.close,
+        lambda: store.pending_prompt_queue.accept_explicit_finish(report),
+        store.pending_prompt_queue.cancel_explicit_child,
+        store.pending_prompt_queue.explicit_finish_report,
+        store.pending_prompt_queue.idle_nudge_eligible,
+        store.pending_prompt_queue.terminal_transition,
+    )
+
+    for operation in operations:
+        with pytest.raises(PendingPromptLoopThreadLockError):
+            operation()
+
+
+@pytest.mark.asyncio
 async def test_send_racing_turn_boundary_close_is_never_stranded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5995,7 +6021,7 @@ async def test_consume_run_keeps_pending_entry_when_delivery_fails(
     from zeta.agent import runner as agent_runner
 
     child_store = ConversationStore(tmp_path, session_id="run")
-    child_store.append_pending_prompt("follow up")
+    await asyncio.to_thread(child_store.append_pending_prompt, "follow up")
 
     call_prompts: list[str] = []
 
@@ -6011,6 +6037,7 @@ async def test_consume_run_keeps_pending_entry_when_delivery_fails(
     child_loop = SimpleNamespace(
         explicit_finish=False,
         _delivering_prompt_id=None,
+        _yield_for_pending_prompt=False,
         notification_wake=SimpleNamespace(pending_message=lambda: None),
     )
     result = await agent_runner.consume_run(
@@ -6021,11 +6048,11 @@ async def test_consume_run_keeps_pending_entry_when_delivery_fails(
     assert result["isError"] is True
     assert call_prompts == ["initial", "follow up"]
     # Ack must not have run since the follow-up delivery errored.
-    assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
+    assert [entry.data["text"] for entry in await asyncio.to_thread(child_store.pending_prompts)] == [
         "follow up"
     ]
     with pytest.raises(PendingPromptsClosedError):
-        child_store.append_pending_prompt("after failure")
+        await asyncio.to_thread(child_store.append_pending_prompt, "after failure")
 
 
 @pytest.mark.asyncio
@@ -6043,7 +6070,7 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
         agent_type="run",
         description="long horizon run",
     )
-    child_store.append_pending_prompt("follow up")
+    await asyncio.to_thread(child_store.append_pending_prompt, "follow up")
     prompts: list[str] = []
     finish_calls = 0
 
@@ -6081,7 +6108,7 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
             lifecycle = restarted.agent_lifecycle()
             assert lifecycle is not None
             assert lifecycle["finished_at"] is None
-            assert restarted.pending_prompts()[0].data["text"] == "follow up"
+            assert (await asyncio.to_thread(restarted.pending_prompts))[0].data["text"] == "follow up"
         return await original_close(store)
 
     monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
@@ -6175,7 +6202,7 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     result = await task
 
     assert result["isError"] is False
-    assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
+    assert [entry.data["text"] for entry in await asyncio.to_thread(child_store.pending_prompts)] == [
         "follow up"
     ]
 
@@ -6230,7 +6257,7 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
     result = await task
 
     assert result["isError"] is False
-    assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
+    assert [entry.data["text"] for entry in await asyncio.to_thread(child_store.pending_prompts)] == [
         "follow up"
     ]
 
@@ -6278,7 +6305,7 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
 
     assert result["isError"] is True
     assert "timed out" in result["content"][0]["text"]
-    assert child_store.pending_prompts() == []
+    assert await asyncio.to_thread(child_store.pending_prompts) == []
 
 
 @pytest.mark.asyncio
@@ -6328,7 +6355,7 @@ async def test_a_queued_prompt_stays_out_of_the_run_context(tmp_path: Path) -> N
 
     store = ConversationStore(tmp_path, session_id="run")
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("work the big task")]), MessageOrigin.USER))
-    store.append_pending_prompt("secret follow-up")
+    await asyncio.to_thread(store.append_pending_prompt, "secret follow-up")
     loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
 
     assembled = await loop.context_assembler.assemble()
@@ -7424,7 +7451,7 @@ async def test_child_finish_gate_lists_mixed_child_and_task(tmp_path: Path) -> N
     assert "collect mixed evidence" in backend.gate_text
     assert "background tasks" in backend.gate_text
     assert "task-" in backend.gate_text
-    assert notification.data["text"].startswith(("child stopped task and finished", "WAIT"))
+    assert notification.data["text"].startswith("child stopped task and finished")
     assert not store.agent_children()
     await loop.close()
 
@@ -8946,6 +8973,7 @@ class _ExplicitFinishLoop:
         self.agent_depth = 1
         self.explicit_finish = True
         self._explicit_finish_report = None
+        self._yield_for_pending_prompt = False
         self.notification_wake = NotificationWake(registry._session_store)
 
     @property
@@ -9225,7 +9253,7 @@ async def test_real_input_wins_over_immediate_reminder(
     original = loop._terminal_transition_fence.reserve_idle_nudge
 
     async def reserve() -> bool:
-        store.pending_prompt_queue.append("real input", origin=MessageOrigin.AGENT_SEND)
+        await asyncio.to_thread(store.pending_prompt_queue.append, "real input", origin=MessageOrigin.AGENT_SEND)
         loop._background_owner.conversation_channel.wake("root:1")
         return await original()
 
@@ -9396,7 +9424,7 @@ async def test_reminded_child_that_calls_finish_completes_with_report(
     assert prompts == ["work", run_consumer_module._IMMEDIATE_FINISH_REMINDER]
     assert result["explicitFinishReport"] == expected
     assert loop._explicit_finish_report == expected
-    assert store.pending_prompt_queue.explicit_finish_report() == expected
+    assert await asyncio.to_thread(store.pending_prompt_queue.explicit_finish_report) == expected
     await registry.close()
     store.close()
 
@@ -9454,11 +9482,11 @@ async def test_cancel_or_accepted_finish_racing_reminder_admission(
             )
         )
         assert result["isError"] is False
-        accepted_report = store.pending_prompt_queue.explicit_finish_report()
+        accepted_report = await asyncio.to_thread(store.pending_prompt_queue.explicit_finish_report)
     release_admission.set()
     await asyncio.wait_for(idle_waiting.wait(), 2)
 
-    report = store.pending_prompt_queue.explicit_finish_report()
+    report = await asyncio.to_thread(store.pending_prompt_queue.explicit_finish_report)
     assert (terminal_action == "cancel" and report is None) or (
         terminal_action == "finish" and report == accepted_report
     )
@@ -9776,7 +9804,7 @@ async def test_idle_child_wakes_for_task_and_child_completion_only(
     await asyncio.sleep(0.02)
     # Reads and unrelated notices do not call wake, so they cannot start a turn.
     assert len(turns) == 1
-    store.append_pending_prompt("follow up")
+    await asyncio.to_thread(store.append_pending_prompt, "follow up")
     owner.conversation_channel.wake("root:1")
     await asyncio.sleep(0.02)
     store.append_task_notification(
@@ -9955,7 +9983,7 @@ async def test_idle_nudge_loses_to_prompt_committed_after_eligibility_check(
 
     async def commit_prompt() -> None:
         await eligibility_checked.wait()
-        store.append_pending_prompt("real follow-up")
+        await asyncio.to_thread(store.append_pending_prompt, "real follow-up")
         prompt_committed.set()
 
     commit = asyncio.create_task(commit_prompt())
@@ -10428,7 +10456,7 @@ async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
         "approved",
         channel=owner.conversation_channel,
     ) is None
-    assert child.pending_prompts()[0].data["text"] == "approved"
+    assert (await asyncio.to_thread(child.pending_prompts))[0].data["text"] == "approved"
     owner.cancel_subtree("root:1")
     await owner.wait()
 
@@ -10553,7 +10581,7 @@ async def test_finish_accepted_after_follow_up_read_mid_turn(
     assert backend.finish_attempts == 1
     assert backend.child_prompts.count("first follow-up") == 1
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
-    assert child_store.pending_prompts() == []
+    assert await asyncio.to_thread(child_store.pending_prompts) == []
     assert sum(
         message.role is MessageRole.USER
         and message.metadata.get("zeta.pending_prompt_id") is not None
@@ -10649,7 +10677,7 @@ async def test_ask_parent_answer_does_not_block_finish(
     await _wait_for_notification(store, "completed")
 
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
-    assert child_store.pending_prompts() == []
+    assert await asyncio.to_thread(child_store.pending_prompts) == []
     refusals = [
         message
         for message in child_store.messages()
@@ -10663,6 +10691,89 @@ async def test_ask_parent_answer_does_not_block_finish(
         for entry in store.agent_notifications()
     )
     await loop.close()
+
+
+async def _assert_fence_operation_does_not_block_loop(
+    store: ConversationStore,
+    operation,
+) -> object:
+    locked = threading.Event()
+
+    def hold_lock() -> None:
+        with store._append_lock():
+            locked.set()
+            threading.Event().wait(0.25)
+
+    holder = asyncio.create_task(asyncio.to_thread(hold_lock))
+    assert await asyncio.to_thread(locked.wait, 2)
+    loop = asyncio.get_running_loop()
+    ticked = loop.create_future()
+    started = loop.time()
+    task = asyncio.create_task(operation())
+    loop.call_soon(ticked.set_result, None)
+    await ticked
+    delay = loop.time() - started
+    result = await task
+    await holder
+    assert delay < 0.05
+    return result
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_accept_does_not_block_event_loop(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="finish-off-loop")
+    fence = TerminalTransitionFence(store)
+
+    result = await _assert_fence_operation_does_not_block_loop(
+        store,
+        lambda: fence.accept_finish({"status": "done", "summary": "done"}),
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_idle_nudge_do_not_block_event_loop(
+    tmp_path: Path,
+) -> None:
+    cancel_store = ConversationStore(tmp_path, session_id="cancel-off-loop")
+    assert (
+        await _assert_fence_operation_does_not_block_loop(
+            cancel_store, TerminalTransitionFence(cancel_store).cancel
+        )
+        is True
+    )
+
+    nudge_store = ConversationStore(tmp_path, session_id="nudge-off-loop")
+    assert (
+        await _assert_fence_operation_does_not_block_loop(
+            nudge_store, TerminalTransitionFence(nudge_store).reserve_idle_nudge
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_offload_uses_isolated_writer_not_resident_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="isolated-pending-reader")
+    resident_id = id(store)
+    seen_store_ids: list[int] = []
+    original = ConversationStore.pending_prompts
+
+    def inspect_store(candidate: ConversationStore):
+        seen_store_ids.append(id(candidate))
+        assert id(candidate) != resident_id
+        return original(candidate)
+
+    inspect_store.__name__ = "pending_prompts"
+    monkeypatch.setattr(ConversationStore, "pending_prompts", inspect_store)
+
+    assert await pending_delivery_module.pending_deliveries(store) == []
+    assert len(seen_store_ids) == 1
 
 
 @pytest.mark.asyncio
@@ -10705,7 +10816,8 @@ async def test_resume_legacy_interrupted_send_row_delivers_once(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="child")
-    pending = store.pending_prompt_queue.append(
+    pending = await asyncio.to_thread(
+        store.pending_prompt_queue.append,
         "legacy follow-up", origin=MessageOrigin.AGENT_SEND
     )
     store.append_message(
@@ -10750,7 +10862,7 @@ async def test_resume_legacy_interrupted_send_row_delivers_once(
     assert result["isError"] is False
     assert len(user_rows) == 1
     assert backend.prompt_count == 1
-    assert store.pending_prompts() == []
+    assert await asyncio.to_thread(store.pending_prompts) == []
     await loop.close()
 
 
@@ -10788,7 +10900,7 @@ async def test_tui_child_composer_answer_closes_matching_question(
     await asyncio.wait_for(commands._child_send_tasks[handle][0], timeout=2)
 
     assert question.id not in {entry.id for entry in parent.agent_notifications()}
-    assert [entry.data["text"] for entry in child.pending_prompts()] == [
+    assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == [
         "Re q-composer: approved"
     ]
     await loop.close()
@@ -10822,7 +10934,7 @@ async def test_slash_send_answer_closes_matching_question(tmp_path: Path) -> Non
 
     assert result.startswith(f"queued for {handle}")
     assert question.id not in {entry.id for entry in parent.agent_notifications()}
-    assert [entry.data["text"] for entry in child.pending_prompts()] == [
+    assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == [
         "Re q-slash: approved"
     ]
     await loop.close()
@@ -10848,7 +10960,7 @@ async def test_follow_up_not_acknowledged_by_retry_notice_before_provider_event(
         accepts_follow_ups=True,
     )
     await _send_follow_up(parent_loop, handle, "retry follow-up")
-    pending = child.pending_prompts()[0]
+    pending = (await asyncio.to_thread(child.pending_prompts))[0]
     prompt_message = Message(
         MessageRole.USER,
         [TextContent("retry follow-up")],
@@ -10875,7 +10987,7 @@ async def test_follow_up_not_acknowledged_by_retry_notice_before_provider_event(
     first_attempt.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first_attempt
-    assert [entry.id for entry in child.pending_prompts()] == [pending.id]
+    assert [entry.id for entry in await asyncio.to_thread(child.pending_prompts)] == [pending.id]
 
     persisted_prompt = next(
         message
@@ -10893,7 +11005,7 @@ async def test_follow_up_not_acknowledged_by_retry_notice_before_provider_event(
         )
     )
 
-    assert child.pending_prompts() == []
+    assert await asyncio.to_thread(child.pending_prompts) == []
     assert capture_backend.prompt_count == 1
     assert sum(
         message.metadata.get("zeta.pending_prompt_id") == pending.id
@@ -10944,22 +11056,21 @@ async def test_reviewer_follow_up_committed_at_finish_boundary_is_read(
     tmp_path: Path,
 ) -> None:
     store, registry, _loop = _explicit_finish_registry(tmp_path)
-    store.pending_prompt_queue.append(
-        "review this first", origin=MessageOrigin.AGENT_SEND
+    await asyncio.to_thread(
+        store.pending_prompt_queue.append, "review this first", origin=MessageOrigin.AGENT_SEND
     )
     refused = await registry.execute(
         ToolCall("finish-1", "finish", {"status": "done", "summary": "done"})
     )
     assert refused["isError"] is True
-    await asyncio.to_thread(
-        store.acknowledge_pending_prompt, store.pending_prompts()[0].id
-    )
+    pending = (await asyncio.to_thread(store.pending_prompts))[0]
+    await asyncio.to_thread(store.acknowledge_pending_prompt, pending.id)
     accepted = await registry.execute(
         ToolCall("finish-2", "finish", {"status": "done", "summary": "done"})
     )
     assert accepted["isError"] is False
     with pytest.raises(PendingPromptsClosedError):
-        store.pending_prompt_queue.append("too late", origin=MessageOrigin.AGENT_SEND)
+        await asyncio.to_thread(store.pending_prompt_queue.append, "too late", origin=MessageOrigin.AGENT_SEND)
     await registry.close()
 
 
@@ -11024,7 +11135,7 @@ async def test_terminal_fence_serializes_finish_idle_nudge_cancel_and_recovery(
         return await prompt_fence.reserve_idle_nudge()
 
     nudge = asyncio.create_task(nudge_after_prompt())
-    prompt_store.append_pending_prompt("real follow-up")
+    await asyncio.to_thread(prompt_store.append_pending_prompt, "real follow-up")
     prompt_ready.set()
     assert await nudge is False
 
@@ -11094,7 +11205,7 @@ async def test_explicit_finish_cancel_after_acceptance_keeps_report(
     await finish_accepted.wait()
     assert await fence.cancel() is False
     await finish_task
-    assert store.pending_prompt_queue.explicit_finish_report() == report
+    assert await asyncio.to_thread(store.pending_prompt_queue.explicit_finish_report) == report
 
 
 def test_events_after_terminal_state_emit_no_second_receipt(tmp_path: Path) -> None:

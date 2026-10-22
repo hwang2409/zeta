@@ -170,7 +170,7 @@ async def consume_child(
                     tool_result=event.tool_result,
                     depth=lifecycle_depth(event.tool_call),
                 )
-                if getattr(child_loop, "_yield_for_pending_prompt", False):
+                if child_loop._yield_for_pending_prompt:
                     child_loop._yield_for_pending_prompt = False
                     final_message = Message(
                         MessageRole.ASSISTANT,
@@ -939,25 +939,24 @@ async def run_agent_tool(
     if getattr(child_loop, "explicit_finish", False) and terminal_fence is None:
         terminal_fence = TerminalTransitionFence(child_store)
 
-    def request_child_cancel() -> None:
-        """Cancel this child unless a durable finish already owns termination."""
-        if terminal_fence is not None and not terminal_fence.request_cancel():
-            return
-        child_loop.tool_registry.abort()
-        child_loop.store.drop_client_steering("abort")
-        if not child_task.done():
-            child_task.cancel()
-
     async def cancel_child() -> None:
         nonlocal child_canceled
         if child_canceled:
             return
-        if terminal_fence is not None and terminal_fence.accepted_report() is not None:
+        if terminal_fence is not None and not await terminal_fence.cancel():
             return
         child_canceled = True
+        child_loop.tool_registry.abort()
+        child_loop.store.drop_client_steering("abort")
+        if not child_task.done():
+            child_task.cancel()
         loop._background_owner.cancel_subtree(child_instance_id)
         await asyncio.gather(child_task, return_exceptions=True)
         child_store.mark_agent_canceled(tool_call.id)
+
+    def request_child_cancel() -> asyncio.Task[None]:
+        """Start cancellation without blocking the owner's event loop."""
+        return loop._create_task(cancel_child())
 
     if background:
         # Notification text has a stricter durable contract than the foreground
@@ -969,8 +968,8 @@ async def run_agent_tool(
             MAX_AGENT_NOTIFICATION_TEXT,
         )
 
-        def request_background_cancel() -> None:
-            request_child_cancel()
+        def request_background_cancel() -> asyncio.Task[None]:
+            return request_child_cancel()
 
         def cleanup_background_child() -> None:
             loop._agent_child_stores.pop(tool_call.id, None)

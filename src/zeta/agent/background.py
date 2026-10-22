@@ -127,7 +127,9 @@ class BackgroundAgentOwner:
         self.store_leases = ExitStack()
         self._stores: list[ConversationStore] = []
         self._pending_stores: set[ConversationStore] = set()
-        self._cancellers: dict[str, Callable[[], None]] = {}
+        self._cancellers: dict[
+            str, Callable[[], asyncio.Task[None] | None]
+        ] = {}
         self._watchers: dict[str, asyncio.Task[Any]] = {}
         self._parent_stores: dict[str, ConversationStore] = {}
         self._active_stores: dict[str, tuple[ConversationStore, ...]] = {}
@@ -158,7 +160,26 @@ class BackgroundAgentOwner:
         self.cancel_subtree(instance_id)
         return True
 
-    def cancel_subtree(self, instance_id: str) -> None:
+    async def cancel_and_wait(self, instance_id: str) -> bool:
+        """Request cancellation and wait for asynchronous cancellation work."""
+        if instance_id not in self._cancellers:
+            return False
+        tasks = self.cancel_subtree(instance_id)
+        if not tasks:
+            return True
+        waiter = asyncio.gather(*tasks)
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(waiter)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        return True
+
+    def cancel_subtree(self, instance_id: str) -> tuple[asyncio.Task[None], ...]:
         selected = {instance_id}
         changed = True
         while changed:
@@ -167,10 +188,14 @@ class BackgroundAgentOwner:
                 if child not in selected and parent in selected:
                     selected.add(child)
                     changed = True
+        tasks: list[asyncio.Task[None]] = []
         for child in tuple(self._cancellers):
             if child in selected and child not in self._cancel_requested:
                 self._cancel_requested.add(child)
-                self._cancellers[child]()
+                result = self._cancellers[child]()
+                if isinstance(result, asyncio.Task):
+                    tasks.append(result)
+        return tuple(tasks)
 
     def owns_running(self, instance_id: str) -> bool:
         return instance_id in self._cancellers
@@ -214,7 +239,7 @@ class BackgroundAgentOwner:
     def register(
         self,
         instance_id: str,
-        cancel: Callable[[], None],
+        cancel: Callable[[], asyncio.Task[None] | None],
         watcher: asyncio.Task[Any],
         parent_store: ConversationStore | None = None,
         description: str | None = None,
@@ -568,7 +593,7 @@ def _recover_nested_children(
                 )
                 terminal = child_store.agent_lifecycle() if child_store else None
                 accepted_report = (
-                    TerminalTransitionFence(child_store).accepted_report()
+                    TerminalTransitionFence(child_store).accepted_report_snapshot()
                     if child_store
                     else None
                 )
@@ -733,7 +758,7 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                 )
                 terminal = child_store.agent_lifecycle() if child_store else None
                 accepted_report = (
-                    TerminalTransitionFence(child_store).accepted_report()
+                    TerminalTransitionFence(child_store).accepted_report_snapshot()
                     if child_store
                     else None
                 )
@@ -925,7 +950,7 @@ async def finish_background_child(
     status = "completed"
     notification_text = ""
     explicit_finish_report = (
-        TerminalTransitionFence(child_store).accepted_report()
+        await TerminalTransitionFence(child_store).recover()
         if explicit_finish
         else None
     )

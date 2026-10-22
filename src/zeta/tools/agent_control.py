@@ -41,7 +41,7 @@ async def agent_cancel(
         owner = _owner(registry)
         if _status(registry, [handle]):
             return _agent_error("unknown child handle", max_bytes)
-        requested = owner.cancel(handle)
+        requested = await owner.cancel_and_wait(handle)
         result = {
             "content": [text_block(
                 "agent cancellation requested: " + handle

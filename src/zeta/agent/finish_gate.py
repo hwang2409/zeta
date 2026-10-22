@@ -247,7 +247,7 @@ async def _wait_for_finish(
         state.note_task_outlived_child_bound(bool(tasks))
         state.begin_post_task_turns(bool(tasks))
         pending_notification = child_loop.notification_system_message() is not None
-        terminal = _terminal_transition(
+        terminal = await _terminal_transition(
             child_loop,
             children,
             tasks,
@@ -271,14 +271,16 @@ async def _wait_for_finish(
     return FinishGateResult("completed")
 
 
-def _terminal_transition(
+async def _terminal_transition(
     child_loop: AgentLoop,
     children: tuple[tuple[str, str], ...],
     tasks: tuple[tuple[str, str], ...],
     pending_notification: bool,
     delivering_prompt_id: str | None,
 ) -> FinishGateResult | None:
-    pending_prompts = child_loop.store.pending_prompts()
+    pending_prompts = await child_loop.store._to_thread_durable(
+        child_loop.store.pending_prompts
+    )
     if any(prompt.id != delivering_prompt_id for prompt in pending_prompts):
         return FinishGateResult("completed")
     if not children and not tasks and not pending_notification:

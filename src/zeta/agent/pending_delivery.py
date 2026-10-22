@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -105,26 +104,12 @@ def _answered_question_notification_id(
     )
 
 
-async def _offload_store_call[T](function: Callable[[], T]) -> T:
-    task = asyncio.create_task(asyncio.to_thread(function))
-    cancelled = False
-    while True:
-        try:
-            result = await asyncio.shield(task)
-            break
-        except asyncio.CancelledError:
-            cancelled = True
-    if cancelled:
-        raise asyncio.CancelledError
-    return result
-
-
 async def pending_deliveries(
     store: ConversationStore,
 ) -> list[ConversationEntry]:
     """Read pending deliveries without file I/O on the event loop."""
 
-    return await _offload_store_call(store.pending_prompts)
+    return await store._to_thread_durable(store.pending_prompts)
 
 
 async def close_pending_delivery_queue_if_empty(
@@ -132,13 +117,13 @@ async def close_pending_delivery_queue_if_empty(
 ) -> list[ConversationEntry]:
     """Atomically return pending deliveries or close empty admission off-loop."""
 
-    return await _offload_store_call(store.close_pending_queue_if_empty)
+    return await store._to_thread_durable(store.close_pending_queue_if_empty)
 
 
 async def close_pending_delivery_queue(store: ConversationStore) -> None:
     """Close pending-delivery admission off-loop."""
 
-    await _offload_store_call(store.close_pending_queue)
+    await store._to_thread_durable(store.close_pending_queue)
 
 
 def _commit_follow_up(
