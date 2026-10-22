@@ -971,7 +971,8 @@ def build_key_bindings(
     @bindings.add(*resolved_keys["exit"], filter=~panel_mode)
     def exit_prompt(event: KeyPressEvent) -> None:
         on_exit()
-        event.app.exit(exception=EOFError())
+        if event.app.future is not None and not event.app.future.done():
+            event.app.exit(exception=EOFError())
 
     if on_page_up is not None:
 
