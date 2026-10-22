@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.accounts import AccountId
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session import SessionManager, SessionMetadata
@@ -4042,6 +4043,24 @@ async def test_stream_access_recovery_does_not_depend_on_message(
     # Reuse the round-3 wire scenario without changing its assertions:
     # dedicated code, durable restoration, and a successful next send.
     await test_stream_access_error_restores_model_over_wire(tmp_path, provider, events)
+
+
+@pytest.mark.asyncio
+async def test_serve_session_response_includes_account_fields(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        server.runtime.manager.record_account_selection(
+            server.runtime.metadata, AccountId("codex", "named"), boundary=3, switched=True
+        )
+        row = (await _request(reader, writer, 3, "list_sessions"))[-1]["result"]["sessions"][0]
+        assert row["selected_accounts"] == {"codex": "codex:named"}
+        assert row["account_switch_sequences"] == {"codex": 1}
+        assert row["native_context_boundaries"] == {"codex": 3}
+    finally:
+        await _close(server, writer)
 
 
 @pytest.mark.asyncio

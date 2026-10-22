@@ -73,6 +73,7 @@ import httpx
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.accounts import AccountId
 from zeta.automations import commands
 from zeta.automations import runner as automation_runner
 from zeta.automations.authoring import import_jobs, listing, resolve_job
@@ -2124,6 +2125,62 @@ def test_action_allow_permissions_validate_and_match(tmp_path: Path) -> None:
     assert policy.decide(registry.resolve_call("task", {"action": "start", "command": "ruff"})) is ApprovalDecision.DENY
 
 @pytest.mark.asyncio
+async def test_approved_legacy_revision_without_account_fails_with_redraft_guidance(
+    tmp_path: Path,
+) -> None:
+    job = _job(tmp_path, "legacy")
+    with SQLiteStore(tmp_path) as store:
+        state = store.draft(job)
+        document = state.job.document()
+        document.pop("account", None)
+        store.db.execute(
+            "UPDATE revisions SET document=? WHERE name=? AND revision=?",
+            (json.dumps(document), job.name, state.revision),
+        )
+        store.db.execute(
+            "UPDATE jobs SET enabled=1, approved_at=?, recipient=?, last_run=?, last_check=? WHERE name=?",
+            (START.isoformat(), "U123", START.isoformat(), START.isoformat(), job.name),
+        )
+        store.db.commit()
+        due = tick(store, DUE)[0]
+        run_id = store.claim(due)
+        await run_claimed(store, due, run_id, home=tmp_path)
+        run = store.runs(job.name)[0]
+        assert run.status == "failed"
+        assert "create a new draft revision (re-draft the job) and approve it" in run.detail
+        assert "reapprove" not in run.detail
+        assert not (tmp_path / "sessions").exists()
+
+
+async def test_approved_revision_with_removed_account_fails_with_redraft_guidance(
+    tmp_path: Path,
+) -> None:
+    from tests.support.credentials import named_account_credentials
+    from zeta.oauth import OAuthTokens
+
+    account = AccountId("codex", "removed")
+    named_account_credentials(tmp_path, "codex", "removed").save(
+        OAuthTokens("access", "refresh", 9_999_999_999.0)
+    )
+    job = _job(tmp_path, "removed")
+    with SQLiteStore(tmp_path) as store:
+        state = store.draft(job)
+        store.approve(job.name, state.revision, "U123", START)
+        registry = json.loads((tmp_path / "accounts.json").read_text())
+        registry["accounts"].pop(str(account))
+        registry["defaults"].pop("codex", None)
+        (tmp_path / "accounts.json").write_text(json.dumps(registry))
+        due = tick(store, DUE)[0]
+        run_id = store.claim(due)
+        await run_claimed(store, due, run_id, home=tmp_path)
+        run = store.runs(job.name)[0]
+        assert run.status == "failed"
+        assert "create a new draft revision (re-draft the job) and approve it" in run.detail
+        assert "log the account back in under the same name" in run.detail
+        assert "reapprove" not in run.detail
+        assert not (tmp_path / "sessions").exists()
+
+
 async def test_run_pins_account_recorded_at_approval(tmp_path: Path) -> None:
     from tests.support.credentials import named_account_credentials
     from zeta.accounts import AccountId, AccountStore

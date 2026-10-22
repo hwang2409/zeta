@@ -118,6 +118,23 @@ from .project_inbox import ProjectInboxNotificationMixin
 from .skill_refresh import RuntimePrompt, SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 
+
+def _sanitize_account_message(message: Message) -> Message:
+    content = [
+        ThinkingContent(block.text)
+        if isinstance(block, ThinkingContent)
+        else block
+        for block in message.content
+        if not isinstance(block, RedactedThinkingContent)
+    ]
+    return Message(
+        message.role,
+        content,
+        tool_result=message.tool_result,
+        metadata=message.metadata,
+    )
+
+
 TaskResult = TypeVar("TaskResult")
 
 class AgentLoop(
@@ -308,30 +325,15 @@ class AgentLoop(
         sequence = account_context.switch_sequence if account_context is not None else 0
         if provider is None or sequence == 0:
             return messages
-        safe: list[Message] = []
-        for message in messages:
+        return [
+            message
             if (
                 message.metadata.get("account_provider") == provider
                 and message.metadata.get("account_switch_sequence") == sequence
-            ):
-                safe.append(message)
-                continue
-            content = [
-                ThinkingContent(block.text)
-                if isinstance(block, ThinkingContent)
-                else block
-                for block in message.content
-                if not isinstance(block, RedactedThinkingContent)
-            ]
-            safe.append(
-                Message(
-                    message.role,
-                    content,
-                    tool_result=message.tool_result,
-                    metadata=message.metadata,
-                )
             )
-        return safe
+            else _sanitize_account_message(message)
+            for message in messages
+        ]
 
     def set_backend(self, backend: CompletionBackend) -> None:
         """Replace the provider backend used by subsequent completions."""

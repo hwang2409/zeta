@@ -41,6 +41,25 @@ MountFactory = Callable[
 ]
 
 
+def _account_preflight(job: Job, home: Path, backend: CompletionBackend | None) -> str | None:
+    pinned_account = AccountId(*job.account.split(":", 1)) if job.account else None
+    named_provider = account_provider(job.provider)
+    if named_provider is None or api_key_mode(job.provider) or backend is not None:
+        return None
+    if pinned_account is None:
+        return (
+            "approved automation revision has no pinned account; create a new draft "
+            "revision (re-draft the job) and approve it"
+        )
+    if not AccountStore(home).contains(pinned_account):
+        return (
+            f"approved automation account {pinned_account} no longer exists; create a "
+            "new draft revision (re-draft the job) and approve it, or log the account "
+            "back in under the same name"
+        )
+    return None
+
+
 def poll_events(text: str, lower: datetime, upper: datetime) -> tuple[PollEvent, ...]:
     value = json.loads(text)
     if (
@@ -126,22 +145,9 @@ async def run_claimed(
         return
     job = state.job
     pinned_account = AccountId(*job.account.split(":", 1)) if job.account else None
-    named_provider = account_provider(job.provider)
-    if named_provider is not None and not api_key_mode(job.provider):
-        if pinned_account is None and backend is None:
-            store.finish(
-                run_id,
-                "failed",
-                "approved automation revision has no pinned account; reapprove it",
-            )
-            return
-        if backend is None and not AccountStore(home).contains(pinned_account):
-            store.finish(
-                run_id,
-                "failed",
-                f"approved automation account {pinned_account} no longer exists; reapprove it",
-            )
-            return
+    if (detail := _account_preflight(job, home, backend)) is not None:
+        store.finish(run_id, "failed", detail)
+        return
     skill_catalog = discover_session_skills(home=home)
     agent_catalog = discover_packaged_agents()
     manager = SessionManager(home)
