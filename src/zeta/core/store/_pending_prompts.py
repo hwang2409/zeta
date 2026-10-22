@@ -7,13 +7,14 @@ import weakref
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from ...protocol.types import MessageOrigin
+from ...protocol.types import Message, MessageOrigin
 from ..checkpoints import ConversationEntry
 
 if TYPE_CHECKING:
     from ._store import ConversationStore
 
 MAX_PENDING_PROMPT_TEXT = 16_000
+PENDING_PROMPT_ID_METADATA = "zeta.pending_prompt_id"
 
 
 class PendingPromptsClosedError(RuntimeError):
@@ -81,6 +82,27 @@ class PendingPromptQueue:
                 self._store._append_row_unlocked(
                     "pending_prompt_ack", {"prompt_id": prompt_id}
                 )
+
+    def acknowledge_messages(self, messages: list[Message]) -> None:
+        """Consume pending prompts included in one provider context."""
+        prompt_ids = {
+            prompt_id
+            for message in messages
+            if isinstance(
+                prompt_id := message.metadata.get(PENDING_PROMPT_ID_METADATA), str
+            )
+        }
+        if not prompt_ids:
+            return
+        with self._store._append_lock():
+            self._store._load()
+            pending_ids = {entry.id for entry in self._pending_unlocked()}
+            rows = [
+                ("pending_prompt_ack", {"prompt_id": prompt_id})
+                for prompt_id in prompt_ids & pending_ids
+            ]
+            if rows:
+                self._store._append_many_unlocked(rows)
 
     def close_if_empty(self) -> list[ConversationEntry]:
         with self._store._append_lock():

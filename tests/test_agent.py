@@ -1338,6 +1338,16 @@ async def _wait_for_notification(store: ConversationStore, status: str) -> objec
     raise AssertionError(f"missing {status} background notification")
 
 
+async def _wait_for_pending_prompt_count(
+    store: ConversationStore, expected: int
+) -> None:
+    for _ in range(100):
+        if len(store.pending_prompts()) == expected:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"pending prompt count did not reach {expected}")
+
+
 async def _wait_for_no_agent_children(store: ConversationStore) -> None:
     for _ in range(100):
         if not store.agent_children():
@@ -5529,6 +5539,9 @@ class FollowUpFinishBackend(CompletionBackend):
         self.last_finish_prompt = ""
         self.replied_after_finish = False
         self.finish_generated = asyncio.Event()
+        self.finish_context_seen = asyncio.Event()
+        self.release_finish = asyncio.Event()
+        self.pause_before_finish = False
 
     async def complete(
         self,
@@ -5546,6 +5559,7 @@ class FollowUpFinishBackend(CompletionBackend):
             ),
             "",
         )
+        pause_before_blocks = False
         if last_user == "start":
             blocks = [ToolUseContent(_run_agent_call())]
         elif not self.child_prompts:
@@ -5558,6 +5572,8 @@ class FollowUpFinishBackend(CompletionBackend):
             blocks = [TextContent("continue")]
         else:
             self.child_prompts.append(last_user)
+            self.finish_context_seen.set()
+            pause_before_blocks = self.pause_before_finish
             self.finish_attempts += 1
             self.last_finish_prompt = last_user
             self.replied_after_finish = False
@@ -5571,6 +5587,80 @@ class FollowUpFinishBackend(CompletionBackend):
                     )
                 )
             ]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        if pause_before_blocks:
+            await self.release_finish.wait()
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+class AskParentFinishBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.child_started = asyncio.Event()
+        self.release_child = asyncio.Event()
+        self.question_published = asyncio.Event()
+        self.answer_seen = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        question_asked = any(
+            message.tool_result is not None
+            and message.tool_result.tool_call_id == "ask-parent"
+            for message in messages
+        )
+        finish_called = any(
+            message.tool_result is not None
+            and message.tool_result.tool_call_id == "finish-answer"
+            for message in messages
+        )
+        if finish_called:
+            blocks = [TextContent("done")]
+        elif last_user == "start":
+            blocks = [ToolUseContent(_run_agent_call())]
+        elif not question_asked:
+            self.child_started.set()
+            await self.release_child.wait()
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "ask-parent",
+                        "ask_parent",
+                        {"question": "may i finish?"},
+                    )
+                )
+            ]
+        elif last_user == "approved":
+            self.answer_seen.set()
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "finish-answer",
+                        "finish",
+                        {"status": "done", "summary": "approved"},
+                    )
+                )
+            ]
+        else:
+            self.question_published.set()
+            blocks = [ToolUseContent(ToolCall("status", "agent_status", {}))]
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
@@ -10254,10 +10344,11 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
 
 
 @pytest.mark.asyncio
-async def test_explicit_finish_accepts_from_a_delivered_follow_up(
+async def test_finish_accepted_after_follow_up_read_mid_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = FollowUpFinishBackend()
+    backend.pause_before_finish = True
     monkeypatch.setitem(AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True))
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
@@ -10266,25 +10357,33 @@ async def test_explicit_finish_accepts_from_a_delivered_follow_up(
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
     handle = _run_handle_from_receipt(store)
+    child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
     assert send_to_run(
         store, handle, "first follow-up",
         channel=loop._background_owner.conversation_channel,
     ) is None
     backend.release_child.set()
+    await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
+    child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+    await _wait_for_pending_prompt_count(child_store, 0)
+    backend.release_finish.set()
     await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
     await _wait_for_notification(store, "completed")
 
     assert backend.finish_attempts == 1
     assert backend.child_prompts[-1] == "first follow-up"
+    child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+    assert child_store.pending_prompts() == []
     await loop.close()
 
 
 @pytest.mark.asyncio
-async def test_explicit_finish_refuses_when_another_follow_up_is_queued(
+async def test_unread_follow_up_still_blocks_finish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = FollowUpFinishBackend()
     backend.finish_refused_recovery = True
+    backend.pause_before_finish = True
     monkeypatch.setitem(AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True))
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
@@ -10295,9 +10394,13 @@ async def test_explicit_finish_refuses_when_another_follow_up_is_queued(
     handle = _run_handle_from_receipt(store)
     channel = loop._background_owner.conversation_channel
     assert send_to_run(store, handle, "first follow-up", channel=channel) is None
-    assert send_to_run(store, handle, "second follow-up", channel=channel) is None
     child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
     backend.release_child.set()
+    await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
+    child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+    await _wait_for_pending_prompt_count(child_store, 0)
+    assert send_to_run(store, handle, "second follow-up", channel=channel) is None
+    backend.release_finish.set()
     await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
     await _wait_for_notification(store, "completed")
 
@@ -10313,6 +10416,50 @@ async def test_explicit_finish_refuses_when_another_follow_up_is_queued(
         for message in child_store.messages()
         if message.tool_result is not None
     ]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_ask_parent_answer_does_not_block_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = AskParentFinishBackend()
+    monkeypatch.setitem(
+        AGENT_PRESETS,
+        "run",
+        replace(AGENT_PRESETS["run"], explicit_finish=True),
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    handle = _run_handle_from_receipt(store)
+    child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
+    backend.release_child.set()
+    await asyncio.wait_for(backend.question_published.wait(), timeout=2)
+    assert send_to_run(
+        store,
+        handle,
+        "approved",
+        channel=loop._background_owner.conversation_channel,
+    ) is None
+    await asyncio.wait_for(backend.answer_seen.wait(), timeout=2)
+    await _wait_for_notification(store, "completed")
+
+    child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+    assert child_store.pending_prompts() == []
+    assert not any(
+        message.tool_result is not None
+        and message.tool_result.is_error
+        and "pending follow-up" in message.tool_result.content
+        for message in child_store.messages()
+    )
+    assert not any(
+        entry.data.get("kind") == "child_question"
+        for entry in store.agent_notifications()
+    )
     await loop.close()
 
 

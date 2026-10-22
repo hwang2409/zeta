@@ -34,6 +34,7 @@ from ...core.hooks import HookManager
 from ...core.slash import effective_budget_for_model
 from ...core.store import ConversationStore
 from ...core.store._approval_display import ApprovalAuditRequest
+from ...core.store._pending_prompts import PENDING_PROMPT_ID_METADATA
 from ...core.tool_dispatch import dispatch_tool_calls
 from ...mcp import (
     MCPManagementService,
@@ -887,8 +888,30 @@ class AgentLoop(
                     self.backend.complete(context_messages, active_tools),
                     provider_retry_budget,
                 )
-                provider_stream = completion if steering is None else provider_events(
-                    completion, partial(self.store.deliver_client_steering, steering)
+
+                pending_prompt_context = any(
+                    PENDING_PROMPT_ID_METADATA in message.metadata
+                    for message in context_messages
+                )
+                provider_stream = (
+                    completion
+                    if steering is None and not pending_prompt_context
+                    else provider_events(
+                        completion,
+                        (
+                            partial(self.store.deliver_client_steering, steering)
+                            if steering is not None
+                            else None
+                        ),
+                        (
+                            partial(
+                                self.store.acknowledge_pending_prompt_messages,
+                                context_messages,
+                            )
+                            if pending_prompt_context
+                            else None
+                        ),
+                    )
                 )
                 async for event in provider_stream:
                     attempt_state.observe(event)

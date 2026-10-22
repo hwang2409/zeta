@@ -193,10 +193,20 @@ async def consume_child(
         )
 
     try:
+        user_message = None
+        if delivering_prompt_id is not None:
+            user_message = Message(
+                MessageRole.USER,
+                [TextContent(prompt)],
+                metadata={
+                    "zeta.origin": origin.value,
+                    "zeta.pending_prompt_id": delivering_prompt_id,
+                },
+            )
         events = (
             child_loop.run_notification_turn()
             if notification_turn
-            else child_loop.run_turn(prompt, origin=origin)
+            else child_loop.run_turn(prompt, origin=origin, user_message=user_message)
         )
         await consume_events(events)
         if explicit_report is not None:
@@ -465,7 +475,9 @@ async def _build_child_loop(
         if child_loop.explicit_finish:
             register_finish(child_registry, child_loop=child_loop)
             register_handoff(child_loop)
-        loop._background_owner.conversation_channel.register_loop(child_instance_id)
+        loop._background_owner.conversation_channel.register_loop(
+            child_instance_id, child_loop
+        )
         if loop.plan_mode:
             child_loop.set_plan_mode(True)
         child_loop.set_background_event_sink(loop._publish_background_event)

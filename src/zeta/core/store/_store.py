@@ -817,6 +817,15 @@ class ConversationStore(
 
         self.pending_prompt_queue.acknowledge(prompt_id)
 
+    async def acknowledge_pending_prompt_messages(
+        self, messages: list[Message]
+    ) -> None:
+        """Acknowledge follow-ups when their provider context starts."""
+
+        await self._to_thread_durable(
+            self.pending_prompt_queue.acknowledge_messages, messages
+        )
+
     def append_compaction_marker(
         self,
         summary: str,
