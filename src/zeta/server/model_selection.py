@@ -5,11 +5,9 @@ Keep a durable fallback until the selected model completes its first response.
 This uses the existing protocol 1.1 settings RPC and ordinary error events.
 """
 
-import asyncio
-
 from ..accounts import AccountId, account_provider, api_key_mode
 from ..core.approval import ApprovalDecision
-from ..core.session import SessionMetadata
+from ..core.session import SessionMetadata, persist_metadata_change
 from ..core.slash import resolve_session_budget
 from ..models.catalog import provider_for_model
 from ..protocol.types import ErrorInfo
@@ -105,13 +103,16 @@ async def apply(
 async def confirm(runtime: ServerRuntime) -> None:
     metadata = runtime.metadata
     if metadata.model_fallback is not None:
-        await asyncio.to_thread(
-            runtime.manager.record_session_settings,
+        await persist_metadata_change(
+            runtime.manager,
             metadata,
-            model=metadata.model,
-            approval_mode=runtime.policy.default.value,
-            budget=metadata.compaction_budget,
-            provider=metadata.provider,
+            lambda candidate: runtime.manager.record_session_settings(
+                candidate,
+                model=candidate.model,
+                approval_mode=runtime.policy.default.value,
+                budget=candidate.compaction_budget,
+                provider=candidate.provider,
+            ),
         )
 
 

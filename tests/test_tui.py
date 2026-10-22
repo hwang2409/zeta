@@ -1526,14 +1526,16 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
     )
     attention_fork.unregister("request_attention")
     register_fork(attention_fork)
-    automation_session = SessionManager(tmp_path / "automation").create(
+    automation_session = await asyncio.to_thread(
+        SessionManager(tmp_path / "automation").create,
         provider="codex",
         model="fake",
         cwd=tmp_path,
         skill_catalog=SkillCatalog.empty(),
         system_prompt="system",
     )
-    automation_loop = build_unattended_loop(
+    automation_loop = await asyncio.to_thread(
+        build_unattended_loop,
         automation_session,
         home=tmp_path / "automation",
         allow=(),
@@ -10296,7 +10298,8 @@ async def test_vi_composer_history_down_restores_multiline_entry_cursor(
     assert submitted == ["first line\nsecond line", "other first\nother second"]
 
 
-def test_vim_slash_command_toggles_both_directions(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_vim_slash_command_toggles_both_directions(tmp_path: Path) -> None:
     session = PromptSession()
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
@@ -10308,10 +10311,10 @@ def test_vim_slash_command_toggles_both_directions(tmp_path: Path) -> None:
     app._invalidate_prompt = lambda: None
     session.editing_mode = EditingMode.VI
 
-    assert app.slash_vim("off") == "vim mode: off"
+    assert await app.slash_vim("off") == "vim mode: off"
     assert app.vim_mode is False
     assert session.editing_mode is EditingMode.EMACS
-    assert app.slash_vim("on") == "vim mode: on"
+    assert await app.slash_vim("on") == "vim mode: on"
     assert app.vim_mode is True
     assert session.editing_mode is EditingMode.VI
 
@@ -11992,7 +11995,8 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
     tmp_path: Path, model: str, expected_budget: int
 ) -> None:
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(
+    opened = await asyncio.to_thread(
+        manager.create,
         provider="ollama",
         model="claude-sonnet-4-6",
         cwd=tmp_path,
@@ -12075,7 +12079,9 @@ async def test_tui_model_command_respects_unknown_fence_and_uses_transition(
     tmp_path: Path,
 ) -> None:
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
+    )
     context = SessionAccountContext.load(
         manager.home, manager, opened.metadata, validate=False
     )
@@ -12129,7 +12135,9 @@ async def test_tui_model_command_respects_unknown_fence_and_uses_transition(
 @pytest.mark.asyncio
 async def test_tui_model_command_does_no_lock_work_on_loop(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
+    )
     context = SessionAccountContext.load(
         manager.home, manager, opened.metadata, validate=False
     )
@@ -12207,7 +12215,9 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     )
     await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     resolver = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -12269,7 +12279,9 @@ async def test_account_picker_ignores_repeat_select_while_switching(
         )
     await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     resolver = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -12432,7 +12444,9 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
         OAuthTokens("access", "refresh", 9_999_999_999, email="henry@example.com"),
     )
     manager = SessionManager(home)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     context = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -12527,7 +12541,7 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
     }
     store._write_usage_bytes(account, (json.dumps(usage) + "\n").encode())
     manager = SessionManager(home)
-    opened = manager.create(provider="claude", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(manager.create, provider="claude", model="offline", cwd=tmp_path)
     context = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -12578,7 +12592,7 @@ async def test_accounts_refresh_does_not_block_event_loop(
         OAuthTokens("access", "refresh", 9_999_999_999),
     )
     manager = SessionManager(home)
-    opened = manager.create(provider="claude", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(manager.create, provider="claude", model="offline", cwd=tmp_path)
     context = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )

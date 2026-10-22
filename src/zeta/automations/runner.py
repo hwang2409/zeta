@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..accounts import AccountId, AccountStore, account_provider, api_key_mode
-from ..core.session import SessionManager
+from ..core.session import SessionManager, persist_metadata_change
 from ..mcp.mount import MCPMount
 from ..project_registry import ProjectRegistryError
 from ..prompts import load_identity
@@ -161,7 +161,8 @@ async def run_claimed(
             "project discovery unavailable; continuing without project: %s", exc
         )
         project_id = None
-    session = manager.create(
+    session = await asyncio.to_thread(
+        manager.create,
         provider=job.provider,
         model=job.model,
         cwd=job.cwd,
@@ -173,7 +174,13 @@ async def run_claimed(
         auto_project=False,
     )
     if pinned_account is not None:
-        manager.record_account_selection(session.metadata, pinned_account, boundary=0)
+        await persist_metadata_change(
+            manager,
+            session.metadata,
+            lambda candidate: manager.record_account_selection(
+                candidate, pinned_account, boundary=0
+            ),
+        )
     store.attach_session(run_id, session.metadata.session_id)
     loop = None
     phase = "running"
@@ -302,4 +309,9 @@ async def run_claimed(
         if loop is not None:
             loop.abort()
             await loop.close()
-        SessionManager(home).touch(session.metadata)
+        final_manager = SessionManager(home)
+        await persist_metadata_change(
+            final_manager,
+            session.metadata,
+            lambda candidate: final_manager.touch(candidate),
+        )

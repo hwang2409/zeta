@@ -356,7 +356,7 @@ class ServerRuntime:
     async def resume_session(self, session_id: str) -> SessionMetadata:
         if self._state is not None and self._state.session_id == session_id:
             return self.metadata
-        metadata = self.manager.read_metadata(session_id)
+        metadata = await asyncio.to_thread(self.manager.read_metadata, session_id)
         if metadata.provider == "fake":
             raise ValueError(REMOVED_PROVIDER_ERROR)
         session_cwd = Path(metadata.cwd)
@@ -384,7 +384,8 @@ class ServerRuntime:
             cwd_project = resolve_project_context(
                 discovery, self.manager.project_registry
             )
-            resumed_prompt = resume_prompt(
+            resumed_prompt = await asyncio.to_thread(
+                resume_prompt,
                 opened.metadata,
                 manager=self.manager,
                 store=opened.store,

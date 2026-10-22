@@ -336,7 +336,7 @@ class SessionAccountContext:
                 self._mark_unknown(build_backend)
             return metadata
         finally:
-            locked.release()
+            await asyncio.shield(asyncio.to_thread(locked.release))
 
     def _mark_unknown(
         self, build_backend: Callable[[SessionMetadata], Any]
@@ -458,7 +458,7 @@ class SessionAccountContext:
         try:
             self._apply(loop, state)
         finally:
-            locked.release()
+            await asyncio.shield(asyncio.to_thread(locked.release))
 
     def _recover_locked(
         self, loop: Any, build_backend: Callable[[SessionMetadata], Any]

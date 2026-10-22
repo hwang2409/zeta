@@ -28,7 +28,12 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.project_context import project_instructions_editor_command
-from zeta.core.session import SessionError, SessionManager
+from zeta.core.session import (
+    SessionError,
+    SessionManager,
+    SessionMetadata,
+    persist_metadata_change,
+)
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.project_registry import ProjectRegistry
@@ -1329,14 +1334,15 @@ async def test_completed_turn_refreshes_recency_off_loop_and_flushes_on_close(
     manager = SessionManager(home)
     first_metadata = manager.read_metadata(session_id)
     first_metadata.updated_at = "2020-01-01T00:00:00+00:00"
-    manager._write(first_metadata)
-    other = manager.create(
+    await asyncio.to_thread(manager._write, first_metadata)
+    other = await asyncio.to_thread(
+        manager.create,
         provider=first_metadata.provider,
         model=first_metadata.model,
         cwd=tmp_path,
     )
     other.metadata.updated_at = "2021-01-01T00:00:00+00:00"
-    manager._write(other.metadata)
+    await asyncio.to_thread(manager._write, other.metadata)
     other.store.close()
     backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
 
@@ -1366,6 +1372,55 @@ async def test_completed_turn_refreshes_recency_off_loop_and_flushes_on_close(
     assert manager.find_most_recent(cwd=tmp_path).session_id == session_id
     assert write_threads
     assert all(thread_id != event_loop_thread for thread_id in write_threads)
+
+
+@pytest.mark.asyncio
+async def test_persist_metadata_change_converges_when_cancelled(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def change(candidate: SessionMetadata) -> None:
+        started.set()
+        release.wait(timeout=1)
+        manager.record_name(candidate, name="persisted")
+
+    task = asyncio.create_task(
+        persist_metadata_change(manager, opened.metadata, change)
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert opened.metadata.name == "persisted"
+    persisted = await asyncio.to_thread(
+        manager.read_metadata, opened.metadata.session_id
+    )
+    assert persisted.name == "persisted"
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_metadata_lock_rejects_event_loop_thread(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    try:
+        with (
+            pytest.raises(SessionError, match="event-loop thread"),
+            manager._metadata_lock(opened.metadata.session_id),
+        ):
+            pass
+    finally:
+        opened.store.close()
 
 
 def test_recency_refresh_skips_busy_lock_and_later_succeeds(tmp_path: Path) -> None:
@@ -1432,13 +1487,26 @@ async def test_close_does_not_wait_for_busy_recency_lock(
     app._invalidate_prompt = lambda: None
     manager = SessionManager(home)
     timed_out = False
+    lock_held = threading.Event()
+    release_lock = threading.Event()
 
-    with manager._metadata_lock(session_id):
+    def hold_lock() -> None:
+        with manager._metadata_lock(session_id):
+            lock_held.set()
+            release_lock.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert await asyncio.to_thread(lock_held.wait, 1)
+    try:
         await app._consume_turn("hello")
         try:
             await asyncio.wait_for(app.close(), timeout=0.5)
         except TimeoutError:
             timed_out = True
+    finally:
+        release_lock.set()
+        holder.join(timeout=1)
 
     await app.close()
     assert not timed_out
@@ -1469,7 +1537,9 @@ async def test_recency_refresh_does_not_overwrite_newer_metadata(
     await app._consume_turn("hello")
     manager = SessionManager(home)
     latest = manager.read_metadata(session_id)
-    manager.record_override(latest, provider=None, model="newer-model")
+    await asyncio.to_thread(
+        manager.record_override, latest, provider=None, model="newer-model"
+    )
     await app.close()
 
     assert manager.read_metadata(session_id).model == "newer-model"
@@ -1559,25 +1629,32 @@ async def test_model_swap_persists_and_restores_on_resume(
     assert resumed.model == "gpt-5.6-sol"
 
 
-def test_vim_mode_defaults_on_and_persists_on_resume(
+@pytest.mark.asyncio
+async def test_vim_mode_defaults_on_and_persists_on_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    first = create_app(_args())
+    first = await asyncio.to_thread(create_app, _args())
 
     assert first.vim_mode is True
-    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(first, "/vim off") == "vim mode: off"
+    assert (
+        await create_slash_registry(
+            skill_catalog=SkillCatalog.empty()
+        ).dispatch_async(first, "/vim off")
+        == "vim mode: off"
+    )
     assert first.vim_mode is False
     assert (
         SessionManager(home).open(first.loop.store.session_id).metadata.vim_mode
         is False
     )
 
-    resumed = create_app(
+    resumed = await asyncio.to_thread(
+        create_app,
         build_parser().parse_args(
             ["--resume", first.loop.store.session_id, "--provider", "codex"]
-        )
+        ),
     )
     assert resumed.vim_mode is False
 
@@ -1629,7 +1706,9 @@ async def test_unknown_model_with_provider_prefix_warns_before_state_change(
 ) -> None:
     home = tmp_path / "zeta-home"
     manager = SessionManager(home)
-    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="claude", model="claude-sonnet-4-6", cwd=tmp_path
+    )
     app = TUIApp(
         AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()),
         provider="claude",
@@ -2278,7 +2357,9 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    opened = SessionManager(home).create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        SessionManager(home).create, provider="codex", model="offline", cwd=tmp_path
+    )
     call = ToolCall("approval-resume", "bash", {"command": "danger"})
     opened.store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -2367,7 +2448,9 @@ async def test_slash_approve_and_deny_answer_pending_by_key(
 @pytest.mark.asyncio
 async def test_cancel_then_approve_does_not_resume_tool(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     policy = ApprovalPolicy(store=opened.store)
     executed: list[str] = []
 
@@ -2411,7 +2494,8 @@ async def test_cancel_honors_approval_won_by_other_writer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "zeta-home" / "sessions"
-    opened = SessionManager(tmp_path / "zeta-home").create(
+    opened = await asyncio.to_thread(
+        SessionManager(tmp_path / "zeta-home").create,
         provider="codex", model="offline", cwd=tmp_path
     )
     policy = ApprovalPolicy(store=opened.store)
@@ -2469,7 +2553,9 @@ async def test_resume_pending_tool_executes_and_persists_result(
     tmp_path: Path, decision: str
 ) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     policy = ApprovalPolicy(store=opened.store)
     executed: list[str] = []
 
@@ -2510,7 +2596,9 @@ skill_catalog=SkillCatalog.empty(),
 @pytest.mark.asyncio
 async def test_resumed_tool_abort_active_persists_canceled_result(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     policy = ApprovalPolicy(store=opened.store)
     started = asyncio.Event()
 
@@ -2551,7 +2639,9 @@ skill_catalog=SkillCatalog.empty(),
 @pytest.mark.asyncio
 async def test_resumed_tool_direct_cancel_persists_canceled_result(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     policy = ApprovalPolicy(store=opened.store)
     started = asyncio.Event()
 
@@ -2594,7 +2684,9 @@ async def test_resumed_tool_immediate_abort_persists_canceled_result(
     tmp_path: Path,
 ) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     policy = ApprovalPolicy(store=opened.store)
 
     async def never_runs(arguments: dict[str, str]) -> str:
@@ -2722,7 +2814,9 @@ async def test_resume_does_not_act_on_stale_state_while_writer_holds_lock(
 @pytest.mark.asyncio
 async def test_resume_pending_tool_rejects_existing_result(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     policy = ApprovalPolicy(store=opened.store)
     executed: list[str] = []
 
@@ -2766,7 +2860,8 @@ async def test_summary_success_commits_override_before_main_failure(
 ) -> None:
     home = tmp_path / "zeta-home"
     manager = SessionManager(home)
-    opened = manager.create(
+    opened = await asyncio.to_thread(
+        manager.create,
         provider="codex",
         model="offline",
         cwd=tmp_path,
@@ -2936,7 +3031,9 @@ async def test_resume_replays_historical_agent_wait_call_with_scripted_backend(
     tmp_path: Path,
 ) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     historical = ToolCall("old-wait", "agent_wait", {"handles": ["child"]})
     opened.store.append_message(
         Message(MessageRole.ASSISTANT, [ToolUseContent(historical)])
@@ -2963,7 +3060,9 @@ async def test_resume_replays_historical_agent_wait_call_with_scripted_backend(
 @pytest.mark.asyncio
 async def test_resume_replays_the_same_context_branch(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     backend = FakeBackend([ScriptedTurn(content=[TextContent("first")])])
     loop = AgentLoop(backend, opened.store, skill_catalog=SkillCatalog.empty())
     [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]

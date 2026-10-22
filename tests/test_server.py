@@ -6,6 +6,7 @@ import ast
 import asyncio
 import inspect
 import json
+import multiprocessing
 import os
 import shlex
 import signal
@@ -29,7 +30,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
-from zeta.core.session import SessionManager, SessionMetadata
+from zeta.core.session import SessionManager, SessionMetadata, persist_metadata_change
 from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.oauth import OAuthTokens
@@ -2102,6 +2103,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
     try:
         await _request(reader, writer, 3, "send", {"text": "first"})
         await _event(reader, "usage")
+        await _event(reader, "turn_end")
         assert (await _request(reader, writer, 4, "status"))[-1]["result"]["usage"]
 
         await _request(reader, writer, 5, "new_session", {"provider": "codex"})
@@ -2109,6 +2111,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
 
         await _request(reader, writer, 7, "send", {"text": "second"})
         await _event(reader, "usage")
+        await _event(reader, "turn_end")
         assert (await _request(reader, writer, 8, "status"))[-1]["result"]["usage"]
 
         await _request(reader, writer, 9, "resume", {"session_id": first_session})
@@ -3459,8 +3462,11 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, mo
 async def test_removed_provider_resume_is_rejected_without_session_mutation(
     tmp_path: Path, server_provider: str
 ) -> None:
-    opened = SessionManager(tmp_path).create(
-        provider="fake", model="offline", cwd=tmp_path
+    opened = await asyncio.to_thread(
+        SessionManager(tmp_path).create,
+        provider="fake",
+        model="offline",
+        cwd=tmp_path,
     )
     with opened.store.path.open("ab") as stream:
         stream.write(b'{"type":')
@@ -3523,14 +3529,16 @@ async def test_session_listing_includes_real_and_removed_provider_sessions(
     tmp_path: Path, server_provider: str
 ) -> None:
     manager = SessionManager(tmp_path)
-    sessions = {
-        provider: manager.create(provider=provider, model=model, cwd=tmp_path).metadata.session_id
-        for provider, model in (
-            ("fake", "offline"),
-            ("claude", "claude-sonnet-4-6"),
-            ("codex", "gpt-5.4"),
+    sessions = {}
+    for provider, model in (
+        ("fake", "offline"),
+        ("claude", "claude-sonnet-4-6"),
+        ("codex", "gpt-5.4"),
+    ):
+        opened = await asyncio.to_thread(
+            manager.create, provider=provider, model=model, cwd=tmp_path
         )
-    }
+        sessions[provider] = opened.metadata.session_id
     server = ZetaServer(
         home=tmp_path,
         port=0,
@@ -4067,8 +4075,15 @@ async def test_serve_session_response_includes_account_fields(tmp_path: Path) ->
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        server.runtime.manager.record_account_selection(
-            server.runtime.metadata, AccountId("codex", "named"), boundary=3, switched=True
+        await persist_metadata_change(
+            server.runtime.manager,
+            server.runtime.metadata,
+            lambda candidate: server.runtime.manager.record_account_selection(
+                candidate,
+                AccountId("codex", "named"),
+                boundary=3,
+                switched=True,
+            ),
         )
         row = (await _request(reader, writer, 3, "list_sessions"))[-1]["result"]["sessions"][0]
         assert row["selected_accounts"] == {"codex": "codex:named"}
@@ -4143,7 +4158,9 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
     reader, writer = await _ready(server)
     try:
         sid = server.runtime.session_id
-        server.runtime.manager.rename(sid, "private display name")
+        await asyncio.to_thread(
+            server.runtime.manager.rename, sid, "private display name"
+        )
         for method, params in (("rename_session", {"name": "changed"}), ("delete_session", {})):
             result = (await _request(reader, writer, 3, method, {"session_id": sid, **params}))[-1]
             assert result["error"]["code"] == -32601
@@ -4275,7 +4292,12 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         sid = (await _request(reader, writer, 2, "new_session"))[-1]["result"]["session"]["session_id"]
         # Also check an inactive target so the streaming guard, not the active guard, decides deletion.
-        other = server.runtime.manager.create(provider="codex", model="offline", cwd=tmp_path)
+        other = await asyncio.to_thread(
+            server.runtime.manager.create,
+            provider="codex",
+            model="offline",
+            cwd=tmp_path,
+        )
         other.store.close()
         await _request(reader, writer, 3, "send", {"text": "slow response"})
         await asyncio.wait_for(started.wait(), TIMEOUT)
@@ -6046,6 +6068,89 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
             request_task.cancel()
         holder.join(timeout=1)
         await _close(server, writer)
+
+
+def _serve_switch_rename_race(home_value: str, results: object) -> None:
+    home = Path(home_value)
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        named_account_credentials(home, account.provider, account.name).save(
+            OAuthTokens(account.name, "refresh", 9_999_999_999)
+        )
+    AccountStore(home).set_default(first)
+
+    async def run() -> None:
+        server = ZetaServer(home=home, cwd=home, port=0, provider="codex")
+        reader, writer, sid = await _ready_extensions(server)
+        assert server._client is not None and server.runtime.loop is not None
+        first_client = server._client
+        second_client = _Client(server, asyncio.StreamReader(), writer)
+        original_commit = account_session_module.SessionAccountContext._commit_to_disk
+        event_loop = asyncio.get_running_loop()
+        rename_tasks: list[asyncio.Task[object]] = []
+
+        def commit_then_queue_rename(self: object, state: object):
+            locked = original_commit(self, state)
+
+            def start_rename() -> None:
+                rename_tasks.append(
+                    asyncio.create_task(
+                        second_client._ergonomics(
+                            "rename_session",
+                            {"session_id": sid, "name": "renamed during switch"},
+                        )
+                    )
+                )
+
+            event_loop.call_soon_threadsafe(start_rename)
+            return locked
+
+        account_session_module.SessionAccountContext._commit_to_disk = (  # type: ignore[method-assign]
+            commit_then_queue_rename
+        )
+        try:
+            response = await _request(
+                reader,
+                writer,
+                "switch-racing-rename",
+                "account_switch",
+                {"session_id": sid, "account": str(second)},
+            )
+            assert response[-1]["result"]["account"] == str(second)
+            assert rename_tasks
+            await rename_tasks[0]
+            assert server.runtime.metadata.name == "renamed during switch"
+        finally:
+            account_session_module.SessionAccountContext._commit_to_disk = (  # type: ignore[method-assign]
+                original_commit
+            )
+            await first_client.close()
+            await server.close()
+
+    try:
+        asyncio.run(run())
+    except BaseException as exc:  # noqa: BLE001 - report child failure to parent
+        results.put(repr(exc))
+    else:
+        results.put(None)
+
+
+def test_serve_switch_and_second_client_rename_do_not_deadlock(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    process = context.Process(
+        target=_serve_switch_rename_race,
+        args=(str(tmp_path / "race-home"), results),
+    )
+    process.start()
+    process.join(timeout=5)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1)
+        pytest.fail("serve switch and second-client rename deadlocked")
+    assert process.exitcode == 0
+    assert results.get(timeout=1) is None
 
 
 @pytest.mark.asyncio

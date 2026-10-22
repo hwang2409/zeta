@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import fcntl
 import json
@@ -33,6 +34,7 @@ from .session_files import (
     SessionNotFoundError,
     open_session_file,
     read_session_file,
+    require_off_loop_lock,
     session_directory,
     session_root,
     child_directory,
@@ -58,6 +60,10 @@ from .session_links import (
 logger = logging.getLogger(__name__)
 
 META_VERSION = 1
+
+
+class SessionLoopThreadLockError(SessionError):
+    """A session metadata lock was requested on an asyncio loop thread."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1118,6 +1124,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         blocking: bool = True,
         timeout: float | None = None,
     ):
+        if blocking:
+            require_off_loop_lock("session metadata", SessionLoopThreadLockError)
         self._validate_id(session_id)
         if timeout is not None:
             deadline = time.monotonic() + timeout
@@ -1161,12 +1169,31 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             raise SessionError(f"invalid session id: {session_id!r}")
 
 
+async def persist_metadata_change(
+    manager: SessionManager,
+    metadata: SessionMetadata,
+    change: Callable[[SessionMetadata], None],
+) -> None:
+    """Run durable metadata work off-loop, then apply its result on-loop."""
+
+    candidate = copy.deepcopy(metadata)
+    persistence = asyncio.create_task(asyncio.to_thread(change, candidate))
+    try:
+        await asyncio.shield(persistence)
+    except asyncio.CancelledError:
+        await persistence
+        manager._copy_metadata(metadata, candidate)
+        raise
+    manager._copy_metadata(metadata, candidate)
+
+
 __all__ = [
     "META_VERSION",
     "SESSION_NAME_MAX_LENGTH",
     "OpenedSession",
     "SessionError",
     "SessionInUseError",
+    "SessionLoopThreadLockError",
     "SessionManager",
     "SessionMetadata",
     "SessionPreview",
@@ -1175,6 +1202,7 @@ __all__ = [
     "format_relative_age",
     "list_sessions",
     "normalize_session_name",
+    "persist_metadata_change",
 ]
 
 

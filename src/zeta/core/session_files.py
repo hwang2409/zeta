@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import os
 import stat
 import uuid
+from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
@@ -28,6 +30,18 @@ class SessionInUseError(SessionError):
 
 
 _READ_RETRIES = 3
+
+
+def require_off_loop_lock(
+    kind: str, error: Callable[[str], BaseException] = RuntimeError
+) -> None:
+    """Reject file-lock acquisition on an asyncio event-loop thread."""
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise error(f"{kind} lock requested on an asyncio event-loop thread")
 
 
 @contextmanager

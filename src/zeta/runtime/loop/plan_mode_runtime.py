@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ...agent.plan_mode import plan_mode_prompt
@@ -16,7 +16,7 @@ class PlanModeRuntimeMixin:
     _plan_mode: bool
     _plan_mode_prior_prompt: Any
     _plan_mode_policy: Any
-    _on_plan_mode_change: Callable[[bool], None] | None
+    _on_plan_mode_change: Callable[[bool], Awaitable[None] | None] | None
     context_assembler: Any
     tool_registry: Any
 
@@ -24,14 +24,14 @@ class PlanModeRuntimeMixin:
     def plan_mode(self) -> bool:
         return self._plan_mode
 
-    def set_plan_mode(self, enabled: bool) -> None:
+    def set_plan_mode(self, enabled: bool) -> Awaitable[None] | None:
         """Restrict the assistant to read-only tools, or lift the restriction.
 
         GPT-5.6 keeps tool schemas stable; other models advertise a subset.
         """
 
         if enabled == self._plan_mode:
-            return
+            return None
         assembler = self.context_assembler
         runtime_prompt = getattr(self, "_runtime_prompt", None)
         if enabled:
@@ -54,7 +54,8 @@ class PlanModeRuntimeMixin:
             self._plan_mode_prior_prompt = None
         self._plan_mode = enabled
         if self._on_plan_mode_change is not None:
-            self._on_plan_mode_change(enabled)
+            return self._on_plan_mode_change(enabled)
+        return None
 
     def plan_mode_allows(self, tool_call: ToolCall) -> bool:
         """Authorize one registry-resolved capability in the plan-mode layer."""

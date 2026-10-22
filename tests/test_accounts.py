@@ -1286,7 +1286,9 @@ async def test_grandchild_inherits_child_snapshot_not_global_default(
     )
     await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
-    opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
+    )
     resolver = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -1342,7 +1344,9 @@ async def test_live_child_websearch_ignores_later_parent_switch(
     )
     await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
-    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="claude", model="claude-sonnet-4-6", cwd=tmp_path
+    )
     resolver = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )

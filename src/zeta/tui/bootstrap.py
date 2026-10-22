@@ -29,6 +29,7 @@ from ..core.session import (
     SessionPreview,
     env_home,
     format_relative_age,
+    persist_metadata_change,
 )
 from ..core.slash import resolve_session_budget
 from ..models.catalog import REMOVED_PROVIDER_ERROR
@@ -500,8 +501,44 @@ def _create_app_with_root(
         pending_override = None
         return authoritative
 
-    def plan_mode_changed(enabled: bool) -> None:
-        manager.record_plan_mode(metadata, enabled=enabled)
+    async def persist_budget(budget: int) -> None:
+        await persist_metadata_change(
+            manager,
+            metadata,
+            lambda candidate: manager.record_budget(
+                candidate, budget=budget, pinned=False
+            ),
+        )
+
+    async def persist_vim_mode(enabled: bool) -> None:
+        await persist_metadata_change(
+            manager,
+            metadata,
+            lambda candidate: manager.record_vim_mode(candidate, enabled=enabled),
+        )
+
+    async def persist_name(label: str) -> None:
+        await persist_metadata_change(
+            manager,
+            metadata,
+            lambda candidate: manager.record_name(candidate, name=label),
+        )
+
+    def plan_mode_changed(enabled: bool) -> asyncio.Task[None] | None:
+        try:
+            event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            manager.record_plan_mode(metadata, enabled=enabled)
+            return None
+        return event_loop.create_task(
+            persist_metadata_change(
+                manager,
+                metadata,
+                lambda candidate: manager.record_plan_mode(
+                    candidate, enabled=enabled
+                ),
+            )
+        )
 
     max_turns_override = getattr(args, "max_turns", None)
     composition = compose_runtime(
@@ -566,13 +603,9 @@ def _create_app_with_root(
         on_budget_change=(
             None
             if budget_pinned
-            else lambda budget: manager.record_budget(
-                metadata, budget=budget, pinned=False
-            )
+            else persist_budget
         ),
-        on_vim_mode_change=lambda enabled: manager.record_vim_mode(
-            metadata, enabled=enabled
-        ),
+        on_vim_mode_change=persist_vim_mode,
         startup_notices=startup_notices,
         startup_warnings=startup_warnings,
         startup_alerts=startup_alerts,
@@ -580,7 +613,7 @@ def _create_app_with_root(
         workspace_snapshot_cap=config.workspace_snapshot_cap,
         ephemeral_root=ephemeral_root,
         session_name=metadata.name,
-        on_name_change=lambda label: manager.record_name(metadata, name=label),
+        on_name_change=persist_name,
         key_remap=config.keybindings,
         project_dir=repo_root,
         project_eligible=discovery.eligible and discovery.primary_root is not None,

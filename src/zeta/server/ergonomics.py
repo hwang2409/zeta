@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import os
 import shutil
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from uuid import uuid4
 
@@ -55,6 +56,32 @@ IMAGE_EXTENSIONS = {
 }
 DIRECTION_CONTROLS = "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
 ENTITLEMENT_ERROR_CODES = {"auth_error", "model_not_found", "permission_denied"}
+
+
+async def mutate_session(
+    runtime: ServerRuntime,
+    method: str,
+    session_id: str,
+    name: object,
+    require_idle: Callable[[], Awaitable[None]],
+) -> dict[str, object]:
+    session_id = await asyncio.to_thread(runtime.manager.resolve_id, session_id)
+    if method == "delete_session":
+        await require_idle()
+        if runtime.opened is not None and session_id == runtime.session_id:
+            raise ProtocolError(
+                -32005,
+                "select another session before deleting this session",
+                {"code": "active_session"},
+            )
+        await asyncio.to_thread(runtime.manager.delete, session_id)
+        return {"session_id": session_id}
+    if not isinstance(name, str):
+        raise ProtocolError(-32602, "name must be a string")
+    metadata = await asyncio.to_thread(runtime.manager.rename, session_id, name)
+    if runtime.opened is not None and session_id == runtime.session_id:
+        runtime.manager._copy_metadata(runtime.metadata, metadata)
+    return {"session": metadata.to_dict()}
 
 
 def active(runtime: ServerRuntime, params: dict):

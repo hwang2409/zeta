@@ -23,7 +23,12 @@ from ...accounts import (
 from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
-from ...core.session import SessionError, env_home, normalize_session_name
+from ...core.session import (
+    SessionError,
+    env_home,
+    normalize_session_name,
+    persist_metadata_change,
+)
 from ...core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashStatus,
@@ -501,19 +506,19 @@ class SlashHandlerMixin:
             return f"model: {self.model} ({'; '.join(notes)})"
         return f"model: {self.model}"
 
-    def slash_plan(self, args: str) -> str | ModelInputEnvelope:
+    async def slash_plan(self, args: str) -> str | ModelInputEnvelope:
         """Toggle plan mode or submit a prompt while entering it."""
 
         requested = args.strip()
         normalized = requested.lower()
         if not requested:
-            return self._set_plan_mode_from_command(not self.loop.plan_mode)
+            return await self._set_plan_mode_from_command(not self.loop.plan_mode)
         if normalized == "off":
-            return self._set_plan_mode_from_command(False)
+            return await self._set_plan_mode_from_command(False)
         if normalized == "on":
-            return self._set_plan_mode_from_command(True)
+            return await self._set_plan_mode_from_command(True)
         if normalized == "toggle":
-            return self._set_plan_mode_from_command(not self.loop.plan_mode)
+            return await self._set_plan_mode_from_command(not self.loop.plan_mode)
         if self.active or self.pending_approvals:
             return (
                 "plan mode unchanged: cannot change plan mode while a turn or "
@@ -524,7 +529,7 @@ class SlashHandlerMixin:
             if blocked is not None:
                 return blocked
         if not self.loop.plan_mode:
-            self.loop.set_plan_mode(True)
+            await self._change_plan_mode(True)
             self._invalidate_prompt()
         return ModelInputEnvelope(
             requested,
@@ -532,7 +537,7 @@ class SlashHandlerMixin:
             MessageOrigin.SLASH_EXPANSION,
         )
 
-    def slash_implement(self, args: str) -> str | ModelInputEnvelope:
+    async def slash_implement(self, args: str) -> str | ModelInputEnvelope:
         """Exit plan mode and submit the explicit implementation request."""
 
         if args:
@@ -544,7 +549,7 @@ class SlashHandlerMixin:
                 "implement unavailable: cannot leave plan mode while a turn or "
                 "approval is active"
             )
-        self.loop.set_plan_mode(False)
+        await self._change_plan_mode(False)
         self._invalidate_prompt()
         return ModelInputEnvelope(
             "implement the plan you proposed above",
@@ -552,7 +557,7 @@ class SlashHandlerMixin:
             MessageOrigin.SLASH_EXPANSION,
         )
 
-    def _set_plan_mode_from_command(self, enabled: bool) -> str:
+    async def _set_plan_mode_from_command(self, enabled: bool) -> str:
         if enabled == self.loop.plan_mode:
             return f"plan mode: {'on' if enabled else 'off'}"
         if self.active or self.pending_approvals:
@@ -564,7 +569,7 @@ class SlashHandlerMixin:
             blocked = self._plan_mode_background_blocker()
             if blocked is not None:
                 return blocked
-        self.loop.set_plan_mode(enabled)
+        await self._change_plan_mode(enabled)
         self._invalidate_prompt()
         if enabled:
             return "plan mode: on (read-only tools; deliver the plan as your answer)"
@@ -579,10 +584,18 @@ class SlashHandlerMixin:
             f"{', '.join(work)}; stop it or wait"
         )
 
+    async def _change_plan_mode(self, enabled: bool) -> None:
+        persisted = self.loop.set_plan_mode(enabled)
+        if persisted is not None:
+            await persisted
+
     def toggle_plan_mode(self) -> None:
         """Toggle plan mode from the keyboard, reporting the same notice."""
 
-        self._print_system(self.slash_plan("toggle"))
+        async def toggle() -> None:
+            self._print_system(await self.slash_plan("toggle"))
+
+        asyncio.create_task(toggle())
 
     def slash_tools(self, args: str) -> str:
         """List registered tools or trust pending project tools."""
@@ -637,7 +650,7 @@ class SlashHandlerMixin:
         self.request_new_session()
         return "starting a fresh session..."
 
-    def slash_name(self, args: str) -> str:
+    async def slash_name(self, args: str) -> str:
         """Persist a session label shown in the resume picker."""
 
         raw = args.strip()
@@ -651,13 +664,13 @@ class SlashHandlerMixin:
         except SessionError as exc:
             return f"session name unchanged: {exc}"
         try:
-            self._on_name_change(label)
+            await self._on_name_change(label)
         except SessionError as exc:
             return f"session name unchanged: {exc}"
         self._session_name = label
         return f"session name: {label}"
 
-    def slash_project(self, args: str) -> str:
+    async def slash_project(self, args: str) -> str:
         registry = self.loop.project_registry
         if registry is None:
             return "project registry unavailable"
@@ -669,10 +682,14 @@ class SlashHandlerMixin:
             )
             try:
                 project = registry.find_or_create_for_directory(root)
-                metadata = self.loop.manager.associate_project(
-                    self.loop.session_metadata, project.project_id
+                await persist_metadata_change(
+                    self.loop.manager,
+                    self.loop.session_metadata,
+                    lambda candidate: self.loop.manager.associate_project(
+                        candidate, project.project_id
+                    ),
                 )
-                self.loop._set_runtime_project(metadata)
+                self.loop._set_runtime_project(self.loop.session_metadata)
             except (ProjectRegistryError, OSError, SessionError) as exc:
                 return f"could not initialize project: {exc}"
         else:
@@ -759,7 +776,7 @@ class SlashHandlerMixin:
         self._rebuild_transcript()
         self._invalidate_prompt()
 
-    def slash_vim(self, args: str) -> str:
+    async def slash_vim(self, args: str) -> str:
         requested = args.strip().lower()
         if not args:
             return f"vim mode: {'on' if self.vim_mode else 'off'}"
@@ -768,7 +785,7 @@ class SlashHandlerMixin:
         enabled = not self.vim_mode if requested == "toggle" else requested == "on"
         was_enabled = self.vim_mode
         if self._on_vim_mode_change is not None:
-            self._on_vim_mode_change(enabled)
+            await self._on_vim_mode_change(enabled)
         self.vim_mode = enabled
         if (session := self._active_session or self._session) is not None:
             if was_enabled and not enabled:

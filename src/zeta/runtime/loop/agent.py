@@ -179,7 +179,7 @@ class AgentLoop(
         token_budget: int = 200_000,
         retained_tail: int = 8,
         on_completion_success: Callable[[], Awaitable[None] | None] | None = None,
-        on_plan_mode_change: Callable[[bool], None] | None = None,
+        on_plan_mode_change: Callable[[bool], Awaitable[None] | None] | None = None,
         hooks: HookManager | None = None,
         skip_mcp_mount: bool = False,
         agent_depth: int = 0,
