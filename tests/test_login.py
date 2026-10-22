@@ -225,7 +225,7 @@ def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
                 "import asyncio; from dataclasses import replace; import zeta.cli.main as cli_main; "
                 "from zeta.core.login_flow import run_login; "
                 "from zeta.providers.login import build_login_provider, pkce_values; "
-                "cli_main._run_login = lambda provider: asyncio.run(run_login("
+                "cli_main._run_login = lambda provider, *_args: asyncio.run(run_login("
                 "replace(build_login_provider(provider, cli_main.env_home()), callback_port=0), pkce_values)); "
                 "raise SystemExit(cli_main.main(['login', '--account', 'default']))"
             ),
