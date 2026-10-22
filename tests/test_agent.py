@@ -10576,6 +10576,92 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
 
 
 @pytest.mark.asyncio
+async def test_concurrent_agent_cancel_waiters_share_failed_confirmation(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store)
+    release = asyncio.Event()
+    watcher = asyncio.create_task(asyncio.Event().wait())
+    attempts = 0
+
+    async def fail_confirmation() -> bool:
+        await release.wait()
+        raise OSError("durable write failed")
+
+    def cancel() -> CancellationRequest:
+        nonlocal attempts
+        attempts += 1
+        return CancellationRequest(asyncio.create_task(fail_confirmation()), watcher)
+
+    owner.register("root:1", cancel, watcher)
+    first = asyncio.create_task(owner.cancel_and_wait("root:1"))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(owner.cancel_and_wait("root:1"))
+    await asyncio.sleep(0)
+
+    assert first.done() is False
+    assert second.done() is False
+    assert attempts == 1
+
+    release.set()
+    outcomes = await asyncio.gather(first, second)
+    assert [outcome.status for outcome in outcomes] == ["failed", "failed"]
+    assert [outcome.error for outcome in outcomes] == [
+        "durable write failed",
+        "durable write failed",
+    ]
+    assert attempts == 1
+
+    owner.unregister("root:1")
+    watcher.cancel()
+    await asyncio.gather(watcher, return_exceptions=True)
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_retry_after_waiter_cancellation_reuses_confirmation(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store)
+    release = asyncio.Event()
+    watcher = asyncio.create_task(asyncio.Event().wait())
+    attempts = 0
+
+    async def reject_confirmation() -> bool:
+        await release.wait()
+        return False
+
+    def cancel() -> CancellationRequest:
+        nonlocal attempts
+        attempts += 1
+        return CancellationRequest(asyncio.create_task(reject_confirmation()), watcher)
+
+    owner.register("root:1", cancel, watcher)
+    first = asyncio.create_task(owner.cancel_and_wait("root:1"))
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    retry = asyncio.create_task(owner.cancel_and_wait("root:1"))
+    await asyncio.sleep(0)
+    assert retry.done() is False
+    assert attempts == 1
+
+    release.set()
+    outcome = await retry
+    assert outcome.status == "unconfirmed"
+    assert attempts == 1
+
+    owner.unregister("root:1")
+    watcher.cancel()
+    await asyncio.gather(watcher, return_exceptions=True)
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_cancel_propagates_caller_cancellation(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store)
