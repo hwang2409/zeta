@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+import zeta.accounts.session as account_session_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import AccountId, AccountStore, AccountUsage
@@ -5850,7 +5851,7 @@ async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_account_switch_does_not_block_loop_while_lifecycle_lock_held(
+async def test_account_switch_does_not_block_loop_while_registry_lock_held(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
@@ -5868,24 +5869,24 @@ async def test_account_switch_does_not_block_loop_while_lifecycle_lock_held(
     release = threading.Event()
     waiting = threading.Event()
 
-    def hold_lifecycle_lock() -> None:
-        with AccountStore(home).lifecycle_guard(second):
+    def hold_registry_lock() -> None:
+        store = AccountStore(home)
+        with store._home() as home_fd, store._registry_guard(home_fd):
             locked.set()
             assert release.wait(5)
 
-    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder = threading.Thread(target=hold_registry_lock)
     holder.start()
     assert await asyncio.to_thread(locked.wait, 1)
-    original_lifecycle_guard = AccountStore._lifecycle_guard
+    original_registry_guard = AccountStore._registry_guard
 
     @contextmanager
-    def observed_lifecycle_guard(store, home_fd, account, *, wait=True):
-        if account == second:
-            waiting.set()
-        with original_lifecycle_guard(store, home_fd, account, wait=wait):
+    def observed_registry_guard(store, home_fd):
+        waiting.set()
+        with original_registry_guard(store, home_fd):
             yield
 
-    monkeypatch.setattr(AccountStore, "_lifecycle_guard", observed_lifecycle_guard)
+    monkeypatch.setattr(AccountStore, "_registry_guard", observed_registry_guard)
     ticks = 0
     stop = asyncio.Event()
 
@@ -5921,3 +5922,65 @@ async def test_account_switch_does_not_block_loop_while_lifecycle_lock_held(
             request_task.cancel()
         holder.join(timeout=1)
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_shutdown_with_switch_lock_held_exits_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    monkeypatch.setattr(
+        account_session_module, "ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS", 0.05
+    )
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    assert server.runtime.opened is not None
+    manager = server.runtime.manager
+    lock_held = threading.Event()
+    persist_entered = threading.Event()
+    release = threading.Event()
+    persist = manager.record_account_selection
+
+    def observed_persist(*args: object, **kwargs: object) -> None:
+        persist_entered.set()
+        persist(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "record_account_selection", observed_persist)
+
+    def hold_metadata_lock() -> None:
+        with manager._metadata_lock(server.runtime.opened.metadata.session_id):
+            lock_held.set()
+            assert release.wait(5)
+
+    holder = threading.Thread(target=hold_metadata_lock)
+    holder.start()
+    assert await asyncio.to_thread(lock_held.wait, 1)
+    request_task = asyncio.create_task(
+        _request(
+            reader,
+            writer,
+            "accounts-switch-shutdown",
+            "account_switch",
+            {"session_id": sid, "account": str(second)},
+        )
+    )
+    try:
+        assert await asyncio.to_thread(persist_entered.wait, 1)
+        client = server._client
+        assert client is not None and client._account_switch_task is not None
+        await asyncio.wait_for(server.close(), 1)
+        assert client._account_switch_task is None
+    finally:
+        release.set()
+        holder.join(timeout=1)
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.gather(request_task, return_exceptions=True)

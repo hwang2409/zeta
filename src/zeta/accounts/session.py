@@ -11,12 +11,28 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
 from .exhaustion import classify_subscription_limit, recovery_alternatives
 from .store import AccountDisplay, AccountError, AccountId, AccountStore
 from .usage import read_usage, record_subscription_limit
 
 if TYPE_CHECKING:
     from ..core.session import SessionManager, SessionMetadata
+
+
+ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS = OAUTH_REFRESH_TIMEOUT_SECONDS
+
+
+async def _shielded(operation: Any) -> Any:
+    task = asyncio.create_task(operation)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        except BaseException:  # noqa: BLE001, S110 - caller cancellation wins
+            pass
+        raise
 
 
 def account_provider(provider: str) -> str | None:
@@ -200,60 +216,99 @@ class SessionAccountContext:
         build_backend: Callable[[AccountId], Any],
     ) -> None:
         async with self._switch_lock:
-            operation = asyncio.create_task(
-                self._complete_switch(
+            backend = await asyncio.to_thread(
+                self._prepare, account, build_backend
+            )
+            await _shielded(
+                self._commit(
                     loop,
                     account,
+                    backend,
                     boundary=boundary,
                     provider=provider,
-                    build_backend=build_backend,
                 )
             )
-            cancelled = False
-            while not operation.done():
-                try:
-                    await asyncio.shield(operation)
-                except asyncio.CancelledError:
-                    cancelled = True
-                except Exception:
-                    if not cancelled:
-                        raise
-            if cancelled:
-                operation.exception()
-                raise asyncio.CancelledError
-            operation.result()
 
-    async def _complete_switch(
+    def _prepare(
+        self, account: AccountId, build_backend: Callable[[AccountId], Any]
+    ) -> Any:
+        if self.switching_unavailable is not None:
+            raise AccountError(self.switching_unavailable)
+        if self._frozen:
+            raise AccountError("child account snapshots cannot be changed")
+        if not self.store.contains(account):
+            raise AccountError(f"account {account} does not exist; use /accounts")
+        return build_backend(account)
+
+    async def _commit(
         self,
         loop: Any,
         account: AccountId,
+        backend: Any,
         *,
         boundary: int,
         provider: str,
-        build_backend: Callable[[AccountId], Any],
     ) -> None:
-        def persist() -> tuple[Any, SessionMetadata]:
-            if self.switching_unavailable is not None:
-                raise AccountError(self.switching_unavailable)
-            if self._frozen:
-                raise AccountError("child account snapshots cannot be changed")
-            if not self.store.contains(account):
-                raise AccountError(f"account {account} does not exist; use /accounts")
-            backend = build_backend(account)
-            assert self.manager is not None
-            metadata = copy.deepcopy(self.metadata)
-            self.manager.record_account_selection(
-                metadata, account, boundary=boundary, switched=True
-            )
-            return backend, metadata
-
-        backend, metadata = await asyncio.to_thread(persist)
         assert self.manager is not None
-        self.manager._copy_metadata(self.metadata, metadata)
-        self._pins = {**self._pins, account.provider: account}
-        self._switch_sequences = dict(self.metadata.account_switch_sequences)
-        if backend is not None:
-            self.activate(loop, backend, provider)
+        old_metadata = copy.deepcopy(self.metadata)
+        old_pins = dict(self._pins)
+        old_sequences = dict(self._switch_sequences)
+        old_backend = loop.backend
+        old_provider = self._active_provider
+
+        def restore() -> None:
+            self.manager._copy_metadata(self.metadata, old_metadata)
+            self._pins = old_pins
+            self._switch_sequences = old_sequences
+            self.restore(loop, (old_backend, old_provider))
+
+        try:
+            metadata = self.manager._apply_account_selection(
+                copy.deepcopy(self.metadata),
+                account,
+                boundary=boundary,
+                switched=True,
+            )
+            self.manager._copy_metadata(self.metadata, metadata)
+            self._pins = {**self._pins, account.provider: account}
+            self._switch_sequences = dict(metadata.account_switch_sequences)
+            if backend is not None:
+                self.activate(loop, backend, provider)
+        except BaseException:
+            restore()
+            raise
+
+        def persist() -> None:
+            assert self.manager is not None
+            self.manager.record_account_selection(
+                self.metadata,
+                account,
+                boundary=boundary,
+                switched=True,
+                lock_timeout=ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS,
+            )
+
+        try:
+            await asyncio.to_thread(persist)
+        except BaseException:
+            try:
+                on_disk = await asyncio.to_thread(
+                    self.manager.read_metadata,
+                    self.metadata.session_id,
+                    lock_timeout=ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS,
+                )
+            except BaseException:  # noqa: BLE001 - rollback includes cancellation
+                restore()
+            else:
+                if on_disk.selected_accounts.get(account.provider) == str(account):
+                    self.manager._copy_metadata(self.metadata, on_disk)
+                    self._pins = {**self._pins, account.provider: account}
+                    self._switch_sequences = dict(
+                        on_disk.account_switch_sequences
+                    )
+                else:
+                    restore()
+            raise
 
     async def subscription_limit_event(self, failure: object) -> dict[str, object] | None:
         return await asyncio.to_thread(self._subscription_limit_event, failure)

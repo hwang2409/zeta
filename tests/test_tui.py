@@ -51,6 +51,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
+import zeta.accounts.session as account_session_module
 from tests.support.credentials import (
     anthropic_credentials,
     codex_credentials,
@@ -12156,6 +12157,78 @@ async def test_account_picker_ignores_repeat_select_while_switching(
     release.set()
     await asyncio.wait_for(first_task, 1)
     opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_shutdown_with_switch_lock_held_exits_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    loop.tool_registry.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._accounts_picker = SimpleNamespace(highlighted=second)
+    app._presenter.print_unit = lambda _renderable: None
+    monkeypatch.setattr(
+        account_session_module,
+        "ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "zeta.tui.slash_handlers.build_backend",
+        lambda *_args, **_kwargs: (object(), "offline"),
+    )
+    lock_held = threading.Event()
+    persist_entered = threading.Event()
+    release = threading.Event()
+    persist = manager.record_account_selection
+
+    def observed_persist(*args: object, **kwargs: object) -> None:
+        persist_entered.set()
+        persist(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "record_account_selection", observed_persist)
+
+    def hold_metadata_lock() -> None:
+        with manager._metadata_lock(opened.metadata.session_id):
+            lock_held.set()
+            assert release.wait(5)
+
+    holder = threading.Thread(target=hold_metadata_lock)
+    holder.start()
+    assert await asyncio.to_thread(lock_held.wait, 1)
+    task = app.accounts_picker_select()
+    assert task is not None
+    try:
+        assert await asyncio.to_thread(persist_entered.wait, 1)
+        await asyncio.wait_for(app.close(), 1)
+        assert task.done()
+    finally:
+        release.set()
+        holder.join(timeout=1)
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        opened.store.close()
 
 
 @pytest.mark.asyncio

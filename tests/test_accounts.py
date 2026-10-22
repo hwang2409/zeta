@@ -180,6 +180,21 @@ def test_missing_anthropic_login_keeps_auth_error_type(tmp_path: Path) -> None:
         asyncio.run(access())
 
 
+def test_explicit_credential_store_has_no_recovery_side_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = AccountId("codex", "work")
+    named_account_credentials(tmp_path, account.provider, account.name).save(tokens())
+
+    def fail_resolve(*_args: object, **_kwargs: object) -> AccountId:
+        raise AssertionError("explicit account construction must not recover credentials")
+
+    monkeypatch.setattr(AccountStore, "resolve_account", fail_resolve)
+    credential = credential_store("codex", home=tmp_path, account=account)
+    assert credential is not None
+    assert credential.account == account
+
+
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 def test_provider_driver_refresh_through_account_credentials_keeps_headers_and_rotation(
     provider: str, tmp_path: Path

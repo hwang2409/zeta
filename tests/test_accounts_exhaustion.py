@@ -156,24 +156,46 @@ def _account_context(
     return context, opened, first, second
 
 
+def _assert_switch_state(
+    context: SessionAccountContext,
+    account: AccountId,
+    backend: object,
+    loop: SimpleNamespace,
+    *,
+    sequence: int,
+    boundary: int = 0,
+) -> None:
+    assert context.manager is not None
+    persisted = context.manager.read_metadata(context.metadata.session_id)
+    assert persisted.selected_accounts == {"codex": str(account)}
+    assert persisted.account_switch_sequences == ({"codex": sequence} if sequence else {})
+    assert persisted.native_context_boundaries == {"codex": boundary}
+    assert context.metadata.to_dict() == persisted.to_dict()
+    assert context.snapshot()["codex"] == account
+    assert context.switch_sequence == sequence
+    assert context.active_provider == "codex"
+    assert loop.backend is backend
+
+
 @pytest.mark.asyncio
-async def test_switch_cancelled_after_persist_converges_live_and_disk(
+async def test_switch_cancelled_during_prepare_changes_nothing(
     tmp_path: Path,
 ) -> None:
-    context, opened, _first, second = await asyncio.to_thread(
+    context, opened, first, second = await asyncio.to_thread(
         _account_context, tmp_path
     )
     entered = threading.Event()
     release = threading.Event()
+    finished = threading.Event()
     first_backend = object()
-    second_backend = object()
     loop = SimpleNamespace(backend=first_backend)
     loop.set_backend = lambda backend: setattr(loop, "backend", backend)
 
     def build_backend(_account: AccountId) -> object:
         entered.set()
         assert release.wait(5)
-        return second_backend
+        finished.set()
+        return object()
 
     task = asyncio.create_task(
         context.switch_active(
@@ -189,15 +211,157 @@ async def test_switch_cancelled_after_persist_converges_live_and_disk(
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 5)
+    assert await asyncio.to_thread(finished.wait, 1)
 
-    persisted = context.manager.read_metadata(context.metadata.session_id)
-    assert persisted.selected_accounts == {"codex": str(second)}
-    assert persisted.account_switch_sequences == {"codex": 1}
-    assert context.metadata.selected_accounts == persisted.selected_accounts
-    assert context.snapshot()["codex"] == second
-    assert context.switch_sequence == 1
-    assert context.active_provider == "codex"
+    _assert_switch_state(context, first, first_backend, loop, sequence=0)
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_switch_apply_failure_restores_old_state(tmp_path: Path) -> None:
+    context, opened, first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    first_backend = object()
+    second_backend = object()
+    loop = SimpleNamespace(backend=first_backend)
+    failed = False
+
+    def set_backend(backend: object) -> None:
+        nonlocal failed
+        loop.backend = backend
+        if backend is second_backend and not failed:
+            failed = True
+            raise RuntimeError("apply failed")
+
+    loop.set_backend = set_backend
+    with pytest.raises(RuntimeError, match="apply failed"):
+        await context.switch_active(
+            loop,
+            second,
+            boundary=3,
+            provider="codex",
+            build_backend=lambda _account: second_backend,
+        )
+
+    _assert_switch_state(context, first, first_backend, loop, sequence=0)
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_switch_persist_failure_restores_old_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    first_backend = object()
+    second_backend = object()
+    loop = SimpleNamespace(backend=first_backend)
+    applied: list[object] = []
+
+    def set_backend(backend: object) -> None:
+        applied.append(backend)
+        loop.backend = backend
+
+    loop.set_backend = set_backend
+
+    def fail_persist(*_args: object, **_kwargs: object) -> None:
+        raise OSError("persist failed")
+
+    assert context.manager is not None
+    monkeypatch.setattr(context.manager, "record_account_selection", fail_persist)
+    with pytest.raises(OSError, match="persist failed"):
+        await context.switch_active(
+            loop,
+            second,
+            boundary=3,
+            provider="codex",
+            build_backend=lambda _account: second_backend,
+        )
+
+    _assert_switch_state(context, first, first_backend, loop, sequence=0)
+    assert applied == [second_backend, first_backend]
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_switch_persist_published_then_failed_keeps_new_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, _first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    first_backend = object()
+    second_backend = object()
+    loop = SimpleNamespace(backend=first_backend)
+    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
+    assert context.manager is not None
+    persist = context.manager.record_account_selection
+
+    def publish_then_fail(*args: object, **kwargs: object) -> None:
+        persist(*args, **kwargs)
+        raise OSError("published then failed")
+
+    monkeypatch.setattr(
+        context.manager, "record_account_selection", publish_then_fail
+    )
+    with pytest.raises(OSError, match="published then failed"):
+        await context.switch_active(
+            loop,
+            second,
+            boundary=3,
+            provider="codex",
+            build_backend=lambda _account: second_backend,
+        )
+
+    _assert_switch_state(
+        context, second, second_backend, loop, sequence=1, boundary=3
+    )
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_switch_cancel_during_commit_converges_then_reraises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, _first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    first_backend = object()
+    second_backend = object()
+    loop = SimpleNamespace(backend=first_backend)
+    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
+    assert context.manager is not None
+    persist = context.manager.record_account_selection
+
+    def blocked_persist(*args: object, **kwargs: object) -> None:
+        entered.set()
+        assert release.wait(5)
+        persist(*args, **kwargs)
+
+    monkeypatch.setattr(context.manager, "record_account_selection", blocked_persist)
+    task = asyncio.create_task(
+        context.switch_active(
+            loop,
+            second,
+            boundary=0,
+            provider="codex",
+            build_backend=lambda _account: second_backend,
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
     assert loop.backend is second_backend
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5)
+
+    _assert_switch_state(
+        context, second, second_backend, loop, sequence=1, boundary=1
+    )
     opened.store.close()
 
 

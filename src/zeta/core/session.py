@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -647,32 +648,52 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         *,
         boundary: int,
         switched: bool = False,
+        lock_timeout: float | None = None,
     ) -> None:
         """Persist one provider selection and its native-context boundary atomically."""
 
-        provider = account.provider
-        value = str(account)
-
         def update(item: SessionMetadata) -> SessionMetadata:
-            item.selected_accounts[provider] = value
-            item.native_context_boundaries[provider] = (
-                max(boundary, item.native_context_boundaries.get(provider, 0) + 1)
-                if switched
-                else boundary
+            return self._apply_account_selection(
+                item, account, boundary=boundary, switched=switched
             )
-            if switched:
-                item.account_switch_sequences[provider] = (
-                    item.account_switch_sequences.get(provider, 0) + 1
-                )
-            return self._touch(item)
 
-        current = self._mutate(metadata.session_id, update)
+        current = self._mutate(
+            metadata.session_id, update, lock_timeout=lock_timeout
+        )
         self._copy_metadata(metadata, current)
 
-    def read_metadata(self, session_id: str) -> SessionMetadata:
+    @classmethod
+    def _apply_account_selection(
+        cls,
+        metadata: SessionMetadata,
+        account: Any,
+        *,
+        boundary: int,
+        switched: bool,
+    ) -> SessionMetadata:
+        provider = account.provider
+        metadata.selected_accounts[provider] = str(account)
+        metadata.native_context_boundaries[provider] = (
+            max(boundary, metadata.native_context_boundaries.get(provider, 0) + 1)
+            if switched
+            else boundary
+        )
+        if switched:
+            metadata.account_switch_sequences[provider] = (
+                metadata.account_switch_sequences.get(provider, 0) + 1
+            )
+        return cls._touch(metadata)
+
+    def read_metadata(
+        self, session_id: str, *, lock_timeout: float | None = None
+    ) -> SessionMetadata:
         """Read validated metadata without opening or repairing the conversation."""
         self._validate_id(session_id)
-        return self._read(session_id)
+        if lock_timeout is None:
+            return self._read(session_id)
+        with self._metadata_lock(session_id, timeout=lock_timeout) as directory_fd:
+            assert directory_fd is not None
+            return self._read(session_id, directory_fd=directory_fd)
 
     def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
         metadata = self.read_metadata(session_id)
@@ -1137,8 +1158,10 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self,
         session_id: str,
         update: Callable[[SessionMetadata], SessionMetadata],
+        *,
+        lock_timeout: float | None = None,
     ) -> SessionMetadata:
-        with self._metadata_lock(session_id) as directory_fd:
+        with self._metadata_lock(session_id, timeout=lock_timeout) as directory_fd:
             current = self._read(session_id, directory_fd=directory_fd)
             updated = update(current)
             self._write_unlocked(updated, directory_fd=directory_fd)
@@ -1188,8 +1211,25 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         write_session_json(directory_fd, "meta.json", metadata.to_storage_dict())
 
     @contextmanager
-    def _metadata_lock(self, session_id: str, *, blocking: bool = True):
+    def _metadata_lock(
+        self,
+        session_id: str,
+        *,
+        blocking: bool = True,
+        timeout: float | None = None,
+    ):
         self._validate_id(session_id)
+        if timeout is not None:
+            deadline = time.monotonic() + timeout
+            while True:
+                with self._metadata_lock(session_id, blocking=False) as directory_fd:
+                    if directory_fd is not None:
+                        yield directory_fd
+                        return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SessionError("session metadata lock acquisition timed out")
+                time.sleep(min(0.05, remaining))
         with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
             try:
                 lock_fd = open_session_file(
