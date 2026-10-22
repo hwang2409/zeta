@@ -147,17 +147,6 @@ def compose_runtime(
                 tool_allow_layers=config.tool_allow_layers,
             )
             cleanup.enter_context(opened.store)
-        else:
-            if (
-                effective_budget != opened.metadata.compaction_budget
-                or budget_pinned != opened.metadata.budget_pinned
-            ):
-                manager.record_budget(
-                    opened.metadata,
-                    budget=effective_budget,
-                    pinned=budget_pinned,
-                    touch=False,
-                )
         metadata = opened.metadata
         account_resolver = SessionAccountResolver.load(home, manager, metadata)
         backend_account_provider = account_provider(provider)
@@ -169,6 +158,16 @@ def compose_runtime(
         backend, selected_model = backend_builder(
             provider, session_model, **backend_kwargs
         )
+        if resuming and (
+            effective_budget != metadata.compaction_budget
+            or budget_pinned != metadata.budget_pinned
+        ):
+            manager.record_budget(
+                metadata,
+                budget=effective_budget,
+                pinned=budget_pinned,
+                touch=False,
+            )
         if resuming:
             persisted_policy = ToolPolicy.create(
                 metadata.tool_allow,

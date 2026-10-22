@@ -140,11 +140,7 @@ def _tui_slash_commands() -> tuple[SlashCommand, ...]:
             "/always [key] — allow this tool/action for the running session",
         ),
         SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]"),
-        SlashCommand(
-            "accounts",
-            lambda app, args: app.slash_accounts(args),
-            "list accounts and switch this session",
-        ),
+        SlashCommand("accounts", lambda app, args: app.slash_accounts(args), "switch account"),
         SlashCommand(
             "permissions",
             lambda app, args: app.slash_permissions(args),
