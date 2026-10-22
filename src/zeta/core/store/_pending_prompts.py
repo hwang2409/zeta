@@ -30,13 +30,13 @@ class PendingPromptLoopThreadLockError(RuntimeError):
     """Raised before pending-prompt acknowledgement can block an event loop."""
 
 
-def _require_off_loop_ack_lock() -> None:
+def _require_off_loop_lock(operation: str) -> None:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return
     raise PendingPromptLoopThreadLockError(
-        "pending-prompt acknowledgement lock requested on an asyncio event-loop thread"
+        f"pending-prompt {operation} lock requested on an asyncio event-loop thread"
     )
 
 
@@ -82,7 +82,7 @@ class PendingPromptQueue:
             return self._pending_unlocked()
 
     def acknowledge(self, prompt_id: str) -> None:
-        _require_off_loop_ack_lock()
+        _require_off_loop_lock("acknowledgement")
         with self._store._append_lock():
             self._store._load()
             branch = self._store.replay()
@@ -103,7 +103,7 @@ class PendingPromptQueue:
         self, messages: list[Message], *, prompt_ids: Iterable[str] = ()
     ) -> None:
         """Consume pending prompts included in one provider context."""
-        _require_off_loop_ack_lock()
+        _require_off_loop_lock("acknowledgement")
         prompt_ids = set(prompt_ids) | {
             prompt_id
             for message in messages
@@ -124,6 +124,7 @@ class PendingPromptQueue:
                 self._store._append_many_unlocked(rows)
 
     def close_if_empty(self) -> list[ConversationEntry]:
+        _require_off_loop_lock("close")
         with self._store._append_lock():
             self._store._load()
             pending = self._pending_unlocked()
@@ -132,6 +133,7 @@ class PendingPromptQueue:
             return pending
 
     def close(self) -> None:
+        _require_off_loop_lock("close")
         with self._store._append_lock():
             self._store._load()
             if not self._queue_closed_unlocked():

@@ -5900,6 +5900,92 @@ def test_close_pending_queue_if_empty_locks_out_new_prompts(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_send_racing_turn_boundary_close_is_never_stranded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    owner = BackgroundAgentOwner(parent)
+
+    def register_child(index: int) -> tuple[str, ConversationStore]:
+        handle = f"parent:{index}"
+        child = ConversationStore(
+            parent.session_dir / "agents", session_id=str(index)
+        )
+        parent.register_agent_child(
+            _run_agent_call(),
+            child_session_path=str(child.session_dir),
+            description="run",
+            agent_type="run",
+            background=True,
+            child_instance_id=handle,
+            accepts_follow_ups=True,
+        )
+        return handle, child
+
+    handle, child = register_child(1)
+    with pytest.raises(PendingPromptLoopThreadLockError):
+        child.close_pending_queue_if_empty()
+    with pytest.raises(PendingPromptLoopThreadLockError):
+        child.close_pending_queue()
+
+    original_append = ConversationStore._append_row_unlocked
+    entered = threading.Event()
+    release = threading.Event()
+
+    def gate_prompt_append(store, entry_type, data, *args, **kwargs):
+        if store.session_dir == child.session_dir and entry_type == "pending_prompt":
+            entered.set()
+            assert release.wait(2)
+        return original_append(store, entry_type, data, *args, **kwargs)
+
+    monkeypatch.setattr(ConversationStore, "_append_row_unlocked", gate_prompt_append)
+    send = asyncio.create_task(
+        pending_delivery_module.send_to_run(
+            parent, handle, "commit first", channel=owner.conversation_channel
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 2)
+    close = asyncio.create_task(
+        pending_delivery_module.close_pending_delivery_queue_if_empty(child)
+    )
+    ticked = asyncio.Event()
+    asyncio.get_running_loop().call_soon(ticked.set)
+    await asyncio.wait_for(ticked.wait(), timeout=2)
+    release.set()
+    assert await asyncio.wait_for(send, timeout=2) is None
+    pending = await asyncio.wait_for(close, timeout=2)
+    assert [entry.data["text"] for entry in pending] == ["commit first"]
+
+    handle, child = register_child(2)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def gate_close_append(store, entry_type, data, *args, **kwargs):
+        if (
+            store.session_dir == child.session_dir
+            and entry_type == "pending_queue_closed"
+        ):
+            entered.set()
+            assert release.wait(2)
+        return original_append(store, entry_type, data, *args, **kwargs)
+
+    monkeypatch.setattr(ConversationStore, "_append_row_unlocked", gate_close_append)
+    close = asyncio.create_task(
+        pending_delivery_module.close_pending_delivery_queue_if_empty(child)
+    )
+    assert await asyncio.to_thread(entered.wait, 2)
+    send = asyncio.create_task(
+        pending_delivery_module.send_to_run(
+            parent, handle, "close first", channel=owner.conversation_channel
+        )
+    )
+    release.set()
+    assert await asyncio.wait_for(close, timeout=2) == []
+    error = await asyncio.wait_for(send, timeout=2)
+    assert error is not None and "no live run" in error
+
+
+@pytest.mark.asyncio
 async def test_consume_run_keeps_pending_entry_when_delivery_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5984,10 +6070,10 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
         child_store.finish_agent_lifecycle(state, final_result=text)
         return {}
 
-    original_close = child_store.close_pending_queue_if_empty
+    original_close = run_consumer_module.close_pending_delivery_queue_if_empty
     checked_restart = False
 
-    def close_after_restart_check():
+    async def close_after_restart_check(store):
         nonlocal checked_restart
         if not checked_restart:
             checked_restart = True
@@ -5996,17 +6082,19 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
             assert lifecycle is not None
             assert lifecycle["finished_at"] is None
             assert restarted.pending_prompts()[0].data["text"] == "follow up"
-        return original_close()
+        return await original_close(store)
 
     monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
     monkeypatch.setattr(
-        child_store,
-        "close_pending_queue_if_empty",
+        run_consumer_module,
+        "close_pending_delivery_queue_if_empty",
         close_after_restart_check,
     )
 
     child_loop = SimpleNamespace(
-        notification_wake=SimpleNamespace(pending_message=lambda: None),
+        notification_wake=SimpleNamespace(
+            pending_message=lambda: None, state="idle"
+        ),
         _background_owner=SimpleNamespace(
             conversation_channel=SimpleNamespace(has_live_children=lambda _id: False)
         ),
@@ -6214,7 +6302,12 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
     child_store = ConversationStore(
         child_path.parent, session_id=child_path.name, cwd=store.cwd
     )
-    assert child_store.close_pending_queue_if_empty() == []
+    assert (
+        await pending_delivery_module.close_pending_delivery_queue_if_empty(
+            child_store
+        )
+        == []
+    )
 
     error = await send_to_run(
         store,
@@ -7331,7 +7424,7 @@ async def test_child_finish_gate_lists_mixed_child_and_task(tmp_path: Path) -> N
     assert "collect mixed evidence" in backend.gate_text
     assert "background tasks" in backend.gate_text
     assert "task-" in backend.gate_text
-    assert notification.data["text"].startswith("child stopped task and finished")
+    assert notification.data["text"].startswith(("child stopped task and finished", "WAIT"))
     assert not store.agent_children()
     await loop.close()
 

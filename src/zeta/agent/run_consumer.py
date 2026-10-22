@@ -12,6 +12,11 @@ from ..protocol.types import MessageOrigin
 from ..tools.agent import agent_stats
 from .explicit_finish import IdleNudgeLifecycle, kill_tasks_after_deadline
 from .finish_gate import FinishGateState
+from .pending_delivery import (
+    close_pending_delivery_queue,
+    close_pending_delivery_queue_if_empty,
+    pending_deliveries,
+)
 from .receipt import (
     MAX_AGENT_RESULT_BYTES,
     TerminalState,
@@ -176,11 +181,9 @@ async def consume_run(
             if idle and safety_started is None:
                 safety_started = asyncio.get_running_loop().time()
             current_entry = None
-            pending = (
-                child_store.close_pending_queue_if_empty()
-                if child_store.pending_prompts()
-                else []
-            )
+            pending = await pending_deliveries(child_store)
+            if pending:
+                pending = await close_pending_delivery_queue_if_empty(child_store)
             if pending:
                 idle_lifecycle.reset_idle_period()
                 current_entry = pending[0]
@@ -284,7 +287,7 @@ async def consume_run(
                 )
                 idle_published = False
                 continue
-            pending = child_store.close_pending_queue_if_empty()
+            pending = await close_pending_delivery_queue_if_empty(child_store)
             if pending:
                 continue
             terminal_result = _finalize_result(
@@ -315,7 +318,7 @@ async def consume_run(
         if safety_task is not None:
             await asyncio.gather(safety_task, return_exceptions=True)
         try:
-            child_store.close_pending_queue()
+            await close_pending_delivery_queue(child_store)
         finally:
             if terminal_result is not None and callable(final_finish_lifecycle):
                 content = terminal_result.get("content")
