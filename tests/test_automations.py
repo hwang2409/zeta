@@ -119,7 +119,7 @@ async def test_no_delivery_job_approves_and_runs_without_slack_config(
     document["servers"] = []
     job = parse_job("inbox-only", document)
     with SQLiteStore(tmp_path) as store:
-        state = store.draft(job)
+        state = await asyncio.to_thread(store.draft, job)
         review = await review_job(store, job.name, tmp_path)
         assert review.recipient is None
         store.approve(job.name, state.revision, review.recipient, START)
@@ -151,7 +151,7 @@ async def test_no_delivery_job_with_inbox_grant_approves_and_sends_without_slack
     job = parse_job("inbox-only", document)
 
     with SQLiteStore(tmp_path) as store:
-        state = store.draft(job)
+        state = await asyncio.to_thread(store.draft, job)
         review = await review_job(store, job.name, tmp_path)
         assert review.recipient is None
         assert review.inbox_target_ids == (target.project_id,)
@@ -295,6 +295,8 @@ def _job(tmp_path: Path, name: str = "brief", *, poll: bool = False):
 
 
 def _arm(store: SQLiteStore, job, now: datetime = START) -> None:
+    if job.account is None:
+        job = replace(job, account=f"{job.provider}:default")
     state = store.draft(job)
     store.approve(job.name, state.revision, "U123", now)
 
@@ -420,7 +422,7 @@ async def _run_inbox_send(
     grants = resolve_inbox_grants(job, projects)
     assert grants is not None
     with SQLiteStore(tmp_path) as store:
-        state = store.draft(job)
+        state = await asyncio.to_thread(store.draft, job)
         store.approve(job.name, state.revision, "U123", START, grants.target_ids)
         occurrence = tick(store, DUE)[0]
         run_id = store.claim(occurrence)
@@ -589,7 +591,7 @@ async def test_inbox_grant_pinned_to_approved_project_id(tmp_path: Path) -> None
     grants = resolve_inbox_grants(job, projects)
     assert grants is not None
     with SQLiteStore(tmp_path) as store:
-        state = store.draft(job)
+        state = await asyncio.to_thread(store.draft, job)
         store.approve(job.name, state.revision, "U123", START, grants.target_ids)
         shutil.rmtree(projects.root / target.project_id)
         replacement = projects.create_project("target", "replacement")
@@ -1277,17 +1279,17 @@ async def test_human_review_token_arms_only_the_exact_revision(
         )
     )
     with SQLiteStore(tmp_path) as store:
-        store.draft(_job(tmp_path))
+        await asyncio.to_thread(store.draft, _job(tmp_path))
     preview = await commands.slash("approve brief", home=tmp_path, cwd=str(tmp_path))
     token = preview.split("Approval token: ")[1].splitlines()[0]
     assert "Resolved recipient: U123" in preview
     with SQLiteStore(tmp_path) as store:
-        store.draft(_job(tmp_path, "other"))
+        await asyncio.to_thread(store.draft, _job(tmp_path, "other"))
     other = await commands.slash("approve other", home=tmp_path, cwd=str(tmp_path))
     assert other.split("Approval token: ")[1].splitlines()[0] != token
     with SQLiteStore(tmp_path) as store:
         assert not store.get("brief").enabled
-        store.draft(replace(_job(tmp_path), prompt="Changed after review"))
+        await asyncio.to_thread(store.draft, replace(_job(tmp_path), prompt="Changed after review"))
     with pytest.raises(ValueError, match="review changed"):
         await commands.slash(f"approve brief {token}", home=tmp_path, cwd=str(tmp_path))
     preview = await commands.slash("approve brief", home=tmp_path, cwd=str(tmp_path))
@@ -2130,7 +2132,7 @@ async def test_approved_legacy_revision_without_account_fails_with_redraft_guida
 ) -> None:
     job = _job(tmp_path, "legacy")
     with SQLiteStore(tmp_path) as store:
-        state = store.draft(job)
+        state = await asyncio.to_thread(store.draft, job)
         document = state.job.document()
         document.pop("account", None)
         store.db.execute(
@@ -2159,12 +2161,13 @@ async def test_approved_revision_with_removed_account_fails_with_redraft_guidanc
     from zeta.oauth import OAuthTokens
 
     account = AccountId("codex", "removed")
-    named_account_credentials(tmp_path, "codex", "removed").save(
-        OAuthTokens("access", "refresh", 9_999_999_999.0)
+    await asyncio.to_thread(
+        named_account_credentials(tmp_path, "codex", "removed").save,
+        OAuthTokens("access", "refresh", 9_999_999_999.0),
     )
     job = _job(tmp_path, "removed")
     with SQLiteStore(tmp_path) as store:
-        state = store.draft(job)
+        state = await asyncio.to_thread(store.draft, job)
         store.approve(job.name, state.revision, "U123", START)
         registry = json.loads((tmp_path / "accounts.json").read_text())
         registry["accounts"].pop(str(account))
@@ -2189,10 +2192,14 @@ async def test_run_pins_account_recorded_at_approval(tmp_path: Path) -> None:
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
     token = OAuthTokens("access", "refresh", 9_999_999_999.0)
-    named_account_credentials(tmp_path, "codex", "first").save(token)
-    named_account_credentials(tmp_path, "codex", "second").save(token)
+    await asyncio.to_thread(
+        named_account_credentials(tmp_path, "codex", "first").save, token
+    )
+    await asyncio.to_thread(
+        named_account_credentials(tmp_path, "codex", "second").save, token
+    )
     accounts = AccountStore(tmp_path)
-    accounts.set_default(first)
+    await asyncio.to_thread(accounts.set_default, first)
     job = _job(tmp_path)
     document = job.document()
     document["provider"] = "codex"
@@ -2202,11 +2209,11 @@ async def test_run_pins_account_recorded_at_approval(tmp_path: Path) -> None:
     job = parse_job("pinned-account", document)
 
     with SQLiteStore(tmp_path) as store:
-        state = store.draft(job)
+        state = await asyncio.to_thread(store.draft, job)
         assert state.job.account == "codex:first"
         store.approve(job.name, state.revision, None, START)
         assert store.get(job.name).job.account == "codex:first"
-        accounts.set_default(second)
+        await asyncio.to_thread(accounts.set_default, second)
         occurrence = tick(store, DUE)[0]
         run_id = store.claim(occurrence)
         await run_claimed(

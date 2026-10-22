@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import httpx
+
+from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
 
 if TYPE_CHECKING:
     from .store import AccountId, AccountStore
@@ -191,6 +194,22 @@ def read_usage(store: AccountStore, account: AccountId, *, now: datetime | None 
         return UsageState(None, "usage unknown", "invalid usage response")
 
 
+@asynccontextmanager
+async def _refresh_guard(
+    store: AccountStore, account: AccountId
+) -> AsyncIterator[int]:
+    stack = ExitStack()
+    try:
+        home_fd = await asyncio.to_thread(
+            stack.enter_context,
+            store.lifecycle_guard(account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS),
+        )
+        await asyncio.to_thread(stack.enter_context, store.usage_guard(account))
+        yield home_fd
+    finally:
+        await asyncio.shield(asyncio.to_thread(stack.close))
+
+
 class AccountUsage:
     """Refresh stale accounts sequentially and preserve safe durable state."""
 
@@ -213,7 +232,7 @@ class AccountUsage:
             transport=self._transport,
             follow_redirects=False,
         ) as client:
-            for account in self.store.list():
+            for account in await asyncio.to_thread(self.store.list):
                 now = _utc(self._clock())
                 state = read_usage(self.store, account, now=now)
                 if state.freshness == "now":
@@ -230,10 +249,7 @@ class AccountUsage:
         now: datetime,
         client: httpx.AsyncClient,
     ) -> UsageState | None:
-        with (
-            self.store.lifecycle_guard(account) as home_fd,
-            self.store.usage_guard(account),
-        ):
+        async with _refresh_guard(self.store, account) as home_fd:
             state = read_usage(self.store, account, now=now)
             if state.freshness == "now" or (
                 state.last_attempt_at is not None

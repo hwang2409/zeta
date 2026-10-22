@@ -74,6 +74,10 @@ class AccountCredentialLockTimeoutError(AccountError):
     """Credential publication could not acquire its lifecycle lock in time."""
 
 
+class AccountLoopThreadLockError(AccountError):
+    """A blocking account lock was requested on an asyncio loop thread."""
+
+
 @dataclass(frozen=True, slots=True)
 class AccountId:
     provider: str
@@ -122,6 +126,8 @@ class AccountStore:
     def _lock_at(
         self, directory_fd: int, name: str, *, wait: bool = True
     ) -> Iterator[None]:
+        if wait:
+            _require_off_loop_lock("blocking")
         created = not _exists(directory_fd, name)
         for attempt in range(3):
             try:
@@ -296,16 +302,17 @@ class AccountStore:
     def resolve_account(
         self, provider: str, account: AccountId | None = None
     ) -> AccountId:
-        """Migrate legacy auth, then resolve an account or the global default."""
+        """Resolve an account or the global default."""
 
         provider = "anthropic" if provider == "claude" else provider
         if provider not in _PROVIDERS:
             raise ValueError("invalid account provider")
         if account is not None and account.provider != provider:
             raise ValueError("account provider does not match")
-        self.migrate()
         resolved = account or self.default(provider) or AccountId(provider, "default")
-        with self.credential_guard(resolved) as home_fd:
+        with self.credential_guard(
+            resolved, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+        ) as home_fd:
             self._recover_account(home_fd, resolved)
         return resolved
 
@@ -400,12 +407,20 @@ class AccountStore:
         self._write_registry(home_fd, value)
 
     def migrate(self) -> None:
-        with (
-            self._home() as home_fd,
-            self._lock_at(home_fd, ".accounts-migration.lock"),
-        ):
-            for provider in ("anthropic", "codex"):
-                self._migrate_provider(home_fd, provider)
+        with self._home() as home_fd:
+            if not any(
+                _exists(home_fd, name)
+                for name in (
+                    "anthropic-oauth.json",
+                    "codex-oauth.json",
+                    "accounts.json",
+                    "accounts",
+                )
+            ):
+                return
+            with self._lock_at(home_fd, ".accounts-migration.lock"):
+                for provider in ("anthropic", "codex"):
+                    self._migrate_provider(home_fd, provider)
 
     def _migrate_provider(self, home_fd: int, provider: str) -> None:
         account = AccountId(provider, "default")
@@ -561,7 +576,7 @@ class AccountCredentials:
 
     async def access_token(self, client: httpx.AsyncClient) -> str:
         async with self._async_lock:
-            if not self.store.contains(self.account):
+            if not await asyncio.to_thread(self.store.contains, self.account):
                 return await self._bootstrap_access_token(client)
             async with self._async_guard(registry=False) as home_fd:
                 tokens = _read_account_tokens(home_fd, self.account)
@@ -583,7 +598,7 @@ class AccountCredentials:
 
     async def refresh_token(self, client: httpx.AsyncClient) -> str:
         async with self._async_lock:
-            if not self.store.contains(self.account):
+            if not await asyncio.to_thread(self.store.contains, self.account):
                 return await self._bootstrap_access_token(client, refresh=True)
             async with self._async_guard(registry=False) as home_fd:
                 tokens = _read_account_tokens(home_fd, self.account)
@@ -693,10 +708,21 @@ class AccountCredentials:
             await asyncio.shield(asyncio.to_thread(stack.close))
 
 
+def _require_off_loop_lock(kind: str) -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise AccountLoopThreadLockError(
+        f"{kind} account lock requested on an asyncio event-loop thread"
+    )
+
+
 @contextmanager
 def _bounded_guard(
     guard: Callable[[], AbstractContextManager[int]], timeout: float
 ) -> Iterator[int]:
+    _require_off_loop_lock("bounded")
     deadline = time.monotonic() + timeout
     while True:
         stack = ExitStack()

@@ -8,6 +8,7 @@ themselves as such rather than half-executing.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -155,22 +156,22 @@ class ServerSlashSession:
             ),
         )
 
-    def slash_accounts(self, args: str) -> str:
+    async def slash_accounts(self, args: str) -> str:
         """List accounts or change one display label."""
 
         context = getattr(self._runtime.loop, "account_context", None)
         if context is None:
             return "accounts unavailable for this session"
         if args.split():
-            return rename_account_command(context.store, args)
-        displays = context.store.list_display()
+            return await asyncio.to_thread(rename_account_command, context.store, args)
+        displays = await asyncio.to_thread(context.store.list_display)
         lines: list[str] = []
         for item in displays:
             lines.append(str(item) + (f"  {item.detail}" if item.detail else ""))
             lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
         return "\n".join(lines) or "no accounts"
 
-    def slash_model(self, args: str) -> str:
+    async def slash_model(self, args: str) -> str:
         """Switch models directly, or report the current model to the client."""
 
         runtime = self._runtime
@@ -179,7 +180,7 @@ class ServerSlashSession:
             return f"model: {runtime.model} (open Settings to switch)"
         mode = runtime.policy.default.value if runtime.policy else "ask"
         try:
-            apply_settings(runtime, requested, mode)
+            await asyncio.to_thread(apply_settings, runtime, requested, mode)
         except ValueError as exc:
             return f"model unchanged: {exc}"
         except (OSError, RuntimeError) as exc:

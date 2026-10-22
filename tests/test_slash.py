@@ -1199,7 +1199,7 @@ async def test_slash_webhook_commands(
 
     with SQLiteStore(tmp_path) as store:
         for name, webhook in (("hook", True), ("plain", False), ("off", True)):
-            state = store.draft(job(name, webhook))
+            state = await asyncio.to_thread(store.draft, job(name, webhook))
             store.approve(name, state.revision, "U123", datetime.now(UTC))
         store.disable("off")
         before = store.webhook_credentials("hook")

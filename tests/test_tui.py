@@ -12046,20 +12046,27 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
         opened.store.close()
 
 
-def test_accounts_command_lists_and_switches(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
-    named_account_credentials(home, "codex", "first").save(
-        OAuthTokens("first", "refresh", 9_999_999_999)
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "first").save,
+        OAuthTokens("first", "refresh", 9_999_999_999),
     )
-    named_account_credentials(home, "codex", "second").save(
-        OAuthTokens("second", "refresh", 9_999_999_999)
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "second").save,
+        OAuthTokens("second", "refresh", 9_999_999_999),
     )
-    AccountStore(home).set_default(first)
+    await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
-    resolver = SessionAccountContext.load(home, manager, opened.metadata)
+    resolver = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
     backend = FakeBackend([])
     loop = AgentLoop(backend, opened.store, skill_catalog=SkillCatalog.empty())
     loop.manager = manager
@@ -12069,8 +12076,26 @@ def test_accounts_command_lists_and_switches(tmp_path: Path) -> None:
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
     rendered: list[Panel] = []
     app._presenter.print_unit = rendered.append
+    list_display = AccountStore.list_display
+    switch = SessionAccountContext.switch
+    off_loop_calls: list[str] = []
 
-    assert app.slash_accounts("") == ""
+    def checked_list_display(store: AccountStore):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        off_loop_calls.append("list")
+        return list_display(store)
+
+    def checked_switch(context, account, *, boundary):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        off_loop_calls.append("switch")
+        return switch(context, account, boundary=boundary)
+
+    monkeypatch.setattr(AccountStore, "list_display", checked_list_display)
+    monkeypatch.setattr(SessionAccountContext, "switch", checked_switch)
+
+    assert await app.slash_accounts("") == ""
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(rendered[0])
     plain = Text.from_ansi(output.getvalue()).plain
@@ -12080,9 +12105,12 @@ def test_accounts_command_lists_and_switches(tmp_path: Path) -> None:
     assert "codex:second" in plain
 
     app.accounts_picker_move(1)
-    app.accounts_picker_select()
+    task = app.accounts_picker_select()
+    assert task is not None
+    await task
 
-    assert resolver.resolve("codex") == second
+    assert off_loop_calls == ["list", "switch"]
+    assert await asyncio.to_thread(resolver.resolve, "codex") == second
     assert loop.account_context.snapshot()["codex"] == second
     assert AccountStore(home).default("codex") == first
     assert manager.read_metadata(opened.metadata.session_id).selected_accounts == {
@@ -12091,17 +12119,51 @@ def test_accounts_command_lists_and_switches(tmp_path: Path) -> None:
     opened.store.close()
 
 
-def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
+@pytest.mark.asyncio
+async def test_tui_session_account_switch_runs_store_off_loop() -> None:
+    account = AccountId("codex", "work")
+    switched: list[tuple[AccountId, int]] = []
+
+    def checked_switch(selected: AccountId, *, boundary: int) -> None:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        switched.append((selected, boundary))
+
+    app = SimpleNamespace(
+        _accounts_picker=SimpleNamespace(highlighted=account),
+        loop=SimpleNamespace(
+            account_context=SimpleNamespace(switch=checked_switch),
+            store=SimpleNamespace(replay=list),
+            context_assembler=SimpleNamespace(token_budget=100_000),
+        ),
+        provider="claude",
+        model="offline",
+        _dismiss_accounts_picker=lambda: None,
+        _print_system=lambda _message: None,
+    )
+
+    task = TUIApp.accounts_picker_select(app)
+    assert task is not None
+    await task
+
+    assert switched == [(account, 0)]
+
+
+@pytest.mark.asyncio
+async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     account = AccountId("codex", "work")
-    named_account_credentials(home, "codex", "work").save(
-        OAuthTokens("access", "refresh", 9_999_999_999, email="henry@example.com")
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "work").save,
+        OAuthTokens("access", "refresh", 9_999_999_999, email="henry@example.com"),
     )
     manager = SessionManager(home)
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
-    context = SessionAccountContext.load(home, manager, opened.metadata)
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.manager = manager
     loop.session_metadata = opened.metadata
@@ -12138,7 +12200,7 @@ def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
     assert publisher_waiting.wait(1)
     started = time.monotonic()
     try:
-        assert app.slash_accounts("") == ""
+        assert await app.slash_accounts("") == ""
         assert time.monotonic() - started < 0.15
     finally:
         release.set()
@@ -12170,8 +12232,9 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
 ) -> None:
     home = tmp_path / "home"
     account = AccountId("anthropic", "work")
-    named_account_credentials(home, "anthropic", "work").save(
-        OAuthTokens("access", "refresh", 9_999_999_999, email="henry@example.com")
+    await asyncio.to_thread(
+        named_account_credentials(home, "anthropic", "work").save,
+        OAuthTokens("access", "refresh", 9_999_999_999, email="henry@example.com"),
     )
     store = AccountStore(home)
     reset = datetime.now(UTC).replace(microsecond=0) + timedelta(days=4)
@@ -12193,7 +12256,9 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
     store._write_usage_bytes(account, (json.dumps(usage) + "\n").encode())
     manager = SessionManager(home)
     opened = manager.create(provider="claude", model="offline", cwd=tmp_path)
-    context = SessionAccountContext.load(home, manager, opened.metadata)
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.manager = manager
     loop.session_metadata = opened.metadata
@@ -12212,7 +12277,7 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
 
     monkeypatch.setattr(AccountUsage, "refresh_stale", refresh_stale)
     try:
-        assert app.slash_accounts("") == ""
+        assert await app.slash_accounts("") == ""
         app.accounts_picker_refresh()
         while app._accounts_picker and app._accounts_picker.refreshing:
             await asyncio.sleep(0.01)
@@ -12236,12 +12301,15 @@ async def test_accounts_refresh_does_not_block_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
-    named_account_credentials(home, "anthropic", "work").save(
-        OAuthTokens("access", "refresh", 9_999_999_999)
+    await asyncio.to_thread(
+        named_account_credentials(home, "anthropic", "work").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
     )
     manager = SessionManager(home)
     opened = manager.create(provider="claude", model="offline", cwd=tmp_path)
-    context = SessionAccountContext.load(home, manager, opened.metadata)
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.manager = manager
     loop.session_metadata = opened.metadata
@@ -12256,7 +12324,7 @@ async def test_accounts_refresh_does_not_block_event_loop(
 
     monkeypatch.setattr(AccountUsage, "refresh_stale", blocking_refresh)
     try:
-        assert app.slash_accounts("") == ""
+        assert await app.slash_accounts("") == ""
         app.accounts_picker_refresh()
         started = time.monotonic()
         await asyncio.sleep(0.02)

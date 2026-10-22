@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
-from ..accounts import AccountId, AccountUsage
+from ..accounts import AccountId, AccountStore, AccountUsage
 from ..accounts.usage import usage_json
 from .protocol import ProtocolError
 from .runtime import ServerRuntime
 
 REQUEST_METHODS = {"account_list", "account_refresh", "account_switch"}
+
+
+async def migrate(home: Path) -> None:
+    await asyncio.to_thread(AccountStore(home).migrate)
 
 
 def list_accounts(runtime: ServerRuntime) -> dict[str, object]:
@@ -41,7 +46,7 @@ async def request(
     params: dict[str, object],
 ) -> dict[str, object]:
     if method == "account_list":
-        return list_accounts(runtime)
+        return await asyncio.to_thread(list_accounts, runtime)
     await require_idle()
     if method == "account_refresh":
         return await refresh_accounts(runtime)
@@ -64,4 +69,4 @@ async def refresh_accounts(runtime: ServerRuntime) -> dict[str, object]:
             AccountUsage(runtime.loop.account_context.store).refresh_stale()
         )
     )
-    return list_accounts(runtime)
+    return await asyncio.to_thread(list_accounts, runtime)

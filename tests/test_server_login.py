@@ -119,7 +119,8 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         assert await callback(captured["redirect"], {"code": "synthetic-code", "state": captured["state"]}) == 200
         await asyncio.wait_for(server._client.logins.tasks[provider], 3)
         assert (await rpc(reader, writer, "login_status", provider=provider))["result"] == {"state": "succeeded"}
-        assert credential_store(provider, home=server.home).read() == expected
+        saved = await asyncio.to_thread(credential_store, provider, home=server.home)
+        assert await asyncio.to_thread(saved.read) == expected
         rows = (await rpc(reader, writer, "login_providers"))["result"]["providers"]
         assert next(row for row in rows if row["provider"] == provider)["credentials_present"]
         assert (await rpc(reader, writer, "status"))["result"]["state"] == "idle"
@@ -172,7 +173,8 @@ async def test_login_failures_release_listener_and_allow_retry(tmp_path, monkeyp
         listener = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", port)
         listener.close()
         await listener.wait_closed()
-        assert credential_store("claude", home=server.home).read() is None
+        saved = await asyncio.to_thread(credential_store, "claude", home=server.home)
+        assert await asyncio.to_thread(saved.read) is None
         if outcome != "disconnect":
             monkeypatch.setattr(providers, "build_anthropic_authorization_url", lambda *args: "https://authorize.invalid/")
             retry = (await rpc(reader, writer, "login_start", provider="claude"))["result"]
@@ -204,7 +206,9 @@ async def test_serve_login_publication_does_not_block_event_loop(
     monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
     monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
     provider = replace(
-        providers.build_login_provider("anthropic", tmp_path / "zeta"),
+        await asyncio.to_thread(
+            providers.build_login_provider, "anthropic", tmp_path / "zeta"
+        ),
         callback_port=0,
     )
     monkeypatch.setattr(server_login, "build_login_provider", lambda *_args: provider)
@@ -271,7 +275,7 @@ async def test_cancelled_serve_login_never_publishes_and_releases_locks(
         return next(exchanged)
 
     provider = replace(
-        providers.build_login_provider("anthropic", home),
+        await asyncio.to_thread(providers.build_login_provider, "anthropic", home),
         callback_port=0,
         build_authorization_url=build,
         exchange_authorization_code=exchange,
@@ -338,7 +342,7 @@ async def test_cancelled_serve_login_never_publishes_and_releases_locks(
 
     assert not holder.is_alive()
     assert published == [new]
-    assert provider.credential_store.read() == new
+    assert await asyncio.to_thread(provider.credential_store.read) == new
     with AccountStore(home).provider_login_lock("anthropic"):
         pass
     assert len(os.listdir("/dev/fd")) == fd_before
@@ -394,7 +398,9 @@ async def test_login_action_uses_failed_provider_before_model_revert(tmp_path, v
         await rpc(reader, writer, "hello", protocol_version=version)
         created = await rpc(reader, writer, "new_session")
         assert "result" in created, created
-        model_selection.apply(server.runtime, "gpt-5.4", "ask")
+        await asyncio.to_thread(
+            model_selection.apply, server.runtime, "gpt-5.4", "ask"
+        )
         await server._client._event(
             StreamEvent(StreamEventType.ERROR, error=ErrorInfo(
                 "http_error" if status else "auth_error", "Not a string classification hint", status, provider_error)),

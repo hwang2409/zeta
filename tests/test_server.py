@@ -2450,7 +2450,7 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
     monkeypatch.setattr(tui_app, "build_backend", tui_backend)
     monkeypatch.setattr(server_runtime, "default_backend", serve_backend)
     monkeypatch.delenv("ZETA_TEST_SCRIPTED_PROVIDER")
-    tui = tui_app.create_app(build_parser().parse_args(["--provider", "codex"]))
+    tui = await asyncio.to_thread(tui_app.create_app, build_parser().parse_args(["--provider", "codex"]))
     server = ZetaServer(home=home, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _connect(server)
     try:
@@ -3429,9 +3429,11 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, mo
         assert runtime.metadata.to_dict() == before
         assert runtime.loop.backend is backend
         assert "result" in (await _request(reader, writer, 4, "status"))[-1]
-        credential = credential_store(target, home=tmp_path)
+        credential = await asyncio.to_thread(credential_store, target, home=tmp_path)
         assert credential is not None
-        credential.save(OAuthTokens("test-access", "test-refresh", 4_000_000_000))
+        await asyncio.to_thread(
+            credential.save, OAuthTokens("test-access", "test-refresh", 4_000_000_000)
+        )
         response = (await _request(reader, writer, 5, "set_settings", {
             "session_id": runtime.session_id, "model": model, "approval_mode": "deny",
         }))[-1]
@@ -3812,7 +3814,7 @@ async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, v
         assert "model_fallback" not in created["session"]
         runtime = server.runtime
         sid = runtime.session_id
-        model_selection.apply(runtime, "gpt-5.4", "ask")
+        await asyncio.to_thread(model_selection.apply, runtime, "gpt-5.4", "ask")
         assert runtime.metadata.model_fallback is not None
         resumed = (await _request(reader, writer, 3, "resume", {"session_id": sid}))[-1]["result"]
         status = (await _request(reader, writer, 4, "status"))[-1]["result"]
@@ -3885,7 +3887,7 @@ async def test_mcp_auth_failure_does_not_revert_model(tmp_path, monkeypatch):
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
         runtime = server.runtime
-        model_selection.apply(runtime, "gpt-5.4", "ask")
+        await asyncio.to_thread(model_selection.apply, runtime, "gpt-5.4", "ask")
         fallback = runtime.metadata.model_fallback
 
         async def fail_mcp_setup():
@@ -4647,8 +4649,9 @@ async def test_slash_extensions_reject_legacy_clients(tmp_path: Path) -> None:
 async def test_serve_accounts_label_command(tmp_path: Path) -> None:
     home = tmp_path / "home"
     account = AccountId("codex", "work")
-    named_account_credentials(home, "codex", "work").save(
-        OAuthTokens("access", "refresh", 9_999_999_999)
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "work").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
     )
     server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
@@ -4669,19 +4672,25 @@ async def test_serve_accounts_label_command(tmp_path: Path) -> None:
             "kind": "output",
             "text": "renamed codex:work to codex:henry",
         }
-        assert AccountStore(home).resolve_reference("codex", "henry") == account
+        assert (
+            await asyncio.to_thread(
+                AccountStore(home).resolve_reference, "codex", "henry"
+            )
+            == account
+        )
     finally:
         await _close(server, writer)
 
 
 @pytest.mark.asyncio
-async def test_serve_account_list_includes_usage_and_refresh_method(
+async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     account = AccountId("codex", "work")
-    named_account_credentials(home, "codex", "work").save(
-        OAuthTokens("access", "refresh", 9_999_999_999)
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "work").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
     )
     store = AccountStore(home)
     store._write_usage_bytes(
@@ -4712,6 +4721,17 @@ async def test_serve_account_list_includes_usage_and_refresh_method(
         return {}
 
     monkeypatch.setattr(AccountUsage, "refresh_stale", refresh_stale)
+    list_display = AccountStore.list_display
+    off_loop_reads = 0
+
+    def checked_list_display(account_store: AccountStore):
+        nonlocal off_loop_reads
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        off_loop_reads += 1
+        return list_display(account_store)
+
+    monkeypatch.setattr(AccountStore, "list_display", checked_list_display)
     server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
@@ -4748,6 +4768,7 @@ async def test_serve_account_list_includes_usage_and_refresh_method(
         )[-1]["result"]
         assert refreshed
         assert refreshed_list == listed
+        assert off_loop_reads == 2
     finally:
         await _close(server, writer)
 
@@ -4758,8 +4779,9 @@ async def test_serve_accounts_panel_does_not_block_on_held_lifecycle_lock(
 ) -> None:
     home = tmp_path / "home"
     account = AccountId("codex", "work")
-    named_account_credentials(home, "codex", "work").save(
-        OAuthTokens("access", "refresh", 9_999_999_999)
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "work").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
     )
     server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
@@ -5690,8 +5712,10 @@ async def test_serve_cross_provider_model_change_updates_account_context(
     from zeta.server import model_selection
 
     token = OAuthTokens("access", "refresh", 9_999_999_999.0)
-    named_account_credentials(tmp_path, "codex").save(token)
-    named_account_credentials(tmp_path, "anthropic").save(token)
+    await asyncio.to_thread(named_account_credentials(tmp_path, "codex").save, token)
+    await asyncio.to_thread(
+        named_account_credentials(tmp_path, "anthropic").save, token
+    )
     server = ZetaServer(
         home=tmp_path,
         port=0,
@@ -5704,11 +5728,15 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
         runtime = server.runtime
-        runtime.loop.account_context.switch(
-            AccountId("codex", "default"), boundary=0
+        await asyncio.to_thread(
+            runtime.loop.account_context.switch,
+            AccountId("codex", "default"),
+            boundary=0,
         )
-        runtime.loop.account_context.switch(
-            AccountId("anthropic", "default"), boundary=0
+        await asyncio.to_thread(
+            runtime.loop.account_context.switch,
+            AccountId("anthropic", "default"),
+            boundary=0,
         )
         native = Message(
             MessageRole.ASSISTANT,
@@ -5717,14 +5745,16 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         )
         runtime.loop.store.append_message(native)
 
-        model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
+        await asyncio.to_thread(
+            model_selection.apply, runtime, "claude-sonnet-4-6", "ask"
+        )
         assert runtime.loop.account_context.active_provider == "anthropic"
         assert runtime.loop.account_context.switch_sequence == 1
         assert runtime.loop._account_safe_context([native])[0].content == [
             ThinkingContent("codex"),
             TextContent("answer"),
         ]
-        model_selection.apply(runtime, "gpt-5.4", "ask")
+        await asyncio.to_thread(model_selection.apply, runtime, "gpt-5.4", "ask")
         assert runtime.loop.account_context.active_provider == "codex"
         assert runtime.loop.account_context.switch_sequence == 1
         assert runtime.loop._account_safe_context([native])[0].content == native.content
@@ -5740,7 +5770,9 @@ async def test_serve_cross_provider_model_change_updates_account_context(
             lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
         )
         with pytest.raises(OSError, match="write failed"):
-            model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
+            await asyncio.to_thread(
+                model_selection.apply, runtime, "claude-sonnet-4-6", "ask"
+            )
         assert (
             runtime.loop.backend,
             runtime.loop.account_context.active_provider,
