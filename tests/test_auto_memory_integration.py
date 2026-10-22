@@ -156,7 +156,8 @@ async def test_composed_runtime_reconciles_real_persisted_trigger_and_notices(
             return memory_backend, model
         return _UnusedBackend(), model or "unused"
 
-    composition = compose_runtime(
+    composition = await asyncio.to_thread(
+        compose_runtime,
         home=home,
         cwd=workspace,
         manager=manager,
@@ -278,7 +279,8 @@ async def test_attention_fork_composition_cannot_write_project_memory(
         for path in (home / "projects").rglob("*")
         if path.is_file()
     }
-    composition = compose_runtime(
+    composition = await asyncio.to_thread(
+        compose_runtime,
         home=home,
         cwd=workspace,
         manager=manager,
@@ -372,7 +374,9 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
             agent_catalog=AgentCatalog.empty(),
         )
 
-    normal = composition_for(original, "normalindexcanary")
+    normal = await asyncio.to_thread(
+        composition_for, original, "normalindexcanary"
+    )
     try:
         async for _ in normal.loop.run_turn(
             "normalindexcanary", origin=MessageOrigin.USER
@@ -383,7 +387,9 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
         await normal.loop.close()
 
     fork = manager.open(fork_id)
-    discussion = composition_for(fork, "forkonlyindexcanary")
+    discussion = await asyncio.to_thread(
+        composition_for, fork, "forkonlyindexcanary"
+    )
     try:
         async for _ in discussion.loop.run_turn(
             "forkonlyindexcanary", origin=MessageOrigin.USER

@@ -171,7 +171,7 @@ async def test_model_tool_and_review_cannot_set_or_read_credentials(
             },
         )
     with SQLiteStore(tmp_path) as store:
-        _arm(store, _job(tmp_path))
+        await __import__("asyncio").to_thread(_arm, store, _job(tmp_path))
         credentials = store.webhook_credentials("hook")
         review = show(store, "hook")
         assert credentials.secret.hex() not in review
@@ -808,7 +808,7 @@ async def test_daemon_survives_delivery_claim_error(tmp_path: Path, monkeypatch:
     from zeta.automations.daemon import serve
 
     with SQLiteStore(tmp_path) as store:
-        _arm(store, _job(tmp_path))
+        await __import__("asyncio").to_thread(_arm, store, _job(tmp_path))
         assert store.accept_webhook("hook", 1, b"payload", {}, NOW, delivery_id="one")
     stop = __import__("asyncio").Event()
     original = SQLiteStore.claim_webhook

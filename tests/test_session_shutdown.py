@@ -159,7 +159,7 @@ async def test_closed_app_rejects_snapshot_access(
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
     if opened_snapshots:
         app._snapshots()
     await app.close()
@@ -287,7 +287,7 @@ async def test_tui_cleanup_continues_after_close_error(
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
     snapshots = app._snapshots()
     registry = app.loop.tool_registry.background_tasks
     original_registry_close = registry.close
@@ -413,7 +413,7 @@ async def test_closed_tui_drops_callbacks_without_gc(
 
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
     monkeypatch.chdir(tmp_path)
-    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
     app._snapshots()
     loop = app.loop
     reference = weakref.ref(app)
@@ -435,7 +435,7 @@ async def test_closed_tui_drops_pending_paste_callbacks_without_gc(
 
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
     monkeypatch.chdir(tmp_path)
-    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
     loop = app.loop
     session = app._make_session()
     app._active_session = session

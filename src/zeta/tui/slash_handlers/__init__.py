@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 from prompt_toolkit.enums import EditingMode
 
@@ -195,11 +196,13 @@ class SlashHandlerMixin:
         self._invalidate_prompt()
         return ""
 
-    def slash_accounts(self, args: str) -> str:
+    async def slash_accounts(self, args: str) -> str:
         """List named accounts and open the current-session switcher."""
 
         if args.split():
-            return rename_account_command(self.loop.account_context.store, args)
+            return await asyncio.to_thread(
+                rename_account_command, self.loop.account_context.store, args
+            )
         if self.active or self.pending_approvals:
             return "accounts unavailable: cannot switch while a turn or approval is active"
         context = getattr(self.loop, "account_context", None)
@@ -207,7 +210,7 @@ class SlashHandlerMixin:
             return "accounts unavailable for this session"
         if context.switching_unavailable is not None:
             return context.switching_unavailable
-        displays = context.store.list_display()
+        displays = await asyncio.to_thread(context.store.list_display)
         if not displays:
             return "no accounts; run zeta login <provider> --account <name>"
         return self._show_accounts_picker(context, displays)
@@ -257,24 +260,32 @@ class SlashHandlerMixin:
             if current is None:
                 return
             current.refreshing = False
-            displays = self.loop.account_context.store.list_display()
+            displays = await asyncio.to_thread(
+                self.loop.account_context.store.list_display
+            )
             current.usages = {item.account: item.usage for item in displays}
             self._repaint_accounts_picker()
 
         asyncio.create_task(refresh())
 
-    def accounts_picker_default(self) -> None:
+    def accounts_picker_default(self) -> asyncio.Task[None] | None:
         picker = self._accounts_picker
         if picker is None:
-            return
+            return None
         account = picker.highlighted
-        try:
-            self.loop.account_context.store.set_default(account)
-        except (AccountError, OSError, ValueError) as exc:
-            self._print_system(f"default unchanged: {exc}")
-            return
-        picker.defaults[account.provider] = account
-        self._repaint_accounts_picker()
+
+        async def set_default() -> None:
+            try:
+                await asyncio.to_thread(
+                    self.loop.account_context.store.set_default, account
+                )
+            except (AccountError, OSError, ValueError) as exc:
+                self._print_system(f"default unchanged: {exc}")
+                return
+            picker.defaults[account.provider] = account
+            self._repaint_accounts_picker()
+
+        return asyncio.create_task(set_default())
 
     def accounts_picker_rename(self) -> None:
         picker = self._accounts_picker
@@ -287,13 +298,14 @@ class SlashHandlerMixin:
         session.default_buffer.insert_text(f"/accounts rename {account} ")
         self._invalidate_prompt()
 
-    def accounts_picker_select(self) -> None:
+    def accounts_picker_select(self) -> asyncio.Task[None] | None:
         picker = self._accounts_picker
         if picker is None:
-            return
+            return None
         account = picker.highlighted
         context = self.loop.account_context
-        try:
+
+        def prepare_switch() -> Any:
             backend = None
             current_provider = "anthropic" if self.provider == "claude" else self.provider
             if account.provider == current_provider:
@@ -306,13 +318,20 @@ class SlashHandlerMixin:
             entries = self.loop.store.replay()
             boundary = entries[-1].seq if entries else 0
             context.switch(account, boundary=boundary)
-            if backend is not None:
-                context.activate(self.loop, backend, self.provider)
-        except (AccountError, OSError, RuntimeError, ValueError) as exc:
-            self._print_system(f"account unchanged: {exc}")
-            return
-        self._dismiss_accounts_picker()
-        self._print_system(f"account: {account}")
+            return backend
+
+        async def switch() -> None:
+            try:
+                backend = await asyncio.to_thread(prepare_switch)
+                if backend is not None:
+                    context.activate(self.loop, backend, self.provider)
+            except (AccountError, OSError, RuntimeError, ValueError) as exc:
+                self._print_system(f"account unchanged: {exc}")
+                return
+            self._dismiss_accounts_picker()
+            self._print_system(f"account: {account}")
+
+        return asyncio.create_task(switch())
 
     def accounts_picker_cancel(self) -> None:
         self._dismiss_accounts_picker()

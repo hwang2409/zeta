@@ -145,7 +145,9 @@ async def run_claimed(
         return
     job = state.job
     pinned_account = AccountId(*job.account.split(":", 1)) if job.account else None
-    if (detail := _account_preflight(job, home, backend)) is not None:
+    if (
+        detail := await asyncio.to_thread(_account_preflight, job, home, backend)
+    ) is not None:
         store.finish(run_id, "failed", detail)
         return
     skill_catalog = discover_session_skills(home=home)
@@ -177,7 +179,8 @@ async def run_claimed(
     phase = "running"
     try:
         async with asyncio.timeout(timeout_seconds):
-            loop = build_unattended_loop(
+            loop = await asyncio.to_thread(
+                build_unattended_loop,
                 session,
                 home=home,
                 allow=job.allow,

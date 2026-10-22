@@ -392,7 +392,9 @@ async def _build_child_loop(
         )
         account_context = getattr(loop, "account_context", None)
         if account_context is not None:
-            child_registry.account_context = account_context.child_snapshot(child_provider)
+            child_registry.account_context = await asyncio.to_thread(
+                account_context.child_snapshot, child_provider
+            )
         loop._background_owner.store_leases.callback(
             child_registry.background_tasks.release_directory
         )
@@ -552,7 +554,12 @@ async def run_agent_tool(
             state="failed",
         )
     effective_model = model if model is not None else preset.model
-    child_backend, backend_error = resolve_child_backend(loop, effective_model)
+    if getattr(loop, "account_context", None) is None:
+        child_backend, backend_error = resolve_child_backend(loop, effective_model)
+    else:
+        child_backend, backend_error = await asyncio.to_thread(
+            resolve_child_backend, loop, effective_model
+        )
     if backend_error is not None:
         return loop._child_result_payload(
             tool_call.id,
