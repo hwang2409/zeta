@@ -33,6 +33,16 @@ from .receipt import (
 )
 from .terminal_fence import TerminalTransitionFence
 
+_AGENT_CANCEL_CONFIRM_TIMEOUT = 1.0
+
+
+@dataclass(frozen=True)
+class CancellationRequest:
+    """Durable cancellation confirmation and its eventual cleanup."""
+
+    confirmation: asyncio.Task[bool]
+    cleanup: asyncio.Task[None]
+
 
 def finish_gate_message(
     children: tuple[tuple[str, str], ...], tasks: tuple[tuple[str, str], ...]
@@ -128,7 +138,7 @@ class BackgroundAgentOwner:
         self._stores: list[ConversationStore] = []
         self._pending_stores: set[ConversationStore] = set()
         self._cancellers: dict[
-            str, Callable[[], asyncio.Task[None] | None]
+            str, Callable[[], CancellationRequest | asyncio.Task[None] | None]
         ] = {}
         self._watchers: dict[str, asyncio.Task[Any]] = {}
         self._parent_stores: dict[str, ConversationStore] = {}
@@ -161,25 +171,24 @@ class BackgroundAgentOwner:
         return True
 
     async def cancel_and_wait(self, instance_id: str) -> bool:
-        """Request cancellation and wait for asynchronous cancellation work."""
+        """Request cancellation and briefly await durable confirmation."""
         if instance_id not in self._cancellers:
             return False
-        tasks = self.cancel_subtree(instance_id)
-        if not tasks:
+        confirmations = self.cancel_subtree(instance_id)
+        if not confirmations:
             return True
-        waiter = asyncio.gather(*tasks)
-        cancelled = False
-        while True:
-            try:
-                await asyncio.shield(waiter)
-                break
-            except asyncio.CancelledError:
-                cancelled = True
-        if cancelled:
-            raise asyncio.CancelledError
+        waiter = asyncio.gather(*confirmations, return_exceptions=True)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(waiter), timeout=_AGENT_CANCEL_CONFIRM_TIMEOUT
+            )
+        except TimeoutError:
+            pass
         return True
 
-    def cancel_subtree(self, instance_id: str) -> tuple[asyncio.Task[None], ...]:
+    def cancel_subtree(
+        self, instance_id: str
+    ) -> tuple[asyncio.Task[bool] | asyncio.Task[None], ...]:
         selected = {instance_id}
         changed = True
         while changed:
@@ -188,14 +197,16 @@ class BackgroundAgentOwner:
                 if child not in selected and parent in selected:
                     selected.add(child)
                     changed = True
-        tasks: list[asyncio.Task[None]] = []
+        confirmations: list[asyncio.Task[bool] | asyncio.Task[None]] = []
         for child in tuple(self._cancellers):
             if child in selected and child not in self._cancel_requested:
                 self._cancel_requested.add(child)
                 result = self._cancellers[child]()
-                if isinstance(result, asyncio.Task):
-                    tasks.append(result)
-        return tuple(tasks)
+                if isinstance(result, CancellationRequest):
+                    confirmations.append(result.confirmation)
+                elif isinstance(result, asyncio.Task):
+                    confirmations.append(result)
+        return tuple(confirmations)
 
     def owns_running(self, instance_id: str) -> bool:
         return instance_id in self._cancellers
@@ -239,7 +250,7 @@ class BackgroundAgentOwner:
     def register(
         self,
         instance_id: str,
-        cancel: Callable[[], asyncio.Task[None] | None],
+        cancel: Callable[[], CancellationRequest | asyncio.Task[None] | None],
         watcher: asyncio.Task[Any],
         parent_store: ConversationStore | None = None,
         description: str | None = None,

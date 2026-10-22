@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 from ..core.checkpoints import ConversationEntry, ConversationIntegrityError
@@ -73,6 +75,22 @@ class PendingDelivery:
         await store.acknowledge_pending_prompt_messages(
             context_messages, prompt_ids=(self.prompt_id,)
         )
+
+
+def pending_prompt_acknowledgement(
+    store: ConversationStore,
+    delivery: PendingDelivery | None,
+    context_messages: list[Message],
+) -> Callable[[], Awaitable[None]] | None:
+    """Select the first-provider-event acknowledgement for this context."""
+
+    if delivery is not None:
+        return partial(delivery.acknowledge, store, context_messages)
+    if any(
+        PENDING_PROMPT_ID_METADATA in message.metadata for message in context_messages
+    ):
+        return partial(store.acknowledge_pending_prompt_messages, context_messages)
+    return None
 
 
 def _is_legacy_delivery_row(

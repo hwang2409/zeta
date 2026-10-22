@@ -44,7 +44,7 @@ from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
-from .background import finish_background_child
+from .background import CancellationRequest, finish_background_child
 from .budget import MAX_AGENT_DEPTH
 from .budget import child_depth as next_agent_depth
 from .conversation_channel import has_follow_up_loop
@@ -939,13 +939,20 @@ async def run_agent_tool(
     if getattr(child_loop, "explicit_finish", False) and terminal_fence is None:
         terminal_fence = TerminalTransitionFence(child_store)
 
-    async def cancel_child() -> None:
+    async def confirm_child_cancel() -> bool:
         nonlocal child_canceled
         if child_canceled:
-            return
+            return False
         if terminal_fence is not None and not await terminal_fence.cancel():
-            return
+            return False
         child_canceled = True
+        return True
+
+    async def cleanup_canceled_child(
+        confirmation: asyncio.Task[bool],
+    ) -> None:
+        if not await confirmation:
+            return
         child_loop.tool_registry.abort()
         child_loop.store.drop_client_steering("abort")
         if not child_task.done():
@@ -954,9 +961,14 @@ async def run_agent_tool(
         await asyncio.gather(child_task, return_exceptions=True)
         child_store.mark_agent_canceled(tool_call.id)
 
-    def request_child_cancel() -> asyncio.Task[None]:
-        """Start cancellation without blocking the owner's event loop."""
-        return loop._create_task(cancel_child())
+    def request_child_cancel() -> CancellationRequest:
+        """Start durable cancellation and separately owned cleanup."""
+        confirmation = loop._create_task(confirm_child_cancel())
+        cleanup = loop._create_task(cleanup_canceled_child(confirmation))
+        return CancellationRequest(confirmation, cleanup)
+
+    async def cancel_child() -> None:
+        await request_child_cancel().cleanup
 
     if background:
         # Notification text has a stricter durable contract than the foreground
@@ -968,7 +980,7 @@ async def run_agent_tool(
             MAX_AGENT_NOTIFICATION_TEXT,
         )
 
-        def request_background_cancel() -> asyncio.Task[None]:
+        def request_background_cancel() -> CancellationRequest:
             return request_child_cancel()
 
         def cleanup_background_child() -> None:

@@ -24,6 +24,7 @@ import zeta.runtime.loop.agent as agent_loop_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.background import (
     BackgroundAgentOwner,
+    CancellationRequest,
     adopt_agent_children,
     finish_background_child,
     recover_agent_children,
@@ -7069,6 +7070,8 @@ class _TaskFinishGateBackend(CompletionBackend):
         elif gate is not None and output_read is not None:
             self.task_output_read.set()
             blocks = [TextContent(f"task result: {output_read}")]
+        elif gate is not None and notification and killed:
+            blocks = [TextContent("child stopped task and finished")]
         elif gate is not None and notification and noise_notification:
             self.noise_notification_turns += 1
             blocks = [TextContent("WAIT")]
@@ -7080,8 +7083,6 @@ class _TaskFinishGateBackend(CompletionBackend):
                     ToolCall("read-task", "task_output", {"task_id": task_id.group()})
                 )
             ]
-        elif gate is not None and notification and killed:
-            blocks = [TextContent("child stopped task and finished")]
         elif gate is not None:
             self.gate_text = next(
                 block.text for block in gate.content if isinstance(block, TextContent)
@@ -7438,7 +7439,7 @@ async def test_child_finish_gate_task_kill_path(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_finish_gate_lists_mixed_child_and_task(tmp_path: Path) -> None:
+async def test_agent_cancel_mixed_child_and_task_terminal_result(tmp_path: Path) -> None:
     backend = _TaskFinishGateBackend(
         _python("import time; time.sleep(30)"), action="kill", mixed_child=True
     )
@@ -10412,6 +10413,51 @@ async def test_setting_off_preserves_legacy_finish_gate(
     await asyncio.gather(watcher, return_exceptions=True)
     loop._background_owner.unregister("root:1:1")
     await registry.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_returns_within_bound_when_cleanup_is_stuck(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store)
+    release = asyncio.Event()
+    watcher = asyncio.create_task(release.wait())
+
+    def cancel() -> CancellationRequest:
+        confirmation = asyncio.create_task(asyncio.sleep(0, result=True))
+        return CancellationRequest(confirmation, watcher)
+
+    owner.register("root:1", cancel, watcher)
+
+    assert await asyncio.wait_for(owner.cancel_and_wait("root:1"), timeout=0.1)
+
+    release.set()
+    await owner.wait()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_propagates_caller_cancellation(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store)
+    release = asyncio.Event()
+    watcher = asyncio.create_task(release.wait())
+
+    def cancel() -> asyncio.Task[None]:
+        return watcher
+
+    owner.register("root:1", cancel, watcher)
+    cancellation = asyncio.create_task(owner.cancel_and_wait("root:1"))
+    await asyncio.sleep(0)
+    cancellation.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(cancellation, timeout=0.1)
+
+    release.set()
+    await owner.wait()
     store.close()
 
 

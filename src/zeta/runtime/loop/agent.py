@@ -18,7 +18,10 @@ from ...agent.background import (
 from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.durable import durable_message
 from ...agent.notifications import AgentNotificationMixin, NotificationWake
-from ...agent.pending_delivery import PendingDelivery
+from ...agent.pending_delivery import (
+    PendingDelivery,
+    pending_prompt_acknowledgement,
+)
 from ...agent.plan_mode import (
     PLAN_MODE_POLICY,
     plan_mode_messages,
@@ -35,7 +38,6 @@ from ...core.hooks import HookManager
 from ...core.slash import effective_budget_for_model
 from ...core.store import ConversationStore
 from ...core.store._approval_display import ApprovalAuditRequest
-from ...core.store._pending_prompts import PENDING_PROMPT_ID_METADATA
 from ...core.tool_dispatch import dispatch_tool_calls
 from ...mcp import (
     MCPManagementService,
@@ -892,13 +894,12 @@ class AgentLoop(
                     provider_retry_budget,
                 )
 
-                pending_prompt_context = pending_delivery is not None or any(
-                    PENDING_PROMPT_ID_METADATA in message.metadata
-                    for message in context_messages
+                acknowledge_pending_prompt = pending_prompt_acknowledgement(
+                    self.store, pending_delivery, context_messages
                 )
                 provider_stream = (
                     completion
-                    if steering is None and not pending_prompt_context
+                    if steering is None and acknowledge_pending_prompt is None
                     else provider_events(
                         completion,
                         (
@@ -906,20 +907,7 @@ class AgentLoop(
                             if steering is not None
                             else None
                         ),
-                        (
-                            partial(
-                                pending_delivery.acknowledge,
-                                self.store,
-                                context_messages,
-                            )
-                            if pending_delivery is not None
-                            else partial(
-                                self.store.acknowledge_pending_prompt_messages,
-                                context_messages,
-                            )
-                            if pending_prompt_context
-                            else None
-                        ),
+                        acknowledge_pending_prompt,
                     )
                 )
                 async for event in provider_stream:
