@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
+import zeta.agent.background as agent_background_module
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
@@ -10436,6 +10437,142 @@ async def test_agent_cancel_returns_within_bound_when_cleanup_is_stuck(
     release.set()
     await owner.wait()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_reports_failed_confirmation_and_allows_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(tmp_path / "child")
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=parent_store,
+        skill_catalog=SkillCatalog.empty(),
+        register_builtin=True,
+    )
+    owner = BackgroundAgentOwner(parent_store)
+    watcher = asyncio.create_task(asyncio.Event().wait())
+    attempts = 0
+    fence = TerminalTransitionFence(child_store)
+
+    async def fail_confirmation() -> bool:
+        raise OSError("durable write failed")
+
+    def cancel() -> CancellationRequest:
+        nonlocal attempts
+        attempts += 1
+        confirmation = asyncio.create_task(
+            fail_confirmation() if attempts == 1 else fence.cancel()
+        )
+        return CancellationRequest(confirmation, watcher)
+
+    owner.register("root:1", cancel, watcher)
+    registry._agent_owner = owner
+    monkeypatch.setattr(
+        "zeta.tools.agent._read_agent_status", lambda _: [{"handle": "root:1"}]
+    )
+    try:
+        failed = await registry.execute(
+            ToolCall("cancel-1", "agent_cancel", {"handle": "root:1"})
+        )
+        retried = await registry.execute(
+            ToolCall("cancel-2", "agent_cancel", {"handle": "root:1"})
+        )
+
+        assert failed["isError"] is True
+        assert failed["structuredContent"]["handle"] == "root:1"
+        assert failed["structuredContent"]["status"] == "cancellation_failed"
+        assert failed["structuredContent"]["confirmation_error"] == "durable write failed"
+        assert retried["isError"] is False
+        assert retried["structuredContent"]["status"] == "cancellation_confirmed"
+        assert attempts == 2
+        assert sum(
+            entry.type == "terminal_transition"
+            for entry in child_store.active_branch_snapshot()
+        ) == 1
+    finally:
+        owner.unregister("root:1")
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        await registry.close()
+        child_store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(tmp_path / "child")
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=parent_store,
+        skill_catalog=SkillCatalog.empty(),
+        register_builtin=True,
+    )
+    owner = BackgroundAgentOwner(parent_store)
+    watcher = asyncio.create_task(asyncio.Event().wait())
+    release = asyncio.Event()
+    fence = TerminalTransitionFence(child_store)
+    attempts = 0
+
+    async def confirm() -> bool:
+        await release.wait()
+        return await fence.cancel()
+
+    def cancel() -> CancellationRequest:
+        nonlocal attempts
+        attempts += 1
+        confirmation = asyncio.create_task(confirm())
+        return CancellationRequest(confirmation, watcher)
+
+    owner.register("root:1", cancel, watcher)
+    registry._agent_owner = owner
+    monkeypatch.setattr(agent_background_module, "_AGENT_CANCEL_CONFIRM_TIMEOUT", 0.01)
+    monkeypatch.setattr(
+        "zeta.tools.agent._read_agent_status", lambda _: [{"handle": "root:1"}]
+    )
+    try:
+        call = ToolCall("cancel-1", "agent_cancel", {"handle": "root:1"})
+        unconfirmed = await registry.execute(call)
+        assert unconfirmed["isError"] is True
+        assert unconfirmed["structuredContent"]["status"] == "cancellation_unconfirmed"
+        assert "not confirmed" in unconfirmed["content"][0]["text"]
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(
+                    call.id,
+                    unconfirmed["content"][0]["text"],
+                    is_error=True,
+                    structured_content=unconfirmed["structuredContent"],
+                ),
+            )
+        )
+        assert rendered is not None
+        output = StringIO()
+        Console(file=output, width=120, color_system=None).print(rendered)
+        assert "agent cancellation not confirmed within 1 second: root:1" in output.getvalue()
+
+        release.set()
+        retried = await registry.execute(
+            ToolCall("cancel-2", "agent_cancel", {"handle": "root:1"})
+        )
+        assert retried["isError"] is False
+        assert retried["structuredContent"]["status"] == "cancellation_confirmed"
+        assert attempts == 1
+        assert sum(
+            entry.type == "terminal_transition"
+            for entry in child_store.active_branch_snapshot()
+        ) == 1
+    finally:
+        owner.unregister("root:1")
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        await registry.close()
+        child_store.close()
 
 
 @pytest.mark.asyncio

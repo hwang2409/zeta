@@ -41,17 +41,28 @@ async def agent_cancel(
         owner = _owner(registry)
         if _status(registry, [handle]):
             return _agent_error("unknown child handle", max_bytes)
-        requested = await owner.cancel_and_wait(handle)
+        outcome = await owner.cancel_and_wait(handle)
+        status = {
+            "confirmed": "cancellation_confirmed",
+            "unconfirmed": "cancellation_unconfirmed",
+            "failed": "cancellation_failed",
+            "already_finished": "already_finished",
+        }[outcome.status]
+        text = {
+            "confirmed": "agent cancellation confirmed: ",
+            "unconfirmed": "agent cancellation not confirmed within 1 second: ",
+            "failed": "agent cancellation failed: ",
+            "already_finished": "agent already finished: ",
+        }[outcome.status] + handle
+        if outcome.error is not None:
+            text += ": " + outcome.error
+        structured_content = {"handle": handle, "status": status}
+        if outcome.error is not None:
+            structured_content["confirmation_error"] = outcome.error
         result = {
-            "content": [text_block(
-                "agent cancellation requested: " + handle
-                if requested else "agent already finished: " + handle
-            )],
-            "isError": False,
-            "structuredContent": {
-                "handle": handle,
-                "status": "cancellation_requested" if requested else "already_finished",
-            },
+            "content": [text_block(text)],
+            "isError": outcome.status in {"unconfirmed", "failed"},
+            "structuredContent": structured_content,
         }
         return _bounded_agent_result(result, max_bytes)
     except (TypeError, ValueError) as exc:

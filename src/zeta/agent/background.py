@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import (
@@ -42,6 +42,20 @@ class CancellationRequest:
 
     confirmation: asyncio.Task[bool]
     cleanup: asyncio.Task[None]
+
+
+@dataclass(frozen=True)
+class CancellationOutcome:
+    """Result of waiting briefly for durable cancellation ownership."""
+
+    status: Literal["confirmed", "unconfirmed", "failed", "already_finished"]
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class _CancellationConfirmation:
+    instance_id: str
+    task: asyncio.Task[bool] | asyncio.Task[None]
 
 
 def finish_gate_message(
@@ -146,6 +160,9 @@ class BackgroundAgentOwner:
         self._descriptions: dict[str, str] = {}
         self._canceling = False
         self._cancel_requested: set[str] = set()
+        self._cancel_confirmations: dict[
+            str, asyncio.Task[bool] | asyncio.Task[None]
+        ] = {}
         self._parent_ids: dict[str, str | None] = {}
         self._original_parent_ids: dict[str, str | None] = {}
         self._wake_callback: Callable[[], None] | None = None
@@ -170,25 +187,50 @@ class BackgroundAgentOwner:
         self.cancel_subtree(instance_id)
         return True
 
-    async def cancel_and_wait(self, instance_id: str) -> bool:
+    async def cancel_and_wait(self, instance_id: str) -> CancellationOutcome:
         """Request cancellation and briefly await durable confirmation."""
         if instance_id not in self._cancellers:
-            return False
+            return CancellationOutcome("already_finished")
         confirmations = self.cancel_subtree(instance_id)
         if not confirmations:
-            return True
-        waiter = asyncio.gather(*confirmations, return_exceptions=True)
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(waiter), timeout=_AGENT_CANCEL_CONFIRM_TIMEOUT
-            )
-        except TimeoutError:
-            pass
-        return True
+            return CancellationOutcome("confirmed")
+        done, pending = await asyncio.wait(
+            [confirmation.task for confirmation in confirmations],
+            timeout=_AGENT_CANCEL_CONFIRM_TIMEOUT,
+        )
+        by_task = {confirmation.task: confirmation for confirmation in confirmations}
+        error: str | None = None
+        unconfirmed = bool(pending)
+        for confirmation in confirmations:
+            if confirmation.task not in done:
+                continue
+            try:
+                confirmed = confirmation.task.result()
+            except asyncio.CancelledError:
+                error = error or "cancellation confirmation was canceled"
+                confirmed = False
+            except Exception as exc:  # noqa: BLE001 - confirmation failures are data
+                error = error or str(exc)
+                confirmed = False
+            if confirmed is False:
+                self._cancel_requested.discard(confirmation.instance_id)
+                if (
+                    self._cancel_confirmations.get(confirmation.instance_id)
+                    is confirmation.task
+                ):
+                    self._cancel_confirmations.pop(confirmation.instance_id, None)
+                unconfirmed = True
+        for task in pending:
+            self._cancel_requested.discard(by_task[task].instance_id)
+        if error is not None:
+            return CancellationOutcome("failed", error)
+        if unconfirmed:
+            return CancellationOutcome("unconfirmed")
+        return CancellationOutcome("confirmed")
 
     def cancel_subtree(
         self, instance_id: str
-    ) -> tuple[asyncio.Task[bool] | asyncio.Task[None], ...]:
+    ) -> tuple[_CancellationConfirmation, ...]:
         selected = {instance_id}
         changed = True
         while changed:
@@ -197,15 +239,22 @@ class BackgroundAgentOwner:
                 if child not in selected and parent in selected:
                     selected.add(child)
                     changed = True
-        confirmations: list[asyncio.Task[bool] | asyncio.Task[None]] = []
+        confirmations: list[_CancellationConfirmation] = []
         for child in tuple(self._cancellers):
-            if child in selected and child not in self._cancel_requested:
-                self._cancel_requested.add(child)
+            if child not in selected or child in self._cancel_requested:
+                continue
+            self._cancel_requested.add(child)
+            confirmation = self._cancel_confirmations.get(child)
+            if confirmation is None:
                 result = self._cancellers[child]()
                 if isinstance(result, CancellationRequest):
-                    confirmations.append(result.confirmation)
+                    confirmation = result.confirmation
                 elif isinstance(result, asyncio.Task):
-                    confirmations.append(result)
+                    confirmation = result
+                if confirmation is not None:
+                    self._cancel_confirmations[child] = confirmation
+            if confirmation is not None:
+                confirmations.append(_CancellationConfirmation(child, confirmation))
         return tuple(confirmations)
 
     def owns_running(self, instance_id: str) -> bool:
@@ -278,6 +327,7 @@ class BackgroundAgentOwner:
         self._parent_ids.pop(instance_id, None)
         self._original_parent_ids.pop(instance_id, None)
         self._cancel_requested.discard(instance_id)
+        self._cancel_confirmations.pop(instance_id, None)
 
     def adopt(
         self,
