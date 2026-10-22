@@ -13,8 +13,14 @@ from typing import Any
 
 from prompt_toolkit.enums import EditingMode
 
-from ...accounts import AccountError, AccountUsage, SessionAccountContext
-from ...accounts.store import AccountDisplay, rename_account_command
+from ...accounts import (
+    AccountError,
+    AccountId,
+    AccountListSnapshot,
+    AccountUsage,
+    account_provider,
+)
+from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
 from ...core.session import SessionError, env_home, normalize_session_name
@@ -31,6 +37,7 @@ from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import MessageOrigin, StreamEvent
+from ...providers.factory import build_backend
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -173,19 +180,13 @@ class SlashHandlerMixin:
     def model_picker_active(self) -> bool:
         return self._model_picker is not None
 
-    def _show_accounts_picker(
-        self, context: SessionAccountContext, displays: list[AccountDisplay]
-    ) -> str:
-        defaults = {
-            provider: account
-            for provider in ("anthropic", "codex")
-            if (account := context.store.default(provider)) is not None
-        }
+    def _show_accounts_picker(self, snapshot: AccountListSnapshot) -> str:
+        displays = snapshot.displays
         self._dismiss_accounts_picker()
         picker = AccountsPicker(
             tuple(item.account for item in displays),
-            context.snapshot(),
-            defaults,
+            snapshot.selected,
+            snapshot.defaults,
             {item.account: item.detail for item in displays if item.detail},
             {item.account: item.label for item in displays},
             {item.account: item.usage for item in displays},
@@ -209,18 +210,30 @@ class SlashHandlerMixin:
             return "accounts unavailable for this session"
         if context.switching_unavailable is not None:
             return context.switching_unavailable
-        displays = await asyncio.to_thread(context.store.list_display)
-        if not displays:
+        snapshot = await context.list_snapshot()
+        if not snapshot.displays:
             return "no accounts; run zeta login <provider> --account <name>"
-        return self._show_accounts_picker(context, displays)
+        return self._show_accounts_picker(snapshot)
 
-    def _handle_account_limit(self, event: StreamEvent) -> None:
+    def _handle_account_limit(self, event: StreamEvent) -> asyncio.Task[None]:
         context = self.loop.account_context
-        displays = context.store.list_display()
-        alternative = event.data.get("alternative")
-        if event.data.get("action") == "switch" and isinstance(alternative, str):
-            displays = [item for item in displays if str(item.account) == alternative]
-        self._show_accounts_picker(context, displays)
+
+        async def show() -> None:
+            snapshot = await context.list_snapshot()
+            alternative = event.data.get("alternative")
+            if event.data.get("action") == "switch" and isinstance(alternative, str):
+                snapshot = AccountListSnapshot(
+                    tuple(
+                        item
+                        for item in snapshot.displays
+                        if str(item.account) == alternative
+                    ),
+                    snapshot.selected,
+                    snapshot.defaults,
+                )
+            self._show_accounts_picker(snapshot)
+
+        return asyncio.create_task(show())
 
     @property
     def accounts_picker_active(self) -> bool:
@@ -312,26 +325,31 @@ class SlashHandlerMixin:
         account = picker.highlighted
         context = self.loop.account_context
 
-        def prepare_switch() -> Any:
-            backend = None
-            current_provider = "anthropic" if self.provider == "claude" else self.provider
-            if account.provider == current_provider:
-                backend, _ = build_backend(
-                    self.provider,
-                    self.model,
-                    token_budget=self.loop.context_assembler.token_budget,
-                    **{**context.backend_kwargs(self.provider), "account": account},
-                )
-            entries = self.loop.store.replay()
-            boundary = entries[-1].seq if entries else 0
-            context.switch(account, boundary=boundary)
+        current_provider = account_provider(self.provider)
+
+        def prepare_backend(selected: AccountId) -> Any:
+            if selected.provider != current_provider:
+                return None
+            backend, _ = build_backend(
+                self.provider,
+                self.model,
+                home=context.home,
+                account=selected,
+                token_budget=self.loop.context_assembler.token_budget,
+            )
             return backend
 
         async def switch() -> None:
             try:
-                backend = await asyncio.to_thread(prepare_switch)
-                if backend is not None:
-                    context.activate(self.loop, backend, self.provider)
+                entries = self.loop.store.replay()
+                boundary = entries[-1].seq if entries else 0
+                await context.switch_active(
+                    self.loop,
+                    account,
+                    boundary=boundary,
+                    provider=self.provider,
+                    build_backend=prepare_backend,
+                )
             except (AccountError, OSError, RuntimeError, ValueError) as exc:
                 self._print_system(f"account unchanged: {exc}")
                 return

@@ -92,7 +92,7 @@ def test_limit_marks_account_known_exhausted_until_reset(tmp_path: Path) -> None
 
     persisted = read_usage(store, ACCOUNT, now=NOW)
     assert persisted.known_exhausted(NOW)
-    assert format_usage_lines(persisted)[0].startswith("limit reached · resets ")
+    assert format_usage_lines(persisted)[0].startswith("7d 100% · resets ")
     assert not persisted.known_exhausted(NOW + timedelta(hours=1, seconds=1))
 
 
@@ -156,7 +156,9 @@ def _account_context(
 async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    context, opened, first, second = _account_context(tmp_path)
+    context, opened, first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
     now = datetime.now(UTC)
     snapshot = UsageSnapshot(
         now,
@@ -233,11 +235,15 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
         )
 
         boundary = opened.store.replay()[-1].seq
-        context.switch_active(
-            loop, second, "codex", loop.backend.model, boundary=boundary
+        await context.switch_active(
+            loop,
+            second,
+            boundary=boundary,
+            provider="codex",
+            build_backend=lambda _account: loop.backend,
         )
         assert requests == 1
-        assert context.resolve("codex") == second
+        assert await asyncio.to_thread(context.resolve, "codex") == second
     finally:
         await client.aclose()
         opened.store.close()
@@ -247,7 +253,9 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
 async def test_limit_recovery_does_not_block_event_loop_while_usage_lock_held(
     tmp_path: Path,
 ) -> None:
-    context, opened, first, _second = _account_context(tmp_path)
+    context, opened, first, _second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
     entered = threading.Event()
     release = threading.Event()
 

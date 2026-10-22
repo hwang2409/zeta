@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .exhaustion import classify_subscription_limit, recovery_alternatives
-from .store import AccountError, AccountId, AccountStore
+from .store import AccountDisplay, AccountError, AccountId, AccountStore
 from .usage import read_usage, record_subscription_limit
 
 if TYPE_CHECKING:
@@ -27,6 +29,20 @@ def api_key_mode(provider: str) -> bool:
     return provider in {"claude", "anthropic"} and os.environ.get(
         "ZETA_ALLOW_API_KEY"
     ) == "1"
+
+
+@dataclass(frozen=True, slots=True)
+class AccountListSnapshot:
+    displays: tuple[AccountDisplay, ...]
+    selected: dict[str, AccountId]
+    defaults: dict[str, AccountId]
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAccountSwitch:
+    account: AccountId
+    backend: Any
+    metadata: SessionMetadata
 
 
 @dataclass(slots=True)
@@ -144,6 +160,21 @@ class SessionAccountContext:
     def snapshot(self) -> dict[str, AccountId]:
         return dict(self._pins)
 
+    async def list_snapshot(self) -> AccountListSnapshot:
+        selected = self.snapshot()
+
+        def load() -> AccountListSnapshot:
+            displays = tuple(self.store.list_display())
+            providers = {item.account.provider for item in displays}
+            defaults = {
+                provider: account
+                for provider in providers
+                if (account := self.store.default(provider)) is not None
+            }
+            return AccountListSnapshot(displays, selected, defaults)
+
+        return await asyncio.to_thread(load)
+
     def child_snapshot(self, provider: str | None) -> SessionAccountContext:
         needed = {"codex"}
         canonical = account_provider(provider or "")
@@ -166,18 +197,53 @@ class SessionAccountContext:
         )
 
     def switch(self, account: AccountId, *, boundary: int) -> None:
+        prepared = self._prepare_switch(account, boundary, lambda _account: None)
+        self._apply_switch(None, prepared, self.metadata.provider)
+
+    async def switch_active(
+        self,
+        loop: Any,
+        account: AccountId,
+        *,
+        boundary: int,
+        provider: str,
+        build_backend: Callable[[AccountId], Any],
+    ) -> None:
+        prepared = await asyncio.to_thread(
+            self._prepare_switch, account, boundary, build_backend
+        )
+        self._apply_switch(loop, prepared, provider)
+
+    def _prepare_switch(
+        self,
+        account: AccountId,
+        boundary: int,
+        build_backend: Callable[[AccountId], Any],
+    ) -> _PreparedAccountSwitch:
         if self.switching_unavailable is not None:
             raise AccountError(self.switching_unavailable)
         if self._frozen:
             raise AccountError("child account snapshots cannot be changed")
         if not self.store.contains(account):
             raise AccountError(f"account {account} does not exist; use /accounts")
+        backend = build_backend(account)
         assert self.manager is not None
+        metadata = copy.deepcopy(self.metadata)
         self.manager.record_account_selection(
-            self.metadata, account, boundary=boundary, switched=True
+            metadata, account, boundary=boundary, switched=True
         )
+        return _PreparedAccountSwitch(account, backend, metadata)
+
+    def _apply_switch(
+        self, loop: Any | None, prepared: _PreparedAccountSwitch, provider: str
+    ) -> None:
+        assert self.manager is not None
+        self.manager._copy_metadata(self.metadata, prepared.metadata)
+        account = prepared.account
         self._pins = {**self._pins, account.provider: account}
         self._switch_sequences = dict(self.metadata.account_switch_sequences)
+        if loop is not None and prepared.backend is not None:
+            self.activate(loop, prepared.backend, provider)
 
     async def subscription_limit_event(self, failure: object) -> dict[str, object] | None:
         return await asyncio.to_thread(self._subscription_limit_event, failure)
@@ -202,24 +268,6 @@ class SessionAccountContext:
         }
         alternatives = recovery_alternatives(account, states, now)
         return limit.recovery_event(frozen=self._frozen, alternatives=alternatives)
-
-    def switch_active(
-        self, loop: Any, account: AccountId, provider: str, model: str, *, boundary: int
-    ) -> None:
-        from ..providers.factory import build_backend
-
-        current_provider = account_provider(provider)
-        backend = None
-        if account.provider == current_provider:
-            backend, _ = build_backend(
-                provider,
-                model,
-                token_budget=loop.context_assembler.token_budget,
-                **{**self.backend_kwargs(provider), "account": account},
-            )
-        self.switch(account, boundary=boundary)
-        if backend is not None:
-            self.activate(loop, backend, provider)
 
     def activate(self, loop: Any, backend: Any, provider: str) -> tuple[Any, str | None]:
         previous = (loop.backend, self._active_provider)

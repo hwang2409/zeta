@@ -12077,7 +12077,6 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     rendered: list[Panel] = []
     app._presenter.print_unit = rendered.append
     list_display = AccountStore.list_display
-    switch = SessionAccountContext.switch
     off_loop_calls: list[str] = []
 
     def checked_list_display(store: AccountStore):
@@ -12086,14 +12085,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
         off_loop_calls.append("list")
         return list_display(store)
 
-    def checked_switch(context, account, *, boundary):
-        with pytest.raises(RuntimeError, match="no running event loop"):
-            asyncio.get_running_loop()
-        off_loop_calls.append("switch")
-        return switch(context, account, boundary=boundary)
-
     monkeypatch.setattr(AccountStore, "list_display", checked_list_display)
-    monkeypatch.setattr(SessionAccountContext, "switch", checked_switch)
 
     assert await app.slash_accounts("") == ""
     output = StringIO()
@@ -12109,7 +12101,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     assert task is not None
     await task
 
-    assert off_loop_calls == ["list", "switch"]
+    assert off_loop_calls == ["list"]
     assert await asyncio.to_thread(resolver.resolve, "codex") == second
     assert loop.account_context.snapshot()["codex"] == second
     assert AccountStore(home).default("codex") == first
@@ -12129,10 +12121,21 @@ async def test_tui_session_account_switch_runs_store_off_loop() -> None:
             asyncio.get_running_loop()
         switched.append((selected, boundary))
 
+    async def checked_switch_active(
+        _loop,
+        selected: AccountId,
+        *,
+        boundary: int,
+        provider: str,
+        build_backend,
+    ) -> None:
+        del provider, build_backend
+        await asyncio.to_thread(checked_switch, selected, boundary=boundary)
+
     app = SimpleNamespace(
         _accounts_picker=SimpleNamespace(highlighted=account),
         loop=SimpleNamespace(
-            account_context=SimpleNamespace(switch=checked_switch),
+            account_context=SimpleNamespace(switch_active=checked_switch_active),
             store=SimpleNamespace(replay=list),
             context_assembler=SimpleNamespace(token_budget=100_000),
         ),
@@ -12374,8 +12377,11 @@ def _limit_tui(tmp_path: Path) -> tuple[TUIApp, SessionAccountContext, Conversat
     return app, context, opened.store
 
 
-def test_limit_notice_renders_and_switch_key_switches_session(tmp_path: Path) -> None:
-    app, context, store = _limit_tui(tmp_path)
+@pytest.mark.asyncio
+async def test_limit_notice_renders_and_switch_key_switches_session(
+    tmp_path: Path,
+) -> None:
+    app, context, store = await asyncio.to_thread(_limit_tui, tmp_path)
     event = StreamEvent(
         StreamEventType.ACCOUNT_LIMIT,
         data={
@@ -12386,17 +12392,24 @@ def test_limit_notice_renders_and_switch_key_switches_session(tmp_path: Path) ->
         },
     )
     assert "codex:first" in renderable_plain(render_event(event))
-    app._handle_account_limit(event)
+    await app._handle_account_limit(event)
     assert app._accounts_picker is not None
     assert app._accounts_picker.accounts == (AccountId("codex", "second"),)
-    app.accounts_picker_select()
-    assert context.resolve("codex") == AccountId("codex", "second")
+    task = app.accounts_picker_select()
+    assert task is not None
+    await task
+    assert await asyncio.to_thread(context.resolve, "codex") == AccountId(
+        "codex", "second"
+    )
     store.close()
 
 
-def test_limit_without_single_alternative_opens_accounts(tmp_path: Path) -> None:
-    app, _, store = _limit_tui(tmp_path)
-    app._handle_account_limit(
+@pytest.mark.asyncio
+async def test_limit_without_single_alternative_opens_accounts(
+    tmp_path: Path,
+) -> None:
+    app, _, store = await asyncio.to_thread(_limit_tui, tmp_path)
+    await app._handle_account_limit(
         StreamEvent(
             StreamEventType.ACCOUNT_LIMIT,
             data={
@@ -12410,3 +12423,68 @@ def test_limit_without_single_alternative_opens_accounts(tmp_path: Path) -> None
     assert app._accounts_picker is not None
     assert len(app._accounts_picker.accounts) == 2
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_account_limit_event_lists_accounts_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _, store = await asyncio.to_thread(_limit_tui, tmp_path)
+    alternative = AccountId("codex", "second")
+    locked = threading.Event()
+    release = threading.Event()
+    waiting = threading.Event()
+
+    def hold_lifecycle_lock() -> None:
+        with AccountStore(app.loop.account_context.home).lifecycle_guard(alternative):
+            locked.set()
+            assert release.wait(5)
+
+    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder.start()
+    assert await asyncio.to_thread(locked.wait, 1)
+    original_list_display = AccountStore.list_display
+
+    def waiting_list_display(account_store):
+        waiting.set()
+        with account_store.lifecycle_guard(alternative):
+            return original_list_display(account_store)
+
+    monkeypatch.setattr(AccountStore, "list_display", waiting_list_display)
+    ticks = 0
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        task = app._handle_account_limit(
+            StreamEvent(
+                StreamEventType.ACCOUNT_LIMIT,
+                data={
+                    "account": "codex:first",
+                    "resets_at": "2026-10-27T18:31:48Z",
+                    "action": "switch",
+                    "alternative": str(alternative),
+                },
+            )
+        )
+        assert task is not None
+        assert await asyncio.to_thread(waiting.wait, 1)
+        for _ in range(3):
+            await asyncio.sleep(0.01)
+        assert ticks > 1
+        release.set()
+        await asyncio.wait_for(task, 5)
+        assert app._accounts_picker is not None
+        assert app._accounts_picker.accounts == (alternative,)
+    finally:
+        release.set()
+        stop.set()
+        await ticker_task
+        holder.join(timeout=1)
+        store.close()

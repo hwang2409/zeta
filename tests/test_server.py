@@ -5837,3 +5837,77 @@ async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
         assert server.runtime.loop.account_context.resolve("codex") == second
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_account_switch_does_not_block_loop_while_lifecycle_lock_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    locked = threading.Event()
+    release = threading.Event()
+    waiting = threading.Event()
+
+    def hold_lifecycle_lock() -> None:
+        with AccountStore(home).lifecycle_guard(second):
+            locked.set()
+            assert release.wait(5)
+
+    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder.start()
+    assert await asyncio.to_thread(locked.wait, 1)
+    original_lifecycle_guard = AccountStore._lifecycle_guard
+
+    @contextmanager
+    def observed_lifecycle_guard(store, home_fd, account, *, wait=True):
+        if account == second:
+            waiting.set()
+        with original_lifecycle_guard(store, home_fd, account, wait=wait):
+            yield
+
+    monkeypatch.setattr(AccountStore, "_lifecycle_guard", observed_lifecycle_guard)
+    ticks = 0
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+
+    ticker_task = asyncio.create_task(ticker())
+    request_task = asyncio.create_task(
+        _request(
+            reader,
+            writer,
+            "accounts-switch-locked",
+            "account_switch",
+            {"session_id": sid, "account": str(second)},
+        )
+    )
+    try:
+        assert await asyncio.to_thread(waiting.wait, 1)
+        for _ in range(3):
+            await asyncio.sleep(0.01)
+        assert ticks > 1
+        release.set()
+        response = await asyncio.wait_for(request_task, 5)
+        assert response[-1]["result"] == {"account": str(second), "replay": False}
+    finally:
+        release.set()
+        stop.set()
+        await ticker_task
+        if not request_task.done():
+            request_task.cancel()
+        holder.join(timeout=1)
+        await _close(server, writer)
