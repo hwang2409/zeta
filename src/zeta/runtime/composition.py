@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -279,20 +280,24 @@ def compose_runtime(
         memory_reconciler = None
         if memory_enabled:
             memory_backend: CompletionBackend | None = None
+            memory_backend_lock = asyncio.Lock()
 
             async def invoke_memory(prompt: str) -> ReconciliationResponse:
                 nonlocal memory_backend
                 if memory_backend is None:
-                    memory_provider = provider_for_model(config.memory_model)
-                    memory_backend, _ = backend_builder(
-                        memory_provider,
-                        config.memory_model,
-                        home=home,
-                        account=memory_account,
-                        stall_seconds=config.stream_stall_seconds,
-                        stall_retries=config.stream_stall_retries,
-                        token_budget=effective_budget,
-                    )
+                    async with memory_backend_lock:
+                        if memory_backend is None:
+                            memory_provider = provider_for_model(config.memory_model)
+                            memory_backend, _ = await asyncio.to_thread(
+                                backend_builder,
+                                memory_provider,
+                                config.memory_model,
+                                home=home,
+                                account=memory_account,
+                                stall_seconds=config.stream_stall_seconds,
+                                stall_retries=config.stream_stall_retries,
+                                token_budget=effective_budget,
+                            )
                 return await complete_reconciliation(memory_backend, prompt)
 
             memory_reconciler = AutoMemoryReconciler(
