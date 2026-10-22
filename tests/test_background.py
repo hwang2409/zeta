@@ -1604,7 +1604,7 @@ asyncio.run(main(Path(sys.argv[1])))
 async def test_archive_private_and_session_scoped(tmp_path: Path) -> None:
     home = tmp_path / "home"
     manager = SessionManager(home)
-    opened = manager.create(provider="codex", model="fake", cwd=tmp_path)
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="fake", cwd=tmp_path))
     store = opened.store
     tasks = BackgroundTaskRegistry(
         session_dir=store.session_dir,

@@ -754,9 +754,9 @@ async def test_draft_approve_fire_deliver_inspect_and_resume_round_trip(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
-    origin = SessionManager(tmp_path).create(
+    origin = await asyncio.to_thread(lambda: SessionManager(tmp_path).create(
         provider="codex", model="fake", cwd=tmp_path
-    )
+    ))
     registry = ToolRegistry(tmp_path, session_store=origin.store, skill_catalog=SkillCatalog.empty())
     job = _job(tmp_path)
     response = await registry.execute(
@@ -948,14 +948,14 @@ async def test_unattended_runtime_preserves_persisted_allow_layers(
     tmp_path: Path,
 ) -> None:
     marker = tmp_path / "must-not-exist"
-    session = SessionManager(tmp_path).create(
+    session = await asyncio.to_thread(lambda: SessionManager(tmp_path).create(
         provider="codex",
         model="fake",
         cwd=tmp_path,
         skill_catalog=discover_session_skills(home=tmp_path),
         tool_allow=("*",),
         tool_allow_layers=(("remote__*",), ("*",)),
-    )
+    ))
     loop = build_unattended_loop(
         session, home=tmp_path, allow=("bash",), backend=FakeBackend([])
     )
@@ -978,13 +978,13 @@ async def test_unattended_runtime_ignores_global_yolo_hooks_and_project_tools(
         'yolo = true\n[approval]\nallow = ["bash"]\n'
     )
     catalog = discover_session_skills(home=tmp_path)
-    session = SessionManager(tmp_path).create(
+    session = await asyncio.to_thread(lambda: SessionManager(tmp_path).create(
         provider="codex",
         model="fake",
         cwd=tmp_path,
         system_prompt=load_identity(catalog=catalog),
         skill_catalog=catalog,
-    )
+    ))
     loop = build_unattended_loop(
         session, home=tmp_path, allow=(), backend=FakeBackend([])
     )
@@ -1001,13 +1001,13 @@ async def test_automation_run_keeps_approved_skill_snapshot(
     tmp_path: Path,
 ) -> None:
     catalog = discover_session_skills(home=tmp_path)
-    session = SessionManager(tmp_path).create(
+    session = await asyncio.to_thread(lambda: SessionManager(tmp_path).create(
         provider="codex",
         model="fake",
         cwd=tmp_path,
         system_prompt=load_identity(catalog=catalog),
         skill_catalog=catalog,
-    )
+    ))
     skill = tmp_path / "skills" / "late.md"
     skill.parent.mkdir(parents=True)
     skill.write_text(
@@ -1050,13 +1050,13 @@ async def test_automation_catalog_excludes_project_skills_from_prompt_and_tool(
         encoding="utf-8",
     )
     catalog = discover_session_skills(home=tmp_path)
-    session = SessionManager(tmp_path).create(
+    session = await asyncio.to_thread(lambda: SessionManager(tmp_path).create(
         provider="codex",
         model="fake",
         cwd=tmp_path,
         system_prompt=load_identity(catalog=catalog),
         skill_catalog=catalog,
-    )
+    ))
     loop = build_unattended_loop(
         session,
         home=tmp_path,

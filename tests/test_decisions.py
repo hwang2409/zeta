@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
@@ -96,8 +97,8 @@ def _decisions_app(home: Path, opened) -> TUIApp:
 async def test_decisions_tick_counts_only_current_root_session(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "git")
-    current = _session(tmp_path, project.project_id)
-    other = _session(tmp_path, project.project_id)
+    current = await asyncio.to_thread(lambda: _session(tmp_path, project.project_id))
+    other = await asyncio.to_thread(lambda: _session(tmp_path, project.project_id))
     _request(current, project.project_id, "Current", "This one.")
     _request(other, project.project_id, "Other", "Not this one.")
 
@@ -120,8 +121,8 @@ async def test_decisions_tick_counts_only_current_root_session(tmp_path: Path) -
 async def test_decisions_tick_clears_after_resolve_attention(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "git")
-    current = _session(tmp_path, project.project_id)
-    other = _session(tmp_path, project.project_id)
+    current = await asyncio.to_thread(lambda: _session(tmp_path, project.project_id))
+    other = await asyncio.to_thread(lambda: _session(tmp_path, project.project_id))
     _request(other, project.project_id, "Other", "Not this one.")
     anchor = current.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
@@ -138,7 +139,7 @@ async def test_decisions_tick_clears_after_resolve_attention(tmp_path: Path) -> 
     await app._decisions_tick()
     assert app.decisions_count == 1
 
-    fork_id = create_discussion_fork(tmp_path, current.store.session_id, record.id)
+    fork_id = await asyncio.to_thread(lambda: create_discussion_fork(tmp_path, current.store.session_id, record.id))
     fork = manager.open(fork_id)
     registry = ToolRegistry(
         tmp_path,

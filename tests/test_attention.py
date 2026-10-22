@@ -444,7 +444,7 @@ async def test_attention_fork_preserves_prompt_composition_on_resume(
             },
         )
     manager = SessionManager(home)
-    source = manager.create(
+    source = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="offline",
         cwd=workspace,
@@ -458,7 +458,7 @@ async def test_attention_fork_preserves_prompt_composition_on_resume(
         prompt_recipe=context.prompt_recipe,
         prompt_components=context.prompt_components,
         auto_project=False,
-    )
+    ))
     anchor = source.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("choose")])
     )
@@ -470,7 +470,7 @@ async def test_attention_fork_preserves_prompt_composition_on_resume(
         title="Question",
         why="Need a choice.",
     )
-    fork_id = create_discussion_fork(home, source.store.session_id, attention.id)
+    fork_id = await asyncio.to_thread(lambda: create_discussion_fork(home, source.store.session_id, attention.id))
     source.store.close()
     fork = manager.open(fork_id, _read_only=True)
     try:

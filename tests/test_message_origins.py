@@ -222,7 +222,7 @@ def _render_envelope(envelope: ModelInputEnvelope) -> dict[str, object]:
     )
 
 
-def test_plan_preserves_exact_typed_input_as_nested_user_evidence() -> None:
+async def test_plan_preserves_exact_typed_input_as_nested_user_evidence() -> None:
     class Session(SlashHandlerMixin):
         active = False
         pending_approvals: tuple[object, ...] = ()
@@ -238,7 +238,7 @@ def test_plan_preserves_exact_typed_input_as_nested_user_evidence() -> None:
             pass
 
     typed = "/plan   inspect this exact branch"
-    envelope = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+    envelope = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
         Session(), typed
     )
 

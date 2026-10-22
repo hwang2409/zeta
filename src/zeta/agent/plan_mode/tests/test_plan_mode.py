@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from io import StringIO
@@ -460,37 +461,37 @@ class PlanSession:
         return None
 
 
-def dispatch(session: object, value: str) -> str | ModelInputEnvelope | None:
-    return create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(session, value)
+async def dispatch(session: object, value: str) -> str | ModelInputEnvelope | None:
+    return await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(session, value)
 
 
-def test_plan_command_reports_and_toggles() -> None:
+async def test_plan_command_reports_and_toggles() -> None:
     from zeta.tui.slash_handlers import SlashHandlerMixin
 
     class Session(SlashHandlerMixin, PlanSession):
         pass
 
     session = Session()
-    assert dispatch(session, "/plan") == (
+    assert await dispatch(session, "/plan") == (
         "plan mode: on (read-only tools; deliver the plan as your answer)"
     )
     assert session.plan_mode is True
-    assert dispatch(session, "/plan") == "plan mode: off"
-    assert dispatch(session, "/plan on") == (
+    assert await dispatch(session, "/plan") == "plan mode: off"
+    assert await dispatch(session, "/plan on") == (
         "plan mode: on (read-only tools; deliver the plan as your answer)"
     )
-    assert dispatch(session, "/plan off") == "plan mode: off"
+    assert await dispatch(session, "/plan off") == "plan mode: off"
     assert session.plan_mode is False
 
 
-def test_plan_command_submits_prompt_when_text_is_present() -> None:
+async def test_plan_command_submits_prompt_when_text_is_present() -> None:
     from zeta.tui.slash_handlers import SlashHandlerMixin
 
     class Session(SlashHandlerMixin, PlanSession):
         pass
 
     session = Session()
-    result = dispatch(session, "/plan inspect the repository")
+    result = await dispatch(session, "/plan inspect the repository")
     assert isinstance(result, ModelInputEnvelope)
     assert result.text == "inspect the repository"
     assert result.display_text == "/plan inspect the repository"
@@ -498,7 +499,7 @@ def test_plan_command_submits_prompt_when_text_is_present() -> None:
     assert session.plan_mode is True
 
 
-def test_plan_command_refuses_while_a_turn_is_active() -> None:
+async def test_plan_command_refuses_while_a_turn_is_active() -> None:
     from zeta.tui.slash_handlers import SlashHandlerMixin
 
     class Session(SlashHandlerMixin, PlanSession):
@@ -506,7 +507,7 @@ def test_plan_command_refuses_while_a_turn_is_active() -> None:
 
     session = Session()
     session.active = True
-    assert dispatch(session, "/plan on") == (
+    assert await dispatch(session, "/plan on") == (
         "plan mode unchanged: cannot change plan mode while a turn or "
         "approval is active"
     )
@@ -529,7 +530,7 @@ async def test_plan_command_refuses_live_background_work_then_allows_entry(
         description="/build",
     )
 
-    blocked = dispatch(app, "/plan on")
+    blocked = await dispatch(app, "/plan on")
     assert blocked == (
         "plan mode unchanged: background work is active: /build; stop it or wait"
     )
@@ -537,7 +538,7 @@ async def test_plan_command_refuses_live_background_work_then_allows_entry(
 
     await watcher
     app.loop._background_owner.unregister("macro:test")
-    assert dispatch(app, "/plan on") == (
+    assert await dispatch(app, "/plan on") == (
         "plan mode: on (read-only tools; deliver the plan as your answer)"
     )
     assert app.loop.plan_mode is True
@@ -556,7 +557,7 @@ async def test_plan_command_refuses_running_background_process_then_allows_entry
         "sleep 0.2", tmp_path
     )
 
-    assert dispatch(app, "/plan on") == (
+    assert await dispatch(app, "/plan on") == (
         "plan mode unchanged: background work is active: sleep 0.2; stop it or wait"
     )
     assert app.loop.plan_mode is False
@@ -568,7 +569,7 @@ async def test_plan_command_refuses_running_background_process_then_allows_entry
     async with asyncio.timeout(5):
         while app._submissions.active or app.loop.store.agent_notifications():
             await asyncio.sleep(0)
-    assert dispatch(app, "/plan on") == (
+    assert await dispatch(app, "/plan on") == (
         "plan mode: on (read-only tools; deliver the plan as your answer)"
     )
     assert app.loop.plan_mode is True
@@ -580,7 +581,7 @@ def test_plan_command_is_listed_in_help() -> None:
     assert "/implement" in create_slash_registry(skill_catalog=SkillCatalog.empty()).help_text()
 
 
-def test_implement_exits_and_submits_the_explicit_request() -> None:
+async def test_implement_exits_and_submits_the_explicit_request() -> None:
     from zeta.tui.slash_handlers import SlashHandlerMixin
 
     class Session(SlashHandlerMixin, PlanSession):
@@ -588,7 +589,7 @@ def test_implement_exits_and_submits_the_explicit_request() -> None:
 
     session = Session()
     session.set_plan_mode(True)
-    result = dispatch(session, "/implement")
+    result = await dispatch(session, "/implement")
     assert isinstance(result, ModelInputEnvelope)
     assert result.text == "implement the plan you proposed above"
     assert session.plan_mode is False
@@ -622,14 +623,17 @@ def test_yolo_has_no_plan_mode_approval_flow(
     assert policy.decide(app.loop.tool_registry.resolve_call("bash", {})) is ApprovalDecision.ALLOW
 
 
-def test_status_command_reports_plan_mode(
+async def test_status_command_reports_plan_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
-    app = create_app(build_parser().parse_args(["--provider", "codex"]))
-    assert "plan_mode: off" in dispatch(app, "/status")
+    app = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
+    assert "plan_mode: off" in await dispatch(app, "/status")
     app.loop.set_plan_mode(True)
-    assert "plan_mode: on" in dispatch(app, "/status")
+    assert "plan_mode: on" in await dispatch(app, "/status")
+    await app.close()
 
 
 def test_plan_mode_persists_and_restores_session_metadata(
@@ -710,7 +714,7 @@ def test_shift_tab_is_inert_without_a_handler() -> None:
     ]
 
 
-def test_key_toggle_reports_through_the_same_path_as_the_command() -> None:
+async def test_key_toggle_reports_through_the_same_path_as_the_command() -> None:
     from zeta.tui.slash_handlers import SlashHandlerMixin
 
     printed: list[str] = []
@@ -721,10 +725,12 @@ def test_key_toggle_reports_through_the_same_path_as_the_command() -> None:
 
     session = Session()
     session.toggle_plan_mode()
+    await asyncio.sleep(0)
     assert session.plan_mode is True
     assert printed == [
         "plan mode: on (read-only tools; deliver the plan as your answer)"
     ]
     session.toggle_plan_mode()
+    await asyncio.sleep(0)
     assert session.plan_mode is False
     assert printed[-1] == "plan mode: off"

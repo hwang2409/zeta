@@ -142,9 +142,11 @@ def test_project_tool_inspects_auto_associated_memory(tmp_path: Path) -> None:
     assert result["structuredContent"]["project"]["project_id"] == opened.metadata.project_id
 
 
-def test_project_slash_show_and_init(tmp_path: Path) -> None:
+async def test_project_slash_show_and_init(tmp_path: Path) -> None:
     root = repo(tmp_path); m = manager(tmp_path)
-    opened = m.create(provider="codex", model="test", cwd=root)
+    opened = await asyncio.to_thread(
+        lambda: m.create(provider="codex", model="test", cwd=root)
+    )
     class Loop:
         project_registry = m.project_registry
         manager = m
@@ -159,13 +161,15 @@ def test_project_slash_show_and_init(tmp_path: Path) -> None:
     # Exercise the production slash handler through the session mixin implementation.
     from zeta.tui.slash_handlers import SlashHandlerMixin
     handler = object.__new__(SlashHandlerMixin); handler.loop = Loop()
-    output = handler.slash_project("")
+    output = await handler.slash_project("")
     assert "project: repo" in output
     plain = tmp_path / "plain"; plain.mkdir()
-    opened2 = m.create(provider="codex", model="test", cwd=plain, auto_project=False)
+    opened2 = await asyncio.to_thread(
+        lambda: m.create(provider="codex", model="test", cwd=plain, auto_project=False)
+    )
     handler.loop.session_metadata = opened2.metadata; handler.loop.store.cwd = str(plain)
-    assert "unassociated" in handler.slash_project("")
-    assert "project: plain" in handler.slash_project("init")
+    assert "unassociated" in await handler.slash_project("")
+    assert "project: plain" in await handler.slash_project("init")
 
 
 def test_settings_auto_project_false(tmp_path: Path) -> None:
@@ -541,7 +545,7 @@ def test_incomplete_git_discovery_is_ineligible_and_warns(
         opened.store.close()
 
 
-def test_registered_home_and_injected_filesystem_root_projects_do_not_auto_capture(
+async def test_registered_home_and_injected_filesystem_root_projects_do_not_auto_capture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake_root = tmp_path / "fake-root"
@@ -552,7 +556,9 @@ def test_registered_home_and_injected_filesystem_root_projects_do_not_auto_captu
     home_project = m.project_registry.find_or_create_for_directory(user_home)
     root_project = m.project_registry.find_or_create_for_directory(fake_root)
 
-    opened = m.create(provider="codex", model="test", cwd=nested)
+    opened = await asyncio.to_thread(
+        lambda: m.create(provider="codex", model="test", cwd=nested)
+    )
     try:
         assert opened.metadata.project_id is None
         assert opened.metadata.project_id != home_project.project_id
@@ -578,19 +584,23 @@ def test_registered_home_and_injected_filesystem_root_projects_do_not_auto_captu
     monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta"))
     monkeypatch.chdir(user_home)
-    explicit = create_app(build_parser().parse_args(["--provider", "codex"]))
+    explicit = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
     try:
-        assert "project: user-home" in explicit.slash_project("init")
+        assert "project: user-home" in await explicit.slash_project("init")
         assert explicit.loop.session_metadata.project_id == home_project.project_id
     finally:
-        asyncio.run(explicit.close())
+        await explicit.close()
 
     monkeypatch.chdir(nested)
-    later = create_app(build_parser().parse_args(["--provider", "codex"]))
+    later = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
     try:
         assert later.loop.session_metadata.project_id is None
     finally:
-        asyncio.run(later.close())
+        await later.close()
 
 
 def test_first_auto_created_session_refreshes_project_memory_on_resume(
@@ -643,7 +653,7 @@ async def test_project_init_rebinds_runtime_child_and_approval(
     app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
     try:
         assert app.loop.root_project_id is None
-        assert "project: plain" in app.slash_project("init")
+        assert "project: plain" in await app.slash_project("init")
         project_id = app.loop.session_metadata.project_id
         assert project_id is not None
         assert app.loop.root_project_id == project_id

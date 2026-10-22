@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import concurrent.futures
 import hashlib
 import io
@@ -170,9 +171,9 @@ def test_session_push_agent_tool_cannot_force_replacement(tmp_path: Path) -> Non
 async def test_session_push_agent_tool_marks_registry_busy_as_retryable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    opened = SessionManager(tmp_path / "home").create(
+    opened = await asyncio.to_thread(lambda: SessionManager(tmp_path / "home").create(
         provider="codex", model="fake", cwd=tmp_path
-    )
+    ))
     registry = ToolRegistry(
         tmp_path,
         register_builtin=False,

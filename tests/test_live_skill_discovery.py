@@ -212,7 +212,7 @@ async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
     tmp_path: Path,
 ) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
-    loop, manager, home, _ = _session_loop(tmp_path, backend)
+    loop, manager, home, _ = await asyncio.to_thread(lambda: _session_loop(tmp_path, backend))
     release, holder = _hold_metadata_lock(manager, loop.session_metadata.session_id)
     _install_live_skill(home)
     started = time.monotonic()
@@ -236,7 +236,7 @@ async def test_touch_adopts_metadata_without_reverting_live_prompt(
     tmp_path: Path,
 ) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
-    loop, manager, home, _ = _session_loop(tmp_path, backend)
+    loop, manager, home, _ = await asyncio.to_thread(lambda: _session_loop(tmp_path, backend))
     original_prompt = loop.session_metadata.system_prompt
     original_catalog = loop.session_metadata.skill_catalog
     _install_live_skill(home)
@@ -244,12 +244,12 @@ async def test_touch_adopts_metadata_without_reverting_live_prompt(
 
     other = SessionManager(home).open(loop.session_metadata.session_id)
     try:
-        SessionManager(home).record_override(
+        await asyncio.to_thread(lambda: SessionManager(home).record_override(
             other.metadata, provider=None, model="new-model"
-        )
+        ))
     finally:
         other.store.close()
-    manager.touch(loop.session_metadata)
+    await asyncio.to_thread(lambda: manager.touch(loop.session_metadata))
 
     assert loop.session_metadata.model == "new-model"
     assert loop.session_metadata.system_prompt == original_prompt
@@ -320,7 +320,7 @@ async def test_concurrent_resume_keeps_live_prompt_components_with_skill_refresh
     memory_offset = prompt.index(memory)
     memory_digest = hashlib.sha256(memory.encode()).hexdigest()
     manager = SessionManager(home)
-    first = manager.create(
+    first = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="offline",
         cwd=project,
@@ -338,10 +338,10 @@ async def test_concurrent_resume_keeps_live_prompt_components_with_skill_refresh
             }
         },
         auto_project=False,
-    )
+    ))
     _install_live_skill(home, "first", "first description")
     second = manager.open(first.metadata.session_id)
-    resumed = resume_prompt(
+    resumed = await asyncio.to_thread(lambda: resume_prompt(
         second.metadata,
         manager=manager,
         store=second.store,
@@ -351,7 +351,7 @@ async def test_concurrent_resume_keeps_live_prompt_components_with_skill_refresh
         context_loader=lambda **kwargs: (_ for _ in ()).throw(
             AssertionError(f"unexpected default rebuild: {kwargs}")
         ),
-    )
+    ))
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
     config = resolve(
         load_settings(home=home).settings,
@@ -417,7 +417,7 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
     memory_offset = prompt.index(memory)
     memory_digest = hashlib.sha256(memory.encode()).hexdigest()
     manager = SessionManager(home)
-    opened = manager.create(
+    opened = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="offline",
         cwd=project,
@@ -435,7 +435,7 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
             }
         },
         auto_project=False,
-    )
+    ))
     loop = AgentLoop(
         FakeBackend([]),
         opened.store,
@@ -460,7 +460,7 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
     )
     resumed = manager.open(opened.metadata.session_id)
     try:
-        result = resume_prompt(
+        result = await asyncio.to_thread(lambda: resume_prompt(
             resumed.metadata,
             manager=manager,
             store=resumed.store,
@@ -470,7 +470,7 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
             context_loader=lambda **kwargs: (_ for _ in ()).throw(
                 AssertionError(f"unexpected default rebuild: {kwargs}")
             ),
-        )
+        ))
         component = result.context.prompt_components["project_memory"]
         offset = int(component["offset"])
         length = int(component["length"])

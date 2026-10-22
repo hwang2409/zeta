@@ -1107,7 +1107,7 @@ async def test_approval_scope_rejects_invalid_values(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_resumed_approval_finishes_idle_after_terminal_event(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="offline", cwd=tmp_path))
     target = tmp_path / "input.txt"
     target.write_text("approved")
     call = ToolCall("resumed-call", "read", {"path": str(target)})
@@ -2601,7 +2601,7 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
 @pytest.mark.asyncio
 async def test_serve_resume_renders_legacy_browser_tool_messages(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="offline", cwd=tmp_path))
     session_id = opened.metadata.session_id
     transcript_path = opened.store.path
     opened.store.close()
@@ -4611,7 +4611,7 @@ async def test_serve_resume_slash_list_shows_skill_parse_notice(
 ) -> None:
     home = tmp_path / "home"
     manager = SessionManager(home)
-    opened = manager.create(
+    opened = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="offline",
         cwd=tmp_path,
@@ -4620,7 +4620,7 @@ async def test_serve_resume_slash_list_shows_skill_parse_notice(
         agent_catalog=AgentCatalog.empty(),
         prompt_recipe=None,
         auto_project=False,
-    )
+    ))
     session_id = opened.metadata.session_id
     opened.store.close()
     malformed = home / "skills" / "broken" / "SKILL.md"
@@ -4871,7 +4871,7 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
     mutation RPC guards with the exact same check."""
 
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="offline", cwd=tmp_path))
     # Seed one outstanding tool call so ``pending_requests()`` returns it
     # even though no turn task is running — this is the scenario the fix
     # closes: _require_idle passes, require_mutable must not.
