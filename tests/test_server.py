@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.accounts import AccountId
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session import SessionManager, SessionMetadata
@@ -4045,6 +4046,24 @@ async def test_stream_access_recovery_does_not_depend_on_message(
 
 
 @pytest.mark.asyncio
+async def test_serve_session_response_includes_account_fields(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        server.runtime.manager.record_account_selection(
+            server.runtime.metadata, AccountId("codex", "named"), boundary=3, switched=True
+        )
+        row = (await _request(reader, writer, 3, "list_sessions"))[-1]["result"]["sessions"][0]
+        assert row["selected_accounts"] == {"codex": "codex:named"}
+        assert row["account_switch_sequences"] == {"codex": 1}
+        assert row["native_context_boundaries"] == {"codex": 3}
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_session_management_lifecycle_and_active_delete(tmp_path):
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
@@ -5485,5 +5504,76 @@ async def test_resume_missing_session_structured_error(tmp_path: Path) -> None:
             "message": "session missing was not found",
             "data": {"code": "session_not_found", "session_id": "missing"},
         }
+    finally:
+        await _close(server, writer)
+
+@pytest.mark.asyncio
+async def test_serve_cross_provider_model_change_updates_account_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.support.credentials import named_account_credentials
+    from tests.support.server_backend import ServerFakeBackend
+    from zeta.accounts import AccountId
+    from zeta.oauth import OAuthTokens
+    from zeta.protocol.types import Message, MessageRole, TextContent, ThinkingContent
+    from zeta.server import model_selection
+
+    token = OAuthTokens("access", "refresh", 9_999_999_999.0)
+    named_account_credentials(tmp_path, "codex").save(token)
+    named_account_credentials(tmp_path, "anthropic").save(token)
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="codex",
+        model="gpt-5.4",
+        backend_factory=lambda _p, m, _h: (ServerFakeBackend(model=m), m),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        runtime = server.runtime
+        runtime.loop.account_context.switch(
+            AccountId("codex", "default"), boundary=0
+        )
+        runtime.loop.account_context.switch(
+            AccountId("anthropic", "default"), boundary=0
+        )
+        native = Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("codex", "encrypted"), TextContent("answer")],
+            metadata={"account_provider": "codex", "account_switch_sequence": 1},
+        )
+        runtime.loop.store.append_message(native)
+
+        model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
+        assert runtime.loop.account_context.active_provider == "anthropic"
+        assert runtime.loop.account_context.switch_sequence == 1
+        assert runtime.loop._account_safe_context([native])[0].content == [
+            ThinkingContent("codex"),
+            TextContent("answer"),
+        ]
+        model_selection.apply(runtime, "gpt-5.4", "ask")
+        assert runtime.loop.account_context.active_provider == "codex"
+        assert runtime.loop.account_context.switch_sequence == 1
+        assert runtime.loop._account_safe_context([native])[0].content == native.content
+
+        previous = (
+            runtime.loop.backend,
+            runtime.loop.account_context.active_provider,
+            runtime.loop.account_context.switch_sequence,
+        )
+        monkeypatch.setattr(
+            runtime.manager,
+            "record_session_settings",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
+        )
+        with pytest.raises(OSError, match="write failed"):
+            model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
+        assert (
+            runtime.loop.backend,
+            runtime.loop.account_context.active_provider,
+            runtime.loop.account_context.switch_sequence,
+        ) == previous
     finally:
         await _close(server, writer)

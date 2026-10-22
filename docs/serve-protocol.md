@@ -659,7 +659,9 @@ SessionMetadata = {
     project_memory_length: integer or null,
     project_memory_digest: string or null,
     prompt_recipe: string or null, prompt_components: object,
-    tool_allow: array[string] or null, tool_deny: array[string]
+    tool_allow: array[string] or null, tool_deny: array[string],
+    selected_accounts: object, account_switch_sequences: object,
+    native_context_boundaries: object
   },
   optional: {
     tool_allow_layers: array[array[string]],
@@ -708,7 +710,9 @@ appears only in `list_sessions`. A 1.0 `list_sessions` omits `name`.
 
 `created_at` and `updated_at` are ISO-8601 strings. IDs, names, paths, and
 provider values are strings. `retained_tail` and `compaction_budget` are
-positive integers. The server preserves usage keys and values.
+positive integers. `selected_accounts` maps providers to account IDs;
+`account_switch_sequences` and `native_context_boundaries` map providers to
+non-negative integers. The server preserves usage keys and values.
 
 Tool result `content_blocks` uses the MCP-compatible union. A `text` block
 requires `text`, `truncated`, and `full_size`. A truncated text block can also

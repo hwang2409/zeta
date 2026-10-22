@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..accounts import SessionAccountContext, account_provider
 from ..config.settings import ResolvedConfig
 from ..config.tool_policy import ToolPolicy
 from ..core.approval import ApprovalDecision, ApprovalPolicy
@@ -115,9 +116,7 @@ def compose_runtime(
             "stall_retries": config.stream_stall_retries,
             "token_budget": effective_budget,
         }
-        backend, selected_model = backend_builder(
-            provider, session_model, **backend_kwargs
-        )
+        selected_model = session_model or default_model(provider) or "unknown"
         if opened is None:
             opened = manager.create(
                 provider=provider,
@@ -148,18 +147,22 @@ def compose_runtime(
                 tool_allow_layers=config.tool_allow_layers,
             )
             cleanup.enter_context(opened.store)
-        else:
-            if (
-                effective_budget != opened.metadata.compaction_budget
-                or budget_pinned != opened.metadata.budget_pinned
-            ):
-                manager.record_budget(
-                    opened.metadata,
-                    budget=effective_budget,
-                    pinned=budget_pinned,
-                    touch=False,
-                )
         metadata = opened.metadata
+        account_context = SessionAccountContext.load(home, manager, metadata)
+        backend_kwargs.update(account_context.backend_kwargs(provider))
+        backend, selected_model = backend_builder(
+            provider, session_model, **backend_kwargs
+        )
+        if resuming and (
+            effective_budget != metadata.compaction_budget
+            or budget_pinned != metadata.budget_pinned
+        ):
+            manager.record_budget(
+                metadata,
+                budget=effective_budget,
+                pinned=budget_pinned,
+                touch=False,
+            )
         if resuming:
             persisted_policy = ToolPolicy.create(
                 metadata.tool_allow,
@@ -195,6 +198,16 @@ def compose_runtime(
         if attention_fork is not None:
             tool_policy = tool_policy.narrowed_by(ATTENTION_FORK_POLICY)
         hooks_restricted = tool_policy.restricted
+        memory_enabled = (
+            attention_fork is None
+            and config.memory_auto
+            and metadata.project_id is not None
+        )
+        memory_account = None
+        if memory_enabled:
+            memory_provider = provider_for_model(config.memory_model)
+            if account_provider(memory_provider) is not None:
+                memory_account = account_context.resolve(memory_provider)
         loop_kwargs: dict[str, Any] = {
             "approval_policy": policy,
             "hooks": (
@@ -232,6 +245,7 @@ def compose_runtime(
             tool_deny=tool_policy.deny,
             tool_allow_layers=tool_policy.allow_layers,
             image_policy=image_policy_for_provider(provider),
+            account_context=account_context,
             required_tool_names=tuple(
                 dict.fromkeys(
                     (
@@ -261,12 +275,9 @@ def compose_runtime(
         loop.post_stream_provider_retry = post_stream_provider_retry
         loop.manager = manager
         loop.session_metadata = metadata
+        loop.account_context = account_context
         memory_reconciler = None
-        if (
-            attention_fork is None
-            and config.memory_auto
-            and metadata.project_id is not None
-        ):
+        if memory_enabled:
             memory_backend: CompletionBackend | None = None
 
             async def invoke_memory(prompt: str) -> ReconciliationResponse:
@@ -277,6 +288,7 @@ def compose_runtime(
                         memory_provider,
                         config.memory_model,
                         home=home,
+                        account=memory_account,
                         stall_seconds=config.stream_stall_seconds,
                         stall_retries=config.stream_stall_retries,
                         token_budget=effective_budget,

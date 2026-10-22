@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 
+from ..accounts import AccountId
 from ..config.settings import ResolvedConfig, SettingsError
 from ..config.settings import resolve as resolve_settings
 from ..core.project_context import (
@@ -213,6 +214,7 @@ def build_backend(
     stall_retries: int | None = None,
     ollama_base_url: str | None = None,
     token_budget: int | None = None,
+    account: AccountId | None = None,
 ) -> tuple[CompletionBackend, str]:
     """Build the selected network provider."""
 
@@ -224,6 +226,7 @@ def build_backend(
         stall_retries=stall_retries,
         ollama_base_url=ollama_base_url,
         token_budget=token_budget,
+        account=account,
     )
 
 

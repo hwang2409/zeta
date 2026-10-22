@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 
+from ..accounts import AccountId, AccountStore, account_provider, api_key_mode
 from ..core.session import SessionManager
 from ..mcp.mount import MCPMount
 from ..project_registry import ProjectRegistryError
@@ -38,6 +39,25 @@ from .webhook import MAX_PROMPT_PAYLOAD_BYTES
 MountFactory = Callable[
     [Job, ToolRegistry, Path, InboxGrants | None], Awaitable[MCPMount]
 ]
+
+
+def _account_preflight(job: Job, home: Path, backend: CompletionBackend | None) -> str | None:
+    pinned_account = AccountId(*job.account.split(":", 1)) if job.account else None
+    named_provider = account_provider(job.provider)
+    if named_provider is None or api_key_mode(job.provider) or backend is not None:
+        return None
+    if pinned_account is None:
+        return (
+            "approved automation revision has no pinned account; create a new draft "
+            "revision (re-draft the job) and approve it"
+        )
+    if not AccountStore(home).contains(pinned_account):
+        return (
+            f"approved automation account {pinned_account} no longer exists; create a "
+            "new draft revision (re-draft the job) and approve it, or log the account "
+            "back in under the same name"
+        )
+    return None
 
 
 def poll_events(text: str, lower: datetime, upper: datetime) -> tuple[PollEvent, ...]:
@@ -124,6 +144,10 @@ async def run_claimed(
         store.finish(run_id, status, detail)
         return
     job = state.job
+    pinned_account = AccountId(*job.account.split(":", 1)) if job.account else None
+    if (detail := _account_preflight(job, home, backend)) is not None:
+        store.finish(run_id, "failed", detail)
+        return
     skill_catalog = discover_session_skills(home=home)
     agent_catalog = discover_packaged_agents()
     manager = SessionManager(home)
@@ -146,6 +170,8 @@ async def run_claimed(
         project_id=project_id,
         auto_project=False,
     )
+    if pinned_account is not None:
+        manager.record_account_selection(session.metadata, pinned_account, boundary=0)
     store.attach_session(run_id, session.metadata.session_id)
     loop = None
     phase = "running"

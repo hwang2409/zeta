@@ -21,12 +21,32 @@ import zeta.oauth as oauth_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.server.login as server_login
 from tests.support.credentials import named_account_credentials
-from zeta.accounts import AccountError, AccountId, AccountStore
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.accounts import (
+    AccountError,
+    AccountId,
+    AccountStore,
+    SessionAccountContext,
+)
 from zeta.agent.runner import resolve_child_backend
+from zeta.core.loop import AgentLoop
+from zeta.core.session import SessionManager
+from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    RedactedThinkingContent,
+    TextContent,
+    ThinkingContent,
+)
 from zeta.providers.factory import build_backend, credential_store
 from zeta.runtime import unattended
 from zeta.server.login import Logins
+from zeta.skills import SkillCatalog
+from zeta.tools import websearch
+from zeta.tools.websearch import codex as websearch_codex
 from zeta.tui import models as tui_models
 
 _SENTINEL = "token-text-must-not-escape"
@@ -303,6 +323,26 @@ def test_migration_is_noop_when_already_migrated(tmp_path: Path) -> None:
     )
 
 
+def test_migration_does_not_delete_legacy_file_newer_than_migrated_copy(
+    tmp_path: Path,
+) -> None:
+    _write_legacy(tmp_path, "codex")
+    store = AccountStore(tmp_path)
+    store.migrate()
+    destination = store.credential_path(AccountId("codex", "default"))
+    destination_mtime = destination.stat().st_mtime_ns
+    newer = OAuthTokens("newer-access", "newer-refresh", 10_000_000_000.0)
+    legacy = tmp_path / "codex-oauth.json"
+    legacy.write_text(json.dumps(newer.to_dict()))
+    newer_mtime = destination_mtime + 1_000_000_000
+    os.utime(legacy, ns=(newer_mtime, newer_mtime))
+
+    store.migrate()
+
+    assert json.loads(destination.read_text()) == newer.to_dict()
+    assert not legacy.exists()
+
+
 def test_account_files_are_0600_and_dirs_are_private(tmp_path: Path) -> None:
     store = AccountStore(tmp_path)
     named_account_credentials(tmp_path, "codex", "personal").save(tokens())
@@ -464,7 +504,13 @@ def test_migration_then_every_reader_uses_the_account_store(
             json=lambda: {"data": []},
         ),
     )
-    assert tui_models.load_model_catalog("claude", home=tmp_path) == frozenset()
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    context = SessionAccountContext.load(tmp_path, manager, opened.metadata)
+    assert tui_models.load_model_catalog(
+        "claude", account_context=context
+    ) == frozenset()
+    opened.store.close()
 
     expected = AccountStore(tmp_path).credential_path(
         AccountId("anthropic", "default")
@@ -875,3 +921,348 @@ def test_accounts_default_invalid_input_is_a_command_error(
     output = capsys.readouterr()
     assert "invalid account id" in output.err.lower()
     assert _SENTINEL not in output.err
+
+
+def test_new_session_pins_global_default_in_meta(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    account = AccountId("anthropic", "work")
+    named_account_credentials(home, "anthropic", "work").save(tokens())
+    AccountStore(home).set_default(account)
+    manager = SessionManager(home)
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+
+    resolver = SessionAccountContext.load(home, manager, opened.metadata)
+
+    assert resolver.resolve("claude") == account
+    assert manager.read_metadata(opened.metadata.session_id).selected_accounts == {
+        "anthropic": "anthropic:work"
+    }
+    opened.store.close()
+
+
+def test_resumed_session_without_selection_pins_default_at_load(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    opened.store.close()
+    account = AccountId("codex", "personal")
+    named_account_credentials(home, "codex", "personal").save(tokens())
+    AccountStore(home).set_default(account)
+
+    resumed = manager.open(opened.metadata.session_id)
+    resolver = SessionAccountContext.load(home, manager, resumed.metadata)
+
+    assert resolver.resolve("codex") == account
+    assert manager.read_metadata(resumed.metadata.session_id).selected_accounts == {
+        "codex": "codex:personal"
+    }
+    resumed.store.close()
+
+
+def test_session_with_missing_pinned_account_fails_naming_accounts(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    manager.record_account_selection(
+        opened.metadata, AccountId("codex", "deleted"), boundary=0
+    )
+
+    with pytest.raises(AccountError, match=r"codex:deleted.*?/accounts"):
+        SessionAccountContext.load(home, manager, opened.metadata)
+    opened.store.close()
+
+
+def test_switch_changes_only_current_session_not_other_sessions_or_live_children(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    named_account_credentials(home, "codex", "first").save(tokens())
+    named_account_credentials(home, "codex", "second").save(tokens())
+    AccountStore(home).set_default(first)
+    manager = SessionManager(home)
+    current = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    other = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    current_resolver = SessionAccountContext.load(home, manager, current.metadata)
+    other_resolver = SessionAccountContext.load(home, manager, other.metadata)
+    child_accounts = current_resolver.snapshot()
+
+    current_resolver.switch(second, boundary=7)
+
+    assert current_resolver.resolve("codex") == second
+    assert other_resolver.resolve("codex") == first
+    assert child_accounts["codex"] == first
+    current_resolver.switch(first, boundary=7)
+    current_metadata = manager.read_metadata(current.metadata.session_id)
+    assert current_metadata.account_switch_sequences == {"codex": 2}
+    assert current_metadata.native_context_boundaries == {"codex": 8}
+    assert manager.read_metadata(other.metadata.session_id).selected_accounts == {
+        "codex": "codex:first"
+    }
+    current.store.close()
+    other.store.close()
+
+
+def test_child_inherits_parent_pinned_account(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    account = AccountId("anthropic", "work")
+    named_account_credentials(home, "anthropic", "work").save(tokens())
+    manager = SessionManager(home)
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    manager.record_account_selection(opened.metadata, account, boundary=0)
+    resolver = SessionAccountContext.load(home, manager, opened.metadata)
+    loop = SimpleNamespace(
+        backend=None,
+        context_assembler=SimpleNamespace(token_budget=200_000),
+        account_context=resolver,
+    )
+
+    child, error = resolve_child_backend(loop, "claude-sonnet-4-6")
+
+    assert error is None
+    assert child.token_store.account == account
+    opened.store.close()
+
+
+def test_every_backend_path_uses_session_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    anthropic = AccountId("anthropic", "work")
+    codex = AccountId("codex", "personal")
+    named_account_credentials(home, "anthropic", "work").save(tokens())
+    named_account_credentials(home, "codex", "personal").save(tokens())
+    manager = SessionManager(home)
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    manager.record_account_selection(opened.metadata, anthropic, boundary=0)
+    resolver = SessionAccountContext.load(home, manager, opened.metadata)
+    selected = resolver.snapshot()
+
+    primary, _ = build_backend("claude", None, home=home, account=selected["anthropic"])
+    captured: list[tuple[AccountId | None, Path | None]] = []
+
+    async def capture(_query, _signal, *, account=None, home=None):
+        captured.append((account, home))
+        return websearch_codex.CodexSearchResult("answer", [])
+
+    monkeypatch.setattr(websearch.codex, "search", capture)
+    registry = SimpleNamespace(account_context=resolver)
+    asyncio.run(
+        websearch._websearch(
+            registry,
+            {"query": "query"},
+            SimpleNamespace(aborted=False),
+        )
+    )
+    loop = SimpleNamespace(
+        backend=primary,
+        context_assembler=SimpleNamespace(token_budget=200_000),
+        account_context=resolver,
+    )
+    child, error = resolve_child_backend(loop, "gpt-5.6-luna")
+
+    assert primary.token_store.account == anthropic
+    assert error is None
+    assert child.token_store.account == codex
+    assert captured == [(codex, home)]
+    assert manager.read_metadata(opened.metadata.session_id).selected_accounts == {
+        "anthropic": "anthropic:work",
+        "codex": "codex:personal",
+    }
+    opened.store.close()
+
+
+def test_account_switch_filters_stale_native_artifacts(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [
+                ThinkingContent("summary", "encrypted"),
+                RedactedThinkingContent("redacted"),
+                TextContent("answer"),
+            ],
+            metadata={"account_provider": "codex", "account_switch_sequence": 0},
+        )
+    )
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("next")])])
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = SimpleNamespace(
+        active_provider="codex", switch_sequence=1
+    )
+
+    async def run() -> None:
+        async for _ in loop.run_turn("continue", origin=MessageOrigin.USER):
+            pass
+
+    asyncio.run(run())
+
+    stale = next(message for message in backend.calls[0][0] if message.role == MessageRole.ASSISTANT)
+    assert stale.content == [ThinkingContent("summary"), TextContent("answer")]
+    store.close()
+
+@pytest.mark.asyncio
+async def test_grandchild_inherits_child_snapshot_not_global_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent import runner as agent_runner
+    from zeta.core.abort import AbortGenerationRegistry
+    from zeta.protocol.types import ToolCall
+    from zeta.skills.agent_catalog import discover_packaged_agents
+
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    named_account_credentials(home, "codex", "first").save(tokens())
+    named_account_credentials(home, "codex", "second").save(tokens())
+    AccountStore(home).set_default(first)
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    resolver = SessionAccountContext.load(home, manager, opened.metadata)
+    parent = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=discover_packaged_agents(),
+    )
+    parent.account_context = resolver
+    parent.tool_registry.account_context = resolver
+
+    async def consume_child(child_loop: AgentLoop, _prompt: str, **_kwargs: object):
+        AccountStore(home).set_default(second)
+        grandchild, error = resolve_child_backend(child_loop, "gpt-5.6-luna")
+        assert error is None
+        assert grandchild.token_store.account == first
+        return {"content": [{"type": "text", "text": "done"}], "isError": False}
+
+    monkeypatch.setattr(agent_runner, "consume_child", consume_child)
+    call = ToolCall(
+        "child", "agent", {"prompt": "work", "description": "child", "background": False}
+    )
+    try:
+        result = await parent._run_agent_tool(
+            call, call.arguments, AbortGenerationRegistry().new_generation(), None
+        )
+        assert result["isError"] is False
+    finally:
+        await parent.close()
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_live_child_websearch_ignores_later_parent_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent import runner as agent_runner
+    from zeta.core.abort import AbortGenerationRegistry
+    from zeta.protocol.types import ToolCall
+    from zeta.skills.agent_catalog import discover_packaged_agents
+
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    named_account_credentials(home, "codex", "first").save(tokens())
+    named_account_credentials(home, "codex", "second").save(tokens())
+    AccountStore(home).set_default(first)
+    manager = SessionManager(home)
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    resolver = SessionAccountContext.load(home, manager, opened.metadata)
+    parent = AgentLoop(
+        FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty(),
+        agent_catalog=discover_packaged_agents(),
+    )
+    parent.account_context = resolver
+    parent.tool_registry.account_context = resolver
+    captured: list[AccountId | None] = []
+
+    async def capture(_query, _signal, *, account=None, home=None):
+        captured.append(account)
+        return websearch_codex.CodexSearchResult("answer", [])
+
+    async def consume_child(child_loop: AgentLoop, _prompt: str, **_kwargs: object):
+        resolver.switch(second, boundary=0)
+        await websearch._websearch(
+            child_loop.tool_registry,
+            {"query": "query"},
+            SimpleNamespace(aborted=False),
+        )
+        return {"content": [{"type": "text", "text": "done"}], "isError": False}
+
+    monkeypatch.setattr(websearch.codex, "search", capture)
+    monkeypatch.setattr(agent_runner, "consume_child", consume_child)
+    call = ToolCall(
+        "child", "agent", {"prompt": "work", "description": "child", "background": False}
+    )
+    try:
+        result = await parent._run_agent_tool(
+            call, call.arguments, AbortGenerationRegistry().new_generation(), None
+        )
+        assert result["isError"] is False
+        assert captured == [first]
+    finally:
+        await parent.close()
+        opened.store.close()
+
+
+def test_model_catalog_uses_session_pinned_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_account = AccountId("anthropic", "session")
+    default_account = AccountId("anthropic", "global")
+    named_account_credentials(tmp_path, "anthropic", "session").save(tokens())
+    named_account_credentials(tmp_path, "anthropic", "global").save(
+        OAuthTokens("wrong", "wrong-refresh", 9_999_999_999.0)
+    )
+    AccountStore(tmp_path).set_default(default_account)
+    requests: list[httpx.Request] = []
+
+    def request(url: str, **kwargs: object):
+        requests.append(httpx.Request("GET", url, headers=kwargs["headers"]))
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"data": [{"id": "claude-sonnet-4-6"}]},
+        )
+
+    monkeypatch.setattr(tui_models.httpx, "get", request)
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    manager.record_account_selection(opened.metadata, session_account, boundary=0)
+    context = SessionAccountContext.load(tmp_path, manager, opened.metadata)
+    assert tui_models.load_model_catalog(
+        "claude", account_context=context
+    ) == frozenset({"claude-sonnet-4-6"})
+    opened.store.close()
+    assert requests[0].headers["authorization"] == f"Bearer {_SENTINEL}"
+
+
+def test_api_key_mode_skips_named_accounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.accounts.session import SessionAccountContext
+
+    monkeypatch.setenv("ZETA_ALLOW_API_KEY", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-api-key")
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    context = SessionAccountContext.load(tmp_path, manager, opened.metadata)
+
+    assert context.auth_mode == "api-key"
+    assert context.backend_kwargs("claude") == {"home": tmp_path}
+    assert opened.metadata.selected_accounts == {}
+    assert context.switching_unavailable == (
+        "this session uses an API key; account switching is unavailable"
+    )
+
+    from zeta.tui.app import TUIApp
+
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
+    rendered: list[object] = []
+    app._presenter.print_unit = rendered.append
+    app._handle_slash_output(app.slash_accounts(""))
+    assert rendered[0].plain == (
+        "system · this session uses an API key; account switching is unavailable"
+    )
+    opened.store.close()

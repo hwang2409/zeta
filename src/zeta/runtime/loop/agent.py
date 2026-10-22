@@ -70,6 +70,7 @@ from ...protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
+    RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
     TextContent,
@@ -116,6 +117,23 @@ from .plan_mode_runtime import PlanModeRuntimeMixin
 from .project_inbox import ProjectInboxNotificationMixin
 from .skill_refresh import RuntimePrompt, SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
+
+
+def _sanitize_account_message(message: Message) -> Message:
+    content = [
+        ThinkingContent(block.text)
+        if isinstance(block, ThinkingContent)
+        else block
+        for block in message.content
+        if not isinstance(block, RedactedThinkingContent)
+    ]
+    return Message(
+        message.role,
+        content,
+        tool_result=message.tool_result,
+        metadata=message.metadata,
+    )
+
 
 TaskResult = TypeVar("TaskResult")
 
@@ -300,6 +318,31 @@ class AgentLoop(
                 self.backend, schemas, policy=self._plan_mode_policy
             )
         return canonical_tool_schemas(schemas)
+
+    def _account_safe_context(self, messages: list[Message]) -> list[Message]:
+        account_context = getattr(self, "account_context", None)
+        provider = account_context.active_provider if account_context is not None else None
+        sequence = account_context.switch_sequence if account_context is not None else 0
+        if provider is None or sequence == 0:
+            return messages
+        return [
+            message
+            if (
+                message.metadata.get("account_provider") == provider
+                and message.metadata.get("account_switch_sequence") == sequence
+            )
+            else _sanitize_account_message(message)
+            for message in messages
+        ]
+
+    def set_backend(self, backend: CompletionBackend) -> None:
+        """Replace the provider backend used by subsequent completions."""
+
+        self.backend = backend
+        self.context_assembler.backend = backend
+        self.context_assembler.compaction_policy.backend = backend
+        self.set_token_budget(self.context_assembler.token_budget)
+
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
         if not model.strip():
@@ -820,6 +863,7 @@ class AgentLoop(
                 )
                 if self._plan_mode:
                     context_messages = plan_mode_messages(context_messages)
+                context_messages = self._account_safe_context(context_messages)
                 context = self.context_assembler.last_context
                 if retrying_context:
                     current_tokens = None if context is None else context.token_count
@@ -1093,6 +1137,17 @@ class AgentLoop(
             stop_reason=self._turn_stop_reason,
             output_tokens=self._turn_output_tokens,
         )
+        account_context = getattr(self, "account_context", None)
+        if account_context is not None and account_context.active_provider is not None:
+            metadata = dict(annotated.metadata)
+            metadata["account_provider"] = account_context.active_provider
+            metadata["account_switch_sequence"] = account_context.switch_sequence
+            annotated = Message(
+                annotated.role,
+                annotated.content,
+                tool_result=annotated.tool_result,
+                metadata=metadata,
+            )
         if not self._turn_provider_retry_records:
             return annotated
         metadata = dict(annotated.metadata)

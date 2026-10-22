@@ -76,6 +76,33 @@ def _valid_memory_digest(value: object) -> bool:
     return type(value) is str and _MEMORY_DIGEST.match(value) is not None
 
 
+def _account_metadata(value: Mapping[str, Any], path: Path) -> tuple[dict[str, str], dict[str, int], dict[str, int]]:
+    selected = value.get("selected_accounts", {})
+    sequences = value.get("account_switch_sequences", {})
+    boundaries = value.get("native_context_boundaries", {})
+    valid_providers = {"anthropic", "codex"}
+    if (
+        type(selected) is not dict
+        or any(
+            provider not in valid_providers
+            or type(account) is not str
+            or not account.startswith(f"{provider}:")
+            for provider, account in selected.items()
+        )
+        or any(
+            type(items) is not dict
+            or any(
+                provider not in valid_providers
+                or type(number) is not int
+                or number < 0
+                for provider, number in items.items()
+            )
+            for items in (sequences, boundaries)
+        )
+    ):
+        raise SessionError(f"session account selection is invalid: {path}")
+    return selected, sequences, boundaries
+
 def env_home() -> Path:
     """Return zeta's home, honoring the test and local override."""
 
@@ -123,6 +150,9 @@ class SessionMetadata:
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
+    selected_accounts: dict[str, str] = field(default_factory=dict)
+    account_switch_sequences: dict[str, int] = field(default_factory=dict)
+    native_context_boundaries: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def new(
@@ -257,6 +287,11 @@ class SessionMetadata:
         raw_tool_allow = value.get("tool_allow")
         raw_tool_deny = value.get("tool_deny", [])
         raw_tool_allow_layers = value.get("tool_allow_layers")
+        (
+            selected_accounts,
+            account_switch_sequences,
+            native_context_boundaries,
+        ) = _account_metadata(value, path)
         try:
             tool_allow = validate_tool_patterns(raw_tool_allow, field="tool_allow")
             tool_deny = validate_tool_patterns(raw_tool_deny, field="tool_deny")
@@ -380,6 +415,9 @@ class SessionMetadata:
             tool_allow=tool_allow,
             tool_deny=tool_deny,
             tool_allow_layers=tool_allow_layers,
+            selected_accounts=dict(selected_accounts),
+            account_switch_sequences=dict(account_switch_sequences),
+            native_context_boundaries=dict(native_context_boundaries),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -413,6 +451,9 @@ class SessionMetadata:
             "prompt_components": self.prompt_components,
             "tool_allow": list(self.tool_allow) if self.tool_allow is not None else None,
             "tool_deny": list(self.tool_deny),
+            "selected_accounts": self.selected_accounts,
+            "account_switch_sequences": self.account_switch_sequences,
+            "native_context_boundaries": self.native_context_boundaries,
             **(
                 {
                     "tool_allow_layers": [
@@ -598,6 +639,36 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 self.project_registry.root, previous_project_id, current.session_id
             )
         return current
+
+    def record_account_selection(
+        self,
+        metadata: SessionMetadata,
+        account: Any,
+        *,
+        boundary: int,
+        switched: bool = False,
+    ) -> None:
+        """Persist one provider selection and its native-context boundary atomically."""
+
+        provider = account.provider
+        value = str(account)
+
+        def update(item: SessionMetadata) -> SessionMetadata:
+            item.selected_accounts[provider] = value
+            item.native_context_boundaries[provider] = (
+                max(boundary, item.native_context_boundaries.get(provider, 0) + 1)
+                if switched
+                else boundary
+            )
+            if switched:
+                item.account_switch_sequences[provider] = (
+                    item.account_switch_sequences.get(provider, 0) + 1
+                )
+            return self._touch(item)
+
+        current = self._mutate(metadata.session_id, update)
+        self._copy_metadata(metadata, current)
+
     def read_metadata(self, session_id: str) -> SessionMetadata:
         """Read validated metadata without opening or repairing the conversation."""
         self._validate_id(session_id)

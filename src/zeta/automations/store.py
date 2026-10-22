@@ -11,12 +11,13 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, Self
 from zoneinfo import ZoneInfoNotFoundError
 
+from ..accounts import AccountStore, account_provider, api_key_mode
 from ..core.session import env_home
 from .models import (
     DueOccurrence,
@@ -83,7 +84,8 @@ class SQLiteStore:
             raise ValueError("pending webhook limits must be positive")
         self.max_pending_count = max_pending_count
         self.max_pending_bytes = max_pending_bytes
-        directory = (home or env_home()) / "automations"
+        self.home = home or env_home()
+        directory = self.home / "automations"
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
         self.path = directory / "automations.sqlite3"
@@ -180,6 +182,10 @@ class SQLiteStore:
                 os.close(descriptor)
 
     def draft(self, job: Job, *, source: str = "tool") -> JobState:
+        provider = account_provider(job.provider)
+        if provider is not None and job.account is None and not api_key_mode(job.provider):
+            account = AccountStore(self.home).resolve_account(job.provider)
+            job = replace(job, account=str(account))
         document = json.dumps(job.document(), sort_keys=True)
         with self._transaction():
             row = self.db.execute(
@@ -263,6 +269,12 @@ class SQLiteStore:
                 raise ValueError("draft changed; inspect and approve the new revision")
             if state.enabled:
                 raise ValueError("automation is already armed")
+            if (
+                account_provider(state.job.provider) is not None
+                and state.job.account is None
+                and not api_key_mode(state.job.provider)
+            ):
+                raise ValueError("draft has no pinned account; create a new revision")
             self.db.execute(
                 """UPDATE jobs SET enabled=1, approved_at=?, recipient=?, inbox_target_ids=?,
                 last_run=?, last_check=?, last_due=NULL WHERE name=? AND revision=?""",

@@ -33,9 +33,7 @@ from ..core.project_context import (
     load_project_context,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_project_context
     project_instructions_editor_command,
 )
-from ..core.session import (
-    env_home,
-)
+from ..core.session import env_home
 from ..core.slash import (
     SlashCommand,
     SlashStatus,
@@ -97,6 +95,7 @@ from .render import (
 )
 from .runtime_close import RuntimeCloseMixin
 from .slash_handlers import SlashHandlerMixin
+from .slash_handlers.accounts_picker import AccountsPicker
 from .slash_handlers.command_runtime import CommandRuntimeMixin
 from .slash_handlers.decisions_panel import DecisionsMixin
 from .slash_handlers.fork_view import ForkViewMixin
@@ -139,6 +138,7 @@ def _tui_slash_commands() -> tuple[SlashCommand, ...]:
             "/always [key] — allow this tool/action for the running session",
         ),
         SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]"),
+        SlashCommand("accounts", lambda app, args: app.slash_accounts(args), "switch account"),
         SlashCommand(
             "permissions",
             lambda app, args: app.slash_permissions(args),
@@ -282,12 +282,15 @@ class TUIApp(
         self.vim_mode = vim_mode
         self._on_vim_mode_change = on_vim_mode_change
         self._on_budget_change = on_budget_change
-        self._model_catalog_loader = model_catalog_loader or _load_model_catalog
+        account_context = getattr(loop, "account_context", None)
+        self._model_catalog_loader = model_catalog_loader or (lambda provider: _load_model_catalog(provider, account_context=account_context))
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None
         self._model_picker: ModelPicker | None = None
         self._model_picker_unit: Any = None
+        self._accounts_picker: AccountsPicker | None = None
+        self._accounts_picker_unit: Any = None
         self._zeta_home: Path | None = (
             Path(zeta_home).resolve() if zeta_home is not None else None
         )
@@ -537,10 +540,11 @@ class TUIApp(
             on_plan_toggle=lambda: app.toggle_plan_mode(),
             on_scroll_up=self._transcript.scroll_up,
             on_scroll_down=self._transcript.scroll_down,
-            on_picker_move=lambda delta: app.model_picker_move(delta),
-            on_picker_select=lambda: app.model_picker_select(),
-            on_picker_cancel=lambda: app.model_picker_cancel(),
-            picker_active=lambda: app.model_picker_active,
+            on_picker_move=lambda delta: app._picker_move(delta),
+            on_picker_select=lambda: app._picker_select(),
+            on_picker_cancel=lambda: app._picker_cancel(),
+            on_picker_default=lambda: app.accounts_picker_default(),
+            picker_active=lambda: app._picker_active,
             on_agent_list_down=lambda: app._focus_agent_list(),
             agent_list_active=lambda: app._agent_navigation.list_focused(),
             on_agent_list_move=lambda delta: (

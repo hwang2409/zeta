@@ -1729,7 +1729,7 @@ async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="gpt-5.4",
-        model_catalog_loader=lambda provider: None,
+        model_catalog_loader=lambda provider, **kwargs: None,
     )
 
     output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model gpt-5.6-sol")
@@ -2118,7 +2118,7 @@ async def test_forced_override_commits_after_first_successful_request(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider: None)
+    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None)
     first = create_app(_args())
     session_id = first.loop.store.session_id
     backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
@@ -3000,7 +3000,7 @@ def test_new_session_stores_the_model_derived_budget(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider: None)
+    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None)
     app = create_app(
         build_parser().parse_args(
             ["--provider", "claude", "--model", "claude-sonnet-4-6"]
@@ -3027,7 +3027,7 @@ def test_token_budget_override_pins_and_survives_resume(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider: None)
+    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None)
     first = create_app(
         build_parser().parse_args(
             [
@@ -3056,7 +3056,7 @@ def test_resume_retunes_an_unpinned_budget_to_the_model(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider: None)
+    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None)
     session_id = create_app(
         build_parser().parse_args(
             ["--provider", "claude", "--model", "claude-opus-4-5"]
@@ -3088,7 +3088,7 @@ def test_model_command_leaves_a_pinned_budget_alone(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider: None)
+    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None)
     app = create_app(
         build_parser().parse_args(
             [

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from prompt_toolkit.enums import EditingMode
 
+from ...accounts import AccountError
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
 from ...core.session import SessionError, env_home, normalize_session_name
@@ -27,9 +28,11 @@ from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import MessageOrigin
+from ...providers.factory import build_backend
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
+from .accounts_picker import AccountsPicker
 from .model_picker import ModelPicker
 from .permissions import format_permissions, revoke_permissions
 
@@ -143,8 +146,128 @@ class SlashHandlerMixin:
         return known_models(self.provider, self._model_catalog)
 
     @property
+    def _picker_active(self) -> bool:
+        return self.accounts_picker_active or self.model_picker_active
+
+    def _picker_move(self, delta: int) -> None:
+        if self.accounts_picker_active:
+            self.accounts_picker_move(delta)
+        else:
+            self.model_picker_move(delta)
+
+    def _picker_select(self) -> None:
+        if self.accounts_picker_active:
+            self.accounts_picker_select()
+        else:
+            self.model_picker_select()
+
+    def _picker_cancel(self) -> None:
+        if self.accounts_picker_active:
+            self.accounts_picker_cancel()
+        else:
+            self.model_picker_cancel()
+
+    @property
     def model_picker_active(self) -> bool:
         return self._model_picker is not None
+
+    def slash_accounts(self, args: str) -> str:
+        """List named accounts and open the current-session switcher."""
+
+        if args.strip():
+            return "usage: /accounts"
+        if self.active or self.pending_approvals:
+            return "accounts unavailable: cannot switch while a turn or approval is active"
+        context = getattr(self.loop, "account_context", None)
+        if context is None:
+            return "accounts unavailable for this session"
+        if context.switching_unavailable is not None:
+            return context.switching_unavailable
+        accounts = tuple(context.store.list())
+        if not accounts:
+            return "no accounts; run zeta login <provider> --account <name>"
+        defaults = {
+            provider: account
+            for provider in ("anthropic", "codex")
+            if (account := context.store.default(provider)) is not None
+        }
+        self._dismiss_accounts_picker()
+        picker = AccountsPicker(accounts, context.snapshot(), defaults)
+        self._accounts_picker = picker
+        self._accounts_picker_unit = self._presenter.print_unit(picker.render())
+        self._invalidate_prompt()
+        return ""
+
+    @property
+    def accounts_picker_active(self) -> bool:
+        return self._accounts_picker is not None
+
+    def accounts_picker_move(self, delta: int) -> None:
+        picker = self._accounts_picker
+        if picker is None:
+            return
+        picker.move(delta)
+        self._repaint_accounts_picker()
+
+    def _repaint_accounts_picker(self) -> None:
+        picker = self._accounts_picker
+        if picker is None:
+            return
+        unit = self._accounts_picker_unit
+        if unit is not None:
+            self._accounts_picker_unit = self._transcript.replace(unit, picker.render())
+        self._invalidate_prompt()
+
+    def accounts_picker_default(self) -> None:
+        picker = self._accounts_picker
+        if picker is None:
+            return
+        account = picker.highlighted
+        try:
+            self.loop.account_context.store.set_default(account)
+        except (AccountError, OSError, ValueError) as exc:
+            self._print_system(f"default unchanged: {exc}")
+            return
+        picker.defaults[account.provider] = account
+        self._repaint_accounts_picker()
+
+    def accounts_picker_select(self) -> None:
+        picker = self._accounts_picker
+        if picker is None:
+            return
+        account = picker.highlighted
+        context = self.loop.account_context
+        try:
+            backend = None
+            current_provider = "anthropic" if self.provider == "claude" else self.provider
+            if account.provider == current_provider:
+                backend, _ = build_backend(
+                    self.provider,
+                    self.model,
+                    token_budget=self.loop.context_assembler.token_budget,
+                    **{**context.backend_kwargs(self.provider), "account": account},
+                )
+            entries = self.loop.store.replay()
+            boundary = entries[-1].seq if entries else 0
+            context.switch(account, boundary=boundary)
+            if backend is not None:
+                context.activate(self.loop, backend, self.provider)
+        except (AccountError, OSError, RuntimeError, ValueError) as exc:
+            self._print_system(f"account unchanged: {exc}")
+            return
+        self._dismiss_accounts_picker()
+        self._print_system(f"account: {account}")
+
+    def accounts_picker_cancel(self) -> None:
+        self._dismiss_accounts_picker()
+        self._invalidate_prompt()
+
+    def _dismiss_accounts_picker(self) -> None:
+        unit = self._accounts_picker_unit
+        self._accounts_picker = None
+        self._accounts_picker_unit = None
+        if unit is not None:
+            self._transcript.remove(unit, leading_blank=True)
 
     def slash_model(self, args: str) -> str:
         """Pick a model from a card, or switch straight to a named one."""
