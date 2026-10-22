@@ -24,7 +24,7 @@
     },
     "email": "<redacted>",
     "model_usage": {
-      "gpt-6-astra": {
+      "<redacted>": {
         "available": true,
         "available_at": null,
         "credits_would_enable": false
