@@ -877,7 +877,7 @@ async def test_server_ollama_create_and_switch_budgets_match_everywhere(
         assert runtime.loop.context_assembler.token_budget == 40_960
         assert await _captured_num_ctx(backend) == 40_960
 
-        model_selection.apply(runtime, "qwen3:4b", "ask")
+        await model_selection.apply(runtime, "qwen3:4b", "ask")
         persisted = runtime.manager.read_metadata(runtime.session_id)
         assert persisted.compaction_budget == 40_960
         assert runtime.loop.context_assembler.token_budget == 40_960
@@ -949,7 +949,7 @@ async def test_server_switch_to_ollama_caps_persisted_assembler_and_transport(
         assert runtime.loop is not None
         assert runtime.loop.context_assembler.token_budget == 100_000
 
-        model_selection.apply(runtime, "qwen3:4b", "ask")
+        await model_selection.apply(runtime, "qwen3:4b", "ask")
 
         backend = runtime.loop.backend
         assert isinstance(backend, OllamaBackend)
