@@ -15,6 +15,8 @@ import pytest
 
 import zeta.providers.codex as codex_module
 import zeta.providers.transport as transport_module
+import zeta.server.accounts as server_accounts
+import zeta.tui.slash_handlers as tui_slash_handlers
 from tests.support.credentials import named_account_credentials
 from zeta.accounts import AccountId, AccountStore, AccountUsage, SessionAccountContext
 from zeta.accounts.exhaustion import (
@@ -32,11 +34,13 @@ from zeta.accounts.usage import (
 )
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
+from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
 from zeta.protocol.types import MessageOrigin, MessageRole, StreamEventType, TextContent
 from zeta.providers.codex import CodexBackend
 from zeta.providers.retry_policy import ProviderRetryBudget
 from zeta.skills import SkillCatalog
+from zeta.tui import TUIApp
 
 FIXTURE = Path(__file__).parent / "fixtures/usage/codex_responses_429_usage_limit_reached.json"
 NOW = datetime(2026, 10, 22, 16, 0, tzinfo=UTC)
@@ -150,6 +154,162 @@ def _account_context(
     opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
     context = SessionAccountContext.load(home, manager, opened.metadata)
     return context, opened, first, second
+
+
+@pytest.mark.asyncio
+async def test_switch_cancelled_after_persist_converges_live_and_disk(
+    tmp_path: Path,
+) -> None:
+    context, opened, _first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    first_backend = object()
+    second_backend = object()
+    loop = SimpleNamespace(backend=first_backend)
+    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
+
+    def build_backend(_account: AccountId) -> object:
+        entered.set()
+        assert release.wait(5)
+        return second_backend
+
+    task = asyncio.create_task(
+        context.switch_active(
+            loop,
+            second,
+            boundary=0,
+            provider="codex",
+            build_backend=build_backend,
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5)
+
+    persisted = context.manager.read_metadata(context.metadata.session_id)
+    assert persisted.selected_accounts == {"codex": str(second)}
+    assert persisted.account_switch_sequences == {"codex": 1}
+    assert context.metadata.selected_accounts == persisted.selected_accounts
+    assert context.snapshot()["codex"] == second
+    assert context.switch_sequence == 1
+    assert context.active_provider == "codex"
+    assert loop.backend is second_backend
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_switches_are_serialized(tmp_path: Path) -> None:
+    context, opened, first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+    loop = SimpleNamespace(backend=object())
+    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
+    backends = {first: object(), second: object()}
+
+    def build_backend(account: AccountId) -> object:
+        if account == first:
+            first_entered.set()
+            assert release_first.wait(5)
+        else:
+            second_entered.set()
+        return backends[account]
+
+    first_task = asyncio.create_task(
+        context.switch_active(
+            loop,
+            first,
+            boundary=1,
+            provider="codex",
+            build_backend=build_backend,
+        )
+    )
+    assert await asyncio.to_thread(first_entered.wait, 1)
+    second_task = asyncio.create_task(
+        context.switch_active(
+            loop,
+            second,
+            boundary=2,
+            provider="codex",
+            build_backend=build_backend,
+        )
+    )
+    await asyncio.to_thread(second_entered.wait, 0.1)
+    release_first.set()
+    await asyncio.wait_for(asyncio.gather(first_task, second_task), 5)
+
+    persisted = context.manager.read_metadata(context.metadata.session_id)
+    assert persisted.selected_accounts == {"codex": str(second)}
+    assert persisted.account_switch_sequences == {"codex": 2}
+    assert context.metadata.selected_accounts == persisted.selected_accounts
+    assert context.snapshot()["codex"] == second
+    assert context.switch_sequence == 2
+    assert context.active_provider == "codex"
+    assert loop.backend is backends[second]
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_account_switch_never_replays_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+
+    def fail_replay(_store: ConversationStore) -> list[object]:
+        raise AssertionError("account switching must not replay the transcript")
+
+    monkeypatch.setattr(ConversationStore, "replay", fail_replay)
+    monkeypatch.setattr(
+        tui_slash_handlers,
+        "build_backend",
+        lambda *_args, **_kwargs: (SimpleNamespace(model="offline"), "codex"),
+    )
+    monkeypatch.setattr(
+        server_accounts,
+        "build_backend",
+        lambda *_args, **_kwargs: (SimpleNamespace(model="offline"), "codex"),
+    )
+    loop = SimpleNamespace(
+        account_context=context,
+        backend=SimpleNamespace(model="offline"),
+        context_assembler=SimpleNamespace(token_budget=100_000),
+        store=opened.store,
+    )
+    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
+    app = SimpleNamespace(
+        _accounts_picker=SimpleNamespace(highlighted=second),
+        _account_switch_task=None,
+        loop=loop,
+        provider="codex",
+        model="offline",
+        _dismiss_accounts_picker=lambda: None,
+        _print_system=lambda _message: None,
+    )
+
+    task = TUIApp.accounts_picker_select(app)
+    assert task is not None
+    await task
+
+    async def idle() -> None:
+        return None
+
+    response = await server_accounts.request(
+        "account_switch",
+        SimpleNamespace(loop=loop, metadata=context.metadata),
+        idle,
+        {"account": str(first)},
+    )
+    assert response == {"account": str(first), "replay": False}
+    assert context.snapshot()["codex"] == first
+    opened.store.close()
 
 
 @pytest.mark.asyncio

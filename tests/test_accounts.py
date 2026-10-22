@@ -1090,28 +1090,55 @@ def test_session_with_missing_pinned_account_fails_naming_accounts(tmp_path: Pat
     opened.store.close()
 
 
-def test_switch_changes_only_current_session_not_other_sessions_or_live_children(
+@pytest.mark.asyncio
+async def test_switch_changes_only_current_session_not_other_sessions_or_live_children(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
-    named_account_credentials(home, "codex", "first").save(tokens())
-    named_account_credentials(home, "codex", "second").save(tokens())
-    AccountStore(home).set_default(first)
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "first").save, tokens()
+    )
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "second").save, tokens()
+    )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
-    current = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
-    other = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
-    current_resolver = SessionAccountContext.load(home, manager, current.metadata)
-    other_resolver = SessionAccountContext.load(home, manager, other.metadata)
+    current = await asyncio.to_thread(
+        manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
+    )
+    other = await asyncio.to_thread(
+        manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
+    )
+    current_resolver = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, current.metadata
+    )
+    other_resolver = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, other.metadata
+    )
     child_accounts = current_resolver.snapshot()
+    loop = SimpleNamespace(backend=None)
+    loop.set_backend = lambda backend: setattr(loop, "backend", backend)
 
-    current_resolver.switch(second, boundary=7)
+    await current_resolver.switch_active(
+        loop,
+        second,
+        boundary=7,
+        provider="codex",
+        build_backend=lambda _account: None,
+    )
 
-    assert current_resolver.resolve("codex") == second
-    assert other_resolver.resolve("codex") == first
+    assert await asyncio.to_thread(current_resolver.resolve, "codex") == second
+    assert await asyncio.to_thread(other_resolver.resolve, "codex") == first
     assert child_accounts["codex"] == first
-    current_resolver.switch(first, boundary=7)
+    await current_resolver.switch_active(
+        loop,
+        first,
+        boundary=7,
+        provider="codex",
+        build_backend=lambda _account: None,
+    )
     current_metadata = manager.read_metadata(current.metadata.session_id)
     assert current_metadata.account_switch_sequences == {"codex": 2}
     assert current_metadata.native_context_boundaries == {"codex": 8}
@@ -1313,7 +1340,13 @@ async def test_live_child_websearch_ignores_later_parent_switch(
         return websearch_codex.CodexSearchResult("answer", [])
 
     async def consume_child(child_loop: AgentLoop, _prompt: str, **_kwargs: object):
-        await asyncio.to_thread(resolver.switch, second, boundary=0)
+        await resolver.switch_active(
+            parent,
+            second,
+            boundary=0,
+            provider="claude",
+            build_backend=lambda _account: None,
+        )
         await websearch._websearch(
             child_loop.tool_registry,
             {"query": "query"},

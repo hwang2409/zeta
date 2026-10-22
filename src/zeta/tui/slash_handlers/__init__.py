@@ -320,7 +320,8 @@ class SlashHandlerMixin:
 
     def accounts_picker_select(self) -> asyncio.Task[None] | None:
         picker = self._accounts_picker
-        if picker is None:
+        current_task = getattr(self, "_account_switch_task", None)
+        if picker is None or (current_task is not None and not current_task.done()):
             return None
         account = picker.highlighted
         context = self.loop.account_context
@@ -341,22 +342,24 @@ class SlashHandlerMixin:
 
         async def switch() -> None:
             try:
-                entries = self.loop.store.replay()
-                boundary = entries[-1].seq if entries else 0
                 await context.switch_active(
                     self.loop,
                     account,
-                    boundary=boundary,
+                    boundary=self.loop.store.active_branch_head_sequence(),
                     provider=self.provider,
                     build_backend=prepare_backend,
                 )
             except (AccountError, OSError, RuntimeError, ValueError) as exc:
                 self._print_system(f"account unchanged: {exc}")
                 return
+            finally:
+                self._account_switch_task = None
             self._dismiss_accounts_picker()
             self._print_system(f"account: {account}")
 
-        return asyncio.create_task(switch())
+        task = asyncio.create_task(switch())
+        self._account_switch_task = task
+        return task
 
     def accounts_picker_cancel(self) -> None:
         self._dismiss_accounts_picker()

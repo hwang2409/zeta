@@ -71,12 +71,10 @@ async def request(
         )
         return backend
 
-    entries = loop.store.replay()
-    boundary = entries[-1].seq if entries else 0
     await context.switch_active(
         loop,
         account,
-        boundary=boundary,
+        boundary=loop.store.active_branch_head_sequence(),
         provider=provider,
         build_backend=prepare_backend,
     )

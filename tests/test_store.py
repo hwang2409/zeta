@@ -662,6 +662,7 @@ def test_append_replay_round_trip_and_parent_links(tmp_path: Path) -> None:
     reopened = ConversationStore(tmp_path, session_id="session-1")
 
     assert [entry.id for entry in reopened.replay()] == [first.id, second.id]
+    assert reopened.active_branch_head_sequence() == second.seq
     assert second.parent_id == first.id
     assert [item.content[0].text for item in reopened.messages()] == ["hello", "hi"]
     assert reopened.session_id == "session-1"

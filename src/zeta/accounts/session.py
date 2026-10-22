@@ -38,13 +38,6 @@ class AccountListSnapshot:
     defaults: dict[str, AccountId]
 
 
-@dataclass(frozen=True, slots=True)
-class _PreparedAccountSwitch:
-    account: AccountId
-    backend: Any
-    metadata: SessionMetadata
-
-
 @dataclass(slots=True)
 class SessionAccountContext:
     """Resolve credentials and keep provider transitions local to one session."""
@@ -57,6 +50,7 @@ class SessionAccountContext:
     _frozen: bool = False
     _active_provider: str | None = None
     _switch_sequences: dict[str, int] = field(default_factory=dict)
+    _switch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
     @classmethod
     def load(
@@ -196,10 +190,6 @@ class SessionAccountContext:
             _switch_sequences=dict(self._switch_sequences),
         )
 
-    def switch(self, account: AccountId, *, boundary: int) -> None:
-        prepared = self._prepare_switch(account, boundary, lambda _account: None)
-        self._apply_switch(None, prepared, self.metadata.provider)
-
     async def switch_active(
         self,
         loop: Any,
@@ -209,41 +199,61 @@ class SessionAccountContext:
         provider: str,
         build_backend: Callable[[AccountId], Any],
     ) -> None:
-        prepared = await asyncio.to_thread(
-            self._prepare_switch, account, boundary, build_backend
-        )
-        self._apply_switch(loop, prepared, provider)
+        async with self._switch_lock:
+            operation = asyncio.create_task(
+                self._complete_switch(
+                    loop,
+                    account,
+                    boundary=boundary,
+                    provider=provider,
+                    build_backend=build_backend,
+                )
+            )
+            cancelled = False
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    if not cancelled:
+                        raise
+            if cancelled:
+                operation.exception()
+                raise asyncio.CancelledError
+            operation.result()
 
-    def _prepare_switch(
+    async def _complete_switch(
         self,
+        loop: Any,
         account: AccountId,
+        *,
         boundary: int,
+        provider: str,
         build_backend: Callable[[AccountId], Any],
-    ) -> _PreparedAccountSwitch:
-        if self.switching_unavailable is not None:
-            raise AccountError(self.switching_unavailable)
-        if self._frozen:
-            raise AccountError("child account snapshots cannot be changed")
-        if not self.store.contains(account):
-            raise AccountError(f"account {account} does not exist; use /accounts")
-        backend = build_backend(account)
-        assert self.manager is not None
-        metadata = copy.deepcopy(self.metadata)
-        self.manager.record_account_selection(
-            metadata, account, boundary=boundary, switched=True
-        )
-        return _PreparedAccountSwitch(account, backend, metadata)
-
-    def _apply_switch(
-        self, loop: Any | None, prepared: _PreparedAccountSwitch, provider: str
     ) -> None:
+        def persist() -> tuple[Any, SessionMetadata]:
+            if self.switching_unavailable is not None:
+                raise AccountError(self.switching_unavailable)
+            if self._frozen:
+                raise AccountError("child account snapshots cannot be changed")
+            if not self.store.contains(account):
+                raise AccountError(f"account {account} does not exist; use /accounts")
+            backend = build_backend(account)
+            assert self.manager is not None
+            metadata = copy.deepcopy(self.metadata)
+            self.manager.record_account_selection(
+                metadata, account, boundary=boundary, switched=True
+            )
+            return backend, metadata
+
+        backend, metadata = await asyncio.to_thread(persist)
         assert self.manager is not None
-        self.manager._copy_metadata(self.metadata, prepared.metadata)
-        account = prepared.account
+        self.manager._copy_metadata(self.metadata, metadata)
         self._pins = {**self._pins, account.provider: account}
         self._switch_sequences = dict(self.metadata.account_switch_sequences)
-        if loop is not None and prepared.backend is not None:
-            self.activate(loop, prepared.backend, provider)
+        if backend is not None:
+            self.activate(loop, backend, provider)
 
     async def subscription_limit_event(self, failure: object) -> dict[str, object] | None:
         return await asyncio.to_thread(self._subscription_limit_event, failure)

@@ -1190,6 +1190,11 @@ class ConversationStore(
 
         return self._entries[-1].id if self._entries else None
 
+    def active_branch_head_sequence(self) -> int:
+        """Return the active leaf sequence without materializing the branch."""
+
+        return self._entries[-1].seq if self._entries else 0
+
     def _active_branch(self) -> tuple[ConversationEntry, ...]:
         """Return resident active-branch entries for store-internal queries."""
 

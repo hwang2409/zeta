@@ -291,6 +291,7 @@ class TUIApp(
         self._model_picker_unit: Any = None
         self._accounts_picker: AccountsPicker | None = None
         self._accounts_picker_unit: Any = None
+        self._account_switch_task: asyncio.Task[None] | None = None
         self._zeta_home: Path | None = (
             Path(zeta_home).resolve() if zeta_home is not None else None
         )

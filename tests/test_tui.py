@@ -12112,6 +12112,53 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
 
 
 @pytest.mark.asyncio
+async def test_account_picker_ignores_repeat_select_while_switching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    resolver = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = resolver
+    loop.tool_registry.account_context = resolver
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def held_switch(*_args: object, **_kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(SessionAccountContext, "switch_active", held_switch)
+    assert await app.slash_accounts("") == ""
+    app.accounts_picker_move(1)
+
+    first_task = app.accounts_picker_select()
+    assert first_task is not None
+    await asyncio.wait_for(entered.wait(), 1)
+    assert app.accounts_picker_select() is None
+    assert calls == 1
+    release.set()
+    await asyncio.wait_for(first_task, 1)
+    opened.store.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_session_account_switch_runs_store_off_loop() -> None:
     account = AccountId("codex", "work")
     switched: list[tuple[AccountId, int]] = []
@@ -12134,9 +12181,10 @@ async def test_tui_session_account_switch_runs_store_off_loop() -> None:
 
     app = SimpleNamespace(
         _accounts_picker=SimpleNamespace(highlighted=account),
+        _account_switch_task=None,
         loop=SimpleNamespace(
             account_context=SimpleNamespace(switch_active=checked_switch_active),
-            store=SimpleNamespace(replay=list),
+            store=SimpleNamespace(active_branch_head_sequence=lambda: 0),
             context_assembler=SimpleNamespace(token_budget=100_000),
         ),
         provider="claude",
