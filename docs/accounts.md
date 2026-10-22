@@ -15,7 +15,7 @@ v1 has three vertical phases:
 
 1. **safe accounts and selection:** store named accounts, migrate the existing
    login without loss, support sequential login, a global default, and a
-   per-session selection. all backend construction uses one account resolver.
+   per-session selection. all backend construction uses one session account context.
 2. **usage and the workflow:** after terms review, refresh all stale accounts with
    one explicit `r`, show partial failures, switch the current session with
    `enter`, and ship the smallest `zeta serve` list/switch mapping with a real
@@ -43,10 +43,10 @@ A normal backend is constructed with a provider credential
 ([`factory.py:76-118`](../src/zeta/providers/factory.py#L76-L118)). a child inherits
 its parent's backend unless it chooses another model, in which case it constructs
 a backend at child start ([`runner.py:313-352`](../src/zeta/agent/runner.py#L313-L352)).
-The resolver must replace these direct paths. automatic memory reconciliation
+The session account context must replace these direct paths. automatic memory reconciliation
 still exists; eviction summaries were removed in #529 and are not a backend in
 this design. memory reconciliation is a session-owned background call and uses
-the session's pinned account through the same resolver. explicit
+the session's pinned account through the same context. explicit
 `ZETA_ALLOW_API_KEY=1` selects api-key auth, not a named subscription account.
 
 `/model` changes the session provider by constructing and applying a backend. the
@@ -276,7 +276,7 @@ gets a new boundary. if metadata persistence or backend construction fails,
 restore the prior backend and selection; do not report success. test resume and
 `a → b → a`.
 
-all backend creation uses one resolver with explicit auth mode: session account
+all backend creation asks one session account context with explicit auth mode: session account
 for interactive, child, automation, and memory calls; the global-default fallback
 follows the session-load rule above; API-key mode only when explicitly enabled.
 add attribution tests for primary, child, automation, and memory calls, including
@@ -294,7 +294,7 @@ the failed request.
 
 ## delivery order and cuts
 
-phase 1 delivers storage, migration, locks, selection, resolver, and native
+phase 1 delivers storage, migration, locks, selection, account context, and native
 boundaries. phase 2 delivers verified explicit refresh, `/accounts`, local logout
 if needed for correction, and the smallest serve list/session-switch mapping with
 a real render-path test in the same change. phase 3 delivers verified
