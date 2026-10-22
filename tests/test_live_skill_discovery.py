@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
 import inspect
@@ -360,7 +361,8 @@ async def test_concurrent_resume_keeps_live_prompt_components_with_skill_refresh
         cli_token_budget=None,
         cli_auto_memory=False,
     )
-    runtime = compose_runtime(
+    runtime = await asyncio.to_thread(
+        compose_runtime,
         home=home,
         cwd=project,
         manager=manager,
