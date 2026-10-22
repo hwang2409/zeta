@@ -284,7 +284,20 @@ class TUIApp(
         self.vim_mode = vim_mode
         self._on_vim_mode_change = on_vim_mode_change
         self._on_budget_change = on_budget_change
-        self._model_catalog_loader = model_catalog_loader or _load_model_catalog
+        account_context = getattr(loop, "account_context", None)
+        if model_catalog_loader is not None:
+            self._model_catalog_loader = model_catalog_loader
+        elif account_context is None:
+            self._model_catalog_loader = _load_model_catalog
+        else:
+            self._model_catalog_loader = lambda selected_provider: (
+                None
+                if account_context.auth_mode == "api-key"
+                else _load_model_catalog(
+                    selected_provider,
+                    **account_context.backend_kwargs(selected_provider),
+                )
+            )
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None

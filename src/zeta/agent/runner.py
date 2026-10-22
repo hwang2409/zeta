@@ -328,21 +328,10 @@ def resolve_child_backend(
         provider = provider_for_model(model)
     except ValueError as exc:
         return None, f"agent error: {exc}"
-    selected_accounts = getattr(loop, "selected_accounts", {})
-    account_provider = "anthropic" if provider == "claude" else provider
-    account = selected_accounts.get(account_provider)
-    resolver = getattr(loop, "account_resolver", None)
-    if account is None and resolver is not None and account_provider in {"anthropic", "codex"}:
-        account = resolver.resolve(provider)
-        selected_accounts[account_provider] = account
-        loop.tool_registry.selected_accounts[account_provider] = account
+    context = getattr(loop, "account_context", None)
+    account_kwargs = context.backend_kwargs(provider) if context is not None else {}
     # Check credentials up front: the alternative is a child that spawns, burns a
     # turn, and dies on an auth error the parent cannot act on.
-    account_kwargs: dict[str, object] = {}
-    if (account_home := getattr(loop, "account_home", None)) is not None:
-        account_kwargs["home"] = account_home
-    if account is not None:
-        account_kwargs["account"] = account
     store = credential_store(provider, **account_kwargs)
     if store is not None:
         tokens = store.read() or store.bootstrap()
@@ -355,12 +344,9 @@ def resolve_child_backend(
         child_budget = effective_budget_for_model(
             provider, model, loop.context_assembler.token_budget
         )
-        backend_kwargs: dict[str, object] = {"token_budget": child_budget}
-        if account_home is not None:
-            backend_kwargs["home"] = account_home
-        if account is not None:
-            backend_kwargs["account"] = account
-        backend, _ = build_backend(provider, model, **backend_kwargs)
+        backend, _ = build_backend(
+            provider, model, token_budget=child_budget, **account_kwargs
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         return None, f"agent error: could not start {provider} backend: {exc}"
     return backend, None
@@ -404,6 +390,9 @@ async def _build_child_loop(
             cwd=cwd_override,
             image_policy=child_image_policy,
         )
+        account_context = getattr(loop, "account_context", None)
+        if account_context is not None:
+            child_registry.account_context = account_context.child_snapshot(child_provider)
         loop._background_owner.store_leases.callback(
             child_registry.background_tasks.release_directory
         )
@@ -472,6 +461,7 @@ async def _build_child_loop(
         )
         child_loop.explicit_finish = explicit_finish
         child_loop.one_shot = getattr(loop, "one_shot", False)
+        child_loop.account_context = child_registry.account_context
         if child_loop.explicit_finish:
             register_finish(child_registry, child_loop=child_loop)
             register_handoff(child_loop)

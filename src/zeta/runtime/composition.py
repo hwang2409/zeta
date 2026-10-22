@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..accounts import SessionAccountResolver, account_provider
+from ..accounts import SessionAccountContext, account_provider
 from ..config.settings import ResolvedConfig
 from ..config.tool_policy import ToolPolicy
 from ..core.approval import ApprovalDecision, ApprovalPolicy
@@ -148,13 +148,8 @@ def compose_runtime(
             )
             cleanup.enter_context(opened.store)
         metadata = opened.metadata
-        account_resolver = SessionAccountResolver.load(home, manager, metadata)
-        backend_account_provider = account_provider(provider)
-        if backend_account_provider is not None:
-            backend_account = account_resolver.resolve(provider)
-            if backend_account_provider in metadata.selected_accounts:
-                backend_kwargs["account"] = backend_account
-        selected_accounts = account_resolver.snapshot()
+        account_context = SessionAccountContext.load(home, manager, metadata)
+        backend_kwargs.update(account_context.backend_kwargs(provider))
         backend, selected_model = backend_builder(
             provider, session_model, **backend_kwargs
         )
@@ -212,8 +207,7 @@ def compose_runtime(
         if memory_enabled:
             memory_provider = provider_for_model(config.memory_model)
             if account_provider(memory_provider) is not None:
-                memory_account = account_resolver.resolve(memory_provider)
-                selected_accounts[memory_account.provider] = memory_account
+                memory_account = account_context.resolve(memory_provider)
         loop_kwargs: dict[str, Any] = {
             "approval_policy": policy,
             "hooks": (
@@ -251,9 +245,7 @@ def compose_runtime(
             tool_deny=tool_policy.deny,
             tool_allow_layers=tool_policy.allow_layers,
             image_policy=image_policy_for_provider(provider),
-            selected_accounts=selected_accounts,
-            account_home=home,
-            account_resolver=account_resolver.resolve,
+            account_context=account_context,
             required_tool_names=tuple(
                 dict.fromkeys(
                     (
@@ -283,13 +275,7 @@ def compose_runtime(
         loop.post_stream_provider_retry = post_stream_provider_retry
         loop.manager = manager
         loop.session_metadata = metadata
-        loop.account_resolver = account_resolver
-        loop.account_home = home
-        loop.selected_accounts = selected_accounts
-        loop.account_provider = account_provider(provider)
-        loop.account_switch_sequence = metadata.account_switch_sequences.get(
-            loop.account_provider, 0
-        )
+        loop.account_context = account_context
         memory_reconciler = None
         if memory_enabled:
             memory_backend: CompletionBackend | None = None

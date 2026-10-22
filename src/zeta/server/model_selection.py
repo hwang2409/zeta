@@ -46,8 +46,9 @@ def apply(
         fallback = (runtime.provider, previous, previous_budget)
     if fallback is not None and (provider, model) == fallback[:2]:
         fallback = None
+    transition = None
     try:
-        loop.backend = backend
+        transition = loop.account_context.activate(loop, backend, provider)
         loop.set_model(model)
         loop.set_token_budget(budget)
         runtime.manager.record_session_settings(
@@ -60,11 +61,12 @@ def apply(
         )
     except Exception:
         loop.set_token_budget(previous_budget)
-        loop.backend = previous_backend
+        if transition is not None:
+            loop.account_context.restore(loop, transition)
+        else:
+            loop.set_backend(previous_backend)
         loop.set_model(previous)
         raise
-    assembler.backend = backend
-    assembler.compaction_policy.backend = backend
     runtime.policy.default = ApprovalDecision(mode)
 
 

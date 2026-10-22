@@ -209,14 +209,10 @@ class ServerRuntime:
                 config.token_budget,
             )
         token_budget = effective_budget_for_model(provider, model, token_budget)
-        account = None
-        if self._state is not None and provider in {"claude", "anthropic", "codex"}:
-            account = self._state.loop.account_resolver.resolve(provider)
-            if account.provider in self._state.metadata.selected_accounts:
-                self._state.loop.selected_accounts[account.provider] = account
-                self._state.loop.tool_registry.selected_accounts[account.provider] = account
-            else:
-                account = None
+        credential_kwargs: dict[str, object] = {}
+        if self._state is not None:
+            credential_kwargs = self._state.loop.account_context.backend_kwargs(provider)
+            credential_kwargs.pop("home", None)
         backend, _ = self._build_backend(
             provider,
             model,
@@ -225,7 +221,7 @@ class ServerRuntime:
             stall_retries=config.stream_stall_retries,
             require_credentials=True,
             token_budget=token_budget,
-            account=account,
+            **credential_kwargs,
         )
         return backend
 

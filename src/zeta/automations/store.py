@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Protocol, Self
 from zoneinfo import ZoneInfoNotFoundError
 
+from ..accounts import AccountStore, account_provider, api_key_mode
 from ..core.session import env_home
 from .models import (
     DueOccurrence,
@@ -83,7 +84,8 @@ class SQLiteStore:
             raise ValueError("pending webhook limits must be positive")
         self.max_pending_count = max_pending_count
         self.max_pending_bytes = max_pending_bytes
-        directory = (home or env_home()) / "automations"
+        self.home = home or env_home()
+        directory = self.home / "automations"
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
         self.path = directory / "automations.sqlite3"
@@ -263,6 +265,19 @@ class SQLiteStore:
                 raise ValueError("draft changed; inspect and approve the new revision")
             if state.enabled:
                 raise ValueError("automation is already armed")
+            provider = account_provider(state.job.provider)
+            if (
+                provider is not None
+                and state.job.account is None
+                and not api_key_mode(state.job.provider)
+            ):
+                account = AccountStore(self.home).resolve_account(state.job.provider)
+                document = state.job.document()
+                document["account"] = str(account)
+                self.db.execute(
+                    "UPDATE revisions SET document=? WHERE name=? AND revision=?",
+                    (json.dumps(document, sort_keys=True), name, revision),
+                )
             self.db.execute(
                 """UPDATE jobs SET enabled=1, approved_at=?, recipient=?, inbox_target_ids=?,
                 last_run=?, last_check=?, last_due=NULL WHERE name=? AND revision=?""",

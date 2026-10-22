@@ -76,6 +76,36 @@ def _valid_memory_digest(value: object) -> bool:
     return type(value) is str and _MEMORY_DIGEST.match(value) is not None
 
 
+def _account_metadata(
+    value: Mapping[str, Any], path: Path
+) -> tuple[dict[str, str], dict[str, int], dict[str, int]]:
+    selected = value.get("selected_accounts", {})
+    sequences = value.get("account_switch_sequences", {})
+    boundaries = value.get("native_context_boundaries", {})
+    valid_providers = {"anthropic", "codex"}
+    if (
+        type(selected) is not dict
+        or any(
+            provider not in valid_providers
+            or type(account) is not str
+            or not account.startswith(f"{provider}:")
+            for provider, account in selected.items()
+        )
+        or any(
+            type(items) is not dict
+            or any(
+                provider not in valid_providers
+                or type(number) is not int
+                or number < 0
+                for provider, number in items.items()
+            )
+            for items in (sequences, boundaries)
+        )
+    ):
+        raise SessionError(f"session account selection is invalid: {path}")
+    return selected, sequences, boundaries
+
+
 def env_home() -> Path:
     """Return zeta's home, honoring the test and local override."""
 
@@ -260,33 +290,11 @@ class SessionMetadata:
         raw_tool_allow = value.get("tool_allow")
         raw_tool_deny = value.get("tool_deny", [])
         raw_tool_allow_layers = value.get("tool_allow_layers")
-        selected_accounts = value.get("selected_accounts", {})
-        account_switch_sequences = value.get("account_switch_sequences", {})
-        native_context_boundaries = value.get("native_context_boundaries", {})
-        if (
-            type(selected_accounts) is not dict
-            or any(
-                provider not in {"anthropic", "codex"}
-                or type(account) is not str
-                or not account.startswith(f"{provider}:")
-                for provider, account in selected_accounts.items()
-            )
-            or type(account_switch_sequences) is not dict
-            or any(
-                provider not in {"anthropic", "codex"}
-                or type(sequence) is not int
-                or sequence < 0
-                for provider, sequence in account_switch_sequences.items()
-            )
-            or type(native_context_boundaries) is not dict
-            or any(
-                provider not in {"anthropic", "codex"}
-                or type(boundary) is not int
-                or boundary < 0
-                for provider, boundary in native_context_boundaries.items()
-            )
-        ):
-            raise SessionError(f"session account selection is invalid: {path}")
+        (
+            selected_accounts,
+            account_switch_sequences,
+            native_context_boundaries,
+        ) = _account_metadata(value, path)
         try:
             tool_allow = validate_tool_patterns(raw_tool_allow, field="tool_allow")
             tool_deny = validate_tool_patterns(raw_tool_deny, field="tool_deny")

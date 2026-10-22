@@ -55,7 +55,7 @@ from tests.support.credentials import (
     named_account_credentials,
 )
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.accounts import AccountId, AccountStore, SessionAccountResolver
+from zeta.accounts import AccountId, AccountStore, SessionAccountContext
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
@@ -12047,13 +12047,13 @@ def test_accounts_command_lists_and_switches(tmp_path: Path) -> None:
     AccountStore(home).set_default(first)
     manager = SessionManager(home)
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
-    resolver = SessionAccountResolver.load(home, manager, opened.metadata)
+    resolver = SessionAccountContext.load(home, manager, opened.metadata)
     backend = FakeBackend([])
     loop = AgentLoop(backend, opened.store, skill_catalog=SkillCatalog.empty())
     loop.manager = manager
     loop.session_metadata = opened.metadata
-    loop.account_resolver = resolver
-    loop.selected_accounts = resolver.snapshot()
+    loop.account_context = resolver
+    loop.tool_registry.account_context = resolver
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
     rendered: list[Panel] = []
     app._presenter.print_unit = rendered.append
@@ -12071,7 +12071,7 @@ def test_accounts_command_lists_and_switches(tmp_path: Path) -> None:
     app.accounts_picker_select()
 
     assert resolver.resolve("codex") == second
-    assert loop.selected_accounts["codex"] == second
+    assert loop.account_context.snapshot()["codex"] == second
     assert AccountStore(home).default("codex") == first
     assert manager.read_metadata(opened.metadata.session_id).selected_accounts == {
         "codex": "codex:second"

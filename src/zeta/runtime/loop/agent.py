@@ -303,8 +303,9 @@ class AgentLoop(
         return canonical_tool_schemas(schemas)
 
     def _account_safe_context(self, messages: list[Message]) -> list[Message]:
-        provider = getattr(self, "account_provider", None)
-        sequence = getattr(self, "account_switch_sequence", 0)
+        account_context = getattr(self, "account_context", None)
+        provider = account_context.active_provider if account_context is not None else None
+        sequence = account_context.switch_sequence if account_context is not None else 0
         if provider is None or sequence == 0:
             return messages
         safe: list[Message] = []
@@ -1134,12 +1135,11 @@ class AgentLoop(
             stop_reason=self._turn_stop_reason,
             output_tokens=self._turn_output_tokens,
         )
-        if (provider := getattr(self, "account_provider", None)) is not None:
+        account_context = getattr(self, "account_context", None)
+        if account_context is not None and account_context.active_provider is not None:
             metadata = dict(annotated.metadata)
-            metadata["account_provider"] = provider
-            metadata["account_switch_sequence"] = getattr(
-                self, "account_switch_sequence", 0
-            )
+            metadata["account_provider"] = account_context.active_provider
+            metadata["account_switch_sequence"] = account_context.switch_sequence
             annotated = Message(
                 annotated.role,
                 annotated.content,

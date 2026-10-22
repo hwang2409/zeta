@@ -5487,3 +5487,70 @@ async def test_resume_missing_session_structured_error(tmp_path: Path) -> None:
         }
     finally:
         await _close(server, writer)
+
+@pytest.mark.asyncio
+async def test_serve_cross_provider_model_change_updates_account_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.support.credentials import named_account_credentials
+    from tests.support.server_backend import ServerFakeBackend
+    from zeta.accounts import AccountId
+    from zeta.oauth import OAuthTokens
+    from zeta.protocol.types import Message, MessageRole, TextContent, ThinkingContent
+    from zeta.server import model_selection
+
+    token = OAuthTokens("access", "refresh", 9_999_999_999.0)
+    named_account_credentials(tmp_path, "codex").save(token)
+    named_account_credentials(tmp_path, "anthropic").save(token)
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="codex",
+        model="gpt-5.4",
+        backend_factory=lambda _p, m, _h: (ServerFakeBackend(model=m), m),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        runtime = server.runtime
+        runtime.loop.account_context.switch(
+            AccountId("codex", "default"), boundary=0
+        )
+        runtime.loop.account_context.switch(
+            AccountId("anthropic", "default"), boundary=0
+        )
+        runtime.loop.store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [ThinkingContent("codex", "encrypted"), TextContent("answer")],
+                metadata={"account_provider": "codex", "account_switch_sequence": 1},
+            )
+        )
+
+        model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
+        assert runtime.loop.account_context.active_provider == "anthropic"
+        assert runtime.loop.account_context.switch_sequence == 1
+        model_selection.apply(runtime, "gpt-5.4", "ask")
+        assert runtime.loop.account_context.active_provider == "codex"
+        assert runtime.loop.account_context.switch_sequence == 1
+
+        previous = (
+            runtime.loop.backend,
+            runtime.loop.account_context.active_provider,
+            runtime.loop.account_context.switch_sequence,
+        )
+        monkeypatch.setattr(
+            runtime.manager,
+            "record_session_settings",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
+        )
+        with pytest.raises(OSError, match="write failed"):
+            model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
+        assert (
+            runtime.loop.backend,
+            runtime.loop.account_context.active_provider,
+            runtime.loop.account_context.switch_sequence,
+        ) == previous
+    finally:
+        await _close(server, writer)

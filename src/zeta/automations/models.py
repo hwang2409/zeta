@@ -23,10 +23,13 @@ class Job:
     provider: str
     model: str
     cwd: str
+    account: str | None = None
 
     def document(self) -> dict[str, object]:
         value = asdict(self)
         value.pop("name")
+        if self.account is None:
+            value.pop("account")
         if isinstance(self.trigger, Webhook):
             trigger: dict[str, object] = {
                 "kind": "webhook",
@@ -115,12 +118,13 @@ def parse_job(name: str, value: object) -> Job:
         "cwd",
     }
     missing = required - set(value)
-    extra = set(value) - required - {"deliver"}
+    extra = set(value) - required - {"deliver", "account"}
     if missing or extra:
         fields = required | {"deliver"} | set(value)
         raise ValueError(f"job fields must be: {', '.join(sorted(fields))}")
     value = dict(value)
     value.setdefault("deliver", "none")
+    value.setdefault("account", None)
     for field in ("prompt", "provider", "model", "cwd"):
         if not isinstance(value[field], str) or not value[field].strip():
             raise ValueError(f"{field} must be a nonempty string")
@@ -132,6 +136,13 @@ def parse_job(name: str, value: object) -> Job:
         if len(value[field]) != len(set(value[field])):
             raise ValueError(f"{field} must not contain duplicates")
     validate_provider(value["provider"])
+    if value["account"] is not None and (
+        not isinstance(value["account"], str)
+        or not value["account"].startswith(
+            "anthropic:" if value["provider"] == "claude" else f"{value['provider']}:"
+        )
+    ):
+        raise ValueError("account must match the job provider")
     if not Path(value["cwd"]).is_absolute():
         raise ValueError("cwd must be an absolute path on the daemon host")
     if value["deliver"] != "none" and (
@@ -152,4 +163,5 @@ def parse_job(name: str, value: object) -> Job:
         value["provider"],
         value["model"],
         value["cwd"],
+        value["account"],
     )

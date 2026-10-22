@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 
+from ..accounts import AccountId, AccountStore, account_provider, api_key_mode
 from ..core.session import SessionManager
 from ..mcp.mount import MCPMount
 from ..project_registry import ProjectRegistryError
@@ -124,6 +125,23 @@ async def run_claimed(
         store.finish(run_id, status, detail)
         return
     job = state.job
+    pinned_account = AccountId(*job.account.split(":", 1)) if job.account else None
+    named_provider = account_provider(job.provider)
+    if named_provider is not None and not api_key_mode(job.provider):
+        if pinned_account is None and backend is None:
+            store.finish(
+                run_id,
+                "failed",
+                "approved automation revision has no pinned account; reapprove it",
+            )
+            return
+        if backend is None and not AccountStore(home).contains(pinned_account):
+            store.finish(
+                run_id,
+                "failed",
+                f"approved automation account {pinned_account} no longer exists; reapprove it",
+            )
+            return
     skill_catalog = discover_session_skills(home=home)
     agent_catalog = discover_packaged_agents()
     manager = SessionManager(home)
@@ -146,6 +164,8 @@ async def run_claimed(
         project_id=project_id,
         auto_project=False,
     )
+    if pinned_account is not None:
+        manager.record_account_selection(session.metadata, pinned_account, boundary=0)
     store.attach_session(run_id, session.metadata.session_id)
     loop = None
     phase = "running"

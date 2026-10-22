@@ -1,6 +1,6 @@
 """Named subscription accounts and crash-safe legacy migration."""
 
-from .session import SessionAccountResolver, account_provider
+from .session import SessionAccountContext, account_provider, api_key_mode
 from .store import (
     AccountCredentialLockTimeoutError,
     AccountCredentials,
@@ -15,6 +15,7 @@ __all__ = [
     "AccountError",
     "AccountId",
     "AccountStore",
-    "SessionAccountResolver",
+    "SessionAccountContext",
     "account_provider",
+    "api_key_mode",
 ]

@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 
+from ..accounts import AccountId
 from ..core.session import env_home
 from ..models.catalog import PROVIDER_MODELS
 from ..providers.factory import credential_store
@@ -100,7 +101,10 @@ def _load_codex_model_catalog() -> frozenset[str] | None:
 
 
 def load_model_catalog(
-    provider: str, *, home: str | Path | None = None
+    provider: str,
+    *,
+    home: str | Path | None = None,
+    account: AccountId | None = None,
 ) -> frozenset[str] | None:
     """Load a provider catalog, returning None when it cannot be obtained."""
 
@@ -111,7 +115,7 @@ def load_model_catalog(
 
     auth_home = Path(home) if home is not None else env_home()
     try:
-        token_store = credential_store("claude", home=auth_home)
+        token_store = credential_store("claude", home=auth_home, account=account)
         assert token_store is not None
         tokens = token_store.read() or token_store.bootstrap()
         if tokens is None or not tokens.is_valid():

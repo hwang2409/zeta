@@ -263,18 +263,10 @@ async def _websearch(
     max_results = arguments.get("max_results", 8)
     codex_reason: str | None = None
     try:
-        account = registry.selected_accounts.get("codex")
-        if account is None and registry.account_resolver is not None:
-            account = registry.account_resolver("codex")
-            registry.selected_accounts["codex"] = account
+        context = registry.account_context
         hosted = await (
-            codex.search(
-                query,
-                abort_signal,
-                account=account,
-                home=registry.account_home,
-            )
-            if account is not None or registry.account_home is not None
+            codex.search(query, abort_signal, **context.backend_kwargs("codex"))
+            if context is not None
             else codex.search(query, abort_signal)
         )
     except CodexLoginRequiredError:

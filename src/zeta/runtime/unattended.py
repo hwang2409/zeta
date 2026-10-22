@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from ..accounts import SessionAccountResolver, account_provider
+from ..accounts import SessionAccountContext
 from ..config.settings import load_settings
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.session import OpenedSession, SessionManager
@@ -24,21 +24,17 @@ def build_unattended_loop(
 ) -> AgentLoop:
     metadata, store = session.metadata, session.store
     manager = SessionManager(home)
-    resolver = SessionAccountResolver.load(home, manager, metadata)
-    selected_provider = account_provider(metadata.provider)
-    account = resolver.resolve(metadata.provider) if selected_provider is not None else None
-    if selected_provider not in metadata.selected_accounts:
-        account = None
-    selected_accounts = resolver.snapshot()
+    account_context = SessionAccountContext.load(
+        home, manager, metadata, validate=backend is None
+    )
     if metadata.provider == "ollama":
         raise ValueError("Ollama automations are not yet supported")
     if backend is None:
         backend, _model = build_backend(
             metadata.provider,
             metadata.model,
-            home=home,
             token_budget=metadata.compaction_budget,
-            account=account,
+            **account_context.backend_kwargs(metadata.provider),
         )
     policy = ApprovalPolicy(
         store=store, default=ApprovalDecision.DENY, always_allow=allow
@@ -62,9 +58,7 @@ def build_unattended_loop(
         tool_allow_layers=metadata.tool_allow_layers,
         image_policy=image_policy_for_provider(metadata.provider),
         command_niceness=load_settings(home=home).settings.command_niceness,
-        selected_accounts=selected_accounts,
-        account_home=home,
-        account_resolver=resolver.resolve,
+        account_context=account_context,
     )
     loop = AgentLoop(
         backend,
@@ -82,11 +76,5 @@ def build_unattended_loop(
     )
     loop.manager = manager
     loop.session_metadata = metadata
-    loop.account_resolver = resolver
-    loop.account_home = home
-    loop.selected_accounts = selected_accounts
-    loop.account_provider = account_provider(metadata.provider)
-    loop.account_switch_sequence = metadata.account_switch_sequences.get(
-        loop.account_provider, 0
-    )
+    loop.account_context = account_context
     return loop

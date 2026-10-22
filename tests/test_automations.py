@@ -2122,3 +2122,42 @@ def test_action_allow_permissions_validate_and_match(tmp_path: Path) -> None:
     assert policy.decide(registry.resolve_call("task", {"action": "output", "task_id": "1"})) is ApprovalDecision.ALLOW
     assert policy.decide(registry.resolve_call("task", {"action": "start", "command": "pytest -q"})) is ApprovalDecision.ALLOW
     assert policy.decide(registry.resolve_call("task", {"action": "start", "command": "ruff"})) is ApprovalDecision.DENY
+
+@pytest.mark.asyncio
+async def test_run_pins_account_recorded_at_approval(tmp_path: Path) -> None:
+    from tests.support.credentials import named_account_credentials
+    from zeta.accounts import AccountId, AccountStore
+    from zeta.oauth import OAuthTokens
+
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    token = OAuthTokens("access", "refresh", 9_999_999_999.0)
+    named_account_credentials(tmp_path, "codex", "first").save(token)
+    named_account_credentials(tmp_path, "codex", "second").save(token)
+    accounts = AccountStore(tmp_path)
+    accounts.set_default(first)
+    job = _job(tmp_path)
+    document = job.document()
+    document["provider"] = "codex"
+    document["model"] = "gpt-5.4"
+    document["deliver"] = "none"
+    document["servers"] = []
+    job = parse_job("pinned-account", document)
+
+    with SQLiteStore(tmp_path) as store:
+        state = store.draft(job)
+        store.approve(job.name, state.revision, None, START)
+        assert store.get(job.name).job.account == "codex:first"
+        accounts.set_default(second)
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=tmp_path,
+            backend=FakeBackend([ScriptedTurn(content=[TextContent("done")])]),
+        )
+        run = store.runs(job.name)[0]
+        metadata = SessionManager(tmp_path).read_metadata(run.session_id)
+        assert metadata.selected_accounts == {"codex": "codex:first"}

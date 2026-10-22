@@ -178,19 +178,21 @@ class SlashHandlerMixin:
             return "usage: /accounts"
         if self.active or self.pending_approvals:
             return "accounts unavailable: cannot switch while a turn or approval is active"
-        resolver = getattr(self.loop, "account_resolver", None)
-        if resolver is None:
+        context = getattr(self.loop, "account_context", None)
+        if context is None:
             return "accounts unavailable for this session"
-        accounts = tuple(resolver.store.list())
+        if context.switching_unavailable is not None:
+            return context.switching_unavailable
+        accounts = tuple(context.store.list())
         if not accounts:
             return "no accounts; run zeta login <provider> --account <name>"
         defaults = {
             provider: account
             for provider in ("anthropic", "codex")
-            if (account := resolver.store.default(provider)) is not None
+            if (account := context.store.default(provider)) is not None
         }
         self._dismiss_accounts_picker()
-        picker = AccountsPicker(accounts, resolver.snapshot(), defaults)
+        picker = AccountsPicker(accounts, context.snapshot(), defaults)
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())
         self._invalidate_prompt()
@@ -222,7 +224,7 @@ class SlashHandlerMixin:
             return
         account = picker.highlighted
         try:
-            self.loop.account_resolver.store.set_default(account)
+            self.loop.account_context.store.set_default(account)
         except (AccountError, OSError, ValueError) as exc:
             self._print_system(f"default unchanged: {exc}")
             return
@@ -234,7 +236,7 @@ class SlashHandlerMixin:
         if picker is None:
             return
         account = picker.highlighted
-        resolver = self.loop.account_resolver
+        context = self.loop.account_context
         try:
             backend = None
             current_provider = "anthropic" if self.provider == "claude" else self.provider
@@ -242,20 +244,14 @@ class SlashHandlerMixin:
                 backend, _ = build_backend(
                     self.provider,
                     self.model,
-                    home=self._zeta_home or env_home(),
                     token_budget=self.loop.context_assembler.token_budget,
-                    account=account,
+                    **{**context.backend_kwargs(self.provider), "account": account},
                 )
             entries = self.loop.store.replay()
             boundary = entries[-1].seq if entries else 0
-            resolver.switch(account, boundary=boundary)
-            self.loop.selected_accounts[account.provider] = account
-            self.loop.tool_registry.selected_accounts[account.provider] = account
+            context.switch(account, boundary=boundary)
             if backend is not None:
-                self.loop.set_backend(backend)
-                self.loop.account_switch_sequence = (
-                    resolver.metadata.account_switch_sequences[account.provider]
-                )
+                context.activate(self.loop, backend, self.provider)
         except (AccountError, OSError, RuntimeError, ValueError) as exc:
             self._print_system(f"account unchanged: {exc}")
             return
