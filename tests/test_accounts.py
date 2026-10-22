@@ -462,7 +462,10 @@ def test_accounts_list_shows_migrated_legacy_login(
 
     assert cli_main._handle_accounts(args) == 0
 
-    assert capsys.readouterr().out == "codex:default\n"
+    assert capsys.readouterr().out == (
+        "codex:default  ★ default\n"
+        "  usage unknown\n"
+    )
     assert not legacy.exists()
 
 

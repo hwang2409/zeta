@@ -2,7 +2,7 @@
 
 ## status
 
-phase 1 account storage, selection, mutable display labels, and offline identity display are implemented. usage and exhaustion recovery remain later work.
+phase 1 account storage, selection, mutable display labels, and offline identity display are implemented. phase 2 verified explicit usage refresh is implemented. exhaustion recovery remains later work.
 
 ## problem and v1 outcome
 
@@ -241,8 +241,9 @@ sources:
   it is not a usage source.
 
 The verified adapters therefore show Anthropic five-hour/seven-day windows and
-Codex primary/secondary windows when each complete window is present. A missing,
-null, malformed, non-finite, or out-of-range value makes that window unknown.
+the Codex primary window. Codex secondary remains unknown because the fixture's
+`secondary_window` was null. A missing, null, malformed, non-finite, or
+out-of-range value makes that window unknown.
 Refresh attempts have a persisted 60-second per-account cooldown, including
 failed attempts.
 

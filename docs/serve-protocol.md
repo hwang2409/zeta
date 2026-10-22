@@ -889,6 +889,17 @@ error code and message. Provider status and origin remain internal.
 - `model_catalog`: returns `models`, sorted names from both built-in real provider
   catalogs, and `providers`, a model-name-to-provider map (`claude` or `codex`).
 - `session_settings`: returns `model` and `approval_mode`.
+- `account_list`: takes `session_id` and returns every named subscription
+  account with `account`, `label`, optional `detail`, `current`, `default`, and
+  `usage`. `usage` contains `freshness`, a safe optional `error`, and either a
+  null `snapshot` or the normalized `version`, `captured_at`, `source`, and
+  `windows` fields documented in `accounts.md`. This request is lock-free and
+  never calls a provider endpoint.
+- `account_refresh`: takes `session_id`, requires an idle session, and performs
+  the same explicit refresh as `r` in `/accounts`: all stale accounts,
+  sequentially, with the persisted 60-second per-account cooldown. Provider
+  work runs off the server event loop. The response has the same shape as
+  `account_list`, including safe per-account failures and preserved snapshots.
 - `set_settings`: takes `model` from that catalog and `approval_mode` (`ask`,
   `allow`, or `deny`). Both persist atomically in session metadata and apply to
   future completions. Explicit approval tool rules retain precedence. Invalid

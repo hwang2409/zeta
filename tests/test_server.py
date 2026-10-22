@@ -25,7 +25,7 @@ import pytest
 
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.accounts import AccountId, AccountStore
+from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session import SessionManager, SessionMetadata
@@ -4670,6 +4670,84 @@ async def test_serve_accounts_label_command(tmp_path: Path) -> None:
             "text": "renamed codex:work to codex:henry",
         }
         assert AccountStore(home).resolve_reference("codex", "henry") == account
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_account_list_includes_usage_and_refresh_method(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, "codex", "work").save(
+        OAuthTokens("access", "refresh", 9_999_999_999)
+    )
+    store = AccountStore(home)
+    store._write_usage_bytes(
+        account,
+        json.dumps(
+            {
+                "version": 1,
+                "captured_at": "2026-10-22T12:00:00Z",
+                "source": "usage_endpoint",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 6.0,
+                        "window_minutes": 10080,
+                        "resets_at": "2026-10-29T03:24:45Z",
+                    }
+                ],
+                "last_attempt_at": "2026-10-22T12:00:00Z",
+                "last_error": None,
+            }
+        ).encode(),
+    )
+    refreshed = False
+
+    async def refresh_stale(self):
+        nonlocal refreshed
+        refreshed = True
+        return {}
+
+    monkeypatch.setattr(AccountUsage, "refresh_stale", refresh_stale)
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        listed = (
+            await _request(
+                reader,
+                writer,
+                "accounts-list",
+                "account_list",
+                {"session_id": sid},
+            )
+        )[-1]["result"]
+        row = listed["accounts"][0]
+        assert row["account"] == "codex:work"
+        assert row["current"] is True
+        assert row["default"] is True
+        assert row["usage"]["snapshot"]["windows"] == [
+            {
+                "kind": "primary",
+                "used_percent": 6.0,
+                "window_minutes": 10080,
+                "resets_at": "2026-10-29T03:24:45Z",
+            }
+        ]
+
+        refreshed_list = (
+            await _request(
+                reader,
+                writer,
+                "accounts-refresh",
+                "account_refresh",
+                {"session_id": sid},
+            )
+        )[-1]["result"]
+        assert refreshed
+        assert refreshed_list == listed
     finally:
         await _close(server, writer)
 

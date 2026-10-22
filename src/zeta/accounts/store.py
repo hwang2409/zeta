@@ -94,6 +94,7 @@ class AccountDisplay:
     account: AccountId
     label: str
     detail: str | None = None
+    usage: Any = None
 
     def __str__(self) -> str:
         return f"{self.account.provider}:{self.label}"
@@ -160,6 +161,28 @@ class AccountStore:
             yield
 
     @contextmanager
+    def usage_guard(self, account: AccountId) -> Iterator[None]:
+        with (
+            self._home() as home_fd,
+            _account_lock_directory(home_fd, account) as lock_fd,
+            self._lock_at(lock_fd, "usage.lock"),
+        ):
+            yield
+
+    def _read_usage_bytes(self, account: AccountId) -> bytes | None:
+        with self._home() as home_fd:
+            try:
+                with _open_account_directory(home_fd, account) as account_fd:
+                    return _read_optional_bytes(account_fd, "usage.json")
+            except FileNotFoundError:
+                return None
+
+    def _write_usage_bytes(self, account: AccountId, data: bytes) -> None:
+        with self._home() as home_fd, _account_directory(home_fd, account) as account_fd:
+            _atomic_publish(account_fd, "usage.json", data)
+            _fsync_directory(account_fd)
+
+    @contextmanager
     def provider_login_lock(self, provider: str) -> Iterator[None]:
         if provider not in _PROVIDERS:
             raise ValueError("invalid account provider")
@@ -194,11 +217,14 @@ class AccountStore:
                     if tokens
                     else ()
                 )
+                from .usage import read_usage
+
                 result.append(
                     AccountDisplay(
                         account,
                         value["labels"].get(key, account.name),
                         " · ".join(details) or None,
+                        read_usage(self, account),
                     )
                 )
         return result
@@ -544,6 +570,16 @@ class AccountCredentials:
                 if tokens.is_valid():
                     return tokens.access_token
                 return await self._refresh_locked(home_fd, tokens, client)
+
+    async def _access_token_locked(
+        self, home_fd: int, client: httpx.AsyncClient
+    ) -> str:
+        tokens = _read_account_tokens(home_fd, self.account)
+        if tokens is None:
+            raise self._login_required_error()
+        if tokens.is_valid():
+            return tokens.access_token
+        return await self._refresh_locked(home_fd, tokens, client)
 
     async def refresh_token(self, client: httpx.AsyncClient) -> str:
         async with self._async_lock:

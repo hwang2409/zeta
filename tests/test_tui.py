@@ -20,6 +20,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from textwrap import dedent
@@ -56,7 +57,7 @@ from tests.support.credentials import (
     named_account_credentials,
 )
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.accounts import AccountId, AccountStore, SessionAccountContext
+from zeta.accounts import AccountId, AccountStore, AccountUsage, SessionAccountContext
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
@@ -12134,6 +12135,109 @@ def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
         release.set()
         holder.join()
         publisher.join()
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_accounts_panel_renders_usage_and_refresh_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("anthropic", "work")
+    named_account_credentials(home, "anthropic", "work").save(
+        OAuthTokens("access", "refresh", 9_999_999_999, email="henry@example.com")
+    )
+    store = AccountStore(home)
+    reset = datetime.now(UTC).replace(microsecond=0) + timedelta(days=4)
+    usage = {
+        "version": 1,
+        "captured_at": "2020-01-01T00:00:00Z",
+        "source": "usage_endpoint",
+        "windows": [
+            {
+                "kind": "five_hour",
+                "used_percent": 42.0,
+                "window_minutes": 300,
+                "resets_at": reset.isoformat().replace("+00:00", "Z"),
+            }
+        ],
+        "last_attempt_at": "2020-01-01T00:00:00Z",
+        "last_error": "rate limited",
+    }
+    store._write_usage_bytes(account, (json.dumps(usage) + "\n").encode())
+    manager = SessionManager(home)
+    opened = manager.create(provider="claude", model="offline", cwd=tmp_path)
+    context = SessionAccountContext.load(home, manager, opened.metadata)
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
+    rendered: list[Panel] = []
+    app._presenter.print_unit = rendered.append
+    app._transcript.replace = lambda unit, replacement: rendered.append(replacement) or replacement
+
+    refreshed = False
+
+    async def refresh_stale(self):
+        nonlocal refreshed
+        refreshed = True
+        return {}
+
+    monkeypatch.setattr(AccountUsage, "refresh_stale", refresh_stale)
+    try:
+        assert app.slash_accounts("") == ""
+        app.accounts_picker_refresh()
+        while app._accounts_picker and app._accounts_picker.refreshing:
+            await asyncio.sleep(0.01)
+        output = StringIO()
+        Console(file=output, force_terminal=False, width=100).print(rendered[-1])
+        plain = Text.from_ansi(output.getvalue()).plain
+        local_reset = reset.astimezone().strftime("%b %d %H:%M").lower()
+        assert refreshed
+        assert "anthropic:work" in plain
+        assert "henry@example.com" in plain
+        assert "5h 42%" in plain
+        assert f"resets {local_reset}" in plain
+        assert "stale" in plain
+        assert "refresh failed: rate limited" in plain
+    finally:
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_accounts_refresh_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    named_account_credentials(home, "anthropic", "work").save(
+        OAuthTokens("access", "refresh", 9_999_999_999)
+    )
+    manager = SessionManager(home)
+    opened = manager.create(provider="claude", model="offline", cwd=tmp_path)
+    context = SessionAccountContext.load(home, manager, opened.metadata)
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
+    app._presenter.print_unit = Mock()
+    app._transcript.replace = lambda unit, replacement: replacement
+
+    async def blocking_refresh(self):
+        time.sleep(0.2)  # noqa: ASYNC251 - proves the work runs on another thread
+        return {}
+
+    monkeypatch.setattr(AccountUsage, "refresh_stale", blocking_refresh)
+    try:
+        assert app.slash_accounts("") == ""
+        app.accounts_picker_refresh()
+        started = time.monotonic()
+        await asyncio.sleep(0.02)
+        assert time.monotonic() - started < 0.1
+        while app._accounts_picker and app._accounts_picker.refreshing:
+            await asyncio.sleep(0.01)
+    finally:
         opened.store.close()
 
 

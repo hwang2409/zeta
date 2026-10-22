@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..accounts.store import rename_account_command
+from ..accounts.usage import format_usage_lines
 from ..core.commands.custom_commands import CustomCommand
 from ..core.project_context import discover_repo_root
 from ..core.slash import (
@@ -163,10 +164,11 @@ class ServerSlashSession:
         if args.split():
             return rename_account_command(context.store, args)
         displays = context.store.list_display()
-        return "\n".join(
-            str(item) + (f"  {item.detail}" if item.detail else "")
-            for item in displays
-        ) or "no accounts"
+        lines: list[str] = []
+        for item in displays:
+            lines.append(str(item) + (f"  {item.detail}" if item.detail else ""))
+            lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
+        return "\n".join(lines) or "no accounts"
 
     def slash_model(self, args: str) -> str:
         """Switch models directly, or report the current model to the client."""
