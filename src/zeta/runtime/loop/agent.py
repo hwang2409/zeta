@@ -215,6 +215,7 @@ class AgentLoop(
         self.explicit_finish = False
         self._explicit_finish_report: dict[str, object] | None = None
         self._delivering_prompt_id: str | None = None
+        self._yield_for_pending_prompt = False
         self.notification_wake = NotificationWake(store)
         # Partial assistant persistence uses these values so provider metadata is
         # retained even when the stream later fails or is cancelled.

@@ -67,11 +67,15 @@ async def provider_events(
                 raise error
         if on_started is not None:
             await on_started()
-        first_event = True
+        first_provider_event = True
         while (event := await events.get()) is not finished:
             assert isinstance(event, StreamEvent)
-            if first_event:
-                first_event = False
+            if first_provider_event and event.type in {
+                StreamEventType.MESSAGE_START,
+                StreamEventType.MESSAGE_UPDATE,
+                StreamEventType.MESSAGE_END,
+            }:
+                first_provider_event = False
                 if on_first_event is not None:
                     await on_first_event()
             try:

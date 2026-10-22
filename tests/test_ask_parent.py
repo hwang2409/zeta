@@ -88,7 +88,7 @@ async def test_ask_parent_returns_immediately_and_persists_once(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_agent_send_closes_pending_question_as_answer(
+async def test_ordinary_agent_send_is_not_consumed_as_question_answer(
     tmp_path: Path,
 ) -> None:
     parent, child, registry, handle, owner = _setup(tmp_path)
@@ -110,7 +110,7 @@ async def test_agent_send_closes_pending_question_as_answer(
     ) is None
     await asyncio.wait_for(ask, timeout=0.2)
     assert [entry.data["text"] for entry in child.pending_prompts()] == ["Proceed"]
-    assert parent.agent_notifications() == []
+    assert len(parent.agent_notifications()) == 1
     owner.cancel_all()
 
 

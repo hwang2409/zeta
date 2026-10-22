@@ -21,6 +21,7 @@ from ..core.project_context import (
 from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
+from ..core.store._pending_prompts import PENDING_PROMPT_ID_METADATA
 from ..media.image_policy import image_policy_for_provider
 from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
@@ -169,6 +170,13 @@ async def consume_child(
                     tool_result=event.tool_result,
                     depth=lifecycle_depth(event.tool_call),
                 )
+                if child_loop._yield_for_pending_prompt:
+                    child_loop._yield_for_pending_prompt = False
+                    final_message = Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent("pending follow-up will be delivered next")],
+                    )
+                    return
             elif event.type is StreamEventType.TURN_END:
                 turns = child_turns() + 1
                 update_turns(turns)
@@ -194,21 +202,41 @@ async def consume_child(
 
     try:
         user_message = None
+        persist_user_message = True
         if delivering_prompt_id is not None:
-            user_message = Message(
-                MessageRole.USER,
-                [TextContent(prompt)],
-                metadata={
-                    "zeta.origin": origin.value,
-                    "zeta.pending_prompt_id": delivering_prompt_id,
-                },
+            user_message = next(
+                (
+                    message
+                    for message in reversed(child_loop.store.messages())
+                    if message.metadata.get(PENDING_PROMPT_ID_METADATA)
+                    == delivering_prompt_id
+                ),
+                None,
             )
+            persist_user_message = user_message is None
+            if user_message is None:
+                user_message = Message(
+                    MessageRole.USER,
+                    [TextContent(prompt)],
+                    metadata={
+                        "zeta.origin": origin.value,
+                        PENDING_PROMPT_ID_METADATA: delivering_prompt_id,
+                    },
+                )
         events = (
             child_loop.run_notification_turn()
             if notification_turn
-            else child_loop.run_turn(prompt, origin=origin, user_message=user_message)
+            else child_loop.run_turn(
+                prompt,
+                origin=origin,
+                user_message=user_message,
+                persist_user_message=persist_user_message,
+            )
         )
-        await consume_events(events)
+        try:
+            await consume_events(events)
+        finally:
+            await events.aclose()
         if explicit_report is not None:
             report_status = explicit_report["status"]
             summary = explicit_report["summary"]
@@ -477,9 +505,7 @@ async def _build_child_loop(
         if child_loop.explicit_finish:
             register_finish(child_registry, child_loop=child_loop)
             register_handoff(child_loop)
-        loop._background_owner.conversation_channel.register_loop(
-            child_instance_id, child_loop
-        )
+        loop._background_owner.conversation_channel.register_loop(child_instance_id)
         if loop.plan_mode:
             child_loop.set_plan_mode(True)
         child_loop.set_background_event_sink(loop._publish_background_event)

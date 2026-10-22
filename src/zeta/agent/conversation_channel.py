@@ -15,10 +15,9 @@ from ..core.store import (
     PendingPromptCommitTimeoutError,
     PendingPromptsClosedError,
 )
-from ..protocol.types import Message, MessageOrigin, MessageRole, TextContent
+from ..protocol.types import MessageOrigin
 
 if TYPE_CHECKING:
-    from ..runtime.loop import AgentLoop
     from .background import BackgroundAgentOwner
 
 
@@ -53,26 +52,20 @@ class ConversationChannel:
     ) -> None:
         self._owner = owner
         self._root_store = root_store
-        self._wakes: dict[
-            str, tuple[asyncio.AbstractEventLoop, asyncio.Event, AgentLoop | None]
-        ] = {}
+        self._wakes: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Event]] = {}
         self._root_wake: Callable[[], None] | None = None
 
     def set_root_wake(self, callback: Callable[[], None] | None) -> None:
         self._root_wake = callback
 
-    def register_loop(self, instance_id: str, child_loop: AgentLoop | None = None) -> None:
-        self._wakes[instance_id] = (
-            asyncio.get_running_loop(),
-            asyncio.Event(),
-            child_loop,
-        )
+    def register_loop(self, instance_id: str) -> None:
+        self._wakes[instance_id] = (asyncio.get_running_loop(), asyncio.Event())
 
     def unregister_loop(self, instance_id: str) -> None:
         self._wakes.pop(instance_id, None)
 
     async def wait(self, instance_id: str) -> None:
-        _loop, event, _child_loop = self._wakes[instance_id]
+        _loop, event = self._wakes[instance_id]
         await event.wait()
         event.clear()
 
@@ -83,7 +76,7 @@ class ConversationChannel:
             return
         target = self._wakes.get(instance_id)
         if target is not None:
-            loop, event, _child_loop = target
+            loop, event = target
             loop.call_soon_threadsafe(event.set)
 
     def publish_follow_up(
@@ -131,7 +124,7 @@ class ConversationChannel:
                 _lock_deadline=deadline,
                 _must_exist=True,
             ) as child_store:
-                prompt = child_store.pending_prompt_queue.append(
+                child_store.pending_prompt_queue.append(
                     message,
                     origin=MessageOrigin.AGENT_SEND,
                     deadline=deadline,
@@ -144,29 +137,6 @@ class ConversationChannel:
             if (child_path / "conversation.jsonl").exists():
                 raise
             return no_live_run
-        target = self._wakes.get(child_instance_id)
-        if target is not None and target[2] is not None and target[2]._turn_active:
-            target[2].steer(
-                Message(
-                    MessageRole.USER,
-                    [TextContent(message)],
-                    metadata={
-                        "zeta.origin": MessageOrigin.AGENT_SEND.value,
-                        "zeta.pending_prompt_id": prompt.id,
-                    },
-                )
-            )
-        question = next(
-            (
-                entry
-                for entry in reversed(parent_store.agent_notifications())
-                if entry.data.get("kind") == "child_question"
-                and entry.data.get("child_instance_id") == child_instance_id
-            ),
-            None,
-        )
-        if question is not None:
-            parent_store.acknowledge_agent_notification(question.id)
         self.wake(child_instance_id)
         return None
 

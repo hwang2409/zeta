@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 from ...agent.conversation_channel import ConversationChannel
@@ -10,6 +11,7 @@ from ...core.store import ConversationStore
 from ..registry import ToolRegistry, text_block
 
 AGENT_SEND_COMMIT_TIMEOUT_SECONDS = 1.0
+QUESTION_ANSWER_PATTERN = re.compile(r"^Re ([^:\s]+):(?:\s|$)")
 
 
 def send_to_run(
@@ -26,6 +28,25 @@ def send_to_run(
         child_instance_id,
         message,
         commit_timeout=AGENT_SEND_COMMIT_TIMEOUT_SECONDS,
+    )
+
+
+def _answered_question_notification_id(
+    store: ConversationStore, child_instance_id: str, message: str
+) -> str | None:
+    match = QUESTION_ANSWER_PATTERN.match(message)
+    if match is None:
+        return None
+    question_id = match.group(1)
+    return next(
+        (
+            entry.id
+            for entry in store.agent_notifications()
+            if entry.data.get("kind") == "child_question"
+            and entry.data.get("child_instance_id") == child_instance_id
+            and entry.data.get("question_id") == question_id
+        ),
+        None,
     )
 
 
@@ -62,6 +83,13 @@ async def _agent_send(
             "structuredContent": None,
         }
     child_instance_id = arguments["child_instance_id"]
+    notification_id = _answered_question_notification_id(
+        registry.session_store, child_instance_id, arguments["message"]
+    )
+    if notification_id is not None:
+        await registry.session_store.acknowledge_agent_notifications_async(
+            [notification_id]
+        )
     return {
         "content": [
             text_block(

@@ -1338,6 +1338,17 @@ async def _wait_for_notification(store: ConversationStore, status: str) -> objec
     raise AssertionError(f"missing {status} background notification")
 
 
+async def _send_follow_up(loop: AgentLoop, handle: str, message: str) -> None:
+    result = await loop.tool_registry.execute(
+        ToolCall(
+            f"send-{message}",
+            "agent_send",
+            {"child_instance_id": handle, "message": message},
+        )
+    )
+    assert result["isError"] is False
+
+
 async def _wait_for_pending_prompt_count(
     store: ConversationStore, expected: int
 ) -> None:
@@ -5603,6 +5614,7 @@ class AskParentFinishBackend(CompletionBackend):
         self.child_started = asyncio.Event()
         self.release_child = asyncio.Event()
         self.question_published = asyncio.Event()
+        self.release_question_finish = asyncio.Event()
         self.answer_seen = asyncio.Event()
 
     async def complete(
@@ -5647,7 +5659,7 @@ class AskParentFinishBackend(CompletionBackend):
                     )
                 )
             ]
-        elif last_user == "approved":
+        elif last_user.endswith(": approved"):
             self.answer_seen.set()
             blocks = [
                 ToolUseContent(
@@ -5660,7 +5672,16 @@ class AskParentFinishBackend(CompletionBackend):
             ]
         else:
             self.question_published.set()
-            blocks = [ToolUseContent(ToolCall("status", "agent_status", {}))]
+            await self.release_question_finish.wait()
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "finish-before-answer",
+                        "finish",
+                        {"status": "done", "summary": "waiting for answer"},
+                    )
+                )
+            ]
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
@@ -5668,6 +5689,41 @@ class AskParentFinishBackend(CompletionBackend):
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, blocks),
         )
+
+
+class RetryBeforeProviderBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.retry_sent = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        yield StreamEvent(StreamEventType.RETRY, data={"text": "retrying"})
+        self.retry_sent.set()
+        await self.release.wait()
+
+
+class CapturePromptBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.prompt_count = 0
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        self.prompt_count = sum(
+            message.metadata.get("zeta.pending_prompt_id") is not None
+            for message in messages
+        )
+        reply = Message(MessageRole.ASSISTANT, [TextContent("done")])
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(StreamEventType.MESSAGE_END, message=reply)
 
 
 class WorkerBackend(RunBackend):
@@ -10358,10 +10414,7 @@ async def test_finish_accepted_after_follow_up_read_mid_turn(
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
     handle = _run_handle_from_receipt(store)
     child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
-    assert send_to_run(
-        store, handle, "first follow-up",
-        channel=loop._background_owner.conversation_channel,
-    ) is None
+    await _send_follow_up(loop, handle, "first follow-up")
     backend.release_child.set()
     await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
@@ -10371,9 +10424,18 @@ async def test_finish_accepted_after_follow_up_read_mid_turn(
     await _wait_for_notification(store, "completed")
 
     assert backend.finish_attempts == 1
-    assert backend.child_prompts[-1] == "first follow-up"
+    assert backend.child_prompts.count("first follow-up") == 1
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     assert child_store.pending_prompts() == []
+    assert sum(
+        message.role is MessageRole.USER
+        and message.metadata.get("zeta.pending_prompt_id") is not None
+        and any(
+            isinstance(block, TextContent) and block.text == "first follow-up"
+            for block in message.content
+        )
+        for message in child_store.messages()
+    ) == 1
     await loop.close()
 
 
@@ -10392,14 +10454,13 @@ async def test_unread_follow_up_still_blocks_finish(
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
     handle = _run_handle_from_receipt(store)
-    channel = loop._background_owner.conversation_channel
-    assert send_to_run(store, handle, "first follow-up", channel=channel) is None
+    await _send_follow_up(loop, handle, "first follow-up")
     child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
     backend.release_child.set()
     await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     await _wait_for_pending_prompt_count(child_store, 0)
-    assert send_to_run(store, handle, "second follow-up", channel=channel) is None
+    await _send_follow_up(loop, handle, "second follow-up")
     backend.release_finish.set()
     await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
     await _wait_for_notification(store, "completed")
@@ -10439,27 +10500,152 @@ async def test_ask_parent_answer_does_not_block_finish(
     child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
     backend.release_child.set()
     await asyncio.wait_for(backend.question_published.wait(), timeout=2)
-    assert send_to_run(
-        store,
-        handle,
-        "approved",
-        channel=loop._background_owner.conversation_channel,
-    ) is None
+    question = next(
+        entry
+        for entry in store.agent_notifications()
+        if entry.data.get("kind") == "child_question"
+    )
+    other_question = store.append_child_question(
+        child_instance_id=handle,
+        question_id="other-question",
+        question="unrelated?",
+    )
+    answer = f"Re {question.data['question_id']}: approved"
+    await _send_follow_up(loop, handle, answer)
+    assert [
+        entry.id
+        for entry in store.agent_notifications()
+        if entry.data.get("kind") == "child_question"
+    ] == [other_question.id]
+    backend.release_question_finish.set()
     await asyncio.wait_for(backend.answer_seen.wait(), timeout=2)
     await _wait_for_notification(store, "completed")
 
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     assert child_store.pending_prompts() == []
-    assert not any(
-        message.tool_result is not None
+    refusals = [
+        message
+        for message in child_store.messages()
+        if message.tool_result is not None
         and message.tool_result.is_error
         and "pending follow-up" in message.tool_result.content
-        for message in child_store.messages()
-    )
+    ]
+    assert len(refusals) == 1
     assert not any(
         entry.data.get("kind") == "child_question"
         for entry in store.agent_notifications()
     )
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_follow_up_not_acknowledged_by_retry_notice_before_provider_event(
+    tmp_path: Path,
+) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
+    parent_loop = AgentLoop(
+        FakeBackend([]), parent, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    handle = "parent:1"
+    parent.register_agent_child(
+        _run_agent_call(),
+        child_session_path=str(child.session_dir),
+        description="run",
+        agent_type="run",
+        background=True,
+        child_instance_id=handle,
+        accepts_follow_ups=True,
+    )
+    await _send_follow_up(parent_loop, handle, "retry follow-up")
+    pending = child.pending_prompts()[0]
+    prompt_message = Message(
+        MessageRole.USER,
+        [TextContent("retry follow-up")],
+        metadata={
+            "zeta.origin": MessageOrigin.AGENT_SEND.value,
+            "zeta.pending_prompt_id": pending.id,
+        },
+    )
+
+    retry_backend = RetryBeforeProviderBackend()
+    child_loop = AgentLoop(
+        retry_backend, child, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    first_attempt = asyncio.create_task(
+        _collect(
+            child_loop.run_turn(
+                "retry follow-up",
+                origin=MessageOrigin.AGENT_SEND,
+                user_message=prompt_message,
+            )
+        )
+    )
+    await asyncio.wait_for(retry_backend.retry_sent.wait(), timeout=2)
+    first_attempt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_attempt
+    assert [entry.id for entry in child.pending_prompts()] == [pending.id]
+
+    persisted_prompt = next(
+        message
+        for message in child.messages()
+        if message.metadata.get("zeta.pending_prompt_id") == pending.id
+    )
+    capture_backend = CapturePromptBackend()
+    child_loop.backend = capture_backend
+    await _collect(
+        child_loop.run_turn(
+            "retry follow-up",
+            origin=MessageOrigin.AGENT_SEND,
+            user_message=persisted_prompt,
+            persist_user_message=False,
+        )
+    )
+
+    assert child.pending_prompts() == []
+    assert capture_backend.prompt_count == 1
+    assert sum(
+        message.metadata.get("zeta.pending_prompt_id") == pending.id
+        for message in child.messages()
+    ) == 1
+    await child_loop.close()
+    await parent_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_send_does_not_close_open_question(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = AskParentFinishBackend()
+    monkeypatch.setitem(
+        AGENT_PRESETS,
+        "run",
+        replace(AGENT_PRESETS["run"], explicit_finish=True),
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    handle = _run_handle_from_receipt(store)
+    backend.release_child.set()
+    await asyncio.wait_for(backend.question_published.wait(), timeout=2)
+    question = next(
+        entry
+        for entry in store.agent_notifications()
+        if entry.data.get("kind") == "child_question"
+    )
+    await _send_follow_up(loop, handle, "progress update")
+
+    assert [
+        entry.id
+        for entry in store.agent_notifications()
+        if entry.data.get("kind") == "child_question"
+    ] == [question.id]
+    loop._background_owner.cancel_subtree(handle)
+    await loop._background_owner.wait()
     await loop.close()
 
 
