@@ -2498,6 +2498,54 @@ async def test_finish_gate_turn_cap_defers_task_exit_during_stream_close(
 
 
 @pytest.mark.asyncio
+async def test_finish_gate_uses_task_deadline_to_deliver_late_task_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(
+        store, finish_gate_timeout=0.01, finish_gate_task_timeout=10
+    )
+    registry = SimpleNamespace(snapshot=tuple)
+    child_loop = SimpleNamespace(
+        _background_owner=owner,
+        agent_instance_id="child-1",
+        tool_registry=SimpleNamespace(background_tasks=registry),
+    )
+    state = FinishGateState()
+    state.start(child_loop)
+    state.task_outlived_child_bound = True
+    deadlines: list[float] = []
+
+    class CaptureTimeout:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    def capture_timeout(deadline: float) -> CaptureTimeout:
+        deadlines.append(deadline)
+        return CaptureTimeout()
+
+    monkeypatch.setattr(asyncio, "timeout_at", capture_timeout)
+
+    async def events() -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+
+    async def consume(
+        stream: AsyncIterator[StreamEvent], control: FinishGateControl | None
+    ) -> None:
+        async for _event in stream:
+            pass
+
+    result = await state.run_model_turn(child_loop, events(), consume)
+
+    assert result is None
+    assert deadlines == [state.task_deadline]
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_child_finish_gate_wait_timeout_adopts(
     tmp_path: Path,
 ) -> None:

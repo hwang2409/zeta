@@ -128,7 +128,9 @@ class FinishGateState:
         loop = asyncio.get_running_loop()
         tasks_were_running = bool(self.owned_tasks(child_loop))
         deadline = loop.time() + owner.finish_gate_timeout
-        if tasks_were_running:
+        if self.task_outlived_child_bound:
+            deadline = self._task_deadline()
+        elif tasks_were_running:
             deadline = min(deadline, self._task_deadline())
         try:
             async with asyncio.timeout_at(deadline):
