@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import hashlib
 import json
 import os
 import re
 import stat
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -60,9 +62,6 @@ class AccountStore:
         self.home = Path(home)
         self.registry = self.home / "accounts.json"
         self.accounts = self.home / "accounts"
-        self.locks = self.home / "account-locks"
-        self.migration_lock = self.home / ".accounts-migration.lock"
-        self.registry_lock = self.home / ".accounts.lock"
 
     @contextmanager
     def _home(self) -> Iterator[int]:
@@ -226,10 +225,30 @@ class AccountStore:
         self, home_fd: int, account: AccountId
     ) -> OAuthTokens | None:
         value = self._read_registry(home_fd)
-        tokens = _read_account_tokens(home_fd, account)
-        if str(account) not in value["accounts"] and tokens is not None:
-            self._register_account(home_fd, account, value)
-        return tokens
+        registered = str(account) in value["accounts"]
+        try:
+            with _open_account_directory(home_fd, account) as account_fd:
+                pending = _read_publication_pending(account_fd)
+                if registered:
+                    tokens = _read_optional_tokens(account_fd)
+                    if pending is not None:
+                        _delete_publication_pending(account_fd)
+                    return tokens
+                if pending is None:
+                    return None
+                credential = _read_optional_bytes(account_fd, "oauth.json")
+                if (
+                    credential is None
+                    or pending != _publication_record(account, credential)
+                ):
+                    _delete_publication_pending(account_fd)
+                    return None
+                tokens = _tokens_from_bytes(credential)
+                self._register_account(home_fd, account, value)
+                _delete_publication_pending(account_fd)
+                return tokens
+        except FileNotFoundError:
+            return None
 
     def _register_account(
         self,
@@ -266,15 +285,10 @@ class AccountStore:
             value = self._read_registry(home_fd)
             registered = str(account) in value["accounts"]
             legacy_exists = _exists_regular(home_fd, legacy_name)
-            staged = _read_account_tokens(home_fd, account)
-            if registered:
+            staged = self._recover_account(home_fd, account)
+            if registered or staged is not None:
                 if staged is None:
                     raise AccountError("OAuth credentials are invalid; login required")
-                if legacy_exists:
-                    _unlink_legacy(home_fd, legacy_name)
-                return
-            if staged is not None:
-                self._register_account(home_fd, account, value)
                 if legacy_exists:
                     _unlink_legacy(home_fd, legacy_name)
                 return
@@ -282,11 +296,13 @@ class AccountStore:
                 return
             tokens = _read_tokens(home_fd, legacy_name)
             with _account_directory(home_fd, account) as account_fd:
-                _write_tokens(account_fd, tokens)
+                credential = _token_bytes(tokens)
+                _write_publication_pending(account_fd, account, credential)
+                _write_token_bytes(account_fd, credential)
                 _verify_tokens(account_fd, tokens)
-            value["accounts"][str(account)] = {"provider": provider, "name": "default"}
-            value["defaults"].setdefault(provider, str(account))
-            self._write_registry(home_fd, value)
+            self._register_account(home_fd, account, value)
+            with _open_account_directory(home_fd, account) as account_fd:
+                _delete_publication_pending(account_fd)
             _unlink_legacy(home_fd, legacy_name)
 
     def _read_registry(self, home_fd: int) -> dict[str, Any]:
@@ -368,12 +384,17 @@ class AccountCredentials:
             return _read_account_tokens(home_fd, self.account)
 
     def save(
-        self, tokens: OAuthTokens, *, lock_timeout: float | None = None
+        self,
+        tokens: OAuthTokens,
+        *,
+        lock_timeout: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         with self.store.credential_guard(
             self.account, timeout=lock_timeout
         ) as home_fd:
-            self._publish(home_fd, tokens)
+            if cancel_event is None or not cancel_event.is_set():
+                self._publish(home_fd, tokens)
 
     def bootstrap(self) -> OAuthTokens | None:
         with self.store.credential_guard(self.account) as home_fd:
@@ -457,8 +478,18 @@ class AccountCredentials:
             _verify_tokens(account_fd, tokens)
 
     def _publish(self, home_fd: int, tokens: OAuthTokens) -> None:
-        self._write(home_fd, tokens)
+        registered = str(self.account) in self.store._read_registry(home_fd)["accounts"]
+        if registered:
+            self._write(home_fd, tokens)
+            return
+        credential = _token_bytes(tokens)
+        with _account_directory(home_fd, self.account) as account_fd:
+            _write_publication_pending(account_fd, self.account, credential)
+            _write_token_bytes(account_fd, credential)
+            _verify_tokens(account_fd, tokens)
         self.store._register_account(home_fd, self.account)
+        with _open_account_directory(home_fd, self.account) as account_fd:
+            _delete_publication_pending(account_fd)
 
     def _login_required_error(self) -> RuntimeError:
         return self._driver.login_required_error(
@@ -601,9 +632,66 @@ def _atomic_publish(directory_fd: int, name: str, data: bytes) -> None:
             pass
 
 
+def _token_bytes(tokens: OAuthTokens) -> bytes:
+    return (json.dumps(tokens.to_dict(), separators=(",", ":")) + "\n").encode()
+
+
 def _write_tokens(directory_fd: int, tokens: OAuthTokens) -> None:
-    data = (json.dumps(tokens.to_dict(), separators=(",", ":")) + "\n").encode()
-    _atomic_publish(directory_fd, "oauth.json", data)
+    _write_token_bytes(directory_fd, _token_bytes(tokens))
+
+
+def _write_token_bytes(directory_fd: int, credential: bytes) -> None:
+    _atomic_publish(directory_fd, "oauth.json", credential)
+    _fsync_directory(directory_fd)
+
+
+def _publication_record(account: AccountId, credential: bytes) -> dict[str, str]:
+    return {
+        "provider": account.provider,
+        "name": account.name,
+        "sha256": hashlib.sha256(credential).hexdigest(),
+    }
+
+
+def _write_publication_pending(
+    directory_fd: int, account: AccountId, credential: bytes
+) -> None:
+    data = (
+        json.dumps(
+            _publication_record(account, credential), separators=(",", ":"), sort_keys=True
+        )
+        + "\n"
+    ).encode()
+    _atomic_publish(directory_fd, "publish-pending.json", data)
+    _fsync_directory(directory_fd)
+
+
+def _read_publication_pending(directory_fd: int) -> dict[str, str] | None:
+    raw = _read_optional(directory_fd, "publish-pending.json")
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"provider", "name", "sha256"}
+            or value["provider"] not in _PROVIDERS
+            or not isinstance(value["name"], str)
+            or not _SLUG.fullmatch(value["name"])
+            or not isinstance(value["sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])
+        ):
+            raise ValueError
+        return dict(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _delete_publication_pending(directory_fd: int) -> None:
+    try:
+        os.unlink("publish-pending.json", dir_fd=directory_fd)
+    except FileNotFoundError:
+        return
     _fsync_directory(directory_fd)
 
 
@@ -628,15 +716,40 @@ def _read_account_tokens(home_fd: int, account: AccountId) -> OAuthTokens | None
 
 def _read_tokens(directory_fd: int, name: str) -> OAuthTokens:
     try:
-        with os.fdopen(open_session_file(directory_fd, name, os.O_RDONLY)) as handle:
-            value = json.load(handle)
+        credential = _read_optional_bytes(directory_fd, name)
+        if credential is None:
+            raise FileNotFoundError(name)
+        return _tokens_from_bytes(credential)
+    except AccountError:
+        raise
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise AccountError("OAuth credentials are invalid; login required") from exc
+
+
+def _read_optional_tokens(directory_fd: int) -> OAuthTokens | None:
+    credential = _read_optional_bytes(directory_fd, "oauth.json")
+    return None if credential is None else _tokens_from_bytes(credential)
+
+
+def _tokens_from_bytes(credential: bytes) -> OAuthTokens:
+    try:
+        value = json.loads(credential)
         if not isinstance(value, Mapping):
             raise TypeError
         return OAuthTokens.from_mapping(value, error_type=AccountError)
     except AccountError:
         raise AccountError("OAuth credentials are invalid; login required") from None
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
         raise AccountError("OAuth credentials are invalid; login required") from exc
+
+
+def _read_optional_bytes(directory_fd: int, name: str) -> bytes | None:
+    try:
+        fd = open_session_file(directory_fd, name, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
 
 
 def _read_optional(directory_fd: int, name: str) -> str | None:

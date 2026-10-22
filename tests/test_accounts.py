@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import multiprocessing
@@ -219,7 +220,7 @@ def test_migration_crash_at_each_step_keeps_a_working_login(
     elif step == "credential_file":
         original = wrap("_atomic_publish", lambda args, count: args[1] == "oauth.json")
     elif step == "credential_directory_sync":
-        original = wrap("_write_tokens", lambda args, count: True)
+        original = wrap("_write_token_bytes", lambda args, count: True)
     elif step == "credential_verification":
         original = wrap("_read_tokens", lambda args, count: count == 2)
     elif step == "registry_file":
@@ -349,6 +350,43 @@ def test_concurrent_login_is_rejected_per_provider(tmp_path: Path) -> None:
     assert process.exitcode == 0
 
 
+def test_cli_login_does_not_overwrite_legacy_login_without_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legacy = _write_legacy(tmp_path, "anthropic")
+    expected = json.loads(legacy.read_text())
+    monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
+
+    async def login_must_not_run(*_args, **_kwargs):
+        raise AssertionError("login started before the existing account was checked")
+
+    monkeypatch.setattr(cli_main, "run_login", login_must_not_run)
+
+    with pytest.raises(AccountError, match="already exists"):
+        cli_main._run_login("anthropic", "default", False)
+
+    destination = AccountStore(tmp_path).credential_path(
+        AccountId("anthropic", "default")
+    )
+    assert not legacy.exists()
+    assert json.loads(destination.read_text()) == expected
+
+
+def test_accounts_list_shows_migrated_legacy_login(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    legacy = _write_legacy(tmp_path, "codex")
+    monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
+    args = SimpleNamespace(action=None, account=None, json=False)
+
+    assert cli_main._handle_accounts(args) == 0
+
+    assert capsys.readouterr().out == "codex:default\n"
+    assert not legacy.exists()
+
+
 def test_named_login_registers_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -469,6 +507,51 @@ def test_refresh_after_migration_writes_the_account_credential(
     assert not (tmp_path / "anthropic-oauth.json").exists()
 
 
+def test_orphan_credential_without_pending_record_is_not_registered(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(tmp_path)
+    account = AccountId("anthropic", "deleted")
+    path = store.credential_path(account)
+    path.parent.mkdir(parents=True)
+    orphan = OAuthTokens("codex-access", "codex-refresh", 4_000_000_000)
+    path.write_text(json.dumps(orphan.to_dict()) + "\n")
+    original = path.read_bytes()
+
+    assert store.resolve_account("anthropic", account) == account
+    assert store.list() == []
+    assert store.default("anthropic") is None
+    assert path.read_bytes() == original
+
+
+def test_pending_record_digest_mismatch_discards_record_and_keeps_credential(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(tmp_path)
+    account = AccountId("anthropic", "work")
+    path = store.credential_path(account)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(tokens().to_dict()) + "\n")
+    original = path.read_bytes()
+    pending = path.with_name("publish-pending.json")
+    pending.write_text(
+        json.dumps(
+            {
+                "provider": account.provider,
+                "name": account.name,
+                "sha256": hashlib.sha256(b"different credential").hexdigest(),
+            }
+        )
+        + "\n"
+    )
+
+    assert store.resolve_account("anthropic", account) == account
+    assert store.list() == []
+    assert store.default("anthropic") is None
+    assert not pending.exists()
+    assert path.read_bytes() == original
+
+
 @pytest.mark.parametrize("publication", ["bootstrap", "login"])
 def test_crash_between_credential_and_registry_publish_recovers_account(
     publication: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -495,6 +578,8 @@ def test_crash_between_credential_and_registry_publish_recovers_account(
         else:
             credential.save(expected)
     monkeypatch.setattr(AccountStore, "_write_registry", real_write_registry)
+    pending = credential.path.with_name("publish-pending.json")
+    assert pending.exists()
 
     def bootstrap_must_not_run() -> OAuthTokens:
         raise AssertionError("bootstrap source was consulted during recovery")
@@ -512,6 +597,7 @@ def test_crash_between_credential_and_registry_publish_recovers_account(
     store = AccountStore(tmp_path)
     assert store.list() == [AccountId("anthropic", "default")]
     assert store.default("anthropic") == AccountId("anthropic", "default")
+    assert not pending.exists()
     assert bootstrap_calls == (1 if publication == "bootstrap" else 0)
 
 
@@ -523,6 +609,16 @@ def test_recovery_never_overwrites_a_corrupt_staged_credential(
     path.parent.mkdir(parents=True)
     corrupt = b"not valid oauth json\n"
     path.write_bytes(corrupt)
+    path.with_name("publish-pending.json").write_text(
+        json.dumps(
+            {
+                "provider": credential.account.provider,
+                "name": credential.account.name,
+                "sha256": hashlib.sha256(corrupt).hexdigest(),
+            }
+        )
+        + "\n"
+    )
     monkeypatch.setattr(
         credential._driver,
         "bootstrap",

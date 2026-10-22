@@ -390,6 +390,7 @@ def _run_login(
     store = AccountStore(home)
     account_id = AccountId(provider, account)
     with store.provider_login_lock(provider):
+        store.migrate()
         if store.contains(account_id) and not replace_existing:
             raise AccountError(f"account {account_id} already exists; use --replace")
         return asyncio.run(
@@ -401,7 +402,9 @@ def _handle_login(args: argparse.Namespace) -> int:
     try:
         replace_existing = args.replace
         account = AccountId(args.provider, args.account)
-        if AccountStore(env_home()).contains(account) and not replace_existing:
+        store = AccountStore(env_home())
+        store.migrate()
+        if store.contains(account) and not replace_existing:
             if not sys.stdin.isatty() or input(
                 f"replace {account}? [y/N] "
             ).lower() not in {"y", "yes"}:
@@ -430,6 +433,7 @@ def _handle_login(args: argparse.Namespace) -> int:
 def _handle_accounts(args: argparse.Namespace) -> int:
     store = AccountStore(env_home())
     try:
+        store.migrate()
         if args.action == "default":
             if not args.account or ":" not in args.account:
                 raise AccountError("default requires provider:name")

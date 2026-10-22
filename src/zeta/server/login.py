@@ -75,9 +75,19 @@ class Logins:
         login_provider = "anthropic" if provider == "claude" else provider
         lock = AccountStore(self.home).provider_login_lock(login_provider)
         locked = False
+        acquisition = asyncio.create_task(asyncio.to_thread(lock.__enter__))
         try:
-            await asyncio.to_thread(lock.__enter__)
-            locked = True
+            try:
+                await asyncio.shield(acquisition)
+                locked = True
+            except asyncio.CancelledError:
+                result = (
+                    await asyncio.shield(
+                        asyncio.gather(acquisition, return_exceptions=True)
+                    )
+                )[0]
+                locked = not isinstance(result, BaseException)
+                raise
             async with asyncio.timeout(self.timeout):
                 await run_login(
                     build_login_provider(login_provider, self.home),

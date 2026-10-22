@@ -24,7 +24,11 @@ class CredentialSink(Protocol[TokenT]):
     """The part of a provider credential store used by login."""
 
     def save(
-        self, tokens: TokenT, *, lock_timeout: float | None = None
+        self,
+        tokens: TokenT,
+        *,
+        lock_timeout: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Persist tokens."""
 
@@ -229,11 +233,23 @@ async def run_login(
         if publication_timeout_seconds is None:
             provider.credential_store.save(tokens)
         else:
-            await asyncio.to_thread(
-                provider.credential_store.save,
-                tokens,
-                lock_timeout=publication_timeout_seconds,
+            cancel_publication = threading.Event()
+            publication = asyncio.create_task(
+                asyncio.to_thread(
+                    provider.credential_store.save,
+                    tokens,
+                    lock_timeout=publication_timeout_seconds,
+                    cancel_event=cancel_publication,
+                )
             )
+            try:
+                await asyncio.shield(publication)
+            except asyncio.CancelledError:
+                cancel_publication.set()
+                await asyncio.shield(
+                    asyncio.gather(publication, return_exceptions=True)
+                )
+                raise
         return provider.token_handle(tokens)
     finally:
         # Cancellation can arrive after exchange, while shutdown is running.
