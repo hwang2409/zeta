@@ -356,11 +356,14 @@ def _tokens_from_response(value: Any, fallback_refresh: str | None) -> OAuthToke
     if type(expires_in) not in {int, float}:
         raise ValueError("token response expiry is invalid")
     account = value.get("account")
+    organization = value.get("organization")
     email = _first_string(value, "email")
     workspace = _first_string(value, "workspace", "organization_name")
     if isinstance(account, Mapping):
-        email = email or _first_string(account, "email")
+        email = email or _first_string(account, "email_address", "email")
         workspace = workspace or _first_string(account, "workspace", "name")
+    if isinstance(organization, Mapping):
+        workspace = workspace or _first_string(organization, "name")
     return OAuthTokens(
         access_token,
         refresh_token or fallback_refresh or "",

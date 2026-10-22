@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -54,6 +55,13 @@ _SENTINEL = "token-text-must-not-escape"
 
 def tokens() -> OAuthTokens:
     return OAuthTokens(_SENTINEL, "refresh-secret", 9_999_999_999.0)
+
+
+def _jwt_token(claims: dict[str, object]) -> str:
+    def segment(value: dict[str, object]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+    return ".".join((segment({"alg": "none"}), segment(claims), "signature"))
 
 
 def test_no_writable_credential_store_outside_account_credentials() -> None:
@@ -141,6 +149,34 @@ def test_provider_driver_refresh_through_account_credentials_keeps_headers_and_r
     persisted = credential.read()
     assert persisted is not None
     assert persisted.refresh_token == "new-refresh"
+
+
+def test_anthropic_email_address_captured_on_refresh(tmp_path: Path) -> None:
+    credential = named_account_credentials(tmp_path, "anthropic")
+    credential.save(OAuthTokens("old-access", "old-refresh", 1.0))
+    credential._driver.token_url = "https://refresh.test/token"
+
+    def refresh(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600,
+                "account": {"email_address": "claude@example.com"},
+                "organization": {"name": "Acme"},
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(refresh)) as client:
+            await credential.refresh_token(client)
+
+    asyncio.run(run())
+    persisted = credential.read()
+    assert persisted is not None
+    assert persisted.email == "claude@example.com"
+    assert persisted.workspace == "Acme"
 
 
 def _write_legacy(home: Path, provider: str) -> Path:
@@ -1365,17 +1401,43 @@ def test_rename_leaves_approved_automation_pinned_with_redraft_message(
     assert "re-draft" in message
 
 
+def test_codex_email_from_access_token_profile_claim(tmp_path: Path) -> None:
+    access_token = _jwt_token(
+        {"https://api.openai.com/profile": {"email": "henry@example.com"}}
+    )
+    credential = named_account_credentials(tmp_path, "codex")
+    credential.save(OAuthTokens(access_token, "refresh", 9_999_999_999))
+
+    listed = AccountStore(tmp_path).list_display()
+
+    assert [(str(item.account), item.detail) for item in listed] == [
+        ("codex:default", "henry@example.com")
+    ]
+
+
 def test_list_shows_email_metadata_when_present_offline(tmp_path: Path) -> None:
     parsed = OAuthTokens.from_mapping(
         {
             "access_token": "access",
             "refresh_token": "refresh",
             "expires_at": 9_999_999_999,
-            "account": {"email": "claude@example.com"},
+            "account": {"email_address": "claude@example.com"},
+            "organization": {"name": "Acme"},
         },
         error_type=RuntimeError,
     )
     assert parsed.email == "claude@example.com"
+    assert parsed.workspace == "Acme"
+    identity = OAuthTokens.from_mapping(
+        {
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_at": 9_999_999_999,
+            "id_token": _jwt_token({"email": "codex@example.com"}),
+        },
+        error_type=RuntimeError,
+    )
+    assert identity.email == "codex@example.com"
     codex = OAuthTokens(
         "access", "refresh", 9_999_999_999, email="henry@example.com"
     )

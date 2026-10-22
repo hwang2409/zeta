@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import fcntl
 import hashlib
 import io
@@ -426,6 +427,20 @@ def error_body_excerpt(body: bytes, *, limit: int = 300) -> str:
     return " ".join(text.split())[:limit]
 
 
+def _jwt_payload(token: str | None) -> Mapping[str, Any]:
+    if not token:
+        return {}
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+        return payload if isinstance(payload, Mapping) else {}
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return {}
+
+
 @dataclass(frozen=True, slots=True)
 class OAuthTokens:
     access_token: str
@@ -433,6 +448,13 @@ class OAuthTokens:
     expires_at: float
     email: str | None = None
     workspace: str | None = None
+
+    def __post_init__(self) -> None:
+        profile = _jwt_payload(self.access_token).get(
+            "https://api.openai.com/profile"
+        )
+        if not self.email and isinstance(profile, Mapping):
+            object.__setattr__(self, "email", _first_string(profile, "email"))
 
     @classmethod
     def from_mapping(
@@ -453,11 +475,17 @@ class OAuthTokens:
         if expires_at > 100_000_000_000:
             expires_at /= 1000
         account = value.get("account")
-        email = _first_string(value, "email")
-        workspace = _first_string(value, "workspace", "organization_name")
+        organization = value.get("organization")
+        identity = _jwt_payload(_first_string(value, "id_token", "idToken"))
+        email = _first_string(value, "email") or _first_string(identity, "email")
+        workspace = _first_string(
+            value, "workspace", "organization_name"
+        ) or _first_string(identity, "workspace", "organization_name")
         if isinstance(account, Mapping):
-            email = email or _first_string(account, "email")
+            email = email or _first_string(account, "email_address", "email")
             workspace = workspace or _first_string(account, "workspace", "name")
+        if isinstance(organization, Mapping):
+            workspace = workspace or _first_string(organization, "name")
         return cls(access_token, refresh_token, float(expires_at), email, workspace)
 
     def to_dict(self) -> dict[str, Any]:
