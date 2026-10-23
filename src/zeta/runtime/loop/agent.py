@@ -15,7 +15,6 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import replace
-from functools import partial
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -26,10 +25,7 @@ from ...agent.background import (
 from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.durable import durable_message
 from ...agent.notifications import AgentNotificationMixin, NotificationWake
-from ...agent.pending_delivery import (
-    PendingDelivery,
-    pending_prompt_acknowledgement,
-)
+from ...agent.pending_delivery import PendingDelivery
 from ...agent.plan_mode import (
     PLAN_MODE_POLICY,
     plan_mode_messages,
@@ -115,7 +111,7 @@ from ._completion import (
     can_retry_context,
     close_completion,
     ensure_context_reduced,
-    provider_events,
+    observed_completion,
     provider_prompt_tokens,
     provider_retry_notice,
     start_provider_attempt,
@@ -903,22 +899,8 @@ class AgentLoop(
                     self.backend.complete(context_messages, active_tools),
                     provider_retry_budget,
                 )
-
-                acknowledge_pending_prompt = pending_prompt_acknowledgement(
-                    self.store, pending_delivery, context_messages
-                )
-                provider_stream = (
-                    completion
-                    if steering is None and acknowledge_pending_prompt is None
-                    else provider_events(
-                        completion,
-                        (
-                            partial(self.store.deliver_client_steering, steering)
-                            if steering is not None
-                            else None
-                        ),
-                        acknowledge_pending_prompt,
-                    )
+                provider_stream = observed_completion(
+                    completion, self.store, steering, pending_delivery, context_messages
                 )
                 async for event in provider_stream:
                     attempt_state.observe(event)

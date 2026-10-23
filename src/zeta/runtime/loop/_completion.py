@@ -11,10 +11,12 @@ import asyncio
 import errno
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from functools import partial
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from ...agent.pending_delivery import pending_prompt_acknowledgement
 from ...core.abort import AbortSignal
 from ...protocol.types import (
     ContentBlock,
@@ -30,6 +32,11 @@ from ...providers.retry_policy import (
     RetryPlan,
 )
 from ...providers.stream_diagnostics import StreamDiagnostics
+
+if TYPE_CHECKING:
+    from ...agent.pending_delivery import PendingDelivery
+    from ...core.store import ConversationStore
+    from ...core.store._client_delivery import ClientSteeringBatch
 
 MAX_ERROR_MESSAGE = 400
 
@@ -87,6 +94,29 @@ async def provider_events(
         if not producer.done():
             producer.cancel()
             await asyncio.gather(producer, return_exceptions=True)
+
+
+def observed_completion(
+    completion: AsyncIterator[StreamEvent],
+    store: ConversationStore,
+    steering: ClientSteeringBatch | None,
+    pending_delivery: PendingDelivery | None,
+    context_messages: list[Message],
+) -> AsyncIterator[StreamEvent]:
+    """Attach steering delivery and pending-prompt acknowledgement to a stream.
+
+    Steering is published when the provider starts. A pending prompt is
+    acknowledged only after the first provider event, so retries and cancels
+    before that point leave it pending.
+    """
+
+    acknowledge = pending_prompt_acknowledgement(store, pending_delivery, context_messages)
+    if steering is None and acknowledge is None:
+        return completion
+    on_started = (
+        partial(store.deliver_client_steering, steering) if steering is not None else None
+    )
+    return provider_events(completion, on_started, acknowledge)
 
 
 def _is_permission_error(error: BaseException) -> bool:
