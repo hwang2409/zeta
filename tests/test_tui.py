@@ -697,6 +697,92 @@ async def test_live_notification_presentation_survives_tui_resume(
 
 
 @pytest.mark.asyncio
+async def test_canceled_live_notification_marks_presentation_before_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = StringIO()
+    store = ConversationStore(tmp_path / "session")
+    notification = store.append_agent_notification(
+        "child-canceled-presentation",
+        child_session_path="/tmp/child-canceled-presentation",
+        description="child",
+        status="completed",
+        text="child canceled presentation done",
+    )
+    loop = AgentLoop(
+        FakeBackend([]), store, skill_catalog=SkillCatalog.empty(), skip_mcp_mount=True
+    )
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False, width=160),
+    )
+    flow = await loop._ensure_step_delivery()
+    await flow.prepare_request("terminal_fallback", [], None)
+    event = loop._delivery_publication_events(flow.active_publications)[0]
+    rendered = render_event(event)
+    assert rendered is not None
+    rendered_output = asyncio.Event()
+    original_print_unit = app._print_unit
+
+    def record_print(*args: object, **kwargs: object) -> None:
+        original_print_unit(*args, **kwargs)
+        rendered_output.set()
+
+    monkeypatch.setattr(app, "_print_unit", record_print)
+    await store._async_write_lock.acquire()
+    presentation = asyncio.create_task(
+        app._print_special_event(
+            event,
+            rendered,
+            suppress_errors=False,
+            user_text="",
+            retry_message=Message(MessageRole.USER, [TextContent("")]),
+        )
+    )
+    try:
+        await rendered_output.wait()
+        assert output.getvalue().count("child · completed") == 1
+        assert not store.is_agent_notification_presented_to_tui(notification.id)
+        presentation.cancel()
+        await asyncio.sleep(0)
+        store._async_write_lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await presentation
+
+        reopened = ConversationStore(store.root_dir, session_id=store.session_id)
+        resumed_output = StringIO()
+        resumed_app = TUIApp(
+            AgentLoop(
+                FakeBackend([]),
+                reopened,
+                skill_catalog=SkillCatalog.empty(),
+                skip_mcp_mount=True,
+            ),
+            provider="codex",
+            model="offline",
+            console=Console(file=resumed_output, force_terminal=False, width=160),
+        )
+        try:
+            assert reopened.is_agent_notification_presented_to_tui(notification.id)
+            resumed_app._rebuild_transcript()
+            visible = output.getvalue() + resumed_output.getvalue()
+            assert visible.count("child · completed") == 1
+        finally:
+            await resumed_app.loop.close()
+            reopened.close()
+    finally:
+        if store._async_write_lock.locked():
+            store._async_write_lock.release()
+        if not presentation.done():
+            presentation.cancel()
+            await asyncio.gather(presentation, return_exceptions=True)
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_background_completion_is_rendered_when_exit_overtakes_acknowledgement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

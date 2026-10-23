@@ -581,12 +581,18 @@ as `send` and `resume` return the existing `-32004` busy error; they cannot take
 the reserved turn.
 
 The wake claims one notification batch without consuming it. Receipt events
-are streamed from that claim. The server acknowledges the full batch only
-after the parent turn succeeds. Provider failure, cancellation, or client
-disconnection releases the claim without acknowledgement, so the same batch
-remains pending for the next attach. Repeated reconnects or resumes do not
-schedule another parent turn for a batch that completed successfully. If a
-turn is active, the server does not start a concurrent notification turn.
+are streamed from that claim. Each receipt includes a stable
+`data.notification_id`. Within one serve process, the server sends at most one
+receipt per id after a successful write. A failed write remains retryable. A
+still-pending notification can be sent again after a reconnect or serve
+restart, so clients must deduplicate receipts by `notification_id`.
+
+Model delivery remains exactly once and is acknowledged only after provider
+answer evidence. Provider failure, cancellation, or client disconnection
+releases an unacknowledged claim, so the same batch remains pending for the
+next attach. Repeated reconnects or resumes do not schedule another parent turn
+for a batch that completed successfully. If a turn is active, the server does
+not start a concurrent notification turn.
 
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"usage","session_id":"abc123","usage":{"input_tokens":10,"output_tokens":4}}}

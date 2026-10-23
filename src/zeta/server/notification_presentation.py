@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 
 from zeta.server import event_contract
 
-NotificationSender = Callable[..., Awaitable[None]]
+NotificationSender = Callable[..., Awaitable[bool]]
 
 
 class NotificationPresentation:
@@ -37,10 +37,12 @@ class NotificationPresentation:
             notification.get("kind", "agent_completion"), protocol_version
         )
         try:
-            await send(event_name, session_id, data=dict(notification))
+            written = await send(event_name, session_id, data=dict(notification))
         except asyncio.CancelledError:
             raise
         except BaseException:
             if key is not None:
                 self._presented.discard(key)
             raise
+        if not written and key is not None:
+            self._presented.discard(key)

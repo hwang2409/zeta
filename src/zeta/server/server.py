@@ -1032,10 +1032,10 @@ class _Client:
 
     async def _notify(
         self, event: str, session_id: str | None = None, **fields: object
-    ) -> None:
+    ) -> bool:
         if session_id is None and self.server.runtime.opened is not None:
             session_id = self.server.runtime.session_id
-        await self._write(self.codec.notification(event, session_id, **fields))
+        return await self._write(self.codec.notification(event, session_id, **fields))
 
     def _list_sessions(
         self, request_id: str | int, params: dict[str, Any]
@@ -1134,9 +1134,9 @@ class _Client:
                 suppress_write_errors=suppress_write_errors,
             )
 
-    async def _write(self, payload: bytes) -> None:
+    async def _write(self, payload: bytes) -> bool:
         async with self._write_lock:
-            await self.codec.write(self.writer, payload)
+            return await self.codec.write(self.writer, payload)
 
     def _turn_busy(self) -> bool:
         loop = self.server.runtime.loop

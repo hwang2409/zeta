@@ -84,11 +84,12 @@ async def test_notification_presentation_retries_failed_send() -> None:
     presentation = NotificationPresentation()
     attempts = 0
 
-    async def send(*args: object, **kwargs: object) -> None:
+    async def send(*args: object, **kwargs: object) -> bool:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise ConnectionError("send failed")
+        return True
 
     notification = {"notification_id": "notification-1"}
     with pytest.raises(ConnectionError, match="send failed"):
@@ -96,6 +97,49 @@ async def test_notification_presentation_retries_failed_send() -> None:
     await presentation.publish("session-1", notification, "1.0", send)
 
     assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_notification_presentation_retries_disconnected_codec_write(
+    tmp_path: Path,
+) -> None:
+    class DisconnectedWriter:
+        def write(self, payload: bytes) -> None:
+            raise ConnectionError("disconnected")
+
+        async def drain(self) -> None:
+            raise AssertionError("drain must not run after a failed write")
+
+    class HealthyWriter:
+        def __init__(self) -> None:
+            self.frames: list[bytes] = []
+
+        def write(self, payload: bytes) -> None:
+            self.frames.append(payload)
+
+        async def drain(self) -> None:
+            pass
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    client = _Client(server, asyncio.StreamReader(), DisconnectedWriter())
+    notification = {"notification_id": "notification-1"}
+
+    await server.notification_presentations.publish(
+        "session-1", notification, "1.0", client._notify
+    )
+    healthy = HealthyWriter()
+    client.writer = healthy
+    await server.notification_presentations.publish(
+        "session-1", notification, "1.0", client._notify
+    )
+
+    receipts = [
+        json.loads(frame)
+        for frame in healthy.frames
+        if json.loads(frame)["params"]["event"] == "sub_agent_receipt"
+    ]
+    assert len(receipts) == 1
+    assert receipts[0]["params"]["data"]["notification_id"] == "notification-1"
 
 
 def test_serve_maps_account_state_unknown() -> None:

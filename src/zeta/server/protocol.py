@@ -194,8 +194,8 @@ class FrameCodec:
             session_id, event, "event exceeds the size limit"
         )
 
-    async def write(self, writer: Any, payload: bytes) -> None:
-        """Write one codec-produced frame and absorb a disconnected peer."""
+    async def write(self, writer: Any, payload: bytes) -> bool:
+        """Write one codec-produced frame; report a disconnected peer."""
 
         if len(payload) > MAX_FRAME_BYTES:
             payload = self.error_response(
@@ -207,7 +207,8 @@ class FrameCodec:
             writer.write(payload)
             await writer.drain()
         except (ConnectionError, BrokenPipeError):
-            pass
+            return False
+        return True
 
     def _bounded_json(
         self, value: Mapping[str, Any], *, request_id: str | int | None
