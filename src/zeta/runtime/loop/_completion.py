@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from ...agent.pending_delivery import pending_prompt_acknowledgement
 from ...core.abort import AbortSignal
 from ...protocol.types import (
     ContentBlock,
@@ -34,17 +33,34 @@ from ...providers.retry_policy import (
 from ...providers.stream_diagnostics import StreamDiagnostics
 
 if TYPE_CHECKING:
-    from ...agent.pending_delivery import PendingDelivery
     from ...core.store import ConversationStore
     from ...core.store._client_delivery import ClientSteeringBatch
 
 MAX_ERROR_MESSAGE = 400
+_PROVIDER_EVIDENCE_EVENTS = {
+    StreamEventType.MESSAGE_START,
+    StreamEventType.MESSAGE_UPDATE,
+    StreamEventType.MESSAGE_END,
+}
+
+
+async def _delivery_publications(
+    on_first_event: Callable[[], Awaitable[object]] | None,
+    publication_events: Callable[[object], Iterator[StreamEvent]] | None,
+) -> AsyncIterator[StreamEvent]:
+    if on_first_event is None:
+        return
+    publications = await on_first_event()
+    if publication_events is not None:
+        for publication in publication_events(publications):
+            yield publication
 
 
 async def provider_events(
     completion: AsyncIterator[StreamEvent],
     on_started: Callable[[], Awaitable[None]] | None = None,
-    on_first_event: Callable[[], Awaitable[None]] | None = None,
+    on_first_event: Callable[[], Awaitable[object]] | None = None,
+    publication_events: Callable[[object], Iterator[StreamEvent]] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """Preserve stream ordering while exposing the provider-start seam."""
 
@@ -77,14 +93,12 @@ async def provider_events(
         first_provider_event = True
         while (event := await events.get()) is not finished:
             assert isinstance(event, StreamEvent)
-            if first_provider_event and event.type in {
-                StreamEventType.MESSAGE_START,
-                StreamEventType.MESSAGE_UPDATE,
-                StreamEventType.MESSAGE_END,
-            }:
+            if first_provider_event and event.type in _PROVIDER_EVIDENCE_EVENTS:
                 first_provider_event = False
-                if on_first_event is not None:
-                    await on_first_event()
+                async for publication in _delivery_publications(
+                    on_first_event, publication_events
+                ):
+                    yield publication
             try:
                 yield event
             finally:
@@ -100,8 +114,8 @@ def observed_completion(
     completion: AsyncIterator[StreamEvent],
     store: ConversationStore,
     steering: ClientSteeringBatch | None,
-    pending_delivery: PendingDelivery | None,
-    context_messages: list[Message],
+    acknowledge_delivery: Callable[[], Awaitable[object]] | None,
+    publication_events: Callable[[object], Iterator[StreamEvent]] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """Attach steering delivery and pending-prompt acknowledgement to a stream.
 
@@ -110,13 +124,17 @@ def observed_completion(
     before that point leave it pending.
     """
 
-    acknowledge = pending_prompt_acknowledgement(store, pending_delivery, context_messages)
-    if steering is None and acknowledge is None:
+    if steering is None and acknowledge_delivery is None:
         return completion
     on_started = (
         partial(store.deliver_client_steering, steering) if steering is not None else None
     )
-    return provider_events(completion, on_started, acknowledge)
+    return provider_events(
+        completion,
+        on_started,
+        acknowledge_delivery,
+        publication_events,
+    )
 
 
 def _is_permission_error(error: BaseException) -> bool:

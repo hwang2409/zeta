@@ -101,6 +101,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from .core.context_parts.admission import RequestBudgetExceeded
 from .protocol.types import (
     CompletionBackend,
     ContentBlock,
@@ -641,7 +642,7 @@ class CompactionPolicy:
                     ):
                         completed = event.message
             except Exception as exc:
-                if isinstance(exc, SummaryCompletionError):
+                if isinstance(exc, (SummaryCompletionError, RequestBudgetExceeded)):
                     raise
                 code = getattr(exc, "code", None)
                 if type(code) is str:

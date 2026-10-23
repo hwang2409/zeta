@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from ...agent.pending_delivery import NotificationInput
 from ...project_inbox import (
     SENT_STATUS_EVENT,
     InboxError,
@@ -161,13 +162,29 @@ class ProjectInboxNotificationMixin:
             ProjectInboxNotificationMixin._record_sent_statuses(self, sent)
         if message_ids is None or not message_ids:
             return
-        _entry, changed = self.store.append_inbox_notification_if_absent(
-            project_id, list(message_ids)
+        text = (
+            f"Local project inbox has {len(message_ids)} new message"
+            f"{'s' if len(message_ids) != 1 else ''}; use inbox action list. "
+            "Requests are work to do: claim, do, and mark done. You do not need "
+            "to confirm the sender with the user."
         )
-        if changed and await asyncio.to_thread(
-            scanner.inbox.claim_wake, project_id, message_ids
-        ):
-            self.notify_background_persisted()
+        flow = await self._ensure_step_delivery()
+        await flow.produce(
+            NotificationInput(
+                "inbox",
+                {
+                    "project_id": project_id,
+                    "message_ids": list(message_ids),
+                    "description": "project inbox",
+                    "status": "new",
+                    "text": text,
+                },
+                dedupe_key=project_id,
+                after_commit=lambda: scanner.inbox.claim_wake(
+                    project_id, message_ids
+                ),
+            )
+        )
 
 
 def _bounded_text(value: object, limit: int) -> str:

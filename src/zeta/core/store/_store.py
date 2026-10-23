@@ -14,7 +14,7 @@ import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Self  # noqa: F401 - re-exported by the store facade
 
 from ...agent.receipt import encode_json
 from ...protocol.types import (
@@ -50,6 +50,7 @@ from ._approval_display import (
 from ._async_writes import AsyncDurableWritesMixin
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
 from ._incremental_validation import IncrementalValidationMixin
+from ._lifecycle import StoreLifecycleMixin
 from ._log import ConversationLogMixin, PersistedAppend
 from ._notifications import NotificationStateMixin
 from ._pending_prompts import (
@@ -59,6 +60,7 @@ from ._pending_prompts import (
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
+from ._step_delivery import StepDeliveryStoreMixin
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
@@ -84,6 +86,8 @@ class ConversationStore(
     StoreRuntimeLeaseMixin,
     AgentStateMixin,
     CheckpointForkMixin,
+    StepDeliveryStoreMixin,
+    StoreLifecycleMixin,
 ):
     def __init__(
         self,
@@ -179,25 +183,6 @@ class ConversationStore(
                 self._runtime_lease,
                 lease.pop_all(),
             )
-    def close(self) -> None:
-        """Drain durable writers, then release this store's activity leases."""
-        if self._drain_durable_writes_for_close():
-            if self._runtime_lease is not None:
-                self._runtime_lease.close()
-            self.directory_fd = -1
-            self._release_lease()
-    def refresh(self) -> None:
-        """Reload durable state without acquiring ownership of the session."""
-        if self._closed:
-            raise ConversationIntegrityError("conversation store is closed")
-        with nullcontext() if self._read_only else self._append_lock():
-            self._load()
-            self._load_session_state()
-
-    def __enter__(self) -> Self:
-        return self
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
 
     def set_bash_cwd(self, cwd: str | Path) -> None:
         """Persist the shell's current directory outside the append-only log."""
@@ -223,7 +208,11 @@ class ConversationStore(
             bash_cwd = value.get("bash_cwd")
             todo_items = parse_todo_items(value.get("todo_items", []))
             todo_dismissed = value.get("todo_dismissed", False)
-            if type(bash_cwd) is not str or not bash_cwd or type(todo_dismissed) is not bool:
+            if (
+                type(bash_cwd) is not str
+                or not bash_cwd
+                or type(todo_dismissed) is not bool
+            ):
                 raise ValueError
             agent_state = _parse_agent_state(value, self.state_path)
         except (FileNotFoundError, TypeError, ValueError) as exc:
@@ -299,11 +288,9 @@ class ConversationStore(
         loaded_children = agent_state["agent_children"]
         for marker_key, loaded_marker in loaded_children.items():
             live_marker = self._agent_children.get(marker_key)
-            if (
-                live_marker is not None
-                and live_marker.get("child_session_path")
-                == loaded_marker.get("child_session_path")
-            ):
+            if live_marker is not None and live_marker.get(
+                "child_session_path"
+            ) == loaded_marker.get("child_session_path"):
                 loaded_marker["turns_used"] = max(
                     loaded_marker.get("turns_used", 0),
                     live_marker.get("turns_used", 0),
@@ -545,7 +532,9 @@ class ConversationStore(
                         raise ValueError("compaction pinned message must be an object")
                     pinned = Message.from_dict(pinned_message)
                     if pinned.role is not MessageRole.USER:
-                        raise ValueError("compaction pinned message must be a user message")
+                        raise ValueError(
+                            "compaction pinned message must be a user message"
+                        )
                 if kind not in {"summary", "evict"}:
                     raise ValueError("unknown compaction kind")
                 if kind == "evict":
@@ -561,7 +550,9 @@ class ConversationStore(
                     if telemetry is not None and type(telemetry) is not dict:
                         raise ValueError("eviction telemetry must be an object")
                 elif view is not None or telemetry is not None:
-                    raise ValueError("summary compaction cannot contain an eviction view")
+                    raise ValueError(
+                        "summary compaction cannot contain an eviction view"
+                    )
             elif entry.type == "client_delivery":
                 validate_client_delivery_data(entry.data, self.session_id)
             elif entry.type == "warning":
@@ -716,7 +707,10 @@ class ConversationStore(
             self._entries.append(entry)
             self._entry_ids.add(entry.id)
             self._record_active_entry(entry)
-            if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
+            if (
+                entry.type == "notification"
+                and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+            ):
                 task_id = entry.data.get("task_id")
                 if type(task_id) is str and task_id:
                     self._task_notification_ids.add(task_id)
@@ -774,7 +768,10 @@ class ConversationStore(
             self._rebuild_incremental_validation_state()
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
-        if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
+        if (
+            entry.type == "notification"
+            and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+        ):
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:
                 self._task_notification_ids.add(task_id)
@@ -783,10 +780,17 @@ class ConversationStore(
     def append_message(
         self, message: Message, *, parent_id: str | None = None
     ) -> ConversationEntry:
-        return self._append_row("message", {"message": require_new_message_origin(message).to_dict()}, parent_id)
+        return self._append_row(
+            "message",
+            {"message": require_new_message_origin(message).to_dict()},
+            parent_id,
+        )
 
     async def append_message_async(
-        self, message: Message, *, parent_id: str | None = None,
+        self,
+        message: Message,
+        *,
+        parent_id: str | None = None,
         on_persisted: Callable[[], None] | None = None,
     ) -> ConversationEntry:
         """Append off-loop and run ``on_persisted`` before deferred cancellation."""
@@ -908,7 +912,9 @@ class ConversationStore(
         parent_id: str | None = None,
     ) -> ConversationEntry:
         request_data = normalize_approval_requests(message, approval_requests)
-        data: dict[str, Any] = {"message": require_new_message_origin(message).to_dict()}
+        data: dict[str, Any] = {
+            "message": require_new_message_origin(message).to_dict()
+        }
         if request_data:
             data["approval_requests"] = request_data
         with self._append_lock():
@@ -1008,7 +1014,11 @@ class ConversationStore(
         parent_id: str | None = None,
     ) -> ConversationEntry:
         return self.append_message_with_approval_requests(
-            Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)], metadata={"response_state": "synthetic"}),
+            Message(
+                MessageRole.ASSISTANT,
+                [ToolUseContent(tool_call)],
+                metadata={"response_state": "synthetic"},
+            ),
             [(request_id, tool_call)],
             parent_id=parent_id,
         )

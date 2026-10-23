@@ -89,6 +89,7 @@ from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
 from .paste_runtime import PasteRuntime
 from .render import (
+    render_event,
     render_markdown,
     render_thought,
     render_thought_live_delta,
@@ -124,7 +125,6 @@ def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
         overlay.hint("↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"),
     ]
 
-
 def _tui_slash_commands() -> tuple[SlashCommand, ...]:
     """Commands that require the full-screen terminal UI."""
 
@@ -146,7 +146,6 @@ def _tui_slash_commands() -> tuple[SlashCommand, ...]:
         ),
     )
 
-
 def _prompt_style_with_background(
     foreground: str, background: str, *, background_first: bool = False
 ) -> str:
@@ -159,7 +158,6 @@ def _prompt_style_with_background(
         else (foreground, background_style)
     )
     return " ".join(part for part in parts if part)
-
 
 class TUIApp(
     SubmissionMixin,
@@ -806,7 +804,10 @@ class TUIApp(
 
     def _handle_background_event_now(self, event: StreamEvent) -> None:
         """Render child progress while keeping completion notices at turn boundaries."""
-
+        if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:
+            self._print_unit(render_event(event))
+            self._invalidate_stream_prompt()
+            return
         if event.type in {
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,

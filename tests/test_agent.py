@@ -20,9 +20,11 @@ import zeta.agent.background as agent_background_module
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
+import zeta.core.store._log as store_log_module
 import zeta.runtime.execution as execution_module
 import zeta.runtime.loop.agent as agent_loop_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.background import (
     BackgroundAgentOwner,
     CancellationRequest,
@@ -31,7 +33,6 @@ from zeta.agent.background import (
     recover_agent_children,
 )
 from zeta.agent.finish_gate import FinishGateControl, FinishGateState
-from zeta.agent.notifications import NotificationWake
 from zeta.agent.presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
@@ -44,12 +45,14 @@ from zeta.agent.runner import (
 from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.checkpoints import ConversationEntry
 from zeta.core.context import ContextAssembler
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
     ConversationStore,
     PendingPromptsClosedError,
 )
+from zeta.core.store import _step_delivery as step_delivery_store_module
 from zeta.core.store._pending_prompts import PendingPromptLoopThreadLockError
 from zeta.mcp import MCPMount
 from zeta.protocol.types import (
@@ -72,6 +75,7 @@ from zeta.providers.codex import CodexStreamError
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.loop._completion import observed_completion
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog, SkillMeta
 from zeta.skills.agent_catalog import AgentCatalog
@@ -205,6 +209,7 @@ async def test_context_overflow_forces_emergency_eviction_and_retries_once(
         store,
         max_turns=1,
         context_assembler=assembler,
+        tool_schemas=[],
         skill_catalog=SkillCatalog.empty(),
     )
 
@@ -259,6 +264,7 @@ async def test_context_overflow_retry_failure_persists_turn_once(
         store,
         max_turns=1,
         context_assembler=assembler,
+        tool_schemas=[],
         skill_catalog=SkillCatalog.empty(),
     )
 
@@ -469,6 +475,12 @@ async def test_background_owner_waits_for_child_close_before_unregister(
     )
     child_store.mark_agent_parent(call.id)
     owner = BackgroundAgentOwner(parent_store)
+    owner.conversation_channel.register_delivery_flow(
+        None, pending_delivery_module.StepDeliveryFlow(parent_store)
+    )
+    owner.conversation_channel.register_delivery_flow(
+        "child-1", pending_delivery_module.StepDeliveryFlow(child_store)
+    )
     close_started = asyncio.Event()
     release_close = asyncio.Event()
     cleanup_called = asyncio.Event()
@@ -495,7 +507,6 @@ async def test_background_owner_waits_for_child_close_before_unregister(
             ),
             child_store=child_store,
             parent_store=parent_store,
-            notification_store=parent_store,
             tool_call=call,
             child_instance_id="child-1",
             child_path=str(child_store.session_dir),
@@ -546,6 +557,13 @@ async def test_background_completion_truncates_long_killed_task_id(
         description="task research",
     )
     long_task_id = "task-" + "x" * 80
+    owner = BackgroundAgentOwner(parent_store)
+    owner.conversation_channel.register_delivery_flow(
+        None, pending_delivery_module.StepDeliveryFlow(parent_store)
+    )
+    owner.conversation_channel.register_delivery_flow(
+        "child-1", pending_delivery_module.StepDeliveryFlow(child_store)
+    )
 
     await finish_background_child(
         child_task=asyncio.create_task(
@@ -556,7 +574,6 @@ async def test_background_completion_truncates_long_killed_task_id(
         ),
         child_store=child_store,
         parent_store=parent_store,
-        notification_store=parent_store,
         tool_call=call,
         child_instance_id="child-1",
         child_path=str(child_store.session_dir),
@@ -577,6 +594,7 @@ async def test_background_completion_truncates_long_killed_task_id(
         cleanup=lambda: None,
         close_child=lambda: asyncio.sleep(0, result=(long_task_id,)),
         error_message=str,
+        background_owner=owner,
     )
 
     notification = parent_store.agent_notifications()[0]
@@ -718,14 +736,7 @@ class BackgroundBackend(CompletionBackend):
             "",
         )
         if any(
-            message.role is MessageRole.SYSTEM
-            and any(
-                isinstance(block, TextContent)
-                and block.text.startswith(
-                    "durable notifications (kind is agent_completion when omitted):"
-                )
-                for block in message.content
-            )
+            message.metadata.get("zeta_event") == "agent_notifications"
             for message in messages
         ):
             blocks = [TextContent("parent reacted to completion")]
@@ -1098,10 +1109,22 @@ class FollowUpFinishGateBackend(CompletionBackend):
             blocks = [ToolUseContent(grandchild)]
         elif last_user == "grandchild prompt":
             await asyncio.Event().wait()
-        elif last_user.startswith("follow-up"):
+        elif last_user.startswith("follow-up") and not self.follow_up_prompts:
             self.follow_up_prompts.append(last_user)
             self.follow_up_processed.set()
-            blocks = [TextContent("processed follow-up")]
+            blocks = [
+                TextContent("processed follow-up"),
+                ToolUseContent(
+                    ToolCall(
+                        "handoff-after-follow-up",
+                        "agent_handoff",
+                        {
+                            "reason": "follow-up processed",
+                            "outputs": "The grandchild result appears in the root.",
+                        },
+                    )
+                ),
+            ]
         elif grandchild_started and gate is None:
             blocks = [TextContent("child ready to finish")]
         elif gate is not None:
@@ -1343,6 +1366,17 @@ async def _wait_for_notification(store: ConversationStore, status: str) -> objec
     raise AssertionError(f"missing {status} background notification")
 
 
+async def _wait_for_background_event(
+    events: list[StreamEvent], event_type: StreamEventType
+) -> StreamEvent:
+    for _ in range(100):
+        for event in events:
+            if event.type is event_type:
+                return event
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"missing {event_type.value} background event")
+
+
 async def _send_follow_up(loop: AgentLoop, handle: str, message: str) -> None:
     result = await loop.tool_registry.execute(
         ToolCall(
@@ -1447,6 +1481,9 @@ async def test_background_agent_returns_handle_and_parent_continues(
     backend.release_child.set()
     notification = await _wait_for_notification(store, "completed")
     assert notification.data["text"].startswith("child complete")
+    deadline = asyncio.get_running_loop().time() + 2
+    while store.agent_children() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
     assert not store.agent_children()
     await loop.close()
 
@@ -1479,11 +1516,15 @@ async def test_background_completion_wakes_idle_parent(
         await asyncio.sleep(0)
     await wake_task
 
-    assert wake_events[0].type is StreamEventType.AGENT_NOTIFICATION
-    assert wake_events[0].data["text"].startswith("child complete")
-    assert wake_events[0].data["text"].count("error=false") == 1
-    assert wake_events[0].data["text"].count("canceled=false") == 1
-    rendered = render_event(wake_events[0])
+    receipt = next(
+        event
+        for event in wake_events
+        if event.type is StreamEventType.AGENT_NOTIFICATION
+    )
+    assert receipt.data["text"].startswith("child complete")
+    assert receipt.data["text"].count("error=false") == 1
+    assert receipt.data["text"].count("canceled=false") == 1
+    rendered = render_event(receipt)
     assert rendered is not None
     assert rendered.plain.startswith("⏺ background research · completed · ")
     assert "error=false" not in rendered.plain
@@ -1731,7 +1772,11 @@ async def test_aborted_notification_wake_commits_durable_notifications(
         status="completed",
         text="done 1",
     )
-    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn([TextContent("ack")])]),
+        store,
+        skill_catalog=SkillCatalog.empty(),
+    )
     wake = asyncio.Event()
     loop.set_background_wake_callback(wake.set)
 
@@ -1754,18 +1799,21 @@ async def test_aborted_notification_wake_commits_durable_notifications(
                     status="completed",
                     text="done 2",
                 )
+                loop.notify_background_persisted()
                 task.cancel()
 
     wake_task = asyncio.create_task(consume())
     with pytest.raises(asyncio.CancelledError):
         await wake_task
     try:
-        assert store.agent_notifications() == []
+        assert [
+            entry.data["text"] for entry in store.agent_notifications()
+        ] == ["done 2"]
         assert sum(
             message.metadata.get("zeta_event") == "agent_notifications"
             for message in store.messages()
-        ) == 2
-        assert not wake.is_set()
+        ) == 1
+        assert wake.is_set()
     finally:
         await loop.close()
 
@@ -1801,7 +1849,7 @@ async def test_failed_notification_wake_commits_durable_batch(
 
 
 @pytest.mark.asyncio
-async def test_notification_completion_during_wake_continues_same_turn(
+async def test_notification_completion_during_wake_waits_for_next_idle_epoch(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -1827,6 +1875,7 @@ async def test_notification_completion_during_wake_continues_same_turn(
                 status="completed",
                 text="second",
             )
+            loop.notify_background_persisted()
         return b"request"
 
     backend = FakeBackend(
@@ -1840,12 +1889,15 @@ async def test_notification_completion_during_wake_continues_same_turn(
 
     events = await _collect(loop.run_notification_turn())
 
-    assert len(backend.calls) == 2
+    assert len(backend.calls) == 1
     assert [
         event.data["child_instance_id"]
         for event in events
         if event.type is StreamEventType.AGENT_NOTIFICATION
-    ] == ["child-1", "child-2"]
+    ] == ["child-1"]
+    assert [
+        entry.data["child_instance_id"] for entry in store.agent_notifications()
+    ] == ["child-2"]
     assert not any(
         event.type is StreamEventType.ERROR
         and event.error is not None
@@ -1870,10 +1922,8 @@ async def test_background_multibyte_receipt_fits_persisted_limit(
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
 
-    terminal = next(
-        event
-        for event in background_events
-        if event.type is StreamEventType.TOOL_EXECUTION_END
+    terminal = await _wait_for_background_event(
+        background_events, StreamEventType.TOOL_EXECUTION_END
     )
     assert terminal.tool_result is not None
     assert terminal.tool_result.content.count("error=false") == 1
@@ -1985,7 +2035,7 @@ async def test_notification_during_wake_setup_waits_for_next_delivery(
         for message in backend.calls[0][0]
         if message.metadata.get("zeta_event") == "agent_notifications"
     ]
-    assert wake_batches == [["child-1"], ["child-2"]]
+    assert wake_batches == [["child-1", "child-2"]]
     await loop.close()
 
 
@@ -2016,9 +2066,11 @@ async def test_background_completion_during_setup_is_drained_at_turn_start(
     events = await _collect(loop.run_turn("follow up", origin=MessageOrigin.USER))
 
     assert setup_started.is_set()
-    assert events[0].type is StreamEventType.AGENT_NOTIFICATION
-    assert events[0].data["status"] == "completed"
-    assert events[1].type is StreamEventType.AGENT_START
+    receipt = next(
+        event for event in events if event.type is StreamEventType.AGENT_NOTIFICATION
+    )
+    assert receipt.data["status"] == "completed"
+    assert events[0].type is StreamEventType.AGENT_START
     assert store.agent_notifications() == []
     await loop.close()
 
@@ -2058,10 +2110,8 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     assert "parent session exited" not in notification.data["text"]
     assert notification.data["text"].count("error=false") == 1
     assert notification.data["text"].count("canceled=true") == 1
-    terminal = next(
-        event
-        for event in background_events
-        if event.type is StreamEventType.TOOL_EXECUTION_END
+    terminal = await _wait_for_background_event(
+        background_events, StreamEventType.TOOL_EXECUTION_END
     )
     assert terminal.tool_result is not None
     assert terminal.tool_result.is_error is False
@@ -3039,7 +3089,8 @@ def _persist_background_receipt(
     )
 
 
-def test_resume_cancels_live_background_child(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_resume_cancels_live_background_child(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="parent")
     call = _background_agent_call()
     child = ConversationStore(store.session_dir / "agents", session_id="1")
@@ -3054,7 +3105,8 @@ def test_resume_cancels_live_background_child(tmp_path: Path) -> None:
     )
 
     resumed = ConversationStore(tmp_path, session_id="parent")
-    AgentLoop(BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
 
     notification = resumed.agent_notifications()[0]
     assert notification.data["status"] == "canceled"
@@ -3068,7 +3120,8 @@ def test_resume_cancels_live_background_child(tmp_path: Path) -> None:
     }
 
 
-def test_resume_keeps_completed_unnotified_background_notification(
+@pytest.mark.asyncio
+async def test_resume_keeps_completed_unnotified_background_notification(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="parent")
@@ -3092,7 +3145,8 @@ def test_resume_keeps_completed_unnotified_background_notification(
     )
 
     resumed = ConversationStore(tmp_path, session_id="parent")
-    AgentLoop(BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
 
     notification = resumed.agent_notifications()[0]
     assert notification.data["status"] == "completed"
@@ -3104,7 +3158,8 @@ def test_resume_keeps_completed_unnotified_background_notification(
     )
 
 
-def test_resume_recovers_killed_task_provenance_from_terminal_lifecycle(
+@pytest.mark.asyncio
+async def test_resume_recovers_killed_task_provenance_from_terminal_lifecycle(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="parent")
@@ -3128,7 +3183,8 @@ def test_resume_recovers_killed_task_provenance_from_terminal_lifecycle(
     )
 
     resumed = ConversationStore(tmp_path, session_id="parent")
-    AgentLoop(BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
     notification = resumed.agent_notifications()[0]
     assert notification.data["killed_task_ids"] == ["task-a"]
     assert notification.data["killed_task_count"] == 100
@@ -3190,7 +3246,8 @@ async def test_resume_drops_corrupt_lifecycle_killed_task_metadata(
     store.close()
 
 
-def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> None:
     root = ConversationStore(tmp_path, session_id="root")
     child = ConversationStore(root.session_dir / "agents", session_id="1")
     grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
@@ -3208,7 +3265,8 @@ def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> None:
     )
 
     resumed = ConversationStore(tmp_path, session_id="root")
-    AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
 
     notification = resumed.agent_notifications()[0]
     assert notification.data["status"] == "canceled"
@@ -3222,7 +3280,8 @@ def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> None:
     }
 
 
-def test_resume_keeps_same_id_adopted_background_grandchildren_separate(
+@pytest.mark.asyncio
+async def test_resume_keeps_same_id_adopted_background_grandchildren_separate(
     tmp_path: Path,
 ) -> None:
     root = ConversationStore(tmp_path, session_id="root")
@@ -3249,7 +3308,8 @@ def test_resume_keeps_same_id_adopted_background_grandchildren_separate(
     assert set(root.agent_children()) == {"root:2:1"}
 
     resumed = ConversationStore(tmp_path, session_id="root")
-    AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
 
     notifications = resumed.agent_notifications(pending_only=False)
     assert [entry.data["child_instance_id"] for entry in notifications] == ["root:2:1"]
@@ -4655,7 +4715,8 @@ async def test_abort_propagates_through_two_nested_levels(tmp_path: Path) -> Non
     await loop.close()
 
 
-def test_resume_cancels_nested_tree_markers(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_resume_cancels_nested_tree_markers(tmp_path: Path) -> None:
     root = ConversationStore(tmp_path, session_id="root")
     child = ConversationStore(root.session_dir / "agents", session_id="1")
     grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
@@ -4676,7 +4737,8 @@ def test_resume_cancels_nested_tree_markers(tmp_path: Path) -> None:
     )
 
     resumed = ConversationStore(tmp_path, session_id="root")
-    AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
 
     assert not resumed.agent_children()
     assert ConversationStore(
@@ -4693,7 +4755,8 @@ def test_resume_cancels_nested_tree_markers(tmp_path: Path) -> None:
     }
 
 
-def test_resume_cancels_gated_nested_tree_without_duplicate_notifications(
+@pytest.mark.asyncio
+async def test_resume_cancels_gated_nested_tree_without_duplicate_notifications(
     tmp_path: Path,
 ) -> None:
     root = ConversationStore(tmp_path, session_id="root")
@@ -4733,14 +4796,19 @@ def test_resume_cancels_gated_nested_tree_without_duplicate_notifications(
     )
 
     resumed = ConversationStore(tmp_path, session_id="root")
-    AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
 
     assert resumed.agent_notifications()[0].data["status"] == "canceled"
     resumed_child = ConversationStore(resumed.session_dir / "agents", session_id="1")
     resumed_grandchild = ConversationStore(
         resumed_child.session_dir / "agents", session_id="1"
     )
-    assert resumed_child.agent_notifications()[0].data["status"] == "canceled"
+    assert resumed_child.agent_notifications() == []
+    assert {
+        entry.data["child_instance_id"]
+        for entry in resumed.agent_notifications(pending_only=False)
+    } == {"root:1", "root:1:1"}
     assert not resumed.agent_children()
     assert not resumed_child.agent_children()
     assert resumed_grandchild.agent_canceled() == {
@@ -4753,7 +4821,8 @@ def test_resume_cancels_gated_nested_tree_without_duplicate_notifications(
         resumed_child.agent_notifications(pending_only=False)
     )
     restarted = ConversationStore(tmp_path, session_id="root")
-    AgentLoop(FakeBackend([]), restarted, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(FakeBackend([]), restarted, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
     restarted_child = ConversationStore(restarted.session_dir / "agents", session_id="1")
     assert len(restarted.agent_notifications(pending_only=False)) == root_notification_count
     assert (
@@ -5452,7 +5521,8 @@ async def test_setup_failure_persists_canonical_terminal_receipt(
     assert result.content.endswith("error=true · canceled=false")
 
 
-def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="parent")
     call = _agent_call()
     child = ConversationStore(
@@ -5467,7 +5537,8 @@ def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
         turns_used=2,
     )
 
-    AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -5482,7 +5553,8 @@ def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
     assert '"agent_parent"' not in (child.state_path).read_text()
 
 
-def test_resume_preserves_typed_child_receipt(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_resume_preserves_typed_child_receipt(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="parent")
     call = _agent_call(agent_type="explore")
     child = ConversationStore(
@@ -5498,7 +5570,8 @@ def test_resume_preserves_typed_child_receipt(tmp_path: Path) -> None:
         turns_used=2,
     )
 
-    AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -5914,7 +5987,19 @@ async def test_background_start_text_names_handle_and_polling_tools(
     assert f"handle={handle}" in result.content
     assert "agent_status" in result.content
     assert "agent_output" in result.content
-    assert "Completion is announced automatically" in result.content
+    assert (
+        "Completion is announced automatically: while you run, after your "
+        "current tool call and before your next model call; while you are "
+        "idle, at your next turn."
+    ) in result.content
+    assert "turn boundary" not in result.content
+    agent_description = loop.tool_registry.definitions_by_name["agent"].description
+    assert (
+        "Background completion is announced automatically: while you run, "
+        "after your current tool call and before your next model call; while "
+        "you are idle, at your next turn. Do not poll."
+    ) in agent_description
+    assert "turn boundary" not in agent_description
     assert "poll with" not in result.content
     assert "task_output" not in result.content
     assert result.content.startswith("background agent started:")
@@ -6366,9 +6451,6 @@ async def test_pending_store_lock_rejects_event_loop_thread(tmp_path: Path) -> N
         lambda: store.pending_prompt_queue.append("another"),
         store.pending_prompt_queue.pending,
         lambda: store.pending_prompt_queue.acknowledge(prompt.id),
-        lambda: store.pending_prompt_queue.acknowledge_messages(
-            [], prompt_ids=(prompt.id,)
-        ),
         store.pending_prompt_queue.close_if_empty,
         store.pending_prompt_queue.close,
         lambda: store.pending_prompt_queue.accept_explicit_finish(report),
@@ -6383,8 +6465,803 @@ async def test_pending_store_lock_rejects_event_loop_thread(tmp_path: Path) -> N
             operation()
 
 
+def _task_exit_input(task_id: str) -> pending_delivery_module.NotificationInput:
+    return pending_delivery_module.NotificationInput(
+        "task_exit",
+        {
+            "task_id": task_id,
+            "headline": f"command {task_id}",
+            "exit_code": 0,
+            "output_tail": "done",
+            "background_owner": "run_background",
+            "background_phase": "natural_exit",
+        },
+        dedupe_key=task_id,
+    )
+
+
 @pytest.mark.asyncio
-async def test_send_racing_turn_boundary_close_is_never_stranded(
+async def test_agent_send_reaches_running_child_at_next_step_boundary(
+    tmp_path: Path,
+) -> None:
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+
+    async def wait_tool(arguments: dict[str, object]) -> str:
+        del arguments
+        tool_started.set()
+        await release_tool.wait()
+        return "tool complete"
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("wait-1", "wait", {})]),
+            ScriptedTurn([TextContent("handled")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.register("wait", wait_tool)
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=2,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    turn = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    await asyncio.wait_for(tool_started.wait(), timeout=2)
+    await loop.step_delivery.produce(
+        pending_delivery_module.PromptInput(
+            "next step", MessageOrigin.AGENT_SEND, None
+        )
+    )
+    release_tool.set()
+    await asyncio.wait_for(turn, timeout=2)
+
+    second_request = backend.calls[1][0]
+    tool_result_index = next(
+        index
+        for index, message in enumerate(second_request)
+        if message.role is MessageRole.TOOL_RESULT
+    )
+    prompt_index = next(
+        index
+        for index, message in enumerate(second_request)
+        if message.metadata.get("zeta.pending_prompt_id") is not None
+    )
+    assert tool_result_index < prompt_index
+    assert second_request[prompt_index].content == [TextContent("next step")]
+    assert await asyncio.to_thread(store.pending_prompts) == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_two_agent_sends_before_step_deliver_fifo_on_consecutive_requests(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    for text in ("first", "second"):
+        await flow.produce(
+            pending_delivery_module.PromptInput(
+                text, MessageOrigin.AGENT_SEND, None
+            )
+        )
+
+    first = await flow.prepare_request("terminal_fallback", [], None)
+    assert first.messages[-1].content == [TextContent("first")]
+    assert flow.has_prompt_edge
+    await flow.acknowledge_active()
+    second = await flow.prepare_request("terminal_fallback", [], None)
+    assert second.messages[-1].content == [TextContent("second")]
+    await flow.acknowledge_active()
+
+    assert first.prompt_id != second.prompt_id
+    assert await asyncio.to_thread(store.pending_prompts) == []
+
+
+@pytest.mark.asyncio
+async def test_agent_send_racing_wake_clear_remains_armed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_stage = ConversationStore._stage_delivery_request
+    for producer_first in (True, False):
+        store = ConversationStore(tmp_path / str(producer_first))
+        flow = pending_delivery_module.StepDeliveryFlow(store)
+        await flow.prepare_request("terminal_fallback", [], None)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def gated_stage(
+            target: ConversationStore,
+            *args,
+            _store_dir: Path = store.session_dir,
+            _entered: threading.Event = entered,
+            _producer_first: bool = producer_first,
+            _release: threading.Event = release,
+        ):
+            if target.session_dir == _store_dir:
+                _entered.set()
+                if _producer_first:
+                    assert _release.wait(2)
+                    return original_stage(target, *args)
+                staged = original_stage(target, *args)
+                assert _release.wait(2)
+                return staged
+            return original_stage(target, *args)
+
+        gated_stage.__name__ = "_stage_delivery_request"
+        monkeypatch.setattr(
+            ConversationStore, "_stage_delivery_request", gated_stage
+        )
+        if producer_first:
+            await flow.produce(
+                pending_delivery_module.PromptInput(
+                    "racing", MessageOrigin.AGENT_SEND, None
+                )
+            )
+            release.set()
+            prepared = await flow.prepare_request("terminal_fallback", [], None)
+        else:
+            prepare = asyncio.create_task(
+                flow.prepare_request("terminal_fallback", [], None)
+            )
+            assert await asyncio.to_thread(entered.wait, 2)
+            produce = asyncio.create_task(
+                flow.produce(
+                    pending_delivery_module.PromptInput(
+                        "racing", MessageOrigin.AGENT_SEND, None
+                    )
+                )
+            )
+            release.set()
+            prepared = await asyncio.wait_for(prepare, timeout=2)
+            await produce
+        if prepared.prompt_id is None:
+            assert flow.has_prompt_edge
+            prepared = await flow.prepare_request("terminal_fallback", [], None)
+        assert prepared.messages[-1].content == [TextContent("racing")]
+        await flow.acknowledge_active()
+        assert await asyncio.to_thread(store.pending_prompts) == []
+        monkeypatch.setattr(
+            ConversationStore, "_stage_delivery_request", original_stage
+        )
+
+
+def _write_large_linear_store(store: ConversationStore, row_count: int) -> None:
+    message = Message(MessageRole.ASSISTANT, [TextContent("old")]).to_dict()
+    store.append_message(Message.from_dict(message))
+    rows = store.path.read_text(encoding="utf-8").splitlines(keepends=True)
+    parent_id = json.loads(rows[-1])["id"]
+    for seq in range(2, row_count + 1):
+        entry_id = f"entry-{seq}"
+        rows.append(
+            json.dumps(
+                ConversationEntry(
+                    seq=seq,
+                    id=entry_id,
+                    parent_id=parent_id,
+                    lane="main",
+                    type="message",
+                    data={"message": message},
+                ).to_dict()
+            )
+            + "\n"
+        )
+        parent_id = entry_id
+    store.close()
+    store.path.write_text("".join(rows), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("foreign_change", ["branch", "replacement"])
+async def test_step_delivery_never_reads_log_on_loop_after_foreign_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    foreign_change: str,
+) -> None:
+    initial = ConversationStore(
+        tmp_path, session_id=f"step-publish-{foreign_change}"
+    )
+    session_id = initial.session_id
+    _write_large_linear_store(initial, 50_000)
+    store = ConversationStore(tmp_path, session_id=session_id, _must_exist=True)
+    checkpoint = store.append_checkpoint("base")
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("discarded")]))
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    await flow.initialize()
+
+    if foreign_change == "branch":
+        foreign = ConversationStore(tmp_path, session_id=store.session_id)
+        foreign.append_fork(str(checkpoint.seq))
+        foreign.close()
+    else:
+        replacement = store.path.with_suffix(".replacement")
+        replacement.write_bytes(store.path.read_bytes())
+        replacement.replace(store.path)
+
+    owner_thread = threading.get_ident()
+    owner_calls: list[str] = []
+
+    def observe(name: str, function):
+        def observed(candidate, *args, **kwargs):
+            if threading.get_ident() == owner_thread:
+                owner_calls.append(name)
+            return function(candidate, *args, **kwargs)
+
+        return observed
+
+    monkeypatch.setattr(
+        ConversationStore, "_load", observe("_load", ConversationStore._load)
+    )
+    monkeypatch.setattr(
+        ConversationStore,
+        "_load_full",
+        observe("_load_full", ConversationStore._load_full),
+    )
+    monkeypatch.setattr(
+        ConversationStore,
+        "_read_fd",
+        staticmethod(observe("_read_fd", ConversationStore._read_fd)),
+    )
+    original_open_session_file = store_log_module.open_session_file
+
+    def observed_open_session_file(*args, **kwargs):
+        if threading.get_ident() == owner_thread:
+            owner_calls.append("open_session_file")
+        return original_open_session_file(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_log_module, "open_session_file", observed_open_session_file
+    )
+
+    await flow.produce(
+        pending_delivery_module.PromptInput(
+            "follow up", MessageOrigin.AGENT_SEND, None
+        )
+    )
+    notification = pending_delivery_module.NotificationInput(
+        "task_exit",
+        {
+            "task_id": "task-1",
+            "headline": "command task-1",
+            "exit_code": 0,
+            "output_tail": "done",
+            "background_owner": "run_background",
+            "background_phase": "natural_exit",
+        },
+        dedupe_key="task-1",
+    )
+    await flow.produce(notification)
+    prepared = await flow.prepare_request("terminal_fallback", [], None)
+    assert prepared.prompt_id is not None
+    assert prepared.notification_ids
+    await flow.acknowledge_active()
+    await flow.admit_terminal("segment_end")
+
+    assert owner_calls == []
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+    assert store.entries == fresh.entries
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("foreign_change", ["branch", "replacement"])
+async def test_agent_send_rewarms_50k_writer_before_commit_deadline(
+    tmp_path: Path,
+    foreign_change: str,
+) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    child = ConversationStore(tmp_path / "child", session_id="1")
+    _write_large_linear_store(child, 50_000)
+    child = ConversationStore(
+        tmp_path / "child", session_id="1", _must_exist=True
+    )
+    checkpoint = child.append_checkpoint("base")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("discarded")]))
+    handle = "parent:1"
+    parent.register_agent_child(
+        _run_agent_call(),
+        child_session_path=str(child.session_dir),
+        description="run",
+        agent_type="run",
+        background=True,
+        child_instance_id=handle,
+        accepts_follow_ups=True,
+    )
+    owner = BackgroundAgentOwner(parent)
+    flow = pending_delivery_module.StepDeliveryFlow(child)
+    owner.conversation_channel.register_delivery_flow(handle, flow)
+    await flow.initialize()
+
+    if foreign_change == "branch":
+        foreign = ConversationStore(
+            child.root_dir, session_id=child.session_id, _must_exist=True
+        )
+        foreign.append_fork(str(checkpoint.seq))
+        foreign.close()
+    else:
+        replacement = child.path.with_suffix(".replacement")
+        replacement.write_bytes(child.path.read_bytes())
+        replacement.replace(child.path)
+
+    assert await pending_delivery_module.send_to_run(
+        parent,
+        handle,
+        "follow up",
+        channel=owner.conversation_channel,
+    ) is None
+    fresh = ConversationStore(
+        child.root_dir, session_id=child.session_id, _must_exist=True
+    )
+    assert [
+        entry.data["text"]
+        for entry in await asyncio.to_thread(fresh.pending_prompts)
+    ] == ["follow up"]
+    await owner.conversation_channel.unregister_delivery_flow(handle)
+    await asyncio.to_thread(fresh.close)
+    await asyncio.to_thread(child.close)
+    await asyncio.to_thread(parent.close)
+
+
+@pytest.mark.asyncio
+async def test_step_delivery_writer_handles_50k_rows_within_send_deadline(
+    tmp_path: Path,
+) -> None:
+    initial = ConversationStore(tmp_path)
+    session_id = initial.session_id
+    _write_large_linear_store(initial, 50_000)
+    store = ConversationStore(tmp_path, session_id=session_id, _must_exist=True)
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    await flow.prepare_request("terminal_fallback", [], None)
+
+    timings: dict[str, float] = {}
+
+    async def timed(name: str, operation):
+        started = asyncio.get_running_loop().time()
+        result = await operation
+        timings[name] = asyncio.get_running_loop().time() - started
+        return result
+
+    first = await timed(
+        "prompt",
+        flow.produce(
+            pending_delivery_module.PromptInput(
+                "first", MessageOrigin.AGENT_SEND, asyncio.get_running_loop().time() + 1
+            )
+        ),
+    )
+    await timed("notification", flow.produce(_task_exit_input("large-store")))
+    staged = await timed(
+        "stage", flow.prepare_request("terminal_fallback", [], None)
+    )
+    assert staged.prompt_id == first.entries[0].id
+    await timed("acknowledge", flow.acknowledge_active())
+    await timed(
+        "second_prompt",
+        flow.produce(
+            pending_delivery_module.PromptInput(
+                "second", MessageOrigin.AGENT_SEND, asyncio.get_running_loop().time() + 1
+            )
+        ),
+    )
+
+    assert max(timings.values()) < 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_step_delivery_indexes_remain_pending_only_after_acknowledgements(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+
+    for index in range(100):
+        await flow.produce(
+            pending_delivery_module.PromptInput(
+                f"prompt-{index}", MessageOrigin.AGENT_SEND, None
+            )
+        )
+        await flow.produce(_task_exit_input(f"task-{index}"))
+        await flow.prepare_request("terminal_fallback", [], None)
+        await flow.acknowledge_active()
+        assert len(store._active_notifications) == 0
+        assert len(store._active_pending_prompt_entries) == 0
+        assert len(store._active_pending_prompt_messages) == 0
+
+    session_id = store.session_id
+    await asyncio.to_thread(store.close)
+    reopened = ConversationStore(tmp_path, session_id=session_id, _must_exist=True)
+    assert len(reopened._active_notifications) == 0
+    assert len(reopened._active_pending_prompt_entries) == 0
+    flow = pending_delivery_module.StepDeliveryFlow(reopened)
+    started = asyncio.get_running_loop().time()
+    for _ in range(25):
+        await flow.prepare_request("terminal_fallback", [], None)
+    assert asyncio.get_running_loop().time() - started < 0.5
+    await asyncio.to_thread(reopened.close)
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_preserves_next_prompt_wake(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    await flow.produce(
+        pending_delivery_module.PromptInput("first", MessageOrigin.AGENT_SEND, None)
+    )
+    first = await flow.prepare_request("terminal_fallback", [], None)
+    await flow.produce(
+        pending_delivery_module.PromptInput("second", MessageOrigin.AGENT_SEND, None)
+    )
+
+    retry = await flow.prepare_request("retry", [], None)
+    assert retry.prompt_id == first.prompt_id
+    assert retry.messages[-1].content == [TextContent("first")]
+    assert flow.has_prompt_edge
+    await flow.acknowledge_active()
+    following = await flow.prepare_request("terminal_fallback", [], None)
+    assert following.prompt_id != first.prompt_id
+    assert following.messages[-1].content == [TextContent("second")]
+    await flow.acknowledge_active()
+
+
+@pytest.mark.asyncio
+async def test_root_delivery_committed_after_terminal_check_rearms_idle_wake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    flow = await loop._ensure_step_delivery()
+    woke = asyncio.Event()
+    original_schedule = loop._schedule_transcript_index
+    producer: asyncio.Task[pending_delivery_module.ProducerResult] | None = None
+
+    def schedule_and_produce() -> None:
+        nonlocal producer
+        original_schedule()
+        if producer is None:
+            producer = asyncio.create_task(
+                flow.produce(_task_exit_input("terminal-race"))
+            )
+
+    monkeypatch.setattr(loop, "_schedule_transcript_index", schedule_and_produce)
+    loop.set_background_wake_callback(woke.set)
+    events: list[StreamEvent] = []
+    async for event in loop.run_turn("start", origin=MessageOrigin.USER):
+        events.append(event)
+        if event.type is StreamEventType.AGENT_END:
+            assert producer is not None
+            notification = await producer
+            assert notification.changed
+            assert not woke.is_set()
+
+    assert events[-1].type is StreamEventType.AGENT_END
+    await asyncio.wait_for(woke.wait(), 1)
+    assert [entry.id for entry in store.agent_notifications()] == [
+        notification.entries[0].id
+    ]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_succeeds", [True, False])
+async def test_provider_error_does_not_ack_staged_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_succeeds: bool,
+) -> None:
+    class ErrorThenAnswerBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            self.calls.append(list(messages))
+            if len(self.calls) == 1 or not retry_succeeds:
+                yield StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo("server_error", "retryable failure"),
+                    delta="",
+                )
+                return
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+            )
+
+    async def retry_now(*_args, **_kwargs) -> bool:
+        return retry_succeeds or len(backend.calls) < 2
+
+    backend = ErrorThenAnswerBackend()
+    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    first = await loop.step_delivery.produce(
+        pending_delivery_module.PromptInput("first", MessageOrigin.AGENT_SEND, None)
+    )
+    second = await loop.step_delivery.produce(
+        pending_delivery_module.PromptInput("second", MessageOrigin.AGENT_SEND, None)
+    )
+
+    events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    assert len(backend.calls) == (3 if retry_succeeds else 2)
+    request_prompt_ids = [
+        [
+            message.metadata["zeta.pending_prompt_id"]
+            for message in request
+            if message.metadata.get("zeta.pending_prompt_id") is not None
+        ]
+        for request in backend.calls
+    ]
+    assert request_prompt_ids[0][-1] == first.entries[0].id
+    assert request_prompt_ids[1][-1] == first.entries[0].id
+    delivered = [
+        event
+        for event in events
+        if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED
+    ]
+    pending = await asyncio.to_thread(store.pending_prompts)
+    if retry_succeeds:
+        assert request_prompt_ids[2][-1] == second.entries[0].id
+        assert len(delivered) == 2
+        assert pending == []
+    else:
+        assert delivered == []
+        assert [entry.id for entry in pending] == [
+            first.entries[0].id,
+            second.entries[0].id,
+        ]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_error_root_exit_admits_terminal_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ErrorBackend(CompletionBackend):
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            yield StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo("http_error", "unauthorized", status_code=401),
+            )
+
+    store = ConversationStore(tmp_path)
+    backend = ErrorBackend()
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    flow = await loop._ensure_step_delivery()
+    original_admit = flow.admit_terminal
+    admitted = asyncio.Event()
+
+    async def admit_with_producer(intent):
+        if intent == "foreground_end":
+            await flow.produce(_task_exit_input("provider-error-terminal"))
+            admitted.set()
+        return await original_admit(intent)
+
+    monkeypatch.setattr(flow, "admit_terminal", admit_with_producer)
+    events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    assert events[-1].type is StreamEventType.AGENT_END
+    assert admitted.is_set()
+    assert flow.has_pending_edge
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_event_acks_exact_staged_ids_before_publication(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    prompt = await flow.produce(
+        pending_delivery_module.PromptInput("follow up", MessageOrigin.AGENT_SEND, None)
+    )
+    notification = await flow.produce(_task_exit_input("task-atomic"))
+    prepared = await flow.prepare_request("terminal_fallback", [], None)
+    assert prepared.prompt_id == prompt.entries[0].id
+    assert prepared.notification_ids == (notification.entries[0].id,)
+    publication_checked = False
+
+    async def provider():
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+        )
+
+    def publications(value: object):
+        nonlocal publication_checked
+        assert isinstance(value, pending_delivery_module.DeliveryPublications)
+        assert asyncio.get_running_loop() is loop
+        assert prompt.entries[0].id not in store._active_pending_prompt_entries
+        assert notification.entries[0].id not in store._active_notifications
+        assert value.delivered_prompt is not None
+        assert [entry.id for entry in value.notifications] == [
+            notification.entries[0].id
+        ]
+        publication_checked = True
+        return iter((StreamEvent(StreamEventType.CHILD_MESSAGE_DELIVERED),))
+
+    loop = asyncio.get_running_loop()
+    events = await _collect(
+        observed_completion(
+            provider(), store, None, flow.acknowledge_active, publications
+        )
+    )
+    assert publication_checked
+    assert events[0].type is StreamEventType.CHILD_MESSAGE_DELIVERED
+    assert events[1].type is StreamEventType.MESSAGE_START
+
+
+@pytest.mark.asyncio
+async def test_delivery_after_commit_failure_keeps_durable_receipt(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    item = pending_delivery_module.NotificationInput(
+        "inbox",
+        {
+            "project_id": "project-a",
+            "message_ids": ["message-a"],
+            "description": "new project inbox message",
+            "status": "new",
+            "text": "new project inbox message",
+        },
+        dedupe_key="project-a",
+        after_commit=lambda: (_ for _ in ()).throw(OSError("claim failed")),
+    )
+
+    result = await flow.produce(item)
+
+    assert result.changed is False
+    assert len(result.entries) == 1
+    assert flow.has_pending_edge is False
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+    assert [entry.id for entry in reopened.agent_notifications()] == [
+        result.entries[0].id
+    ]
+    retry = await flow.produce(
+        replace(item, after_commit=lambda: True)
+    )
+    assert retry.changed is True
+    assert retry.entries[0].id == result.entries[0].id
+    assert flow.has_pending_edge
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_producer_races_step_snapshot_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_stage = ConversationStore._stage_delivery_request
+    for producer_first in (True, False):
+        store = ConversationStore(tmp_path / str(producer_first))
+        flow = pending_delivery_module.StepDeliveryFlow(store)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def gated_stage(
+            target: ConversationStore,
+            *args,
+            _store_dir: Path = store.session_dir,
+            _entered: threading.Event = entered,
+            _producer_first: bool = producer_first,
+            _release: threading.Event = release,
+        ):
+            if target.session_dir == _store_dir:
+                _entered.set()
+                if _producer_first:
+                    assert _release.wait(2)
+                    return original_stage(target, *args)
+                staged = original_stage(target, *args)
+                assert _release.wait(2)
+                return staged
+            return original_stage(target, *args)
+
+        gated_stage.__name__ = "_stage_delivery_request"
+        monkeypatch.setattr(
+            ConversationStore, "_stage_delivery_request", gated_stage
+        )
+        if producer_first:
+            await flow.produce(_task_exit_input("task-race"))
+            release.set()
+            prepared = await flow.prepare_request("terminal_fallback", [], None)
+        else:
+            prepare = asyncio.create_task(
+                flow.prepare_request("terminal_fallback", [], None)
+            )
+            assert await asyncio.to_thread(entered.wait, 2)
+            produce = asyncio.create_task(
+                flow.produce(_task_exit_input("task-race"))
+            )
+            release.set()
+            prepared = await asyncio.wait_for(prepare, timeout=2)
+            await produce
+        if not prepared.notification_ids:
+            assert flow.has_pending_edge
+            prepared = await flow.prepare_request("terminal_fallback", [], None)
+        assert len(prepared.notification_ids) == 1
+        await flow.acknowledge_active()
+        assert store.agent_notifications() == []
+        monkeypatch.setattr(
+            ConversationStore, "_stage_delivery_request", original_stage
+        )
+
+
+@pytest.mark.asyncio
+async def test_notification_producer_races_turn_end_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_admit = ConversationStore._admit_step_delivery_terminal
+    for producer_first in (True, False):
+        store = ConversationStore(tmp_path / str(producer_first))
+        flow = pending_delivery_module.StepDeliveryFlow(store)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def gated_admit(
+            target: ConversationStore,
+            intent: str,
+            *,
+            _store_dir: Path = store.session_dir,
+            _entered: threading.Event = entered,
+            _producer_first: bool = producer_first,
+            _release: threading.Event = release,
+        ):
+            if target.session_dir == _store_dir:
+                _entered.set()
+                if _producer_first:
+                    assert _release.wait(2)
+                    return original_admit(target, intent)
+                result = original_admit(target, intent)
+                assert _release.wait(2)
+                return result
+            return original_admit(target, intent)
+
+        gated_admit.__name__ = "_admit_step_delivery_terminal"
+        monkeypatch.setattr(
+            ConversationStore, "_admit_step_delivery_terminal", gated_admit
+        )
+        if producer_first:
+            await flow.produce(_task_exit_input("task-race"))
+            release.set()
+            terminal = await flow.admit_terminal("finish_gate_wait")
+        else:
+            admit = asyncio.create_task(flow.admit_terminal("finish_gate_wait"))
+            assert await asyncio.to_thread(entered.wait, 2)
+            produce = asyncio.create_task(
+                flow.produce(_task_exit_input("task-race"))
+            )
+            release.set()
+            terminal = await asyncio.wait_for(admit, timeout=2)
+            await produce
+        assert terminal.pending or flow.has_pending_edge
+        prepared = await flow.prepare_request("terminal_fallback", [], None)
+        assert len(prepared.notification_ids) == 1
+        await flow.acknowledge_active()
+        assert store.agent_notifications() == []
+        monkeypatch.setattr(
+            ConversationStore, "_admit_step_delivery_terminal", original_admit
+        )
+
+
+@pytest.mark.asyncio
+async def test_turn_boundary_close_races_agent_send_atomically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     parent = ConversationStore(tmp_path / "parent")
@@ -6403,6 +7280,9 @@ async def test_send_racing_turn_boundary_close_is_never_stranded(
             background=True,
             child_instance_id=handle,
             accepts_follow_ups=True,
+        )
+        owner.conversation_channel.register_delivery_flow(
+            handle, pending_delivery_module.StepDeliveryFlow(child)
         )
         return handle, child
 
@@ -6429,16 +7309,20 @@ async def test_send_racing_turn_boundary_close_is_never_stranded(
         )
     )
     assert await asyncio.to_thread(entered.wait, 2)
-    close = asyncio.create_task(
-        pending_delivery_module.close_pending_delivery_queue_if_empty(child)
-    )
+    flow = owner.conversation_channel._delivery_targets[handle].flow
+    close = asyncio.create_task(flow.admit_terminal("segment_end"))
     ticked = asyncio.Event()
     asyncio.get_running_loop().call_soon(ticked.set)
     await asyncio.wait_for(ticked.wait(), timeout=2)
     release.set()
     assert await asyncio.wait_for(send, timeout=2) is None
-    pending = await asyncio.wait_for(close, timeout=2)
-    assert [entry.data["text"] for entry in pending] == ["commit first"]
+    terminal = await asyncio.wait_for(close, timeout=2)
+    assert terminal.pending is True
+    assert terminal.closed_empty is False
+    assert [
+        entry.data["text"]
+        for entry in await asyncio.to_thread(child.pending_prompts)
+    ] == ["commit first"]
 
     handle, child = register_child(2)
     entered = threading.Event()
@@ -6454,9 +7338,8 @@ async def test_send_racing_turn_boundary_close_is_never_stranded(
         return original_append(store, entry_type, data, *args, **kwargs)
 
     monkeypatch.setattr(ConversationStore, "_append_row_unlocked", gate_close_append)
-    close = asyncio.create_task(
-        pending_delivery_module.close_pending_delivery_queue_if_empty(child)
-    )
+    flow = owner.conversation_channel._delivery_targets[handle].flow
+    close = asyncio.create_task(flow.admit_terminal("segment_end"))
     assert await asyncio.to_thread(entered.wait, 2)
     send = asyncio.create_task(
         pending_delivery_module.send_to_run(
@@ -6464,7 +7347,9 @@ async def test_send_racing_turn_boundary_close_is_never_stranded(
         )
     )
     release.set()
-    assert await asyncio.wait_for(close, timeout=2) == []
+    terminal = await asyncio.wait_for(close, timeout=2)
+    assert terminal.pending is False
+    assert terminal.closed_empty is True
     error = await asyncio.wait_for(send, timeout=2)
     assert error is not None and "no live run" in error
 
@@ -6492,11 +7377,10 @@ async def test_consume_run_keeps_pending_entry_when_delivery_fails(
 
     monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
 
-    child_loop = SimpleNamespace(
-        explicit_finish=False,
-        _delivering_prompt_id=None,
-        _yield_for_pending_prompt=False,
-        notification_wake=SimpleNamespace(pending_message=lambda: None),
+    child_loop = AgentLoop(
+        FakeBackend([]),
+        child_store,
+        skill_catalog=SkillCatalog.empty(),
     )
     result = await agent_runner.consume_run(
         child_loop,
@@ -6504,11 +7388,18 @@ async def test_consume_run_keeps_pending_entry_when_delivery_fails(
         child_store=child_store,
     )
     assert result["isError"] is True
-    assert call_prompts == ["initial", "follow up"]
+    assert call_prompts == ["initial", ""]
     # Ack must not have run since the follow-up delivery errored.
-    assert [entry.data["text"] for entry in await asyncio.to_thread(child_store.pending_prompts)] == [
-        "follow up"
-    ]
+    assert [
+        entry.data["text"]
+        for entry in await asyncio.to_thread(child_store.pending_prompts)
+    ] == ["follow up"]
+    terminal = await child_loop.step_delivery.admit_terminal("segment_end")
+    assert terminal.pending
+    await child_loop.step_delivery.prepare_request("terminal_fallback", [], None)
+    await child_loop.step_delivery.acknowledge_active()
+    terminal = await child_loop.step_delivery.admit_terminal("segment_end")
+    assert terminal.closed_empty
     with pytest.raises(PendingPromptsClosedError):
         await asyncio.to_thread(child_store.append_pending_prompt, "after failure")
 
@@ -6532,9 +7423,25 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
     prompts: list[str] = []
     finish_calls = 0
 
+    checked_restart = False
+
     async def fake_consume_child(child_loop, prompt, **kwargs):
-        del child_loop
-        await _ack_fake_delivery(child_store, kwargs)
+        del kwargs
+        nonlocal checked_restart
+        if prompts:
+            flow = await child_loop._ensure_step_delivery()
+            prepared = await flow.prepare_request("terminal_fallback", [], None)
+            assert prepared.prompt_id is not None
+            prompt = prepared.messages[-1].content[0].text
+            restarted = ConversationStore(tmp_path, session_id="run")
+            lifecycle = restarted.agent_lifecycle()
+            assert lifecycle is not None
+            assert lifecycle["finished_at"] is None
+            assert (await asyncio.to_thread(restarted.pending_prompts))[0].data[
+                "text"
+            ] == "follow up"
+            checked_restart = True
+            await flow.acknowledge_active()
         prompts.append(prompt)
         return {
             "content": [
@@ -6555,35 +7462,12 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
         child_store.finish_agent_lifecycle(state, final_result=text)
         return {}
 
-    original_close = run_consumer_module.close_pending_delivery_queue_if_empty
-    checked_restart = False
-
-    async def close_after_restart_check(store):
-        nonlocal checked_restart
-        if not checked_restart:
-            checked_restart = True
-            restarted = ConversationStore(tmp_path, session_id="run")
-            lifecycle = restarted.agent_lifecycle()
-            assert lifecycle is not None
-            assert lifecycle["finished_at"] is None
-            assert (await asyncio.to_thread(restarted.pending_prompts))[0].data["text"] == "follow up"
-        return await original_close(store)
-
     monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
-    monkeypatch.setattr(
-        run_consumer_module,
-        "close_pending_delivery_queue_if_empty",
-        close_after_restart_check,
-    )
 
-    child_loop = SimpleNamespace(
-        notification_wake=SimpleNamespace(
-            pending_message=lambda: None, state="idle"
-        ),
-        _background_owner=SimpleNamespace(
-            conversation_channel=SimpleNamespace(has_live_children=lambda _id: False)
-        ),
-        agent_instance_id=None,
+    child_loop = AgentLoop(
+        FakeBackend([]),
+        child_store,
+        skill_catalog=SkillCatalog.empty(),
     )
     result = await agent_runner.consume_run(
         child_loop,
@@ -6595,6 +7479,7 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
 
     assert result["isError"] is False
     assert prompts == ["initial", "follow up"]
+    assert checked_restart is True
     assert finish_calls == 1
     lifecycle = child_store.agent_lifecycle()
     assert lifecycle is not None
@@ -6625,20 +7510,24 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
 
     started = threading.Event()
     release = threading.Event()
-    original_commit = pending_delivery_module._commit_follow_up
+    original_commit = step_delivery_store_module._commit_delivery_input
 
-    def blocked_commit(*args, **kwargs):
+    def blocked_commit(store, item):
         started.set()
         release.wait(timeout=2)
-        return original_commit(*args, **kwargs)
+        return original_commit(store, item)
 
     monkeypatch.setattr(
-        pending_delivery_module, "_commit_follow_up", blocked_commit
+        step_delivery_store_module, "_commit_delivery_input", blocked_commit
     )
     registry = ToolRegistry(
         tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
     )
-    registry._agent_owner = BackgroundAgentOwner(parent_store)
+    owner = BackgroundAgentOwner(parent_store)
+    owner.conversation_channel.register_delivery_flow(
+        "parent:1", pending_delivery_module.StepDeliveryFlow(child_store)
+    )
+    registry._agent_owner = owner
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
@@ -6648,7 +7537,9 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
             )
         )
     )
-    await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=2)
+    async with asyncio.timeout(2):
+        while not started.is_set():
+            await asyncio.sleep(0)
 
     task.cancel()
     await asyncio.sleep(0)
@@ -6657,9 +7548,9 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     await asyncio.sleep(0)
     assert not task.done()
     release.set()
-    result = await task
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
-    assert result["isError"] is False
     assert [entry.data["text"] for entry in await asyncio.to_thread(child_store.pending_prompts)] == [
         "follow up"
     ]
@@ -6698,7 +7589,11 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
     registry = ToolRegistry(
         tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
     )
-    registry._agent_owner = BackgroundAgentOwner(parent_store)
+    owner = BackgroundAgentOwner(parent_store)
+    owner.conversation_channel.register_delivery_flow(
+        "parent:1", pending_delivery_module.StepDeliveryFlow(child_store)
+    )
+    registry._agent_owner = owner
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
@@ -6715,6 +7610,17 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
     result = await task
 
     assert result["isError"] is False
+    assert result["content"][0]["text"] == (
+        "queued a follow-up for parent:1; a running child receives it after its "
+        "current tool call, before its next model call; an idle child receives it "
+        "at its next turn"
+    )
+    assert registry.definitions_by_name["agent_send"].description == (
+        "Send a follow-up to an eligible child you started. A running child "
+        "receives it after its current tool call, before its next model call. An "
+        "idle child receives it at its next turn. When answering ask_parent, you "
+        "can reference its question id in the message."
+    )
     assert [entry.data["text"] for entry in await asyncio.to_thread(child_store.pending_prompts)] == [
         "follow up"
     ]
@@ -6742,7 +7648,11 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
     registry = ToolRegistry(
         tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
     )
-    registry._agent_owner = BackgroundAgentOwner(parent_store)
+    owner = BackgroundAgentOwner(parent_store)
+    delivery_flow = pending_delivery_module.StepDeliveryFlow(child_store)
+    await delivery_flow.initialize()
+    owner.conversation_channel.register_delivery_flow("parent:1", delivery_flow)
+    registry._agent_owner = owner
     lock = child_store._append_lock()
     lock.__enter__()
     try:
@@ -6757,13 +7667,17 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
         )
         await asyncio.sleep(0)
         task.cancel()
-        result = await asyncio.wait_for(task, timeout=2)
+        await asyncio.sleep(0)
+        assert not task.done()
     finally:
         lock.__exit__(None, None, None)
 
-    assert result["isError"] is True
-    assert "timed out" in result["content"][0]["text"]
-    assert await asyncio.to_thread(child_store.pending_prompts) == []
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2)
+    assert [
+        entry.data["text"]
+        for entry in await asyncio.to_thread(child_store.pending_prompts)
+    ] == ["follow up"]
 
 
 @pytest.mark.asyncio
@@ -6787,12 +7701,11 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
     child_store = ConversationStore(
         child_path.parent, session_id=child_path.name, cwd=store.cwd
     )
-    assert (
-        await pending_delivery_module.close_pending_delivery_queue_if_empty(
-            child_store
-        )
-        == []
-    )
+    terminal = await pending_delivery_module.StepDeliveryFlow(
+        child_store
+    ).admit_terminal("foreground_end")
+    assert terminal.closed_empty
+    assert terminal.pending is False
 
     error = await send_to_run(
         store,
@@ -7021,8 +7934,10 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
         "use /send <run-id> <message>; /runs lists the live ones"
     )
     assert "no live run" in await commands.slash_send("bogus-id hello")
-    assert f"queued for {handle}" in await commands.slash_send(
-        f"{handle} also check the tests"
+    assert await commands.slash_send(f"{handle} also check the tests") == (
+        f"queued for {handle}; a running child receives it after its current tool "
+        "call, before its next model call; an idle child receives it at its next "
+        "turn"
     )
 
     backend.release_child.set()
@@ -7085,8 +8000,22 @@ async def test_context_retry_of_notification_consumption_is_never_nudged(
             self.calls.append(list(messages))
             call = len(self.calls)
             if call == 1:
-                self.store.append_task_notification(
-                    task_id="task", command="work", exit_code=0
+                flow = await loop._ensure_step_delivery()
+                await flow.produce(
+                    pending_delivery_module.NotificationInput(
+                        "task_exit",
+                        {
+                            "origin": "notification",
+                            "kind": "task_exited",
+                            "task_id": "task",
+                            "headline": "work",
+                            "exit_code": 0,
+                            "output_tail": "",
+                            "background_owner": "run_background",
+                            "background_phase": "natural_exit",
+                        },
+                        dedupe_key="task",
+                    )
                 )
                 blocks = [TextContent("visible work " * 100)]
             elif call == 2:
@@ -7196,8 +8125,22 @@ async def test_notification_consumption_reply_is_never_nudged(tmp_path: Path) ->
                 for message in messages
             )
             if len(self.calls) == 1:
-                self.store.append_task_notification(
-                    task_id="task", command="work", exit_code=0
+                flow = await loop._ensure_step_delivery()
+                await flow.produce(
+                    pending_delivery_module.NotificationInput(
+                        "task_exit",
+                        {
+                            "origin": "notification",
+                            "kind": "task_exited",
+                            "task_id": "task",
+                            "headline": "work",
+                            "exit_code": 0,
+                            "output_tail": "",
+                            "background_owner": "run_background",
+                            "background_phase": "natural_exit",
+                        },
+                        dedupe_key="task",
+                    )
                 )
                 blocks = [TextContent("visible")]
             else:
@@ -7796,14 +8739,20 @@ async def test_finish_gate_turn_cap_does_not_kill_running_task(
     child_path = Path(marker["child_session_path"])
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     for index in range(3):
-        child_store.append_agent_notification(
-            f"noise-{index}",
-            child_session_path=f"/tmp/noise-{index}",
-            description="noise notification",
-            status="completed",
-            text=f"noise notification {index}",
+        await owner.conversation_channel.produce_to(
+            child_handle,
+            pending_delivery_module.NotificationInput(
+                "child_completion",
+                child_store._agent_notification_data(
+                    f"noise-{index}",
+                    child_session_path=f"/tmp/noise-{index}",
+                    description="noise notification",
+                    status="completed",
+                    text=f"noise notification {index}",
+                ),
+                dedupe_key=f"noise-{index}",
+            ),
         )
-        owner.conversation_channel.wake(child_handle)
         await asyncio.sleep(0.01)
         deadline = asyncio.get_running_loop().time() + 0.2
         while (
@@ -8102,6 +9051,7 @@ async def test_child_task_exit_does_not_wake_root(tmp_path: Path) -> None:
         max_turns=1,
         agent_depth=1,
         background_owner=root._background_owner,
+        agent_instance_id="child",
         skill_catalog=SkillCatalog.empty(),
     )
     task_id, _ = await child.tool_registry.background_tasks.start(
@@ -8133,6 +9083,7 @@ class _ChildConsumeBackend(CompletionBackend):
 
     def __init__(self, store: ConversationStore) -> None:
         self.store = store
+        self.loop: AgentLoop | None = None
         self.saw_notification = False
 
     async def complete(
@@ -8149,8 +9100,23 @@ class _ChildConsumeBackend(CompletionBackend):
             self.saw_notification = True
             blocks = [TextContent("acknowledged task exit")]
         else:
-            self.store.append_task_notification(
-                task_id="task-mid", command="sleep", exit_code=0
+            assert self.loop is not None
+            flow = await self.loop._ensure_step_delivery()
+            await flow.produce(
+                pending_delivery_module.NotificationInput(
+                    "task_exit",
+                    {
+                        "origin": "notification",
+                        "kind": "task_exited",
+                        "task_id": "task-mid",
+                        "headline": "sleep",
+                        "exit_code": 0,
+                        "output_tail": "",
+                        "background_owner": "run_background",
+                        "background_phase": "natural_exit",
+                    },
+                    dedupe_key="task-mid",
+                )
             )
             blocks = [TextContent("did work")]
         yield StreamEvent(StreamEventType.MESSAGE_START)
@@ -8180,8 +9146,10 @@ async def test_child_consumes_pending_task_notification_before_completing(
         max_turns=None,
         agent_depth=1,
         background_owner=root._background_owner,
+        agent_instance_id="child",
         skill_catalog=SkillCatalog.empty(),
     )
+    backend.loop = child
     await _collect(child.run_turn("do work", origin=MessageOrigin.USER))
     assert backend.saw_notification is True
     assert child_store.agent_notifications() == []
@@ -9432,7 +10400,21 @@ class _ExplicitFinishLoop:
         self.explicit_finish = True
         self._explicit_finish_report = None
         self._yield_for_pending_prompt = False
-        self.notification_wake = NotificationWake(registry._session_store)
+        self.step_delivery = None
+
+    async def _ensure_step_delivery(self):
+        if self.step_delivery is None:
+            self.step_delivery = pending_delivery_module.StepDeliveryFlow(
+                self.tool_registry._session_store,
+                wake_sink=lambda _source: self._background_owner.conversation_channel.wake(
+                    self.agent_instance_id
+                ),
+            )
+            self._background_owner.conversation_channel.register_delivery_flow(
+                self.agent_instance_id, self.step_delivery
+            )
+            self.step_delivery.initialize_resident_edges()
+        return self.step_delivery
 
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
@@ -9608,19 +10590,34 @@ async def test_child_finishes_during_notification_turn_that_woke_it(
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
 
     if wake_kind == "task":
-        child_store.append_task_notification(
-            task_id="task-1", command="true", exit_code=0
+        item = pending_delivery_module.NotificationInput(
+            "task_exit",
+            {
+                "origin": "notification",
+                "kind": "task_exited",
+                "task_id": "task-1",
+                "headline": "true",
+                "exit_code": 0,
+                "output_tail": "",
+                "background_owner": "run_background",
+                "background_phase": "natural_exit",
+            },
+            dedupe_key="task-1",
         )
     else:
-        child_store.append_agent_notification_if_absent(
-            f"{handle}:1",
-            child_session_path=str(child_path / "agents" / "1"),
-            description="direct child",
-            status="completed",
-            text="direct child completed",
+        item = pending_delivery_module.NotificationInput(
+            "child_completion",
+            child_store._agent_notification_data(
+                f"{handle}:1",
+                child_session_path=str(child_path / "agents" / "1"),
+                description="direct child",
+                status="completed",
+                text="direct child completed",
+            ),
+            dedupe_key=f"{handle}:1",
         )
     child_store.close()
-    loop._background_owner.conversation_channel.wake(handle)
+    await loop._background_owner.conversation_channel.produce_to(handle, item)
 
     notification = await _wait_for_notification(store, "completed")
     completions = [
@@ -9682,9 +10679,7 @@ async def _ack_fake_delivery(
 ) -> None:
     prompt_id = kwargs.get("delivering_prompt_id")
     if isinstance(prompt_id, str):
-        await store.acknowledge_pending_prompt_messages(
-            [], prompt_ids=(prompt_id,)
-        )
+        await asyncio.to_thread(store.acknowledge_pending_prompt, prompt_id)
 
 
 def _reminder_loop(tmp_path: Path) -> tuple[ConversationStore, ToolRegistry, _ExplicitFinishLoop]:
@@ -9711,14 +10706,26 @@ async def test_real_input_wins_over_immediate_reminder(
     original = loop._terminal_transition_fence.reserve_idle_nudge
 
     async def reserve() -> bool:
-        await asyncio.to_thread(store.pending_prompt_queue.append, "real input", origin=MessageOrigin.AGENT_SEND)
-        loop._background_owner.conversation_channel.wake("root:1")
+        await loop.step_delivery.produce(
+            pending_delivery_module.PromptInput(
+                "real input",
+                MessageOrigin.AGENT_SEND,
+                asyncio.get_running_loop().time() + 5,
+            )
+        )
         return await original()
 
     loop._terminal_transition_fence.reserve_idle_nudge = reserve
 
     async def consume(_loop, prompt, **kwargs):
         await _ack_fake_delivery(store, kwargs)
+        if not prompt and loop.step_delivery.has_prompt_edge:
+            prepared = await loop.step_delivery.prepare_request(
+                "terminal_fallback", [], None
+            )
+            assert prepared.prompt_id is not None
+            prompt = prepared.messages[-1].content[0].text
+            await loop.step_delivery.acknowledge_active()
         calls.append(prompt)
         return {
             "content": [{"type": "text", "text": "reply"}],
@@ -10050,14 +11057,8 @@ async def test_explicit_finish_child_ending_with_text_gets_one_immediate_reminde
     owner.conversation_channel.register_loop("root:1")
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.bind_session_store(store)
-    loop = SimpleNamespace(
-        explicit_finish=True,
-        agent_instance_id="root:1",
-        _background_owner=owner,
-        _terminal_transition_fence=TerminalTransitionFence(store),
-        notification_wake=SimpleNamespace(pending_message=lambda: None),
-        tool_registry=registry,
-    )
+    loop = _ExplicitFinishLoop(registry, owner)
+    loop._terminal_transition_fence = TerminalTransitionFence(store)
 
     idle_waiting = asyncio.Event()
 
@@ -10126,14 +11127,9 @@ async def test_idle_child_is_running_during_wake_turn(
     owner.conversation_channel.register_loop("parent:1")
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.bind_session_store(child_store)
-    loop = SimpleNamespace(
-        explicit_finish=True,
-        agent_instance_id="parent:1",
-        _background_owner=owner,
-        _terminal_transition_fence=TerminalTransitionFence(child_store),
-        notification_wake=SimpleNamespace(pending_message=lambda: None),
-        tool_registry=registry,
-    )
+    loop = _ExplicitFinishLoop(registry, owner)
+    loop.agent_instance_id = "parent:1"
+    loop._terminal_transition_fence = TerminalTransitionFence(child_store)
     first_idle = asyncio.Event()
     wake_started = asyncio.Event()
     release_wake = asyncio.Event()
@@ -10142,6 +11138,9 @@ async def test_idle_child_is_running_during_wake_turn(
     async def fake_consume(_loop, _prompt, **kwargs):
         nonlocal calls
         await _ack_fake_delivery(child_store, kwargs)
+        if not _prompt and loop.step_delivery.has_prompt_edge:
+            await loop.step_delivery.prepare_request("terminal_fallback", [], None)
+            await loop.step_delivery.acknowledge_active()
         calls += 1
         if calls == 2:
             wake_started.set()
@@ -10213,29 +11212,21 @@ async def test_idle_child_wakes_for_task_and_child_completion_only(
     owner.conversation_channel.register_loop("root:1")
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.bind_session_store(store)
-    pending = SimpleNamespace(
-        pending_message=lambda: (
-            store.agent_notifications()[0] if store.agent_notifications() else None
-        )
-    )
-    loop = SimpleNamespace(
-        explicit_finish=True,
-        agent_instance_id="root:1",
-        _background_owner=owner,
-        _terminal_transition_fence=TerminalTransitionFence(
-            store, notification_pending=lambda: pending.pending_message() is not None
+    loop = _ExplicitFinishLoop(registry, owner)
+    loop._terminal_transition_fence = TerminalTransitionFence(
+        store,
+        notification_pending=lambda: bool(
+            loop.step_delivery and loop.step_delivery.has_pending_edge
         ),
-        notification_wake=pending,
-        tool_registry=registry,
     )
     turns: list[MessageOrigin] = []
 
     async def fake_consume(_loop, _prompt, *, origin, **kwargs):
         await _ack_fake_delivery(store, kwargs)
+        if not _prompt and loop.step_delivery.has_pending_edge:
+            await loop.step_delivery.prepare_request("terminal_fallback", [], None)
+            await loop.step_delivery.acknowledge_active()
         turns.append(origin)
-        if kwargs.get("notification_turn"):
-            for entry in store.agent_notifications():
-                store.acknowledge_agent_notification(entry.id)
         if len(turns) < 4:
             kwargs["finish_lifecycle"]("idle", "WAIT")
             return {
@@ -10262,22 +11253,47 @@ async def test_idle_child_wakes_for_task_and_child_completion_only(
     await asyncio.sleep(0.02)
     # Reads and unrelated notices do not call wake, so they cannot start a turn.
     assert len(turns) == 1
-    await asyncio.to_thread(store.append_pending_prompt, "follow up")
-    owner.conversation_channel.wake("root:1")
-    await asyncio.sleep(0.02)
-    store.append_task_notification(
-        task_id="task-a", command="echo", exit_code=0, output_tail="done", log_path=None
+    await owner.conversation_channel.produce_to(
+        "root:1",
+        pending_delivery_module.PromptInput(
+            "follow up",
+            MessageOrigin.AGENT_SEND,
+            asyncio.get_running_loop().time() + 5,
+        ),
     )
-    owner.conversation_channel.wake("root:1")
     await asyncio.sleep(0.02)
-    store.append_agent_notification(
-        "root:1:1",
-        child_session_path=str(tmp_path / "child"),
-        description="child",
-        status="completed",
-        text="done",
+    await owner.conversation_channel.produce_to(
+        "root:1",
+        pending_delivery_module.NotificationInput(
+            "task_exit",
+            {
+                "origin": "notification",
+                "kind": "task_exited",
+                "task_id": "task-a",
+                "headline": "echo",
+                "exit_code": 0,
+                "output_tail": "done",
+                "background_owner": "run_background",
+                "background_phase": "natural_exit",
+            },
+            dedupe_key="task-a",
+        ),
     )
-    owner.conversation_channel.wake("root:1")
+    await asyncio.sleep(0.02)
+    await owner.conversation_channel.produce_to(
+        "root:1",
+        pending_delivery_module.NotificationInput(
+            "child_completion",
+            store._agent_notification_data(
+                "root:1:1",
+                child_session_path=str(tmp_path / "child"),
+                description="child",
+                status="completed",
+                text="done",
+            ),
+            dedupe_key="root:1:1",
+        ),
+    )
     await asyncio.wait_for(run, 1)
     assert len(turns) == 4
     owner.conversation_channel.unregister_loop("root:1")
@@ -10307,18 +11323,19 @@ async def _idle_nudge_run(
     registry.bind_session_store(store)
     if fence is None:
         fence = TerminalTransitionFence(store)
-    loop = SimpleNamespace(
-        explicit_finish=True,
-        agent_instance_id="root:1",
-        _background_owner=owner,
-        _terminal_transition_fence=fence,
-        notification_wake=SimpleNamespace(pending_message=lambda: None),
-        tool_registry=registry,
-    )
+    loop = _ExplicitFinishLoop(registry, owner)
+    loop._terminal_transition_fence = fence
     prompts: list[str] = []
 
     async def fake_consume(_loop, prompt, **kwargs):
         await _ack_fake_delivery(store, kwargs)
+        if not prompt and loop.step_delivery.has_prompt_edge:
+            prepared = await loop.step_delivery.prepare_request(
+                "terminal_fallback", [], None
+            )
+            assert prepared.prompt_id is not None
+            prompt = prepared.messages[-1].content[0].text
+            await loop.step_delivery.acknowledge_active()
         prompts.append(prompt)
         done = finish_after_calls is not None and len(prompts) >= finish_after_calls
         if not done:
@@ -10441,7 +11458,14 @@ async def test_idle_nudge_loses_to_prompt_committed_after_eligibility_check(
 
     async def commit_prompt() -> None:
         await eligibility_checked.wait()
-        await asyncio.to_thread(store.append_pending_prompt, "real follow-up")
+        await owner.conversation_channel.produce_to(
+            "root:1",
+            pending_delivery_module.PromptInput(
+                "real follow-up",
+                MessageOrigin.AGENT_SEND,
+                asyncio.get_running_loop().time() + 5,
+            ),
+        )
         prompt_committed.set()
 
     commit = asyncio.create_task(commit_prompt())
@@ -11051,6 +12075,33 @@ async def test_recovery_skips_ancestor_when_descendant_is_leased(
 
 
 @pytest.mark.asyncio
+async def test_recovery_refresh_never_runs_on_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    owner_thread = threading.get_ident()
+    refresh_threads: list[int] = []
+    original_load = ConversationStore._load_detached_store_state
+
+    def guarded_refresh_load(target: ConversationStore):
+        refresh_threads.append(threading.get_ident())
+        if threading.get_ident() == owner_thread:
+            raise RuntimeError("refresh load ran on event-loop thread")
+        return original_load(target)
+
+    monkeypatch.setattr(
+        ConversationStore, "_load_detached_store_state", guarded_refresh_load
+    )
+
+    await loop.activate()
+
+    assert refresh_threads
+    assert owner_thread not in refresh_threads
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_child_lease_work_never_runs_on_event_loop(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     with (
@@ -11061,7 +12112,8 @@ async def test_child_lease_work_never_runs_on_event_loop(tmp_path: Path) -> None
     store.close()
 
 
-def test_idle_child_restart_recovers_as_canceled(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_idle_child_restart_recovers_as_canceled(tmp_path: Path) -> None:
     root = ConversationStore(tmp_path, session_id="root")
     child = ConversationStore(root.session_dir / "agents", session_id="1")
     call = ToolCall(
@@ -11096,11 +12148,12 @@ def test_idle_child_restart_recovers_as_canceled(tmp_path: Path) -> None:
     root.close()
     reopened = ConversationStore(tmp_path, session_id="root")
     loop = AgentLoop(FakeBackend([]), reopened, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
     assert reopened.agent_children() == {}
     recovered = ConversationStore(reopened.session_dir / "agents", session_id="1")
     assert recovered.agent_lifecycle()["state"] == "canceled"
     recovered.close()
-    asyncio.run(loop.close())
+    await loop.close()
     reopened.close()
 
 
@@ -11501,6 +12554,12 @@ async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
     owner = BackgroundAgentOwner(parent)
     wake = asyncio.Event()
     owner.conversation_channel.set_root_wake(wake.set)
+    owner.conversation_channel.register_delivery_flow(
+        None,
+        pending_delivery_module.StepDeliveryFlow(
+            parent, wake_sink=lambda _source: owner.conversation_channel.wake(None)
+        ),
+    )
     child_task = asyncio.create_task(asyncio.Event().wait())
     owner.register(
         "root:1",
@@ -11511,7 +12570,7 @@ async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
         parent_instance_id=None,
         description="review",
     )
-    owner.conversation_channel.publish_idle(
+    await owner.conversation_channel.publish_idle(
         child_instance_id="root:1",
         child_session_path=str(child.session_dir),
         description="review",
@@ -11527,6 +12586,9 @@ async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
         accepts_follow_ups=True,
         explicit_finish=True,
     )
+    owner.conversation_channel.register_delivery_flow(
+        "root:1", pending_delivery_module.StepDeliveryFlow(child)
+    )
     assert await send_to_run(
         parent,
         "root:1",
@@ -11538,7 +12600,10 @@ async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
     await owner.wait()
 
 
-def test_idle_notification_wakes_waiting_parent_without_polling(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_idle_notification_wakes_waiting_parent_without_polling(
+    tmp_path: Path,
+) -> None:
     parent = ConversationStore(tmp_path / "parent")
     child = ConversationStore(tmp_path / "child")
     owner = BackgroundAgentOwner(parent)
@@ -11547,7 +12612,13 @@ def test_idle_notification_wakes_waiting_parent_without_polling(tmp_path: Path) 
     parent.append_child_question(
         child_instance_id="root:1", question_id="q1", question="approve?"
     )
-    owner.conversation_channel.publish_idle(
+    owner.conversation_channel.register_delivery_flow(
+        None,
+        pending_delivery_module.StepDeliveryFlow(
+            parent, wake_sink=lambda _source: owner.conversation_channel.wake(None)
+        ),
+    )
+    await owner.conversation_channel.publish_idle(
         child_instance_id="root:1",
         child_session_path=str(child.session_dir),
         description="review",
@@ -11618,8 +12689,18 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
         description="grandchild",
     )
     owner.conversation_channel.register_loop("root:1")
+    owner.conversation_channel.register_delivery_flow(
+        None, pending_delivery_module.StepDeliveryFlow(root)
+    )
+    owner.conversation_channel.register_delivery_flow(
+        "root:1",
+        pending_delivery_module.StepDeliveryFlow(
+            parent,
+            wake_sink=lambda _source: owner.conversation_channel.wake("root:1"),
+        ),
+    )
     parent_wake = asyncio.create_task(owner.conversation_channel.wait("root:1"))
-    owner.conversation_channel.publish_idle(
+    await owner.conversation_channel.publish_idle(
         child_instance_id="root:1:1",
         child_session_path=str(grandchild.session_dir),
         description="grandchild",
@@ -11702,7 +12783,7 @@ async def test_unread_follow_up_still_blocks_finish(
     assert any(
         message.tool_result is not None
         and message.tool_result.is_error
-        and "pending follow-up" in message.tool_result.content
+        and "pending notification" in message.tool_result.content
         for message in child_store.messages()
     ), [
         message.tool_result.content
@@ -11760,7 +12841,7 @@ async def test_ask_parent_answer_does_not_block_finish(
         for message in child_store.messages()
         if message.tool_result is not None
         and message.tool_result.is_error
-        and "pending follow-up" in message.tool_result.content
+        and "pending notification" in message.tool_result.content
     ]
     assert len(refusals) == 1
     assert not any(
@@ -11839,17 +12920,20 @@ async def test_offload_uses_isolated_writer_not_resident_store(
     store = ConversationStore(tmp_path, session_id="isolated-pending-reader")
     resident_id = id(store)
     seen_store_ids: list[int] = []
-    original = ConversationStore.pending_prompts
+    original = ConversationStore._stage_delivery_request
 
-    def inspect_store(candidate: ConversationStore):
+    def inspect_store(candidate: ConversationStore, *args):
         seen_store_ids.append(id(candidate))
         assert id(candidate) != resident_id
-        return original(candidate)
+        return original(candidate, *args)
 
-    inspect_store.__name__ = "pending_prompts"
-    monkeypatch.setattr(ConversationStore, "pending_prompts", inspect_store)
+    inspect_store.__name__ = "_stage_delivery_request"
+    monkeypatch.setattr(ConversationStore, "_stage_delivery_request", inspect_store)
 
-    assert await pending_delivery_module.pending_deliveries(store) == []
+    prepared = await pending_delivery_module.StepDeliveryFlow(store).prepare_request(
+        "terminal_fallback", [], None
+    )
+    assert prepared.prompt_id is None
     assert len(seen_store_ids) == 1
 
 
@@ -11965,6 +13049,9 @@ async def test_tui_child_composer_answer_closes_matching_question(
     question = parent.append_child_question(
         child_instance_id=handle, question_id="q-composer", question="approve?"
     )
+    loop._background_owner.conversation_channel.register_delivery_flow(
+        handle, pending_delivery_module.StepDeliveryFlow(child)
+    )
     commands = _RunCommands(loop)
     commands._agent_navigation = SimpleNamespace(
         child_view_active=True, child_instance_id=lambda: handle
@@ -12003,6 +13090,9 @@ async def test_slash_send_answer_closes_matching_question(tmp_path: Path) -> Non
     question = parent.append_child_question(
         child_instance_id=handle, question_id="q-slash", question="approve?"
     )
+    loop._background_owner.conversation_channel.register_delivery_flow(
+        handle, pending_delivery_module.StepDeliveryFlow(child)
+    )
     commands = _RunCommands(loop)
 
     result = commands.slash_send(f"{handle} Re q-slash: approved")
@@ -12018,7 +13108,7 @@ async def test_slash_send_answer_closes_matching_question(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_follow_up_not_acknowledged_by_retry_notice_before_provider_event(
+async def test_retry_before_provider_event_leaves_prompt_pending(
     tmp_path: Path,
 ) -> None:
     parent = ConversationStore(tmp_path / "parent")
@@ -12035,6 +13125,9 @@ async def test_follow_up_not_acknowledged_by_retry_notice_before_provider_event(
         background=True,
         child_instance_id=handle,
         accepts_follow_ups=True,
+    )
+    parent_loop._background_owner.conversation_channel.register_delivery_flow(
+        handle, pending_delivery_module.StepDeliveryFlow(child)
     )
     await _send_follow_up(parent_loop, handle, "retry follow-up")
     pending = (await asyncio.to_thread(child.pending_prompts))[0]
@@ -12178,22 +13271,36 @@ async def test_pending_task_or_child_notification_rejects_finish(
     )
     assert pending_child["isError"] is True
 
-    assert loop.notification_wake.schedule() is True
+    store.acknowledge_agent_notifications([store.agent_notifications()[0].id])
+    flow = await loop._ensure_step_delivery()
+    await flow.produce(
+        pending_delivery_module.NotificationInput(
+            "task_exit",
+            {
+                "origin": "notification",
+                "kind": "task_exited",
+                "task_id": "t2",
+                "headline": "true",
+                "exit_code": 0,
+                "output_tail": "",
+                "background_owner": "run_background",
+                "background_phase": "natural_exit",
+            },
+            dedupe_key="t2",
+        )
+    )
     reserved = await registry.execute(
         ToolCall("finish-3", "finish", {"status": "done", "summary": "done"})
     )
     assert reserved["isError"] is True
 
-    message = loop.notification_wake.begin(notification=True)
-    assert message is not None
-    loop.notification_wake.commit_persisted(message)
-    assert loop.notification_wake.pending_message() is None
-    assert loop.notification_wake.has_undelivered_claim is False
+    prepared = await flow.prepare_request("terminal_fallback", [], None)
+    assert prepared.notification_ids
+    await flow.acknowledge_active()
     delivered = await registry.execute(
         ToolCall("finish-4", "finish", {"status": "done", "summary": "done"})
     )
     assert delivered["isError"] is False, delivered
-    await loop.notification_wake.finish(success=True)
     await registry.close()
 
 
@@ -12317,7 +13424,8 @@ def test_events_after_terminal_state_emit_no_second_receipt(tmp_path: Path) -> N
     )
 
 
-def test_finish_recovery_after_durable_acceptance_publishes_report_once(
+@pytest.mark.asyncio
+async def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     tmp_path: Path,
 ) -> None:
     parent = ConversationStore(tmp_path / "parent")
@@ -12339,11 +13447,16 @@ def test_finish_recovery_after_durable_acceptance_publishes_report_once(
         agent_type="worker",
         description="review",
     )
-    child.pending_prompt_queue.accept_explicit_finish(
-        {"status": "done", "summary": "recovered", "head_sha": "abcdef0"}
+    await asyncio.to_thread(
+        child.pending_prompt_queue.accept_explicit_finish,
+        {"status": "done", "summary": "recovered", "head_sha": "abcdef0"},
     )
-    loop = SimpleNamespace(store=parent, _background_owner=BackgroundAgentOwner(parent))
-    recover_agent_children(loop)
+    owner = BackgroundAgentOwner(parent)
+    flow = pending_delivery_module.StepDeliveryFlow(parent)
+    owner.conversation_channel.register_delivery_flow(None, flow)
+    loop = SimpleNamespace(store=parent, _background_owner=owner)
+    for item in await asyncio.to_thread(recover_agent_children, loop):
+        await flow.produce(item)
     notices = [
         item
         for item in parent.agent_notifications(pending_only=False)
@@ -12351,7 +13464,8 @@ def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     ]
     assert len(notices) == 1
     assert notices[0].data["summary"] == "recovered"
-    recover_agent_children(loop)
+    for item in await asyncio.to_thread(recover_agent_children, loop):
+        await flow.produce(item)
     assert (
         len(
             [
@@ -12362,3 +13476,624 @@ def test_finish_recovery_after_durable_acceptance_publishes_report_once(
         )
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_large_request_admission_counts_off_loop_without_stalling_heartbeat(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    assembler = ContextAssembler(store, token_budget=1_000_000)
+    flow = pending_delivery_module.StepDeliveryFlow(store, context_assembler=assembler)
+    messages = [
+        Message(MessageRole.USER, [TextContent("x" * 40)]) for _ in range(50_000)
+    ]
+    owner_thread = threading.get_ident()
+    estimator_threads: list[int] = []
+    estimator_started = asyncio.Event()
+    release_estimator = threading.Event()
+    original_estimate = assembler.estimate_request
+    event_loop = asyncio.get_running_loop()
+
+    def gated_estimate(messages, tool_schemas):
+        estimator_threads.append(threading.get_ident())
+        event_loop.call_soon_threadsafe(estimator_started.set)
+        assert release_estimator.wait(2)
+        return original_estimate(messages, tool_schemas)
+
+    assembler._request_admission._estimate = gated_estimate
+    heartbeat_count = 0
+    stop = False
+
+    async def heartbeat() -> None:
+        nonlocal heartbeat_count
+        while not stop:
+            await asyncio.sleep(0.001)
+            heartbeat_count += 1
+
+    ticker = asyncio.create_task(heartbeat())
+    preparation = asyncio.create_task(flow.prepare_request("after_tools", messages, None))
+    await asyncio.wait_for(estimator_started.wait(), 1)
+    before = heartbeat_count
+    await asyncio.sleep(0.03)
+    after = heartbeat_count
+    release_estimator.set()
+    await preparation
+    stop = True
+    await ticker
+
+    assert estimator_threads
+    assert all(thread != owner_thread for thread in estimator_threads)
+    assert after > before
+
+
+@pytest.mark.asyncio
+async def test_provider_request_budget_includes_tool_schemas(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    backend = FakeBackend([ScriptedTurn([TextContent("should not run")])])
+    huge_schema = {
+        "name": "large_tool",
+        "description": "d" * 40_000,
+        "input_schema": {"type": "object", "properties": {}},
+    }
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        token_budget=8_192,
+        tool_schemas=[huge_schema],
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    events = await _collect(loop.run_turn("small request", origin=MessageOrigin.USER))
+
+    assert backend.calls == []
+    assert any(event.type is StreamEventType.ERROR for event in events)
+    await loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token_budget", [8_192, 400_000, 1_000_000])
+async def test_notification_batch_uses_whole_request_budget(
+    tmp_path: Path, token_budget: int
+) -> None:
+    store = ConversationStore(tmp_path, session_id=f"budget-{token_budget}")
+    for index in range(8):
+        message = Message(
+            MessageRole.USER if index % 2 == 0 else MessageRole.ASSISTANT,
+            [TextContent(f"history-{index} " * 2_000)],
+        )
+        store.append_message(
+            with_message_origin(message, MessageOrigin.USER)
+            if message.role is MessageRole.USER
+            else message
+        )
+    store.append_agent_notification_if_absent(
+        "root:1:1",
+        child_session_path="/child/conversation.jsonl",
+        description="budget child",
+        status="completed",
+        text="result " * 1_000,
+    )
+    await asyncio.to_thread(
+        store.pending_prompt_queue.append,
+        "p" * 15_000,
+        origin=MessageOrigin.AGENT_SEND,
+    )
+    store.queue_client_steering(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("s" * 2_000)]),
+            MessageOrigin.USER,
+        )
+    )
+    assembler = ContextAssembler(store, token_budget=token_budget, retained_tail=1)
+    flow = pending_delivery_module.StepDeliveryFlow(store, context_assembler=assembler)
+    prepared = await flow.prepare_request(
+        "after_tools", await assembler.assemble(), store.pending_client_steering()
+    )
+
+    assert assembler.estimate_messages(prepared.messages) <= (
+        assembler.estimator_token_budget
+    )
+    notification_messages = [
+        message
+        for message in prepared.messages
+        if message.metadata.get("zeta_event") == "agent_notifications"
+    ]
+    assert all(
+        len(json.dumps(message.to_dict()).encode()) <= 65_536
+        for message in notification_messages
+    )
+    if prepared.steering is not None:
+        assert prepared.messages[-1].content[0].text == "s" * 2_000
+
+
+async def _budget_delivery_flow(
+    tmp_path: Path, *, steering_chars: int, prompt_chars: int = 16_000
+) -> tuple[
+    ConversationStore,
+    ContextAssembler,
+    pending_delivery_module.StepDeliveryFlow,
+]:
+    store = ConversationStore(tmp_path)
+    await asyncio.to_thread(
+        store.pending_prompt_queue.append,
+        "p" * prompt_chars,
+        origin=MessageOrigin.AGENT_SEND,
+    )
+    store.queue_client_steering(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("s" * steering_chars)]),
+            MessageOrigin.USER,
+        )
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=8_192,
+        retained_tail=1,
+        backend=FakeBackend([ScriptedTurn([TextContent("summary")])] * 10),
+    )
+    return (
+        store,
+        assembler,
+        pending_delivery_module.StepDeliveryFlow(store, context_assembler=assembler),
+    )
+
+
+@pytest.mark.asyncio
+async def test_8k_window_max_prompt_and_max_fitting_steering_reserves_whole_suffix(
+    tmp_path: Path,
+) -> None:
+    store, assembler, flow = await _budget_delivery_flow(
+        tmp_path, steering_chars=14_000
+    )
+    prepared = await flow.prepare_request(
+        "after_tools", await assembler.assemble(), store.pending_client_steering()
+    )
+
+    assert prepared.prompt_id is not None
+    assert prepared.steering is not None
+    assert prepared.messages[-1].content[0].text == "s" * 14_000
+    assert assembler.estimate_messages(prepared.messages) <= 8_192
+
+
+@pytest.mark.asyncio
+async def test_8k_window_impossible_fixed_suffix_defers_agent_send(
+    tmp_path: Path,
+) -> None:
+    store, assembler, flow = await _budget_delivery_flow(
+        tmp_path, steering_chars=20_000
+    )
+    prepared = await flow.prepare_request(
+        "after_tools", await assembler.assemble(), store.pending_client_steering()
+    )
+
+    assert prepared.prompt_id is None
+    assert prepared.steering is not None
+    assert prepared.messages[-1].content[0].text == "s" * 20_000
+    assert flow.prompt_priority is not None
+    assert len(await asyncio.to_thread(store.pending_prompts)) == 1
+    assert assembler.estimate_messages(prepared.messages) <= 8_192
+
+
+def _user_texts(messages: Sequence[Message]) -> list[str]:
+    return [
+        block.text
+        for message in messages
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt_outcome", ["evidence", "retry", "cancellation", "failure"]
+)
+async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
+    tmp_path: Path, prompt_outcome: str
+) -> None:
+    store, assembler, _flow = await _budget_delivery_flow(
+        tmp_path, steering_chars=20_000, prompt_chars=16_000
+    )
+
+    produced_steering_ids: list[str] = []
+    dispatched_steering_ids: list[str] = []
+    admitted_requests = []
+
+    class FairnessBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+            self.prompt_attempts = 0
+            self.blocked = asyncio.Event()
+            self.priority_after_retry: str | None = None
+            self.priority_after_evidence: str | None = "not-observed"
+
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            assert admitted_requests[len(self.calls)].messages == tuple(messages)
+            assert admitted_requests[len(self.calls)].tool_schemas == tuple(tool_schemas)
+            self.calls.append(list(messages))
+            call_number = len(self.calls)
+            if call_number <= 3:
+                steering_text = f"steer-{call_number}"
+                produced_steering_ids.append(steering_text)
+                store.queue_client_steering(
+                    with_message_origin(
+                        Message(MessageRole.USER, [TextContent(steering_text)]),
+                        MessageOrigin.USER,
+                    )
+                )
+            contains_prompt = any(
+                isinstance(block, TextContent) and block.text == "p" * 16_000
+                for message in messages
+                for block in message.content
+            )
+            if contains_prompt:
+                self.prompt_attempts += 1
+                if prompt_outcome == "cancellation" and self.prompt_attempts == 1:
+                    self.blocked.set()
+                    await asyncio.Event().wait()
+                if prompt_outcome == "failure" and self.prompt_attempts == 1:
+                    yield StreamEvent(
+                        StreamEventType.ERROR,
+                        error=ErrorInfo("provider_error", "failed before evidence"),
+                    )
+                    return
+                if prompt_outcome == "retry" and self.prompt_attempts == 1:
+                    yield StreamEvent(StreamEventType.RETRY, data={"text": "retrying"})
+                    self.priority_after_retry = loop.step_delivery.prompt_priority
+            reply = Message(MessageRole.ASSISTANT, [TextContent("done")])
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            if call_number == 1:
+                assembler.update_token_budget(1_000_000)
+            if contains_prompt:
+                self.priority_after_evidence = loop.step_delivery.prompt_priority
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=reply,
+                data={"usage": {"input_tokens": 1_000, "output_tokens": 1}},
+            )
+
+    backend = FairnessBackend()
+    loop = AgentLoop(
+        backend,
+        store,
+        context_assembler=assembler,
+        max_turns=20,
+        tool_schemas=[],
+        skill_catalog=SkillCatalog.empty(),
+    )
+    dispatch_admitted_request = assembler.dispatch_admitted_request
+
+    def capture_dispatch(backend, request):
+        admitted_requests.append(request)
+        request_texts = _user_texts(request.messages)
+        steering = store.pending_client_steering()
+        if steering is not None:
+            dispatched_steering_ids.extend(
+                text
+                for text in _user_texts(steering.messages)
+                if text.startswith("steer-") and text in request_texts
+            )
+        return dispatch_admitted_request(backend, request)
+
+    assembler.dispatch_admitted_request = capture_dispatch
+
+    async def run_once(*, stop_at_evidence: bool = True) -> list[StreamEvent]:
+        events: list[StreamEvent] = []
+        stream = loop.run_turn(
+            "", origin=MessageOrigin.USER, persist_user_message=False
+        )
+        try:
+            async for event in stream:
+                events.append(event)
+                if stop_at_evidence and event.type in {
+                    StreamEventType.MESSAGE_END,
+                    StreamEventType.ERROR,
+                }:
+                    break
+        finally:
+            await stream.aclose()
+        return events
+
+    await run_once()
+    assert loop.step_delivery is not None
+    priority = loop.step_delivery.prompt_priority
+    assert priority is not None
+    assert _user_texts(backend.calls[0])[-1] == "s" * 20_000
+
+    if prompt_outcome == "cancellation":
+        task = asyncio.create_task(run_once())
+        await asyncio.wait_for(backend.blocked.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert loop.step_delivery.prompt_priority == priority
+        await run_once()
+    else:
+        await run_once()
+        if prompt_outcome == "failure":
+            assert loop.step_delivery.prompt_priority == priority
+            await run_once()
+
+    prompt_calls = [
+        messages
+        for messages in backend.calls
+        if "p" * 16_000 in _user_texts(messages)
+    ]
+    assert len(prompt_calls) == (2 if prompt_outcome in {"cancellation", "failure"} else 1)
+    assert all(
+        not any(text.startswith("steer-") for text in _user_texts(messages))
+        for messages in prompt_calls
+    )
+    if prompt_outcome == "retry":
+        assert backend.priority_after_retry == priority
+    assert backend.priority_after_evidence is None
+    assert loop.step_delivery.prompt_priority is None
+
+    for _ in range(10):
+        if not store.has_pending_client_steering:
+            break
+        await run_once(stop_at_evidence=False)
+    assert not store.has_pending_client_steering, (
+        produced_steering_ids,
+        [
+            [text for text in _user_texts(messages) if text.startswith("steer-")]
+            for messages in backend.calls
+        ],
+    )
+    assert dispatched_steering_ids == produced_steering_ids
+    assert len(dispatched_steering_ids) == len(set(dispatched_steering_ids))
+    await loop.close()
+
+
+def _context_message_near_budget(
+    assembler: ContextAssembler, *, remaining_tokens: int
+) -> Message:
+    budget = assembler.estimator_token_budget
+    low, high = 0, budget * 8
+    while low < high:
+        middle = (low + high + 1) // 2
+        message = Message(MessageRole.USER, [TextContent("k" * middle)])
+        if assembler.estimate_messages((message,)) <= budget - remaining_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    return Message(MessageRole.USER, [TextContent("k" * low)])
+
+
+def test_minimum_notification_digest_uses_real_wire_shape(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    entry = store.append_agent_notification_if_absent(
+        "c" * 80,
+        child_session_path="p" * 200,
+        description="d" * 120,
+        status="completed",
+        text="x" * 256,
+    )[0]
+    assembler = ContextAssembler(store, token_budget=8_192)
+    real_digest = _notification_message((entry,), digest=True)
+    metadata_free = Message(
+        MessageRole.SYSTEM,
+        [TextContent(real_digest.content[0].text)],
+    )
+
+    assert real_digest.metadata
+    assert assembler.estimate_messages((real_digest,)) > assembler.estimate_messages(
+        (metadata_free,)
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_budget_change_recomputes_delivery_targets(tmp_path: Path) -> None:
+    assembler = ContextAssembler(ConversationStore(tmp_path), token_budget=1_000_000)
+
+    assembler.update_token_budget(8_192)
+    assert assembler.trigger_token_budget == int(8_192 * 0.9)
+    assert assembler.delivery_notification_budget == 512
+
+    assembler.update_token_budget(1_000_000)
+    assert assembler.trigger_token_budget == int(1_000_000 * 0.9)
+    assert assembler.delivery_notification_budget == 8_192
+
+
+def _notification_digest_tokens(
+    store: ConversationStore, assembler: ContextAssembler
+) -> int:
+    digest = _notification_message(
+        store.agent_notifications(), digest=True
+    )
+    return assembler.estimate_messages((digest,))
+
+
+def _append_maximum_digest_notification(store: ConversationStore) -> None:
+    store.append_agent_notification_if_absent(
+        "c" * 80,
+        child_session_path="p" * 200,
+        description="d" * 120,
+        status="completed",
+        text="x" * 256,
+        report={
+            "status": "done",
+            "verdict": "pass",
+            "head_sha": "a" * 40,
+            "summary": "x" * 256,
+            "pr_number": 1_111_111_111,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_notification_defers_when_capacity_below_minimal_digest(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    _append_maximum_digest_notification(store)
+    assembler = ContextAssembler(store, token_budget=8_192)
+    flow = pending_delivery_module.StepDeliveryFlow(store, context_assembler=assembler)
+    minimum = _notification_digest_tokens(store, assembler)
+    context = _context_message_near_budget(assembler, remaining_tokens=minimum - 1)
+
+    deferred = await flow.prepare_request("idle_start", [context], None)
+
+    assert deferred.deferred_low_capacity is True
+    assert deferred.notification_ids == ()
+    assert len(store.agent_notifications()) == 1
+    assert not any(entry.type == "notification_ack" for entry in store.entries)
+
+    flow.release_active()
+    assembler.update_token_budget(400_000)
+    flow.capacity_changed()
+    delivered = await flow.prepare_request("after_tools", [], None)
+    assert delivered.deferred_low_capacity is False
+    assert len(delivered.notification_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_persistent_low_capacity_is_quiescent_and_finish_proceeds(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    _append_maximum_digest_notification(store)
+    assembler = ContextAssembler(store, token_budget=8_192)
+    wakes: list[str] = []
+    flow = pending_delivery_module.StepDeliveryFlow(
+        store, context_assembler=assembler, wake_sink=wakes.append
+    )
+    minimum = _notification_digest_tokens(store, assembler)
+    context = _context_message_near_budget(assembler, remaining_tokens=minimum - 1)
+    deferred = await flow.prepare_request("idle_start", [context], None)
+    assert deferred.low_capacity_notice is not None
+
+    wakes.clear()
+    for _ in range(100):
+        flow.wake("notification")
+
+    assert wakes == []
+    assert flow.has_pending_edge is False
+    assert (await flow.admit_terminal("finish")).pending is False
+    assert len(store.agent_notifications()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["agent_send", "nudge"])
+async def test_low_capacity_clears_after_compaction_on_agent_send_and_nudge(
+    tmp_path: Path, source: str
+) -> None:
+    store = ConversationStore(tmp_path)
+    _append_maximum_digest_notification(store)
+    assembler = ContextAssembler(store, token_budget=8_192)
+    flow = pending_delivery_module.StepDeliveryFlow(store, context_assembler=assembler)
+    minimum = _notification_digest_tokens(store, assembler)
+    context = _context_message_near_budget(assembler, remaining_tokens=minimum - 1)
+    assert (
+        await flow.prepare_request("idle_start", [context], None)
+    ).deferred_low_capacity
+    if source == "agent_send":
+        await flow.produce(
+            pending_delivery_module.PromptInput(
+                "continue", MessageOrigin.AGENT_SEND, None
+            )
+        )
+
+    assembler.update_token_budget(80_000)
+    flow.capacity_changed()
+    prepared = await flow.prepare_request("after_tools", [], None)
+
+    assert prepared.deferred_low_capacity is False
+    assert prepared.notification_ids
+
+
+@pytest.mark.asyncio
+async def test_thousand_completion_idle_burst_uses_one_provider_call(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    for index in range(1_000):
+        store.append_agent_notification_if_absent(
+            f"root:{index}:1",
+            child_session_path=f"/child/{index}/conversation.jsonl",
+            description=f"child {index}",
+            status="completed",
+            text="done " * 100,
+        )
+    backend = FakeBackend([ScriptedTurn([TextContent("received")])])
+    loop = AgentLoop(
+        backend,
+        store,
+        token_budget=8_192,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_notification_turn())
+
+    assert len(backend.calls) == 1
+    assert store.agent_notifications()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_low_capacity_notification_does_not_block_completion(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    _append_maximum_digest_notification(store)
+    assembler = ContextAssembler(store, token_budget=8_192)
+    flow = pending_delivery_module.StepDeliveryFlow(store, context_assembler=assembler)
+    minimum = _notification_digest_tokens(store, assembler)
+    context = _context_message_near_budget(assembler, remaining_tokens=minimum - 1)
+    assert (
+        await flow.prepare_request("terminal_fallback", [context], None)
+    ).deferred_low_capacity
+
+    admitted = await flow.admit_terminal("finish_gate_wait")
+
+    assert admitted.pending is False
+    assert len(store.agent_notifications()) == 1
+
+
+@pytest.mark.asyncio
+async def test_8k_window_prompt_alone_over_budget_keeps_priority(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    prompt = await asyncio.to_thread(
+        store.pending_prompt_queue.append,
+        "p" * 15_000,
+        origin=MessageOrigin.AGENT_SEND,
+    )
+    assembler = ContextAssembler(store, token_budget=8_192, retained_tail=1)
+    prompt_tokens = assembler.estimate_messages(
+        (Message(MessageRole.USER, [TextContent("p" * 15_000)]),)
+    )
+    target = assembler.estimator_token_budget - prompt_tokens + 1
+    low, high = 0, assembler.estimator_token_budget * 8
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = Message(MessageRole.SYSTEM, [TextContent("k" * middle)])
+        if assembler.estimate_messages((candidate,)) <= target:
+            low = middle
+        else:
+            high = middle - 1
+    assembler.system_prompt = Message(MessageRole.SYSTEM, [TextContent("k" * low)])
+    flow = pending_delivery_module.StepDeliveryFlow(store, context_assembler=assembler)
+
+    prepared = await flow.prepare_request(
+        "idle_start", await assembler.assemble(force=True, emergency=True), None
+    )
+
+    assert prepared.overflow_message is not None
+    assert prepared.overflow_message.startswith(
+        "the pending message was not sent: it does not fit in this model's context "
+        "window ("
+    )
+    assert (
+        f" of {assembler.estimator_token_budget} tokens)" in prepared.overflow_message
+    )
+    assert flow.prompt_priority == prompt.id
+    assert await asyncio.to_thread(store.pending_prompt_queue.pending) == [prompt]
+    assert flow.active_prompt_id is None
