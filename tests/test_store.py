@@ -885,6 +885,187 @@ async def test_async_publish_refreshes_after_owner_state_changes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner_change", ["bash_cwd", "todos", "agent", "lifecycle"])
+async def test_off_loop_refresh_preserves_newer_owner_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_change: str,
+) -> None:
+    store = ConversationStore(tmp_path, session_id=f"refresh-{owner_change}")
+    snapshot_ready = threading.Event()
+    release_snapshot = threading.Event()
+    original_load = ConversationStore._load_detached_store_state
+
+    def blocked_load(candidate: ConversationStore):
+        state = original_load(candidate)
+        snapshot_ready.set()
+        assert release_snapshot.wait(timeout=5)
+        return state
+
+    monkeypatch.setattr(ConversationStore, "_load_detached_store_state", blocked_load)
+    refresh = asyncio.create_task(store._refresh_off_loop())
+    assert await asyncio.to_thread(snapshot_ready.wait, 2)
+
+    if owner_change == "bash_cwd":
+        store.set_bash_cwd("/new")
+    elif owner_change == "todos":
+        store.set_todo_items([{"content": "new", "status": "pending"}])
+    elif owner_change == "agent":
+        store.mark_agent_parent("owner-parent", agent_type="worker")
+    else:
+        store.start_agent_lifecycle(
+            handle="root:1",
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=1,
+            agent_type="worker",
+            description="owner lifecycle",
+        )
+
+    release_snapshot.set()
+    await refresh
+
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+    assert store.bash_cwd == fresh.bash_cwd
+    assert store.todo_items() == fresh.todo_items()
+    assert store.todo_dismissed == fresh.todo_dismissed
+    assert store.agent_children() == fresh.agent_children()
+    assert store.agent_canceled() == fresh.agent_canceled()
+    assert store._agent_parent == fresh._agent_parent
+    assert store.agent_lifecycle() == fresh.agent_lifecycle()
+
+
+@pytest.mark.asyncio
+async def test_off_loop_refresh_is_bounded_under_owner_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="bounded-refresh")
+    original_load = ConversationStore._load_detached_store_state
+    loop = asyncio.get_running_loop()
+    loads = 0
+
+    def load_during_owner_write(candidate: ConversationStore):
+        nonlocal loads
+        loads += 1
+        if loads > 3:
+            raise AssertionError("publication retried without a bound")
+        state = original_load(candidate)
+        changed = threading.Event()
+        loop.call_soon_threadsafe(
+            lambda: (store.set_bash_cwd(f"/owner-{loads}"), changed.set())
+        )
+        assert changed.wait(timeout=2)
+        return state
+
+    monkeypatch.setattr(
+        ConversationStore, "_load_detached_store_state", load_during_owner_write
+    )
+    await asyncio.wait_for(store._refresh_off_loop(), timeout=2)
+
+    assert loads == 1
+    assert store.bash_cwd == "/owner-1"
+
+
+@pytest.mark.asyncio
+async def test_async_publication_cannot_be_starved_by_owner_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="bounded-durable-publication")
+    snapshot_ready = threading.Event()
+    release_snapshot = threading.Event()
+    original_write = ConversationStore._run_durable_write
+
+    def blocked_write(candidate: ConversationStore, *args: object):
+        outcome = original_write(candidate, *args)
+        snapshot_ready.set()
+        assert release_snapshot.wait(timeout=5)
+        return outcome
+
+    monkeypatch.setattr(ConversationStore, "_run_durable_write", blocked_write)
+    loop = asyncio.get_running_loop()
+    refreshes = 0
+
+    def load_during_owner_write(candidate: ConversationStore):
+        nonlocal refreshes
+        refreshes += 1
+        if refreshes > 3:
+            raise AssertionError("durable publication retried without a bound")
+        reader = ConversationStore(
+            candidate.root_dir,
+            session_id=candidate.session_id,
+            _must_exist=True,
+        )
+        try:
+            state = reader._detach_log_state()
+        finally:
+            reader.close()
+        changed = threading.Event()
+        loop.call_soon_threadsafe(
+            lambda: (
+                store.append_message(
+                    message(MessageRole.ASSISTANT, f"stream {refreshes}")
+                ),
+                changed.set(),
+            )
+        )
+        assert changed.wait(timeout=2)
+        return state
+
+    monkeypatch.setattr(
+        ConversationStore,
+        "_load_detached_log_state",
+        load_during_owner_write,
+        raising=False,
+    )
+    write = asyncio.create_task(
+        store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
+    )
+    assert await asyncio.to_thread(snapshot_ready.wait, 2)
+    for index in range(20):
+        store.append_message(message(MessageRole.ASSISTANT, f"owner {index}"))
+    release_snapshot.set()
+    await asyncio.wait_for(write, timeout=2)
+
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+    assert refreshes == 0
+    assert store.entries == fresh.entries
+    assert [item.content[0].text for item in store.messages()] == [
+        "worker",
+        *(f"owner {index}" for index in range(20)),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_off_loop_refresh_cancellation_is_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="cancel-refresh")
+    started = threading.Event()
+    release = threading.Event()
+    original_load = ConversationStore._load_detached_store_state
+
+    def blocked_load(candidate: ConversationStore):
+        started.set()
+        assert release.wait(timeout=5)
+        return original_load(candidate)
+
+    monkeypatch.setattr(ConversationStore, "_load_detached_store_state", blocked_load)
+    refresh = asyncio.create_task(store._refresh_off_loop())
+    assert await asyncio.to_thread(started.wait, 2)
+    refresh.cancel()
+    await asyncio.sleep(0.05)
+    try:
+        assert refresh.done()
+        with pytest.raises(asyncio.CancelledError):
+            await refresh
+    finally:
+        release.set()
+        await asyncio.gather(refresh, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_async_publish_matches_fresh_load_after_interleaved_appends(
     tmp_path: Path,
 ) -> None:
