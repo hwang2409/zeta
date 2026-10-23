@@ -672,6 +672,7 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
         if not owner._stores:
             break
         await asyncio.sleep(0.01)
+    await owner.wait_for_store_closes()
     child_store = child_stores[0]
     with pytest.raises(OSError):
         os.fstat(child_store.directory_fd)
