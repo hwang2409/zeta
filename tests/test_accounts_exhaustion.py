@@ -4,8 +4,11 @@ import asyncio
 import base64
 import inspect
 import json
+import multiprocessing
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -277,12 +280,18 @@ async def test_switch_commit_sees_concurrent_writer_converges_to_disk(
     backends = {second: second_backend, third: third_backend}
     loop = _switch_loop(first_backend)
     assert context.manager is not None
-    commit = SessionAccountContext._commit_to_disk
+    commit = SessionAccountContext._commit_and_apply
 
-    def concurrent_commit(self, *args: object, **kwargs: object):
-        external = context.manager.read_metadata(context.metadata.session_id)
-        context.manager.record_account_selection(
-            external, second, boundary=7, switched=True
+    async def concurrent_commit(self, *args: object, **kwargs: object):
+        external = await asyncio.to_thread(
+            context.manager.read_metadata, context.metadata.session_id
+        )
+        await asyncio.to_thread(
+            context.manager.record_account_selection,
+            external,
+            second,
+            boundary=7,
+            switched=True,
         )
         monkeypatch.setattr(
             context.manager,
@@ -291,9 +300,9 @@ async def test_switch_commit_sees_concurrent_writer_converges_to_disk(
                 OSError("persist failed")
             ),
         )
-        return commit(self, *args, **kwargs)
+        return await commit(self, *args, **kwargs)
 
-    monkeypatch.setattr(SessionAccountContext, "_commit_to_disk", concurrent_commit)
+    monkeypatch.setattr(SessionAccountContext, "_commit_and_apply", concurrent_commit)
     await context.switch_active(
         loop,
         third,
@@ -483,7 +492,7 @@ async def test_unknown_account_state_rederives_from_disk_on_next_turn(
 
 
 @pytest.mark.asyncio
-async def test_switch_cancel_during_commit_converges_then_reraises(
+async def test_switch_cancel_during_commit_releases_lock_and_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     context, opened, _first, second = await asyncio.to_thread(
@@ -519,10 +528,149 @@ async def test_switch_cancel_during_commit_converges_then_reraises(
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 5)
 
-    _assert_switch_state(
-        context, second, second_backend, loop, sequence=1, boundary=1
+    assert context.account_state_unknown
+    assert loop.backend is first_backend
+    persisted = await asyncio.to_thread(
+        context.manager.read_metadata,
+        context.metadata.session_id,
+        lock_timeout=0.2,
+    )
+    assert persisted.selected_accounts == {"codex": str(second)}
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_switch_cancel_during_apply_handoff_releases_lock_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, opened, _first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original_handoff = SessionAccountContext._apply_on_loop
+
+    def blocked_handoff(*args: object, **kwargs: object) -> bool:
+        entered.set()
+        assert release.wait(5)
+        return original_handoff(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        SessionAccountContext, "_apply_on_loop", staticmethod(blocked_handoff)
+    )
+    loop = _switch_loop(object())
+    task = asyncio.create_task(
+        context.switch_active(
+            loop,
+            second,
+            boundary=3,
+            provider="codex",
+            build_backend=lambda _account: object(),
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5)
+
+    assert context.account_state_unknown
+    assert context.manager is not None
+    await asyncio.to_thread(
+        context.manager.read_metadata,
+        context.metadata.session_id,
+        lock_timeout=0.2,
     )
     opened.store.close()
+
+
+def _saturated_switch_rename_race(home_value: str, results: object) -> None:
+    async def run() -> None:
+        home = Path(home_value)
+        context, opened, _first, second = await asyncio.to_thread(
+            _account_context, home
+        )
+        assert context.manager is not None
+        event_loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(max_workers=4)
+        rename_futures: list[object] = []
+        writers_ready = threading.Barrier(5)
+        writer_manager = SessionManager(context.home)
+        metadata_lock = writer_manager._metadata_lock
+
+        @contextmanager
+        def observed_metadata_lock(*args: object, **kwargs: object):
+            writers_ready.wait(timeout=2)
+            with metadata_lock(*args, **kwargs) as directory_fd:
+                yield directory_fd
+
+        writer_manager._metadata_lock = observed_metadata_lock  # type: ignore[method-assign]
+
+        def rename(index: int) -> object:
+            return writer_manager.rename(
+                context.metadata.session_id, f"rename {index}"
+            )
+
+        def queue_renames() -> None:
+            event_loop.set_default_executor(executor)
+            for index in range(8):
+                rename_futures.append(executor.submit(rename, index))
+
+        original_commit = SessionAccountContext._commit_locked
+
+        def commit_then_queue_renames(
+            self: SessionAccountContext, *args: object
+        ) -> object:
+            metadata = original_commit(self, *args)  # type: ignore[arg-type]
+            with context.manager._metadata_lock(
+                context.metadata.session_id, blocking=False
+            ) as directory_fd:
+                assert directory_fd is None
+            event_loop.call_soon_threadsafe(queue_renames)
+            writers_ready.wait(timeout=2)
+            return metadata
+
+        SessionAccountContext._commit_locked = commit_then_queue_renames  # type: ignore[method-assign]
+        try:
+            await context.switch_active(
+                _switch_loop(object()),
+                second,
+                boundary=3,
+                provider="codex",
+                build_backend=lambda _account: object(),
+            )
+            assert len(rename_futures) == 8
+            await asyncio.gather(
+                *(asyncio.wrap_future(future) for future in rename_futures),
+                return_exceptions=True,
+            )
+        finally:
+            SessionAccountContext._commit_locked = original_commit  # type: ignore[method-assign]
+            opened.store.close()
+
+    try:
+        asyncio.run(run())
+    except BaseException as exc:  # noqa: BLE001 - report child failure to parent
+        results.put(repr(exc))
+    else:
+        results.put(None)
+
+
+def test_switch_releases_lock_with_saturated_metadata_writers(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    process = context.Process(
+        target=_saturated_switch_rename_race,
+        args=(str(tmp_path / "saturated-race"), results),
+    )
+    process.start()
+    process.join(timeout=5)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1)
+        pytest.fail("account switch deadlocked with a saturated executor")
+    assert process.exitcode == 0
+    assert results.get(timeout=1) is None
 
 
 @pytest.mark.asyncio
@@ -625,6 +773,8 @@ async def test_cancel_after_commit_returns_releases_metadata_lock(
     other = SessionManager(context.home)
     reader_errors: list[BaseException] = []
     original_apply = SessionAccountContext._apply
+    switching_task = asyncio.current_task()
+    assert switching_task is not None
 
     def apply_then_cancel(
         self: SessionAccountContext, *args: object, **kwargs: object
@@ -643,9 +793,7 @@ async def test_cancel_after_commit_returns_releases_metadata_lock(
         assert not reader.is_alive()
         assert isinstance(reader_errors[0], SessionError)
         original_apply(self, *args, **kwargs)
-        task = asyncio.current_task()
-        assert task is not None
-        task.cancel()
+        switching_task.cancel()
 
     monkeypatch.setattr(SessionAccountContext, "_apply", apply_then_cancel)
     with pytest.raises(asyncio.CancelledError):
@@ -662,6 +810,7 @@ async def test_cancel_after_commit_returns_releases_metadata_lock(
         context.metadata.session_id,
         lock_timeout=0.2,
     )
+    assert context.account_state_unknown
     opened.store.close()
 
 

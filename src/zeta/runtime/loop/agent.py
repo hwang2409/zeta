@@ -115,6 +115,7 @@ from ._completion import (
     provider_prompt_tokens,
     provider_retry_notice,
     start_provider_attempt,
+    subscription_limit_failure,
     task_is_cancelling,
     wait_for_provider_retry,
 )
@@ -987,21 +988,11 @@ class AgentLoop(
                 continue
             if provider_error is not None:
                 source = provider_error_source or provider_error
-                limit_data = None
-                account_context = getattr(self, "account_context", None)
-                if account_context is not None:
-                    limit_data = await account_context.subscription_limit_event(source)
-                if limit_data is not None:
-                    local_reset = limit_data["reset_local"]
-                    provider_error = replace(
-                        provider_error,
-                        code="subscription_limit",
-                        message=(
-                            f"{limit_data['account']} reached its subscription limit; "
-                            f"resets {local_reset}"
-                        ),
-                    )
-                    yield StreamEvent(StreamEventType.ACCOUNT_LIMIT, data=limit_data)
+                provider_error, limit_event = await subscription_limit_failure(
+                    getattr(self, "account_context", None), provider_error, source
+                )
+                if limit_event is not None:
+                    yield limit_event
                 retry_usage = getattr(source, "retry_usage", None)
                 if provider_retry_usage is None and isinstance(retry_usage, Mapping):
                     provider_retry_usage = dict(retry_usage)

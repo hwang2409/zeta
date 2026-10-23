@@ -6,9 +6,8 @@ import asyncio
 import copy
 import logging
 import os
-import sys
+import threading
 from collections.abc import Callable
-from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,18 +24,6 @@ if TYPE_CHECKING:
 
 ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS = OAUTH_REFRESH_TIMEOUT_SECONDS
 logger = logging.getLogger(__name__)
-
-
-async def _shielded(operation: Any) -> Any:
-    task = asyncio.create_task(operation)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        try:
-            await task
-        except BaseException:  # noqa: BLE001, S110 - caller cancellation wins
-            pass
-        raise
 
 
 def account_provider(provider: str) -> str | None:
@@ -71,15 +58,6 @@ class _PreparedAccountState:
 @dataclass(frozen=True, slots=True)
 class _UnknownAccountState:
     build_backend: Callable[[SessionMetadata], Any]
-
-
-@dataclass(frozen=True, slots=True)
-class _LockedMetadata:
-    lock: AbstractContextManager[int | None]
-    metadata: SessionMetadata | None
-
-    def release(self) -> None:
-        self.lock.__exit__(None, None, None)
 
 
 @dataclass(slots=True)
@@ -314,9 +292,7 @@ class SessionAccountContext:
                 build_backend,
                 active_provider,
             )
-            return await _shielded(
-                self._commit_and_apply(loop, new, build_backend)
-            )
+            return await self._commit_and_apply(loop, new, build_backend)
 
     async def _commit_and_apply(
         self,
@@ -324,19 +300,18 @@ class SessionAccountContext:
         new: _PreparedAccountState,
         build_backend: Callable[[SessionMetadata], Any],
     ) -> SessionMetadata:
-        locked = await asyncio.to_thread(self._commit_to_disk, new)
-        try:
-            metadata = locked.metadata
+        def commit(directory_fd: int) -> tuple[SessionMetadata, Callable[[], None]]:
+            metadata = self._commit_locked(new, directory_fd)
             if metadata is None:
-                self._mark_unknown(build_backend)
-                return new.previous_metadata
+                return new.previous_metadata, lambda: self._mark_unknown(build_backend)
             if self._metadata_equal(metadata, new.metadata):
-                self._apply(loop, self._state_from_metadata(new, metadata))
-            elif not self._metadata_equal(metadata, new.previous_metadata):
-                self._mark_unknown(build_backend)
-            return metadata
-        finally:
-            await asyncio.shield(asyncio.to_thread(locked.release))
+                state = self._state_from_metadata(new, metadata)
+                return metadata, lambda: self._apply(loop, state)
+            if not self._metadata_equal(metadata, new.previous_metadata):
+                return metadata, lambda: self._mark_unknown(build_backend)
+            return metadata, lambda: None
+
+        return await self._run_locked_apply(build_backend, commit)
 
     def _mark_unknown(
         self, build_backend: Callable[[SessionMetadata], Any]
@@ -353,6 +328,18 @@ class SessionAccountContext:
     ) -> _PreparedAccountState:
         previous = copy.deepcopy(self.metadata)
         metadata = prepare(copy.deepcopy(previous))
+        return self._prepare_from_metadata(
+            loop, previous, metadata, build_backend, active_provider
+        )
+
+    def _prepare_from_metadata(
+        self,
+        loop: Any,
+        previous: SessionMetadata,
+        metadata: SessionMetadata,
+        build_backend: Callable[[SessionMetadata], Any],
+        active_provider: str | None,
+    ) -> _PreparedAccountState:
         backend = build_backend(metadata)
         backend_state = (
             loop.current_backend_state()
@@ -377,30 +364,107 @@ class SessionAccountContext:
             backend_state,
         )
 
-    def _commit_to_disk(self, state: _PreparedAccountState) -> _LockedMetadata:
+    def _commit_locked(
+        self, state: _PreparedAccountState, directory_fd: int
+    ) -> SessionMetadata | None:
         assert self.manager is not None
-        session_id = self.metadata.session_id
-        lock = self.manager._metadata_lock(
-            session_id, timeout=ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS
-        )
-        directory_fd = lock.__enter__()
+        session_id = state.metadata.session_id
+        current = self.manager._read(session_id, directory_fd=directory_fd)
+        if not self._metadata_equal(current, state.previous_metadata):
+            return current
         try:
-            assert directory_fd is not None
-            current = self.manager._read(session_id, directory_fd=directory_fd)
-            if not self._metadata_equal(current, state.previous_metadata):
-                return _LockedMetadata(lock, current)
+            self.manager._write_unlocked(state.metadata, directory_fd=directory_fd)
+        except BaseException as exc:  # noqa: BLE001 - authoritative reread decides
+            logger.debug("session transition write reported failure: %s", exc)
+        try:
+            return self.manager._read(session_id, directory_fd=directory_fd)
+        except BaseException:  # noqa: BLE001 - disk outcome cannot be proven
+            return None
+
+    async def _run_locked_apply(
+        self,
+        build_backend: Callable[[SessionMetadata], Any],
+        operation: Callable[[int], tuple[Any, Callable[[], None]]],
+    ) -> Any:
+        event_loop = asyncio.get_running_loop()
+        session_id = self.metadata.session_id
+        cancelled = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._locked_apply_worker,
+                event_loop,
+                session_id,
+                cancelled,
+                operation,
+            )
+        )
+        try:
+            result, applied = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled.set()
             try:
-                self.manager._write_unlocked(state.metadata, directory_fd=directory_fd)
-            except BaseException as exc:  # noqa: BLE001 - authoritative reread decides
-                logger.debug("session transition write reported failure: %s", exc)
-            try:
-                metadata = self.manager._read(session_id, directory_fd=directory_fd)
-            except BaseException:  # noqa: BLE001 - disk outcome cannot be proven
-                metadata = None
-            return _LockedMetadata(lock, metadata)
-        except BaseException:
-            lock.__exit__(*sys.exc_info())
+                await asyncio.shield(worker)
+            except BaseException:  # noqa: BLE001, S110 - caller cancellation wins
+                pass
+            self._mark_unknown(build_backend)
             raise
+        except BaseException:
+            self._mark_unknown(build_backend)
+            raise
+        if not applied:
+            self._mark_unknown(build_backend)
+        return result
+
+    def _locked_apply_worker(
+        self,
+        event_loop: asyncio.AbstractEventLoop,
+        session_id: str,
+        cancelled: threading.Event,
+        operation: Callable[[int], tuple[Any, Callable[[], None]]],
+    ) -> tuple[Any, bool]:
+        assert self.manager is not None
+        with self.manager._metadata_lock(
+            session_id, timeout=ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS
+        ) as directory_fd:
+            assert directory_fd is not None
+            result, apply = operation(directory_fd)
+            applied = self._apply_on_loop(event_loop, cancelled, apply)
+            return result, applied
+
+    @staticmethod
+    def _apply_on_loop(
+        event_loop: asyncio.AbstractEventLoop,
+        cancelled: threading.Event,
+        apply: Callable[[], None],
+    ) -> bool:
+        confirmed = threading.Event()
+        gate = threading.Lock()
+        active = True
+        error: BaseException | None = None
+        applied = False
+
+        def apply_if_active() -> None:
+            nonlocal active, applied, error
+            with gate:
+                if not active:
+                    return
+                try:
+                    if not cancelled.is_set():
+                        apply()
+                        applied = True
+                except BaseException as exc:  # noqa: BLE001 - return to worker
+                    error = exc
+                finally:
+                    active = False
+                    confirmed.set()
+
+        event_loop.call_soon_threadsafe(apply_if_active)
+        if not confirmed.wait(ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS):
+            with gate:
+                active = False
+        if error is not None:
+            raise error
+        return applied
 
     @staticmethod
     def _metadata_equal(left: SessionMetadata, right: SessionMetadata) -> bool:
@@ -441,7 +505,7 @@ class SessionAccountContext:
             recovery = self._unknown_state
             assert recovery is not None and self.manager is not None
             try:
-                await _shielded(self._recover_and_apply(loop, recovery.build_backend))
+                await self._recover_and_apply(loop, recovery.build_backend)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -452,36 +516,23 @@ class SessionAccountContext:
     async def _recover_and_apply(
         self, loop: Any, build_backend: Callable[[SessionMetadata], Any]
     ) -> None:
-        locked, state = await asyncio.to_thread(
-            self._recover_locked, loop, build_backend
-        )
-        try:
-            self._apply(loop, state)
-        finally:
-            await asyncio.shield(asyncio.to_thread(locked.release))
+        previous = copy.deepcopy(self.metadata)
 
-    def _recover_locked(
-        self, loop: Any, build_backend: Callable[[SessionMetadata], Any]
-    ) -> tuple[_LockedMetadata, _PreparedAccountState]:
-        assert self.manager is not None
-        session_id = self.metadata.session_id
-        lock = self.manager._metadata_lock(
-            session_id, timeout=ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS
-        )
-        directory_fd = lock.__enter__()
-        try:
-            assert directory_fd is not None
-            metadata = self.manager._read(session_id, directory_fd=directory_fd)
-            state = self._prepare(
-                loop,
-                lambda _current: copy.deepcopy(metadata),
-                build_backend,
-                None,
+        def recover(directory_fd: int) -> tuple[None, Callable[[], None]]:
+            assert self.manager is not None
+            metadata = self.manager._read(
+                previous.session_id, directory_fd=directory_fd
             )
-            return _LockedMetadata(lock, metadata), state
-        except BaseException:
-            lock.__exit__(*sys.exc_info())
-            raise
+
+            def apply() -> None:
+                state = self._prepare_from_metadata(
+                    loop, previous, metadata, build_backend, None
+                )
+                self._apply(loop, state)
+
+            return None, apply
+
+        await self._run_locked_apply(build_backend, recover)
 
     async def subscription_limit_event(self, failure: object) -> dict[str, object] | None:
         return await asyncio.to_thread(self._subscription_limit_event, failure)

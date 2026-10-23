@@ -6086,12 +6086,14 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
         assert server._client is not None and server.runtime.loop is not None
         first_client = server._client
         second_client = _Client(server, asyncio.StreamReader(), writer)
-        original_commit = account_session_module.SessionAccountContext._commit_to_disk
+        original_commit = account_session_module.SessionAccountContext._commit_locked
         event_loop = asyncio.get_running_loop()
         rename_tasks: list[asyncio.Task[object]] = []
 
-        def commit_then_queue_rename(self: object, state: object):
-            locked = original_commit(self, state)
+        def commit_then_queue_rename(
+            self: object, state: object, directory_fd: int
+        ):
+            metadata = original_commit(self, state, directory_fd)
 
             def start_rename() -> None:
                 rename_tasks.append(
@@ -6104,9 +6106,9 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
                 )
 
             event_loop.call_soon_threadsafe(start_rename)
-            return locked
+            return metadata
 
-        account_session_module.SessionAccountContext._commit_to_disk = (  # type: ignore[method-assign]
+        account_session_module.SessionAccountContext._commit_locked = (  # type: ignore[method-assign]
             commit_then_queue_rename
         )
         try:
@@ -6122,7 +6124,7 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
             await rename_tasks[0]
             assert server.runtime.metadata.name == "renamed during switch"
         finally:
-            account_session_module.SessionAccountContext._commit_to_disk = (  # type: ignore[method-assign]
+            account_session_module.SessionAccountContext._commit_locked = (  # type: ignore[method-assign]
                 original_commit
             )
             await first_client.close()
