@@ -84,6 +84,18 @@ class AsyncDurableWritesMixin:
                 self._durable_writes_in_flight -= 1
                 self._durable_write_condition.notify_all()
 
+    def _load_detached_log_state(self: ConversationStore) -> _DetachedLogState:
+        """Load one validated transcript snapshot without touching resident state."""
+        reader = type(self)(
+            self.root_dir,
+            session_id=self.session_id,
+            _must_exist=True,
+        )
+        try:
+            return reader._detach_log_state()
+        finally:
+            reader.close()
+
     def _load_detached_store_state(
         self: ConversationStore,
     ) -> _DetachedConversationState:
@@ -213,17 +225,18 @@ class AsyncDurableWritesMixin:
 
     async def _refresh_off_loop(self: ConversationStore) -> None:
         """Load recovery state once off-loop and publish it through one fence."""
-        loop = asyncio.get_running_loop()
-        fence = self._publication_fence()
-        state = await loop.run_in_executor(None, self._load_detached_store_state)
-        with self._durable_write_condition:
-            if self._closing or self._closed:
-                released_log = state.log
-            else:
-                released_log = self._install_store_state(state, fence)
-        cancelled = await self._release_log_state_off_loop(released_log)
-        if cancelled:
-            raise asyncio.CancelledError
+        async with self._async_write_lock:
+            loop = asyncio.get_running_loop()
+            fence = self._publication_fence()
+            state = await loop.run_in_executor(None, self._load_detached_store_state)
+            with self._durable_write_condition:
+                if self._closing or self._closed:
+                    released_log = state.log
+                else:
+                    released_log = self._install_store_state(state, fence)
+            cancelled = await self._release_log_state_off_loop(released_log)
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _to_thread_store(self: ConversationStore, function: Any, /) -> Any:
         """Run one resident-store lease operation off-loop despite cancellation."""
@@ -272,8 +285,30 @@ class AsyncDurableWritesMixin:
             worker = self._start_durable_write(method_name, args, kwargs)
             outcome, cancelled = await self._await_started_worker(worker)
             result, state, receipts = outcome
-            released_log = self._publish_log_state(state, generation, receipts)
-            cancelled |= await self._release_log_state_off_loop(released_log)
+            if self._transcript_generation == generation:
+                released_log = self._publish_log_state(state, generation, receipts)
+                cancelled |= await self._release_log_state_off_loop(released_log)
+            else:
+                reload_generation = self._transcript_generation
+                reload_worker = asyncio.get_running_loop().run_in_executor(
+                    None, self._load_detached_log_state
+                )
+                reloaded, reload_cancelled = await self._await_started_worker(
+                    reload_worker
+                )
+                cancelled |= reload_cancelled
+                with self._durable_write_condition:
+                    if self._closing or self._closed:
+                        released_reload = reloaded
+                    else:
+                        if self._transcript_generation == reload_generation:
+                            released_reload = self._install_log_state(reloaded)
+                        else:
+                            # A later owner write synchronized this completed commit.
+                            released_reload = reloaded
+                        self._accept_persisted_appends(receipts)
+                cancelled |= await self._release_log_state_off_loop(state)
+                cancelled |= await self._release_log_state_off_loop(released_reload)
             if _on_persisted is not None:
                 _on_persisted()
             if cancelled:

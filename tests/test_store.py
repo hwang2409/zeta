@@ -848,7 +848,7 @@ async def test_async_publish_stays_responsive_during_large_branch_reload(
 
 
 @pytest.mark.asyncio
-async def test_async_publish_refreshes_after_owner_state_changes(
+async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -880,8 +880,131 @@ async def test_async_publish_refreshes_after_owner_state_changes(
     await write
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
-    assert store.entries == fresh.entries
+    assert store._detach_log_state() == fresh._detach_log_state()
     assert [item.content[0].text for item in store.messages()] == ["worker", "owner"]
+
+
+@pytest.mark.asyncio
+async def test_async_publish_matches_fresh_load_when_owner_writes_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="owner-before-commit")
+    worker_ready = threading.Event()
+    release_worker = threading.Event()
+    original_write = ConversationStore._run_durable_write
+
+    def blocked_write(candidate: ConversationStore, *args: object):
+        worker_ready.set()
+        assert release_worker.wait(timeout=5)
+        return original_write(candidate, *args)
+
+    monkeypatch.setattr(ConversationStore, "_run_durable_write", blocked_write)
+    write = asyncio.create_task(
+        store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
+    )
+    assert await asyncio.to_thread(worker_ready.wait, 2)
+    store.append_message(message(MessageRole.ASSISTANT, "owner"))
+    release_worker.set()
+    await write
+
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+    assert store._detach_log_state() == fresh._detach_log_state()
+    assert [item.content[0].text for item in store.messages()] == ["owner", "worker"]
+
+
+@pytest.mark.asyncio
+async def test_async_publish_matches_fresh_load_after_each_owner_worker_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="many-owner-worker-races")
+    worker_ready = threading.Event()
+    release_worker = threading.Event()
+    original_write = ConversationStore._run_durable_write
+    block_before_commit = True
+
+    def blocked_write(candidate: ConversationStore, *args: object):
+        if block_before_commit:
+            worker_ready.set()
+            assert release_worker.wait(timeout=5)
+            return original_write(candidate, *args)
+        outcome = original_write(candidate, *args)
+        worker_ready.set()
+        assert release_worker.wait(timeout=5)
+        return outcome
+
+    monkeypatch.setattr(ConversationStore, "_run_durable_write", blocked_write)
+    for index in range(20):
+        block_before_commit = index % 2 == 0
+        worker_ready.clear()
+        release_worker.clear()
+        write = asyncio.create_task(
+            store.append_message_async(
+                message(MessageRole.ASSISTANT, f"worker {index}")
+            )
+        )
+        assert await asyncio.to_thread(worker_ready.wait, 2)
+        store.append_message(message(MessageRole.ASSISTANT, f"owner {index}"))
+        release_worker.set()
+        await write
+
+        fresh = ConversationStore(tmp_path, session_id=store.session_id)
+        assert store._detach_log_state() == fresh._detach_log_state()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_change", ["bash_cwd", "todos", "agent", "lifecycle"])
+async def test_durable_publish_preserves_newer_owner_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_change: str,
+) -> None:
+    store = ConversationStore(tmp_path, session_id=f"durable-{owner_change}")
+    commit_ready = threading.Event()
+    release_commit = threading.Event()
+    original_write = ConversationStore._run_durable_write
+
+    def blocked_write(candidate: ConversationStore, *args: object):
+        outcome = original_write(candidate, *args)
+        commit_ready.set()
+        assert release_commit.wait(timeout=5)
+        return outcome
+
+    monkeypatch.setattr(ConversationStore, "_run_durable_write", blocked_write)
+    write = asyncio.create_task(
+        store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
+    )
+    assert await asyncio.to_thread(commit_ready.wait, 2)
+
+    if owner_change == "bash_cwd":
+        store.set_bash_cwd("/new")
+    elif owner_change == "todos":
+        store.set_todo_items([{"content": "new", "status": "pending"}])
+    elif owner_change == "agent":
+        store.mark_agent_parent("owner-parent", agent_type="worker")
+    else:
+        store.start_agent_lifecycle(
+            handle="root:1",
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=1,
+            agent_type="worker",
+            description="owner lifecycle",
+        )
+
+    release_commit.set()
+    await write
+
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+    assert store._detach_log_state() == fresh._detach_log_state()
+    assert store.bash_cwd == fresh.bash_cwd
+    assert store.todo_items() == fresh.todo_items()
+    assert store.todo_dismissed == fresh.todo_dismissed
+    assert store._agent_counter == fresh._agent_counter
+    assert store.agent_children() == fresh.agent_children()
+    assert store.agent_canceled() == fresh.agent_canceled()
+    assert store._agent_parent == fresh._agent_parent
+    assert store.agent_lifecycle() == fresh.agent_lifecycle()
 
 
 @pytest.mark.asyncio
@@ -1030,11 +1153,12 @@ async def test_async_publication_cannot_be_starved_by_owner_writes(
     await asyncio.wait_for(write, timeout=2)
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
-    assert refreshes == 0
+    assert refreshes == 1
     assert store.entries == fresh.entries
     assert [item.content[0].text for item in store.messages()] == [
         "worker",
         *(f"owner {index}" for index in range(20)),
+        "stream 1",
     ]
 
 
