@@ -114,6 +114,6 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
                 )
 
     await root._to_thread_store(recover)
-    root.refresh()
+    await root._refresh_off_loop()
     if notification is not root:
-        notification.refresh()
+        await notification._refresh_off_loop()

@@ -118,6 +118,7 @@ class ConversationStore(
         self._runtime_lease: SessionRuntimeLease | None = None
         self._closed = False
         self._closing = False
+        self._transcript_generation = 0
         self._initialize_async_writes()
         if not _read_only and not _must_exist:
             with session_root(self.root_dir, create=True) as root_fd:
