@@ -51,7 +51,6 @@ from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
 from .finish_gate import FinishGateControl, FinishGateState, run_finish_gate
-from .pending_delivery import PendingDelivery
 from .presets import (
     GENERAL_PRESET,
     RUN_PRESET,
@@ -170,13 +169,6 @@ async def consume_child(
                     tool_result=event.tool_result,
                     depth=lifecycle_depth(event.tool_call),
                 )
-                if child_loop._yield_for_pending_prompt:
-                    child_loop._yield_for_pending_prompt = False
-                    final_message = Message(
-                        MessageRole.ASSISTANT,
-                        [TextContent("pending follow-up will be delivered next")],
-                    )
-                    return
             elif event.type is StreamEventType.TURN_END:
                 turns = child_turns() + 1
                 update_turns(turns)
@@ -201,24 +193,13 @@ async def consume_child(
         )
 
     try:
-        delivery = (
-            PendingDelivery.resume(
-                child_loop.store, delivering_prompt_id, prompt, origin
-            )
-            if delivering_prompt_id is not None
-            else None
-        )
         events = (
             child_loop.run_notification_turn()
             if notification_turn
             else child_loop.run_turn(
-                prompt,
+                "" if delivering_prompt_id is not None else prompt,
                 origin=origin,
-                user_message=delivery.message if delivery is not None else None,
-                persist_user_message=(
-                    delivery.persist_message if delivery is not None else True
-                ),
-                pending_delivery=delivery,
+                persist_user_message=delivering_prompt_id is None,
             )
         )
         try:
@@ -494,6 +475,7 @@ async def _build_child_loop(
             register_finish(child_registry, child_loop=child_loop)
             register_handoff(child_loop)
         loop._background_owner.conversation_channel.register_loop(child_instance_id)
+        await child_loop._ensure_step_delivery()
         if loop.plan_mode:
             child_loop.set_plan_mode(True)
         child_loop.set_background_event_sink(loop._publish_background_event)
@@ -994,7 +976,10 @@ async def run_agent_tool(
         def request_background_cancel() -> CancellationRequest:
             return request_child_cancel()
 
-        def cleanup_background_child() -> None:
+        async def cleanup_background_child() -> None:
+            await loop._background_owner.conversation_channel.unregister_delivery_flow(
+                child_instance_id
+            )
             loop._agent_child_stores.pop(tool_call.id, None)
             loop._agent_child_turns.pop(tool_call.id, None)
             loop._agent_child_types.pop(tool_call.id, None)
@@ -1013,12 +998,10 @@ async def run_agent_tool(
             return tuple(await child_loop.close(cancel_background=False))
 
         async def finish_background() -> None:
-            try:
-                await finish_background_child(
+            await finish_background_child(
                     child_task=child_task,
                     child_store=child_store,
                     parent_store=loop.store,
-                    notification_store=loop._background_owner.notification_store,
                     tool_call=tool_call,
                     child_instance_id=child_instance_id,
                     child_path=child_path,
@@ -1046,9 +1029,7 @@ async def run_agent_tool(
                     background_owner=loop._background_owner,
                     max_receipt_bytes=background_receipt_bytes,
                     explicit_finish=terminal_fence is not None,
-                )
-            finally:
-                loop.notify_background_persisted()
+            )
 
         watcher = loop._create_task(finish_background())
         loop._background_child_watchers[tool_call.id] = watcher

@@ -777,7 +777,12 @@ class _Client:
             )
         finally:
             if not started and loop.notification_turn_state == "scheduled":
-                await loop.finish_notification_turn(success=False)
+                loop.cancel_scheduled_notification_turn()
+            if (
+                outcome is TurnOutcome.FOREGROUND_CANCELED
+                and loop.notification_system_message() is not None
+            ):
+                self._schedule_background_wake(session_id)
             self.deliveries.finalize_turn(
                 session_id, state, outcome, schedule_wake=agent_end is None
             )

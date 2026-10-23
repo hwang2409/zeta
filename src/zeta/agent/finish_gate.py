@@ -252,7 +252,6 @@ async def run_finish_gate(
         tasks,
         consume_events,
         failed,
-        delivering_prompt_id,
     )
 
 
@@ -263,7 +262,6 @@ async def _run_finish_gate(
     tasks: tuple[tuple[str, str], ...],
     consume_events: ConsumeEvents,
     failed: Callable[[], bool],
-    delivering_prompt_id: str | None,
 ) -> FinishGateResult:
     async def handoff(arguments: dict[str, Any]) -> str:
         state._control().handoff = (arguments["reason"], arguments["outputs"])
@@ -287,7 +285,6 @@ async def _run_finish_gate(
             child_loop,
             consume_events,
             failed,
-            delivering_prompt_id,
         )
     finally:
         child_loop.tool_registry.unregister("agent_handoff")
@@ -298,7 +295,6 @@ async def _wait_for_finish(
     child_loop: AgentLoop,
     consume_events: ConsumeEvents,
     failed: Callable[[], bool],
-    delivering_prompt_id: str | None,
 ) -> FinishGateResult:
     while not failed():
         children = state.owned_children(child_loop)
@@ -311,7 +307,6 @@ async def _wait_for_finish(
             children,
             tasks,
             pending_notification,
-            delivering_prompt_id,
         )
         if terminal is not None:
             return terminal
@@ -335,13 +330,7 @@ async def _terminal_transition(
     children: tuple[tuple[str, str], ...],
     tasks: tuple[tuple[str, str], ...],
     pending_notification: bool,
-    delivering_prompt_id: str | None,
 ) -> FinishGateResult | None:
-    pending_prompts = await child_loop.store._to_thread_durable(
-        child_loop.store.pending_prompts
-    )
-    if any(prompt.id != delivering_prompt_id for prompt in pending_prompts):
-        return FinishGateResult("completed")
     if not children and not tasks and not pending_notification:
         return FinishGateResult("completed")
     return None

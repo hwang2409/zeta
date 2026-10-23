@@ -51,7 +51,7 @@ def register_ask_parent(
         ):
             return _error("options must contain 1 to 10 nonempty strings")
         question_id = uuid.uuid4().hex
-        channel.publish_question(
+        await channel.publish_question(
             child_instance_id=child_instance_id,
             question_id=question_id,
             question=question,

@@ -17,15 +17,16 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
     if child_loop is None:
         return
 
-    notification_wake = child_loop.notification_wake
     fence = TerminalTransitionFence(
         registry._session_store,
-        notification_pending=lambda: (
-            notification_wake.pending_message() is not None
-            or getattr(notification_wake, "has_undelivered_claim", False)
+        notification_pending=lambda: bool(
+            child_loop.step_delivery
+            and child_loop.step_delivery.has_pending_edge
         ),
-        persisted_notification_ids=lambda: getattr(
-            notification_wake, "persisted_ids", frozenset()
+        persisted_notification_ids=lambda: (
+            child_loop.step_delivery.active_notification_ids
+            if child_loop.step_delivery
+            else frozenset()
         ),
         owned_work=lambda: owned_work_descriptions(child_loop),
         delivering_prompt_id=lambda: getattr(child_loop, "_delivering_prompt_id", None),
@@ -72,8 +73,6 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
             report["verdict"] = verdict
         refusal = await fence.accept_finish(report)
         if refusal is not None:
-            if refusal == "pending follow-up must be read before finish":
-                child_loop._yield_for_pending_prompt = True
             return _error("finish refused; " + refusal)
         child_loop._explicit_finish_report = report
         return {

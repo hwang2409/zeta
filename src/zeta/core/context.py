@@ -210,6 +210,28 @@ class ContextAssembler:
         return self._provider_budgets.trigger
 
     @property
+    def estimator_token_budget(self) -> int:
+        """Return the calibrated whole-request budget in estimator units."""
+
+        return self._calibration.estimator_budget(self.token_budget)
+
+    def estimate_messages(self, messages: Sequence[Message]) -> int:
+        """Count messages with the production context estimator."""
+
+        return self._count(messages)
+
+    @property
+    def delivery_notification_budget(self) -> int:
+        normal_target = self._calibration.estimator_budget(
+            self._provider_budgets.normal_target
+        )
+        return min(
+            8_192,
+            max(512, int(0.02 * normal_target)),
+            max(0, self.estimator_token_budget - normal_target),
+        )
+
+    @property
     def tokens_used_this_session(self) -> int:
         return self._session_usage.total
 
@@ -308,9 +330,13 @@ class ContextAssembler:
         backend: CompletionBackend | None = None,
         force: bool = False,
         emergency: bool = False,
+        reserved_estimator_tokens: int = 0,
     ) -> list[Message]:
         context = await self.assemble_context(
-            backend=backend, force=force, emergency=emergency
+            backend=backend,
+            force=force,
+            emergency=emergency,
+            reserved_estimator_tokens=reserved_estimator_tokens,
         )
         return list(context.messages)
 
@@ -321,6 +347,7 @@ class ContextAssembler:
         force: bool = False,
         bypass_eviction_hysteresis: bool = False,
         emergency: bool = False,
+        reserved_estimator_tokens: int = 0,
     ) -> AssembledContext:
         """Assemble context, optionally forcing work for a retry or manual compact.
 
@@ -329,11 +356,20 @@ class ContextAssembler:
         deterministic eviction pass without switching to model summarization.
         """
 
+        if reserved_estimator_tokens < 0:
+            raise ValueError("reserved estimator tokens must be non-negative")
+        assembly_budget = max(
+            1, self.estimator_token_budget - reserved_estimator_tokens
+        )
         while True:
             branch = self.store.active_branch_snapshot()
             branch_id = self._branch_id(branch)
             preparation = await asyncio.to_thread(
-                _cooperative_call, self._prepare_assembly, branch, force=force
+                _cooperative_call,
+                self._prepare_assembly,
+                branch,
+                force=force,
+                assembly_budget=assembly_budget,
             )
             # Cancellation is observed before accepting preparation derived
             # from a branch that may have changed while the worker ran.
@@ -365,7 +401,7 @@ class ContextAssembler:
         ):
             truncated = self._truncate_tool_results(
                 committed_messages,
-                self.token_budget,
+                assembly_budget,
                 result_seqs,
             )
             if truncated is not None:
@@ -383,6 +419,8 @@ class ContextAssembler:
             system_messages=system_messages,
             bypass_hysteresis=bypass_eviction_hysteresis or emergency,
             target_ratio=EMERGENCY_TARGET_RATIO if emergency else TARGET_RATIO,
+            assembly_budget=assembly_budget,
+            reserved_estimator_tokens=reserved_estimator_tokens,
         )
         if evicted is not None:
             return evicted
@@ -391,7 +429,7 @@ class ContextAssembler:
         if not candidates and adaptive_tail:
             truncated = self._truncate_tool_results(
                 committed_messages,
-                self.token_budget,
+                assembly_budget,
                 result_seqs,
             )
             if truncated is not None:
@@ -399,7 +437,7 @@ class ContextAssembler:
         if not candidates and not (force and pinned_user is not None):
             if force:
                 return self._save(all_messages, False)
-            if committed_tokens > self.token_budget:
+            if committed_tokens > assembly_budget:
                 self._raise_committed_budget(committed_tokens)
             raise BudgetExceeded("context exceeds budget and has no compactible range")
         # Manual compaction remains explicit even when pinning leaves no
@@ -429,7 +467,7 @@ class ContextAssembler:
         # the final check can then raise BudgetExceeded.
         max_source_tokens = min(
             SUMMARY_SOURCE_TOKEN_LIMIT,
-            max(1, self.token_budget // 2, self.token_budget - 8_000),
+            max(1, assembly_budget // 2, assembly_budget - 8_000),
         )
         low, high = 0, max_source_tokens * 4
         while low < high:
@@ -440,7 +478,7 @@ class ContextAssembler:
                 *([] if pinned_user is None else [pinned_user.message]),
                 *(item.message for item in items[boundary:]),
             ]
-            if self._count(bounded_messages) <= self.token_budget:
+            if self._count(bounded_messages) <= assembly_budget:
                 low = midpoint
             else:
                 high = midpoint - 1
@@ -472,18 +510,18 @@ class ContextAssembler:
             *(item.message for item in items[boundary:]),
         ]
         proposed = self._context(proposed_messages, True)
-        if proposed.token_count > self.token_budget:
+        if proposed.token_count > assembly_budget:
             truncated = self._truncate_tool_results(
-                proposed_messages, self.token_budget, result_seqs
+                proposed_messages, assembly_budget, result_seqs
             )
             if truncated is not None:
                 proposed = self._context(truncated, True)
-        if proposed.token_count > self.token_budget:
-            if committed_tokens > self.token_budget:
+        if proposed.token_count > assembly_budget:
+            if committed_tokens > assembly_budget:
                 self._raise_committed_budget(committed_tokens)
             raise BudgetExceeded(
                 f"compacted context ({proposed.token_count} tokens) exceeds "
-                f"the token budget ({self.token_budget})"
+                f"the token budget ({assembly_budget})"
             )
 
         try:
@@ -502,7 +540,11 @@ class ContextAssembler:
         return proposed
 
     def _prepare_assembly(
-        self, branch: Sequence[ConversationEntry], *, force: bool
+        self,
+        branch: Sequence[ConversationEntry],
+        *,
+        force: bool,
+        assembly_budget: int,
     ) -> _AssemblyPreparation:
         """Build the immutable inputs for compaction without store access."""
 
@@ -525,13 +567,13 @@ class ContextAssembler:
         should_compact = force or self.compaction_policy.should_compact(
             total_tokens, self.trigger_token_budget
         )
-        adaptive_tail = committed_tokens > self.token_budget
+        adaptive_tail = committed_tokens > assembly_budget
         if adaptive_tail:
             boundary = self._shrink_tail_boundary(
                 items,
                 boundary,
                 system_messages,
-                self.token_budget,
+                assembly_budget,
                 latest_user,
             )
             committed_messages = self._committed_messages(
@@ -639,6 +681,7 @@ class ContextAssembler:
                     force=force,
                     bypass_eviction_hysteresis=kwargs["bypass_hysteresis"],
                     emergency=kwargs["target_ratio"] == EMERGENCY_TARGET_RATIO,
+                    reserved_estimator_tokens=kwargs["reserved_estimator_tokens"],
                 )
             return None
 
@@ -651,6 +694,8 @@ class ContextAssembler:
         system_messages: Sequence[Message],
         bypass_hysteresis: bool,
         target_ratio: float,
+        assembly_budget: int,
+        reserved_estimator_tokens: int,
     ) -> _EvictionPlan:
         """Pure eviction planning. This method does not read or mutate the store."""
         active_markers = self._active_markers(branch)
@@ -676,9 +721,11 @@ class ContextAssembler:
                 if e.type == "message" and e.seq > previous_end
             )
             if not bypass_hysteresis and growth < max(
-                1, int(self.token_budget * HYSTERESIS_RATIO)
+                1, int(assembly_budget * HYSTERESIS_RATIO)
             ):
-                return self._plan_reuse_eviction(branch, system_messages)
+                return self._plan_reuse_eviction(
+                    branch, system_messages, assembly_budget
+                )
         candidates = [item for index, item in enumerate(items) if index != latest_user]
         latest_user_item = items[latest_user] if latest_user is not None else None
         source_entries = {
@@ -688,7 +735,9 @@ class ContextAssembler:
         }
         if not source_entries:
             return (
-                self._plan_reuse_eviction(branch, system_messages)
+                self._plan_reuse_eviction(
+                    branch, system_messages, assembly_budget
+                )
                 if eviction_markers
                 else _EvictionPlan("none-fallback")
             )
@@ -739,10 +788,13 @@ class ContextAssembler:
         result = evict_messages(
             records,
             fixed_tokens=self._count(fixed),
-            target_tokens=self._calibration.estimator_budget(
-                self._provider_budgets.emergency_target
-                if target_ratio == EMERGENCY_TARGET_RATIO
-                else self._provider_budgets.normal_target
+            target_tokens=min(
+                assembly_budget,
+                self._calibration.estimator_budget(
+                    self._provider_budgets.emergency_target
+                    if target_ratio == EMERGENCY_TARGET_RATIO
+                    else self._provider_budgets.normal_target
+                ),
             ),
             token_counter=self.token_counter,
             unconsumed_source_seqs=unconsumed,
@@ -750,7 +802,9 @@ class ContextAssembler:
         )
         if not result.items_evicted:
             return (
-                self._plan_reuse_eviction(branch, system_messages)
+                self._plan_reuse_eviction(
+                    branch, system_messages, assembly_budget
+                )
                 if eviction_markers
                 else _EvictionPlan("none-fallback")
             )
@@ -767,7 +821,7 @@ class ContextAssembler:
             if m.tool_result is not None
         }
         truncated = self._truncate_tool_results(
-            proposed, self.token_budget, result_seqs
+            proposed, assembly_budget, result_seqs
         )
         if truncated is None:
             return _EvictionPlan("none-fallback")
@@ -791,7 +845,10 @@ class ContextAssembler:
         )
 
     def _plan_reuse_eviction(
-        self, branch: Sequence[ConversationEntry], system_messages: Sequence[Message]
+        self,
+        branch: Sequence[ConversationEntry],
+        system_messages: Sequence[Message],
+        assembly_budget: int,
     ) -> _EvictionPlan:
         visible = self._visible_items(branch)
         messages = [*system_messages, *(item.message for item in visible)]
@@ -801,7 +858,7 @@ class ContextAssembler:
             if m.tool_result is not None and type(m.metadata.get("source_seq")) is int
         }
         truncated = self._truncate_tool_results(
-            messages, self.token_budget, result_seqs
+            messages, assembly_budget, result_seqs
         )
         return (
             _EvictionPlan(
@@ -1011,11 +1068,14 @@ class ContextAssembler:
             metadata=dict(message.metadata),
         )
 
-    def _raise_committed_budget(self, committed_tokens: int) -> None:
+    def _raise_committed_budget(
+        self, committed_tokens: int, budget: int | None = None
+    ) -> None:
+        effective_budget = self.estimator_token_budget if budget is None else budget
         raise BudgetExceeded(
             "system prompt and retained tail "
             f"({committed_tokens} tokens) exceed the token budget "
-            f"({self.token_budget}); raise it with --token-budget"
+            f"({effective_budget}); raise it with --token-budget"
         )
 
     def _context(self, messages: list[Message], compacted: bool) -> AssembledContext:

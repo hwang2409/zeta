@@ -85,6 +85,32 @@ class ConversationStore(
     AgentStateMixin,
     CheckpointForkMixin,
 ):
+    def _commit_delivery_input(self, item: object) -> object:
+        from ...agent.pending_delivery import _commit_delivery_input
+
+        return _commit_delivery_input(self, item)  # type: ignore[arg-type]
+
+    def _stage_delivery_request(
+        self, notification_budget: int | None = None, token_counter: object = None
+    ) -> object:
+        from ...agent.pending_delivery import _stage_delivery_request
+
+        return _stage_delivery_request(
+            self, notification_budget, token_counter  # type: ignore[arg-type]
+        )
+
+    def _acknowledge_staged_delivery(
+        self, prompt_id: str | None, notification_ids: tuple[str, ...]
+    ) -> object:
+        from ...agent.pending_delivery import _acknowledge_staged_delivery
+
+        return _acknowledge_staged_delivery(self, prompt_id, notification_ids)
+
+    def _admit_step_delivery_terminal(self, intent: str) -> tuple[bool, bool]:
+        from ...agent.pending_delivery import _admit_terminal
+
+        return _admit_terminal(self, intent)  # type: ignore[arg-type]
+
     def __init__(
         self,
         session_dir: str | Path | None = None,

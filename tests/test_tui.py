@@ -52,6 +52,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 import zeta.accounts.session as account_session_module
+import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support.credentials import (
     anthropic_credentials,
     codex_credentials,
@@ -677,12 +678,21 @@ def test_shutdown_does_not_surface_task_kill_notification_after_snapshot(
     store.close()
 
 
-def test_run_background_shutdown_output_failure_persists_fallback(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_run_background_shutdown_output_failure_persists_fallback(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path)
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    tasks: list[asyncio.Task[object]] = []
     app = SimpleNamespace(
         _print=lambda value: (_ for _ in ()).throw(BrokenPipeError("closed pipe")),
         _invalidate_prompt=lambda: None,
-        loop=SimpleNamespace(store=store),
+        loop=SimpleNamespace(
+            store=store,
+            step_delivery=flow,
+            _create_task=lambda coroutine: tasks.append(asyncio.create_task(coroutine)),
+        ),
     )
 
     background_notice(
@@ -693,6 +703,7 @@ def test_run_background_shutdown_output_failure_persists_fallback(tmp_path: Path
         ),
     )
 
+    await asyncio.gather(*tasks)
     notifications = store.agent_notifications()
     assert len(notifications) == 1
     assert notifications[0].data["task_id"] == "task-1"
@@ -1636,6 +1647,10 @@ def test_scrollback_stream_events_render() -> None:
             StreamEventType.AGENT_NOTIFICATION,
             data=_notification_payloads()["agent_completion"],
         ),
+        StreamEventType.CHILD_MESSAGE_DELIVERED: StreamEvent(
+            StreamEventType.CHILD_MESSAGE_DELIVERED,
+            data={"child_label": "root:1", "preview": "check the retry"},
+        ),
         StreamEventType.ACCOUNT_LIMIT: StreamEvent(
             StreamEventType.ACCOUNT_LIMIT,
             data={
@@ -1687,6 +1702,20 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert result is not None
     assert isinstance(result, Panel)
     assert "read README.md" in renderable_plain(result)
+
+
+def test_agent_card_labels_staged_agent_send_as_parent_message(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="child")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("check the retry")]),
+            MessageOrigin.AGENT_SEND,
+        )
+    )
+
+    assert read_agent_transcript(store.session_dir) == [
+        "parent message: check the retry"
+    ]
 
 
 @pytest.mark.asyncio
@@ -4687,6 +4716,26 @@ def test_background_start_event_reaches_presenter_with_depth(tmp_path: Path) -> 
     assert "depth 2" in output.getvalue()
 
 
+def test_child_message_delivered_background_event_renders_parent_receipt(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path), output)
+
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.CHILD_MESSAGE_DELIVERED,
+            data={
+                "agent_instance_id": "root:1",
+                "child_label": "worker",
+                "preview": "check the retry",
+            },
+        )
+    )
+
+    assert "delivered to worker: check the retry" in output.getvalue()
+
+
 def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:
     child = ConversationStore(tmp_path, session_id="child")
     child.start_agent_lifecycle(
@@ -5304,7 +5353,10 @@ def test_canceled_agent_card_can_expand_with_persisted_child_tail(tmp_path: Path
     assert "cancelled task" in Text.from_ansi(transcript.render(120)).plain
 
 
-def test_recovered_canceled_agent_card_expands_with_child_tail(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_recovered_canceled_agent_card_expands_with_child_tail(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path, session_id="parent")
     call = ToolCall(
         "agent-recovered",
@@ -5324,22 +5376,29 @@ def test_recovered_canceled_agent_card_expands_with_child_tail(tmp_path: Path) -
         turns_used=2,
     )
 
-    AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    await loop.activate()
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     event = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
         tool_call=call,
         tool_result=result,
     )
-    transcript = TranscriptWidget()
-    transcript.start_tool(
-        call.id,
-        call,
-        render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)),
-    )
-    transcript.finish_tool(call.id, render_event(event), event)
+    def render_transcript() -> str:
+        transcript = TranscriptWidget()
+        transcript.start_tool(
+            call.id,
+            call,
+            render_event(
+                StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+            ),
+        )
+        transcript.finish_tool(call.id, render_event(event), event)
+        return Text.from_ansi(transcript.render(120)).plain
 
-    rendered = Text.from_ansi(transcript.render(120)).plain
+    rendered = await asyncio.to_thread(render_transcript)
     assert "saved child tail" in rendered
     assert "2 turns" in rendered
 

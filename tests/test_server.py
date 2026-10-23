@@ -160,6 +160,33 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
         await _close(server, writer)
 
 
+@pytest.mark.asyncio
+async def test_child_message_delivered_event_maps_from_background_run(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        assert server._client is not None
+        await server._client._event(
+            StreamEvent(
+                StreamEventType.CHILD_MESSAGE_DELIVERED,
+                data={"child_label": "worker", "preview": "check the retry"},
+            ),
+            session_id="parent",
+        )
+
+        notification = await _read(reader)
+        assert notification["params"] == {
+            "event": "child_message_delivered",
+            "session_id": "parent",
+            "data": {"child_label": "worker", "preview": "check the retry"},
+        }
+    finally:
+        await _close(server, writer)
+
+
 def test_removed_fake_provider_has_clear_serve_error(tmp_path: Path) -> None:
     with pytest.raises(
         SettingsError,
@@ -2191,9 +2218,13 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
     monkeypatch.setattr(server._client, "_notify", notify)
     old_session_id = server.runtime.session_id
     assert server.runtime.opened is not None
+    old_store = server.runtime.opened.store
     for index in range(300):
-        server.runtime.opened.store.append_message(
-            with_message_origin(Message(MessageRole.USER, [TextContent(f"history-{index}")]), MessageOrigin.USER)
+        old_store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"history-{index}")]),
+                MessageOrigin.USER,
+            )
         )
     try:
         await _request(reader, writer, 3, "send", {"text": "start"})
@@ -2212,21 +2243,12 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
             if frame.get("params") is not None
         )
 
-        terminal = next(
-            (
-                frame
-                for frame in swap_frames
-                if frame.get("params", {}).get("event") == "tool_end"
-                and frame.get("params", {}).get("data", {}).get("notification_id")
-            ),
-            None,
+        old_notifications = old_store.agent_notifications()
+        assert old_notifications
+        assert all(
+            entry.data["child_instance_id"].startswith(f"{old_session_id}:")
+            for entry in old_notifications
         )
-        while terminal is None:
-            frame = json.loads(await asyncio.wait_for(reader.readline(), TIMEOUT))
-            params = frame.get("params", {})
-            if params.get("event") == "tool_end" and params.get("data", {}).get("notification_id"):
-                terminal = frame
-        assert terminal["params"]["session_id"] == old_session_id
         status = await _request(reader, writer, 5, "status")
         assert status[-1]["result"]["session"]["session_id"] == new_session_id
     finally:
@@ -5236,7 +5258,9 @@ async def test_failed_wake_turn_keeps_durable_notification_input(tmp_path: Path)
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
         assert backend.calls == 1
-        assert store.agent_notifications() == []
+        assert [entry.data["text"] for entry in store.agent_notifications()] == [
+            "done"
+        ]
         assert sum(
             message.metadata.get("zeta_event") == "agent_notifications"
             for message in store.messages()
@@ -5296,69 +5320,6 @@ async def test_foreground_abort_retries_interrupted_notification_turn(
 
 
 @pytest.mark.asyncio
-async def test_foreground_abort_before_notification_persistence_delivers_once(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    backend = FakeBackend([ScriptedTurn([TextContent("delivered")])])
-    server = ZetaServer(
-        home=tmp_path,
-        port=0,
-        provider="codex",
-        backend_factory=lambda provider, model, home: (backend, model or "offline"),
-    )
-    reader, writer, _session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
-    original_append = store.append_message_async
-    append_started = asyncio.Event()
-    append_calls = 0
-
-    async def block_first_append(message, *, on_persisted=None):
-        nonlocal append_calls
-        append_calls += 1
-        if append_calls == 1:
-            append_started.set()
-            await asyncio.Event().wait()
-        await original_append(message, on_persisted=on_persisted)
-
-    monkeypatch.setattr(store, "append_message_async", block_first_append)
-    store.append_agent_notification(
-        "child",
-        child_session_path="/tmp/child",
-        description="child",
-        status="completed",
-        text="done",
-    )
-    writer.close()
-    await writer.wait_closed()
-    await asyncio.sleep(0.05)
-    try:
-        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-        await _request(
-            reader,
-            writer,
-            4,
-            "hello",
-            {"protocol_version": "1.1", "features": ["abort_scope"]},
-        )
-        await asyncio.wait_for(append_started.wait(), TIMEOUT)
-        frames = await _request(
-            reader, writer, 5, "abort", {"scope": "foreground"}
-        )
-        assert frames[-1]["result"]["aborted"] is True
-        await _frames_until_event(reader, "agent_end")
-        assert len(backend.calls) == 1
-        assert append_calls == 2
-        assert store.agent_notifications() == []
-        assert sum(
-            message.metadata.get("zeta_event") == "agent_notifications"
-            for message in store.messages()
-        ) == 1
-    finally:
-        await _close(server, writer)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("scope", [None, "session"])
 async def test_session_abort_does_not_retry_notification_turn(
     tmp_path: Path,
@@ -5399,7 +5360,7 @@ async def test_session_abort_does_not_retry_notification_turn(
         assert frames[-1]["result"]["aborted"] is True
         await asyncio.sleep(0.05)
         assert backend.calls == 1
-        assert store.agent_notifications() == []
+        assert len(store.agent_notifications()) == 1
         assert sum(
             message.metadata.get("zeta_event") == "agent_notifications"
             for message in store.messages()
@@ -5550,7 +5511,7 @@ async def test_disconnected_wake_turn_reuses_durable_notification_input(
         await writer.wait_closed()
         while server._client_active:
             await asyncio.sleep(0)
-        assert store.agent_notifications() == []
+        assert len(store.agent_notifications()) == 1
 
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         await _request(reader, writer, 5, "hello", {"protocol_version": "1.0"})

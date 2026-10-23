@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from .pending_delivery import NotificationInput
 
 from ..core.store import ConversationStore
 from ..protocol.types import ToolResult
@@ -93,27 +96,28 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
     root = loop.store
     notification = loop._background_owner.notification_store
 
-    def recover() -> None:
+    def recover() -> tuple[NotificationInput, ...]:
         from .background import recover_agent_children
 
         with ConversationStore(
             root.root_dir, session_id=root.session_id, cwd=root.cwd
         ) as worker_root:
             if notification is root:
-                recover_agent_children(
+                return recover_agent_children(
                     _DetachedRecoveryLoop(loop, worker_root, worker_root)
                 )
-                return
             with ConversationStore(
                 notification.root_dir,
                 session_id=notification.session_id,
                 cwd=notification.cwd,
             ) as worker_notification:
-                recover_agent_children(
+                return recover_agent_children(
                     _DetachedRecoveryLoop(loop, worker_root, worker_notification)
                 )
 
-    await root._to_thread_store(recover)
+    deliveries = await root._to_thread_store(recover)
+    for item in deliveries:
+        await loop._background_owner.conversation_channel.produce_to(None, item)
     root.refresh()
     if notification is not root:
         notification.refresh()

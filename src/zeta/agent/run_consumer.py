@@ -12,11 +12,6 @@ from ..protocol.types import MessageOrigin
 from ..tools.agent import agent_stats
 from .explicit_finish import IdleNudgeLifecycle, kill_tasks_after_deadline
 from .finish_gate import FinishGateState
-from .pending_delivery import (
-    close_pending_delivery_queue,
-    close_pending_delivery_queue_if_empty,
-    pending_deliveries,
-)
 from .receipt import (
     MAX_AGENT_RESULT_BYTES,
     TerminalState,
@@ -159,7 +154,7 @@ async def consume_run(
         kwargs["finish_lifecycle"] = keep_lifecycle_running
     result: dict[str, object] | None = None
     terminal_result: dict[str, object] | None = None
-    current_entry = None
+    delivered_follow_up = False
     segment_reports: list[str] = []
     kwargs["record_report"] = segment_reports.append
     kwargs["finish_gate_state"] = FinishGateState()
@@ -180,27 +175,9 @@ async def consume_run(
             )
             if idle and safety_started is None:
                 safety_started = asyncio.get_running_loop().time()
-            current_entry = None
-            pending = await pending_deliveries(child_store)
-            if pending:
-                pending = await close_pending_delivery_queue_if_empty(child_store)
-            if pending:
-                idle_lifecycle.reset_idle_period()
-                current_entry = pending[0]
-                kwargs["delivering_prompt_id"] = current_entry.id
-                child_loop._delivering_prompt_id = current_entry.id
-                _transition_running(child_loop, child_store)
-                result = await consume_child(
-                    child_loop,
-                    current_entry.data["text"],
-                    origin=MessageOrigin.AGENT_SEND,
-                    **kwargs,
-                )
-                idle_published = False
-                continue
-            kwargs["delivering_prompt_id"] = None
-            child_loop._delivering_prompt_id = None
-            if child_loop.notification_wake.pending_message() is not None:
+            flow = await child_loop._ensure_step_delivery()
+            if flow.has_pending_edge:
+                delivered_follow_up = delivered_follow_up or flow.has_prompt_edge
                 idle_lifecycle.reset_idle_period()
                 _transition_running(child_loop, child_store)
                 result = await consume_child(
@@ -248,7 +225,7 @@ async def consume_run(
                     metadata = kwargs.get("explicit_finish_metadata")
                     child_path = kwargs.get("child_path")
                     if isinstance(metadata, dict) and isinstance(child_path, str):
-                        child_loop._background_owner.conversation_channel.publish_idle(
+                        await child_loop._background_owner.conversation_channel.publish_idle(
                             child_instance_id=str(metadata["child_instance_id"]),
                             child_session_path=child_path,
                             description=str(metadata["description"]),
@@ -287,14 +264,14 @@ async def consume_run(
                 )
                 idle_published = False
                 continue
-            pending = await close_pending_delivery_queue_if_empty(child_store)
-            if pending:
+            terminal = await flow.admit_terminal("segment_end")
+            if terminal.pending:
                 continue
             terminal_result = _finalize_result(
                 result,
                 segment_reports=segment_reports,
                 receipt_components=receipt_components,
-                delivered_follow_up=current_entry is not None,
+                delivered_follow_up=delivered_follow_up,
                 child_store=child_store,
                 child_turns=child_turns,
                 tool_call_id=tool_call_id,
@@ -305,7 +282,7 @@ async def consume_run(
             result,
             segment_reports=segment_reports,
             receipt_components=receipt_components,
-            delivered_follow_up=current_entry is not None,
+            delivered_follow_up=delivered_follow_up,
             child_store=child_store,
             child_turns=child_turns,
             tool_call_id=tool_call_id,
@@ -317,28 +294,23 @@ async def consume_run(
             safety_task.cancel()
         if safety_task is not None:
             await asyncio.gather(safety_task, return_exceptions=True)
-        try:
-            await close_pending_delivery_queue(child_store)
-        finally:
-            if terminal_result is not None and callable(final_finish_lifecycle):
-                content = terminal_result.get("content")
-                text = (
-                    content[0].get("text")
-                    if (
-                        isinstance(content, list)
-                        and content
-                        and isinstance(content[0], dict)
-                        and isinstance(content[0].get("text"), str)
-                    )
-                    else "agent run ended without a final response"
+        if terminal_result is not None and callable(final_finish_lifecycle):
+            content = terminal_result.get("content")
+            text = (
+                content[0].get("text")
+                if (
+                    isinstance(content, list)
+                    and content
+                    and isinstance(content[0], dict)
+                    and isinstance(content[0].get("text"), str)
                 )
-                final_finish_lifecycle(
-                    "failed" if terminal_result.get("isError") else "completed",
-                    text
-                    if receipt_components is not None
-                    else _without_agent_receipt_suffix(text),
-                )
-                if receipt_components is not None:
-                    child_store.update_agent_lifecycle_result(
-                        text, canonical_receipt=True
-                    )
+                else "agent run ended without a final response"
+            )
+            final_finish_lifecycle(
+                "failed" if terminal_result.get("isError") else "completed",
+                text
+                if receipt_components is not None
+                else _without_agent_receipt_suffix(text),
+            )
+            if receipt_components is not None:
+                child_store.update_agent_lifecycle_result(text, canonical_receipt=True)

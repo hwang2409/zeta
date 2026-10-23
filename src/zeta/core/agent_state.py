@@ -276,16 +276,20 @@ class AgentStateMixin:
         if marker is not None:
             marker["turns_used"] = turns_used
 
+    def _finish_agent_child_unlocked(self, marker_key: str) -> bool:
+        self._load_session_state()
+        if marker_key not in self._agent_children:
+            return False
+        self._agent_children.pop(marker_key)
+        self._write_session_state(self.bash_cwd, self._todo_items)
+        return True
+
     def finish_agent_child(self, marker_key: str) -> None:
         """Remove a child marker after its parent result is durable."""
 
         with self._append_lock():
             self._load()
-            self._load_session_state()
-            if marker_key not in self._agent_children:
-                return
-            self._agent_children.pop(marker_key)
-            self._write_session_state(self.bash_cwd, self._todo_items)
+            self._finish_agent_child_unlocked(marker_key)
 
     def mark_agent_parent(
         self,

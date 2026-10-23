@@ -18,11 +18,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
-from ...agent.background import BackgroundAgentOwner, recover_agent_children
+from ...agent.background import BackgroundAgentOwner
 from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.durable import durable_message
-from ...agent.notifications import AgentNotificationMixin, NotificationWake
-from ...agent.pending_delivery import PendingDelivery
+from ...agent.notifications import AgentNotificationMixin
+from ...agent.pending_delivery import NotificationInput, ProducerResult
 from ...agent.plan_mode import (
     PLAN_MODE_POLICY,
     plan_mode_messages,
@@ -93,6 +93,7 @@ from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
 from ...tools import ToolHandler, ToolRegistry, ToolStreamPublisher
+from ...tools._shared.process import TaskExitInput
 from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
@@ -145,7 +146,6 @@ def _sanitize_account_message(message: Message) -> Message:
         tool_result=message.tool_result,
         metadata=message.metadata,
     )
-
 
 TaskResult = TypeVar("TaskResult")
 
@@ -227,19 +227,13 @@ class AgentLoop(
         self.explicit_finish = False
         self._explicit_finish_report: dict[str, object] | None = None
         self._delivering_prompt_id: str | None = None
-        self._yield_for_pending_prompt = False
-        self.notification_wake = NotificationWake(store)
+        self._initialize_step_delivery(store)
         # Partial assistant persistence uses these values so provider metadata is
         # retained even when the stream later fails or is cancelled.
         self._turn_stop_reason: str | None = None
         self._turn_output_tokens: int | None = None
         self.memory_reconciler: AutoMemoryReconciler | None = None
         self._turn_provider_retry_records: list[dict[str, object]] = []
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            recover_agent_children(self)
-            self._children_recovered = True
         self.tool_registry = select_tool_registry(
             store,
             tools=tools,
@@ -264,8 +258,10 @@ class AgentLoop(
         self.tool_registry.bind_session_store(store)
         # Route model-owned task exits into this loop's depth-aware wake so a
         # child exit lands in the child store without waking the shared root.
-        self.tool_registry.background_tasks.set_notification_sink(
-            self.store, self.notify_background_persisted
+        self._pending_task_recovery = (
+            self.tool_registry.background_tasks.set_notification_sink(
+                self._produce_task_exit
+            )
         )
         self.agent_catalog = self.tool_registry.agent_catalog
         if system_prompt is not None and runtime_prompt is not None:
@@ -380,9 +376,7 @@ class AgentLoop(
     ) -> None:
         """Signal active tools; optionally preserve background work and steering."""
         self.tool_registry.abort()
-        if foreground_only:
-            self.notification_wake.retry_after_foreground_abort()
-        else:
+        if not foreground_only:
             self._background_owner.cancel_all()
             if steering_drop_reason is not None:
                 self.store.drop_client_steering(steering_drop_reason)
@@ -638,6 +632,11 @@ class AgentLoop(
             finally:
                 if self.agent_depth == 0:
                     await self._background_owner.wait_for_store_closes()
+                    if self.step_delivery is not None:
+                        await self._background_owner.conversation_channel.unregister_delivery_flow(
+                            None
+                        )
+                        self.step_delivery = None
                     await self.store._to_thread_store(
                         self._background_owner.store_leases.close
                     )
@@ -646,12 +645,34 @@ class AgentLoop(
     def session_start(self) -> None:
         if self.hooks is not None:
             self.hooks.session_start()
+
+    async def _produce_task_exit(self, item: TaskExitInput) -> ProducerResult:
+        data: dict[str, object] = {
+            "task_id": item.task_id,
+            "headline": item.command,
+            "exit_code": item.exit_code,
+            "output_tail": item.output_tail,
+            "background_owner": item.owner,
+            "background_phase": item.phase,
+        }
+        if item.log_path is not None:
+            data["log_path"] = item.log_path
+        if item.note is not None:
+            data["note"] = item.note
+        step_delivery = await self._ensure_step_delivery()
+        return await step_delivery.produce(
+            NotificationInput("task_exit", data, dedupe_key=item.task_id)
+        )
+
     async def activate(self) -> None:
         """Run frontend startup hooks after the frontend installs its sinks."""
 
         if self._activated:
             return
         self._activated = True
+        for item in self._pending_task_recovery:
+            await self._produce_task_exit(item)
+        self._pending_task_recovery = ()
         if not self._children_recovered:
             await recover_agent_children_off_loop(self)
             self._children_recovered = True
@@ -761,11 +782,11 @@ class AgentLoop(
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
-        pending_delivery: PendingDelivery | None = None,
         system_message: Message | None = None,
         on_persisted: Callable[[], None] | None = None,
         notification_turn: bool = False,
     ) -> AsyncIterator[StreamEvent]:
+        step_delivery = await self._ensure_step_delivery()
         await self.refresh_skills()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
@@ -774,16 +795,15 @@ class AgentLoop(
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None:
             await self._append_turn_message(system_message, on_persisted=on_persisted)
-        elif not notification_turn:
-            reuse_persisted = not persist_user_message
-            if reuse_persisted and user_message not in self.store.messages():
-                raise ValueError("cannot reuse a user message that is not persisted")
+        elif not notification_turn and persist_user_message:
             user_message = user_message_for_turn(
                 user_text,
                 origin=origin,
                 message=user_message,
-                reuse_persisted=reuse_persisted,
+                reuse_persisted=False,
             )
+        elif user_message is not None and user_message not in self.store.messages():
+            raise ValueError("cannot reuse a user message that is not persisted")
         if system_message is None and persist_user_message:
             await self._append_turn_message(user_message)
         await self._flush_skill_refresh_notices()
@@ -794,10 +814,6 @@ class AgentLoop(
             raise
         except Exception as exc:  # noqa: BLE001 - report setup failures
             setup_error = _error_info(exc)
-        async for event in self.drain_notification_batch(
-            message_persisted=system_message is not None, message=system_message
-        ):
-            yield event
         inbox_status_message = self._project_inbox_status_message()
         if inbox_status_message is not None:
             scanner = self._inbox_scanner
@@ -833,7 +849,7 @@ class AgentLoop(
         while (
             self.max_turns is None
             or turn_number < self.max_turns
-            or self.has_pending_notification_turn(notification_turn)
+            or step_delivery.has_pending_edge
             or retrying_context
             or retrying_provider
             # A nudge is persisted as a user message, so it must always get
@@ -850,8 +866,6 @@ class AgentLoop(
                 nudge_turn_pending = False
                 self._turn_stop_reason = None
                 self._turn_output_tokens = None
-                async for event in self.drain_notification_batch():
-                    yield event
                 self.tool_registry.start_batch()
                 yield StreamEvent(
                     StreamEventType.TURN_START,
@@ -899,8 +913,24 @@ class AgentLoop(
                     )
                 active_tools = self._active_tool_schemas()
                 steering = self.store.pending_client_steering()
-                if steering is not None:
-                    context_messages.extend(steering.messages)
+                prepared_delivery = await step_delivery.prepare_request(
+                    "retry" if retrying_provider else "after_tools",
+                    context_messages,
+                    steering,
+                )
+                context_messages = list(prepared_delivery.messages)
+                steering = prepared_delivery.steering
+                self._delivering_prompt_id = prepared_delivery.prompt_id
+                if prepared_delivery.overflow_message is not None:
+                    step_delivery.release_active()
+                    error = ErrorInfo(
+                        "context_length_exceeded",
+                        prepared_delivery.overflow_message,
+                    )
+                    self._persist_partial_with_cancelled_tools([], None, failure=error)
+                    yield StreamEvent(StreamEventType.ERROR, error=error)
+                    yield StreamEvent(StreamEventType.AGENT_END)
+                    return
                 provider_retry_budget = start_provider_attempt(provider_retry_budget)
                 self._turn_provider_retry_records = provider_retry_budget.records
                 self.context_assembler.begin_provider_attempt(context_messages)
@@ -909,7 +939,11 @@ class AgentLoop(
                     provider_retry_budget,
                 )
                 provider_stream = observed_completion(
-                    completion, self.store, steering, pending_delivery, context_messages
+                    completion,
+                    self.store,
+                    steering,
+                    self._acknowledge_step_delivery,
+                    self._delivery_publication_events,
                 )
                 async for event in provider_stream:
                     attempt_state.observe(event)
@@ -1105,7 +1139,7 @@ class AgentLoop(
                     nudged_empty_turn = True
                     nudge_turn_pending = True
                     await self._append_turn_message(build_nudge_message())
-                if self.has_pending_notification_turn(notification_turn):
+                if step_delivery.has_pending_edge:
                     # This continuation consumes the pending notification. It may
                     # share the one max_turns + 1 recovery call with a nudge, but
                     # notification continuations otherwise retain their existing

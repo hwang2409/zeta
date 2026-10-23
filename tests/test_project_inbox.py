@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.project_inbox as project_inbox_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.inbox import run as run_inbox_cli
@@ -263,6 +264,13 @@ def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
 
 def _notice_loop(home, registry, project_id, session_id, wakes):
     store = ConversationStore(home / "sessions", session_id=session_id)
+    flow = pending_delivery_module.StepDeliveryFlow(
+        store, wake_sink=lambda _source: wakes.append(session_id)
+    )
+
+    async def ensure_step_delivery():
+        return flow
+
     return SimpleNamespace(
         tool_registry=SimpleNamespace(
             registered_names=frozenset({"inbox"}),
@@ -276,7 +284,7 @@ def _notice_loop(home, registry, project_id, session_id, wakes):
             registry, project_id, sessions_root=home / "sessions"
         ),
         store=store,
-        notify_background_persisted=lambda: wakes.append(session_id),
+        _ensure_step_delivery=ensure_step_delivery,
     )
 
 
@@ -405,6 +413,13 @@ async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Pa
     )
     store = ConversationStore(home / "sessions", session_id="b" * 32)
     wakes: list[bool] = []
+    flow = pending_delivery_module.StepDeliveryFlow(
+        store, wake_sink=lambda _source: wakes.append(True)
+    )
+
+    async def ensure_step_delivery():
+        return flow
+
     loop = SimpleNamespace(
         tool_registry=SimpleNamespace(
             registered_names=frozenset({"inbox"}),
@@ -418,7 +433,7 @@ async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Pa
             registry, project_b.project_id, sessions_root=home / "sessions"
         ),
         store=store,
-        notify_background_persisted=lambda: wakes.append(True),
+        _ensure_step_delivery=ensure_step_delivery,
     )
     try:
         await AgentLoop._check_project_inbox(loop)

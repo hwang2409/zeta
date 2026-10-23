@@ -564,7 +564,9 @@ kind. On protocol 1.2, `sub_agent_receipt` carries agent completion notification
 and unknown future kinds; `task_exit_notification`,
 `project_inbox_notification`, `child_question`, `child_question_withdrawn`, and
 `child_idle` carry their durable notification `data` object with the matching
-known kind.
+known kind. `child_message_delivered` is emitted for the parent session after a
+running child starts answering a staged `agent_send`; its data contains the
+child label and the bounded one-line message preview.
 
 ### reconnecting sessions and background completions
 
@@ -754,6 +756,7 @@ Event fields are:
 | `child_question` | `event`, `data: object` | `session_id` |
 | `child_question_withdrawn` | `event`, `data: object` | `session_id` |
 | `child_idle` | `event`, `data: object` | `session_id` |
+| `child_message_delivered` | `event`, `data: object` | `session_id` |
 | `retry` | `event`, `data: object` | `session_id` |
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id` |
