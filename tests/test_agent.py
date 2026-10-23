@@ -10710,18 +10710,40 @@ async def test_parent_exit_cancels_idle_child_subtree_and_cleans_receipts(
 
 
 def _start_child_lease_holder(
-    child: ConversationStore, ready: Path, stop: Path
+    child: ConversationStore,
+    ready: Path,
+    stop: Path,
+    *,
+    append_request: Path | None = None,
+    appended: Path | None = None,
 ) -> subprocess.Popen[str]:
     script = """
 import sys
 import time
 from pathlib import Path
 from zeta.core.store import ConversationStore
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
 
 store = ConversationStore(Path(sys.argv[1]), session_id=sys.argv[2])
 store.activate_runtime_lease()
 Path(sys.argv[3]).write_text("ready")
+append_request = None if sys.argv[5] == "-" else Path(sys.argv[5])
+appended = None if sys.argv[6] == "-" else Path(sys.argv[6])
 while not Path(sys.argv[4]).exists():
+    if append_request is not None and append_request.exists() and not appended.exists():
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("concurrent append")]),
+                MessageOrigin.AGENT_PROMPT,
+            )
+        )
+        appended.write_text("appended")
     time.sleep(0.01)
 store.close()
 """
@@ -10734,6 +10756,8 @@ store.close()
             child.session_id,
             str(ready),
             str(stop),
+            str(append_request) if append_request is not None else "-",
+            str(appended) if appended is not None else "-",
         ],
         text=True,
     )
@@ -10786,16 +10810,66 @@ def _seed_recoverable_child(
 async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> None:
     root = ConversationStore(tmp_path, session_id="root")
     child = _seed_recoverable_child(root)
+    dead_child = _seed_recoverable_child(root, number="2")
+    root.append_child_question(
+        child_instance_id="root:1", question_id="busy-question", question="wait?"
+    )
+    root.append_child_question(
+        child_instance_id="root:1:1",
+        question_id="busy-descendant-question",
+        question="wait?",
+    )
+    root.append_child_question(
+        child_instance_id="root:2", question_id="dead-question", question="wait?"
+    )
     child.close()
+    dead_child.close()
     ready = tmp_path / "ready"
     stop = tmp_path / "stop"
-    holder = _start_child_lease_holder(child, ready, stop)
+    append_request = tmp_path / "append-request"
+    appended = tmp_path / "appended"
+    holder = _start_child_lease_holder(
+        child,
+        ready,
+        stop,
+        append_request=append_request,
+        appended=appended,
+    )
     try:
         loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
-        await loop.activate()
-        assert root.agent_children()
+        activation = asyncio.create_task(loop.activate())
+        append_request.write_text("append")
+        for _ in range(500):
+            if appended.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert appended.exists()
+        await activation
+
+        assert set(root.agent_children()) == {"root:1"}
+        active_questions = {
+            entry.data["question_id"]
+            for entry in root.agent_notifications()
+            if entry.data.get("kind") == "child_question"
+        }
+        all_notifications = root.agent_notifications(pending_only=False)
+        withdrawn_questions = {
+            entry.data.get("question_id")
+            for entry in all_notifications
+            if entry.data.get("kind") == "child_question_withdrawn"
+        }
+        assert active_questions == {"busy-question", "busy-descendant-question"}
+        assert "busy-question" not in withdrawn_questions
+        assert "busy-descendant-question" not in withdrawn_questions
+        assert "dead-question" in withdrawn_questions
+
         observed = ConversationStore(root.session_dir / "agents", session_id="1")
         assert observed.agent_canceled() is None
+        assert any(
+            message.role is MessageRole.USER
+            and message.content == [TextContent("concurrent append")]
+            for message in observed.messages()
+        )
         observed.close()
         await loop.close()
     finally:
@@ -10808,6 +10882,16 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
     )
     await repaired_loop.activate()
     assert repaired_root.agent_children() == {}
+    assert not [
+        entry
+        for entry in repaired_root.agent_notifications()
+        if entry.data.get("kind") == "child_question"
+    ]
+    assert {
+        entry.data.get("question_id")
+        for entry in repaired_root.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "child_question_withdrawn"
+    } == {"busy-question", "busy-descendant-question", "dead-question"}
     repaired_child = ConversationStore(
         repaired_root.session_dir / "agents", session_id="1"
     )

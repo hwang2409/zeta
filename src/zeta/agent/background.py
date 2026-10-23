@@ -718,15 +718,20 @@ def recover_agent_children(loop: AgentLoopForRecovery) -> None:
         if notification_store is loop.store
         else _agent_notification_index(loop.store)
     )
+    busy_child_subtrees: set[str] = set()
     for marker_key, marker in child_markers.items():
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
+        child_instance_id = marker.get(
+            "child_instance_id", f"{loop.store.session_id}:{child_path.name}"
+        )
         agents_root = loop.store.session_dir / "agents"
         recovery_stores: dict[Path, ConversationStore] = {}
         with ExitStack() as recovery_leases:
             if not acquire_recovery_subtree(
                 loop.store, child_path, recovery_leases, recovery_stores
             ):
+                busy_child_subtrees.add(child_instance_id)
                 continue
             child_store = recovery_stores.get(child_path)
             if child_store is not None:
@@ -737,9 +742,6 @@ def recover_agent_children(loop: AgentLoopForRecovery) -> None:
                     recovery_stores,
                 )
             if marker.get("background"):
-                child_instance_id = marker.get(
-                    "child_instance_id", f"{loop.store.session_id}:{child_path.name}"
-                )
                 terminal = child_store.agent_lifecycle() if child_store else None
                 accepted_report = (
                     TerminalTransitionFence(child_store).accepted_report_snapshot()
@@ -900,7 +902,9 @@ def recover_agent_children(loop: AgentLoopForRecovery) -> None:
                 elif recovered_result is not None or existing_result is not None:
                     child_store.finish_agent_parent()
             loop.store.finish_agent_child(marker_key)
-    recover_orphaned_questions(loop.store)
+    recover_orphaned_questions(
+        loop.store, excluded_child_subtrees=busy_child_subtrees
+    )
 
 
 BuildResult = Callable[..., dict[str, object]]
