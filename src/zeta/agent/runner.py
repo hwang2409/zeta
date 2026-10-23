@@ -721,14 +721,20 @@ async def run_agent_tool(
             remove_pending_child_link(loop.root_session_dir, child_instance_id)
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
-    child_store.start_agent_lifecycle(
-        handle=child_instance_id,
-        started_at=_now(),
-        depth=child_depth,
-        agent_type=preset.name,
-        description=description,
-        cwd=child_cwd,
-    )
+    try:
+        child_store.start_agent_lifecycle(
+            handle=child_instance_id,
+            started_at=_now(),
+            depth=child_depth,
+            agent_type=preset.name,
+            description=description,
+            cwd=child_cwd,
+        )
+    except BaseException:
+        loop._background_owner.mark_store_finished(child_store)
+        loop._background_owner.release_unused_stores()
+        await loop._background_owner.wait_for_store_closes()
+        raise
     child_policy: ChildApprovalPolicy | None = None
     try:
         loop._agent_child_stores[tool_call.id] = child_store

@@ -148,7 +148,7 @@ def owned_work_descriptions(child_loop: object) -> tuple[str, ...]:
 def register_handoff(child_loop: object) -> None:
     """Register the existing child-adoption operation for an explicit finisher."""
 
-    from .background import adopt_agent_children
+    from .adoption import adopt_agent_children
     from .finish_gate import _register_handoff
 
     async def handoff(arguments: dict[str, object]) -> str:

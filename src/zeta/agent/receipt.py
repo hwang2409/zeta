@@ -765,7 +765,7 @@ def finalize_agent_results(
                 if result.is_canceled:
                     child_store.mark_agent_canceled(call.id)
                 else:
-                    from .background import adopt_agent_children
+                    from .adoption import adopt_agent_children
 
                     adopt_agent_children(
                         child_store,

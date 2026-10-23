@@ -18,11 +18,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
-from ...agent.background import (
-    BackgroundAgentOwner,
-    recover_agent_children,
-    recover_agent_children_off_loop,
-)
+from ...agent.background import BackgroundAgentOwner, recover_agent_children
 from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.durable import durable_message
 from ...agent.notifications import AgentNotificationMixin, NotificationWake
@@ -33,6 +29,7 @@ from ...agent.plan_mode import (
     plan_mode_tool_schemas,
 )
 from ...agent.receipt import finalize_agent_results
+from ...agent.recovery_lease import recover_agent_children_off_loop
 from ...agent.result_payload import ChildResultPayloadMixin
 from ...agent.runner import run_agent_tool
 from ...agent.tool_results import validated_tool_result as _validated_tool_result
