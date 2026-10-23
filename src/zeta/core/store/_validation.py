@@ -211,11 +211,18 @@ NOTIFICATION_KINDS = tuple(NOTIFICATION_VALIDATORS)
 
 
 def validate_notification_data(data: Mapping[str, Any]) -> None:
-    """Validate one notification with a known durable kind."""
+    """Validate one persisted notification with a known durable kind.
+
+    Rows written before notifications recorded ``origin`` omit the field.
+    They are read as ``origin="notification"``, which is the only value
+    writers use; writers still validate the full payload themselves.
+    """
 
     kind = data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
     try:
         validator = NOTIFICATION_VALIDATORS[kind]
     except (KeyError, TypeError):
         raise ValueError("unknown notification kind") from None
+    if "origin" not in data:
+        data = {**data, "origin": "notification"}
     validator(data)

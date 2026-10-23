@@ -315,6 +315,39 @@ def test_append_accepts_legacy_notification_without_killed_task_fields(
     ).agent_notifications()
 
 
+
+def test_load_accepts_legacy_notifications_without_origin(tmp_path: Path) -> None:
+    """Rows written before notifications recorded ``origin`` still load."""
+
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "parent:1",
+        child_session_path="/child",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    store.append_task_notification(task_id="task-1", command="sleep 1", exit_code=0)
+    store.close()
+    rows = [json.loads(line) for line in store.path.read_text().splitlines()]
+    stripped = 0
+    for row in rows:
+        if row.get("type") == "notification" and "origin" in row["data"]:
+            del row["data"]["origin"]
+            stripped += 1
+    assert stripped == 2
+    store.path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    assert reopened.agent_notifications()
+    kinds = {
+        entry.data.get("kind")
+        for entry in reopened.entries
+        if entry.type == "notification"
+    }
+    assert "task_exited" in kinds
+
 @pytest.mark.parametrize(
     "field_value",
     [
