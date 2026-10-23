@@ -7,6 +7,7 @@ import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -836,13 +837,50 @@ async def test_async_publish_stays_responsive_during_large_branch_reload(
         running = False
         await ticker_task
 
-    maximum_gap = max(later - earlier for earlier, later in zip(ticks, ticks[1:]))
+    maximum_gap = max(later - earlier for earlier, later in pairwise(ticks))
     assert maximum_gap < 0.05, f"maximum ticker gap {maximum_gap:.6f}s"
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store.entries == fresh.entries
     assert store.messages() == fresh.messages()
     assert store.agent_notifications() == fresh.agent_notifications()
     assert store._active_pending_prompts == fresh._active_pending_prompts
+
+
+@pytest.mark.asyncio
+async def test_async_publish_refreshes_after_owner_state_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="publish-generation")
+    snapshot_ready = threading.Event()
+    release_snapshot = threading.Event()
+    owner_thread = threading.get_ident()
+    original_detach = ConversationStore._detach_log_state
+    blocked = False
+
+    def block_first_worker_snapshot(candidate: ConversationStore):
+        nonlocal blocked
+        state = original_detach(candidate)
+        if not blocked and threading.get_ident() != owner_thread:
+            blocked = True
+            snapshot_ready.set()
+            assert release_snapshot.wait(timeout=5)
+        return state
+
+    monkeypatch.setattr(
+        ConversationStore, "_detach_log_state", block_first_worker_snapshot
+    )
+    write = asyncio.create_task(
+        store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
+    )
+    assert await asyncio.to_thread(snapshot_ready.wait, 2)
+    store.append_message(message(MessageRole.ASSISTANT, "owner"))
+    release_snapshot.set()
+    await write
+
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+    assert store.entries == fresh.entries
+    assert [item.content[0].text for item in store.messages()] == ["worker", "owner"]
 
 
 @pytest.mark.asyncio

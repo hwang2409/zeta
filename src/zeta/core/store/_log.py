@@ -15,6 +15,7 @@ import json
 import os
 import time
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +30,8 @@ from ..session_files import open_session_file, read_session_file
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
+    from ...protocol.types import ToolResult
+    from ._client_delivery import ClientDelivery
     from ._store import ConversationStore
 
 
@@ -52,8 +55,86 @@ PREFIX_FINGERPRINT_BYTES = 64 * 1024
 MAX_PENDING_APPEND_RECEIPTS = 256
 
 
+@dataclass(frozen=True, slots=True)
+class _DetachedLogState:
+    """Validated transcript state that is safe to install without file access."""
+
+    cwd: str
+    entries: list[ConversationEntry]
+    entry_ids: set[str]
+    active_approval_requests: dict[str, ConversationEntry]
+    active_approval_resolutions: dict[str, str]
+    active_tool_results: dict[str, ToolResult]
+    active_notifications: dict[str, ConversationEntry]
+    active_completion_notifications: dict[str, ConversationEntry]
+    active_notification_acks: set[str]
+    active_notification_presentations: set[str]
+    active_pending_prompts: set[str]
+    active_pending_prompt_acks: set[str]
+    task_notification_ids: set[str]
+    client_deliveries: OrderedDict[str, ClientDelivery]
+    client_delivery_outcomes: dict[bytes, bytes]
+    log_identity: tuple[int, int, int]
+    log_offset: int
+    log_mtime_ns: int
+    log_prefix_fingerprint: bytes
+
+
 class ConversationLogMixin:
     """Load a log once, then synchronize only bytes appended by other writers."""
+
+    def _detach_log_state(self: ConversationStore) -> _DetachedLogState:
+        """Return the worker-owned validated state for an atomic loop install."""
+        return _DetachedLogState(
+            cwd=self.cwd,
+            entries=self._entries,
+            entry_ids=self._entry_ids,
+            active_approval_requests=self._active_approval_requests,
+            active_approval_resolutions=self._active_approval_resolutions,
+            active_tool_results=self._active_tool_results,
+            active_notifications=self._active_notifications,
+            active_completion_notifications=self._active_completion_notifications,
+            active_notification_acks=self._active_notification_acks,
+            active_notification_presentations=self._active_notification_presentations,
+            active_pending_prompts=self._active_pending_prompts,
+            active_pending_prompt_acks=self._active_pending_prompt_acks,
+            task_notification_ids=self._task_notification_ids,
+            client_deliveries=self._client_deliveries,
+            client_delivery_outcomes=self._client_delivery_outcomes,
+            log_identity=self._log_identity,
+            log_offset=self._log_offset,
+            log_mtime_ns=self._log_mtime_ns,
+            log_prefix_fingerprint=self._log_prefix_fingerprint,
+        )
+
+    def _install_log_state(
+        self: ConversationStore, state: _DetachedLogState
+    ) -> _DetachedLogState:
+        """Install validated state on the owner thread using pointer swaps only."""
+        previous = self._detach_log_state()
+        self._before_incremental_state_install()
+        self.cwd = state.cwd
+        self._entry_ids = state.entry_ids
+        self._active_approval_requests = state.active_approval_requests
+        self._active_approval_resolutions = state.active_approval_resolutions
+        self._active_tool_results = state.active_tool_results
+        self._active_notifications = state.active_notifications
+        self._active_completion_notifications = state.active_completion_notifications
+        self._active_notification_acks = state.active_notification_acks
+        self._active_notification_presentations = state.active_notification_presentations
+        self._active_pending_prompts = state.active_pending_prompts
+        self._active_pending_prompt_acks = state.active_pending_prompt_acks
+        self._task_notification_ids = state.task_notification_ids
+        self._client_deliveries = state.client_deliveries
+        self._client_delivery_outcomes = state.client_delivery_outcomes
+        self._log_identity = state.log_identity
+        self._log_offset = state.log_offset
+        self._log_mtime_ns = state.log_mtime_ns
+        self._log_prefix_fingerprint = state.log_prefix_fingerprint
+        # Publish entries last so readers never see rows without matching indexes.
+        self._entries = state.entries
+        self._transcript_generation += 1
+        return previous
 
     def enable_persisted_append_tracking(self: ConversationStore) -> None:
         """Collect bounded append proofs for incremental transcript indexing."""
@@ -471,3 +552,4 @@ class ConversationLogMixin:
         self._log_offset = stat.st_size
         self._log_mtime_ns = stat.st_mtime_ns
         self._log_prefix_fingerprint = fingerprint
+        self._transcript_generation += 1
