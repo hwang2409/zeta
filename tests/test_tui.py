@@ -385,6 +385,7 @@ async def _background_event_transcript_count(
     ],
     *,
     shutdown_output_error: type[Exception] | None = None,
+    app_sink: Callable[[TUIApp], None] | None = None,
 ) -> tuple[int, str]:
     output = StringIO()
     store = ConversationStore(tmp_path / "session", cwd=tmp_path)
@@ -398,6 +399,8 @@ async def _background_event_transcript_count(
         model="offline",
         console=Console(file=output, force_terminal=False, width=160),
     )
+    if app_sink is not None:
+        app_sink(app)
     command = {
         "start": "sleep 30",
         "natural_exit_success": "exit 0",
@@ -625,6 +628,45 @@ async def test_background_event_renders_exactly_once_end_to_end(
 ) -> None:
     count, rendered = await _background_event_transcript_count(tmp_path, owner, event)
     assert count == 1, rendered
+
+
+@pytest.mark.asyncio
+async def test_background_completion_is_rendered_when_exit_overtakes_acknowledgement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_durable_write = ConversationStore._run_durable_write
+    ack_committed = threading.Event()
+    release_ack = threading.Event()
+    apps: list[TUIApp] = []
+
+    def pause_after_ack_commit(self, method_name, args, kwargs):
+        result = original_durable_write(self, method_name, args, kwargs)
+        if method_name == "_acknowledge_staged_delivery":
+            ack_committed.set()
+            assert release_ack.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(ConversationStore, "_run_durable_write", pause_after_ack_commit)
+    transcript = asyncio.create_task(
+        _background_event_transcript_count(
+            tmp_path,
+            "background_macro",
+            "natural_exit_success",
+            app_sink=apps.append,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(ack_committed.wait, 5)
+        assert len(apps) == 1
+        apps[0].request_exit()
+        release_ack.set()
+        count, rendered = await transcript
+        assert count == 1, rendered
+    finally:
+        release_ack.set()
+        if not transcript.done():
+            transcript.cancel()
+            await asyncio.gather(transcript, return_exceptions=True)
 
 
 @pytest.mark.asyncio
