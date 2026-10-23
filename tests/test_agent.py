@@ -10785,8 +10785,24 @@ store.close()
         import time
 
         time.sleep(0.01)
-    process.kill()
+    _reap_lease_holder(process)
     raise AssertionError("lease holder did not become ready")
+
+
+def _reap_lease_holder(process: subprocess.Popen[str]) -> None:
+    """Kill and reap a lease holder so a failed test cannot leave it running."""
+
+    process.kill()
+    process.wait(timeout=10)
+
+
+def _stop_lease_holder(process: subprocess.Popen[str], stop: Path) -> None:
+    stop.write_text("stop")
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _reap_lease_holder(process)
+        raise
 
 
 def _seed_recoverable_child(
@@ -10968,8 +10984,7 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
         ]
         await loop.close()
     finally:
-        stop.write_text("stop")
-        holder.wait(timeout=10)
+        _stop_lease_holder(holder, stop)
 
     repaired_root = ConversationStore(tmp_path, session_id="root")
     repaired_loop = AgentLoop(
@@ -11031,8 +11046,7 @@ async def test_recovery_skips_ancestor_when_descendant_is_leased(
         observed.close()
         await loop.close()
     finally:
-        stop.write_text("stop")
-        holder.wait(timeout=10)
+        _stop_lease_holder(holder, stop)
     root.close()
 
 
