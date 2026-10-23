@@ -338,9 +338,9 @@ class BackgroundAgentOwner:
         """Wait until all scheduled child-store lease releases finish."""
 
         while self._store_close_tasks:
-            await asyncio.gather(
-                *tuple(self._store_close_tasks), return_exceptions=False
-            )
+            close_tasks = tuple(self._store_close_tasks)
+            await asyncio.gather(*close_tasks, return_exceptions=False)
+            self._store_close_tasks.difference_update(close_tasks)
 
     async def wait(self) -> None:
         current = asyncio.current_task()
