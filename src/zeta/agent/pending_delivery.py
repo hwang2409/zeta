@@ -73,6 +73,14 @@ class PreparedRequest:
     low_capacity_notice: str | None = None
     admitted_request: AdmittedSessionRequest | None = None
 
+    @property
+    def has_active_delivery(self) -> bool:
+        return bool(self.prompt_id or self.notification_ids)
+
+    @property
+    def contains_turn_context(self) -> bool:
+        return any(message.metadata.get("turn_context") for message in self.messages)
+
 
 @dataclass(frozen=True, slots=True)
 class TerminalResult:

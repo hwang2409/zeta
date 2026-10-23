@@ -430,7 +430,6 @@ class AgentLoop(
         task.add_done_callback(self._tracked_tasks.discard)
         return task
 
-
     async def _run_agent_tool(
         self,
         tool_call: ToolCall,
@@ -862,11 +861,9 @@ class AgentLoop(
                     active_tools,
                     notification_context=notification_context,
                 )
-                context_persisted = notification_context is not None and any(
-                    message.metadata.get("turn_context")
-                    for message in prepared_delivery.messages
-                )
-                if context_persisted:
+                if notification_context is not None and (
+                    prepared_delivery.contains_turn_context
+                ):
                     if on_persisted is not None:
                         on_persisted()
                     system_message = None
@@ -903,10 +900,7 @@ class AgentLoop(
                     ),
                     provider_retry_budget,
                 )
-                has_active_delivery = bool(
-                    prepared_delivery.prompt_id
-                    or prepared_delivery.notification_ids
-                )
+                has_active_delivery = prepared_delivery.has_active_delivery
                 provider_stream = observed_completion(
                     completion,
                     self.store,
