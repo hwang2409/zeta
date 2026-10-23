@@ -20,6 +20,7 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
+from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
@@ -875,7 +876,7 @@ def test_agent_list_selection_crossing_page_boundary_updates_page(
     assert "page 2/2 · 6 agents" in _list_lines(navigation)[-1]
 
 
-def _child_send_app(tmp_path: Path) -> tuple[TUIApp, ConversationStore, ConversationStore, object, list[str]]:
+async def _child_send_app(tmp_path: Path) -> tuple[TUIApp, ConversationStore, ConversationStore, object, list[str]]:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child_path = _child(store, 1, description="Worker", agent_type="worker")
     call = ToolCall("worker-call", "agent", {"prompt": "work"})
@@ -903,20 +904,28 @@ def _child_send_app(tmp_path: Path) -> tuple[TUIApp, ConversationStore, Conversa
         accepts_follow_ups=True,
         child_instance_id="root:worker",
     )
+    child = ConversationStore(child_path.parent, session_id=child_path.name)
+    channel = app.loop._background_owner.conversation_channel
+    delivery_flow = StepDeliveryFlow(
+        child,
+        wake_sink=lambda _source: channel.wake("root:worker"),
+    )
+    await delivery_flow.initialize()
+    channel.register_delivery_flow("root:worker", delivery_flow)
     notices: list[str] = []
     app._print_system = notices.append
     app._agent_navigation.current_path = child_path
     app._agent_navigation.child_instance_id = lambda: "root:worker"
     session = app._make_session()
     app._active_session = session
-    return app, store, ConversationStore(child_path.parent, session_id=child_path.name), session, notices
+    return app, store, child, session, notices
 
 
 @pytest.mark.asyncio
 async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, store, child, session, notices = _child_send_app(tmp_path)
+    app, store, child, session, notices = await _child_send_app(tmp_path)
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -943,7 +952,7 @@ async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
 async def test_child_send_exception_preserves_text_and_shows_notice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, store, _child, session, notices = _child_send_app(tmp_path)
+    app, store, _child, session, notices = await _child_send_app(tmp_path)
 
     async def fail(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -963,7 +972,7 @@ async def test_child_send_exception_preserves_text_and_shows_notice(
 async def test_child_send_success_keeps_same_text_typed_after_edit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, store, child, session, _notices = _child_send_app(tmp_path)
+    app, store, child, session, _notices = await _child_send_app(tmp_path)
     started = asyncio.Event()
     release = threading.Event()
     real_send = agent_runtime.send_to_run
@@ -982,11 +991,17 @@ async def test_child_send_success_keeps_same_text_typed_after_edit(
     buffer.text = "same"
     release.set()
     for _ in range(100):
-        if await asyncio.to_thread(child.pending_prompts):
+        if not app._child_send_tasks:
             break
         await asyncio.sleep(0.01)
     await asyncio.sleep(0.05)
-    assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == ["same"]
+    def persisted_prompts() -> list[str]:
+        with ConversationStore(
+            child.session_dir.parent, session_id=child.session_id
+        ) as persisted:
+            return [entry.data["text"] for entry in persisted.pending_prompts()]
+
+    assert await asyncio.to_thread(persisted_prompts) == ["same"]
     assert buffer.text == "same"
     assert store.messages() == []
     await app.close()
@@ -996,7 +1011,7 @@ async def test_child_send_success_keeps_same_text_typed_after_edit(
 async def test_close_waits_for_in_flight_child_send_outcome(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, store, child, session, notices = _child_send_app(tmp_path)
+    app, store, child, session, notices = await _child_send_app(tmp_path)
     started = asyncio.Event()
     release = threading.Event()
     real_send = agent_runtime.send_to_run
@@ -1021,35 +1036,25 @@ async def test_close_waits_for_in_flight_child_send_outcome(
     assert notices == notices_before_release
 
 
-def test_send_to_run_ends_within_its_deadline_when_the_append_lock_is_held(
+@pytest.mark.asyncio
+async def test_send_to_run_ends_within_its_deadline_when_the_append_lock_is_held(
     tmp_path: Path,
 ) -> None:
-    app, store, child, _session, _notices = _child_send_app(tmp_path)
+    app, store, child, _session, _notices = await _child_send_app(tmp_path)
     lock_fd = os.open(child.session_dir / ".lock", os.O_RDWR)
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    result: list[str | None] = []
-    worker = threading.Thread(
-        target=lambda: result.append(
-            asyncio.run(
-                agent_runtime.send_to_run(
-                    store,
-                    "root:worker",
-                    "blocked",
-                    channel=app.loop._background_owner.conversation_channel,
-                )
-            )
-        ),
-        daemon=True,
-    )
     try:
-        worker.start()
-        worker.join(5)
-        assert not worker.is_alive()
+        result = await agent_runtime.send_to_run(
+            store,
+            "root:worker",
+            "blocked",
+            channel=app.loop._background_owner.conversation_channel,
+        )
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
-    assert result and result[0] is not None and "timed out" in result[0]
-    assert child.pending_prompts() == []
+    assert result is not None and "timed out" in result
+    assert await asyncio.to_thread(child.pending_prompts) == []
 
 
 @pytest.mark.parametrize("missing", ["conversation", "session"])
@@ -1057,7 +1062,7 @@ def test_send_to_run_ends_within_its_deadline_when_the_append_lock_is_held(
 async def test_send_to_run_rejects_a_missing_child_cleanly(
     tmp_path: Path, missing: str
 ) -> None:
-    app, store, child, _session, _notices = _child_send_app(tmp_path)
+    app, store, child, _session, _notices = await _child_send_app(tmp_path)
     child.close()
     if missing == "conversation":
         (child.session_dir / "conversation.jsonl").unlink()
@@ -1072,40 +1077,33 @@ async def test_send_to_run_rejects_a_missing_child_cleanly(
     assert result is not None and "no live run/child" in result
 
 
-def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Path) -> None:
-    app, store, child, _session, _notices = _child_send_app(tmp_path)
+@pytest.mark.asyncio
+async def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Path) -> None:
+    app, store, child, _session, _notices = await _child_send_app(tmp_path)
     root_fd = os.open(child.session_dir.parent, os.O_RDONLY)
     fcntl.flock(root_fd, fcntl.LOCK_EX)
-    result: list[str | None] = []
-    worker = threading.Thread(
-        target=lambda: result.append(
-            asyncio.run(
-                agent_runtime.send_to_run(
-                    store,
-                    "root:worker",
-                    "while locked",
-                    channel=app.loop._background_owner.conversation_channel,
-                )
-            )
-        ),
-        daemon=True,
-    )
     try:
-        worker.start()
-        worker.join(3)
-        assert not worker.is_alive()
+        result = await agent_runtime.send_to_run(
+            store,
+            "root:worker",
+            "while locked",
+            channel=app.loop._background_owner.conversation_channel,
+        )
     finally:
         fcntl.flock(root_fd, fcntl.LOCK_UN)
         os.close(root_fd)
-    assert result == [None]
-    assert [entry.data["text"] for entry in child.pending_prompts()] == ["while locked"]
+    assert result is None
+    assert [
+        entry.data["text"]
+        for entry in await asyncio.to_thread(child.pending_prompts)
+    ] == ["while locked"]
 
 
 @pytest.mark.asyncio
 async def test_child_send_finishing_after_its_session_left_does_not_touch_ui(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, store, child, session, notices = _child_send_app(tmp_path)
+    app, store, child, session, notices = await _child_send_app(tmp_path)
     started = asyncio.Event()
     release = threading.Event()
     real_send = agent_runtime.send_to_run
@@ -1140,7 +1138,7 @@ async def test_child_send_finishing_after_its_session_left_does_not_touch_ui(
 async def test_child_send_double_enter_queues_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, store, child, session, _notices = _child_send_app(tmp_path)
+    app, store, child, session, _notices = await _child_send_app(tmp_path)
     started = asyncio.Event()
     release = asyncio.Event()
     calls = 0
@@ -1199,6 +1197,15 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
         background=True,
         accepts_follow_ups=True,
         child_instance_id="root:worker",
+    )
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    channel = app.loop._background_owner.conversation_channel
+    channel.register_delivery_flow(
+        "root:worker",
+        StepDeliveryFlow(
+            child_store,
+            wake_sink=lambda _source: channel.wake("root:worker"),
+        ),
     )
     notices: list[str] = []
     loop = asyncio.get_running_loop()

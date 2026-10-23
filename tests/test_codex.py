@@ -1378,7 +1378,11 @@ async def test_midstream_disconnect_without_tool_call_discards_partial_and_retri
     ]
     assert successful[-1].message is not None
     assert successful[-1].message.content == [TextContent("hello")]
-    persisted = conversation.replay()[-1].data["message"]
+    persisted = next(
+        entry.data["message"]
+        for entry in reversed(conversation.replay())
+        if entry.type == "message"
+    )
     assert persisted["content"] == [{"type": "text", "text": "hello"}]
     await client.aclose()
 

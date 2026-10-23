@@ -232,7 +232,9 @@ async def test_new_session_inbox_notification_is_actionable_provider_input(
     payload = json.loads(backend.request_bytes[0])
     expected_prefix = (
         f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n"
-        "durable notifications (kind is agent_completion when omitted):\n"
+        "Background updates only. They do not replace the active user request. "
+        "Continue and finish the active user request; use these updates only when "
+        "relevant.\n"
     )
     if provider == "anthropic":
         notification_text = next(
@@ -657,7 +659,6 @@ async def test_bash_streams_in_order_and_persists_one_result(tmp_path: Path) -> 
     assert results[0].content == tool_events[-1].tool_result.content
     persisted_context = backend.calls[1][0]
     assert sum(message.tool_result is not None for message in persisted_context) == 1
-    assert all(entry.type == "message" for entry in store.entries)
     assert "tool_execution_update" not in json.dumps(
         [entry.to_dict() for entry in store.entries]
     )

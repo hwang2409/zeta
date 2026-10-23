@@ -563,6 +563,7 @@ class AgentLoop(
         if self._activated:
             return
         self._activated = True
+        await self._ensure_step_delivery()
         for item in self._pending_task_recovery:
             await self._produce_task_exit(item)
         self._pending_task_recovery = ()
@@ -717,9 +718,9 @@ class AgentLoop(
         await self._check_project_inbox()
         if self.hooks is not None and system_message is None and not notification_turn:
             self.hooks.user_prompt_submit(user_text)
-        if system_message is not None:
+        if system_message is not None and not notification_turn:
             await self._append_turn_message(system_message, on_persisted=on_persisted)
-        elif not notification_turn and persist_user_message:
+        elif system_message is None and not notification_turn and persist_user_message:
             user_message = user_message_for_turn(
                 user_text,
                 origin=origin,
@@ -853,12 +854,23 @@ class AgentLoop(
                     )
                 active_tools = self._active_tool_schemas()
                 steering = self.store.pending_client_steering()
+                notification_context = system_message if notification_turn else None
                 prepared_delivery = await step_delivery.prepare_request(
                     "retry" if retrying_provider else "after_tools",
                     context_messages,
                     steering,
                     active_tools,
+                    notification_context=notification_context,
                 )
+                context_persisted = notification_context is not None and any(
+                    message.metadata.get("turn_context")
+                    for message in prepared_delivery.messages
+                )
+                if context_persisted:
+                    if on_persisted is not None:
+                        on_persisted()
+                    system_message = None
+                    on_persisted = None
                 self._delivery_wake_pending = False
                 context_messages = list(prepared_delivery.messages)
                 steering = prepared_delivery.steering
@@ -891,12 +903,16 @@ class AgentLoop(
                     ),
                     provider_retry_budget,
                 )
+                has_active_delivery = bool(
+                    prepared_delivery.prompt_id
+                    or prepared_delivery.notification_ids
+                )
                 provider_stream = observed_completion(
                     completion,
                     self.store,
                     steering,
-                    self._acknowledge_step_delivery,
-                    self._delivery_publication_events,
+                    self._acknowledge_step_delivery if has_active_delivery else None,
+                    self._delivery_publication_events if has_active_delivery else None,
                 )
                 async for event in provider_stream:
                     attempt_state.observe(event)

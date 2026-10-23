@@ -314,6 +314,7 @@ def _stage_delivery_request(
     notification_budget: int | None,
     token_counter: Callable[[Sequence[Message]], int] | None,
     notification_selector: NotificationSelector,
+    notification_context: Message | None = None,
 ) -> StagedDelivery:
     with store.pending_prompt_queue._lock():
         store._load()
@@ -331,6 +332,30 @@ def _stage_delivery_request(
                 store, pending_notifications, notification_budget, token_counter
             )
         )
+        if (
+            notification_context is not None
+            and notification_message is not None
+            and not notification_persisted
+        ):
+            notification_message = Message(
+                MessageRole.SYSTEM,
+                [
+                    TextContent(
+                        "\n".join(
+                            block.text
+                            for block in (
+                                *notification_context.content,
+                                *notification_message.content,
+                            )
+                            if isinstance(block, TextContent)
+                        )
+                    )
+                ],
+                metadata={
+                    **notification_message.metadata,
+                    **notification_context.metadata,
+                },
+            )
         _persist_staged_messages(
             store,
             (
@@ -465,9 +490,14 @@ class StepDeliveryStoreMixin:
         notification_budget: int | None,
         token_counter: Callable[[Sequence[Message]], int] | None,
         notification_selector: NotificationSelector,
+        notification_context: Message | None = None,
     ) -> StagedDelivery:
         return _stage_delivery_request(
-            self, notification_budget, token_counter, notification_selector
+            self,
+            notification_budget,
+            token_counter,
+            notification_selector,
+            notification_context,
         )
 
     def _acknowledge_staged_delivery(

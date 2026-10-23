@@ -177,6 +177,8 @@ class StepDeliveryFlow:
         assembled: Sequence[Message],
         steering: ClientSteeringBatch | None,
         tool_schemas: Sequence[Mapping[str, Any]] = (),
+        *,
+        notification_context: Message | None = None,
     ) -> PreparedRequest:
         """Stage one fixed suffix within the calibrated whole-request budget."""
 
@@ -187,7 +189,9 @@ class StepDeliveryFlow:
             staged = self._active
             steering = self._active_steering
         else:
-            staged = await self._stage_new_request(cause, assembler, steering)
+            staged = await self._stage_new_request(
+                cause, assembler, steering, notification_context
+            )
             if self._prompt_priority is not None:
                 steering = None
             self._active_steering = steering
@@ -201,6 +205,7 @@ class StepDeliveryFlow:
             assembled,
             steering,
             max(0, assembler.estimator_token_budget - tool_tokens),
+            notification_context,
         )
         if prepared.overflow_message is None:
             from ..core.context import BudgetExceeded
@@ -224,6 +229,7 @@ class StepDeliveryFlow:
         cause: RequestCause,
         assembler: ContextAssembler | None,
         steering: ClientSteeringBatch | None,
+        notification_context: Message | None,
     ) -> StagedDelivery:
         if cause not in {"after_tools", "terminal_fallback", "idle_start", "retry"}:
             raise ValueError("unknown request cause")
@@ -234,6 +240,7 @@ class StepDeliveryFlow:
                 None,
                 None,
                 _select_notification_delivery,
+                notification_context,
             )
         else:
             staged = await self.store._to_thread_durable(
@@ -241,6 +248,7 @@ class StepDeliveryFlow:
                 0,
                 assembler.estimate_messages,
                 _select_notification_delivery,
+                None,
             )
         self._active = staged
         self._active_steering = steering
@@ -256,6 +264,7 @@ class StepDeliveryFlow:
         assembled: Sequence[Message],
         steering: ClientSteeringBatch | None,
         budget: int,
+        notification_context: Message | None,
     ) -> PreparedRequest:
         assembler = self._context_assembler
         assert assembler is not None
@@ -278,6 +287,7 @@ class StepDeliveryFlow:
                 steering,
                 budget,
                 context_tokens + prompt_tokens + steering_tokens,
+                notification_context,
             )
         context = await self._reserved_context(prompt_tokens + steering_tokens)
         context = self._without_staged(context, staged)
@@ -289,6 +299,7 @@ class StepDeliveryFlow:
                 steering,
                 budget,
                 context_tokens + prompt_tokens + steering_tokens,
+                notification_context,
             )
         return self._defer_fixed_suffix(
             staged,
@@ -416,12 +427,20 @@ class StepDeliveryFlow:
         steering: ClientSteeringBatch | None,
         budget: int,
         without_tokens: int,
+        notification_context: Message | None,
     ) -> PreparedRequest:
         assembler = self._context_assembler
         assert assembler is not None
+        context_tokens = (
+            await asyncio.to_thread(
+                assembler.estimate_messages, (notification_context,)
+            )
+            if notification_context is not None
+            else 0
+        )
         capacity = min(
             assembler.delivery_notification_budget,
-            budget - without_tokens,
+            max(0, budget - without_tokens - context_tokens),
         )
         selected = staged
         if capacity > 0:
@@ -430,6 +449,7 @@ class StepDeliveryFlow:
                 capacity,
                 assembler.estimate_messages,
                 _select_notification_delivery,
+                notification_context,
             )
         request = self._compose(
             selected,
@@ -689,6 +709,10 @@ async def send_to_run(
         )
     except PendingPromptCommitTimeoutError:
         return "pending prompt commit timed out before the queue could be changed"
+    except ValueError as exc:
+        if str(exc) != "session store is closed":
+            raise
+        return no_live_run
     except (LookupError, PendingPromptsClosedError):
         return no_live_run
     match = QUESTION_ANSWER_PATTERN.match(message)

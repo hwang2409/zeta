@@ -790,6 +790,14 @@ def recover_agent_children(
                     )
                     if notification is None:
                         notification = store_notification
+                        if store_notification is not None:
+                            deliveries.append(
+                                NotificationInput(
+                                    "child_completion",
+                                    dict(store_notification.data),
+                                    dedupe_key=child_instance_id,
+                                )
+                            )
                 if notification is None:
                     lifecycle = (
                         child_store.agent_lifecycle()

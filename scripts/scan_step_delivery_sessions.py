@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from zeta.agent.pending_delivery import notification_batch_id
+from zeta.agent._delivery_notifications import notification_batch_id
 from zeta.core.checkpoints import ConversationEntry, active_branch
 from zeta.core.store._validation import validate_notification_data
 
