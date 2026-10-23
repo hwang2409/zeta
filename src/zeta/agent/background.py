@@ -109,6 +109,7 @@ class BackgroundAgentOwner:
         self.store_leases = ExitStack()
         self._stores: list[ConversationStore] = []
         self._pending_stores: set[ConversationStore] = set()
+        self._store_close_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
             str, Callable[[], CancellationRequest | asyncio.Task[None] | None]
         ] = {}
@@ -251,7 +252,12 @@ class BackgroundAgentOwner:
             if store not in self._pending_stores or store in referenced:
                 retained.append(store)
             else:
-                store.close()
+                close_task = asyncio.create_task(
+                    store._to_thread_store(store.close),
+                    name=f"close child store {store.session_id}",
+                )
+                self._store_close_tasks.add(close_task)
+                close_task.add_done_callback(self._store_close_tasks.discard)
                 self._pending_stores.discard(store)
         self._stores = retained
 
@@ -342,6 +348,14 @@ class BackgroundAgentOwner:
             if self._parent_ids.get(instance_id) == parent_instance_id
         )
 
+    async def wait_for_store_closes(self) -> None:
+        """Wait until all scheduled child-store lease releases finish."""
+
+        while self._store_close_tasks:
+            await asyncio.gather(
+                *tuple(self._store_close_tasks), return_exceptions=False
+            )
+
     async def wait(self) -> None:
         current = asyncio.current_task()
         while True:
@@ -352,6 +366,7 @@ class BackgroundAgentOwner:
                 watcher for watcher in self._watchers.values() if watcher is not current
             )
             if not watchers:
+                await self.wait_for_store_closes()
                 return
             await asyncio.gather(*watchers, return_exceptions=True)
 
@@ -583,6 +598,7 @@ def _recover_nested_children(
     store: ConversationStore,
     notification_store: ConversationStore,
     notification_index: dict[str, ConversationEntry],
+    recovery_stores: dict[Path, ConversationStore],
 ) -> None:
     """Cancel descendants left behind when an ancestor session exits."""
 
@@ -597,11 +613,14 @@ def _recover_nested_children(
     for marker_key, marker in child_markers.items():
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
-        child_store = _open_child_store(store, child_path)
-        with child_store if child_store is not None else nullcontext():
+        child_store = recovery_stores.get(child_path)
+        with nullcontext():
             if child_store is not None:
                 _recover_nested_children(
-                    child_store, notification_store, notification_index
+                    child_store,
+                    notification_store,
+                    notification_index,
+                    recovery_stores,
                 )
             existing_result = _existing_tool_result(store, tool_call.id)
             notification_status: str | None = None
@@ -746,6 +765,48 @@ def _recover_nested_children(
             store.finish_agent_child(marker_key)
 
 
+def _acquire_recovery_subtree(
+    parent_store: ConversationStore,
+    child_path: Path,
+    leases: ExitStack,
+    recovery_stores: dict[Path, ConversationStore],
+) -> bool:
+    child_store = _open_child_store(parent_store, child_path)
+    if child_store is None:
+        return True
+    leases.enter_context(child_store)
+    if not leases.enter_context(child_store.orphan_recovery_lease()):
+        return False
+    recovery_stores[child_path] = child_store
+    return all(
+        _acquire_recovery_subtree(
+            child_store,
+            Path(marker["child_session_path"]),
+            leases,
+            recovery_stores,
+        )
+        for marker in child_store.agent_children().values()
+    )
+
+
+class _DetachedRecoveryLoop:
+    def __init__(
+        self,
+        source: _AgentLoopForRecovery,
+        store: ConversationStore,
+        notification_store: ConversationStore,
+    ) -> None:
+        self.store = store
+        self._background_owner = BackgroundAgentOwner(notification_store)
+        self._source = source
+
+    def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
+        return self.store.tool_result(tool_call_id)
+
+    def _canceled_agent_result(self, tool_call_id: str, **kwargs: Any) -> ToolResult:
+        return self._source._canceled_agent_result(tool_call_id, **kwargs)
+
+
 def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
     """Resolve child markers left by a process exit before resuming."""
 
@@ -764,13 +825,19 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         agents_root = loop.store.session_dir / "agents"
-        child_store = _open_child_store(loop.store, child_path)
-        with child_store if child_store is not None else nullcontext():
+        recovery_stores: dict[Path, ConversationStore] = {}
+        with ExitStack() as recovery_leases:
+            if not _acquire_recovery_subtree(
+                loop.store, child_path, recovery_leases, recovery_stores
+            ):
+                continue
+            child_store = recovery_stores.get(child_path)
             if child_store is not None:
                 _recover_nested_children(
                     child_store,
                     notification_store,
                     notification_index,
+                    recovery_stores,
                 )
             if marker.get("background"):
                 child_instance_id = marker.get(
@@ -939,6 +1006,36 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
     recover_orphaned_questions(loop.store)
 
 
+async def recover_agent_children_off_loop(loop: _AgentLoopForRecovery) -> None:
+    """Repair orphaned child trees without lease or close work on the loop."""
+
+    root = loop.store
+    notification = loop._background_owner.notification_store
+
+    def recover() -> None:
+        with ConversationStore(
+            root.root_dir, session_id=root.session_id, cwd=root.cwd
+        ) as worker_root:
+            if notification is root:
+                recover_agent_children(
+                    _DetachedRecoveryLoop(loop, worker_root, worker_root)
+                )
+                return
+            with ConversationStore(
+                notification.root_dir,
+                session_id=notification.session_id,
+                cwd=notification.cwd,
+            ) as worker_notification:
+                recover_agent_children(
+                    _DetachedRecoveryLoop(loop, worker_root, worker_notification)
+                )
+
+    await root._to_thread_store(recover)
+    root.refresh()
+    if notification is not root:
+        notification.refresh()
+
+
 BuildResult = Callable[..., dict[str, object]]
 
 
@@ -956,7 +1053,7 @@ async def finish_background_child(
     build_result: BuildResult,
     validate_result: Callable[[object, str], ToolResult],
     publish_event: Callable[[StreamEvent], None],
-    cleanup: Callable[[], None],
+    cleanup: Callable[[], Awaitable[None] | None],
     close_child: Callable[[], Awaitable[tuple[str, ...]]],
     error_message: Callable[[BaseException], str],
     marker_key: str | None = None,
@@ -1220,4 +1317,6 @@ async def finish_background_child(
             # releasing the child store descriptor.
             await asyncio.sleep(0)
         finally:
-            cleanup()
+            cleanup_result = cleanup()
+            if inspect.isawaitable(cleanup_result):
+                await cleanup_result

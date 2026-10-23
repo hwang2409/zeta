@@ -21,6 +21,7 @@ from typing import Any, Literal, TypeVar
 from ...agent.background import (
     BackgroundAgentOwner,
     recover_agent_children,
+    recover_agent_children_off_loop,
 )
 from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.durable import durable_message
@@ -223,6 +224,7 @@ class AgentLoop(
         self._mcp_notice_sink: Callable[[str], None] | None = None
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
+        self._children_recovered = False
         self._closed = False
         self._turn_active = False
         self.explicit_finish = False
@@ -236,7 +238,11 @@ class AgentLoop(
         self._turn_output_tokens: int | None = None
         self.memory_reconciler: AutoMemoryReconciler | None = None
         self._turn_provider_retry_records: list[dict[str, object]] = []
-        recover_agent_children(self)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            recover_agent_children(self)
+            self._children_recovered = True
         self.tool_registry = select_tool_registry(
             store,
             tools=tools,
@@ -634,7 +640,10 @@ class AgentLoop(
                 killed = await self.tool_registry.close()
             finally:
                 if self.agent_depth == 0:
-                    self._background_owner.store_leases.close()
+                    await self._background_owner.wait_for_store_closes()
+                    await self.store._to_thread_store(
+                        self._background_owner.store_leases.close
+                    )
         return killed
 
     def session_start(self) -> None:
@@ -646,6 +655,9 @@ class AgentLoop(
         if self._activated:
             return
         self._activated = True
+        if not self._children_recovered:
+            await recover_agent_children_off_loop(self)
+            self._children_recovered = True
         self.session_start()
         if self.memory_reconciler is not None:
             self.memory_reconciler.activity()
@@ -1129,6 +1141,7 @@ class AgentLoop(
                 raise
             finally:
                 await dispatch.aclose()
+                await self._background_owner.wait_for_store_closes()
             await self._check_project_inbox()
             yield StreamEvent(
                 StreamEventType.TURN_END,
