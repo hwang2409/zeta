@@ -21,6 +21,11 @@ class AgentLoopForRecovery(Protocol):
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None: ...
 
 
+class _RecoveryOwner:
+    def __init__(self, notification_store: ConversationStore) -> None:
+        self.notification_store = notification_store
+
+
 class _DetachedRecoveryLoop:
     def __init__(
         self,
@@ -29,9 +34,7 @@ class _DetachedRecoveryLoop:
         notification_store: ConversationStore,
     ) -> None:
         self.store = store
-        self._background_owner = type(
-            "RecoveryOwner", (), {"notification_store": notification_store}
-        )()
+        self._background_owner = _RecoveryOwner(notification_store)
         self._source = source
 
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
