@@ -345,6 +345,8 @@ def merge_exception(
 async def close_transport_resources(
     *closes: Awaitable[object],
 ) -> tuple[object | BaseException, ...]:
+    """Close every owned resource without consuming caller cancellation."""
+
     tasks = tuple(asyncio.create_task(close) for close in closes)
     if task_is_cancelling():
         await asyncio.sleep(0)
