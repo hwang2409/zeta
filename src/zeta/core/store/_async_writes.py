@@ -61,7 +61,11 @@ class AsyncDurableWritesMixin:
             )
             try:
                 result = getattr(writer, method_name)(*args, **kwargs)
-                return result, writer._detach_log_state()
+                return (
+                    result,
+                    writer._detach_log_state(),
+                    writer.take_persisted_appends(),
+                )
             finally:
                 writer.close()
         finally:
@@ -220,7 +224,7 @@ class AsyncDurableWritesMixin:
             cancelled = False
             while True:
                 try:
-                    result, state = await asyncio.shield(write)
+                    result, state, receipts = await asyncio.shield(write)
                     break
                 except asyncio.CancelledError:
                     # Repeated cancellation must not release the caller while a
@@ -242,6 +246,7 @@ class AsyncDurableWritesMixin:
             with self._durable_write_condition:
                 if not self._closing and not self._closed:
                     previous = self._install_log_state(state)
+                    self._accept_persisted_appends(receipts)
             if previous is not None:
                 release = loop.run_in_executor(
                     None, self._release_detached_log_state, previous
