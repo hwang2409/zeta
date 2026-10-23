@@ -30,7 +30,8 @@ from .payload_common import (
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
-    close_transport_resources,
+    cleanup_transport,
+    close_resource,
     provider_retry_notice,
     retry_after_seconds,
     retry_provider_completion,
@@ -212,7 +213,7 @@ class OllamaBackend(CompletionBackend):
             async for event in attempts:
                 yield event
         finally:
-            await attempts.aclose()
+            await close_resource(attempts)
 
     async def _complete_once(
         self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
@@ -227,6 +228,9 @@ class OllamaBackend(CompletionBackend):
         if tools:
             payload["tools"] = tools
         client = self.client or httpx.AsyncClient(timeout=self.timeout)
+        stream = None
+        entered = False
+        primary_exception: BaseException | None = None
         try:
             def stall_error(elapsed: float) -> OllamaError:
                 error = OllamaError(
@@ -241,6 +245,7 @@ class OllamaBackend(CompletionBackend):
             response = await wait_for_response_headers(
                 stream.__aenter__(), self.stall_seconds, "Ollama", OllamaError
             )
+            entered = True
             try:
                 if response.status_code >= 400:
                     body = bytearray()
@@ -380,17 +385,31 @@ class OllamaBackend(CompletionBackend):
                     message=Message(MessageRole.ASSISTANT, content),
                     data={"usage": normalize_usage(usage), "stop_reason": stop_reason},
                 )
-            finally:
-                await stream.__aexit__(None, None, None)
+            except httpx.TransportError as exc:
+                primary_exception = OllamaError(
+                    f"Ollama connection failed: {exc}", retryable=True
+                )
+                primary_exception.__cause__ = exc
+            except BaseException as exc:  # noqa: BLE001 - cleanup preserves control
+                primary_exception = exc
         except httpx.TransportError as exc:
-            raise OllamaError(
+            primary_exception = OllamaError(
                 f"Ollama connection failed: {exc}", retryable=True
-            ) from exc
+            )
+            primary_exception.__cause__ = exc
+        except BaseException as exc:  # noqa: BLE001 - cleanup preserves control
+            primary_exception = exc
         finally:
-            if self.client is None:
-                (close_result,) = await close_transport_resources(client.aclose())
-                if isinstance(close_result, BaseException):
-                    raise close_result
+            primary_exception = await cleanup_transport(
+                stream_context=stream,
+                entered=entered,
+                client=client,
+                owns_client=self.client is None,
+                primary_exception=primary_exception,
+                http_error_type=OllamaError,
+            )
+            if primary_exception is not None:
+                raise primary_exception
 
 
 __all__ = ["DEFAULT_OLLAMA_MODEL", "OLLAMA_API_URL", "OllamaBackend", "OllamaError"]

@@ -23,6 +23,19 @@ from .stream_diagnostics import StreamDiagnostics
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
 DEFAULT_STREAM_STALL_SECONDS = 90.0
 DEFAULT_STREAM_STALL_RETRIES = 2
+_BACKGROUND_CLOSE_TASKS: set[asyncio.Task[object]] = set()
+
+
+def _release_background_close(task: asyncio.Task[object]) -> None:
+    _BACKGROUND_CLOSE_TASKS.discard(task)
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+def _retain_background_closes(tasks: tuple[asyncio.Task[object], ...]) -> None:
+    for task in tasks:
+        _BACKGROUND_CLOSE_TASKS.add(task)
+        task.add_done_callback(_release_background_close)
 
 
 def retry_after_seconds(headers: Mapping[str, str] | None) -> float | None:
@@ -207,7 +220,7 @@ async def retry_provider_completion(
         except RuntimeError as exc:
             error = exc
         finally:
-            await attempt.aclose()
+            await close_resource(attempt)
         if error is None:
             if pending_truncated_end is not None:
                 yield pending_truncated_end
@@ -347,19 +360,46 @@ async def close_transport_resources(
 ) -> tuple[object | BaseException, ...]:
     """Close every owned resource without consuming caller cancellation."""
 
-    tasks = tuple(asyncio.create_task(close) for close in closes)
-    if task_is_cancelling():
-        await asyncio.sleep(0)
-        for task in tasks:
+    created: list[asyncio.Task[object]] = []
+    try:
+        for close in closes:
+            created.append(asyncio.create_task(close))
+        tasks = tuple(created)
+        if task_is_cancelling():
+            await asyncio.sleep(0)
+            for task in tasks:
+                task.cancel()
+        results = tuple(await asyncio.gather(*tasks, return_exceptions=True))
+        cancellation = next(
+            (result for result in results if isinstance(result, asyncio.CancelledError)),
+            None,
+        )
+        if cancellation is not None:
+            raise cancellation
+        return results
+    finally:
+        tasks = tuple(created)
+        pending = tuple(task for task in tasks if not task.done())
+        for task in pending:
             task.cancel()
-    results = tuple(await asyncio.gather(*tasks, return_exceptions=True))
-    cancellation = next(
-        (result for result in results if isinstance(result, asyncio.CancelledError)),
-        None,
+        if task_is_cancelling():
+            _retain_background_closes(tasks)
+        elif pending:
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                _retain_background_closes(tasks)
+                raise
+
+
+async def close_resource(resource: object) -> None:
+    """Close one async resource through the shared cancellation-safe owner."""
+
+    (result,) = await close_transport_resources(
+        resource.aclose()  # type: ignore[attr-defined]
     )
-    if cancellation is not None:
-        raise cancellation
-    return results
+    if isinstance(result, BaseException):
+        raise result
 
 
 async def cleanup_transport[ErrorT: RuntimeError](

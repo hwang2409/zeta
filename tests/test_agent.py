@@ -69,6 +69,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.providers.codex import CodexStreamError
+from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
@@ -2618,6 +2619,83 @@ def _finish_gate_with_running_task(
     state = FinishGateState()
     state.start(child_loop)
     return store, child_loop, state
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_ollama_close_obeys_task_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Response:
+        status_code = 200
+
+        async def aiter_lines(self) -> AsyncIterator[str]:
+            yield '{"message":{"content":"partial"}}'
+            await asyncio.Event().wait()
+
+    class StreamContext:
+        def __init__(self) -> None:
+            self.close_started = asyncio.Event()
+            self.close_cancelled = asyncio.Event()
+
+        async def __aenter__(self) -> Response:
+            return Response()
+
+        async def __aexit__(self, *args: object) -> None:
+            self.close_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.close_cancelled.set()
+                raise
+
+    class OwnedClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.stream_context = StreamContext()
+            self.close_started = asyncio.Event()
+            self.close_cancelled = asyncio.Event()
+            clients.append(self)
+
+        def stream(self, *args: object, **kwargs: object) -> StreamContext:
+            return self.stream_context
+
+        async def aclose(self) -> None:
+            self.close_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.close_cancelled.set()
+                raise
+
+    clients: list[OwnedClient] = []
+    monkeypatch.setattr("zeta.providers.ollama.httpx.AsyncClient", OwnedClient)
+    store, child_loop, state = _finish_gate_with_running_task(
+        tmp_path, task_timeout=0.02
+    )
+    started = asyncio.get_running_loop().time()
+
+    async def consume_stream(
+        stream: AsyncIterator[StreamEvent], control: FinishGateControl | None
+    ) -> None:
+        del control
+        async for _event in stream:
+            pass
+
+    result = await asyncio.wait_for(
+        state.run_model_turn(
+            child_loop, OllamaBackend(stall_seconds=0).complete([], []), consume_stream
+        ),
+        timeout=0.1,
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+    await asyncio.sleep(0)
+
+    assert elapsed < 0.05
+    assert result is not None
+    assert result.outcome == "task_safety_expired"
+    assert clients and clients[0].stream_context.close_cancelled.is_set()
+    assert clients[0].close_started.is_set()
+    assert clients[0].close_cancelled.is_set()
+    store.close()
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,6 @@
 import asyncio
+import gc
+import weakref
 from collections.abc import AsyncIterator
 
 import httpx
@@ -18,7 +20,49 @@ from zeta.providers.anthropic_errors import AnthropicStreamError
 from zeta.providers.codex_errors import CodexHTTPError
 from zeta.providers.ollama import OllamaError
 from zeta.providers.retry_policy import ProviderRetryBudget, retryable_provider_error
-from zeta.providers.transport import retry_provider_completion
+from zeta.providers.transport import (
+    close_transport_resources,
+    retry_provider_completion,
+)
+
+
+@pytest.mark.asyncio
+async def test_transport_close_survives_overlapping_cancellation() -> None:
+    started = [asyncio.Event(), asyncio.Event()]
+    close_tasks: list[asyncio.Task[None]] = []
+
+    async def block(index: int) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        close_tasks.append(task)
+        started[index].set()
+        await asyncio.Event().wait()
+
+    async def cancel_then_close() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await close_transport_resources(block(0), block(1))
+
+    owner = asyncio.create_task(cancel_then_close())
+    await asyncio.sleep(0)
+    owner.cancel()
+    asyncio.get_running_loop().call_soon(owner.cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    await asyncio.sleep(0)
+
+    assert all(event.is_set() for event in started)
+    assert all(task.done() for task in close_tasks)
+    assert not set(close_tasks) & asyncio.all_tasks()
+    close_refs = [weakref.ref(task) for task in close_tasks]
+    close_tasks.clear()
+    gc.collect()
+    assert all(
+        reference() is None or reference().done()  # type: ignore[union-attr]
+        for reference in close_refs
+    )
 
 
 @pytest.mark.parametrize("status_code", [520, 521, 522, 523, 524, 529])

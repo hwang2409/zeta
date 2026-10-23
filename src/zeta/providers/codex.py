@@ -40,6 +40,7 @@ from .transport import (
     DEFAULT_STREAM_STALL_SECONDS,
     StreamFinished,
     cleanup_transport,
+    close_resource,
     is_control_exception,
     provider_retry_notice,
     request_error,
@@ -225,7 +226,7 @@ class CodexBackend(CompletionBackend):
             async for event in attempts:
                 yield event
         finally:
-            await attempts.aclose()
+            await close_resource(attempts)
 
     async def _refresh_token(self) -> str:
         client = self.client or httpx.AsyncClient(timeout=None)
@@ -233,7 +234,7 @@ class CodexBackend(CompletionBackend):
             return await self.token_store.refresh_token(client)
         finally:
             if self.client is None:
-                await client.aclose()
+                await close_resource(client)
 
     async def _complete_once(
         self,
