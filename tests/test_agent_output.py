@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.agent.background import adopt_agent_children
+from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.receipt import (
     build_agent_receipt,
     encode_json,

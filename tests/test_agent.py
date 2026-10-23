@@ -1372,6 +1372,57 @@ async def _wait_for_no_agent_children(store: ConversationStore) -> None:
     raise AssertionError("background child cleanup did not finish")
 
 
+def _probe_child_recovery_lease(child: ConversationStore) -> bool:
+    script = """
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+fd = os.open(Path(sys.argv[1]) / sys.argv[2] / "runtime.lease", os.O_RDWR)
+try:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("busy")
+    else:
+        print("acquired")
+finally:
+    os.close(fd)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(child.root_dir), child.session_id],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() == "acquired"
+
+
+@pytest.mark.asyncio
+async def test_live_child_holds_runtime_lease_until_store_close(
+    tmp_path: Path,
+) -> None:
+    backend = BackgroundBackend([_background_agent_call()])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=5)
+    child = next(iter(loop._agent_child_stores.values()))
+    assert not await asyncio.to_thread(_probe_child_recovery_lease, child)
+
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+    for _ in range(100):
+        if await asyncio.to_thread(_probe_child_recovery_lease, child):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("child runtime lease was not released")
+    await loop.close()
+
+
 @pytest.mark.asyncio
 async def test_background_agent_returns_handle_and_parent_continues(
     tmp_path: Path,
@@ -3121,10 +3172,11 @@ async def test_resume_drops_corrupt_lifecycle_killed_task_metadata(
     child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
 
     resumed = ConversationStore(tmp_path, session_id="parent")
+    loop = AgentLoop(
+        BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty()
+    )
     with pytest.warns(RuntimeWarning, match="dropping it"):
-        loop = AgentLoop(
-            BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty()
-        )
+        await loop.activate()
 
     notification = resumed.agent_notifications()[0]
     assert notification.data["status"] == "completed"
@@ -5198,18 +5250,18 @@ async def test_parent_result_append_precedes_marker_cleanup(
         raise RuntimeError("crash after parent result")
 
     monkeypatch.setattr(store, "finish_agent_child", fail_cleanup)
+    crashing_loop = AgentLoop(
+        backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
     with pytest.raises(RuntimeError, match="crash after parent result"):
-        await _collect(
-            AgentLoop(
-                backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-            ).run_turn("start", origin=MessageOrigin.USER)
-        )
+        await _collect(crashing_loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert store.agent_children()
+    await crashing_loop.close()
     replayed = ConversationStore(tmp_path, session_id=store.session_id)
-    AgentLoop(
+    await AgentLoop(
         FakeBackend([]), replayed, max_turns=1, skill_catalog=SkillCatalog.empty()
-    )
+    ).activate()
     results = [
         message.tool_result for message in replayed.messages() if message.tool_result
     ]
@@ -5245,27 +5297,27 @@ async def test_resume_reuses_exact_foreground_terminal_receipt(
         append_message(message)
 
     monkeypatch.setattr(store, "append_message", crash_before_parent_result)
+    crashing_loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
     with pytest.raises(RuntimeError, match="crash before parent result"):
-        await _collect(
-            AgentLoop(
-                backend,
-                store,
-                registry=registry,
-                max_turns=1,
-                skill_catalog=SkillCatalog.empty(),
-            ).run_turn("start", origin=MessageOrigin.USER)
-        )
+        await _collect(crashing_loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert len(original_receipts) == 1
+    await crashing_loop.close()
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     lifecycle = child.agent_lifecycle()
     assert lifecycle is not None
     assert lifecycle["final_result"] == original_receipts[0]
 
     replayed = ConversationStore(tmp_path, session_id=store.session_id)
-    AgentLoop(
+    await AgentLoop(
         FakeBackend([]), replayed, max_turns=1, skill_catalog=SkillCatalog.empty()
-    )
+    ).activate()
     recovered = [
         message.tool_result for message in replayed.messages() if message.tool_result
     ]
@@ -10654,6 +10706,358 @@ async def test_parent_exit_cancels_idle_child_subtree_and_cleans_receipts(
     await owner.wait()
     assert set(canceled) == {"root:1", "root:1:1"}
     assert not owner.running
+    store.close()
+
+
+def _start_child_lease_holder(
+    child: ConversationStore,
+    ready: Path,
+    stop: Path,
+    *,
+    append_started: Path | None = None,
+    recovery_done: Path | None = None,
+    append_finished: Path | None = None,
+) -> subprocess.Popen[str]:
+    script = """
+import sys
+import time
+from pathlib import Path
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
+
+store = ConversationStore(Path(sys.argv[1]), session_id=sys.argv[2])
+store.activate_runtime_lease()
+Path(sys.argv[3]).write_text("ready")
+stop = Path(sys.argv[4])
+append_started = None if sys.argv[5] == "-" else Path(sys.argv[5])
+recovery_done = None if sys.argv[6] == "-" else Path(sys.argv[6])
+append_finished = None if sys.argv[7] == "-" else Path(sys.argv[7])
+if append_started is not None:
+    index = 0
+    while not recovery_done.exists() and not stop.exists():
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"concurrent append {index}")]),
+                MessageOrigin.AGENT_PROMPT,
+            )
+        )
+        index += 1
+        if index == 1:
+            append_started.write_text("started")
+    if recovery_done.exists():
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"concurrent append {index}")]),
+                MessageOrigin.AGENT_PROMPT,
+            )
+        )
+        append_finished.write_text("finished")
+while not stop.exists():
+    time.sleep(0.01)
+store.close()
+"""
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(child.root_dir),
+            child.session_id,
+            str(ready),
+            str(stop),
+            str(append_started) if append_started is not None else "-",
+            str(recovery_done) if recovery_done is not None else "-",
+            str(append_finished) if append_finished is not None else "-",
+        ],
+        text=True,
+    )
+    for _ in range(500):
+        if ready.exists():
+            return process
+        if process.poll() is not None:
+            raise AssertionError(f"lease holder exited with {process.returncode}")
+        import time
+
+        time.sleep(0.01)
+    _reap_lease_holder(process)
+    raise AssertionError("lease holder did not become ready")
+
+
+def _reap_lease_holder(process: subprocess.Popen[str]) -> None:
+    """Kill and reap a lease holder so a failed test cannot leave it running."""
+
+    process.kill()
+    process.wait(timeout=10)
+
+
+def _stop_lease_holder(process: subprocess.Popen[str], stop: Path) -> None:
+    stop.write_text("stop")
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _reap_lease_holder(process)
+        raise
+
+
+def _seed_recoverable_child(
+    parent: ConversationStore,
+    *,
+    number: str = "1",
+    parent_handle: str = "root",
+) -> ConversationStore:
+    child = ConversationStore(parent.session_dir / "agents", session_id=number)
+    call = ToolCall(
+        f"agent-{number}",
+        "agent",
+        {"prompt": "work", "description": "worker", "background": True},
+    )
+    child.mark_agent_parent(call.id, agent_type="worker")
+    child.start_agent_lifecycle(
+        handle=f"{parent_handle}:{number}",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="work",
+    )
+    parent.register_agent_child(
+        call,
+        child_session_path=str(child.session_dir),
+        description="worker",
+        agent_type="worker",
+        background=True,
+        child_instance_id=f"{parent_handle}:{number}",
+        accepts_follow_ups=True,
+        explicit_finish=True,
+    )
+    return child
+
+
+@pytest.mark.asyncio
+async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = _seed_recoverable_child(root)
+    dead_child = _seed_recoverable_child(root, number="2")
+    root.append_child_question(
+        child_instance_id="root:1", question_id="busy-question", question="wait?"
+    )
+    root.append_child_question(
+        child_instance_id="root:1:1",
+        question_id="busy-descendant-question",
+        question="wait?",
+    )
+    root.append_child_question(
+        child_instance_id="root:2", question_id="dead-question", question="wait?"
+    )
+    child.close()
+    dead_child.close()
+    ready = tmp_path / "ready"
+    stop = tmp_path / "stop"
+    root.append_child_idle_notification(
+        "root:1",
+        child_session_path=str(child.session_dir),
+        description="worker",
+        text="WAIT",
+    )
+    root.append_child_idle_notification(
+        "root:1:1",
+        child_session_path=str(child.session_dir / "agents" / "1"),
+        description="worker",
+        text="WAIT",
+    )
+    busy_notice_ids = {
+        entry.id
+        for entry in root.agent_notifications(pending_only=False)
+        if (
+            entry.data.get("child_instance_id") == "root:1"
+            or str(entry.data.get("child_instance_id", "")).startswith("root:1:")
+        )
+        and entry.data.get("kind") in {"agent_completion", "child_idle"}
+    }
+    append_started = tmp_path / "append-started"
+    recovery_done = tmp_path / "recovery-done"
+    append_finished = tmp_path / "append-finished"
+    holder = _start_child_lease_holder(
+        child,
+        ready,
+        stop,
+        append_started=append_started,
+        recovery_done=recovery_done,
+        append_finished=append_finished,
+    )
+    try:
+        for _ in range(500):
+            if append_started.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert append_started.exists()
+
+        loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
+        await loop.activate()
+        observed = ConversationStore(root.session_dir / "agents", session_id="1")
+        appends_before_recovery_returned = [
+            message.content[0].text
+            for message in observed.messages()
+            if message.role is MessageRole.USER
+            and len(message.content) == 1
+            and isinstance(message.content[0], TextContent)
+            and message.content[0].text.startswith("concurrent append ")
+        ]
+        observed.close()
+        assert appends_before_recovery_returned
+        recovery_done.write_text("done")
+        for _ in range(500):
+            if append_finished.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert append_finished.exists()
+
+        assert set(root.agent_children()) == {"root:1"}
+        active_questions = {
+            entry.data["question_id"]
+            for entry in root.agent_notifications()
+            if entry.data.get("kind") == "child_question"
+        }
+        all_notifications = root.agent_notifications(pending_only=False)
+        withdrawn_questions = {
+            entry.data.get("question_id")
+            for entry in all_notifications
+            if entry.data.get("kind") == "child_question_withdrawn"
+        }
+        assert active_questions == {"busy-question", "busy-descendant-question"}
+        assert "busy-question" not in withdrawn_questions
+        assert "busy-descendant-question" not in withdrawn_questions
+        assert "dead-question" in withdrawn_questions
+
+        busy_status_notices = [
+            entry
+            for entry in all_notifications
+            if (
+                entry.data.get("child_instance_id") == "root:1"
+                or str(entry.data.get("child_instance_id", "")).startswith("root:1:")
+            )
+            and entry.data.get("kind") in {"agent_completion", "child_idle"}
+        ]
+        assert {entry.id for entry in busy_status_notices} == busy_notice_ids
+        pending_notice_ids = {entry.id for entry in root.agent_notifications()}
+        assert busy_notice_ids <= pending_notice_ids
+        acknowledged_notice_ids = {
+            entry.data["notification_id"]
+            for entry in root.replay()
+            if entry.type == "notification_ack"
+        }
+        assert busy_notice_ids.isdisjoint(acknowledged_notice_ids)
+
+        dead_completions = [
+            entry
+            for entry in all_notifications
+            if entry.data.get("kind") == "agent_completion"
+            and entry.data.get("child_instance_id") == "root:2"
+        ]
+        assert len(dead_completions) == 1
+        dead_observed = ConversationStore(
+            root.session_dir / "agents", session_id="2"
+        )
+        assert dead_observed.agent_lifecycle()["state"] == "canceled"
+        assert dead_observed.agent_canceled() is not None
+        dead_observed.close()
+
+        observed = ConversationStore(root.session_dir / "agents", session_id="1")
+        assert observed.agent_canceled() is None
+        all_appends = [
+            message.content[0].text
+            for message in observed.messages()
+            if message.role is MessageRole.USER
+            and len(message.content) == 1
+            and isinstance(message.content[0], TextContent)
+            and message.content[0].text.startswith("concurrent append ")
+        ]
+        observed.close()
+        assert len(all_appends) > len(appends_before_recovery_returned)
+        assert all_appends == [
+            f"concurrent append {index}" for index in range(len(all_appends))
+        ]
+        await loop.close()
+    finally:
+        _stop_lease_holder(holder, stop)
+
+    repaired_root = ConversationStore(tmp_path, session_id="root")
+    repaired_loop = AgentLoop(
+        FakeBackend([]), repaired_root, skill_catalog=SkillCatalog.empty()
+    )
+    await repaired_loop.activate()
+    assert repaired_root.agent_children() == {}
+    repaired_completions = [
+        entry
+        for entry in repaired_root.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "agent_completion"
+    ]
+    assert [
+        entry.data.get("child_instance_id") for entry in repaired_completions
+    ].count("root:1") == 1
+    assert [
+        entry.data.get("child_instance_id") for entry in repaired_completions
+    ].count("root:2") == 1
+    assert not [
+        entry
+        for entry in repaired_root.agent_notifications()
+        if entry.data.get("kind") == "child_question"
+    ]
+    assert {
+        entry.data.get("question_id")
+        for entry in repaired_root.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "child_question_withdrawn"
+    } == {"busy-question", "busy-descendant-question", "dead-question"}
+    repaired_child = ConversationStore(
+        repaired_root.session_dir / "agents", session_id="1"
+    )
+    assert repaired_child.agent_canceled() is not None
+    repaired_child.close()
+    await repaired_loop.close()
+    repaired_root.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_skips_ancestor_when_descendant_is_leased(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = _seed_recoverable_child(root)
+    descendant = _seed_recoverable_child(
+        child, number="1", parent_handle="root:1"
+    )
+    descendant.close()
+    child.close()
+    ready = tmp_path / "ready"
+    stop = tmp_path / "stop"
+    holder = _start_child_lease_holder(descendant, ready, stop)
+    try:
+        loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
+        await loop.activate()
+        assert root.agent_children()
+        observed = ConversationStore(root.session_dir / "agents", session_id="1")
+        assert observed.agent_children()
+        assert observed.agent_canceled() is None
+        observed.close()
+        await loop.close()
+    finally:
+        _stop_lease_holder(holder, stop)
+    root.close()
+
+
+@pytest.mark.asyncio
+async def test_child_lease_work_never_runs_on_event_loop(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    with (
+        pytest.raises(RuntimeError, match="event-loop thread"),
+        store.orphan_recovery_lease(),
+    ):
+        pass
     store.close()
 
 

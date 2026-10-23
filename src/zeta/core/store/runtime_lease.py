@@ -8,9 +8,13 @@ from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 
 from ..checkpoints import ConversationIntegrityError
-from ..session_files import open_session_file
+from ..session_files import open_session_file, require_off_loop_lock
 
 RUNTIME_LEASE_NAME = "runtime.lease"
+
+
+class RuntimeLeaseLoopThreadLockError(RuntimeError):
+    """Raised before a runtime lease can block an asyncio event-loop thread."""
 
 
 class StoreRuntimeLeaseMixin:
@@ -24,6 +28,15 @@ class StoreRuntimeLeaseMixin:
         if self._runtime_lease is None:
             raise ConversationIntegrityError("read-only store has no runtime lease")
         self._runtime_lease.activate()
+
+    @contextmanager
+    def orphan_recovery_lease(self) -> Iterator[bool]:
+        """Hold exclusive ownership while repairing an orphaned session."""
+
+        if self._runtime_lease is None:
+            raise ConversationIntegrityError("read-only store has no runtime lease")
+        with self._runtime_lease.try_recovery() as acquired:
+            yield acquired
 
     @contextmanager
     def prompt_resume_lease(self) -> Iterator[bool]:
@@ -58,6 +71,25 @@ class SessionRuntimeLease:
         if not self._shared:
             fcntl.flock(self._fd, fcntl.LOCK_SH)
             self._shared = True
+
+    @contextmanager
+    def try_recovery(self) -> Iterator[bool]:
+        """Try to hold an exclusive lease without waiting for a live runtime."""
+
+        require_off_loop_lock("session runtime lease", RuntimeLeaseLoopThreadLockError)
+        if self._fd < 0:
+            raise RuntimeError("session runtime lease is closed")
+        if self._shared:
+            raise RuntimeError("session runtime lease is already active")
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
 
     @contextmanager
     def resume(self) -> Iterator[bool]:

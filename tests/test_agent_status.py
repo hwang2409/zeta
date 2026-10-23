@@ -196,7 +196,9 @@ async def test_parent_ownership_survives_lifecycle_start_crash(
 
     monkeypatch.undo()
     resumed = ConversationStore(tmp_path, session_id=store.session_id)
-    AgentLoop(FakeBackend([]), resumed, max_turns=1, skill_catalog=SkillCatalog.empty())
+    await AgentLoop(
+        FakeBackend([]), resumed, max_turns=1, skill_catalog=SkillCatalog.empty()
+    ).activate()
     assert not resumed.agent_children()
     assert (
         ConversationStore(store.session_dir / "agents", session_id="1").agent_canceled()

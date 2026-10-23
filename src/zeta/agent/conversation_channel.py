@@ -19,14 +19,21 @@ def has_follow_up_loop(*, accepts_follow_ups: bool, background: bool) -> bool:
     return accepts_follow_ups and background
 
 
-def recover_orphaned_questions(store: ConversationStore) -> int:
+def recover_orphaned_questions(
+    store: ConversationStore, *, excluded_child_subtrees: set[str] | None = None
+) -> int:
     """Withdraw persisted questions whose child did not survive restart."""
 
+    excluded_child_subtrees = excluded_child_subtrees or set()
     child_ids = {
         child_id
         for entry in store.agent_notifications()
         if entry.data.get("kind") == "child_question"
         and type(child_id := entry.data.get("child_instance_id")) is str
+        and not any(
+            child_id == root or child_id.startswith(f"{root}:")
+            for root in excluded_child_subtrees
+        )
     }
     return sum(
         store.close_child_questions(child_id, reason="canceled")

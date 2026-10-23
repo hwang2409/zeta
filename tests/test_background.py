@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.agent.background import BackgroundAgentOwner
 from zeta.agent.notifications import NotificationWake
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.session import SessionManager
@@ -649,6 +650,40 @@ async def test_agent_store_closes_after_each_foreground_completion(
 
 
 @pytest.mark.asyncio
+async def test_wait_for_store_closes_does_not_spin_before_done_callback(
+    tmp_path: Path,
+) -> None:
+    class BoundedCloseTasks(set[asyncio.Task[None]]):
+        checks = 0
+
+        def __bool__(self) -> bool:
+            self.checks += 1
+            assert self.checks <= 3, "completed close task was gathered repeatedly"
+            return len(self) > 0
+
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store)
+    release_close = asyncio.Event()
+
+    async def gated_close() -> None:
+        await release_close.wait()
+
+    close_task = asyncio.create_task(gated_close())
+    close_tasks = BoundedCloseTasks({close_task})
+    owner._store_close_tasks = close_tasks
+    close_task.add_done_callback(close_tasks.discard)
+
+    async def wait_after_close_is_released() -> None:
+        await release_close.wait()
+        await owner.wait_for_store_closes()
+
+    waiter = asyncio.create_task(wait_after_close_is_released())
+    release_close.set()
+    await asyncio.wait_for(waiter, timeout=1)
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path) -> None:
     call = ToolCall(
         "background",
@@ -672,6 +707,7 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
         if not owner._stores:
             break
         await asyncio.sleep(0.01)
+    await owner.wait_for_store_closes()
     child_store = child_stores[0]
     with pytest.raises(OSError):
         os.fstat(child_store.directory_fd)
@@ -709,10 +745,8 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     tracked = []
     tracked_ready = asyncio.Event()
-    stores_released = asyncio.Event()
     owner = loop._background_owner
     track_stores = owner.track_store
-    release_stores = owner.release_unused_stores
 
     def track(child_store):
         tracked.append(child_store)
@@ -720,22 +754,7 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
         if len(tracked) == 2:
             tracked_ready.set()
 
-    def store_closed(child_store) -> bool:
-        try:
-            os.fstat(child_store.directory_fd)
-        except OSError:
-            return True
-        return False
-
-    def release() -> None:
-        release_stores()
-        if len(tracked) == 2 and all(
-            store_closed(child_store) for child_store in tracked
-        ):
-            stores_released.set()
-
     owner.track_store = track
-    owner.release_unused_stores = release
 
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
@@ -744,7 +763,7 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
         os.fstat(tracked[0].directory_fd)
 
         backend.completion_gate.set()
-        await asyncio.wait_for(stores_released.wait(), timeout=5)
+        await asyncio.wait_for(owner.wait(), timeout=5)
         for child_store in tracked:
             with pytest.raises(OSError):
                 os.fstat(child_store.directory_fd)

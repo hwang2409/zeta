@@ -53,6 +53,21 @@ class AsyncDurableWritesMixin:
                 self._durable_writes_in_flight -= 1
                 self._durable_write_condition.notify_all()
 
+    async def _to_thread_store(self: ConversationStore, function: Any, /) -> Any:
+        """Run one resident-store lease operation off-loop despite cancellation."""
+
+        write = asyncio.get_running_loop().run_in_executor(None, function)
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(write)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
     async def _to_thread_durable(
         self: ConversationStore,
         function: Any,
