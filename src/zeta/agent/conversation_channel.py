@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ..core.checkpoints import ConversationEntry
@@ -11,6 +12,14 @@ from ..core.store import ConversationStore
 
 if TYPE_CHECKING:
     from .background import BackgroundAgentOwner
+    from .pending_delivery import DeliveryInput, ProducerResult, StepDeliveryFlow
+
+
+@dataclass(slots=True)
+class _DeliveryTarget:
+    loop: asyncio.AbstractEventLoop
+    flow: StepDeliveryFlow
+    accepted: set[asyncio.Future[ProducerResult]] = field(default_factory=set)
 
 
 def has_follow_up_loop(*, accepts_follow_ups: bool, background: bool) -> bool:
@@ -52,6 +61,7 @@ class ConversationChannel:
         self._owner = owner
         self._root_store = root_store
         self._wakes: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Event]] = {}
+        self._delivery_targets: dict[str | None, _DeliveryTarget] = {}
         self._root_wake: Callable[[], None] | None = None
 
     def set_root_wake(self, callback: Callable[[], None] | None) -> None:
@@ -62,6 +72,42 @@ class ConversationChannel:
 
     def unregister_loop(self, instance_id: str) -> None:
         self._wakes.pop(instance_id, None)
+
+    def register_delivery_flow(
+        self,
+        instance_id: str | None,
+        flow: StepDeliveryFlow,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
+        if instance_id in self._delivery_targets:
+            raise RuntimeError(f"delivery flow already registered: {instance_id!r}")
+        self._delivery_targets[instance_id] = _DeliveryTarget(
+            loop or asyncio.get_running_loop(), flow
+        )
+
+    async def unregister_delivery_flow(self, instance_id: str | None) -> None:
+        target = self._delivery_targets.pop(instance_id, None)
+        if target is not None and target.accepted:
+            await asyncio.gather(*tuple(target.accepted), return_exceptions=True)
+
+    async def produce_to(
+        self, target_instance_id: str | None, item: DeliveryInput, /
+    ) -> ProducerResult:
+        target = self._delivery_targets.get(target_instance_id)
+        if target is None:
+            raise LookupError(f"no live delivery flow: {target_instance_id!r}")
+        if target.loop is asyncio.get_running_loop():
+            return await target.flow.produce(item)
+        concurrent = asyncio.run_coroutine_threadsafe(
+            target.flow.produce(item), target.loop
+        )
+        future = asyncio.wrap_future(concurrent)
+        target.accepted.add(future)
+        try:
+            return await future
+        finally:
+            target.accepted.discard(future)
 
     async def wait(self, instance_id: str) -> None:
         _loop, event = self._wakes[instance_id]
