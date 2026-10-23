@@ -7062,7 +7062,7 @@ async def test_provider_error_root_exit_admits_terminal_producer(
 
 
 @pytest.mark.asyncio
-async def test_provider_event_acks_exact_staged_ids_before_publication(
+async def test_provider_event_publishes_exact_staged_ids_before_acknowledgement(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -7087,8 +7087,8 @@ async def test_provider_event_acks_exact_staged_ids_before_publication(
         nonlocal publication_checked
         assert isinstance(value, pending_delivery_module.DeliveryPublications)
         assert asyncio.get_running_loop() is loop
-        assert prompt.entries[0].id not in store._active_pending_prompt_entries
-        assert notification.entries[0].id not in store._active_notifications
+        assert prompt.entries[0].id in store._active_pending_prompt_entries
+        assert notification.entries[0].id in store._active_notifications
         assert value.delivered_prompt is not None
         assert [entry.id for entry in value.notifications] == [
             notification.entries[0].id
@@ -7099,12 +7099,73 @@ async def test_provider_event_acks_exact_staged_ids_before_publication(
     loop = asyncio.get_running_loop()
     events = await _collect(
         observed_completion(
-            provider(), store, None, flow.acknowledge_active, publications
+            provider(),
+            store,
+            None,
+            flow.active_publications,
+            flow.acknowledge_active,
+            publications,
         )
     )
     assert publication_checked
     assert events[0].type is StreamEventType.CHILD_MESSAGE_DELIVERED
     assert events[1].type is StreamEventType.MESSAGE_START
+    assert prompt.entries[0].id not in store._active_pending_prompt_entries
+    assert notification.entries[0].id not in store._active_notifications
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_notification_ack_commit_keeps_completion_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    notification = await flow.produce(_task_exit_input("task-cancel-publication"))
+    await flow.prepare_request("terminal_fallback", [], None)
+    original_durable_write = type(store)._run_durable_write
+    ack_committed = threading.Event()
+    release_ack = threading.Event()
+
+    def pause_after_ack_commit(self, method_name, args, kwargs):
+        result = original_durable_write(self, method_name, args, kwargs)
+        if method_name == "_acknowledge_staged_delivery":
+            ack_committed.set()
+            assert release_ack.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(type(store), "_run_durable_write", pause_after_ack_commit)
+
+    async def provider():
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+
+    def publications(value: object):
+        assert isinstance(value, pending_delivery_module.DeliveryPublications)
+        assert [entry.id for entry in value.notifications] == [
+            notification.entries[0].id
+        ]
+        return iter((StreamEvent(StreamEventType.AGENT_NOTIFICATION),))
+
+    stream = observed_completion(
+        provider(),
+        store,
+        None,
+        flow.active_publications,
+        flow.acknowledge_active,
+        publications,
+    )
+    publication = await anext(stream)
+    assert publication.type is StreamEventType.AGENT_NOTIFICATION
+    next_event = asyncio.create_task(anext(stream))
+    assert await asyncio.to_thread(ack_committed.wait, 2)
+    next_event.cancel()
+    release_ack.set()
+    with pytest.raises(asyncio.CancelledError):
+        await next_event
+    await stream.aclose()
+
+    assert store.agent_notifications() == []
+    await flow.initialize()
+    store.close()
 
 
 @pytest.mark.asyncio

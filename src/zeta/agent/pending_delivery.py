@@ -88,6 +88,19 @@ class TerminalResult:
     closed_empty: bool
 
 
+def complete_notification_context_staging(
+    prepared: PreparedRequest,
+    system_message: Message | None,
+    notification_turn: bool,
+    on_persisted: Callable[[], None] | None,
+) -> tuple[Message | None, Callable[[], None] | None]:
+    if not notification_turn or not prepared.contains_turn_context:
+        return system_message, on_persisted
+    if on_persisted is not None:
+        on_persisted()
+    return None, None
+
+
 def delivery_disposition(
     flow: StepDeliveryFlow,
     prepared: PreparedRequest,
@@ -126,15 +139,21 @@ class StepDeliveryFlow:
         self._prompt_priority: str | None = None
         self._low_capacity_notifications = False
         self._low_capacity_notice_emitted = False
-        self._ready = self._loop.create_task(
-            self.store._to_thread_durable(self.store._warm_step_delivery_writer)
-        )
+        self._initialize_lock = asyncio.Lock()
+        self._initialized = False
 
     async def initialize(self) -> None:
         """Warm the isolated writer before this flow accepts timed input."""
 
         self._require_owner_loop()
-        await asyncio.shield(self._ready)
+        if self._initialized:
+            return
+        async with self._initialize_lock:
+            if not self._initialized:
+                await self.store._to_thread_durable(
+                    self.store._warm_step_delivery_writer
+                )
+                self._initialized = True
 
     async def produce(self, item: DeliveryInput, /) -> ProducerResult:
         source = validate_delivery_input(item)
@@ -534,7 +553,16 @@ class StepDeliveryFlow:
             staged.prompt_message if prompt else None,
             staged.prompt_id if prompt else None,
             staged.more_pending or bool(staged.notification_ids and not notification),
+            DeliveryPublications(
+                staged.publications.notifications if notification else (),
+                staged.publications.delivered_prompt if prompt else None,
+            ),
         )
+
+    @property
+    def active_publications(self) -> DeliveryPublications:
+        active = self._active
+        return active.publications if active is not None else DeliveryPublications()
 
     async def acknowledge_active(self) -> DeliveryPublications:
         """Durably acknowledge the fixed suffix selected for provider evidence."""

@@ -25,6 +25,7 @@ from ...agent.pending_delivery import (
     NotificationInput,
     ProducerResult,
     StepDeliveryFlow,
+    complete_notification_context_staging,
     delivery_disposition,
 )
 from ...agent.plan_mode import (
@@ -861,13 +862,9 @@ class AgentLoop(
                     active_tools,
                     notification_context=notification_context,
                 )
-                if notification_context is not None and (
-                    prepared_delivery.contains_turn_context
-                ):
-                    if on_persisted is not None:
-                        on_persisted()
-                    system_message = None
-                    on_persisted = None
+                system_message, on_persisted = complete_notification_context_staging(
+                    prepared_delivery, system_message, notification_turn, on_persisted
+                )
                 self._delivery_wake_pending = False
                 context_messages = list(prepared_delivery.messages)
                 steering = prepared_delivery.steering
@@ -905,6 +902,7 @@ class AgentLoop(
                     completion,
                     self.store,
                     steering,
+                    step_delivery.active_publications if has_active_delivery else None,
                     self._acknowledge_step_delivery if has_active_delivery else None,
                     self._delivery_publication_events if has_active_delivery else None,
                 )

@@ -717,6 +717,38 @@ def _recover_nested_children(
             store.finish_agent_child(marker_key)
 
 
+def _mirrored_recovery_notification(
+    owner_store: ConversationStore,
+    notification_store: ConversationStore,
+    notification_index: dict[str, ConversationEntry],
+    owner_notification_index: dict[str, ConversationEntry],
+    child_instance_id: str,
+    deliveries: list[NotificationInput],
+) -> ConversationEntry | None:
+    notification = _sync_agent_notification(
+        notification_store,
+        notification_index,
+        child_instance_id,
+    )
+    if notification_store is owner_store:
+        return notification
+    owner_notification = _sync_agent_notification(
+        owner_store,
+        owner_notification_index,
+        child_instance_id,
+    )
+    if notification is not None or owner_notification is None:
+        return notification
+    deliveries.append(
+        NotificationInput(
+            "child_completion",
+            dict(owner_notification.data),
+            dedupe_key=child_instance_id,
+        )
+    )
+    return owner_notification
+
+
 def recover_agent_children(
     loop: AgentLoopForRecovery,
 ) -> tuple[NotificationInput, ...]:
@@ -777,27 +809,14 @@ def recover_agent_children(
                     notification_store.close_child_questions(
                         child_instance_id, reason=reason
                     )
-                notification = _sync_agent_notification(
+                notification = _mirrored_recovery_notification(
+                    loop.store,
                     notification_store,
                     notification_index,
+                    store_notification_index,
                     child_instance_id,
+                    deliveries,
                 )
-                if notification_store is not loop.store:
-                    store_notification = _sync_agent_notification(
-                        loop.store,
-                        store_notification_index,
-                        child_instance_id,
-                    )
-                    if notification is None:
-                        notification = store_notification
-                        if store_notification is not None:
-                            deliveries.append(
-                                NotificationInput(
-                                    "child_completion",
-                                    dict(store_notification.data),
-                                    dedupe_key=child_instance_id,
-                                )
-                            )
                 if notification is None:
                     lifecycle = (
                         child_store.agent_lifecycle()

@@ -44,22 +44,23 @@ _PROVIDER_EVIDENCE_EVENTS = {
 }
 
 
-async def _delivery_publications(
-    on_first_event: Callable[[], Awaitable[object]] | None,
+async def _complete_delivery(
+    publications: object | None,
+    acknowledge_delivery: Callable[[], Awaitable[object]] | None,
     publication_events: Callable[[object], Iterator[StreamEvent]] | None,
 ) -> AsyncIterator[StreamEvent]:
-    if on_first_event is None:
-        return
-    publications = await on_first_event()
-    if publication_events is not None:
+    if publications is not None and publication_events is not None:
         for publication in publication_events(publications):
             yield publication
+    if acknowledge_delivery is not None:
+        await acknowledge_delivery()
 
 
 async def provider_events(
     completion: AsyncIterator[StreamEvent],
     on_started: Callable[[], Awaitable[None]] | None = None,
-    on_first_event: Callable[[], Awaitable[object]] | None = None,
+    delivery_publications: object | None = None,
+    acknowledge_delivery: Callable[[], Awaitable[object]] | None = None,
     publication_events: Callable[[object], Iterator[StreamEvent]] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """Preserve stream ordering while exposing the provider-start seam."""
@@ -95,8 +96,10 @@ async def provider_events(
             assert isinstance(event, StreamEvent)
             if first_provider_event and event.type in _PROVIDER_EVIDENCE_EVENTS:
                 first_provider_event = False
-                async for publication in _delivery_publications(
-                    on_first_event, publication_events
+                async for publication in _complete_delivery(
+                    delivery_publications,
+                    acknowledge_delivery,
+                    publication_events,
                 ):
                     yield publication
             try:
@@ -114,6 +117,7 @@ def observed_completion(
     completion: AsyncIterator[StreamEvent],
     store: ConversationStore,
     steering: ClientSteeringBatch | None,
+    delivery_publications: object | None,
     acknowledge_delivery: Callable[[], Awaitable[object]] | None,
     publication_events: Callable[[object], Iterator[StreamEvent]] | None = None,
 ) -> AsyncIterator[StreamEvent]:
@@ -132,6 +136,7 @@ def observed_completion(
     return provider_events(
         completion,
         on_started,
+        delivery_publications,
         acknowledge_delivery,
         publication_events,
     )

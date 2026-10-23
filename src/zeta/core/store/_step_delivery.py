@@ -96,6 +96,7 @@ class StagedDelivery:
     prompt_message: Message | None
     prompt_id: str | None
     more_pending: bool
+    publications: DeliveryPublications
 
 
 def _run_after_commit(item: NotificationInput, *, default: bool) -> bool:
@@ -296,6 +297,41 @@ def _select_prompt_delivery(
     )
 
 
+def _attach_notification_context(
+    notification_message: Message | None,
+    notification_persisted: bool,
+    notification_context: Message | None,
+) -> tuple[Message | None, bool]:
+    if (
+        notification_context is None
+        or notification_message is None
+        or notification_message.metadata.get("turn_context") is True
+    ):
+        return notification_message, notification_persisted
+    return (
+        Message(
+            MessageRole.SYSTEM,
+            [
+                TextContent(
+                    "\n".join(
+                        block.text
+                        for block in (
+                            *notification_context.content,
+                            *notification_message.content,
+                        )
+                        if isinstance(block, TextContent)
+                    )
+                )
+            ],
+            metadata={
+                **notification_message.metadata,
+                **notification_context.metadata,
+            },
+        ),
+        False,
+    )
+
+
 def _persist_staged_messages(
     store: ConversationStore,
     selections: Sequence[tuple[Message | None, bool]],
@@ -332,30 +368,11 @@ def _stage_delivery_request(
                 store, pending_notifications, notification_budget, token_counter
             )
         )
-        if (
-            notification_context is not None
-            and notification_message is not None
-            and not notification_persisted
-        ):
-            notification_message = Message(
-                MessageRole.SYSTEM,
-                [
-                    TextContent(
-                        "\n".join(
-                            block.text
-                            for block in (
-                                *notification_context.content,
-                                *notification_message.content,
-                            )
-                            if isinstance(block, TextContent)
-                        )
-                    )
-                ],
-                metadata={
-                    **notification_message.metadata,
-                    **notification_context.metadata,
-                },
-            )
+        notification_message, notification_persisted = _attach_notification_context(
+            notification_message,
+            notification_persisted,
+            notification_context,
+        )
         _persist_staged_messages(
             store,
             (
@@ -371,6 +388,10 @@ def _stage_delivery_request(
             prompt_entry.id if prompt_entry is not None else None,
             len(pending_prompts) > 1
             or len(pending_notifications) > len(notification_entries),
+            DeliveryPublications(
+                tuple(store._snapshot_entry(entry) for entry in notification_entries),
+                store._snapshot_entry(prompt_entry) if prompt_entry is not None else None,
+            ),
         )
 
 
