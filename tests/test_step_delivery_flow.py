@@ -21,6 +21,9 @@ class _Store:
         self.calls: list[tuple[object, int]] = []
         self.installed = False
 
+    def _warm_step_delivery_writer(self) -> None:
+        return None
+
     def _commit_delivery_input(self, item: object) -> ProducerResult:
         self.calls.append((item, threading.get_ident()))
         return ProducerResult((), True, 1)

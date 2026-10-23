@@ -22,6 +22,7 @@ from ..protocol.types import (
 )
 from .adoption import adopt_agent_children
 from .conversation_channel import ConversationChannel, recover_orphaned_questions
+from .pending_delivery import NotificationInput
 from .receipt import (
     MAX_AGENT_RESULT_BYTES,
     TerminalState,
@@ -533,11 +534,50 @@ def _background_terminal(
     )
 
 
+def _recovered_completion_input(
+    child_instance_id: str,
+    *,
+    child_session_path: str,
+    description: str,
+    status: str,
+    text: str,
+    stats: dict[str, object] | None = None,
+    killed_task_ids: list[str] | None = None,
+    killed_task_count: int | None = None,
+    killed_task_ids_truncated: bool = False,
+    report: dict[str, object] | None = None,
+) -> NotificationInput:
+    data: dict[str, object] = {
+        "child_instance_id": child_instance_id,
+        "child_session_path": child_session_path,
+        "description": description,
+        "status": status,
+        "text": text,
+    }
+    if stats is not None:
+        data["stats"] = stats
+    if killed_task_ids is not None:
+        data["killed_task_ids"] = killed_task_ids
+    if killed_task_count is not None:
+        data["killed_task_count"] = killed_task_count
+    if killed_task_ids_truncated:
+        data["killed_task_ids_truncated"] = True
+    if report is not None:
+        data["report_status"] = report["status"]
+        for key in ("summary", "head_sha", "verdict"):
+            if key in report:
+                data[key] = report[key]
+    return NotificationInput(
+        "child_completion", data, dedupe_key=child_instance_id
+    )
+
+
 def _recover_nested_children(
     store: ConversationStore,
     notification_store: ConversationStore,
     notification_index: dict[str, ConversationEntry],
     recovery_stores: dict[Path, ConversationStore],
+    deliveries: list[NotificationInput],
 ) -> None:
     """Cancel descendants left behind when an ancestor session exits."""
 
@@ -560,6 +600,7 @@ def _recover_nested_children(
                     notification_store,
                     notification_index,
                     recovery_stores,
+                    deliveries,
                 )
             existing_result = _existing_tool_result(store, tool_call.id)
             notification_status: str | None = None
@@ -618,8 +659,8 @@ def _recover_nested_children(
                     notification_status = terminal.status
                     notification_text = terminal.text
                     notification_stats = terminal.stats
-                    appended, created = (
-                        notification_store.append_agent_notification_if_absent(
+                    deliveries.append(
+                        _recovered_completion_input(
                             child_instance_id,
                             child_session_path=str(child_path),
                             description=marker["description"],
@@ -629,40 +670,12 @@ def _recover_nested_children(
                             report=accepted_report,
                         )
                     )
-                    notification_index[child_instance_id] = appended
-                    if not created:
-                        notification_status = appended.data["status"]
-                        notification_text = appended.data["text"]
-                        existing_stats = appended.data.get("stats")
-                        notification_stats = (
-                            existing_stats if type(existing_stats) is dict else None
-                        )
                 else:
                     notification_status = existing.data["status"]
                     notification_text = existing.data["text"]
                     existing_stats = existing.data.get("stats")
                     if type(existing_stats) is dict:
                         notification_stats = existing_stats
-                if (
-                    notification_store is not store
-                    and child_instance_id not in store_notification_index
-                ):
-                    appended, _ = store.append_agent_notification_if_absent(
-                        child_instance_id,
-                        child_session_path=str(child_path),
-                        description=marker["description"],
-                        status=notification_status,
-                        text=notification_text,
-                        stats=notification_stats,
-                        report=accepted_report,
-                    )
-                    store_notification_index[child_instance_id] = appended
-                    notification_status = appended.data["status"]
-                    notification_text = appended.data["text"]
-                    appended_stats = appended.data.get("stats")
-                    notification_stats = (
-                        appended_stats if type(appended_stats) is dict else None
-                    )
             elif not existing_result:
                 lifecycle_result = (
                     _lifecycle_tool_result(tool_call, child_store, child_path)
@@ -704,13 +717,15 @@ def _recover_nested_children(
             store.finish_agent_child(marker_key)
 
 
-def recover_agent_children(loop: AgentLoopForRecovery) -> None:
+def recover_agent_children(
+    loop: AgentLoopForRecovery,
+) -> tuple[NotificationInput, ...]:
     """Resolve child markers left by a process exit before resuming."""
 
     child_markers = loop.store.agent_children()
     if not child_markers:
         recover_orphaned_questions(loop.store)
-        return
+        return ()
     notification_store = loop._background_owner.notification_store
     notification_index = _agent_notification_index(notification_store)
     store_notification_index = (
@@ -719,6 +734,7 @@ def recover_agent_children(loop: AgentLoopForRecovery) -> None:
         else _agent_notification_index(loop.store)
     )
     busy_child_subtrees: set[str] = set()
+    deliveries: list[NotificationInput] = []
     for marker_key, marker in child_markers.items():
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
@@ -740,6 +756,7 @@ def recover_agent_children(loop: AgentLoopForRecovery) -> None:
                     notification_store,
                     notification_index,
                     recovery_stores,
+                    deliveries,
                 )
             if marker.get("background"):
                 terminal = child_store.agent_lifecycle() if child_store else None
@@ -795,8 +812,8 @@ def recover_agent_children(loop: AgentLoopForRecovery) -> None:
                     recovered_killed_ids = terminal.killed_task_ids
                     recovered_killed_count = terminal.killed_task_count
                     recovered_killed_truncated = terminal.killed_task_ids_truncated
-                    appended, created = (
-                        notification_store.append_agent_notification_if_absent(
+                    deliveries.append(
+                        _recovered_completion_input(
                             child_instance_id,
                             child_session_path=marker["child_session_path"],
                             description=marker["description"],
@@ -809,34 +826,6 @@ def recover_agent_children(loop: AgentLoopForRecovery) -> None:
                             report=accepted_report,
                         )
                     )
-                    notification_index[child_instance_id] = appended
-                    if not created:
-                        recovered_status = appended.data["status"]
-                        recovered_text = appended.data["text"]
-                        existing_stats = appended.data.get("stats")
-                        recovered_stats = (
-                            existing_stats if type(existing_stats) is dict else None
-                        )
-                    if notification_store is not loop.store:
-                        appended, _ = loop.store.append_agent_notification_if_absent(
-                            child_instance_id,
-                            child_session_path=marker["child_session_path"],
-                            description=marker["description"],
-                            status=recovered_status,
-                            text=recovered_text,
-                            stats=recovered_stats,
-                            killed_task_ids=recovered_killed_ids,
-                            killed_task_count=recovered_killed_count,
-                            killed_task_ids_truncated=recovered_killed_truncated,
-                            report=accepted_report,
-                        )
-                        store_notification_index[child_instance_id] = appended
-                        recovered_status = appended.data["status"]
-                        recovered_text = appended.data["text"]
-                        appended_stats = appended.data.get("stats")
-                        recovered_stats = (
-                            appended_stats if type(appended_stats) is dict else None
-                        )
                     if child_store is not None:
                         if (
                             recovered_status == "canceled"
@@ -905,6 +894,7 @@ def recover_agent_children(loop: AgentLoopForRecovery) -> None:
     recover_orphaned_questions(
         loop.store, excluded_child_subtrees=busy_child_subtrees
     )
+    return tuple(deliveries)
 
 
 BuildResult = Callable[..., dict[str, object]]
@@ -915,7 +905,6 @@ async def finish_background_child(
     child_task: asyncio.Task[dict[str, object]],
     child_store: ConversationStore,
     parent_store: ConversationStore,
-    notification_store: ConversationStore,
     tool_call: ToolCall,
     child_instance_id: str,
     child_path: str,
@@ -927,9 +916,9 @@ async def finish_background_child(
     cleanup: Callable[[], Awaitable[None] | None],
     close_child: Callable[[], Awaitable[tuple[str, ...]]],
     error_message: Callable[[BaseException], str],
+    background_owner: BackgroundAgentOwner,
     marker_key: str | None = None,
     agent_instance_id: str | None = None,
-    background_owner: BackgroundAgentOwner | None = None,
     max_receipt_bytes: int | None = None,
     explicit_finish: bool = False,
 ) -> None:
@@ -1016,20 +1005,13 @@ async def finish_background_child(
         }[status]
         if lifecycle_state == "canceled":
             child_store.mark_agent_canceled(tool_call.id)
-        if background_owner is not None:
-            effective_parent_store, effective_parent_id = background_owner.parent_edge(
-                child_instance_id, parent_store, agent_instance_id
-            )
-        else:
-            effective_parent_store, effective_parent_id = (
-                parent_store,
-                agent_instance_id,
-            )
-        if background_owner is not None:
-            background_owner.conversation_channel.close_questions(
-                child_instance_id,
-                reason="canceled" if status == "canceled" else "finished",
-            )
+        effective_parent_store, effective_parent_id = background_owner.parent_edge(
+            child_instance_id, parent_store, agent_instance_id
+        )
+        await background_owner.conversation_channel.close_questions(
+            child_instance_id,
+            reason="canceled" if status == "canceled" else "finished",
+        )
         if status != "canceled":
             adopt_agent_children(
                 child_store,
@@ -1037,10 +1019,9 @@ async def finish_background_child(
                 background_owner=background_owner,
                 parent_instance_id=effective_parent_id,
             )
-            if background_owner is not None:
-                background_owner.conversation_channel.reroute_questions_from(
-                    child_store
-                )
+            await background_owner.conversation_channel.reroute_questions_from(
+                child_store
+            )
             child_store.finish_agent_parent()
         terminal_stats = agent_stats(
             child_store.agent_lifecycle(),
@@ -1129,47 +1110,19 @@ async def finish_background_child(
             killed_task_ids_truncated=killed_task_ids_truncated,
             canonical_receipt=True,
         )
-        if background_owner is not None:
-            notification = background_owner.conversation_channel.publish_completion(
-                child_instance_id=child_instance_id,
-                marker_key=marker_key or tool_call.id,
-                child_session_path=child_path,
-                description=description,
-                status=status,
-                text=notification_text,
-                stats=terminal_stats,
-                killed_task_ids=killed_task_metadata or None,
-                killed_task_count=killed_task_count or None,
-                killed_task_ids_truncated=killed_task_ids_truncated,
-                report=notification_report,
-            )
-        else:
-            notification = notification_store.append_agent_notification(
-                child_instance_id,
-                child_session_path=child_path,
-                description=description,
-                status=status,
-                text=notification_text,
-                stats=terminal_stats,
-                killed_task_ids=killed_task_metadata or None,
-                killed_task_count=killed_task_count or None,
-                killed_task_ids_truncated=killed_task_ids_truncated,
-                report=notification_report,
-            )
-            if notification_store is not effective_parent_store:
-                effective_parent_store.append_agent_notification(
-                    child_instance_id,
-                    child_session_path=child_path,
-                    description=description,
-                    status=status,
-                    text=notification_text,
-                    stats=terminal_stats,
-                    killed_task_ids=killed_task_metadata or None,
-                    killed_task_count=killed_task_count or None,
-                    killed_task_ids_truncated=killed_task_ids_truncated,
-                    report=notification_report,
-                )
-            effective_parent_store.finish_agent_child(marker_key or tool_call.id)
+        notification = await background_owner.conversation_channel.publish_completion(
+            child_instance_id=child_instance_id,
+            marker_key=marker_key or tool_call.id,
+            child_session_path=child_path,
+            description=description,
+            status=status,
+            text=notification_text,
+            stats=terminal_stats,
+            killed_task_ids=killed_task_metadata or None,
+            killed_task_count=killed_task_count or None,
+            killed_task_ids_truncated=killed_task_ids_truncated,
+            report=notification_report,
+        )
         event_data: dict[str, object] = {"notification_id": notification.id}
         if agent_instance_id is not None:
             event_data["agent_instance_id"] = agent_instance_id

@@ -31,8 +31,9 @@ async def _agent_send(
     return {
         "content": [
             text_block(
-                f"queued a follow-up for {child_instance_id}; it is delivered "
-                "when the child finishes its current turn"
+                f"queued a follow-up for {child_instance_id}; a running child "
+                "receives it after its current tool call, before its next model "
+                "call; an idle child receives it at its next turn"
             )
         ],
         "isError": False,
@@ -45,9 +46,10 @@ def register_send(registry: ToolRegistry) -> None:
         "agent_send",
         _agent_send,
         description=(
-            "Send a follow-up to an eligible child you started. It arrives at "
-            "the next turn boundary and never interrupts a tool call. When "
-            "answering ask_parent, you can reference its question id in the message."
+            "Send a follow-up to an eligible child you started. A running child "
+            "receives it after its current tool call, before its next model call. "
+            "An idle child receives it at its next turn. When answering ask_parent, "
+            "you can reference its question id in the message."
         ),
         parameters={
             "type": "object",

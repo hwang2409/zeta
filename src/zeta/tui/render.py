@@ -527,6 +527,7 @@ STREAM_EVENTS_RENDERED = frozenset({
     StreamEventType.MESSAGE_END,
     StreamEventType.RETRY,
     StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.CHILD_MESSAGE_DELIVERED,
     StreamEventType.ACCOUNT_LIMIT,
     StreamEventType.ACCOUNT_STATE_UNKNOWN,
     StreamEventType.TOOL_EXECUTION_START,
@@ -673,6 +674,10 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         return Text(text if type(text) is str else "retrying", style=theme.DIM)
     if event.type is StreamEventType.AGENT_NOTIFICATION:
         return render_agent_notification(event)
+    if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:
+        label = event.data.get("child_label", "child")
+        preview = event.data.get("preview", "")
+        return Text(f"delivered to {label}: {preview}", style=theme.DIM)
     if event.type is StreamEventType.ACCOUNT_LIMIT:
         account = event.data.get("account", "account")
         reset = event.data.get("reset_local", event.data.get("resets_at", "unknown"))

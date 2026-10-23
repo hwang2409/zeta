@@ -38,6 +38,17 @@ class _PublicationFence:
     agent_lifecycle: dict[str, Any] | None
 
 
+_STEP_DELIVERY_WRITES = frozenset(
+    {
+        "_warm_step_delivery_writer",
+        "_commit_delivery_input",
+        "_stage_delivery_request",
+        "_acknowledge_staged_delivery",
+        "_admit_step_delivery_terminal",
+    }
+)
+
+
 class AsyncDurableWritesMixin:
     """Track, drain, and cancellation-shield writes running in worker threads."""
 
@@ -45,6 +56,7 @@ class AsyncDurableWritesMixin:
         self._async_write_lock = asyncio.Lock()
         self._durable_write_condition = threading.Condition()
         self._durable_writes_in_flight = 0
+        self._durable_writer: ConversationStore | None = None
 
     def _drain_durable_writes_for_close(self: ConversationStore) -> bool:
         with self._durable_write_condition:
@@ -54,7 +66,11 @@ class AsyncDurableWritesMixin:
             if self._closed:
                 return False
             self._closed = True
-            return True
+            writer = self._durable_writer
+            self._durable_writer = None
+        if writer is not None:
+            writer.close()
+        return True
 
     def _run_durable_write(
         self: ConversationStore,
@@ -64,21 +80,28 @@ class AsyncDurableWritesMixin:
     ) -> Any:
         """Run a write against isolated state; the resident store stays loop-owned."""
         try:
-            writer = type(self)(
-                self.root_dir,
-                session_id=self.session_id,
-                _must_exist=True,
-                _collect_persisted_appends=True,
-            )
+            persistent = method_name in _STEP_DELIVERY_WRITES
+            writer = self._durable_writer if persistent else None
+            if writer is None:
+                writer = type(self)(
+                    self.root_dir,
+                    session_id=self.session_id,
+                    _must_exist=True,
+                    _collect_persisted_appends=True,
+                )
+                if persistent:
+                    self._durable_writer = writer
             try:
                 result = getattr(writer, method_name)(*args, **kwargs)
-                return (
-                    result,
-                    writer._detach_log_state(),
-                    writer.take_persisted_appends(),
+                state = (
+                    writer._snapshot_log_state()
+                    if persistent
+                    else writer._detach_log_state()
                 )
+                return result, state, writer.take_persisted_appends()
             finally:
-                writer.close()
+                if not persistent:
+                    writer.close()
         finally:
             with self._durable_write_condition:
                 self._durable_writes_in_flight -= 1

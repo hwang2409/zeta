@@ -48,7 +48,7 @@ def test_scan_reports_valid_legacy_and_version_one_records(tmp_path: Path) -> No
         "background_phase": "natural_exit",
     }
     payload = [notification]
-    from zeta.agent.pending_delivery import notification_batch_id
+    from zeta.agent._delivery_notifications import notification_batch_id
 
     identity = {
         "version": 1,

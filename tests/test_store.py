@@ -844,7 +844,10 @@ async def test_async_publish_stays_responsive_during_large_branch_reload(
     assert store.entries == fresh.entries
     assert store.messages() == fresh.messages()
     assert store.agent_notifications() == fresh.agent_notifications()
-    assert store._active_pending_prompts == fresh._active_pending_prompts
+    assert (
+        store._active_pending_prompt_entries
+        == fresh._active_pending_prompt_entries
+    )
 
 
 @pytest.mark.asyncio
@@ -1216,7 +1219,10 @@ async def test_async_publish_matches_fresh_load_after_interleaved_appends(
     assert store.entries == fresh.entries
     assert store.messages() == fresh.messages()
     assert store.agent_notifications() == fresh.agent_notifications()
-    assert store._active_pending_prompts == fresh._active_pending_prompts
+    assert (
+        store._active_pending_prompt_entries
+        == fresh._active_pending_prompt_entries
+    )
 
 
 @pytest.mark.asyncio
