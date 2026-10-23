@@ -27,7 +27,10 @@ def prepare_backend_state(loop: Any, backend: CompletionBackend) -> PreparedBack
 
 
 def apply_backend_state(loop: Any, state: PreparedBackendState) -> None:
+    if isinstance(state.backend, ContextWindowBackend):
+        state.backend.set_token_budget(state.token_budget)
     loop.backend = state.backend
-    loop.context_assembler.backend = state.backend
-    loop.context_assembler.compaction_policy.backend = state.backend
-    loop.context_assembler.token_budget = state.token_budget
+    loop.context_assembler.update_backend(state.backend)
+    loop.context_assembler.update_token_budget(state.token_budget)
+    if loop.step_delivery is not None:
+        loop.step_delivery.capacity_changed()

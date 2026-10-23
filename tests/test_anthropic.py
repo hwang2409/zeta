@@ -2799,7 +2799,11 @@ async def test_anthropic_failure_persists_signed_empty_thinking_through_loop(
         StreamEventType.ERROR,
         StreamEventType.AGENT_END,
     ]
-    persisted = conversation.replay()[-1].data["message"]
+    persisted = next(
+        entry.data["message"]
+        for entry in reversed(conversation.replay())
+        if entry.type == "message"
+    )
     assert persisted["metadata"]["turn_failed"] is True
     assert persisted["metadata"]["turn_error"]["provider_error"] is True
     assert persisted["content"] == [

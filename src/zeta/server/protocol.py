@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from typing import Any
@@ -33,6 +34,59 @@ TOOL_OUTPUT_MAX_BYTES = 8_000
 class _OversizedInteger:
     def __init__(self, digits: int) -> None:
         self.digits = digits
+
+
+class FrameWriteCancelled(asyncio.CancelledError):
+    """Cancellation that arrived after a frame write started.
+
+    The write ran to completion first; ``written`` is its result.
+    """
+
+    def __init__(self, written: bool) -> None:
+        super().__init__()
+        self.written = written
+
+
+# How long a canceled caller waits for a started frame write to drain before
+# the transport is aborted. A stalled client must not hang abort or shutdown.
+FRAME_CANCEL_GRACE = 1.0
+
+
+async def finish_frame_write(codec: FrameCodec, writer: Any, payload: bytes) -> bool:
+    """Write one frame; through cancellation, report whether it was written.
+
+    Cancellation before this call writes nothing. Cancellation during the
+    write waits at most ``FRAME_CANCEL_GRACE`` for it to finish, then aborts
+    the transport; either way it raises ``FrameWriteCancelled``.
+    """
+
+    task = asyncio.ensure_future(codec.write(writer, payload))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        pass
+    raise FrameWriteCancelled(await _settle_canceled_write(task, writer))
+
+
+async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + FRAME_CANCEL_GRACE
+    aborted = False
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0 and not aborted:
+            aborted = True
+            transport = getattr(writer, "transport", None)
+            if transport is not None:
+                transport.abort()
+            task.cancel()
+        try:
+            await asyncio.wait({task}, timeout=None if aborted else remaining)
+        except asyncio.CancelledError:
+            continue
+    if task.cancelled() or task.exception() is not None:
+        return False
+    return not aborted and task.result()
 
 
 class ProtocolError(Exception):
@@ -194,8 +248,8 @@ class FrameCodec:
             session_id, event, "event exceeds the size limit"
         )
 
-    async def write(self, writer: Any, payload: bytes) -> None:
-        """Write one codec-produced frame and absorb a disconnected peer."""
+    async def write(self, writer: Any, payload: bytes) -> bool:
+        """Write one codec-produced frame; report a disconnected peer."""
 
         if len(payload) > MAX_FRAME_BYTES:
             payload = self.error_response(
@@ -207,7 +261,8 @@ class FrameCodec:
             writer.write(payload)
             await writer.drain()
         except (ConnectionError, BrokenPipeError):
-            pass
+            return False
+        return True
 
     def _bounded_json(
         self, value: Mapping[str, Any], *, request_id: str | int | None

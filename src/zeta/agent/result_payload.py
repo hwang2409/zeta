@@ -4,12 +4,36 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from ..protocol.types import ToolResult
 from ..tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from .receipt import TerminalState, terminal_state
+from .tool_results import validated_tool_result
 
 
 class ChildResultPayloadMixin:
     """Build canonical progress and terminal payloads for child tools."""
+
+    def _canceled_agent_result(
+        self,
+        tool_call_id: str,
+        *,
+        child_session_path: str | None = None,
+        turns_used: int | None = None,
+        agent_type: str | None = None,
+        child_instance_id: str | None = None,
+    ) -> ToolResult:
+        return validated_tool_result(
+            self._child_result_payload(
+                tool_call_id,
+                "tool execution canceled",
+                state="canceled",
+                child_session_path=child_session_path,
+                turns_used=turns_used,
+                agent_type=agent_type,
+                child_instance_id=child_instance_id,
+            ),
+            tool_call_id,
+        )
 
     def _child_result_payload(
         self,

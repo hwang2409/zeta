@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import threading
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -13,6 +14,10 @@ from typing import TYPE_CHECKING, Any
 from rich.text import Text
 
 from ..accounts import AccountId, AccountStore, account_provider
+from ..agent.pending_delivery import (
+    SHUTDOWN_DELIVERY_TIMEOUT_SECONDS,
+    NotificationInput,
+)
 from ..config.settings import ResolvedConfig, SettingsError
 from ..config.settings import resolve as resolve_settings
 from ..core.project_context import (
@@ -169,15 +174,23 @@ def background_notice(
         for task_id, owner in notice.tasks:
             if owner != "run_background":
                 continue
-            try:
-                app.loop.store.append_task_notification(
-                    task_id=task_id,
-                    command="canceled on session exit",
-                    exit_code=None,
-                    background_metadata=("run_background", "session_shutdown"),
+            app.loop._create_task(
+                app.loop.step_delivery.produce(
+                    NotificationInput(
+                        "task_exit",
+                        {
+                            "task_id": task_id,
+                            "headline": "canceled on session exit",
+                            "exit_code": None,
+                            "output_tail": "",
+                            "background_owner": "run_background",
+                            "background_phase": "session_shutdown",
+                        },
+                        dedupe_key=task_id,
+                        deadline=time.monotonic() + SHUTDOWN_DELIVERY_TIMEOUT_SECONDS,
+                    )
                 )
-            except (ValueError, OSError):
-                pass
+            )
     try:
         app._invalidate_prompt()
     except (ValueError, BrokenPipeError, OSError):
