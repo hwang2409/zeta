@@ -31,12 +31,10 @@ class _PublicationFence:
     """One owner snapshot covering every field recovery publication installs."""
 
     transcript_generation: int
-    agent_state: tuple[
-        int,
-        dict[str, dict[str, Any]],
-        dict[str, Any] | None,
-        dict[str, Any] | None,
-    ]
+    agent_counter: int
+    agent_children: dict[str, dict[str, Any]]
+    agent_parent: dict[str, Any] | None
+    agent_canceled: dict[str, Any] | None
     agent_lifecycle: dict[str, Any] | None
 
 
@@ -111,16 +109,54 @@ class AsyncDurableWritesMixin:
         """Capture every owner field that a recovery refresh may replace."""
         return _PublicationFence(
             transcript_generation=self._transcript_generation,
-            agent_state=copy.deepcopy(
-                (
-                    self._agent_counter,
-                    self._agent_children,
-                    self._agent_parent,
-                    self._agent_canceled,
-                )
-            ),
+            agent_counter=self._agent_counter,
+            agent_children=copy.deepcopy(self._agent_children),
+            agent_parent=copy.deepcopy(self._agent_parent),
+            agent_canceled=copy.deepcopy(self._agent_canceled),
             agent_lifecycle=copy.deepcopy(self._agent_lifecycle),
         )
+
+    @staticmethod
+    def _markers_without_turns(
+        markers: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        normalized = copy.deepcopy(markers)
+        for marker in normalized.values():
+            marker.pop("turns_used", None)
+        return normalized
+
+    def _install_agent_state(
+        self: ConversationStore,
+        state: _DetachedConversationState,
+        fence: _PublicationFence,
+    ) -> None:
+        """Install recovery fields that their owner has not changed."""
+        if self._agent_counter == fence.agent_counter:
+            self._agent_counter = state.agent_counter
+        if self._agent_parent == fence.agent_parent:
+            self._agent_parent = state.agent_parent
+        if self._agent_canceled == fence.agent_canceled:
+            self._agent_canceled = state.agent_canceled
+        if self._agent_lifecycle == fence.agent_lifecycle:
+            self._agent_lifecycle = state.agent_lifecycle
+
+        live_markers = self._agent_children
+        if self._markers_without_turns(live_markers) != self._markers_without_turns(
+            fence.agent_children
+        ):
+            return
+        for marker_key, loaded_marker in state.agent_children.items():
+            live_marker = live_markers.get(marker_key)
+            if (
+                live_marker is not None
+                and live_marker.get("child_session_path")
+                == loaded_marker.get("child_session_path")
+            ):
+                loaded_marker["turns_used"] = max(
+                    loaded_marker.get("turns_used", 0),
+                    live_marker.get("turns_used", 0),
+                )
+        self._agent_children = state.agent_children
 
     def _install_store_state(
         self: ConversationStore,
@@ -133,19 +169,7 @@ class AsyncDurableWritesMixin:
         else:
             released_log = state.log
 
-        current_agent_state = (
-            self._agent_counter,
-            self._agent_children,
-            self._agent_parent,
-            self._agent_canceled,
-        )
-        if current_agent_state == fence.agent_state:
-            self._agent_counter = state.agent_counter
-            self._agent_children = state.agent_children
-            self._agent_parent = state.agent_parent
-            self._agent_canceled = state.agent_canceled
-        if self._agent_lifecycle == fence.agent_lifecycle:
-            self._agent_lifecycle = state.agent_lifecycle
+        self._install_agent_state(state, fence)
         return released_log
 
     def _publish_log_state(
