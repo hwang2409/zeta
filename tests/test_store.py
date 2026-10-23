@@ -748,6 +748,132 @@ async def test_async_append_runs_off_loop_and_is_durable_on_return(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("foreign_change", ["branch", "replacement"])
+async def test_async_append_never_loads_transcript_on_event_loop_after_foreign_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    foreign_change: str,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="off-loop-publish")
+    checkpoint = store.append_checkpoint("base")
+    store.append_message(message(MessageRole.ASSISTANT, "discarded"))
+    owner_thread = threading.get_ident()
+    load_threads: list[int] = []
+    original_load_full = ConversationStore._load_full
+
+    def observed_load_full(candidate: ConversationStore) -> None:
+        load_threads.append(threading.get_ident())
+        original_load_full(candidate)
+
+    monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
+    if foreign_change == "branch":
+        foreign = ConversationStore(tmp_path, session_id=store.session_id)
+        foreign.append_fork(str(checkpoint.seq))
+        foreign.close()
+    else:
+        replacement = store.path.with_suffix(".replacement")
+        replacement.write_bytes(store.path.read_bytes().splitlines(keepends=True)[0])
+        replacement.replace(store.path)
+
+    load_threads.clear()
+    await store.append_message_async(message(MessageRole.ASSISTANT, "kept"))
+
+    assert load_threads
+    assert owner_thread not in load_threads
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+    assert store.entries == fresh.entries
+
+
+@pytest.mark.asyncio
+async def test_async_publish_stays_responsive_during_large_branch_reload(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="large-off-loop-publish")
+    notification_data = {
+        "kind": "agent_completion",
+        "child_instance_id": "root:1",
+        "child_session_path": "/child",
+        "description": "child",
+        "status": "completed",
+        "text": "done",
+    }
+    rows = [("warning", {"message": f"row {index}"}) for index in range(49_996)]
+    rows.extend(
+        [
+            ("message", {"message": message(MessageRole.ASSISTANT, "history").to_dict()}),
+            ("notification", notification_data),
+            ("pending_prompt", {"text": "follow up", "origin": "user"}),
+            (
+                "checkpoint",
+                {
+                    "label": "large-base",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "todo_dismissed": False,
+                },
+            ),
+        ]
+    )
+    store.append_many(rows)
+    foreign = ConversationStore(tmp_path, session_id=store.session_id)
+    foreign.append_message(message(MessageRole.ASSISTANT, "discarded"))
+    foreign.append_fork("large-base")
+    foreign.close()
+
+    loop = asyncio.get_running_loop()
+    ticks = [loop.time()]
+    running = True
+
+    async def ticker() -> None:
+        while running:
+            await asyncio.sleep(0.001)
+            ticks.append(loop.time())
+
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)
+    try:
+        await store.append_message_async(message(MessageRole.ASSISTANT, "kept"))
+    finally:
+        running = False
+        await ticker_task
+
+    maximum_gap = max(later - earlier for earlier, later in zip(ticks, ticks[1:]))
+    assert maximum_gap < 0.05, f"maximum ticker gap {maximum_gap:.6f}s"
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+    assert store.entries == fresh.entries
+    assert store.messages() == fresh.messages()
+    assert store.agent_notifications() == fresh.agent_notifications()
+    assert store._active_pending_prompts == fresh._active_pending_prompts
+
+
+@pytest.mark.asyncio
+async def test_async_publish_matches_fresh_load_after_interleaved_appends(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="interleaved-publish")
+    foreign = ConversationStore(tmp_path, session_id=store.session_id)
+
+    for index in range(20):
+        foreign.append_message(message(MessageRole.ASSISTANT, f"foreign {index}"))
+        await store.append_message_async(message(MessageRole.ASSISTANT, f"own {index}"))
+
+    await store._to_thread_durable(store.append_pending_prompt, "follow up")
+    await store._to_thread_durable(
+        store.append_agent_notification,
+        "root:1",
+        child_session_path="/child",
+        description="child",
+        status="completed",
+        text="done",
+    )
+
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+    assert store.entries == fresh.entries
+    assert store.messages() == fresh.messages()
+    assert store.agent_notifications() == fresh.agent_notifications()
+    assert store._active_pending_prompts == fresh._active_pending_prompts
+
+
+@pytest.mark.asyncio
 async def test_async_batch_is_never_partially_visible_in_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
