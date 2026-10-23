@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from typing import Any
 
 PROTOCOL_VERSION = "1.2"
@@ -33,6 +34,37 @@ TOOL_OUTPUT_MAX_BYTES = 8_000
 class _OversizedInteger:
     def __init__(self, digits: int) -> None:
         self.digits = digits
+
+
+class FrameWriteCancelled(asyncio.CancelledError):
+    """Cancellation that arrived after a frame write started.
+
+    The write ran to completion first; ``written`` is its result.
+    """
+
+    def __init__(self, written: bool) -> None:
+        super().__init__()
+        self.written = written
+
+
+async def finish_frame_write(write: Awaitable[bool]) -> bool:
+    """Run a started frame write to completion, even through cancellation.
+
+    Cancellation before this call writes nothing. Cancellation during the
+    write is deferred and raised as ``FrameWriteCancelled`` with the result.
+    """
+
+    task = asyncio.ensure_future(write)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    written = task.result()
+    if cancelled:
+        raise FrameWriteCancelled(written)
+    return written
 
 
 class ProtocolError(Exception):

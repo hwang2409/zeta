@@ -45,6 +45,7 @@ from .protocol import (
     FrameCodec,
     ProtocolError,
     bounded,
+    finish_frame_write,
     negotiate_protocol_version,
 )
 from .runtime import BackendFactory, ServerRuntime
@@ -1136,7 +1137,7 @@ class _Client:
 
     async def _write(self, payload: bytes) -> bool:
         async with self._write_lock:
-            return await self.codec.write(self.writer, payload)
+            return await finish_frame_write(self.codec.write(self.writer, payload))
 
     def _turn_busy(self) -> bool:
         loop = self.server.runtime.loop

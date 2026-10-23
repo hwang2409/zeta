@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 
 from zeta.server import event_contract
+from zeta.server.protocol import FrameWriteCancelled
 
 NotificationSender = Callable[..., Awaitable[bool]]
 
@@ -36,9 +36,13 @@ class NotificationPresentation:
         event_name = event_contract.notification_wire_event(
             notification.get("kind", "agent_completion"), protocol_version
         )
+        # The claim survives only a frame that reached the client; a send
+        # that wrote nothing releases it so a later publish can retry.
         try:
             written = await send(event_name, session_id, data=dict(notification))
-        except asyncio.CancelledError:
+        except FrameWriteCancelled as cancelled:
+            if not cancelled.written and key is not None:
+                self._presented.discard(key)
             raise
         except BaseException:
             if key is not None:

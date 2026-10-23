@@ -142,6 +142,52 @@ async def test_notification_presentation_retries_disconnected_codec_write(
     assert receipts[0]["params"]["data"]["notification_id"] == "notification-1"
 
 
+@pytest.mark.asyncio
+async def test_notification_presentation_retries_after_cancel_before_write(
+    tmp_path: Path,
+) -> None:
+    class HealthyWriter:
+        def __init__(self) -> None:
+            self.frames: list[bytes] = []
+
+        def write(self, payload: bytes) -> None:
+            self.frames.append(payload)
+
+        async def drain(self) -> None:
+            pass
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    healthy = HealthyWriter()
+    client = _Client(server, asyncio.StreamReader(), healthy)
+    notification = {"notification_id": "notification-1"}
+
+    await client._write_lock.acquire()
+    blocked = asyncio.create_task(
+        server.notification_presentations.publish(
+            "session-1", notification, "1.0", client._notify
+        )
+    )
+    while not client._write_lock._waiters:
+        await asyncio.sleep(0)
+    blocked.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await blocked
+    client._write_lock.release()
+    assert healthy.frames == []
+
+    await server.notification_presentations.publish(
+        "session-1", notification, "1.0", client._notify
+    )
+
+    receipts = [
+        json.loads(frame)
+        for frame in healthy.frames
+        if json.loads(frame)["params"]["event"] == "sub_agent_receipt"
+    ]
+    assert len(receipts) == 1
+    assert receipts[0]["params"]["data"]["notification_id"] == "notification-1"
+
+
 def test_serve_maps_account_state_unknown() -> None:
     assert (
         STREAM_EVENT_WIRE_EVENTS[StreamEventType.ACCOUNT_STATE_UNKNOWN]
@@ -2933,17 +2979,16 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
     assert client is not None
     published = asyncio.Event()
     release_publication = asyncio.Event()
-    original_notify = client._notify
+    original_write = client.codec.write
 
-    async def gate_after_receipt(
-        event: str, sent_session_id: str | None = None, **fields: object
-    ) -> None:
-        await original_notify(event, sent_session_id, **fields)
-        if event == "sub_agent_receipt" and not published.is_set():
+    async def gate_after_receipt_bytes(target: object, payload: bytes) -> bool:
+        written = await original_write(target, payload)
+        if b'"sub_agent_receipt"' in payload and not published.is_set():
             published.set()
             await release_publication.wait()
+        return written
 
-    monkeypatch.setattr(client, "_notify", gate_after_receipt)
+    monkeypatch.setattr(client.codec, "write", gate_after_receipt_bytes)
     notification = server.runtime.opened.store.append_agent_notification(
         "child-retry",
         child_session_path="/tmp/child-retry",
@@ -2957,8 +3002,8 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         first_turn = client._turn_task
         assert first_turn is not None
         first_turn.cancel()
-        await asyncio.gather(first_turn, return_exceptions=True)
         release_publication.set()
+        await asyncio.gather(first_turn, return_exceptions=True)
         assert [
             entry.id for entry in server.runtime.opened.store.agent_notifications()
         ] == [notification.id]
