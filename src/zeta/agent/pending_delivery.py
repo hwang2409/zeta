@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Literal
 
 from ..core.checkpoints import ConversationEntry, ConversationIntegrityError
 from ..core.session_files import SessionNotFoundError
@@ -23,6 +26,135 @@ from .conversation_channel import ConversationChannel, has_follow_up_loop
 
 AGENT_SEND_COMMIT_TIMEOUT_SECONDS = 1.0
 QUESTION_ANSWER_PATTERN = re.compile(r"^Re ([^:\s]+):(?:\s|$)")
+
+type JSONValue = None | bool | int | float | str | list[JSONValue] | dict[str, JSONValue]
+DeliveryKind = Literal[
+    "task_exit",
+    "inbox",
+    "child_idle",
+    "child_question",
+    "child_question_close",
+    "child_question_reroute",
+    "question_answer_ack",
+    "child_completion",
+    "macro_completion",
+]
+DeliverySource = Literal["prompt", "notification"]
+
+
+@dataclass(frozen=True, slots=True)
+class PromptInput:
+    text: str
+    origin: MessageOrigin
+    deadline: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationInput:
+    kind: DeliveryKind
+    data: Mapping[str, JSONValue]
+    dedupe_key: str | None = None
+    after_commit: Callable[[], bool] | None = None
+
+
+type DeliveryInput = PromptInput | NotificationInput
+
+
+@dataclass(frozen=True, slots=True)
+class ProducerResult:
+    entries: tuple[ConversationEntry, ...]
+    changed: bool
+    affected: int = 0
+
+
+def notification_batch_id(
+    notifications: Sequence[Mapping[str, JSONValue]], notification_ids: Sequence[str]
+) -> str:
+    """Return the stable identity for one represented notification batch."""
+
+    payload = {
+        "version": 1,
+        "notification_ids": list(notification_ids),
+        "notifications": list(notifications),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+class StepDeliveryFlow:
+    """Own durable delivery production for one resident conversation store."""
+
+    def __init__(
+        self,
+        store: ConversationStore,
+        *,
+        wake_sink: Callable[[DeliverySource], None] | None = None,
+    ) -> None:
+        self.store = store
+        self._loop = asyncio.get_running_loop()
+        self._wake_sink = wake_sink
+        self._edges: set[DeliverySource] = set()
+
+    async def produce(self, item: DeliveryInput, /) -> ProducerResult:
+        source = _validate_delivery_input(item)
+        if asyncio.get_running_loop() is not self._loop:
+            raise RuntimeError("step delivery flow used from a non-owning event loop")
+        result = await self.store._to_thread_durable(
+            self.store._commit_delivery_input, item
+        )
+        if not isinstance(result, ProducerResult):
+            raise TypeError("delivery commit returned an invalid result")
+        if result.changed and not (
+            isinstance(item, NotificationInput)
+            and item.kind
+            in {"child_question_close", "child_question_reroute", "question_answer_ack"}
+        ):
+            self._edges.add(source)
+            if self._wake_sink is not None:
+                self._wake_sink(source)
+        return result
+
+    def wake(self, source: DeliverySource) -> None:
+        if source not in {"prompt", "notification"}:
+            raise ValueError("unknown delivery source")
+        self._loop.call_soon_threadsafe(self._arm_edge, source)
+
+    def _arm_edge(self, source: DeliverySource) -> None:
+        self._edges.add(source)
+        if self._wake_sink is not None:
+            self._wake_sink(source)
+
+
+def _validate_delivery_input(item: DeliveryInput) -> DeliverySource:
+    if isinstance(item, PromptInput):
+        if not item.text.strip():
+            raise ValueError("prompt text must be a nonempty string")
+        if not isinstance(item.origin, MessageOrigin):
+            raise TypeError("prompt origin must be a MessageOrigin")
+        return "prompt"
+    if not isinstance(item, NotificationInput):
+        raise TypeError("delivery input must be PromptInput or NotificationInput")
+    if item.kind not in {
+        "task_exit",
+        "inbox",
+        "child_idle",
+        "child_question",
+        "child_question_close",
+        "child_question_reroute",
+        "question_answer_ack",
+        "child_completion",
+        "macro_completion",
+    }:
+        raise ValueError("unknown delivery kind")
+    if not item.data:
+        raise ValueError("notification data must not be empty")
+    if item.kind in {"task_exit", "inbox", "child_question", "child_completion"} and not item.dedupe_key:
+        raise ValueError(f"{item.kind} requires a dedupe key")
+    if item.after_commit is not None and item.kind != "inbox":
+        raise ValueError("after_commit is only valid for inbox delivery")
+    return "notification"
 
 
 @dataclass(frozen=True)
