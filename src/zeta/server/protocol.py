@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 PROTOCOL_VERSION = "1.2"
@@ -47,24 +47,46 @@ class FrameWriteCancelled(asyncio.CancelledError):
         self.written = written
 
 
-async def finish_frame_write(write: Awaitable[bool]) -> bool:
-    """Run a started frame write to completion, even through cancellation.
+# How long a canceled caller waits for a started frame write to drain before
+# the transport is aborted. A stalled client must not hang abort or shutdown.
+FRAME_CANCEL_GRACE = 1.0
+
+
+async def finish_frame_write(codec: FrameCodec, writer: Any, payload: bytes) -> bool:
+    """Write one frame; through cancellation, report whether it was written.
 
     Cancellation before this call writes nothing. Cancellation during the
-    write is deferred and raised as ``FrameWriteCancelled`` with the result.
+    write waits at most ``FRAME_CANCEL_GRACE`` for it to finish, then aborts
+    the transport; either way it raises ``FrameWriteCancelled``.
     """
 
-    task = asyncio.ensure_future(write)
-    cancelled = False
+    task = asyncio.ensure_future(codec.write(writer, payload))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        pass
+    raise FrameWriteCancelled(await _settle_canceled_write(task, writer))
+
+
+async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + FRAME_CANCEL_GRACE
+    aborted = False
     while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0 and not aborted:
+            aborted = True
+            transport = getattr(writer, "transport", None)
+            if transport is not None:
+                transport.abort()
+            task.cancel()
         try:
-            await asyncio.shield(task)
+            await asyncio.wait({task}, timeout=None if aborted else remaining)
         except asyncio.CancelledError:
-            cancelled = True
-    written = task.result()
-    if cancelled:
-        raise FrameWriteCancelled(written)
-    return written
+            continue
+    if task.cancelled() or task.exception() is not None:
+        return False
+    return not aborted and task.result()
 
 
 class ProtocolError(Exception):

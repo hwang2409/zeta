@@ -26,6 +26,7 @@ import pytest
 
 import zeta.accounts.session as account_session_module
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import AccountId, AccountStore, AccountUsage
@@ -186,6 +187,66 @@ async def test_notification_presentation_retries_after_cancel_before_write(
     ]
     assert len(receipts) == 1
     assert receipts[0]["params"]["data"]["notification_id"] == "notification-1"
+
+
+@pytest.mark.asyncio
+async def test_canceled_write_to_stalled_client_aborts_within_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.05)
+
+    class StalledTransport:
+        def __init__(self) -> None:
+            self.aborted = False
+            self.closed = asyncio.Event()
+
+        def abort(self) -> None:
+            self.aborted = True
+            self.closed.set()
+
+    class StalledWriter:
+        def __init__(self) -> None:
+            self.transport = StalledTransport()
+            self.frames: list[bytes] = []
+
+        def write(self, payload: bytes) -> None:
+            self.frames.append(payload)
+
+        async def drain(self) -> None:
+            await self.transport.closed.wait()
+            raise ConnectionResetError("aborted")
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    writer = StalledWriter()
+    client = _Client(server, asyncio.StreamReader(), writer)
+    notification = {"notification_id": "notification-1"}
+    publish = asyncio.create_task(
+        server.notification_presentations.publish(
+            "session-1", notification, "1.0", client._notify
+        )
+    )
+    while not writer.frames:
+        await asyncio.sleep(0)
+    publish.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(publish, 2)
+    assert writer.transport.aborted
+    assert not client._write_lock.locked()
+
+    healthy = asyncio.Event()
+    writer.transport.closed = healthy
+    healthy.set()
+    sent: list[str] = []
+
+    async def record(event: str, session_id: str | None = None, **fields: object) -> bool:
+        sent.append(event)
+        return True
+
+    await server.notification_presentations.publish(
+        "session-1", notification, "1.0", record
+    )
+    assert sent == ["sub_agent_receipt"]
 
 
 def test_serve_maps_account_state_unknown() -> None:

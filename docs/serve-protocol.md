@@ -584,7 +584,9 @@ The wake claims one notification batch without consuming it. Receipt events
 are streamed from that claim. Each receipt includes a stable
 `data.notification_id`. Within one serve process, the server sends at most one
 receipt per id after a successful write. A failed or canceled write remains
-retryable, so a receipt can repeat but is not lost. A still-pending notification can be sent again after a reconnect or serve
+retryable, so a receipt can repeat but is not lost. A canceled write to a
+client that does not read waits at most one second, then the server closes
+that connection. A still-pending notification can be sent again after a reconnect or serve
 restart, so clients must deduplicate receipts by `notification_id`.
 
 Model delivery remains exactly once and is acknowledged only after provider
