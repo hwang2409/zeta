@@ -10714,8 +10714,9 @@ def _start_child_lease_holder(
     ready: Path,
     stop: Path,
     *,
-    append_request: Path | None = None,
-    appended: Path | None = None,
+    append_started: Path | None = None,
+    recovery_done: Path | None = None,
+    append_finished: Path | None = None,
 ) -> subprocess.Popen[str]:
     script = """
 import sys
@@ -10733,17 +10734,31 @@ from zeta.protocol.types import (
 store = ConversationStore(Path(sys.argv[1]), session_id=sys.argv[2])
 store.activate_runtime_lease()
 Path(sys.argv[3]).write_text("ready")
-append_request = None if sys.argv[5] == "-" else Path(sys.argv[5])
-appended = None if sys.argv[6] == "-" else Path(sys.argv[6])
-while not Path(sys.argv[4]).exists():
-    if append_request is not None and append_request.exists() and not appended.exists():
+stop = Path(sys.argv[4])
+append_started = None if sys.argv[5] == "-" else Path(sys.argv[5])
+recovery_done = None if sys.argv[6] == "-" else Path(sys.argv[6])
+append_finished = None if sys.argv[7] == "-" else Path(sys.argv[7])
+if append_started is not None:
+    index = 0
+    while not recovery_done.exists() and not stop.exists():
         store.append_message(
             with_message_origin(
-                Message(MessageRole.USER, [TextContent("concurrent append")]),
+                Message(MessageRole.USER, [TextContent(f"concurrent append {index}")]),
                 MessageOrigin.AGENT_PROMPT,
             )
         )
-        appended.write_text("appended")
+        index += 1
+        if index == 1:
+            append_started.write_text("started")
+    if recovery_done.exists():
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"concurrent append {index}")]),
+                MessageOrigin.AGENT_PROMPT,
+            )
+        )
+        append_finished.write_text("finished")
+while not stop.exists():
     time.sleep(0.01)
 store.close()
 """
@@ -10756,8 +10771,9 @@ store.close()
             child.session_id,
             str(ready),
             str(stop),
-            str(append_request) if append_request is not None else "-",
-            str(appended) if appended is not None else "-",
+            str(append_started) if append_started is not None else "-",
+            str(recovery_done) if recovery_done is not None else "-",
+            str(append_finished) if append_finished is not None else "-",
         ],
         text=True,
     )
@@ -10826,25 +10842,64 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
     dead_child.close()
     ready = tmp_path / "ready"
     stop = tmp_path / "stop"
-    append_request = tmp_path / "append-request"
-    appended = tmp_path / "appended"
+    root.append_child_idle_notification(
+        "root:1",
+        child_session_path=str(child.session_dir),
+        description="worker",
+        text="WAIT",
+    )
+    root.append_child_idle_notification(
+        "root:1:1",
+        child_session_path=str(child.session_dir / "agents" / "1"),
+        description="worker",
+        text="WAIT",
+    )
+    busy_notice_ids = {
+        entry.id
+        for entry in root.agent_notifications(pending_only=False)
+        if (
+            entry.data.get("child_instance_id") == "root:1"
+            or str(entry.data.get("child_instance_id", "")).startswith("root:1:")
+        )
+        and entry.data.get("kind") in {"agent_completion", "child_idle"}
+    }
+    append_started = tmp_path / "append-started"
+    recovery_done = tmp_path / "recovery-done"
+    append_finished = tmp_path / "append-finished"
     holder = _start_child_lease_holder(
         child,
         ready,
         stop,
-        append_request=append_request,
-        appended=appended,
+        append_started=append_started,
+        recovery_done=recovery_done,
+        append_finished=append_finished,
     )
     try:
-        loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
-        activation = asyncio.create_task(loop.activate())
-        append_request.write_text("append")
         for _ in range(500):
-            if appended.exists():
+            if append_started.exists():
                 break
             await asyncio.sleep(0.01)
-        assert appended.exists()
-        await activation
+        assert append_started.exists()
+
+        loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
+        await loop.activate()
+        observed = ConversationStore(root.session_dir / "agents", session_id="1")
+        appends_before_recovery_returned = [
+            message.content[0].text
+            for message in observed.messages()
+            if message.role is MessageRole.USER
+            and len(message.content) == 1
+            and isinstance(message.content[0], TextContent)
+            and message.content[0].text.startswith("concurrent append ")
+        ]
+        observed.close()
+        assert appends_before_recovery_returned
+        recovery_done.write_text("done")
+        for _ in range(500):
+            if append_finished.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert append_finished.exists()
 
         assert set(root.agent_children()) == {"root:1"}
         active_questions = {
@@ -10863,14 +10918,54 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
         assert "busy-descendant-question" not in withdrawn_questions
         assert "dead-question" in withdrawn_questions
 
+        busy_status_notices = [
+            entry
+            for entry in all_notifications
+            if (
+                entry.data.get("child_instance_id") == "root:1"
+                or str(entry.data.get("child_instance_id", "")).startswith("root:1:")
+            )
+            and entry.data.get("kind") in {"agent_completion", "child_idle"}
+        ]
+        assert {entry.id for entry in busy_status_notices} == busy_notice_ids
+        pending_notice_ids = {entry.id for entry in root.agent_notifications()}
+        assert busy_notice_ids <= pending_notice_ids
+        acknowledged_notice_ids = {
+            entry.data["notification_id"]
+            for entry in root.replay()
+            if entry.type == "notification_ack"
+        }
+        assert busy_notice_ids.isdisjoint(acknowledged_notice_ids)
+
+        dead_completions = [
+            entry
+            for entry in all_notifications
+            if entry.data.get("kind") == "agent_completion"
+            and entry.data.get("child_instance_id") == "root:2"
+        ]
+        assert len(dead_completions) == 1
+        dead_observed = ConversationStore(
+            root.session_dir / "agents", session_id="2"
+        )
+        assert dead_observed.agent_lifecycle()["state"] == "canceled"
+        assert dead_observed.agent_canceled() is not None
+        dead_observed.close()
+
         observed = ConversationStore(root.session_dir / "agents", session_id="1")
         assert observed.agent_canceled() is None
-        assert any(
-            message.role is MessageRole.USER
-            and message.content == [TextContent("concurrent append")]
+        all_appends = [
+            message.content[0].text
             for message in observed.messages()
-        )
+            if message.role is MessageRole.USER
+            and len(message.content) == 1
+            and isinstance(message.content[0], TextContent)
+            and message.content[0].text.startswith("concurrent append ")
+        ]
         observed.close()
+        assert len(all_appends) > len(appends_before_recovery_returned)
+        assert all_appends == [
+            f"concurrent append {index}" for index in range(len(all_appends))
+        ]
         await loop.close()
     finally:
         stop.write_text("stop")
@@ -10882,6 +10977,17 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
     )
     await repaired_loop.activate()
     assert repaired_root.agent_children() == {}
+    repaired_completions = [
+        entry
+        for entry in repaired_root.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "agent_completion"
+    ]
+    assert [
+        entry.data.get("child_instance_id") for entry in repaired_completions
+    ].count("root:1") == 1
+    assert [
+        entry.data.get("child_instance_id") for entry in repaired_completions
+    ].count("root:2") == 1
     assert not [
         entry
         for entry in repaired_root.agent_notifications()
