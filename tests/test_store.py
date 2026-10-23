@@ -925,9 +925,11 @@ async def test_off_loop_refresh_preserves_newer_owner_state(
     await refresh
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
+    assert store._detach_log_state() == fresh._detach_log_state()
     assert store.bash_cwd == fresh.bash_cwd
     assert store.todo_items() == fresh.todo_items()
     assert store.todo_dismissed == fresh.todo_dismissed
+    assert store._agent_counter == fresh._agent_counter
     assert store.agent_children() == fresh.agent_children()
     assert store.agent_canceled() == fresh.agent_canceled()
     assert store._agent_parent == fresh._agent_parent
