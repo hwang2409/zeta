@@ -1,0 +1,46 @@
+"""Per-process exactly-once presentation for serve notifications."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+
+from zeta.server import event_contract
+
+NotificationSender = Callable[..., Awaitable[None]]
+
+
+class NotificationPresentation:
+    """Publish each durable notification at most once per serve session."""
+
+    def __init__(self) -> None:
+        self._presented: set[tuple[str, str]] = set()
+
+    async def publish(
+        self,
+        session_id: str | None,
+        notification: Mapping[str, object],
+        protocol_version: str,
+        send: NotificationSender,
+    ) -> None:
+        notification_id = notification.get("notification_id")
+        key = (
+            (session_id, notification_id)
+            if isinstance(session_id, str) and isinstance(notification_id, str)
+            else None
+        )
+        if key is not None and key in self._presented:
+            return
+        if key is not None:
+            self._presented.add(key)
+        event_name = event_contract.notification_wire_event(
+            notification.get("kind", "agent_completion"), protocol_version
+        )
+        try:
+            await send(event_name, session_id, data=dict(notification))
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            if key is not None:
+                self._presented.discard(key)
+            raise

@@ -55,6 +55,7 @@ from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
 )
+from zeta.server.notification_presentation import NotificationPresentation
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
 from zeta.server.server import _approval_display_fields, _Client
 from zeta.server.slash_commands import ServerSlashSession
@@ -76,6 +77,25 @@ def test_every_durable_notification_kind_has_an_explicit_wire_event() -> None:
 def test_every_stream_event_has_a_wire_mapping() -> None:
     assert set(STREAM_EVENT_WIRE_EVENTS) == set(StreamEventType)
     assert all(STREAM_EVENT_WIRE_EVENTS.values())
+
+
+@pytest.mark.asyncio
+async def test_notification_presentation_retries_failed_send() -> None:
+    presentation = NotificationPresentation()
+    attempts = 0
+
+    async def send(*args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError("send failed")
+
+    notification = {"notification_id": "notification-1"}
+    with pytest.raises(ConnectionError, match="send failed"):
+        await presentation.publish("session-1", notification, "1.0", send)
+    await presentation.publish("session-1", notification, "1.0", send)
+
+    assert attempts == 2
 
 
 def test_serve_maps_account_state_unknown() -> None:
@@ -2845,6 +2865,85 @@ async def test_reconnect_streams_pending_notification_turn(tmp_path: Path) -> No
         assert receipts[0]["data"]["child_instance_id"] == "child-1"
         assert len(backend.calls) == 1
     finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_notification_receipt_is_not_republished_after_canceled_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first")]),
+            ScriptedTurn([TextContent("retry")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    client = server._client
+    assert client is not None
+    published = asyncio.Event()
+    release_publication = asyncio.Event()
+    original_notify = client._notify
+
+    async def gate_after_receipt(
+        event: str, sent_session_id: str | None = None, **fields: object
+    ) -> None:
+        await original_notify(event, sent_session_id, **fields)
+        if event == "sub_agent_receipt" and not published.is_set():
+            published.set()
+            await release_publication.wait()
+
+    monkeypatch.setattr(client, "_notify", gate_after_receipt)
+    notification = server.runtime.opened.store.append_agent_notification(
+        "child-retry",
+        child_session_path="/tmp/child-retry",
+        description="child",
+        status="completed",
+        text="child retry done",
+    )
+    try:
+        client._schedule_background_wake(session_id)
+        await asyncio.wait_for(published.wait(), TIMEOUT)
+        first_turn = client._turn_task
+        assert first_turn is not None
+        first_turn.cancel()
+        await asyncio.gather(first_turn, return_exceptions=True)
+        release_publication.set()
+        assert [
+            entry.id for entry in server.runtime.opened.store.agent_notifications()
+        ] == [notification.id]
+
+        client._schedule_background_wake(session_id)
+        frames = await _frames_until_event(reader, "turn_end")
+        receipts = [
+            frame["params"]
+            for frame in frames
+            if frame.get("params", {}).get("event") == "sub_agent_receipt"
+        ]
+        matching = [
+            receipt
+            for receipt in receipts
+            if receipt.get("data", {}).get("notification_id") == notification.id
+        ]
+        assert len(matching) == 1
+        assert len(backend.calls) == 2
+        for messages, _tools in backend.calls:
+            assert sum(
+                message.metadata.get("zeta_event") == "agent_notifications"
+                and notification.id
+                in message.metadata.get("zeta.step_delivery", {}).get(
+                    "notification_ids", []
+                )
+                for message in messages
+            ) == 1
+    finally:
+        release_publication.set()
         await _close(server, writer)
 
 

@@ -32,6 +32,7 @@ from . import (
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
 from .delivery import DeliveryRequests, TurnOutcome
 from .model_inputs import PendingModelInputs
+from .notification_presentation import NotificationPresentation
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
     PROJECT_REQUESTS,
@@ -100,6 +101,7 @@ class ZetaServer:
         self._client_active = False
         self._client: _Client | None = None
         self._socket_created = False
+        self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
 
     @property
@@ -979,11 +981,9 @@ class _Client:
             )
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
-            notification = dict(event.data)
-            event_name = event_contract.notification_wire_event(
-                notification.get("kind", "agent_completion"), self.protocol_version
+            await self.server.notification_presentations.publish(
+                session_id, event.data, self.protocol_version, self._notify
             )
-            await self._notify(event_name, session_id, data=notification)
             return
         if kind is StreamEventType.ERROR:
             error = (

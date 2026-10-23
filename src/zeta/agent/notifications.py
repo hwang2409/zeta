@@ -69,7 +69,9 @@ class AgentNotificationMixin:
                     "notification_id": notification.id,
                     **notification.data,
                     "kind": notification.data.get("kind", "agent_completion"),
-                    "tui_presented": False,
+                    "tui_presented": self.store.is_agent_notification_presented_to_tui(
+                        notification.id
+                    ),
                 },
             )
             for notification in publications.notifications

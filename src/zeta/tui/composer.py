@@ -274,7 +274,7 @@ class TurnConsumerMixin:
                             StreamEventType.ERROR,
                             StreamEventType.AGENT_NOTIFICATION,
                         }:
-                            turn_failed |= self._print_special_event(
+                            turn_failed |= await self._print_special_event(
                                 event,
                                 rendered,
                                 suppress_errors=suppress_errors or notification,
@@ -318,7 +318,7 @@ class TurnConsumerMixin:
             self._finish_stream_invalidation()
         return notification_failure
 
-    def _print_special_event(
+    async def _print_special_event(
         self,
         event: StreamEvent,
         rendered: Any,
@@ -327,11 +327,30 @@ class TurnConsumerMixin:
         user_text: str,
         retry_message: Message,
     ) -> bool:
+        notification_id = event.data.get("notification_id")
+        if (
+            event.type is StreamEventType.AGENT_NOTIFICATION
+            and isinstance(notification_id, str)
+            and (
+                event.data.get("tui_presented") is True
+                or self.loop.store.is_agent_notification_presented_to_tui(
+                    notification_id
+                )
+            )
+        ):
+            return False
         if not (suppress_errors and event.type is StreamEventType.ERROR):
             self._print_unit(
                 rendered,
                 blank_before=event.type is StreamEventType.AGENT_NOTIFICATION,
             )
+            if (
+                event.type is StreamEventType.AGENT_NOTIFICATION
+                and isinstance(notification_id, str)
+            ):
+                await self.loop.store.mark_agent_notifications_presented_to_tui_async(
+                    [notification_id]
+                )
         if event.type is not StreamEventType.ERROR or not is_retryable_error(
             event.error
         ):

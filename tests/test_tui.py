@@ -631,6 +631,72 @@ async def test_background_event_renders_exactly_once_end_to_end(
 
 
 @pytest.mark.asyncio
+async def test_live_notification_presentation_survives_tui_resume(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    store = ConversationStore(tmp_path / "session")
+    notification = store.append_agent_notification(
+        "child-presentation",
+        child_session_path="/tmp/child-presentation",
+        description="child",
+        status="completed",
+        text="child presentation done",
+    )
+    loop = AgentLoop(
+        FakeBackend([]), store, skill_catalog=SkillCatalog.empty(), skip_mcp_mount=True
+    )
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False, width=160),
+    )
+    flow = await loop._ensure_step_delivery()
+    prepared = await flow.prepare_request("terminal_fallback", [], None)
+    assert prepared.notification_ids == (notification.id,)
+    event = loop._delivery_publication_events(flow.active_publications)[0]
+    rendered = render_event(event)
+    assert rendered is not None
+
+    await app._print_special_event(
+        event,
+        rendered,
+        suppress_errors=False,
+        user_text="",
+        retry_message=Message(MessageRole.USER, [TextContent("")]),
+    )
+
+    assert store.agent_notifications()
+    assert store.is_agent_notification_presented_to_tui(notification.id)
+    retry_event = loop._delivery_publication_events(flow.active_publications)[0]
+    assert retry_event.data["tui_presented"] is True
+    assert render_event(retry_event) is None
+    reopened = ConversationStore(store.root_dir, session_id=store.session_id)
+    resumed_output = StringIO()
+    resumed_app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            reopened,
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=resumed_output, force_terminal=False, width=160),
+    )
+    try:
+        resumed_app._rebuild_transcript()
+        visible = output.getvalue() + resumed_output.getvalue()
+        assert visible.count("child · completed") == 1
+    finally:
+        await resumed_app.loop.close()
+        reopened.close()
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_background_completion_is_rendered_when_exit_overtakes_acknowledgement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -662,6 +728,10 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         release_ack.set()
         count, rendered = await transcript
         assert count == 1, rendered
+        markers = {
+            entry.type for entry in apps[0].loop.store.tui_replay_entries()
+        }
+        assert "notification_tui_presented" in markers
     finally:
         release_ack.set()
         if not transcript.done():

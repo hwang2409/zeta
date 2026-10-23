@@ -7169,6 +7169,78 @@ async def test_cancel_after_notification_ack_commit_keeps_completion_visible(
 
 
 @pytest.mark.asyncio
+async def test_cancel_after_notification_publication_retries_model_delivery_once(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    notification = await flow.produce(_task_exit_input("task-cancel-before-ack"))
+    prepared = await flow.prepare_request("terminal_fallback", [], None)
+    assert prepared.notification_ids == (notification.entries[0].id,)
+
+    provider_calls = 0
+
+    async def provider():
+        nonlocal provider_calls
+        provider_calls += 1
+        assert sum(
+            notification.entries[0].id
+            in message.metadata.get("zeta.step_delivery", {}).get(
+                "notification_ids", []
+            )
+            for message in prepared.messages
+        ) == 1
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+
+    def publications(value: object):
+        assert isinstance(value, pending_delivery_module.DeliveryPublications)
+        assert [entry.id for entry in value.notifications] == [
+            notification.entries[0].id
+        ]
+        return iter(
+            (
+                StreamEvent(
+                    StreamEventType.AGENT_NOTIFICATION,
+                    data={"notification_id": notification.entries[0].id},
+                ),
+            )
+        )
+
+    first = observed_completion(
+        provider(),
+        store,
+        None,
+        flow.active_publications,
+        flow.acknowledge_active,
+        publications,
+    )
+    first_publication = await anext(first)
+    assert first_publication.data["notification_id"] == notification.entries[0].id
+    await first.aclose()
+    assert [entry.id for entry in store.agent_notifications()] == [
+        notification.entries[0].id
+    ]
+
+    retry = observed_completion(
+        provider(),
+        store,
+        None,
+        flow.active_publications,
+        flow.acknowledge_active,
+        publications,
+    )
+    retry_publication = await anext(retry)
+    assert retry_publication.data["notification_id"] == notification.entries[0].id
+    assert (await anext(retry)).type is StreamEventType.MESSAGE_START
+    with pytest.raises(StopAsyncIteration):
+        await anext(retry)
+
+    assert provider_calls == 2
+    assert store.agent_notifications() == []
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_delivery_after_commit_failure_keeps_durable_receipt(
     tmp_path: Path,
 ) -> None:
