@@ -69,6 +69,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.providers.codex import CodexStreamError
+from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog, SkillMeta
@@ -2546,6 +2547,131 @@ async def test_finish_gate_counts_task_started_and_exited_during_model_step(
 
     assert result is None
     assert state.turns_exhausted_with_task
+    store.close()
+
+
+class _BlockingTransportClose:
+    def __init__(self) -> None:
+        self.response_started = asyncio.Event()
+        self.response_closed = asyncio.Event()
+        self.client_started = asyncio.Event()
+        self.client_closed = asyncio.Event()
+
+    async def __aexit__(self, *args: object) -> None:
+        self.response_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.response_closed.set()
+            raise
+
+    async def aclose(self) -> None:
+        self.client_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.client_closed.set()
+            raise
+
+    async def events(self) -> AsyncIterator[StreamEvent]:
+        primary: BaseException | None = None
+        try:
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+        except BaseException as exc:  # noqa: BLE001 - mirror provider cleanup
+            primary = exc
+        finally:
+            primary = await cleanup_transport(
+                stream_context=self,
+                entered=True,
+                client=self,
+                owns_client=True,
+                primary_exception=primary,
+                http_error_type=CodexStreamError,
+            )
+            if primary is not None:
+                raise primary
+
+
+async def _consume_one_event(
+    stream: AsyncIterator[StreamEvent], control: FinishGateControl | None
+) -> None:
+    del control
+    await anext(stream)
+
+
+def _finish_gate_with_running_task(
+    tmp_path: Path, *, task_timeout: float
+) -> tuple[ConversationStore, SimpleNamespace, FinishGateState]:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(
+        store, finish_gate_timeout=1, finish_gate_task_timeout=task_timeout
+    )
+    task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=True)
+    registry = SimpleNamespace(
+        snapshot=lambda: (task,), task_start_generation=1, running_count=1
+    )
+    child_loop = SimpleNamespace(
+        _background_owner=owner,
+        agent_instance_id="child-1",
+        tool_registry=SimpleNamespace(background_tasks=registry),
+    )
+    state = FinishGateState()
+    state.start(child_loop)
+    return store, child_loop, state
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_real_transport_close_obeys_task_deadline(
+    tmp_path: Path,
+) -> None:
+    store, child_loop, state = _finish_gate_with_running_task(
+        tmp_path, task_timeout=0.02
+    )
+    transport = _BlockingTransportClose()
+    before = set(asyncio.all_tasks())
+    started = asyncio.get_running_loop().time()
+
+    result = await asyncio.wait_for(
+        state.run_model_turn(child_loop, transport.events(), _consume_one_event),
+        timeout=0.1,
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+    await asyncio.sleep(0)
+
+    assert elapsed < 0.05
+    assert result is not None
+    assert result.outcome == "task_safety_expired"
+    assert transport.response_closed.is_set()
+    assert transport.client_closed.is_set()
+    assert set(asyncio.all_tasks()) <= before
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_real_transport_close_propagates_caller_cancellation(
+    tmp_path: Path,
+) -> None:
+    store, child_loop, state = _finish_gate_with_running_task(
+        tmp_path, task_timeout=1
+    )
+    transport = _BlockingTransportClose()
+    before = set(asyncio.all_tasks())
+    model_turn = asyncio.create_task(
+        state.run_model_turn(child_loop, transport.events(), _consume_one_event)
+    )
+    await asyncio.wait_for(transport.response_started.wait(), timeout=0.1)
+    started = asyncio.get_running_loop().time()
+
+    model_turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(model_turn, timeout=0.1)
+    elapsed = asyncio.get_running_loop().time() - started
+    await asyncio.sleep(0)
+
+    assert elapsed < 0.05
+    assert transport.response_closed.is_set()
+    assert transport.client_closed.is_set()
+    assert set(asyncio.all_tasks()) <= before
     store.close()
 
 

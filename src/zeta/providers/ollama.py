@@ -30,6 +30,7 @@ from .payload_common import (
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
+    close_transport_resources,
     provider_retry_notice,
     retry_after_seconds,
     retry_provider_completion,
@@ -387,7 +388,9 @@ class OllamaBackend(CompletionBackend):
             ) from exc
         finally:
             if self.client is None:
-                await client.aclose()
+                (close_result,) = await close_transport_resources(client.aclose())
+                if isinstance(close_result, BaseException):
+                    raise close_result
 
 
 __all__ = ["DEFAULT_OLLAMA_MODEL", "OLLAMA_API_URL", "OllamaBackend", "OllamaError"]

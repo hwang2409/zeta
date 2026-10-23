@@ -342,6 +342,24 @@ def merge_exception(
     return primary
 
 
+async def close_transport_resources(
+    *closes: Awaitable[object],
+) -> tuple[object | BaseException, ...]:
+    tasks = tuple(asyncio.create_task(close) for close in closes)
+    if task_is_cancelling():
+        await asyncio.sleep(0)
+        for task in tasks:
+            task.cancel()
+    results = tuple(await asyncio.gather(*tasks, return_exceptions=True))
+    cancellation = next(
+        (result for result in results if isinstance(result, asyncio.CancelledError)),
+        None,
+    )
+    if cancellation is not None:
+        raise cancellation
+    return results
+
+
 async def cleanup_transport[ErrorT: RuntimeError](
     *,
     stream_context: object | None,
@@ -351,30 +369,32 @@ async def cleanup_transport[ErrorT: RuntimeError](
     primary_exception: BaseException | None,
     http_error_type: type[ErrorT],
 ) -> BaseException | None:
+    closes: list[Awaitable[object]] = []
     if entered and stream_context is not None:
-        try:
-            await stream_context.__aexit__(  # type: ignore[attr-defined]
+        closes.append(
+            stream_context.__aexit__(  # type: ignore[attr-defined]
                 type(primary_exception) if primary_exception else None,
                 primary_exception,
                 primary_exception.__traceback__ if primary_exception else None,
             )
-        except BaseException as exc:
-            cleanup = (
-                request_error(exc, http_error_type)
-                if isinstance(exc, httpx.HTTPError)
-                else exc
-            )
-            primary_exception = merge_exception(primary_exception, cleanup)
+        )
     if owns_client:
-        try:
-            await client.aclose()  # type: ignore[attr-defined]
-        except BaseException as exc:
-            cleanup = (
-                request_error(exc, http_error_type)
-                if isinstance(exc, httpx.HTTPError)
-                else exc
-            )
-            primary_exception = merge_exception(primary_exception, cleanup)
+        closes.append(client.aclose())  # type: ignore[attr-defined]
+    try:
+        results = await close_transport_resources(*closes)
+    except asyncio.CancelledError as exc:
+        raise merge_exception(primary_exception, exc)
+    for result in results:
+        if not isinstance(result, BaseException):
+            continue
+        cleanup = (
+            request_error(result, http_error_type)
+            if isinstance(result, httpx.HTTPError)
+            else result
+        )
+        primary_exception = merge_exception(primary_exception, cleanup)
     if task_is_cancelling():
         primary_exception = merge_exception(primary_exception, asyncio.CancelledError())
+    if isinstance(primary_exception, asyncio.CancelledError):
+        raise primary_exception
     return primary_exception
