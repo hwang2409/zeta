@@ -7,8 +7,14 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
-from ..protocol.types import MessageOrigin, StreamEvent
-from .background import finish_gate_message
+from ..protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
+    Message,
+    MessageOrigin,
+    MessageRole,
+    StreamEvent,
+    TextContent,
+)
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
@@ -19,6 +25,46 @@ FinishGateOutcome = Literal[
 ConsumeEvents = Callable[
     [AsyncIterator[StreamEvent], "FinishGateControl | None"], Awaitable[None]
 ]
+
+
+def finish_gate_message(
+    children: tuple[tuple[str, str], ...], tasks: tuple[tuple[str, str], ...]
+) -> Message:
+    running: list[str] = []
+    if children:
+        child_list = ", ".join(
+            f"{handle}: {description}" for handle, description in children
+        )
+        running.append(
+            f"{len(children)} background sub-agents still running: {child_list}"
+        )
+    if tasks:
+        task_list = ", ".join(f"{task_id}: {headline}" for task_id, headline in tasks)
+        running.append(f"{len(tasks)} background tasks still running: {task_list}")
+    stop_choices = []
+    if children:
+        stop_choices.append("cancel sub-agents with agent_cancel")
+    if tasks:
+        stop_choices.append("stop tasks with task_kill")
+    text = (
+        f"You have {'; '.join(running)}. You cannot finish yet. Choose one: "
+        "(a) wait: reply WAIT and end this turn; completions and task exits "
+        "will wake you, with no polling; (b) "
+        f"{' and '.join(stop_choices)}; "
+        "(c) hand off with agent_handoff, providing the reason and where "
+        "the outputs will appear. Sub-agents continue under the parent, but "
+        "background tasks cannot be adopted and will be killed when this "
+        "agent completes; task output remains in this child session's task archive. "
+        "A finish-gate safety bound applies if a task never exits."
+    )
+    return Message(
+        MessageRole.USER,
+        [TextContent(text)],
+        metadata={
+            "zeta_event": "agent_finish_gate",
+            MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
+        },
+    )
 
 
 @dataclass(slots=True)
@@ -80,40 +126,53 @@ class FinishGateState:
     ) -> FinishGateResult | None:
         owner = child_loop._background_owner
         loop = asyncio.get_running_loop()
-        tasks_were_running = bool(self.owned_tasks(child_loop))
+        task_registry = child_loop.tool_registry.background_tasks
+        task_running_at_entry = bool(self.owned_tasks(child_loop))
+        task_start_generation = task_registry.task_start_generation
         deadline = loop.time() + owner.finish_gate_timeout
-        if tasks_were_running:
+        if self.task_outlived_child_bound:
+            deadline = self._task_deadline()
+        elif task_running_at_entry:
             deadline = min(deadline, self._task_deadline())
         try:
             async with asyncio.timeout_at(deadline):
-                await consume_events(events, self.control)
+                try:
+                    await consume_events(events, self.control)
+                finally:
+                    close = getattr(events, "aclose", None)
+                    if close is not None:
+                        await close()
         except TimeoutError:
-            return self._model_timeout_result(
-                child_loop, tasks_were_running=tasks_were_running
+            task_existed = (
+                task_running_at_entry
+                or task_registry.task_start_generation != task_start_generation
             )
-        finally:
-            close = getattr(events, "aclose", None)
-            if close is not None:
-                await close()
-        return self._model_turn_result(child_loop)
+            return self._model_timeout_result(
+                task_existed=task_existed,
+                task_running=task_registry.running_count > 0,
+            )
+        task_existed = (
+            task_running_at_entry
+            or task_registry.task_start_generation != task_start_generation
+        )
+        return self._model_turn_result(task_existed=task_existed)
 
     def _model_timeout_result(
-        self, child_loop: AgentLoop, *, tasks_were_running: bool
+        self, *, task_existed: bool, task_running: bool
     ) -> FinishGateResult | None:
-        tasks = self.owned_tasks(child_loop)
-        if tasks and asyncio.get_running_loop().time() >= self._task_deadline():
+        if task_running and asyncio.get_running_loop().time() >= self._task_deadline():
             return _task_safety_expired()
-        if tasks or tasks_were_running:
+        if task_existed:
             return None
         return _model_bound_expired()
 
-    def _model_turn_result(self, child_loop: AgentLoop) -> FinishGateResult | None:
+    def _model_turn_result(self, *, task_existed: bool) -> FinishGateResult | None:
         control = self._control()
         if control.handoff is not None:
             return FinishGateResult("handed_off", handoff=control.handoff)
         if control.turns < control.max_turns:
             return None
-        if self.owned_tasks(child_loop):
+        if task_existed:
             self.turns_exhausted_with_task = True
             return None
         return FinishGateResult(
@@ -247,7 +306,7 @@ async def _wait_for_finish(
         state.note_task_outlived_child_bound(bool(tasks))
         state.begin_post_task_turns(bool(tasks))
         pending_notification = child_loop.notification_system_message() is not None
-        terminal = _terminal_transition(
+        terminal = await _terminal_transition(
             child_loop,
             children,
             tasks,
@@ -271,14 +330,16 @@ async def _wait_for_finish(
     return FinishGateResult("completed")
 
 
-def _terminal_transition(
+async def _terminal_transition(
     child_loop: AgentLoop,
     children: tuple[tuple[str, str], ...],
     tasks: tuple[tuple[str, str], ...],
     pending_notification: bool,
     delivering_prompt_id: str | None,
 ) -> FinishGateResult | None:
-    pending_prompts = child_loop.store.pending_prompts()
+    pending_prompts = await child_loop.store._to_thread_durable(
+        child_loop.store.pending_prompts
+    )
     if any(prompt.id != delivering_prompt_id for prompt in pending_prompts):
         return FinishGateResult("completed")
     if not children and not tasks and not pending_notification:

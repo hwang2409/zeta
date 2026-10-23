@@ -3,19 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import Callable
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..core.checkpoints import ConversationEntry, ConversationIntegrityError
-from ..core.session_files import SessionNotFoundError
-from ..core.store import (
-    ConversationStore,
-    PendingPromptCommitTimeoutError,
-    PendingPromptsClosedError,
-)
-from ..protocol.types import MessageOrigin
+from ..core.checkpoints import ConversationEntry
+from ..core.store import ConversationStore
 
 if TYPE_CHECKING:
     from .background import BackgroundAgentOwner
@@ -78,67 +70,6 @@ class ConversationChannel:
         if target is not None:
             loop, event = target
             loop.call_soon_threadsafe(event.set)
-
-    def publish_follow_up(
-        self,
-        parent_store: ConversationStore,
-        child_instance_id: object,
-        message: object,
-        *,
-        commit_timeout: float,
-    ) -> str | None:
-        """Durably queue one eligible follow-up, then wake its child loop."""
-
-        if type(child_instance_id) is not str or not child_instance_id.strip():
-            return "child_instance_id must be a nonempty string"
-        if type(message) is not str or not message.strip():
-            return "message must be a nonempty string"
-        no_live_run = (
-            f"no live run/child {child_instance_id!r}; it was canceled, finished, "
-            "or never started"
-        )
-        marker = parent_store.agent_children().get(child_instance_id)
-        if marker is None:
-            return no_live_run
-        if not has_follow_up_loop(
-            accepts_follow_ups=marker.get("accepts_follow_ups") is True,
-            background=marker.get("background") is True,
-        ):
-            agent_type = marker.get("agent_type") or "general"
-            reason = (
-                "it is a foreground child"
-                if marker.get("background") is not True
-                else "its profile does not accept follow-ups"
-            )
-            return (
-                f"agent_send rejected for {agent_type} child {child_instance_id!r}: "
-                f"{reason}"
-            )
-        deadline = time.monotonic() + commit_timeout
-        try:
-            child_path = Path(str(marker["child_session_path"]))
-            with ConversationStore(
-                child_path.parent,
-                session_id=child_path.name,
-                cwd=parent_store.cwd,
-                _lock_deadline=deadline,
-                _must_exist=True,
-            ) as child_store:
-                child_store.pending_prompt_queue.append(
-                    message,
-                    origin=MessageOrigin.AGENT_SEND,
-                    deadline=deadline,
-                )
-        except PendingPromptCommitTimeoutError:
-            return "pending prompt commit timed out before the queue could be changed"
-        except (PendingPromptsClosedError, SessionNotFoundError):
-            return no_live_run
-        except ConversationIntegrityError:
-            if (child_path / "conversation.jsonl").exists():
-                raise
-            return no_live_run
-        self.wake(child_instance_id)
-        return None
 
     def publish_idle(
         self,

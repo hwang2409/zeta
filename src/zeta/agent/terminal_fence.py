@@ -36,10 +36,11 @@ class TerminalTransitionFence:
                 return "wait, cancel, or hand off owned work first: " + shown
             if self._notification_pending():
                 return "pending notification must be read before finish"
-            reason = self._store.pending_prompt_queue.accept_explicit_finish(
+            reason = await self._store._to_thread_durable(
+                self._store._accept_explicit_finish,
                 report,
-                persisted_notification_ids=self._persisted_notification_ids(),
-                delivering_prompt_id=self._delivering_prompt_id(),
+                self._persisted_notification_ids(),
+                self._delivering_prompt_id(),
             )
             if reason is None:
                 self._store.update_agent_lifecycle(
@@ -47,36 +48,38 @@ class TerminalTransitionFence:
                 )
             return reason
 
-    def request_cancel(self) -> bool:
-        """Atomically let cancellation win only before finish acceptance."""
-        return self._store.pending_prompt_queue.cancel_explicit_child()
-
-    def accepted_report(self) -> dict[str, object] | None:
-        """Read the durable winner used by shutdown and restart recovery."""
-        return self._store.pending_prompt_queue.explicit_finish_report()
-
     async def cancel(self) -> bool:
+        """Atomically let cancellation win only before finish acceptance."""
         async with self._lock:
-            return self.request_cancel()
+            return await self._store._to_thread_durable(
+                self._store._cancel_explicit_child
+            )
 
     async def recover(self) -> dict[str, object] | None:
+        """Read the durable winner used by asynchronous shutdown recovery."""
         async with self._lock:
-            return self.accepted_report()
+            return await self._store._to_thread_durable(
+                self._store._explicit_finish_report
+            )
+
+    def accepted_report_snapshot(self) -> dict[str, object] | None:
+        """Read recovery state from a store that its owner just loaded."""
+        return self._store.pending_prompt_queue.explicit_finish_report_snapshot()
 
     async def idle_nudge_eligible(self) -> bool:
         """Return whether the idle clock may run."""
         async with self._lock:
-            return self._idle_nudge_eligible()
+            return await self._idle_nudge_eligible()
 
     async def reserve_idle_nudge(self) -> bool:
         """Atomically let durable input win before reserving one nudge turn."""
         async with self._lock:
-            return self._idle_nudge_eligible()
+            return await self._idle_nudge_eligible()
 
-    def _idle_nudge_eligible(self) -> bool:
-        return self._store.pending_prompt_queue.idle_nudge_eligible(
-            admission_allowed=lambda: (
-                not self._notification_pending() and not self._owned_work()
-            ),
-            persisted_notification_ids=self._persisted_notification_ids(),
+    async def _idle_nudge_eligible(self) -> bool:
+        if self._notification_pending() or self._owned_work():
+            return False
+        return await self._store._to_thread_durable(
+            self._store._idle_nudge_eligible,
+            self._persisted_notification_ids(),
         )

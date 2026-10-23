@@ -785,7 +785,7 @@ async def test_agent_send_entry_persists_agent_send_origin(tmp_path: Path) -> No
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
     handle = _run_handle_from_receipt(store)
     child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
-    assert send_to_run(
+    assert await send_to_run(
         store,
         handle,
         "also check tests",

@@ -26,6 +26,10 @@ from ...agent.background import (
 from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.durable import durable_message
 from ...agent.notifications import AgentNotificationMixin, NotificationWake
+from ...agent.pending_delivery import (
+    PendingDelivery,
+    pending_prompt_acknowledgement,
+)
 from ...agent.plan_mode import (
     PLAN_MODE_POLICY,
     plan_mode_messages,
@@ -228,6 +232,7 @@ class AgentLoop(
         self.explicit_finish = False
         self._explicit_finish_report: dict[str, object] | None = None
         self._delivering_prompt_id: str | None = None
+        self._yield_for_pending_prompt = False
         self.notification_wake = NotificationWake(store)
         # Partial assistant persistence uses these values so provider metadata is
         # retained even when the stream later fails or is cancelled.
@@ -751,6 +756,7 @@ class AgentLoop(
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
+        pending_delivery: PendingDelivery | None = None,
         system_message: Message | None = None,
         on_persisted: Callable[[], None] | None = None,
         notification_turn: bool = False,
@@ -897,8 +903,22 @@ class AgentLoop(
                     self.backend.complete(context_messages, active_tools),
                     provider_retry_budget,
                 )
-                provider_stream = completion if steering is None else provider_events(
-                    completion, partial(self.store.deliver_client_steering, steering)
+
+                acknowledge_pending_prompt = pending_prompt_acknowledgement(
+                    self.store, pending_delivery, context_messages
+                )
+                provider_stream = (
+                    completion
+                    if steering is None and acknowledge_pending_prompt is None
+                    else provider_events(
+                        completion,
+                        (
+                            partial(self.store.deliver_client_steering, steering)
+                            if steering is not None
+                            else None
+                        ),
+                        acknowledge_pending_prompt,
+                    )
                 )
                 async for event in provider_stream:
                     attempt_state.observe(event)

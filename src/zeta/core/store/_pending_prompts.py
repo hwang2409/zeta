@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from ...protocol.types import MessageOrigin
+from ...protocol.types import Message, MessageOrigin
 from ..checkpoints import ConversationEntry
 
 if TYPE_CHECKING:
     from ._store import ConversationStore
 
 MAX_PENDING_PROMPT_TEXT = 16_000
+PENDING_PROMPT_ID_METADATA = "zeta.pending_prompt_id"
 
 
 class PendingPromptsClosedError(RuntimeError):
@@ -24,11 +27,90 @@ class PendingPromptCommitTimeoutError(TimeoutError):
     """Raised when a pending-prompt commit misses its pre-write deadline."""
 
 
+class PendingPromptLoopThreadLockError(RuntimeError):
+    """Raised before pending-prompt acknowledgement can block an event loop."""
+
+
+class PendingPromptStoreMixin:
+    """Expose pending-prompt transactions through one store interface."""
+
+    pending_prompt_queue: PendingPromptQueue
+
+    def append_pending_prompt(self, text: str) -> ConversationEntry:
+        return self.pending_prompt_queue.append(text)
+
+    def close_pending_queue_if_empty(self) -> list[ConversationEntry]:
+        return self.pending_prompt_queue.close_if_empty()
+
+    def close_pending_queue(self) -> None:
+        self.pending_prompt_queue.close()
+
+    def pending_prompts(self) -> list[ConversationEntry]:
+        return self.pending_prompt_queue.pending()
+
+    def acknowledge_pending_prompt(self, prompt_id: str) -> None:
+        self.pending_prompt_queue.acknowledge(prompt_id)
+
+    def _accept_explicit_finish(
+        self,
+        report: dict[str, object],
+        persisted_notification_ids: frozenset[str],
+        delivering_prompt_id: str | None,
+    ) -> str | None:
+        return self.pending_prompt_queue.accept_explicit_finish(
+            report,
+            persisted_notification_ids=persisted_notification_ids,
+            delivering_prompt_id=delivering_prompt_id,
+        )
+
+    def _cancel_explicit_child(self) -> bool:
+        return self.pending_prompt_queue.cancel_explicit_child()
+
+    def _explicit_finish_report(self) -> dict[str, object] | None:
+        return self.pending_prompt_queue.explicit_finish_report()
+
+    def _idle_nudge_eligible(
+        self, persisted_notification_ids: frozenset[str]
+    ) -> bool:
+        return self.pending_prompt_queue.idle_nudge_eligible(
+            persisted_notification_ids=persisted_notification_ids
+        )
+
+    def _acknowledge_pending_prompt_messages(
+        self, messages: list[Message], prompt_ids: tuple[str, ...]
+    ) -> None:
+        self.pending_prompt_queue.acknowledge_messages(messages, prompt_ids=prompt_ids)
+
+    async def acknowledge_pending_prompt_messages(
+        self, messages: list[Message], *, prompt_ids: tuple[str, ...] = ()
+    ) -> None:
+        await self._to_thread_durable(
+            self._acknowledge_pending_prompt_messages, messages, prompt_ids
+        )
+
+
+def _require_off_loop_lock() -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise PendingPromptLoopThreadLockError(
+        "pending-prompt store lock requested on an asyncio event-loop thread"
+    )
+
+
 class PendingPromptQueue:
     """Own every durable append, acknowledgement, close, and timeout decision."""
 
     def __init__(self, store: ConversationStore) -> None:
         self._store = weakref.proxy(store)
+
+    @contextmanager
+    def _lock(self, *, deadline: float | None = None) -> Iterator[None]:
+        """Acquire the pending-store lock only from a blocking worker thread."""
+        _require_off_loop_lock()
+        with self._store._append_lock(deadline=deadline):
+            yield
 
     @staticmethod
     def _check_deadline(deadline: float | None) -> None:
@@ -48,7 +130,7 @@ class PendingPromptQueue:
             raise ValueError("pending prompt text must be a nonempty string")
         if len(text) > MAX_PENDING_PROMPT_TEXT:
             raise ValueError("pending prompt text is too long")
-        with self._store._append_lock(deadline=deadline):
+        with self._lock(deadline=deadline):
             self._store._load()
             self._check_deadline(deadline)
             if self._queue_closed_unlocked():
@@ -61,12 +143,12 @@ class PendingPromptQueue:
             return self._store._snapshot_entry(entry)
 
     def pending(self) -> list[ConversationEntry]:
-        with self._store._append_lock():
+        with self._lock():
             self._store._load()
             return self._pending_unlocked()
 
     def acknowledge(self, prompt_id: str) -> None:
-        with self._store._append_lock():
+        with self._lock():
             self._store._load()
             branch = self._store.replay()
             prompts = [entry for entry in branch if entry.type == "pending_prompt"]
@@ -82,8 +164,31 @@ class PendingPromptQueue:
                     "pending_prompt_ack", {"prompt_id": prompt_id}
                 )
 
+    def acknowledge_messages(
+        self, messages: list[Message], *, prompt_ids: Iterable[str] = ()
+    ) -> None:
+        """Consume pending prompts included in one provider context."""
+        prompt_ids = set(prompt_ids) | {
+            prompt_id
+            for message in messages
+            if isinstance(
+                prompt_id := message.metadata.get(PENDING_PROMPT_ID_METADATA), str
+            )
+        }
+        if not prompt_ids:
+            return
+        with self._lock():
+            self._store._load()
+            pending_ids = {entry.id for entry in self._pending_unlocked()}
+            rows = [
+                ("pending_prompt_ack", {"prompt_id": prompt_id})
+                for prompt_id in prompt_ids & pending_ids
+            ]
+            if rows:
+                self._store._append_many_unlocked(rows)
+
     def close_if_empty(self) -> list[ConversationEntry]:
-        with self._store._append_lock():
+        with self._lock():
             self._store._load()
             pending = self._pending_unlocked()
             if not pending and not self._queue_closed_unlocked():
@@ -91,7 +196,7 @@ class PendingPromptQueue:
             return pending
 
     def close(self) -> None:
-        with self._store._append_lock():
+        with self._lock():
             self._store._load()
             if not self._queue_closed_unlocked():
                 self._store._append_row_unlocked("pending_queue_closed", {})
@@ -104,7 +209,7 @@ class PendingPromptQueue:
         delivering_prompt_id: str | None = None,
     ) -> str | None:
         """Atomically close admission and persist one accepted finish report."""
-        with self._store._append_lock():
+        with self._lock():
             self._store._load()
             transition = self._terminal_transition_unlocked()
             if transition is not None:
@@ -136,7 +241,7 @@ class PendingPromptQueue:
 
     def cancel_explicit_child(self) -> bool:
         """Close admission unless an accepted finish already owns termination."""
-        with self._store._append_lock():
+        with self._lock():
             self._store._load()
             transition = self._terminal_transition_unlocked()
             if transition is not None:
@@ -155,28 +260,29 @@ class PendingPromptQueue:
             return True
 
     def explicit_finish_report(self) -> dict[str, object] | None:
-        with self._store._append_lock():
+        with self._lock():
             self._store._load()
-            transition = self._terminal_transition_unlocked()
-            if transition is None or transition.data["action"] != "finish":
-                return None
-            return dict(transition.data["report"])
+            return self.explicit_finish_report_snapshot()
+
+    def explicit_finish_report_snapshot(self) -> dict[str, object] | None:
+        """Read a report from state already loaded by this store's owner."""
+        transition = self._terminal_transition_unlocked()
+        if transition is None or transition.data["action"] != "finish":
+            return None
+        return dict(transition.data["report"])
 
     def idle_nudge_eligible(
         self,
         *,
-        admission_allowed: Callable[[], bool] = lambda: True,
         persisted_notification_ids: frozenset[str] = frozenset(),
     ) -> bool:
-        """Atomically reject a nudge when input, work, or termination exists."""
-        with self._store._append_lock():
+        """Atomically reject a nudge when durable input or termination exists."""
+        with self._lock():
             self._store._load()
-            return admission_allowed() and self._idle_nudge_eligible_unlocked(
-                persisted_notification_ids
-            )
+            return self._idle_nudge_eligible_unlocked(persisted_notification_ids)
 
     def terminal_transition(self) -> str | None:
-        with self._store._append_lock():
+        with self._lock():
             self._store._load()
             transition = self._terminal_transition_unlocked()
             return str(transition.data["action"]) if transition is not None else None

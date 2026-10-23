@@ -57,6 +57,7 @@ from ._pending_prompts import (
     PendingPromptCommitTimeoutError,
     PendingPromptQueue,
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
+    PendingPromptStoreMixin,
 )
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
@@ -75,6 +76,7 @@ from .runtime_lease import (
 
 class ConversationStore(
     AsyncDurableWritesMixin,
+    PendingPromptStoreMixin,
     ClientDeliveryMixin,
     ConversationLogMixin,
     IncrementalValidationMixin,
@@ -791,31 +793,6 @@ class ConversationStore(
         return await self._to_thread_durable(
             self.append_message, message, _on_persisted=on_persisted, **kwargs
         )
-
-    def append_pending_prompt(self, text: str) -> ConversationEntry:
-        """Queue a follow-up through the pending-prompt queue owner."""
-
-        return self.pending_prompt_queue.append(text)
-
-    def close_pending_queue_if_empty(self) -> list[ConversationEntry]:
-        """Return pending prompts or close the queue through its owner."""
-
-        return self.pending_prompt_queue.close_if_empty()
-
-    def close_pending_queue(self) -> None:
-        """Close the pending-prompt queue through its owner."""
-
-        self.pending_prompt_queue.close()
-
-    def pending_prompts(self) -> list[ConversationEntry]:
-        """Return queued follow-ups through the pending-prompt queue owner."""
-
-        return self.pending_prompt_queue.pending()
-
-    def acknowledge_pending_prompt(self, prompt_id: str) -> None:
-        """Acknowledge a follow-up through the pending-prompt queue owner."""
-
-        self.pending_prompt_queue.acknowledge(prompt_id)
 
     def append_compaction_marker(
         self,

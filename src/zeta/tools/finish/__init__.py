@@ -72,6 +72,8 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
             report["verdict"] = verdict
         refusal = await fence.accept_finish(report)
         if refusal is not None:
+            if refusal == "pending follow-up must be read before finish":
+                child_loop._yield_for_pending_prompt = True
             return _error("finish refused; " + refusal)
         child_loop._explicit_finish_report = report
         return {

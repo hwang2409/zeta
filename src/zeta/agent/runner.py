@@ -44,13 +44,14 @@ from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
-from .background import finish_background_child
+from .background import CancellationRequest, finish_background_child
 from .budget import MAX_AGENT_DEPTH
 from .budget import child_depth as next_agent_depth
 from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
 from .finish_gate import FinishGateControl, FinishGateState, run_finish_gate
+from .pending_delivery import PendingDelivery
 from .presets import (
     GENERAL_PRESET,
     RUN_PRESET,
@@ -169,6 +170,13 @@ async def consume_child(
                     tool_result=event.tool_result,
                     depth=lifecycle_depth(event.tool_call),
                 )
+                if child_loop._yield_for_pending_prompt:
+                    child_loop._yield_for_pending_prompt = False
+                    final_message = Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent("pending follow-up will be delivered next")],
+                    )
+                    return
             elif event.type is StreamEventType.TURN_END:
                 turns = child_turns() + 1
                 update_turns(turns)
@@ -193,12 +201,30 @@ async def consume_child(
         )
 
     try:
+        delivery = (
+            PendingDelivery.resume(
+                child_loop.store, delivering_prompt_id, prompt, origin
+            )
+            if delivering_prompt_id is not None
+            else None
+        )
         events = (
             child_loop.run_notification_turn()
             if notification_turn
-            else child_loop.run_turn(prompt, origin=origin)
+            else child_loop.run_turn(
+                prompt,
+                origin=origin,
+                user_message=delivery.message if delivery is not None else None,
+                persist_user_message=(
+                    delivery.persist_message if delivery is not None else True
+                ),
+                pending_delivery=delivery,
+            )
         )
-        await consume_events(events)
+        try:
+            await consume_events(events)
+        finally:
+            await events.aclose()
         if explicit_report is not None:
             report_status = explicit_report["status"]
             summary = explicit_report["summary"]
@@ -913,25 +939,36 @@ async def run_agent_tool(
     if getattr(child_loop, "explicit_finish", False) and terminal_fence is None:
         terminal_fence = TerminalTransitionFence(child_store)
 
-    def request_child_cancel() -> None:
-        """Cancel this child unless a durable finish already owns termination."""
-        if terminal_fence is not None and not terminal_fence.request_cancel():
+    async def confirm_child_cancel() -> bool:
+        nonlocal child_canceled
+        if child_canceled:
+            return False
+        if terminal_fence is not None and not await terminal_fence.cancel():
+            return False
+        child_canceled = True
+        return True
+
+    async def cleanup_canceled_child(
+        confirmation: asyncio.Task[bool],
+    ) -> None:
+        if not await confirmation:
             return
         child_loop.tool_registry.abort()
         child_loop.store.drop_client_steering("abort")
         if not child_task.done():
             child_task.cancel()
-
-    async def cancel_child() -> None:
-        nonlocal child_canceled
-        if child_canceled:
-            return
-        if terminal_fence is not None and terminal_fence.accepted_report() is not None:
-            return
-        child_canceled = True
         loop._background_owner.cancel_subtree(child_instance_id)
         await asyncio.gather(child_task, return_exceptions=True)
         child_store.mark_agent_canceled(tool_call.id)
+
+    def request_child_cancel() -> CancellationRequest:
+        """Start durable cancellation and separately owned cleanup."""
+        confirmation = loop._create_task(confirm_child_cancel())
+        cleanup = loop._create_task(cleanup_canceled_child(confirmation))
+        return CancellationRequest(confirmation, cleanup)
+
+    async def cancel_child() -> None:
+        await request_child_cancel().cleanup
 
     if background:
         # Notification text has a stricter durable contract than the foreground
@@ -943,8 +980,8 @@ async def run_agent_tool(
             MAX_AGENT_NOTIFICATION_TEXT,
         )
 
-        def request_background_cancel() -> None:
-            request_child_cancel()
+        def request_background_cancel() -> CancellationRequest:
+            return request_child_cancel()
 
         def cleanup_background_child() -> None:
             loop._agent_child_stores.pop(tool_call.id, None)

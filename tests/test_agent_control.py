@@ -129,7 +129,7 @@ async def test_agent_control_tools_execute_through_registry(
     )
     try:
         canceled = await registry.execute(ToolCall("cancel", "agent_cancel", {"handle": "child"}))
-        assert canceled["structuredContent"]["status"] == "cancellation_requested"
+        assert canceled["structuredContent"]["status"] == "cancellation_confirmed"
         owner.unregister("child")
     finally:
         task.cancel()

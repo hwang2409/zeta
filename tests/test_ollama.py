@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import httpx
@@ -1245,6 +1246,86 @@ async def test_ollama_rejects_wrong_typed_frame_fields(field, value) -> None:
     ) as client:
         with pytest.raises(OllamaError, match=field):
             [event async for event in OllamaBackend(client=client).complete([], [])]
+
+
+@pytest.mark.asyncio
+async def test_ollama_cancelled_real_transport_does_not_leak_fds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed_connections = 0
+    all_closed = asyncio.Event()
+    handlers: set[asyncio.Task[None]] = set()
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        nonlocal closed_connections
+        task = asyncio.current_task()
+        assert task is not None
+        handlers.add(task)
+        try:
+            headers = await reader.readuntil(b"\r\n\r\n")
+            content_length = next(
+                (
+                    int(line.split(b":", 1)[1])
+                    for line in headers.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                ),
+                0,
+            )
+            if content_length:
+                await reader.readexactly(content_length)
+            writer.write(
+                b"HTTP/1.1 200 Test\r\nContent-Length: 999999\r\n"
+                b"Connection: close\r\n\r\n"
+                b'{"message":{"content":"partial"}}\n'
+            )
+            await writer.drain()
+            await reader.read()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            handlers.discard(task)
+            closed_connections += 1
+            if closed_connections == 100:
+                all_closed.set()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    original_client = httpx.AsyncClient
+
+    def owned_client(**kwargs):
+        return original_client(transport=_LoopbackAsyncHTTPTransport(), **kwargs)
+
+    monkeypatch.setattr("zeta.providers.ollama.httpx.AsyncClient", owned_client)
+    fd_directory = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+    baseline_fds = len(os.listdir(fd_directory))
+    try:
+        for _ in range(100):
+            first_event = asyncio.Event()
+
+            async def consume(event: asyncio.Event = first_event) -> None:
+                async for _event in OllamaBackend(
+                    base_url=f"http://127.0.0.1:{port}", stall_seconds=0
+                ).complete([], []):
+                    event.set()
+
+            turn = asyncio.create_task(consume())
+            await asyncio.wait_for(first_event.wait(), timeout=_CLIENT_DEADLINE_SECONDS)
+            turn.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await turn
+        await asyncio.wait_for(all_closed.wait(), timeout=_CLIENT_DEADLINE_SECONDS)
+        await asyncio.sleep(0)
+        assert not handlers
+        assert len(os.listdir(fd_directory)) <= baseline_fds
+    finally:
+        server.close()
+        await server.wait_closed()
+        for task in tuple(handlers):
+            task.cancel()
+        if handlers:
+            await asyncio.gather(*handlers, return_exceptions=True)
 
 
 @pytest.mark.asyncio

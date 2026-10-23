@@ -181,6 +181,7 @@ class BackgroundTaskRegistry:
         self._closed = False
         self._close_done: asyncio.Future[tuple[str, ...]] | None = None
         self._pending_starts: set[asyncio.Future[None]] = set()
+        self._task_start_generation = 0
         self._start_cleanup_error: BackgroundSpawnCleanupError | None = None
         self._shutdown_killed: tuple[str, ...] = ()
         self._closing_for_shutdown = False
@@ -200,6 +201,12 @@ class BackgroundTaskRegistry:
     @property
     def running_count(self) -> int:
         return sum(record.running for record in self._records.values())
+
+    @property
+    def task_start_generation(self) -> int:
+        """Return the monotonic count of tasks that reached running state."""
+
+        return self._task_start_generation
 
     @property
     def records(self) -> tuple[_BackgroundRecord, ...]:
@@ -395,6 +402,7 @@ class BackgroundTaskRegistry:
             owner=owner,
         )
         self._records[task_id] = record
+        self._task_start_generation += 1
         record.monitor = asyncio.create_task(self._monitor(record, log_handle))
         self._notice(
             BackgroundTaskNotice(

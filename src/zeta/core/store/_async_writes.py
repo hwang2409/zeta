@@ -41,7 +41,7 @@ class AsyncDurableWritesMixin:
                 self.root_dir,
                 session_id=self.session_id,
                 _must_exist=True,
-                _collect_persisted_appends=self._collect_persisted_appends,
+                _collect_persisted_appends=True,
             )
             try:
                 result = getattr(writer, method_name)(*args, **kwargs)
@@ -99,7 +99,7 @@ class AsyncDurableWritesMixin:
             with self._durable_write_condition:
                 if not self._closing and not self._closed:
                     self._accept_persisted_appends(receipts)
-                    self.refresh()
+                    self._load()
             if _on_persisted is not None:
                 _on_persisted()
             if cancelled:

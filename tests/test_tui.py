@@ -6587,7 +6587,9 @@ async def test_queued_panel_follows_the_viewed_session(
             }
         )
     )
-    prompt = child_store.pending_prompt_queue.append("child one")
+    prompt = await asyncio.to_thread(
+        child_store.pending_prompt_queue.append, "child one"
+    )
     monkeypatch.setattr(
         TUIApp, "queued_messages", property(lambda _self: ("main one", "main two"))
     )
@@ -6615,7 +6617,7 @@ async def test_queued_panel_follows_the_viewed_session(
     assert "main · 2 queued" in text
     assert "main one" not in text
 
-    child_store.pending_prompt_queue.acknowledge(prompt.id)
+    await asyncio.to_thread(child_store.pending_prompt_queue.acknowledge, prompt.id)
     navigation.refresh(force=True)
     await wait_until(lambda: _panel(app).messages == ())
     assert _panel_text(app).strip() == "main · 2 queued"

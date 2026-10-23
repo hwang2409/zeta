@@ -776,8 +776,7 @@ class AgentRunCommandMixin:
         buffer = session.default_buffer if session is not None else None
         ui_generation = getattr(self, "_ui_generation", 0)
         task = asyncio.create_task(
-            asyncio.to_thread(
-                send_to_run,
+            send_to_run(
                 self.loop.store,
                 child_id,
                 value,
@@ -829,8 +828,8 @@ class AgentRunCommandMixin:
         sends = getattr(self, "_child_send_tasks", {})
         self._release_ui_ownership()
         if sends:
-            # send_to_run takes only the child's append lock, under its commit
-            # deadline, so lock waits end within that deadline; wait for every
+            # send_to_run bounds the child's append lock with a commit deadline;
+            # wait for every
             # outcome before teardown instead of abandoning a worker thread.
             # Filesystem I/O (read, write, fsync) is not bounded, the same as
             # the session's own shutdown flush, so a stalled disk delays exit.
@@ -861,12 +860,12 @@ class AgentRunCommandMixin:
             )
         return "\n".join(lines)
 
-    def slash_send(self, args: str) -> str:
+    async def slash_send(self, args: str) -> str:
         parts = args.strip().split(maxsplit=1)
         if len(parts) != 2:
             return "use /send <run-id> <message>; /runs lists the live ones"
         run_id, message = parts
-        error = send_to_run(
+        error = await send_to_run(
             self.loop.store,
             run_id,
             message,

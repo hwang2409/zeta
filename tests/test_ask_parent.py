@@ -102,14 +102,14 @@ async def test_ordinary_agent_send_is_not_consumed_as_question_answer(
             break
         await asyncio.sleep(0.01)
 
-    assert send_to_run(
+    assert await send_to_run(
         parent,
         handle,
         "Proceed",
         channel=owner.conversation_channel,
     ) is None
     await asyncio.wait_for(ask, timeout=0.2)
-    assert [entry.data["text"] for entry in child.pending_prompts()] == ["Proceed"]
+    assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == ["Proceed"]
     assert len(parent.agent_notifications()) == 1
     owner.cancel_all()
 

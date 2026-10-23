@@ -12,6 +12,11 @@ from ..protocol.types import MessageOrigin
 from ..tools.agent import agent_stats
 from .explicit_finish import IdleNudgeLifecycle, kill_tasks_after_deadline
 from .finish_gate import FinishGateState
+from .pending_delivery import (
+    close_pending_delivery_queue,
+    close_pending_delivery_queue_if_empty,
+    pending_deliveries,
+)
 from .receipt import (
     MAX_AGENT_RESULT_BYTES,
     TerminalState,
@@ -175,17 +180,10 @@ async def consume_run(
             )
             if idle and safety_started is None:
                 safety_started = asyncio.get_running_loop().time()
-            # Ack only after a follow-up actually reached the child. A cancel or
-            # backend error mid-consume_child leaves the prompt pending, so the
-            # next run gets a chance to redeliver it instead of it silently gone.
-            if current_entry is not None:
-                child_store.acknowledge_pending_prompt(current_entry.id)
-                current_entry = None
-            pending = (
-                child_store.close_pending_queue_if_empty()
-                if child_store.pending_prompts()
-                else []
-            )
+            current_entry = None
+            pending = await pending_deliveries(child_store)
+            if pending:
+                pending = await close_pending_delivery_queue_if_empty(child_store)
             if pending:
                 idle_lifecycle.reset_idle_period()
                 current_entry = pending[0]
@@ -289,7 +287,7 @@ async def consume_run(
                 )
                 idle_published = False
                 continue
-            pending = child_store.close_pending_queue_if_empty()
+            pending = await close_pending_delivery_queue_if_empty(child_store)
             if pending:
                 continue
             terminal_result = _finalize_result(
@@ -320,7 +318,7 @@ async def consume_run(
         if safety_task is not None:
             await asyncio.gather(safety_task, return_exceptions=True)
         try:
-            child_store.close_pending_queue()
+            await close_pending_delivery_queue(child_store)
         finally:
             if terminal_result is not None and callable(final_finish_lifecycle):
                 content = terminal_result.get("content")
