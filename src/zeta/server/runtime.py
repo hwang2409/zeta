@@ -195,7 +195,12 @@ class ServerRuntime:
         self._post_stream_provider_retry = False
 
     def backend_for_model(
-        self, provider: str, model: str, *, token_budget: int | None = None
+        self,
+        provider: str,
+        model: str,
+        *,
+        token_budget: int | None = None,
+        account: AccountId | None = None,
     ) -> CompletionBackend:
         config = self._config(provider, model)
         if token_budget is None:
@@ -210,7 +215,9 @@ class ServerRuntime:
             )
         token_budget = effective_budget_for_model(provider, model, token_budget)
         credential_kwargs: dict[str, object] = {}
-        if self._state is not None:
+        if account is not None:
+            credential_kwargs["account"] = account
+        elif self._state is not None:
             credential_kwargs = self._state.loop.account_context.backend_kwargs(provider)
             credential_kwargs.pop("home", None)
         backend, _ = self._build_backend(
@@ -349,7 +356,7 @@ class ServerRuntime:
     async def resume_session(self, session_id: str) -> SessionMetadata:
         if self._state is not None and self._state.session_id == session_id:
             return self.metadata
-        metadata = self.manager.read_metadata(session_id)
+        metadata = await asyncio.to_thread(self.manager.read_metadata, session_id)
         if metadata.provider == "fake":
             raise ValueError(REMOVED_PROVIDER_ERROR)
         session_cwd = Path(metadata.cwd)
@@ -377,7 +384,8 @@ class ServerRuntime:
             cwd_project = resolve_project_context(
                 discovery, self.manager.project_registry
             )
-            resumed_prompt = resume_prompt(
+            resumed_prompt = await asyncio.to_thread(
+                resume_prompt,
                 opened.metadata,
                 manager=self.manager,
                 store=opened.store,

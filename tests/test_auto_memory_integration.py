@@ -298,7 +298,7 @@ async def test_attention_fork_composition_cannot_write_project_memory(
     manager = SessionManager(home)
     project = manager.project_registry.create_project("demo", "scope", workspace)
     manager.project_registry.initialize_memory(project.project_id)
-    original = manager.create(
+    original = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="fake",
         cwd=workspace,
@@ -306,7 +306,7 @@ async def test_attention_fork_composition_cannot_write_project_memory(
         auto_project=False,
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
-    )
+    ))
     anchor = original.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
@@ -318,7 +318,7 @@ async def test_attention_fork_composition_cannot_write_project_memory(
         title="Choice",
         why="Choose a direction.",
     )
-    fork_id = create_discussion_fork(home, original.store.session_id, record.id)
+    fork_id = await asyncio.to_thread(lambda: create_discussion_fork(home, original.store.session_id, record.id))
     fork = manager.open(fork_id)
 
     def backend_builder(provider: str, model: str | None, **kwargs: object):
@@ -382,7 +382,7 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
     config = _resolve(home)
     manager = SessionManager(home)
     project = manager.project_registry.create_project("demo", "scope", workspace)
-    original = manager.create(
+    original = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="fake",
         cwd=workspace,
@@ -390,7 +390,7 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
         auto_project=False,
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
-    )
+    ))
     anchor = original.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
@@ -402,7 +402,7 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
         title="Choice",
         why="Choose a direction.",
     )
-    fork_id = create_discussion_fork(home, original.store.session_id, record.id)
+    fork_id = await asyncio.to_thread(lambda: create_discussion_fork(home, original.store.session_id, record.id))
 
     def composition_for(opened: OpenedSession, canary: str) -> RuntimeComposition:
         backend = FakeBackend([ScriptedTurn([TextContent(f"answered {canary}")])])

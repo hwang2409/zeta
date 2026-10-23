@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import os
 import subprocess
@@ -317,7 +318,7 @@ async def test_server_rename_and_cli_delete_serialize_across_processes(tmp_path,
     import asyncio
     import json
 
-    manager, sid = closed_session(tmp_path)
+    manager, sid = await asyncio.to_thread(lambda: closed_session(tmp_path))
     script = """
 import asyncio, sys
 from zeta.server import ZetaServer
@@ -610,7 +611,8 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
         draft.clear()
         message = build_user_message("log", tmp_path, (store.session_dir / "background.log",), session_store=store)
         assert "background" in message.content[1].text
-        assert runtime.manager.rename(sid, "renamed").name == "renamed"
+        renamed = await asyncio.to_thread(runtime.manager.rename, sid, "renamed")
+        assert renamed.name == "renamed"
         store.append_checkpoint("audit")
         await runtime.close()
         await runtime.resume_session(sid)
@@ -657,7 +659,7 @@ async def test_background_descriptor_keeps_lease_until_registry_close(tmp_path):
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="offline", cwd=tmp_path))
     store = opened.store
     tasks = BackgroundTaskRegistry(session_dir=store.session_dir, directory_fd=store.directory_fd)
     store.close()

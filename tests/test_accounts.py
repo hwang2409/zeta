@@ -180,6 +180,21 @@ def test_missing_anthropic_login_keeps_auth_error_type(tmp_path: Path) -> None:
         asyncio.run(access())
 
 
+def test_explicit_credential_store_has_no_recovery_side_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = AccountId("codex", "work")
+    named_account_credentials(tmp_path, account.provider, account.name).save(tokens())
+
+    def fail_resolve(*_args: object, **_kwargs: object) -> AccountId:
+        raise AssertionError("explicit account construction must not recover credentials")
+
+    monkeypatch.setattr(AccountStore, "resolve_account", fail_resolve)
+    credential = credential_store("codex", home=tmp_path, account=account)
+    assert credential is not None
+    assert credential.account == account
+
+
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 def test_provider_driver_refresh_through_account_credentials_keeps_headers_and_rotation(
     provider: str, tmp_path: Path
@@ -1090,28 +1105,57 @@ def test_session_with_missing_pinned_account_fails_naming_accounts(tmp_path: Pat
     opened.store.close()
 
 
-def test_switch_changes_only_current_session_not_other_sessions_or_live_children(
+@pytest.mark.asyncio
+async def test_switch_changes_only_current_session_not_other_sessions_or_live_children(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
-    named_account_credentials(home, "codex", "first").save(tokens())
-    named_account_credentials(home, "codex", "second").save(tokens())
-    AccountStore(home).set_default(first)
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "first").save, tokens()
+    )
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "second").save, tokens()
+    )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
-    current = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
-    other = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
-    current_resolver = SessionAccountContext.load(home, manager, current.metadata)
-    other_resolver = SessionAccountContext.load(home, manager, other.metadata)
+    current = await asyncio.to_thread(
+        manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
+    )
+    other = await asyncio.to_thread(
+        manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
+    )
+    current_resolver = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, current.metadata
+    )
+    other_resolver = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, other.metadata
+    )
     child_accounts = current_resolver.snapshot()
+    loop = SimpleNamespace(backend=None)
+    loop.current_backend_state = lambda: loop.backend
+    loop.prepare_backend_state = lambda backend: backend
+    loop.apply_backend_state = lambda backend: setattr(loop, "backend", backend)
 
-    current_resolver.switch(second, boundary=7)
+    await current_resolver.switch_active(
+        loop,
+        second,
+        boundary=7,
+        provider="codex",
+        build_backend=lambda _account: None,
+    )
 
-    assert current_resolver.resolve("codex") == second
-    assert other_resolver.resolve("codex") == first
+    assert await asyncio.to_thread(current_resolver.resolve, "codex") == second
+    assert await asyncio.to_thread(other_resolver.resolve, "codex") == first
     assert child_accounts["codex"] == first
-    current_resolver.switch(first, boundary=7)
+    await current_resolver.switch_active(
+        loop,
+        first,
+        boundary=7,
+        provider="codex",
+        build_backend=lambda _account: None,
+    )
     current_metadata = manager.read_metadata(current.metadata.session_id)
     assert current_metadata.account_switch_sequences == {"codex": 2}
     assert current_metadata.native_context_boundaries == {"codex": 8}
@@ -1207,7 +1251,9 @@ def test_account_switch_filters_stale_native_artifacts(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("next")])])
     loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
     loop.account_context = SimpleNamespace(
-        active_provider="codex", switch_sequence=1
+        active_provider="codex",
+        switch_sequence=1,
+        account_state_unknown=False,
     )
 
     async def run() -> None:
@@ -1240,7 +1286,9 @@ async def test_grandchild_inherits_child_snapshot_not_global_default(
     )
     await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
-    opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
+    )
     resolver = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -1296,7 +1344,9 @@ async def test_live_child_websearch_ignores_later_parent_switch(
     )
     await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
-    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="claude", model="claude-sonnet-4-6", cwd=tmp_path
+    )
     resolver = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -1313,7 +1363,13 @@ async def test_live_child_websearch_ignores_later_parent_switch(
         return websearch_codex.CodexSearchResult("answer", [])
 
     async def consume_child(child_loop: AgentLoop, _prompt: str, **_kwargs: object):
-        await asyncio.to_thread(resolver.switch, second, boundary=0)
+        await resolver.switch_active(
+            parent,
+            second,
+            boundary=0,
+            provider="claude",
+            build_backend=lambda _account: None,
+        )
         await websearch._websearch(
             child_loop.tool_registry,
             {"query": "query"},

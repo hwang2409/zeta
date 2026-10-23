@@ -13,15 +13,25 @@ from typing import Any
 
 from prompt_toolkit.enums import EditingMode
 
-from ...accounts import AccountError, AccountUsage, SessionAccountContext
-from ...accounts.store import AccountDisplay, rename_account_command
+from ...accounts import (
+    AccountError,
+    AccountId,
+    AccountListSnapshot,
+    AccountUsage,
+    account_provider,
+)
+from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
-from ...core.session import SessionError, env_home, normalize_session_name
+from ...core.session import (
+    SessionError,
+    env_home,
+    normalize_session_name,
+    persist_metadata_change,
+)
 from ...core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashStatus,
-    budget_for_model,
     compaction_history,
 )
 from ...core.todo import todo_count_tuple
@@ -30,11 +40,12 @@ from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
-from ...protocol.types import MessageOrigin
+from ...protocol.types import MessageOrigin, StreamEvent, StreamEventType
 from ...providers.factory import build_backend
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
+from ..render import render_event
 from .accounts_picker import AccountsPicker
 from .model_picker import ModelPicker
 from .permissions import format_permissions, revoke_permissions
@@ -174,19 +185,13 @@ class SlashHandlerMixin:
     def model_picker_active(self) -> bool:
         return self._model_picker is not None
 
-    def _show_accounts_picker(
-        self, context: SessionAccountContext, displays: list[AccountDisplay]
-    ) -> str:
-        defaults = {
-            provider: account
-            for provider in ("anthropic", "codex")
-            if (account := context.store.default(provider)) is not None
-        }
+    def _show_accounts_picker(self, snapshot: AccountListSnapshot) -> str:
+        displays = snapshot.displays
         self._dismiss_accounts_picker()
         picker = AccountsPicker(
             tuple(item.account for item in displays),
-            context.snapshot(),
-            defaults,
+            snapshot.selected,
+            snapshot.defaults,
             {item.account: item.detail for item in displays if item.detail},
             {item.account: item.label for item in displays},
             {item.account: item.usage for item in displays},
@@ -210,10 +215,30 @@ class SlashHandlerMixin:
             return "accounts unavailable for this session"
         if context.switching_unavailable is not None:
             return context.switching_unavailable
-        displays = await asyncio.to_thread(context.store.list_display)
-        if not displays:
+        snapshot = await context.list_snapshot()
+        if not snapshot.displays:
             return "no accounts; run zeta login <provider> --account <name>"
-        return self._show_accounts_picker(context, displays)
+        return self._show_accounts_picker(snapshot)
+
+    def _handle_account_limit(self, event: StreamEvent) -> asyncio.Task[None]:
+        context = self.loop.account_context
+
+        async def show() -> None:
+            snapshot = await context.list_snapshot()
+            alternative = event.data.get("alternative")
+            if event.data.get("action") == "switch" and isinstance(alternative, str):
+                snapshot = AccountListSnapshot(
+                    tuple(
+                        item
+                        for item in snapshot.displays
+                        if str(item.account) == alternative
+                    ),
+                    snapshot.selected,
+                    snapshot.defaults,
+                )
+            self._show_accounts_picker(snapshot)
+
+        return asyncio.create_task(show())
 
     @property
     def accounts_picker_active(self) -> bool:
@@ -300,38 +325,51 @@ class SlashHandlerMixin:
 
     def accounts_picker_select(self) -> asyncio.Task[None] | None:
         picker = self._accounts_picker
-        if picker is None:
+        current_task = getattr(self, "_account_switch_task", None)
+        if picker is None or (current_task is not None and not current_task.done()):
             return None
         account = picker.highlighted
         context = self.loop.account_context
 
-        def prepare_switch() -> Any:
-            backend = None
-            current_provider = "anthropic" if self.provider == "claude" else self.provider
-            if account.provider == current_provider:
-                backend, _ = build_backend(
-                    self.provider,
-                    self.model,
-                    token_budget=self.loop.context_assembler.token_budget,
-                    **{**context.backend_kwargs(self.provider), "account": account},
-                )
-            entries = self.loop.store.replay()
-            boundary = entries[-1].seq if entries else 0
-            context.switch(account, boundary=boundary)
+        current_provider = account_provider(self.provider)
+
+        def prepare_backend(selected: AccountId) -> Any:
+            if selected.provider != current_provider:
+                return None
+            backend, _ = build_backend(
+                self.provider,
+                self.model,
+                home=context.home,
+                account=selected,
+                token_budget=self.loop.context_assembler.token_budget,
+            )
             return backend
 
         async def switch() -> None:
             try:
-                backend = await asyncio.to_thread(prepare_switch)
-                if backend is not None:
-                    context.activate(self.loop, backend, self.provider)
+                await context.switch_active(
+                    self.loop,
+                    account,
+                    boundary=self.loop.store.active_branch_head_sequence(),
+                    provider=self.provider,
+                    build_backend=prepare_backend,
+                )
             except (AccountError, OSError, RuntimeError, ValueError) as exc:
                 self._print_system(f"account unchanged: {exc}")
                 return
+            finally:
+                self._account_switch_task = None
             self._dismiss_accounts_picker()
-            self._print_system(f"account: {account}")
+            if context.account_state_unknown:
+                self._presenter.print_unit(
+                    render_event(StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN))
+                )
+            else:
+                self._print_system(f"account: {account}")
 
-        return asyncio.create_task(switch())
+        task = asyncio.create_task(switch())
+        self._account_switch_task = task
+        return task
 
     def accounts_picker_cancel(self) -> None:
         self._dismiss_accounts_picker()
@@ -344,7 +382,7 @@ class SlashHandlerMixin:
         if unit is not None:
             self._transcript.remove(unit, leading_blank=True)
 
-    def slash_model(self, args: str) -> str:
+    async def slash_model(self, args: str) -> str:
         """Pick a model from a card, or switch straight to a named one."""
 
         requested = args.strip()
@@ -367,7 +405,7 @@ class SlashHandlerMixin:
                 requested = matches[0]
             elif matches:
                 return self._open_model_picker(matches, query=requested)
-        return self._switch_model(requested)
+        return await self._switch_model(requested)
 
     def _open_model_picker(self, choices: tuple[str, ...], *, query: str) -> str:
         """Draw the picker card; its keys take over while the composer is empty."""
@@ -432,7 +470,7 @@ class SlashHandlerMixin:
         self._model_picker = picker.with_choices(choices)
         self._repaint_model_picker()
 
-    def _switch_model(self, model: str) -> str:
+    async def _switch_model(self, model: str) -> str:
         try:
             _validate_model_name(self.provider, model)
         except ValueError as exc:
@@ -447,34 +485,40 @@ class SlashHandlerMixin:
             )
         else:
             catalog_warning = None
-        previous = self.model
+        if model == self.model:
+            return f"model: {model}"
+        if self._on_model_change is None:
+            return "model unchanged: model transition is unavailable"
+        previous_budget = self.loop.context_assembler.token_budget
         try:
-            self.loop.set_model(model)
-            if self._on_model_change is not None:
-                self._on_model_change(model)
+            authoritative = await self._on_model_change(model)
         except Exception as exc:
-            self.loop.set_model(previous)
             return f"model unchanged: {exc}"
-        self.model = model
-        budget_note = self._retune_budget_for_model()
+        self.model = authoritative.model
+        current_budget = self.loop.context_assembler.token_budget
+        budget_note = (
+            f"context budget {previous_budget:,} -> {current_budget:,}"
+            if current_budget != previous_budget
+            else None
+        )
         notes = [note for note in (catalog_warning, budget_note) if note]
         if notes:
-            return f"model: {model} ({'; '.join(notes)})"
-        return f"model: {model}"
+            return f"model: {self.model} ({'; '.join(notes)})"
+        return f"model: {self.model}"
 
-    def slash_plan(self, args: str) -> str | ModelInputEnvelope:
+    async def slash_plan(self, args: str) -> str | ModelInputEnvelope:
         """Toggle plan mode or submit a prompt while entering it."""
 
         requested = args.strip()
         normalized = requested.lower()
         if not requested:
-            return self._set_plan_mode_from_command(not self.loop.plan_mode)
+            return await self._set_plan_mode_from_command(not self.loop.plan_mode)
         if normalized == "off":
-            return self._set_plan_mode_from_command(False)
+            return await self._set_plan_mode_from_command(False)
         if normalized == "on":
-            return self._set_plan_mode_from_command(True)
+            return await self._set_plan_mode_from_command(True)
         if normalized == "toggle":
-            return self._set_plan_mode_from_command(not self.loop.plan_mode)
+            return await self._set_plan_mode_from_command(not self.loop.plan_mode)
         if self.active or self.pending_approvals:
             return (
                 "plan mode unchanged: cannot change plan mode while a turn or "
@@ -485,7 +529,7 @@ class SlashHandlerMixin:
             if blocked is not None:
                 return blocked
         if not self.loop.plan_mode:
-            self.loop.set_plan_mode(True)
+            await self._change_plan_mode(True)
             self._invalidate_prompt()
         return ModelInputEnvelope(
             requested,
@@ -493,7 +537,7 @@ class SlashHandlerMixin:
             MessageOrigin.SLASH_EXPANSION,
         )
 
-    def slash_implement(self, args: str) -> str | ModelInputEnvelope:
+    async def slash_implement(self, args: str) -> str | ModelInputEnvelope:
         """Exit plan mode and submit the explicit implementation request."""
 
         if args:
@@ -505,7 +549,7 @@ class SlashHandlerMixin:
                 "implement unavailable: cannot leave plan mode while a turn or "
                 "approval is active"
             )
-        self.loop.set_plan_mode(False)
+        await self._change_plan_mode(False)
         self._invalidate_prompt()
         return ModelInputEnvelope(
             "implement the plan you proposed above",
@@ -513,7 +557,7 @@ class SlashHandlerMixin:
             MessageOrigin.SLASH_EXPANSION,
         )
 
-    def _set_plan_mode_from_command(self, enabled: bool) -> str:
+    async def _set_plan_mode_from_command(self, enabled: bool) -> str:
         if enabled == self.loop.plan_mode:
             return f"plan mode: {'on' if enabled else 'off'}"
         if self.active or self.pending_approvals:
@@ -525,7 +569,7 @@ class SlashHandlerMixin:
             blocked = self._plan_mode_background_blocker()
             if blocked is not None:
                 return blocked
-        self.loop.set_plan_mode(enabled)
+        await self._change_plan_mode(enabled)
         self._invalidate_prompt()
         if enabled:
             return "plan mode: on (read-only tools; deliver the plan as your answer)"
@@ -540,27 +584,18 @@ class SlashHandlerMixin:
             f"{', '.join(work)}; stop it or wait"
         )
 
+    async def _change_plan_mode(self, enabled: bool) -> None:
+        persisted = self.loop.set_plan_mode(enabled)
+        if persisted is not None:
+            await persisted
+
     def toggle_plan_mode(self) -> None:
         """Toggle plan mode from the keyboard, reporting the same notice."""
 
-        self._print_system(self.slash_plan("toggle"))
+        async def toggle() -> None:
+            self._print_system(await self.slash_plan("toggle"))
 
-    def _retune_budget_for_model(self) -> str | None:
-        """Track the new model's context window unless the budget is pinned."""
-
-        if self._on_budget_change is None:
-            return None
-        budget = budget_for_model(self.provider, self.model)
-        assembler = self.loop.context_assembler
-        if budget == assembler.token_budget:
-            return None
-        previous = assembler.token_budget
-        try:
-            self._on_budget_change(budget)
-        except Exception as exc:
-            return f"context budget unchanged: {exc}"
-        self.loop.set_token_budget(budget)
-        return f"context budget {previous:,} -> {budget:,}"
+        asyncio.create_task(toggle())
 
     def slash_tools(self, args: str) -> str:
         """List registered tools or trust pending project tools."""
@@ -615,7 +650,7 @@ class SlashHandlerMixin:
         self.request_new_session()
         return "starting a fresh session..."
 
-    def slash_name(self, args: str) -> str:
+    async def slash_name(self, args: str) -> str:
         """Persist a session label shown in the resume picker."""
 
         raw = args.strip()
@@ -629,13 +664,13 @@ class SlashHandlerMixin:
         except SessionError as exc:
             return f"session name unchanged: {exc}"
         try:
-            self._on_name_change(label)
+            await self._on_name_change(label)
         except SessionError as exc:
             return f"session name unchanged: {exc}"
         self._session_name = label
         return f"session name: {label}"
 
-    def slash_project(self, args: str) -> str:
+    async def slash_project(self, args: str) -> str:
         registry = self.loop.project_registry
         if registry is None:
             return "project registry unavailable"
@@ -647,10 +682,14 @@ class SlashHandlerMixin:
             )
             try:
                 project = registry.find_or_create_for_directory(root)
-                metadata = self.loop.manager.associate_project(
-                    self.loop.session_metadata, project.project_id
+                await persist_metadata_change(
+                    self.loop.manager,
+                    self.loop.session_metadata,
+                    lambda candidate: self.loop.manager.associate_project(
+                        candidate, project.project_id
+                    ),
                 )
-                self.loop._set_runtime_project(metadata)
+                self.loop._set_runtime_project(self.loop.session_metadata)
             except (ProjectRegistryError, OSError, SessionError) as exc:
                 return f"could not initialize project: {exc}"
         else:
@@ -737,7 +776,7 @@ class SlashHandlerMixin:
         self._rebuild_transcript()
         self._invalidate_prompt()
 
-    def slash_vim(self, args: str) -> str:
+    async def slash_vim(self, args: str) -> str:
         requested = args.strip().lower()
         if not args:
             return f"vim mode: {'on' if self.vim_mode else 'off'}"
@@ -746,7 +785,7 @@ class SlashHandlerMixin:
         enabled = not self.vim_mode if requested == "toggle" else requested == "on"
         was_enabled = self.vim_mode
         if self._on_vim_mode_change is not None:
-            self._on_vim_mode_change(enabled)
+            await self._on_vim_mode_change(enabled)
         self.vim_mode = enabled
         if (session := self._active_session or self._session) is not None:
             if was_enabled and not enabled:

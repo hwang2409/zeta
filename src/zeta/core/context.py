@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -129,7 +129,7 @@ class ContextAssembler:
         backend: CompletionBackend | None = None,
         compaction_policy: CompactionPolicy | None = None,
         token_counter: Callable[[Message], int] | None = None,
-        on_completion_success: Callable[[], None] | None = None,
+        on_completion_success: Callable[[], Awaitable[None] | None] | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
         telemetry_sink: Callable[[Mapping[str, Any]], None] | None = None,
         on_token_growth: Callable[[int], None] | None = None,

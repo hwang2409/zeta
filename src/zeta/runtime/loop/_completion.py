@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import errno
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import httpx
@@ -137,6 +137,27 @@ def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorI
         status_code=getattr(error, "status_code", None),
         provider_error=provider_error,
     )
+
+
+async def subscription_limit_failure(
+    account_context: Any,
+    provider_error: ErrorInfo,
+    source: object,
+) -> tuple[ErrorInfo, StreamEvent | None]:
+    if account_context is None:
+        return provider_error, None
+    limit_data = await account_context.subscription_limit_event(source)
+    if limit_data is None:
+        return provider_error, None
+    error = replace(
+        provider_error,
+        code="subscription_limit",
+        message=(
+            f"{limit_data['account']} reached its subscription limit; "
+            f"resets {limit_data['reset_local']}"
+        ),
+    )
+    return error, StreamEvent(StreamEventType.ACCOUNT_LIMIT, data=limit_data)
 
 
 async def close_completion(

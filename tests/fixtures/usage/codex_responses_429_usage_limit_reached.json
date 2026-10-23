@@ -1,0 +1,17 @@
+{
+  "_fixture": {
+    "captured_at": "2026-10-22",
+    "endpoint_kind": "codex responses",
+    "http_status": 429,
+    "note": "redacted real provider response"
+  },
+  "error": {
+    "type": "usage_limit_reached",
+    "message": "The usage limit has been reached",
+    "plan_type": "<redacted>",
+    "resets_at": 1793082708,
+    "eligible_promo": null,
+    "limit_window_minutes": 10080,
+    "resets_in_seconds": 440273
+  }
+}

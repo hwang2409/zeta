@@ -33,7 +33,7 @@ from ..core.project_context import (
     load_project_context,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_project_context
     project_instructions_editor_command,
 )
-from ..core.session import env_home
+from ..core.session import SessionMetadata, env_home
 from ..core.slash import (
     SlashCommand,
     SlashStatus,
@@ -193,10 +193,10 @@ class TUIApp(
         draft_path: str | Path | None = None,
         approval_policy: ApprovalPolicy | None = None,
         context_files: Sequence[str] = (),
-        on_model_change: Callable[[str], None] | None = None,
+        on_model_change: Callable[[str], Awaitable[SessionMetadata]] | None = None,
         vim_mode: bool = True,
-        on_vim_mode_change: Callable[[bool], None] | None = None,
-        on_budget_change: Callable[[int], None] | None = None,
+        on_vim_mode_change: Callable[[bool], Awaitable[None]] | None = None,
+        on_budget_change: Callable[[int], Awaitable[None]] | None = None,
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
         startup_notices: Sequence[str] = (),
         startup_warnings: Sequence[str] = (),
@@ -205,7 +205,7 @@ class TUIApp(
         workspace_snapshot_cap: int | None = None,
         ephemeral_root: Path | None = None,
         session_name: str = "",
-        on_name_change: Callable[[str], None] | None = None,
+        on_name_change: Callable[[str], Awaitable[None]] | None = None,
         key_remap: Any | None = None,
         project_dir: str | Path | None = None,
         project_eligible: bool | None = None,
@@ -291,9 +291,8 @@ class TUIApp(
         self._model_picker_unit: Any = None
         self._accounts_picker: AccountsPicker | None = None
         self._accounts_picker_unit: Any = None
-        self._zeta_home: Path | None = (
-            Path(zeta_home).resolve() if zeta_home is not None else None
-        )
+        self._account_switch_task: asyncio.Task[None] | None = None
+        self._zeta_home = Path(zeta_home).resolve() if zeta_home is not None else None
         if project_dir is None:
             discovery = discover_project(self.loop.store.cwd)
             repo_root = discovery.primary_root or discovery.cwd

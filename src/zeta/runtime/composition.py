@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,8 +76,8 @@ def compose_runtime(
     project_context: ProjectContext,
     backend_builder: BackendBuilder,
     opened: OpenedSession | None = None,
-    on_completion_success: Callable[[], None] | None = None,
-    on_plan_mode_change: Callable[[bool], None] | None = None,
+    on_completion_success: Callable[[], Awaitable[None] | None] | None = None,
+    on_plan_mode_change: Callable[[bool], Awaitable[None] | None] | None = None,
     max_turns: int | None = None,
     background_event_sink: BackgroundEventSink | None = None,
     skill_catalog: SkillCatalog,
@@ -177,7 +177,9 @@ def compose_runtime(
                 tool_deny=effective_policy.deny,
                 tool_allow_layers=effective_policy.allow_layers,
             )
-        completion_callback = on_completion_success or (lambda: manager.touch(metadata))
+        completion_callback = on_completion_success or (
+            lambda: asyncio.to_thread(manager.refresh_recency, metadata.session_id)
+        )
         policy = ApprovalPolicy(
             store=opened.store,
             default=metadata.approval_mode

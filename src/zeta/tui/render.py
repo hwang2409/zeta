@@ -527,6 +527,8 @@ STREAM_EVENTS_RENDERED = frozenset({
     StreamEventType.MESSAGE_END,
     StreamEventType.RETRY,
     StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.ACCOUNT_LIMIT,
+    StreamEventType.ACCOUNT_STATE_UNKNOWN,
     StreamEventType.TOOL_EXECUTION_START,
     StreamEventType.TOOL_EXECUTION_UPDATE,
     StreamEventType.TOOL_EXECUTION_END,
@@ -671,6 +673,17 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         return Text(text if type(text) is str else "retrying", style=theme.DIM)
     if event.type is StreamEventType.AGENT_NOTIFICATION:
         return render_agent_notification(event)
+    if event.type is StreamEventType.ACCOUNT_LIMIT:
+        account = event.data.get("account", "account")
+        reset = event.data.get("reset_local", event.data.get("resets_at", "unknown"))
+        action = event.data.get("action")
+        suffix = " · enter switches account" if action == "switch" else " · opening /accounts"
+        return Text(f"account limit · {account} · resets {reset}{suffix}", style=theme.WARNING)
+    if event.type is StreamEventType.ACCOUNT_STATE_UNKNOWN:
+        return Text(
+            "account state unknown · rechecking before provider call · use /accounts if it fails",
+            style=theme.WARNING,
+        )
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
         agent_render = AgentCard.render_start(event)
         if agent_render is not None:

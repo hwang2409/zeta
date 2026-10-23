@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 from pathlib import Path
@@ -376,19 +377,19 @@ async def test_list_sessions_filters_project_and_keeps_lineage(tmp_path: Path) -
     registry = ProjectRegistry(server.home / "projects")
     project = registry.create_project("alpha", "repo")
     other = registry.create_project("beta", "repo")
-    parent = server.runtime.manager.create(
+    parent = await asyncio.to_thread(lambda: server.runtime.manager.create(
         provider="codex", model="offline", cwd=server.runtime.cwd, project_id=project.project_id,
         project_role="orchestrator", name="parent", auto_project=False,
-    )
-    child = server.runtime.manager.create(
+    ))
+    child = await asyncio.to_thread(lambda: server.runtime.manager.create(
         provider="codex", model="offline", cwd=server.runtime.cwd, project_id=project.project_id,
         project_role="worker", parent_session_id=parent.metadata.session_id,
         name="child", auto_project=False,
-    )
-    server.runtime.manager.create(
+    ))
+    await asyncio.to_thread(lambda: server.runtime.manager.create(
         provider="codex", model="offline", cwd=server.runtime.cwd, project_id=other.project_id,
         project_role="session", auto_project=False,
-    )
+    ))
     parent.store.close()
     child.store.close()
     before = _mtimes(server.home)

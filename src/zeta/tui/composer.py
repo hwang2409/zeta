@@ -283,6 +283,8 @@ class TurnConsumerMixin:
                             )
                         else:
                             self._print(rendered)
+                if event.type is StreamEventType.ACCOUNT_LIMIT:
+                    self._handle_account_limit(event)
                 self._invalidate_prompt()
                 if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:
                     break

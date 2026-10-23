@@ -94,8 +94,9 @@ def fallback_summary(source: str, *, max_chars: int) -> str:
 
 
 import asyncio
+import inspect
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -205,7 +206,7 @@ class CompactionPolicy:
         system_prompt: Message | None = None,
         max_source_tokens: int = SUMMARY_SOURCE_TOKEN_LIMIT,
         max_fallback_chars: int | None = None,
-        on_success: Callable[[], None] | None = None,
+        on_success: Callable[[], Awaitable[None] | None] | None = None,
         on_usage: Callable[[Mapping[str, Any]], None] | None = None,
         on_telemetry: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> str:
@@ -406,7 +407,7 @@ class CompactionPolicy:
         max_chars: int,
         backend: CompletionBackend | None,
         system_prompt: Message | None,
-        on_success: Callable[[], None] | None,
+        on_success: Callable[[], Awaitable[None] | None] | None,
         on_usage: Callable[[Mapping[str, Any]], None] | None,
         on_retry: Callable[[], None] | None = None,
         on_fallback: Callable[[], None] | None = None,
@@ -515,7 +516,7 @@ class CompactionPolicy:
         max_chars: int,
         backend: CompletionBackend | None,
         system_prompt: Message | None,
-        on_success: Callable[[], None] | None,
+        on_success: Callable[[], Awaitable[None] | None] | None,
         on_usage: Callable[[Mapping[str, Any]], None] | None,
         on_retry: Callable[[], None] | None = None,
         on_fallback: Callable[[], None] | None = None,
@@ -567,7 +568,7 @@ class CompactionPolicy:
         *,
         backend: CompletionBackend | None,
         system_prompt: Message | None,
-        on_success: Callable[[], None] | None,
+        on_success: Callable[[], Awaitable[None] | None] | None,
         on_usage: Callable[[Mapping[str, Any]], None] | None,
         on_retry: Callable[[], None] | None,
         retry: bool,
@@ -677,7 +678,9 @@ class CompactionPolicy:
             failure.code = "empty_summary"
             raise failure
         if on_success is not None:
-            on_success()
+            success_result = on_success()
+            if inspect.isawaitable(success_result):
+                await success_result
         return summary
 
     @staticmethod

@@ -1,5 +1,6 @@
 """Restricted composition for sessions without a human approval interface."""
 
+import asyncio
 from pathlib import Path
 
 from ..accounts import SessionAccountContext
@@ -72,7 +73,9 @@ def build_unattended_loop(
         # Approved automation revisions keep their persisted skill snapshot.
         freeze_skill_catalog=True,
         system_prompt=metadata.system_prompt,
-        on_completion_success=lambda: manager.touch(metadata),
+        on_completion_success=lambda: asyncio.to_thread(
+            manager.refresh_recency, metadata.session_id
+        ),
     )
     loop.manager = manager
     loop.session_metadata = metadata

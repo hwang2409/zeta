@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import fcntl
 import json
 import logging
 import os
 import re
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -32,6 +34,7 @@ from .session_files import (
     SessionNotFoundError,
     open_session_file,
     read_session_file,
+    require_off_loop_lock,
     session_directory,
     session_root,
     child_directory,
@@ -57,6 +60,10 @@ from .session_links import (
 logger = logging.getLogger(__name__)
 
 META_VERSION = 1
+
+
+class SessionLoopThreadLockError(SessionError):
+    """A session metadata lock was requested on an asyncio loop thread."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -640,39 +647,16 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             )
         return current
 
-    def record_account_selection(
-        self,
-        metadata: SessionMetadata,
-        account: Any,
-        *,
-        boundary: int,
-        switched: bool = False,
-    ) -> None:
-        """Persist one provider selection and its native-context boundary atomically."""
-
-        provider = account.provider
-        value = str(account)
-
-        def update(item: SessionMetadata) -> SessionMetadata:
-            item.selected_accounts[provider] = value
-            item.native_context_boundaries[provider] = (
-                max(boundary, item.native_context_boundaries.get(provider, 0) + 1)
-                if switched
-                else boundary
-            )
-            if switched:
-                item.account_switch_sequences[provider] = (
-                    item.account_switch_sequences.get(provider, 0) + 1
-                )
-            return self._touch(item)
-
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)
-
-    def read_metadata(self, session_id: str) -> SessionMetadata:
+    def read_metadata(
+        self, session_id: str, *, lock_timeout: float | None = None
+    ) -> SessionMetadata:
         """Read validated metadata without opening or repairing the conversation."""
         self._validate_id(session_id)
-        return self._read(session_id)
+        if lock_timeout is None:
+            return self._read(session_id)
+        with self._metadata_lock(session_id, timeout=lock_timeout) as directory_fd:
+            assert directory_fd is not None
+            return self._read(session_id, directory_fd=directory_fd)
 
     def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
         metadata = self.read_metadata(session_id)
@@ -919,63 +903,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
-    def record_session_settings(
-        self,
-        metadata: SessionMetadata,
-        *,
-        model: str,
-        approval_mode: str,
-        budget: int,
-        provider: str,
-        model_fallback: tuple[str, str, int] | None = None,
-    ) -> None:
-        """Persist active-session settings together, without changing global config."""
-        if (
-            approval_mode not in {"ask", "allow", "deny"}
-            or not model.strip()
-            or budget <= 0
-        ):
-            raise SessionError("invalid session settings")
-        expected = (
-            metadata.provider,
-            metadata.model,
-            metadata.approval_mode,
-            metadata.compaction_budget,
-            metadata.budget_pinned,
-            metadata.model_fallback,
-        )
-
-        def update(item: SessionMetadata) -> SessionMetadata:
-            if (
-                item.provider,
-                item.model,
-                item.approval_mode,
-                item.compaction_budget,
-                item.budget_pinned,
-                item.model_fallback,
-            ) != expected:
-                raise SessionError("session settings changed before commit")
-            if item.model != model or item.provider != provider:
-                item.override_audit.append(
-                    {
-                        "at": _now(),
-                        "provider": {"from": item.provider, "to": provider}
-                        if item.provider != provider
-                        else None,
-                        "model": {"from": item.model, "to": model}
-                        if item.model != model
-                        else None,
-                    }
-                )
-            item.provider = provider
-            item.model = model
-            item.approval_mode = approval_mode
-            item.model_fallback = model_fallback
-            item.compaction_budget = budget
-            return self._touch(item)
-
-        self._copy_metadata(metadata, self._mutate(metadata.session_id, update))
-
     def record_vim_mode(self, metadata: SessionMetadata, *, enabled: bool) -> None:
         """Persist the composer editing mode with optimistic concurrency."""
 
@@ -1137,8 +1064,10 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self,
         session_id: str,
         update: Callable[[SessionMetadata], SessionMetadata],
+        *,
+        lock_timeout: float | None = None,
     ) -> SessionMetadata:
-        with self._metadata_lock(session_id) as directory_fd:
+        with self._metadata_lock(session_id, timeout=lock_timeout) as directory_fd:
             current = self._read(session_id, directory_fd=directory_fd)
             updated = update(current)
             self._write_unlocked(updated, directory_fd=directory_fd)
@@ -1188,8 +1117,27 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         write_session_json(directory_fd, "meta.json", metadata.to_storage_dict())
 
     @contextmanager
-    def _metadata_lock(self, session_id: str, *, blocking: bool = True):
+    def _metadata_lock(
+        self,
+        session_id: str,
+        *,
+        blocking: bool = True,
+        timeout: float | None = None,
+    ):
+        if blocking:
+            require_off_loop_lock("session metadata", SessionLoopThreadLockError)
         self._validate_id(session_id)
+        if timeout is not None:
+            deadline = time.monotonic() + timeout
+            while True:
+                with self._metadata_lock(session_id, blocking=False) as directory_fd:
+                    if directory_fd is not None:
+                        yield directory_fd
+                        return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SessionError("session metadata lock acquisition timed out")
+                time.sleep(min(0.05, remaining))
         with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
             try:
                 lock_fd = open_session_file(
@@ -1221,12 +1169,31 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             raise SessionError(f"invalid session id: {session_id!r}")
 
 
+async def persist_metadata_change(
+    manager: SessionManager,
+    metadata: SessionMetadata,
+    change: Callable[[SessionMetadata], None],
+) -> None:
+    """Run durable metadata work off-loop, then apply its result on-loop."""
+
+    candidate = copy.deepcopy(metadata)
+    persistence = asyncio.create_task(asyncio.to_thread(change, candidate))
+    try:
+        await asyncio.shield(persistence)
+    except asyncio.CancelledError:
+        await persistence
+        manager._copy_metadata(metadata, candidate)
+        raise
+    manager._copy_metadata(metadata, candidate)
+
+
 __all__ = [
     "META_VERSION",
     "SESSION_NAME_MAX_LENGTH",
     "OpenedSession",
     "SessionError",
     "SessionInUseError",
+    "SessionLoopThreadLockError",
     "SessionManager",
     "SessionMetadata",
     "SessionPreview",
@@ -1235,6 +1202,7 @@ __all__ = [
     "format_relative_age",
     "list_sessions",
     "normalize_session_name",
+    "persist_metadata_change",
 ]
 
 

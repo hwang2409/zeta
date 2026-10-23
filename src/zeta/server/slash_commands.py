@@ -18,6 +18,7 @@ from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
 from ..core.commands.custom_commands import CustomCommand
 from ..core.project_context import discover_repo_root
+from ..core.session import persist_metadata_change
 from ..core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashCommand,
@@ -180,7 +181,7 @@ class ServerSlashSession:
             return f"model: {runtime.model} (open Settings to switch)"
         mode = runtime.policy.default.value if runtime.policy else "ask"
         try:
-            await asyncio.to_thread(apply_settings, runtime, requested, mode)
+            await apply_settings(runtime, requested, mode)
         except ValueError as exc:
             return f"model unchanged: {exc}"
         except (OSError, RuntimeError) as exc:
@@ -220,7 +221,7 @@ class ServerSlashSession:
     def _client_only(self, name: str) -> str:
         return f"/{name}: {_CLIENT_ONLY_NOTICE}"
 
-    def slash_vim(self, args: str) -> str:
+    async def slash_vim(self, args: str) -> str:
         runtime = self._runtime
         requested = args.strip().lower()
         if requested not in {"", "on", "off", "toggle"}:
@@ -230,7 +231,13 @@ class ServerSlashSession:
             return f"vim mode: {'on' if current else 'off'}"
         enabled = not current if requested == "toggle" else requested == "on"
         if enabled != current:
-            runtime.manager.record_vim_mode(runtime.metadata, enabled=enabled)
+            await persist_metadata_change(
+                runtime.manager,
+                runtime.metadata,
+                lambda candidate: runtime.manager.record_vim_mode(
+                    candidate, enabled=enabled
+                ),
+            )
         return f"vim mode: {'on' if enabled else 'off'}"
 
     def slash_plan(self, args: str) -> str | ModelInputEnvelope:
@@ -370,10 +377,15 @@ async def read_request(
     method: str,
     runtime: ServerRuntime,
     require_idle: Callable[[], Awaitable[None]],
+    params: dict[str, object],
+    owner: object,
 ) -> dict[str, object]:
     if method == "slash_list":
         return await list_commands(runtime)
-    return await accounts.request(method, runtime, require_idle)
+    operation = accounts.request(method, runtime, require_idle, params)
+    if method == "account_switch":
+        return await accounts.run_owned_switch(owner, operation)
+    return await operation
 
 
 async def list_commands(runtime: ServerRuntime) -> dict[str, object]:

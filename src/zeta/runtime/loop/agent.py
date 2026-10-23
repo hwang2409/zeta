@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import shlex
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+    Sequence,
+)
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -91,6 +99,11 @@ from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
 )
+from ..backend_state import (
+    PreparedBackendState,
+    apply_backend_state,
+    prepare_backend_state,
+)
 from ._completion import (
     ProviderAttemptState,
     _error_info,
@@ -102,6 +115,7 @@ from ._completion import (
     provider_prompt_tokens,
     provider_retry_notice,
     start_provider_attempt,
+    subscription_limit_failure,
     task_is_cancelling,
     wait_for_provider_retry,
 )
@@ -165,8 +179,8 @@ class AgentLoop(
         runtime_prompt: RuntimePrompt | None = None,
         token_budget: int = 200_000,
         retained_tail: int = 8,
-        on_completion_success: Callable[[], None] | None = None,
-        on_plan_mode_change: Callable[[bool], None] | None = None,
+        on_completion_success: Callable[[], Awaitable[None] | None] | None = None,
+        on_plan_mode_change: Callable[[bool], Awaitable[None] | None] | None = None,
         hooks: HookManager | None = None,
         skip_mcp_mount: bool = False,
         agent_depth: int = 0,
@@ -335,23 +349,15 @@ class AgentLoop(
             for message in messages
         ]
 
-    def set_backend(self, backend: CompletionBackend) -> None:
-        """Replace the provider backend used by subsequent completions."""
+    def prepare_backend_state(self, backend: CompletionBackend) -> PreparedBackendState:
+        return prepare_backend_state(self, backend)
 
-        self.backend = backend
-        self.context_assembler.backend = backend
-        self.context_assembler.compaction_policy.backend = backend
-        self.set_token_budget(self.context_assembler.token_budget)
+    def current_backend_state(self) -> PreparedBackendState:
+        return PreparedBackendState(self.backend, self.context_assembler.token_budget)
 
-    def set_model(self, model: str) -> None:
-        """Set the model used by subsequent provider completions."""
-        if not model.strip():
-            raise ValueError("model must be a nonempty name")
-        if hasattr(self.backend, "model"):
-            self.backend.model = model
-        else:
-            self._model = model
-        self.set_token_budget(self.context_assembler.token_budget)
+    def apply_backend_state(self, state: PreparedBackendState) -> None:
+        apply_backend_state(self, state)
+
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
         provider = getattr(self.backend, "provider", None)
@@ -851,6 +857,10 @@ class AgentLoop(
             provider_retry_usage: dict[str, Any] | None = None
             attempt_state = ProviderAttemptState()
             try:
+                account_context = getattr(self, "account_context", None)
+                if account_context is not None and account_context.account_state_unknown:
+                    yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
+                    await account_context.ensure_account_state(self)
                 if retrying_context or self.context_assembler.needs_compaction():
                     yield StreamEvent(
                         StreamEventType.COMPACTION_START,
@@ -978,6 +988,11 @@ class AgentLoop(
                 continue
             if provider_error is not None:
                 source = provider_error_source or provider_error
+                provider_error, limit_event = await subscription_limit_failure(
+                    getattr(self, "account_context", None), provider_error, source
+                )
+                if limit_event is not None:
+                    yield limit_event
                 retry_usage = getattr(source, "retry_usage", None)
                 if provider_retry_usage is None and isinstance(retry_usage, Mapping):
                     provider_retry_usage = dict(retry_usage)
@@ -1022,7 +1037,9 @@ class AgentLoop(
             retrying_context = False
             retrying_provider = False
             if completion_succeeded and self.on_completion_success is not None:
-                self.on_completion_success()
+                completion_result = self.on_completion_success()
+                if inspect.isawaitable(completion_result):
+                    await completion_result
             if assistant_message is None and partial_blocks:
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
             if assistant_message is None:

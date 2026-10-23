@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 
-from ..accounts import AccountId, AccountStore
+from ..accounts import AccountId, AccountStore, account_provider
 from ..config.settings import ResolvedConfig, SettingsError
 from ..config.settings import resolve as resolve_settings
 from ..core.project_context import (
@@ -29,7 +29,9 @@ from ..core.session import (
     SessionPreview,
     env_home,
     format_relative_age,
+    persist_metadata_change,
 )
+from ..core.slash import resolve_session_budget
 from ..models.catalog import REMOVED_PROVIDER_ERROR
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
@@ -425,34 +427,118 @@ def _create_app_with_root(
             model if model != metadata.model else None,
         )
 
-    def completion_success() -> None:
+    async def completion_success() -> None:
         nonlocal pending_override
         if pending_override is not None:
-            manager.record_override(
-                metadata,
-                provider=pending_override[0],
-                model=pending_override[1],
+            selected_provider = pending_override[0] or metadata.provider
+            selected_model = pending_override[1] or metadata.model
+
+            def prepare(current: SessionMetadata) -> SessionMetadata:
+                return manager._apply_session_settings(
+                    current,
+                    model=selected_model,
+                    approval_mode=current.approval_mode
+                    or approval_policy.default.value,
+                    budget=loop.context_assembler.token_budget,
+                    provider=selected_provider,
+                    model_fallback=current.model_fallback,
+                )
+
+            authoritative = await loop.account_context.switch_model(
+                loop, prepare=prepare, build_backend=lambda _current: None
             )
+            if (
+                authoritative.provider != selected_provider
+                or authoritative.model != selected_model
+            ):
+                raise OSError("session override was not persisted")
             pending_override = None
         if recency is not None:
             recency.refresh()
 
-    def model_changed(model_name: str) -> None:
+    async def model_changed(model_name: str) -> SessionMetadata:
         nonlocal pending_override
-        if pending_override is not None:
-            pending_override = (provider, model_name)
-        else:
-            manager.record_override(metadata, provider=None, model=model_name)
-        effective_budget = loop.context_assembler.token_budget
-        if metadata.compaction_budget != effective_budget:
-            manager.record_budget(
-                metadata,
-                budget=effective_budget,
-                pinned=budget_pinned,
+        context = loop.account_context
+
+        def prepare(current: SessionMetadata) -> SessionMetadata:
+            budget, _ = resolve_session_budget(
+                current.compaction_budget,
+                current.budget_pinned,
+                provider,
+                model_name,
+                None,
+            )
+            return manager._apply_session_settings(
+                current,
+                model=model_name,
+                approval_mode=current.approval_mode or approval_policy.default.value,
+                budget=budget,
+                provider=provider,
+                model_fallback=current.model_fallback,
             )
 
-    def plan_mode_changed(enabled: bool) -> None:
-        manager.record_plan_mode(metadata, enabled=enabled)
+        def prepare_backend(current: SessionMetadata) -> CompletionBackend:
+            selected = current.selected_accounts.get(
+                account_provider(current.provider) or ""
+            )
+            account = AccountId(*selected.split(":", 1)) if selected is not None else None
+            backend, _ = _app.build_backend(
+                current.provider,
+                current.model,
+                home=home,
+                stall_seconds=config.stream_stall_seconds,
+                stall_retries=config.stream_stall_retries,
+                token_budget=current.compaction_budget,
+                account=account,
+            )
+            return backend
+
+        authoritative = await context.switch_model(
+            loop, prepare=prepare, build_backend=prepare_backend
+        )
+        if authoritative.provider != provider or authoritative.model != model_name:
+            raise OSError("session model was not persisted")
+        pending_override = None
+        return authoritative
+
+    async def persist_budget(budget: int) -> None:
+        await persist_metadata_change(
+            manager,
+            metadata,
+            lambda candidate: manager.record_budget(
+                candidate, budget=budget, pinned=False
+            ),
+        )
+
+    async def persist_vim_mode(enabled: bool) -> None:
+        await persist_metadata_change(
+            manager,
+            metadata,
+            lambda candidate: manager.record_vim_mode(candidate, enabled=enabled),
+        )
+
+    async def persist_name(label: str) -> None:
+        await persist_metadata_change(
+            manager,
+            metadata,
+            lambda candidate: manager.record_name(candidate, name=label),
+        )
+
+    def plan_mode_changed(enabled: bool) -> asyncio.Task[None] | None:
+        try:
+            event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            manager.record_plan_mode(metadata, enabled=enabled)
+            return None
+        return event_loop.create_task(
+            persist_metadata_change(
+                manager,
+                metadata,
+                lambda candidate: manager.record_plan_mode(
+                    candidate, enabled=enabled
+                ),
+            )
+        )
 
     max_turns_override = getattr(args, "max_turns", None)
     composition = compose_runtime(
@@ -517,13 +603,9 @@ def _create_app_with_root(
         on_budget_change=(
             None
             if budget_pinned
-            else lambda budget: manager.record_budget(
-                metadata, budget=budget, pinned=False
-            )
+            else persist_budget
         ),
-        on_vim_mode_change=lambda enabled: manager.record_vim_mode(
-            metadata, enabled=enabled
-        ),
+        on_vim_mode_change=persist_vim_mode,
         startup_notices=startup_notices,
         startup_warnings=startup_warnings,
         startup_alerts=startup_alerts,
@@ -531,7 +613,7 @@ def _create_app_with_root(
         workspace_snapshot_cap=config.workspace_snapshot_cap,
         ephemeral_root=ephemeral_root,
         session_name=metadata.name,
-        on_name_change=lambda label: manager.record_name(metadata, name=label),
+        on_name_change=persist_name,
         key_remap=config.keybindings,
         project_dir=repo_root,
         project_eligible=discovery.eligible and discovery.primary_root is not None,

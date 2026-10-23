@@ -51,7 +51,10 @@ def credential_store(
         return None
     auth_home = Path(home) if home is not None else env_home()
     registry = AccountStore(auth_home)
-    selected = registry.resolve_account(provider, account)
+    canonical = "anthropic" if provider == "claude" else provider
+    if account is not None and account.provider != canonical:
+        raise ValueError("account provider does not match")
+    selected = account or registry.resolve_account(provider)
     driver = (
         AnthropicCredentialDriver()
         if provider == "claude"

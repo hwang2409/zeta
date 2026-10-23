@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 from pathlib import Path
@@ -384,7 +385,7 @@ async def test_serve_unknown_recipe_preserves_custom_bytes_and_refreshes_owned_m
     assert context.memory_digest is not None
     custom_prefix = "CUSTOM-LEGACY-PROMPT\n"
     manager = SessionManager(home)
-    opened = manager.create(
+    opened = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="offline",
         cwd=workspace,
@@ -397,7 +398,7 @@ async def test_serve_unknown_recipe_preserves_custom_bytes_and_refreshes_owned_m
         project_memory_offset=context.memory_offset + len(custom_prefix),
         project_memory_length=context.memory_length,
         project_memory_digest=context.memory_digest,
-    )
+    ))
     session_id = opened.metadata.session_id
     opened.store.close()
     _add(registry, project_id, (AddOperation("state", "memory after", _source(2)),))

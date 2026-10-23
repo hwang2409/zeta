@@ -2,7 +2,7 @@
 
 ## status
 
-phase 1 account storage, selection, mutable display labels, and offline identity display are implemented. phase 2 verified explicit usage refresh is implemented. exhaustion recovery remains later work.
+phase 1 account storage, selection, mutable display labels, and offline identity display are implemented. phase 2 verified explicit usage refresh and phase 3 verified exhaustion recovery are implemented.
 
 ## problem and v1 outcome
 
@@ -336,6 +336,22 @@ existing bounded retry behavior. after a subscription-limit failure, offer one
 key to switch when exactly one alternative has fresh, verified usage and is not
 known exhausted. otherwise open `/accounts`. switching never retries or replays
 the failed request.
+
+The implemented Codex rule requires HTTP 429 and
+`error.type == "usage_limit_reached"` from the Responses error body, with integer
+Unix-seconds `resets_at` and a positive integer `limit_window_minutes`. The
+redacted 2026-10-22 fixture is
+`tests/fixtures/usage/codex_responses_429_usage_limit_reached.json`. A classified
+limit is terminal for that request and is saved as a 100% `provider_error`
+usage window until its reset.
+
+An account is known exhausted only while a verified normalized usage window is
+at least 100% and its verified reset is in the future. This applies to the
+fixture-backed 0–100 scales from the Anthropic and Codex usage endpoints, and to
+the classified Codex provider-error window. Anthropic response classification
+is pending a real exhausted-response fixture; an Anthropic 429 remains an
+ordinary provider error. A fresh Anthropic usage snapshot at 100% can still
+exclude that account as an alternative because its usage scale is verified.
 
 ## delivery order and cuts
 

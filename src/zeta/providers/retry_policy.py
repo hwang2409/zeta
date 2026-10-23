@@ -191,6 +191,8 @@ def retryable_provider_error(
 ) -> bool:
     status_code = getattr(error, "status_code", None)
     code = getattr(error, "code", None)
+    if getattr(error, "subscription_limit", None) is not None:
+        return False
     if code in _TERMINAL_ERROR_CODES:
         return False
     # Preserve the notification-turn rule: client errors are permanent even

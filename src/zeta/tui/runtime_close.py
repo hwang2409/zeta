@@ -26,6 +26,13 @@ class RuntimeCloseMixin:
             self._close_task = asyncio.create_task(self._close_runtime())
         await asyncio.shield(self._close_task)
 
+    async def _cancel_account_switch(self) -> None:
+        task = getattr(self, "_account_switch_task", None)
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
     async def _close_runtime(self) -> None:
         first_error: BaseException | None = None
 
@@ -51,6 +58,7 @@ class RuntimeCloseMixin:
         try:
             attempt(self.stop_decisions_poll)
             attempt(self._stop_decisions_refresh)
+            await attempt_async(self._cancel_account_switch)
             prepare_ui_session_change = getattr(
                 self, "_prepare_ui_session_change", None
             )

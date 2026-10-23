@@ -46,6 +46,16 @@ class UsageState:
     error: str | None = None
     last_attempt_at: datetime | None = None
 
+    def known_exhausted(self, now: datetime | None = None) -> bool:
+        current = _utc(now or datetime.now(UTC))
+        return bool(
+            self.snapshot
+            and any(
+                window.used_percent >= 100 and window.resets_at > current
+                for window in self.snapshot.windows
+            )
+        )
+
 
 def usage_freshness(snapshot: UsageSnapshot | None, now: datetime) -> str:
     if snapshot is None:
@@ -326,19 +336,26 @@ class AccountUsage:
         self.store._write_usage_bytes(account, data)
 
 
+def record_subscription_limit(
+    store: AccountStore, account: AccountId, snapshot: UsageSnapshot, captured_at: datetime
+) -> None:
+    """Persist verified provider-error usage under the existing account lock."""
+
+    with store.usage_guard(account):
+        AccountUsage(store)._write(account, snapshot, captured_at, None, "succeeded", finished=captured_at)
+
+
 def format_usage_lines(state: UsageState) -> tuple[str, ...]:
+    if state.known_exhausted() and state.snapshot is not None:
+        reset = max(window.resets_at for window in state.snapshot.windows if window.used_percent >= 100)
+        return (f"limit reached · resets {_format_reset(reset)}",)
     if state.snapshot is None:
         lines = ["usage unknown"]
     else:
         now = datetime.now().astimezone()
         lines = []
         for window in state.snapshot.windows:
-            reset = window.resets_at.astimezone()
-            reset_text = (
-                reset.strftime("%H:%M")
-                if reset.date() == now.date()
-                else reset.strftime("%b %d %H:%M").lower()
-            )
+            reset_text = _format_reset(window.resets_at, now=now)
             percent = f"{window.used_percent:g}%"
             lines.append(
                 f"{_window_label(window)} {percent} · resets {reset_text}"
@@ -347,6 +364,16 @@ def format_usage_lines(state: UsageState) -> tuple[str, ...]:
     if state.error:
         lines.append(f"refresh failed: {state.error}")
     return tuple(lines)
+
+
+def _format_reset(value: datetime, *, now: datetime | None = None) -> str:
+    current = now or datetime.now().astimezone()
+    reset = value.astimezone()
+    return (
+        reset.strftime("%H:%M")
+        if reset.date() == current.date()
+        else reset.strftime("%b %d %H:%M").lower()
+    )
 
 
 def _window_label(window: UsageWindow) -> str:
@@ -385,7 +412,7 @@ def _snapshot_json(snapshot: UsageSnapshot) -> dict[str, object]:
 def _snapshot_from_json(value: Mapping[str, object]) -> UsageSnapshot:
     source = value.get("source")
     windows = value.get("windows")
-    if source != "usage_endpoint" or not isinstance(windows, list) or not windows:
+    if source not in {"usage_endpoint", "provider_error"} or not isinstance(windows, list) or not windows:
         raise ValueError
     parsed: list[UsageWindow] = []
     for raw in windows:

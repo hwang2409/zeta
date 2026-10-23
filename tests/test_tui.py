@@ -51,6 +51,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
+import zeta.accounts.session as account_session_module
 from tests.support.credentials import (
     anthropic_credentials,
     codex_credentials,
@@ -64,6 +65,7 @@ from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
+from zeta.core.slash import budget_for_model
 from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.diagnostics import tui_stalls as tui_stalls_module
@@ -1524,14 +1526,16 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
     )
     attention_fork.unregister("request_attention")
     register_fork(attention_fork)
-    automation_session = SessionManager(tmp_path / "automation").create(
+    automation_session = await asyncio.to_thread(
+        SessionManager(tmp_path / "automation").create,
         provider="codex",
         model="fake",
         cwd=tmp_path,
         skill_catalog=SkillCatalog.empty(),
         system_prompt="system",
     )
-    automation_loop = build_unattended_loop(
+    automation_loop = await asyncio.to_thread(
+        build_unattended_loop,
         automation_session,
         home=tmp_path / "automation",
         allow=(),
@@ -1631,6 +1635,17 @@ def test_scrollback_stream_events_render() -> None:
         StreamEventType.AGENT_NOTIFICATION: StreamEvent(
             StreamEventType.AGENT_NOTIFICATION,
             data=_notification_payloads()["agent_completion"],
+        ),
+        StreamEventType.ACCOUNT_LIMIT: StreamEvent(
+            StreamEventType.ACCOUNT_LIMIT,
+            data={
+                "account": "codex:work",
+                "resets_at": "2026-10-27T18:31:48Z",
+                "action": "accounts",
+            },
+        ),
+        StreamEventType.ACCOUNT_STATE_UNKNOWN: StreamEvent(
+            StreamEventType.ACCOUNT_STATE_UNKNOWN
         ),
         StreamEventType.TOOL_EXECUTION_START: StreamEvent(
             StreamEventType.TOOL_EXECUTION_START, tool_call=call
@@ -10283,7 +10298,8 @@ async def test_vi_composer_history_down_restores_multiline_entry_cursor(
     assert submitted == ["first line\nsecond line", "other first\nother second"]
 
 
-def test_vim_slash_command_toggles_both_directions(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_vim_slash_command_toggles_both_directions(tmp_path: Path) -> None:
     session = PromptSession()
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
@@ -10295,10 +10311,10 @@ def test_vim_slash_command_toggles_both_directions(tmp_path: Path) -> None:
     app._invalidate_prompt = lambda: None
     session.editing_mode = EditingMode.VI
 
-    assert app.slash_vim("off") == "vim mode: off"
+    assert await app.slash_vim("off") == "vim mode: off"
     assert app.vim_mode is False
     assert session.editing_mode is EditingMode.EMACS
-    assert app.slash_vim("on") == "vim mode: on"
+    assert await app.slash_vim("on") == "vim mode: on"
     assert app.vim_mode is True
     assert session.editing_mode is EditingMode.VI
 
@@ -11979,7 +11995,8 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
     tmp_path: Path, model: str, expected_budget: int
 ) -> None:
     manager = SessionManager(tmp_path / "home")
-    opened = manager.create(
+    opened = await asyncio.to_thread(
+        manager.create,
         provider="ollama",
         model="claude-sonnet-4-6",
         cwd=tmp_path,
@@ -11997,12 +12014,29 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
     loop.context_assembler.backend = backend
     loop.context_assembler.compaction_policy.backend = backend
 
-    def persist_model_and_effective_budget(selected: str) -> None:
-        manager.record_override(opened.metadata, provider=None, model=selected)
-        manager.record_budget(
-            opened.metadata,
-            budget=loop.context_assembler.token_budget,
-            pinned=True,
+    context = SessionAccountContext.load(
+        manager.home, manager, opened.metadata
+    )
+    loop.account_context = context
+
+    async def persist_model_and_effective_budget(selected: str):
+        def prepare(metadata):
+            budget = min(metadata.compaction_budget, budget_for_model("ollama", selected))
+            return manager._apply_session_settings(
+                metadata,
+                model=selected,
+                approval_mode=metadata.approval_mode or "ask",
+                budget=budget,
+                provider="ollama",
+                model_fallback=metadata.model_fallback,
+            )
+
+        return await context.switch_model(
+            loop,
+            prepare=prepare,
+            build_backend=lambda metadata: OllamaBackend(
+                model=metadata.model, token_budget=metadata.compaction_budget
+            ),
         )
 
     app = TUIApp(
@@ -12013,7 +12047,9 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
         console=Console(file=StringIO(), force_terminal=False),
     )
     try:
-        assert app.slash_model(model).startswith(f"model: {model}")
+        assert (await app.slash_model(model)).startswith(f"model: {model}")
+        backend = loop.backend
+        assert isinstance(backend, OllamaBackend)
         payloads: list[dict] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -12039,6 +12075,130 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
 
 
 @pytest.mark.asyncio
+async def test_tui_model_command_respects_unknown_fence_and_uses_transition(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "home")
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
+    )
+    context = SessionAccountContext.load(
+        manager.home, manager, opened.metadata, validate=False
+    )
+    loop = AgentLoop(
+        FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()
+    )
+    loop.account_context = context
+    calls = 0
+    transition = SessionAccountContext.switch_model
+
+    async def switch_model(selected: str):
+        nonlocal calls
+        calls += 1
+
+        def prepare(metadata):
+            return manager._apply_session_settings(
+                metadata,
+                model=selected,
+                approval_mode=metadata.approval_mode or "ask",
+                budget=metadata.compaction_budget,
+                provider="codex",
+                model_fallback=metadata.model_fallback,
+            )
+
+        return await transition(
+            context,
+            loop,
+            prepare=prepare,
+            build_backend=lambda _metadata: FakeBackend([]),
+        )
+
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="gpt-5.6-luna",
+        on_model_change=switch_model,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    context._mark_unknown(lambda _metadata: FakeBackend([]))
+
+    output = await app._slash_commands.dispatch_async(app, "/model gpt-5.4")
+
+    assert calls == 1
+    assert output is not None and str(output).startswith("model unchanged:")
+    assert app.model == "gpt-5.6-luna"
+    assert manager.read_metadata(opened.metadata.session_id).model == "gpt-5.6-luna"
+    await loop.close()
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_model_command_does_no_lock_work_on_loop(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "home")
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
+    )
+    context = SessionAccountContext.load(
+        manager.home, manager, opened.metadata, validate=False
+    )
+    loop = AgentLoop(
+        FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()
+    )
+    loop.account_context = context
+
+    async def switch_model(selected: str):
+        def prepare(metadata):
+            return manager._apply_session_settings(
+                metadata,
+                model=selected,
+                approval_mode=metadata.approval_mode or "ask",
+                budget=metadata.compaction_budget,
+                provider="codex",
+                model_fallback=metadata.model_fallback,
+            )
+
+        return await context.switch_model(
+            loop,
+            prepare=prepare,
+            build_backend=lambda _metadata: FakeBackend([]),
+        )
+
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="gpt-5.6-luna",
+        on_model_change=switch_model,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    lock_held = threading.Event()
+
+    def hold_metadata_lock() -> None:
+        with manager._metadata_lock(opened.metadata.session_id) as directory_fd:
+            assert directory_fd is not None
+            lock_held.set()
+            time.sleep(0.25)
+
+    holder = threading.Thread(target=hold_metadata_lock)
+    holder.start()
+    assert await asyncio.to_thread(lock_held.wait, 1)
+    event_loop = asyncio.get_running_loop()
+    started = event_loop.time()
+    callback_delays: list[float] = []
+    event_loop.call_later(
+        0.01, lambda: callback_delays.append(event_loop.time() - started)
+    )
+
+    output = await app._slash_commands.dispatch_async(app, "/model gpt-5.4")
+
+    assert output is not None and str(output).startswith("model: gpt-5.4")
+    assert callback_delays and callback_delays[0] < 0.05
+    await asyncio.to_thread(holder.join, 1)
+    assert not holder.is_alive()
+    await loop.close()
+    opened.store.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -12055,7 +12215,9 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     )
     await asyncio.to_thread(AccountStore(home).set_default, first)
     manager = SessionManager(home)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     resolver = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -12069,7 +12231,6 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     rendered: list[Panel] = []
     app._presenter.print_unit = rendered.append
     list_display = AccountStore.list_display
-    switch = SessionAccountContext.switch
     off_loop_calls: list[str] = []
 
     def checked_list_display(store: AccountStore):
@@ -12078,14 +12239,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
         off_loop_calls.append("list")
         return list_display(store)
 
-    def checked_switch(context, account, *, boundary):
-        with pytest.raises(RuntimeError, match="no running event loop"):
-            asyncio.get_running_loop()
-        off_loop_calls.append("switch")
-        return switch(context, account, boundary=boundary)
-
     monkeypatch.setattr(AccountStore, "list_display", checked_list_display)
-    monkeypatch.setattr(SessionAccountContext, "switch", checked_switch)
 
     assert await app.slash_accounts("") == ""
     output = StringIO()
@@ -12101,7 +12255,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     assert task is not None
     await task
 
-    assert off_loop_calls == ["list", "switch"]
+    assert off_loop_calls == ["list"]
     assert await asyncio.to_thread(resolver.resolve, "codex") == second
     assert loop.account_context.snapshot()["codex"] == second
     assert AccountStore(home).default("codex") == first
@@ -12109,6 +12263,129 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
         "codex": "codex:second"
     }
     opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_account_picker_ignores_repeat_select_while_switching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    resolver = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = resolver
+    loop.tool_registry.account_context = resolver
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def held_switch(*_args: object, **_kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(SessionAccountContext, "switch_active", held_switch)
+    assert await app.slash_accounts("") == ""
+    app.accounts_picker_move(1)
+
+    first_task = app.accounts_picker_select()
+    assert first_task is not None
+    await asyncio.wait_for(entered.wait(), 1)
+    assert app.accounts_picker_select() is None
+    assert calls == 1
+    release.set()
+    await asyncio.wait_for(first_task, 1)
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_shutdown_with_switch_lock_held_exits_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    loop.tool_registry.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._accounts_picker = SimpleNamespace(highlighted=second)
+    app._presenter.print_unit = lambda _renderable: None
+    monkeypatch.setattr(
+        account_session_module,
+        "ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "zeta.tui.slash_handlers.build_backend",
+        lambda *_args, **_kwargs: (object(), "offline"),
+    )
+    lock_held = threading.Event()
+    commit_entered = threading.Event()
+    release = threading.Event()
+    metadata_lock = manager._metadata_lock
+
+    def hold_metadata_lock() -> None:
+        with metadata_lock(opened.metadata.session_id):
+            lock_held.set()
+            assert release.wait(5)
+
+    holder = threading.Thread(target=hold_metadata_lock)
+    holder.start()
+    assert await asyncio.to_thread(lock_held.wait, 1)
+
+    @contextmanager
+    def observed_metadata_lock(*args: object, **kwargs: object):
+        commit_entered.set()
+        with metadata_lock(*args, **kwargs) as directory_fd:
+            yield directory_fd
+
+    monkeypatch.setattr(manager, "_metadata_lock", observed_metadata_lock)
+    task = app.accounts_picker_select()
+    assert task is not None
+    try:
+        assert await asyncio.to_thread(commit_entered.wait, 1)
+        await asyncio.wait_for(app.close(), 1)
+        assert task.done()
+    finally:
+        release.set()
+        holder.join(timeout=1)
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        opened.store.close()
 
 
 @pytest.mark.asyncio
@@ -12121,11 +12398,26 @@ async def test_tui_session_account_switch_runs_store_off_loop() -> None:
             asyncio.get_running_loop()
         switched.append((selected, boundary))
 
+    async def checked_switch_active(
+        _loop,
+        selected: AccountId,
+        *,
+        boundary: int,
+        provider: str,
+        build_backend,
+    ) -> None:
+        del provider, build_backend
+        await asyncio.to_thread(checked_switch, selected, boundary=boundary)
+
     app = SimpleNamespace(
         _accounts_picker=SimpleNamespace(highlighted=account),
+        _account_switch_task=None,
         loop=SimpleNamespace(
-            account_context=SimpleNamespace(switch=checked_switch),
-            store=SimpleNamespace(replay=list),
+            account_context=SimpleNamespace(
+                switch_active=checked_switch_active,
+                account_state_unknown=False,
+            ),
+            store=SimpleNamespace(active_branch_head_sequence=lambda: 0),
             context_assembler=SimpleNamespace(token_budget=100_000),
         ),
         provider="claude",
@@ -12152,7 +12444,9 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
         OAuthTokens("access", "refresh", 9_999_999_999, email="henry@example.com"),
     )
     manager = SessionManager(home)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
     context = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -12247,7 +12541,7 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
     }
     store._write_usage_bytes(account, (json.dumps(usage) + "\n").encode())
     manager = SessionManager(home)
-    opened = manager.create(provider="claude", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(manager.create, provider="claude", model="offline", cwd=tmp_path)
     context = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -12298,7 +12592,7 @@ async def test_accounts_refresh_does_not_block_event_loop(
         OAuthTokens("access", "refresh", 9_999_999_999),
     )
     manager = SessionManager(home)
-    opened = manager.create(provider="claude", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(manager.create, provider="claude", model="offline", cwd=tmp_path)
     context = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -12343,3 +12637,143 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
     assert "codex:henry" in plain
     assert "henry@example.com" in plain
     assert "n rename" in plain
+
+
+def _limit_tui(tmp_path: Path) -> tuple[TUIApp, SessionAccountContext, ConversationStore]:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        named_account_credentials(home, account.provider, account.name).save(
+            OAuthTokens(account.name, "refresh", 9_999_999_999)
+        )
+    AccountStore(home).set_default(first)
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    context = SessionAccountContext.load(home, manager, opened.metadata)
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = Mock()
+    return app, context, opened.store
+
+
+def test_tui_renders_account_state_unknown() -> None:
+    rendered = render_event(StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN))
+    assert "account state unknown" in renderable_plain(rendered)
+    assert "/accounts" in renderable_plain(rendered)
+
+
+@pytest.mark.asyncio
+async def test_limit_notice_renders_and_switch_key_switches_session(
+    tmp_path: Path,
+) -> None:
+    app, context, store = await asyncio.to_thread(_limit_tui, tmp_path)
+    event = StreamEvent(
+        StreamEventType.ACCOUNT_LIMIT,
+        data={
+            "account": "codex:first",
+            "resets_at": "2026-10-27T18:31:48Z",
+            "action": "switch",
+            "alternative": "codex:second",
+        },
+    )
+    assert "codex:first" in renderable_plain(render_event(event))
+    await app._handle_account_limit(event)
+    assert app._accounts_picker is not None
+    assert app._accounts_picker.accounts == (AccountId("codex", "second"),)
+    task = app.accounts_picker_select()
+    assert task is not None
+    await task
+    assert await asyncio.to_thread(context.resolve, "codex") == AccountId(
+        "codex", "second"
+    )
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_limit_without_single_alternative_opens_accounts(
+    tmp_path: Path,
+) -> None:
+    app, _, store = await asyncio.to_thread(_limit_tui, tmp_path)
+    await app._handle_account_limit(
+        StreamEvent(
+            StreamEventType.ACCOUNT_LIMIT,
+            data={
+                "account": "codex:first",
+                "resets_at": "2026-10-27T18:31:48Z",
+                "action": "accounts",
+                "alternative": None,
+            },
+        )
+    )
+    assert app._accounts_picker is not None
+    assert len(app._accounts_picker.accounts) == 2
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_account_limit_event_lists_accounts_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _, store = await asyncio.to_thread(_limit_tui, tmp_path)
+    alternative = AccountId("codex", "second")
+    locked = threading.Event()
+    release = threading.Event()
+    waiting = threading.Event()
+
+    def hold_lifecycle_lock() -> None:
+        with AccountStore(app.loop.account_context.home).lifecycle_guard(alternative):
+            locked.set()
+            assert release.wait(5)
+
+    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder.start()
+    assert await asyncio.to_thread(locked.wait, 1)
+    original_list_display = AccountStore.list_display
+
+    def waiting_list_display(account_store):
+        waiting.set()
+        with account_store.lifecycle_guard(alternative):
+            return original_list_display(account_store)
+
+    monkeypatch.setattr(AccountStore, "list_display", waiting_list_display)
+    ticks = 0
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        task = app._handle_account_limit(
+            StreamEvent(
+                StreamEventType.ACCOUNT_LIMIT,
+                data={
+                    "account": "codex:first",
+                    "resets_at": "2026-10-27T18:31:48Z",
+                    "action": "switch",
+                    "alternative": str(alternative),
+                },
+            )
+        )
+        assert task is not None
+        assert await asyncio.to_thread(waiting.wait, 1)
+        for _ in range(3):
+            await asyncio.sleep(0.01)
+        assert ticks > 1
+        release.set()
+        await asyncio.wait_for(task, 5)
+        assert app._accounts_picker is not None
+        assert app._accounts_picker.accounts == (alternative,)
+    finally:
+        release.set()
+        stop.set()
+        await ticker_task
+        holder.join(timeout=1)
+        store.close()

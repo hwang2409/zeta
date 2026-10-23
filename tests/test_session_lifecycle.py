@@ -66,42 +66,48 @@ def test_session_metadata_persists_name_field(tmp_path: Path) -> None:
     assert reopened.metadata.name == "planning"
 
 
-def test_slash_name_persists_label_and_shows_current(
+@pytest.mark.asyncio
+async def test_slash_name_persists_label_and_shows_current(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    app = create_app(_args())
+    app = await asyncio.to_thread(create_app, _args())
 
     assert (
-        create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name")
+        await create_slash_registry(
+            skill_catalog=SkillCatalog.empty()
+        ).dispatch_async(app, "/name")
         == "session name: (unnamed)"
     )
     assert (
-        create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
-            app, "/name  planning  "
-        )
+        await create_slash_registry(
+            skill_catalog=SkillCatalog.empty()
+        ).dispatch_async(app, "/name  planning  ")
         == "session name: planning"
     )
     assert SessionManager(home).open(app.loop.store.session_id).metadata.name == (
         "planning"
     )
     assert (
-        create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name")
+        await create_slash_registry(
+            skill_catalog=SkillCatalog.empty()
+        ).dispatch_async(app, "/name")
         == "session name: planning"
     )
 
 
-def test_slash_name_rejects_empty_or_control_only(
+@pytest.mark.asyncio
+async def test_slash_name_rejects_empty_or_control_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    app = create_app(_args())
+    app = await asyncio.to_thread(create_app, _args())
 
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
-        app, "/name \x1b[31m\x1b[0m"
-    )
+    output = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/name \x1b[31m\x1b[0m")
     assert output.startswith("session name unchanged")
 
 

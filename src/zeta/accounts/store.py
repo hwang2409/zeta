@@ -25,7 +25,11 @@ from typing import Any, Protocol
 
 import httpx
 
-from ..core.session_files import child_directory, open_session_file
+from ..core.session_files import (
+    child_directory,
+    open_session_file,
+    require_off_loop_lock,
+)
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens, credential_file_lock
 
 _PROVIDERS = {"anthropic", "codex"}
@@ -127,7 +131,9 @@ class AccountStore:
         self, directory_fd: int, name: str, *, wait: bool = True
     ) -> Iterator[None]:
         if wait:
-            _require_off_loop_lock("blocking")
+            require_off_loop_lock(
+                "blocking account", AccountLoopThreadLockError
+            )
         created = not _exists(directory_fd, name)
         for attempt in range(3):
             try:
@@ -708,21 +714,11 @@ class AccountCredentials:
             await asyncio.shield(asyncio.to_thread(stack.close))
 
 
-def _require_off_loop_lock(kind: str) -> None:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    raise AccountLoopThreadLockError(
-        f"{kind} account lock requested on an asyncio event-loop thread"
-    )
-
-
 @contextmanager
 def _bounded_guard(
     guard: Callable[[], AbstractContextManager[int]], timeout: float
 ) -> Iterator[int]:
-    _require_off_loop_lock("bounded")
+    require_off_loop_lock("bounded account", AccountLoopThreadLockError)
     deadline = time.monotonic() + timeout
     while True:
         stack = ExitStack()

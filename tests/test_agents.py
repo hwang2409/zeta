@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -220,14 +221,14 @@ async def test_unattended_runtime_uses_packaged_agents_only(tmp_path: Path) -> N
     home = tmp_path / "home"
     _write_agent(home / "agents" / "custom.md", "custom", "custom", "body")
     custom_catalog = discover_session_agents(home=home)
-    session = SessionManager(home).create(
+    session = await asyncio.to_thread(lambda: SessionManager(home).create(
         provider="codex",
         model="fake",
         cwd=tmp_path,
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=custom_catalog,
         system_prompt="system",
-    )
+    ))
     loop = build_unattended_loop(
         session,
         home=home,

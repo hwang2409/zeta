@@ -690,7 +690,7 @@ async def test_interactive_composition_resolves_ollama_endpoint_centrally(
         builder_kwargs.update(kwargs)
         return build_interactive_backend(provider, model, **kwargs)
 
-    composition = compose_runtime(
+    composition = await asyncio.to_thread(lambda: compose_runtime(
         home=home,
         cwd=project_dir.parent,
         manager=SessionManager(home),
@@ -701,7 +701,7 @@ async def test_interactive_composition_resolves_ollama_endpoint_centrally(
         backend_builder=backend_builder,
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
-    )
+    ))
     try:
         assert isinstance(composition.loop.backend, OllamaBackend)
         assert composition.loop.backend.base_url == expected
@@ -736,7 +736,7 @@ async def test_interactive_ollama_budget_is_identical_everywhere(
     default_provider="codex",
     )
     manager = SessionManager(home)
-    composition = compose_runtime(
+    composition = await asyncio.to_thread(lambda: compose_runtime(
         home=home,
         cwd=project,
         manager=manager,
@@ -747,7 +747,7 @@ async def test_interactive_ollama_budget_is_identical_everywhere(
         backend_builder=build_interactive_backend,
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
-    )
+    ))
     try:
         backend = composition.loop.backend
         assert isinstance(backend, OllamaBackend)
@@ -768,7 +768,7 @@ async def test_resumed_ollama_budget_is_reconciled_everywhere(
     project = tmp_path / "project"
     project.mkdir()
     manager = SessionManager(home)
-    opened = manager.create(
+    opened = await asyncio.to_thread(lambda: manager.create(
         provider="ollama",
         model="qwen3:4b",
         cwd=project,
@@ -776,7 +776,7 @@ async def test_resumed_ollama_budget_is_reconciled_everywhere(
         budget_pinned=True,
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
-    )
+    ))
     config = resolve(
         load_settings(home=home, project_dir=project / ".zeta").settings,
         cli_provider="ollama",
@@ -785,7 +785,7 @@ async def test_resumed_ollama_budget_is_reconciled_everywhere(
         cli_token_budget=None,
     default_provider="codex",
     )
-    composition = compose_runtime(
+    composition = await asyncio.to_thread(lambda: compose_runtime(
         home=home,
         cwd=project,
         manager=manager,
@@ -797,7 +797,7 @@ async def test_resumed_ollama_budget_is_reconciled_everywhere(
         opened=opened,
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
-    )
+    ))
     try:
         backend = composition.loop.backend
         assert isinstance(backend, OllamaBackend)
@@ -877,7 +877,7 @@ async def test_server_ollama_create_and_switch_budgets_match_everywhere(
         assert runtime.loop.context_assembler.token_budget == 40_960
         assert await _captured_num_ctx(backend) == 40_960
 
-        model_selection.apply(runtime, "qwen3:4b", "ask")
+        await model_selection.apply(runtime, "qwen3:4b", "ask")
         persisted = runtime.manager.read_metadata(runtime.session_id)
         assert persisted.compaction_budget == 40_960
         assert runtime.loop.context_assembler.token_budget == 40_960
@@ -894,7 +894,7 @@ async def test_server_resume_reconciles_ollama_budget_everywhere(
     project = tmp_path / "project"
     project.mkdir()
     manager = SessionManager(home)
-    opened = manager.create(
+    opened = await asyncio.to_thread(lambda: manager.create(
         provider="ollama",
         model="qwen3:4b",
         cwd=project,
@@ -902,7 +902,7 @@ async def test_server_resume_reconciles_ollama_budget_everywhere(
         budget_pinned=True,
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
-    )
+    ))
     opened.store.close()
     monkeypatch.delenv("ZETA_OLLAMA_BASE_URL", raising=False)
     runtime = ServerRuntime(home, cwd=project, provider="ollama")
@@ -949,7 +949,7 @@ async def test_server_switch_to_ollama_caps_persisted_assembler_and_transport(
         assert runtime.loop is not None
         assert runtime.loop.context_assembler.token_budget == 100_000
 
-        model_selection.apply(runtime, "qwen3:4b", "ask")
+        await model_selection.apply(runtime, "qwen3:4b", "ask")
 
         backend = runtime.loop.backend
         assert isinstance(backend, OllamaBackend)

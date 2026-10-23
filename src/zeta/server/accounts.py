@@ -5,36 +5,54 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
-from ..accounts import AccountStore, AccountUsage
+from ..accounts import AccountId, AccountStore, AccountUsage, account_provider
 from ..accounts.usage import usage_json
+from ..providers.factory import build_backend
 from .protocol import ProtocolError
 from .runtime import ServerRuntime
 
-REQUEST_METHODS = {"account_list", "account_refresh"}
+REQUEST_METHODS = {"account_list", "account_refresh", "account_switch"}
+
+
+async def run_owned_switch(owner: Any, operation: Awaitable[object]) -> object:
+    task = asyncio.create_task(operation)
+    owner._account_switch_task = task
+    try:
+        return await task
+    finally:
+        owner._account_switch_task = None
+
+
+async def cancel_owned_switch(owner: Any) -> None:
+    task = getattr(owner, "_account_switch_task", None)
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    owner._account_switch_task = None
 
 
 async def migrate(home: Path) -> None:
     await asyncio.to_thread(AccountStore(home).migrate)
 
 
-def list_accounts(runtime: ServerRuntime) -> dict[str, object]:
+async def list_accounts(runtime: ServerRuntime) -> dict[str, object]:
     context = getattr(runtime.loop, "account_context", None)
     if context is None:
         raise ProtocolError(-32005, "accounts unavailable for this session")
-    selected = context.snapshot()
-    displays = context.store.list_display()
+    snapshot = await context.list_snapshot()
     return {
         "accounts": [
             {
                 "account": str(item.account),
                 "label": item.label,
                 "detail": item.detail,
-                "current": selected.get(item.account.provider) == item.account,
-                "default": context.store.default(item.account.provider) == item.account,
+                "current": snapshot.selected.get(item.account.provider) == item.account,
+                "default": snapshot.defaults.get(item.account.provider) == item.account,
                 "usage": usage_json(item.usage),
             }
-            for item in displays
+            for item in snapshot.displays
         ]
     }
 
@@ -43,11 +61,46 @@ async def request(
     method: str,
     runtime: ServerRuntime,
     require_idle: Callable[[], Awaitable[None]],
+    params: dict[str, object],
 ) -> dict[str, object]:
     if method == "account_list":
-        return await asyncio.to_thread(list_accounts, runtime)
+        return await list_accounts(runtime)
     await require_idle()
-    return await refresh_accounts(runtime)
+    if method == "account_refresh":
+        return await refresh_accounts(runtime)
+    raw = params.get("account")
+    if not isinstance(raw, str) or ":" not in raw:
+        raise ProtocolError(-32602, "account must be provider:name")
+    account = AccountId(*raw.split(":", 1))
+    loop = runtime.loop
+    context = loop.account_context
+    provider = runtime.metadata.provider
+    current_provider = account_provider(provider)
+
+    def prepare_backend(selected: AccountId) -> object | None:
+        if selected.provider != current_provider:
+            return None
+        backend, _ = build_backend(
+            provider,
+            loop.backend.model,
+            home=context.home,
+            account=selected,
+            token_budget=loop.context_assembler.token_budget,
+        )
+        return backend
+
+    await context.switch_active(
+        loop,
+        account,
+        boundary=loop.store.active_branch_head_sequence(),
+        provider=provider,
+        build_backend=prepare_backend,
+    )
+    return {
+        "account": str(account),
+        "replay": False,
+        "account_state": "unknown" if context.account_state_unknown else "ready",
+    }
 
 
 async def refresh_accounts(runtime: ServerRuntime) -> dict[str, object]:
@@ -56,4 +109,4 @@ async def refresh_accounts(runtime: ServerRuntime) -> dict[str, object]:
             AccountUsage(runtime.loop.account_context.store).refresh_stale()
         )
     )
-    return await asyncio.to_thread(list_accounts, runtime)
+    return await list_accounts(runtime)

@@ -334,6 +334,7 @@ class _Client:
             if self._closed:
                 return
             await self._terminate_pending_approvals(suppress_write_errors=True)
+            await accounts.cancel_owned_switch(self)
             if self._turn_task is not None and not self._turn_task.done():
                 loop = self.server.runtime.loop
                 if loop is not None:
@@ -348,7 +349,6 @@ class _Client:
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
             self._closed = True
-
     async def _dispatch(
         self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> object:
@@ -513,20 +513,13 @@ class _Client:
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
         runtime = self.server.runtime
         if method in {"rename_session", "delete_session"}:
-            session_id = runtime.manager.resolve_id(_required_string(params, "session_id"))
-            if method == "delete_session":
-                await self._require_idle()
-                if runtime.opened is not None and session_id == runtime.session_id:
-                    raise ProtocolError(-32005, "select another session before deleting this session", {"code": "active_session"})
-                runtime.manager.delete(session_id)
-                return {"session_id": session_id}
-            name = params.get("name")
-            if not isinstance(name, str):
-                raise ProtocolError(-32602, "name must be a string")
-            metadata = runtime.manager.rename(session_id, name)
-            if runtime.opened is not None and session_id == runtime.session_id:
-                runtime.manager._copy_metadata(runtime.metadata, metadata)
-            return {"session": metadata.to_dict()}
+            return await ergonomics.mutate_session(
+                runtime,
+                method,
+                _required_string(params, "session_id"),
+                params.get("name"),
+                self._require_idle,
+            )
         store = ergonomics.active(runtime, params)
         if method == "session_tree":
             return ergonomics.tree(runtime)
@@ -537,7 +530,7 @@ class _Client:
         if method == "session_settings":
             return ergonomics.settings(runtime)
         if method in slash_commands.READ_REQUESTS:
-            return await slash_commands.read_request(method, runtime, self._require_idle)
+            return await slash_commands.read_request(method, runtime, self._require_idle, params, self)
         await self._require_idle()
         if method == "slash_run":
             register = self._model_inputs.registrar(runtime.session_id, enabled="model_input_ids" in self.features)
@@ -557,7 +550,7 @@ class _Client:
             mode = _required_string(params, "approval_mode")
             if model not in ergonomics.catalog(runtime)["models"] or mode not in {"ask", "allow", "deny"}:
                 raise ProtocolError(-32602, "invalid model or approval mode")
-            await asyncio.to_thread(model_selection.apply, runtime, model, mode)
+            await model_selection.apply(runtime, model, mode)
             return ergonomics.settings(runtime)
         if method == "set_compaction":
             _required_string(params, "mode")
@@ -883,7 +876,7 @@ class _Client:
             return
         if kind is StreamEventType.MESSAGE_END:
             if foreground and not event.data.get("truncated"):
-                model_selection.confirm(self.server.runtime)
+                await model_selection.confirm(self.server.runtime)
             usage = event.data.get("usage")
             if foreground and isinstance(usage, Mapping) and usage:
                 state.usage.update(usage)

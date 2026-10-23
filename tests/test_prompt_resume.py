@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import subprocess
 import sys
@@ -189,15 +190,15 @@ def _assert_one_persisted_prompt(
 async def test_conservative_resume_discovers_new_skill(tmp_path: Path) -> None:
     home = tmp_path / "home"
     original_prompt = "unknown recipe prompt bytes"
-    manager, session_id = _manager_with_prompt(
+    manager, session_id = await asyncio.to_thread(lambda: _manager_with_prompt(
         home,
         tmp_path,
         system_prompt=original_prompt,
         prompt_recipe=None,
-    )
+    ))
     _write_skill(home / "skills" / "new-skill" / "SKILL.md")
 
-    resumed = _resume(
+    resumed = await asyncio.to_thread(lambda: _resume(
         manager,
         session_id,
         home,
@@ -205,7 +206,7 @@ async def test_conservative_resume_discovers_new_skill(tmp_path: Path) -> None:
         lambda **kwargs: (_ for _ in ()).throw(
             AssertionError(f"unexpected default rebuild: {kwargs}")
         ),
-    )
+    ))
     registry = ToolRegistry(tmp_path, skill_catalog=resumed.skill_catalog)
     loaded = await registry.execute(
         ToolCall("load-new-skill", "skill", {"name": "new-skill"}),
@@ -223,14 +224,14 @@ async def test_child_of_conservative_resumed_session_sees_new_skill(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
-    manager, session_id = _manager_with_prompt(
+    manager, session_id = await asyncio.to_thread(lambda: _manager_with_prompt(
         home,
         tmp_path,
         system_prompt="unknown recipe prompt bytes",
         prompt_recipe=None,
-    )
+    ))
     _write_skill(home / "skills" / "new-skill" / "SKILL.md")
-    resumed = _resume(manager, session_id, home, tmp_path, lambda **kwargs: None)
+    resumed = await asyncio.to_thread(lambda: _resume(manager, session_id, home, tmp_path, lambda **kwargs: None))
     parent_registry = ToolRegistry(tmp_path, skill_catalog=resumed.skill_catalog)
     child_store = ConversationStore(tmp_path / "child-session")
     try:

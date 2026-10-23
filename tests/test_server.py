@@ -6,6 +6,7 @@ import ast
 import asyncio
 import inspect
 import json
+import multiprocessing
 import os
 import shlex
 import signal
@@ -23,12 +24,13 @@ from typing import Any
 
 import pytest
 
+import zeta.accounts.session as account_session_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
-from zeta.core.session import SessionManager, SessionMetadata
+from zeta.core.session import SessionManager, SessionMetadata, persist_metadata_change
 from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.oauth import OAuthTokens
@@ -73,6 +75,13 @@ def test_every_durable_notification_kind_has_an_explicit_wire_event() -> None:
 def test_every_stream_event_has_a_wire_mapping() -> None:
     assert set(STREAM_EVENT_WIRE_EVENTS) == set(StreamEventType)
     assert all(STREAM_EVENT_WIRE_EVENTS.values())
+
+
+def test_serve_maps_account_state_unknown() -> None:
+    assert (
+        STREAM_EVENT_WIRE_EVENTS[StreamEventType.ACCOUNT_STATE_UNKNOWN]
+        == "account_state_unknown"
+    )
 
 
 def test_server_sends_only_wire_map_event_names() -> None:
@@ -1098,7 +1107,7 @@ async def test_approval_scope_rejects_invalid_values(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_resumed_approval_finishes_idle_after_terminal_event(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="offline", cwd=tmp_path))
     target = tmp_path / "input.txt"
     target.write_text("approved")
     call = ToolCall("resumed-call", "read", {"path": str(target)})
@@ -2094,6 +2103,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
     try:
         await _request(reader, writer, 3, "send", {"text": "first"})
         await _event(reader, "usage")
+        await _event(reader, "turn_end")
         assert (await _request(reader, writer, 4, "status"))[-1]["result"]["usage"]
 
         await _request(reader, writer, 5, "new_session", {"provider": "codex"})
@@ -2101,6 +2111,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
 
         await _request(reader, writer, 7, "send", {"text": "second"})
         await _event(reader, "usage")
+        await _event(reader, "turn_end")
         assert (await _request(reader, writer, 8, "status"))[-1]["result"]["usage"]
 
         await _request(reader, writer, 9, "resume", {"session_id": first_session})
@@ -2590,7 +2601,7 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
 @pytest.mark.asyncio
 async def test_serve_resume_renders_legacy_browser_tool_messages(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="offline", cwd=tmp_path))
     session_id = opened.metadata.session_id
     transcript_path = opened.store.path
     opened.store.close()
@@ -3124,14 +3135,15 @@ async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, 
     try:
         with monkeypatch.context() as patch:
             if failure == "backend":
-                original = runtime.loop.set_model
+                original = runtime.loop.prepare_backend_state
 
-                def fail_model(model):
-                    original(model)
-                    if model == "gpt-5.6-sol":
-                        raise OSError("partial backend change")
+                def fail_model(backend):
+                    state = original(backend)
+                    if backend.model == "gpt-5.6-sol":
+                        raise OSError("target backend failed")
+                    return state
 
-                patch.setattr(runtime.loop, "set_model", fail_model)
+                patch.setattr(runtime.loop, "prepare_backend_state", fail_model)
             elif failure == "metadata":
                 import zeta.core.session as session_module
                 original = session_module.os.replace
@@ -3339,7 +3351,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(tmp_path, mon
             if failure == "metadata":
                 def fail_metadata(*args, **kwargs):
                     raise OSError("metadata persistence failed")
-                patch.setattr(runtime.manager, "record_session_settings", fail_metadata)
+                patch.setattr(runtime.manager, "_write_unlocked", fail_metadata)
             response = (await _request(reader, writer, 3, "set_settings", {
                 "session_id": sid, "model": "gpt-5.4", "approval_mode": "deny",
             }))[-1]
@@ -3450,8 +3462,11 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, mo
 async def test_removed_provider_resume_is_rejected_without_session_mutation(
     tmp_path: Path, server_provider: str
 ) -> None:
-    opened = SessionManager(tmp_path).create(
-        provider="fake", model="offline", cwd=tmp_path
+    opened = await asyncio.to_thread(
+        SessionManager(tmp_path).create,
+        provider="fake",
+        model="offline",
+        cwd=tmp_path,
     )
     with opened.store.path.open("ab") as stream:
         stream.write(b'{"type":')
@@ -3514,14 +3529,16 @@ async def test_session_listing_includes_real_and_removed_provider_sessions(
     tmp_path: Path, server_provider: str
 ) -> None:
     manager = SessionManager(tmp_path)
-    sessions = {
-        provider: manager.create(provider=provider, model=model, cwd=tmp_path).metadata.session_id
-        for provider, model in (
-            ("fake", "offline"),
-            ("claude", "claude-sonnet-4-6"),
-            ("codex", "gpt-5.4"),
+    sessions = {}
+    for provider, model in (
+        ("fake", "offline"),
+        ("claude", "claude-sonnet-4-6"),
+        ("codex", "gpt-5.4"),
+    ):
+        opened = await asyncio.to_thread(
+            manager.create, provider=provider, model=model, cwd=tmp_path
         )
-    }
+        sessions[provider] = opened.metadata.session_id
     server = ZetaServer(
         home=tmp_path,
         port=0,
@@ -3814,7 +3831,7 @@ async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, v
         assert "model_fallback" not in created["session"]
         runtime = server.runtime
         sid = runtime.session_id
-        await asyncio.to_thread(model_selection.apply, runtime, "gpt-5.4", "ask")
+        await model_selection.apply(runtime, "gpt-5.4", "ask")
         assert runtime.metadata.model_fallback is not None
         resumed = (await _request(reader, writer, 3, "resume", {"session_id": sid}))[-1]["result"]
         status = (await _request(reader, writer, 4, "status"))[-1]["result"]
@@ -3887,7 +3904,7 @@ async def test_mcp_auth_failure_does_not_revert_model(tmp_path, monkeypatch):
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
         runtime = server.runtime
-        await asyncio.to_thread(model_selection.apply, runtime, "gpt-5.4", "ask")
+        await model_selection.apply(runtime, "gpt-5.4", "ask")
         fallback = runtime.metadata.model_fallback
 
         async def fail_mcp_setup():
@@ -4058,8 +4075,15 @@ async def test_serve_session_response_includes_account_fields(tmp_path: Path) ->
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        server.runtime.manager.record_account_selection(
-            server.runtime.metadata, AccountId("codex", "named"), boundary=3, switched=True
+        await persist_metadata_change(
+            server.runtime.manager,
+            server.runtime.metadata,
+            lambda candidate: server.runtime.manager.record_account_selection(
+                candidate,
+                AccountId("codex", "named"),
+                boundary=3,
+                switched=True,
+            ),
         )
         row = (await _request(reader, writer, 3, "list_sessions"))[-1]["result"]["sessions"][0]
         assert row["selected_accounts"] == {"codex": "codex:named"}
@@ -4134,7 +4158,9 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
     reader, writer = await _ready(server)
     try:
         sid = server.runtime.session_id
-        server.runtime.manager.rename(sid, "private display name")
+        await asyncio.to_thread(
+            server.runtime.manager.rename, sid, "private display name"
+        )
         for method, params in (("rename_session", {"name": "changed"}), ("delete_session", {})):
             result = (await _request(reader, writer, 3, method, {"session_id": sid, **params}))[-1]
             assert result["error"]["code"] == -32601
@@ -4266,7 +4292,12 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         sid = (await _request(reader, writer, 2, "new_session"))[-1]["result"]["session"]["session_id"]
         # Also check an inactive target so the streaming guard, not the active guard, decides deletion.
-        other = server.runtime.manager.create(provider="codex", model="offline", cwd=tmp_path)
+        other = await asyncio.to_thread(
+            server.runtime.manager.create,
+            provider="codex",
+            model="offline",
+            cwd=tmp_path,
+        )
         other.store.close()
         await _request(reader, writer, 3, "send", {"text": "slow response"})
         await asyncio.wait_for(started.wait(), TIMEOUT)
@@ -4580,7 +4611,7 @@ async def test_serve_resume_slash_list_shows_skill_parse_notice(
 ) -> None:
     home = tmp_path / "home"
     manager = SessionManager(home)
-    opened = manager.create(
+    opened = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="offline",
         cwd=tmp_path,
@@ -4589,7 +4620,7 @@ async def test_serve_resume_slash_list_shows_skill_parse_notice(
         agent_catalog=AgentCatalog.empty(),
         prompt_recipe=None,
         auto_project=False,
-    )
+    ))
     session_id = opened.metadata.session_id
     opened.store.close()
     malformed = home / "skills" / "broken" / "SKILL.md"
@@ -4840,7 +4871,7 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
     mutation RPC guards with the exact same check."""
 
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="offline", cwd=tmp_path))
     # Seed one outstanding tool call so ``pending_requests()`` returns it
     # even though no turn task is running — this is the scenario the fix
     # closes: _require_idle passes, require_mutable must not.
@@ -5701,6 +5732,118 @@ async def test_resume_missing_session_structured_error(tmp_path: Path) -> None:
         await _close(server, writer)
 
 @pytest.mark.asyncio
+async def test_model_selection_respects_unknown_account_fence(
+    tmp_path: Path,
+) -> None:
+    from tests.support.credentials import named_account_credentials
+    from tests.support.server_backend import ServerFakeBackend
+    from zeta.accounts import AccountError
+    from zeta.oauth import OAuthTokens
+    from zeta.server import model_selection
+
+    token = OAuthTokens("access", "refresh", 9_999_999_999.0)
+    await asyncio.to_thread(named_account_credentials(tmp_path, "codex").save, token)
+    await asyncio.to_thread(
+        named_account_credentials(tmp_path, "anthropic").save, token
+    )
+    builds: list[tuple[str, str]] = []
+
+    def backend_factory(provider, model, _home):
+        builds.append((provider, model))
+        return ServerFakeBackend(model=model), model
+
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="codex",
+        model="gpt-5.4",
+        backend_factory=backend_factory,
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        runtime = server.runtime
+        context = runtime.loop.account_context
+        await asyncio.to_thread(
+            runtime.manager.record_session_settings,
+            runtime.metadata,
+            model="claude-sonnet-4-6",
+            approval_mode="ask",
+            budget=runtime.metadata.compaction_budget,
+            provider="claude",
+        )
+        assert runtime.metadata.provider == "claude"
+        assert context.active_provider == "codex"
+        context._account_state_unknown = True
+        before = len(builds)
+
+        with pytest.raises(AccountError, match="state is unknown"):
+            await model_selection.apply(
+                runtime, "claude-sonnet-4-6", "ask"
+            )
+
+        assert len(builds) == before
+        assert context.account_state_unknown
+        assert runtime.metadata.provider == "claude"
+        assert context.active_provider == "codex"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_model_selection_uses_account_transition(
+    tmp_path: Path,
+) -> None:
+    from tests.support.credentials import named_account_credentials
+    from tests.support.server_backend import ServerFakeBackend
+    from zeta.oauth import OAuthTokens
+
+    token = OAuthTokens("access", "refresh", 9_999_999_999.0)
+    await asyncio.to_thread(named_account_credentials(tmp_path, "codex").save, token)
+    await asyncio.to_thread(
+        named_account_credentials(tmp_path, "anthropic").save, token
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="codex",
+        model="gpt-5.4",
+        backend_factory=lambda _p, m, _h: (ServerFakeBackend(model=m), m),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        runtime = server.runtime
+        persisted_before = await asyncio.to_thread(
+            runtime.manager.read_metadata, runtime.session_id
+        )
+        assert runtime.metadata.to_storage_dict() == persisted_before.to_storage_dict()
+        response = await _request(
+            reader,
+            writer,
+            3,
+            "set_settings",
+            {
+                "session_id": runtime.session_id,
+                "model": "claude-sonnet-4-6",
+                "approval_mode": "ask",
+            },
+        )
+
+        assert response[-1]["result"]["model"] == "claude-sonnet-4-6"
+        assert runtime.metadata.provider == "claude"
+        assert runtime.loop.account_context.active_provider == "anthropic"
+        persisted = await asyncio.to_thread(
+            runtime.manager.read_metadata, runtime.session_id
+        )
+        assert persisted.to_dict() == runtime.metadata.to_dict()
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_cross_provider_model_change_updates_account_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5728,15 +5871,19 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
         runtime = server.runtime
-        await asyncio.to_thread(
-            runtime.loop.account_context.switch,
+        await runtime.loop.account_context.switch_active(
+            runtime.loop,
             AccountId("codex", "default"),
             boundary=0,
+            provider=runtime.metadata.provider,
+            build_backend=lambda _account: None,
         )
-        await asyncio.to_thread(
-            runtime.loop.account_context.switch,
+        await runtime.loop.account_context.switch_active(
+            runtime.loop,
             AccountId("anthropic", "default"),
             boundary=0,
+            provider=runtime.metadata.provider,
+            build_backend=lambda _account: None,
         )
         native = Message(
             MessageRole.ASSISTANT,
@@ -5745,16 +5892,14 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         )
         runtime.loop.store.append_message(native)
 
-        await asyncio.to_thread(
-            model_selection.apply, runtime, "claude-sonnet-4-6", "ask"
-        )
+        await model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
         assert runtime.loop.account_context.active_provider == "anthropic"
         assert runtime.loop.account_context.switch_sequence == 1
         assert runtime.loop._account_safe_context([native])[0].content == [
             ThinkingContent("codex"),
             TextContent("answer"),
         ]
-        await asyncio.to_thread(model_selection.apply, runtime, "gpt-5.4", "ask")
+        await model_selection.apply(runtime, "gpt-5.4", "ask")
         assert runtime.loop.account_context.active_provider == "codex"
         assert runtime.loop.account_context.switch_sequence == 1
         assert runtime.loop._account_safe_context([native])[0].content == native.content
@@ -5766,13 +5911,11 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         )
         monkeypatch.setattr(
             runtime.manager,
-            "record_session_settings",
+            "_write_unlocked",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
         )
-        with pytest.raises(OSError, match="write failed"):
-            await asyncio.to_thread(
-                model_selection.apply, runtime, "claude-sonnet-4-6", "ask"
-            )
+        with pytest.raises(OSError, match="settings were not persisted"):
+            await model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
         assert (
             runtime.loop.backend,
             runtime.loop.account_context.active_provider,
@@ -5780,3 +5923,297 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         ) == previous
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    client = object.__new__(_Client)
+    client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    async def ignore_stale_approvals(_session_id: str | None) -> None:
+        return None
+
+    client._notify = notify
+    client._end_stale_approvals = ignore_stale_approvals
+    limit_data = {
+        "account": "codex:first",
+        "resets_at": "2026-10-27T18:31:48Z",
+        "reset_local": "oct 27 18:31 pdt",
+        "window_minutes": 10080,
+        "action": "switch",
+        "alternative": "codex:second",
+    }
+    await client._event(
+        StreamEvent(StreamEventType.ACCOUNT_LIMIT, data=limit_data),
+        session_id="session",
+    )
+    assert notifications == [("account_limit", {"data": limit_data})]
+
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        response = (
+            await _request(
+                reader,
+                writer,
+                "accounts-switch",
+                "account_switch",
+                {"session_id": sid, "account": "codex:second"},
+            )
+        )[-1]["result"]
+        assert response == {
+            "account": "codex:second",
+            "replay": False,
+            "account_state": "ready",
+        }
+        assert (
+            await asyncio.to_thread(
+                server.runtime.loop.account_context.resolve, "codex"
+            )
+            == second
+        )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_account_switch_does_not_block_loop_while_registry_lock_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    locked = threading.Event()
+    release = threading.Event()
+    waiting = threading.Event()
+
+    def hold_registry_lock() -> None:
+        store = AccountStore(home)
+        with store._home() as home_fd, store._registry_guard(home_fd):
+            locked.set()
+            assert release.wait(5)
+
+    holder = threading.Thread(target=hold_registry_lock)
+    holder.start()
+    assert await asyncio.to_thread(locked.wait, 1)
+    original_registry_guard = AccountStore._registry_guard
+
+    @contextmanager
+    def observed_registry_guard(store, home_fd):
+        waiting.set()
+        with original_registry_guard(store, home_fd):
+            yield
+
+    monkeypatch.setattr(AccountStore, "_registry_guard", observed_registry_guard)
+    ticks = 0
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+
+    ticker_task = asyncio.create_task(ticker())
+    request_task = asyncio.create_task(
+        _request(
+            reader,
+            writer,
+            "accounts-switch-locked",
+            "account_switch",
+            {"session_id": sid, "account": str(second)},
+        )
+    )
+    try:
+        assert await asyncio.to_thread(waiting.wait, 1)
+        for _ in range(3):
+            await asyncio.sleep(0.01)
+        assert ticks > 1
+        release.set()
+        response = await asyncio.wait_for(request_task, 5)
+        assert response[-1]["result"] == {
+            "account": str(second),
+            "replay": False,
+            "account_state": "ready",
+        }
+    finally:
+        release.set()
+        stop.set()
+        await ticker_task
+        if not request_task.done():
+            request_task.cancel()
+        holder.join(timeout=1)
+        await _close(server, writer)
+
+
+def _serve_switch_rename_race(home_value: str, results: object) -> None:
+    home = Path(home_value)
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        named_account_credentials(home, account.provider, account.name).save(
+            OAuthTokens(account.name, "refresh", 9_999_999_999)
+        )
+    AccountStore(home).set_default(first)
+
+    async def run() -> None:
+        server = ZetaServer(home=home, cwd=home, port=0, provider="codex")
+        reader, writer, sid = await _ready_extensions(server)
+        assert server._client is not None and server.runtime.loop is not None
+        first_client = server._client
+        second_client = _Client(server, asyncio.StreamReader(), writer)
+        original_commit = account_session_module.SessionAccountContext._commit_locked
+        event_loop = asyncio.get_running_loop()
+        rename_tasks: list[asyncio.Task[object]] = []
+
+        def commit_then_queue_rename(
+            self: object, state: object, directory_fd: int
+        ):
+            metadata = original_commit(self, state, directory_fd)
+
+            def start_rename() -> None:
+                rename_tasks.append(
+                    asyncio.create_task(
+                        second_client._ergonomics(
+                            "rename_session",
+                            {"session_id": sid, "name": "renamed during switch"},
+                        )
+                    )
+                )
+
+            event_loop.call_soon_threadsafe(start_rename)
+            return metadata
+
+        account_session_module.SessionAccountContext._commit_locked = (  # type: ignore[method-assign]
+            commit_then_queue_rename
+        )
+        try:
+            response = await _request(
+                reader,
+                writer,
+                "switch-racing-rename",
+                "account_switch",
+                {"session_id": sid, "account": str(second)},
+            )
+            assert response[-1]["result"]["account"] == str(second)
+            assert rename_tasks
+            await rename_tasks[0]
+            assert server.runtime.metadata.name == "renamed during switch"
+        finally:
+            account_session_module.SessionAccountContext._commit_locked = (  # type: ignore[method-assign]
+                original_commit
+            )
+            await first_client.close()
+            await server.close()
+
+    try:
+        asyncio.run(run())
+    except BaseException as exc:  # noqa: BLE001 - report child failure to parent
+        results.put(repr(exc))
+    else:
+        results.put(None)
+
+
+def test_serve_switch_and_second_client_rename_do_not_deadlock(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    process = context.Process(
+        target=_serve_switch_rename_race,
+        args=(str(tmp_path / "race-home"), results),
+    )
+    process.start()
+    process.join(timeout=5)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1)
+        pytest.fail("serve switch and second-client rename deadlocked")
+    assert process.exitcode == 0
+    assert results.get(timeout=1) is None
+
+
+@pytest.mark.asyncio
+async def test_serve_shutdown_with_switch_lock_held_exits_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    monkeypatch.setattr(
+        account_session_module, "ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS", 0.05
+    )
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    assert server.runtime.opened is not None
+    manager = server.runtime.manager
+    lock_held = threading.Event()
+    commit_entered = threading.Event()
+    release = threading.Event()
+    metadata_lock = manager._metadata_lock
+
+    def hold_metadata_lock() -> None:
+        with metadata_lock(server.runtime.opened.metadata.session_id):
+            lock_held.set()
+            assert release.wait(5)
+
+    holder = threading.Thread(target=hold_metadata_lock)
+    holder.start()
+    assert await asyncio.to_thread(lock_held.wait, 1)
+
+    @contextmanager
+    def observed_metadata_lock(*args: object, **kwargs: object):
+        commit_entered.set()
+        with metadata_lock(*args, **kwargs) as directory_fd:
+            yield directory_fd
+
+    monkeypatch.setattr(manager, "_metadata_lock", observed_metadata_lock)
+    request_task = asyncio.create_task(
+        _request(
+            reader,
+            writer,
+            "accounts-switch-shutdown",
+            "account_switch",
+            {"session_id": sid, "account": str(second)},
+        )
+    )
+    try:
+        assert await asyncio.to_thread(commit_entered.wait, 1)
+        client = server._client
+        assert client is not None and client._account_switch_task is not None
+        await asyncio.wait_for(server.close(), 1)
+        assert client._account_switch_task is None
+    finally:
+        release.set()
+        holder.join(timeout=1)
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.gather(request_task, return_exceptions=True)

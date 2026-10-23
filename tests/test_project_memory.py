@@ -1,3 +1,4 @@
+import asyncio
 import errno
 import json
 import logging
@@ -489,7 +490,7 @@ def _nested_spawn_turns() -> list[ScriptedTurn]:
 
 
 async def _run_root_with_child_and_grandchild(manager: SessionManager, repository: Path):
-    opened = manager.create(provider="codex", model="fake", cwd=repository)
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="fake", cwd=repository))
     loop = AgentLoop(
         FakeBackend(_nested_spawn_turns()),
         opened.store,
@@ -549,7 +550,7 @@ async def test_child_lineage_reconciled_after_registry_failure(
     )
 
     manager = SessionManager(home)
-    opened = manager.create(provider="codex", model="fake", cwd=repository)
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="fake", cwd=repository))
     root_id = opened.metadata.session_id
 
     # Inject a registry-append failure for the child lineage records: the
@@ -1468,7 +1469,7 @@ async def test_child_with_explicit_cwd_records_lineage_to_root_project(
     child_project = registry.create_project("child", "child scope", child_repository)
 
     manager = SessionManager(home)
-    opened = manager.create(provider="codex", model="fake", cwd=root_repository)
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="fake", cwd=root_repository))
     root_id = opened.metadata.session_id
     turns = [
         ScriptedTurn(
