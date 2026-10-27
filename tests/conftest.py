@@ -393,6 +393,8 @@ def isolate_zeta_home(
 
 _FD_GROWTH: list[tuple[int, str]] = []
 _FD_BREACHES: list[str] = []
+# Leave 25% of FD_SETSIZE free for pytest, xdist, and a test's active work.
+_FD_HIGH_WATER = 768
 _FD_MAX = -1
 _FD_OPEN_MAX = 0
 
@@ -460,7 +462,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
         details = ", ".join(f"fd {fd}: {after[fd]}" for fd in retained)
         print(f"fd-retained nodeid={item.nodeid} {details}", flush=True)
     highest = max(after, default=-1)
-    if highest >= 512:
+    if highest >= _FD_HIGH_WATER:
         breach = (
             f"{item.nodeid} reached fd {highest}; retained descriptors: "
             f"{details if retained else 'none added by this test'}"
