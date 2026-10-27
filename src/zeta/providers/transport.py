@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from email.utils import parsedate_to_datetime
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import httpx
 
@@ -86,6 +87,83 @@ def stall_retry_kwargs(stall_retries: int) -> dict[str, object]:
         "stall_notice": lambda n, d, _e: stall_retry_notice(n, d, stall_retries),
         "max_stall_retries": stall_retries,
     }
+
+
+class SSEEventAccumulator[ErrorT: RuntimeError]:
+    """Accumulate one JSON SSE event while preserving provider error types."""
+
+    __slots__ = ("data", "error_type", "event", "provider")
+
+    def __init__(self, provider: str, error_type: type[ErrorT]) -> None:
+        self.provider = provider
+        self.error_type = error_type
+        self.event = "message"
+        self.data: list[str] = []
+
+    def feed(self, line: str) -> tuple[str, dict[str, Any]] | None:
+        if not line:
+            return self.finish()
+        if line.startswith(":"):
+            return None
+        field, _, value = line.partition(":")
+        value = value.removeprefix(" ")
+        if field == "event":
+            self.event = value
+        elif field == "data":
+            self.data.append(value)
+        return None
+
+    def finish(self) -> tuple[str, dict[str, Any]] | None:
+        if not self.data:
+            self.event = "message"
+            return None
+        event = self.event
+        value = "\n".join(self.data)
+        self.event = "message"
+        self.data = []
+        if value == "[DONE]":
+            return event, {"type": "done"}
+        try:
+            payload = json.loads(value)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise self.error_type(f"{self.provider} returned invalid SSE JSON") from exc
+        if not isinstance(payload, dict):
+            raise self.error_type(f"{self.provider} SSE payload is not an object")
+        return event, payload
+
+
+class HTTPClientLease:
+    """Provide one configured-or-owned client and close owned refresh clients."""
+
+    __slots__ = ("client", "owned")
+
+    def __init__(self, configured: httpx.AsyncClient | None) -> None:
+        self.owned = configured is None
+        self.client = configured or httpx.AsyncClient(timeout=None)
+
+    async def refresh(
+        self, refresh_token: Callable[[httpx.AsyncClient], Awaitable[str]]
+    ) -> str:
+        try:
+            return await refresh_token(self.client)
+        finally:
+            if self.owned:
+                await close_resource(self.client)
+
+
+async def build_response_error[ErrorT: RuntimeError](
+    response: httpx.Response,
+    build: Callable[[int, bytes, Mapping[str, str]], ErrorT],
+    limit: int = 8192,
+) -> ErrorT:
+    """Build a provider error from a bounded streaming response body."""
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body.extend(chunk[: limit - len(body)])
+        if len(body) >= limit:
+            break
+    return build(response.status_code, bytes(body), response.headers)
 
 
 class StreamFinished:

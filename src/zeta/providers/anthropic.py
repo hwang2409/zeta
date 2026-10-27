@@ -36,7 +36,10 @@ from .stream_errors import decode_stream_error
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
+    HTTPClientLease,
+    SSEEventAccumulator,
     StreamFinished,
+    build_response_error,
     cleanup_transport,
     close_resource,
     is_control_exception,
@@ -378,46 +381,6 @@ class _BlockState:
     redacted_data: str = ""
 
 
-class _SSEDecoder:
-    def __init__(self) -> None:
-        self.event = "message"
-        self.data: list[str] = []
-
-    def feed(self, line: str) -> tuple[str, dict[str, Any]] | None:
-        if not line:
-            return self._finish()
-        if line.startswith(":"):
-            return None
-        field, _, value = line.partition(":")
-        value = value[1:] if value.startswith(" ") else value
-        if field == "event":
-            self.event = value
-        elif field == "data":
-            self.data.append(value)
-        return None
-
-    def finish(self) -> tuple[str, dict[str, Any]] | None:
-        return self._finish()
-
-    def _finish(self) -> tuple[str, dict[str, Any]] | None:
-        if not self.data:
-            self.event = "message"
-            return None
-        event = self.event
-        value = "\n".join(self.data)
-        self.event = "message"
-        self.data = []
-        if value == "[DONE]":
-            return event, {"type": "done"}
-        try:
-            payload = json.loads(value)
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise AnthropicStreamError("Anthropic returned invalid SSE JSON") from exc
-        if not isinstance(payload, dict):
-            raise AnthropicStreamError("Anthropic SSE payload is not an object")
-        return event, payload
-
-
 def _default_diagnostics_path(token_store: AnthropicCredential) -> Path:
     """Reuse the OAuth store's home directory; a static key has no home of its own."""
 
@@ -494,12 +457,7 @@ class AnthropicBackend(CompletionBackend):
             await close_resource(attempts)
 
     async def _refresh_token(self) -> str:
-        client = self.client or httpx.AsyncClient(timeout=None)
-        try:
-            return await self.token_store.refresh_token(client)
-        finally:
-            if self.client is None:
-                await close_resource(client)
+        return await HTTPClientLease(self.client).refresh(self.token_store.refresh_token)
 
     async def _complete_once(
         self,
@@ -508,7 +466,8 @@ class AnthropicBackend(CompletionBackend):
         *,
         token: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        client = self.client or httpx.AsyncClient(timeout=None)
+        lease = HTTPClientLease(self.client)
+        client = lease.client
         stream_context = None
         entered = False
         primary_exception: BaseException | None = None
@@ -556,8 +515,7 @@ class AnthropicBackend(CompletionBackend):
             entered = True
             try:
                 if response.status_code >= 400:
-                    body = await _read_error_body(response)
-                    raise _http_error(response.status_code, body, response.headers)
+                    raise await build_response_error(response, _http_error)
                 async for event in _decode_response(
                     response,
                     diagnostics_path=self.diagnostics_path,
@@ -585,7 +543,7 @@ class AnthropicBackend(CompletionBackend):
                 stream_context=stream_context,
                 entered=entered,
                 client=client,
-                owns_client=self.client is None,
+                owns_client=lease.owned,
                 primary_exception=primary_exception,
                 http_error_type=AnthropicHTTPError,
             )
@@ -600,15 +558,6 @@ class AnthropicBackend(CompletionBackend):
         )
 
 
-async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes:
-    body = bytearray()
-    async for chunk in response.aiter_bytes():
-        body.extend(chunk[: limit - len(body)])
-        if len(body) >= limit:
-            break
-    return bytes(body)
-
-
 async def _decode_response(
     response: httpx.Response,
     *,
@@ -617,7 +566,7 @@ async def _decode_response(
     stream_started_at: float | None = None,
     stall_seconds: float = 0.0,
 ) -> AsyncIterator[StreamEvent]:
-    decoder = _SSEDecoder()
+    decoder = SSEEventAccumulator("Anthropic", AnthropicStreamError)
     blocks: dict[int, _BlockState] = {}
     active_blocks: set[int] = set()
     stopped_blocks: set[int] = set()

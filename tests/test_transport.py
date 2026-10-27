@@ -21,9 +21,30 @@ from zeta.providers.codex_errors import CodexHTTPError
 from zeta.providers.ollama import OllamaError
 from zeta.providers.retry_policy import ProviderRetryBudget, retryable_provider_error
 from zeta.providers.transport import (
+    build_response_error,
     close_transport_resources,
     retry_provider_completion,
 )
+
+
+@pytest.mark.asyncio
+async def test_response_error_body_is_bounded_and_keeps_response_metadata() -> None:
+    request = httpx.Request("POST", "https://test.invalid")
+    response = httpx.Response(
+        503,
+        headers={"retry-after": "2"},
+        content=b"x" * 9000,
+        request=request,
+    )
+
+    error = await build_response_error(
+        response,
+        lambda status, body, headers: RuntimeError(
+            f"{status}:{len(body)}:{headers['retry-after']}"
+        ),
+    )
+
+    assert str(error) == "503:8192:2"
 
 
 @pytest.mark.asyncio
