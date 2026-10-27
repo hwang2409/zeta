@@ -1062,14 +1062,6 @@ def _tool_calls(messages: Sequence[Message]) -> dict[str, ToolCall]:
     }
 
 
-def _tool_results(messages: Sequence[Message]) -> dict[str, ToolResult]:
-    return {
-        result.tool_call_id: result
-        for message in messages
-        if (result := message.tool_result) is not None
-    }
-
-
 def _call_indexes(messages: Sequence[Message]) -> dict[str, int]:
     return {
         block.tool_call.id: index

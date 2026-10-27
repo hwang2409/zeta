@@ -17,6 +17,43 @@ SUPPORTED_IMAGE_MEDIA_TYPES = frozenset(
 )
 ImageValidation = Literal["valid", "incomplete", "invalid"]
 IMAGE_DEGRADATION_WARNING = "[image block unavailable: invalid stored image data]"
+_MAX_JPEG_HEADER_SCAN = 8 * 1024 * 1024
+
+
+def jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Find a JPEG SOF marker without decoding pixels, within a bounded prefix."""
+
+    data = data[:_MAX_JPEG_HEADER_SCAN]
+    if len(data) < 2 or data[:2] != b"\xff\xd8":
+        return None
+    offset = 2
+    while offset < len(data):
+        if data[offset] != 0xFF:
+            return None
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return None
+        marker = data[offset]
+        offset += 1
+        if marker == 0xDA or marker == 0xD9:
+            return None
+        if marker == 0x00 or marker == 0xD8 or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(data):
+            return None
+        segment_size = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_size < 2 or offset + segment_size > len(data):
+            return None
+        if (0xC0 <= marker <= 0xC3 or 0xC5 <= marker <= 0xC7
+                or 0xC9 <= marker <= 0xCB or 0xCD <= marker <= 0xCF):
+            if segment_size < 7:
+                return None
+            height = int.from_bytes(data[offset + 3 : offset + 5], "big")
+            width = int.from_bytes(data[offset + 5 : offset + 7], "big")
+            return (width, height) if width and height else None
+        offset += segment_size
+    return None
 
 
 def detect_image_media_type(data: bytes, *, complete: bool = False) -> str | None:
