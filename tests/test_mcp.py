@@ -8,6 +8,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -50,6 +51,7 @@ from zeta.tools import ToolRegistry
 from zeta.tools._spill import SpillStore
 
 mount_module = importlib.import_module("zeta.mcp.mount")
+server_actor_module = importlib.import_module("zeta.mcp.server_actor")
 connection_module = importlib.import_module("zeta.mcp.connection")
 
 
@@ -2172,6 +2174,12 @@ async def test_degraded_calls_use_bounded_auto_remount_backoff(
         return _FakeClient(config, fail_connect=True)
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        server_actor_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock.now),
+    )
     monkeypatch.setattr(mount_module, "AUTO_RECONNECT_BASE_DELAY_SECONDS", 0.05)
     monkeypatch.setattr(mount_module, "AUTO_RECONNECT_MAX_DELAY_SECONDS", 0.1)
     registry = ToolRegistry(
@@ -2182,7 +2190,6 @@ async def test_degraded_calls_use_bounded_auto_remount_backoff(
         MCPConfig(tmp_path / "mcp.json", {"retry": initial.config}),
     )
     initial.fail_transport("server exited")
-    await asyncio.sleep(0)
 
     first = await registry.execute(ToolCall("first", "retry__echo", {}))
     second = await registry.execute(ToolCall("second", "retry__echo", {}))
@@ -2193,7 +2200,7 @@ async def test_degraded_calls_use_bounded_auto_remount_backoff(
     assert mount.statuses["retry"].next_retry_at is not None
     assert "Use /mcp reconnect retry." in second["content"][0]["text"]
 
-    await asyncio.sleep(0.06)
+    clock.now = mount.statuses["retry"].next_retry_at
     await registry.execute(ToolCall("third", "retry__echo", {}))
     assert attempts == 3
     await mount.close()
