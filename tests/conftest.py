@@ -438,9 +438,10 @@ def _open_file_descriptors() -> dict[int, str]:
     return {}
 
 
-@pytest.fixture(autouse=True)
-def no_retained_file_descriptors(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+@pytest.hookimpl(hookwrapper=True, trylast=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     """Report retained fds and stop workers before they approach FD_SETSIZE."""
+    del nextitem
     global _FD_MAX, _FD_OPEN_MAX
     # Stable pytest/xdist descriptors and session fixtures predate this snapshot.
     before = _open_file_descriptors()
@@ -451,28 +452,44 @@ def no_retained_file_descriptors(request: pytest.FixtureRequest) -> Generator[No
     _FD_MAX = max((_FD_MAX, *after), default=-1)
     _FD_OPEN_MAX = max(_FD_OPEN_MAX, len(after))
     retained = sorted(after.keys() - before.keys())
-    _FD_GROWTH.append((len(retained), request.node.nodeid))
+    _FD_GROWTH.append((len(retained), item.nodeid))
     if retained:
         details = ", ".join(f"fd {fd}: {after[fd]}" for fd in retained)
-        print(f"fd-retained nodeid={request.node.nodeid} {details}", flush=True)
+        print(f"fd-retained nodeid={item.nodeid} {details}", flush=True)
     highest = max(after, default=-1)
     if highest >= 512:
         pytest.fail(
-            f"{request.node.nodeid} reached fd {highest}; retained descriptors: "
+            f"{item.nodeid} reached fd {highest}; retained descriptors: "
             f"{details if retained else 'none added by this test'}"
         )
 
 
-def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    del session, exitstatus
+def _fd_summary() -> str:
     worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
     top = sorted(_FD_GROWTH, reverse=True)[:5]
     offenders = "; ".join(f"{nodeid} (+{count})" for count, nodeid in top)
-    print(
+    return (
         f"fd-summary worker={worker} max_fd={_FD_MAX} max_open={_FD_OPEN_MAX} "
-        f"top_retained=[{offenders}]",
-        flush=True,
+        f"top_retained=[{offenders}]"
     )
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    del exitstatus
+    summary = _fd_summary()
+    worker_output = getattr(session.config, "workeroutput", None)
+    if worker_output is not None:
+        worker_output["fd_summary"] = summary
+    elif _FD_MAX >= 0:
+        print(summary, flush=True)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error) -> None:
+    del error
+    summary = node.workeroutput.get("fd_summary")
+    if summary is not None:
+        print(summary, flush=True)
 
 
 @pytest.fixture(autouse=True)
