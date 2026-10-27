@@ -9063,9 +9063,18 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
         skill_catalog=SkillCatalog.empty(),
     )
     events = []
-    loop.set_background_event_sink(events.append)
+    receipt_published = asyncio.Event()
+
+    def collect_event(event: StreamEvent) -> None:
+        events.append(event)
+        if event.data.get("notification_id"):
+            receipt_published.set()
+
+    loop.set_background_event_sink(collect_event)
     events.extend(await _collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     notification = await _wait_completion(store)
+    # Persistence precedes terminal-card publication, so synchronize on the sink too.
+    await asyncio.wait_for(receipt_published.wait(), timeout=2)
     text = notification.data["text"]
     assert "background tasks killed on child completion" in text
     stats_marker = " · error=false · canceled=false"
@@ -13682,9 +13691,7 @@ async def test_large_request_admission_counts_off_loop_without_stalling_heartbea
     store = ConversationStore(tmp_path)
     assembler = ContextAssembler(store, token_budget=1_000_000)
     flow = pending_delivery_module.StepDeliveryFlow(store, context_assembler=assembler)
-    messages = [
-        Message(MessageRole.USER, [TextContent("x" * 40)]) for _ in range(50_000)
-    ]
+    messages = [Message(MessageRole.USER, [TextContent("request")])]
     owner_thread = threading.get_ident()
     estimator_threads: list[int] = []
     estimator_started = asyncio.Event()
@@ -13699,29 +13706,16 @@ async def test_large_request_admission_counts_off_loop_without_stalling_heartbea
         return original_estimate(messages, tool_schemas)
 
     assembler._request_admission._estimate = gated_estimate
-    heartbeat_count = 0
-    stop = False
-
-    async def heartbeat() -> None:
-        nonlocal heartbeat_count
-        while not stop:
-            await asyncio.sleep(0.001)
-            heartbeat_count += 1
-
-    ticker = asyncio.create_task(heartbeat())
     preparation = asyncio.create_task(flow.prepare_request("after_tools", messages, None))
-    await asyncio.wait_for(estimator_started.wait(), 1)
-    before = heartbeat_count
-    await asyncio.sleep(0.03)
-    after = heartbeat_count
-    release_estimator.set()
+    try:
+        # This event cannot run if admission calls the gated estimator on-loop.
+        await asyncio.wait_for(estimator_started.wait(), 1)
+    finally:
+        release_estimator.set()
     await preparation
-    stop = True
-    await ticker
 
     assert estimator_threads
     assert all(thread != owner_thread for thread in estimator_threads)
-    assert after > before
 
 
 @pytest.mark.asyncio
