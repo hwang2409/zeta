@@ -5592,6 +5592,7 @@ def test_finished_agent_card_keeps_elapsed_time_after_clock_moves(
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert "5.0s" in rendered
     assert "105.0s" not in rendered
+    child.close()
 
 
 def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
@@ -6611,6 +6612,8 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
         line.strip() for line in Text.from_ansi(output.getvalue()).plain.splitlines()
     )
     assert "✱ thought · 0.2s\nplan" in rendered
+    monkeypatch.undo()
+    asyncio.run(app.close())
 
 
 def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:

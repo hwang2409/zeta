@@ -22,13 +22,21 @@ import pytest
 from rich.console import Console
 
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
+_IS_REPOSITORY_TESTS = (_TEST_SITE_PACKAGES.parent / "pyproject.toml").is_file()
 
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if not _IS_REPOSITORY_TESTS or not config.pluginmanager.hasplugin("asyncio"):
+        return
     for item in items:
-        if item.path.resolve().is_relative_to(_TEST_SITE_PACKAGES):
+        path = item.path.resolve()
+        # These modules patch process-wide clock/config during fixture teardown.
+        if path.is_relative_to(_TEST_SITE_PACKAGES) and path.name not in {
+            "test_test_environment.py",
+            "test_tui.py",
+        }:
             item.fixturenames.append("close_direct_test_runtime_owners")
 
 
