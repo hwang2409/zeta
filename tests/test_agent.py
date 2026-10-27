@@ -12679,6 +12679,45 @@ async def test_agent_cancel_propagates_caller_cancellation(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_question_close_ignores_a_sibling_finishing_delivery_cleanup(
+    tmp_path: Path,
+) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    first_child = ConversationStore(tmp_path / "first-child")
+    second_child = ConversationStore(tmp_path / "second-child")
+    owner = BackgroundAgentOwner(parent)
+    channel = owner.conversation_channel
+    flows = {
+        None: pending_delivery_module.StepDeliveryFlow(parent),
+        "root:1": pending_delivery_module.StepDeliveryFlow(first_child),
+        "root:2": pending_delivery_module.StepDeliveryFlow(second_child),
+    }
+    for target_id, flow in flows.items():
+        channel.register_delivery_flow(target_id, flow)
+    owner.track_store(first_child)
+    owner.track_store(second_child)
+
+    cleanup_gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    channel._delivery_targets["root:1"].accepted.add(cleanup_gate)
+    cleanup_started = asyncio.Event()
+
+    async def unregister_first_child() -> None:
+        cleanup_started.set()
+        await channel.unregister_delivery_flow("root:1")
+
+    cleanup = asyncio.create_task(unregister_first_child())
+    await cleanup_started.wait()
+    try:
+        assert await channel.close_questions("root:2", reason="finished") == 0
+    finally:
+        cleanup_gate.set_result(None)
+        await cleanup
+        parent.close()
+        first_child.close()
+        second_child.close()
+
+
+@pytest.mark.asyncio
 async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
     tmp_path: Path,
 ) -> None:

@@ -345,7 +345,11 @@ class ConversationChannel:
 
         closed = 0
         for store in self._owner.conversation_stores():
-            target_id = self._target_for_store(store)
+            try:
+                target_id = self._target_for_store(store)
+            except LookupError:
+                # A sibling cleanup removes its flow before releasing its store.
+                continue
             result = await self.produce_to(
                 target_id,
                 NotificationInput(
