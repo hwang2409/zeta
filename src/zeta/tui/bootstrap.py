@@ -587,7 +587,6 @@ def _create_app_with_root(
     _validate_keybindings(config.keybindings)
     startup_notices = (
         tuple(loaded_settings.notices)
-        + composition.settings_notices
         + project_context.notices
         + external_tools.notices
         + theme_notices

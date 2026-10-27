@@ -142,34 +142,6 @@ def _register_discovered_tools(registry: ToolRegistry) -> None:
             ) from exc
 
 
-def unknown_policy_selectors(
-    registry: ToolRegistry,
-    tool_allow: Sequence[str],
-    tool_deny: Sequence[str],
-    *approval_lists: Sequence[str],
-) -> tuple[str, ...]:
-    """Return exact configured selectors that name no registered built-in tool."""
-
-    registered = registry._tools
-    unknown: list[str] = []
-    for entries in (tool_allow, tool_deny):
-        for entry in entries:
-            selector = parse_tool_selector(entry)
-            # shortcut: MCP tools register later, so never flag their selectors.
-            if not selector.exact or "__" in selector.name:
-                continue
-            if selector.name not in registered and entry not in unknown:
-                unknown.append(entry)
-    for entries in approval_lists:
-        for entry in entries:
-            rule = parse_approval_rule(entry)
-            if "__" in rule.tool or rule.tool in registered:
-                continue
-            if rule.tool not in unknown:
-                unknown.append(rule.tool)
-    return tuple(unknown)
-
-
 def _validate_unique_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
     call_ids = [tool_call.id for tool_call in tool_calls]
     if len(call_ids) != len(set(call_ids)):

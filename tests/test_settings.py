@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from textwrap import dedent
 
@@ -19,9 +18,7 @@ from zeta.config.settings import (
 )
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
-from zeta.skills import SkillCatalog
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
-from zeta.tools.registry import ToolRegistry, unknown_policy_selectors
 
 
 def _capability(tool: str, arguments: dict[str, object]) -> ResolvedCapability:
@@ -311,55 +308,6 @@ def test_unknown_top_level_key_is_dropped_with_notice(tmp_path: Path) -> None:
     loaded = load_settings(home=home, project_dir=None)
     assert loaded.settings.provider == "claude"
     assert any("unknown" in notice for notice in loaded.notices)
-
-
-def test_stale_tools_selector_is_reported(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    _write(home, 'tools = ["automation"]\n')
-    loaded = load_settings(home=home)
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    try:
-        assert unknown_policy_selectors(
-            registry,
-            loaded.settings.tool_allow or (),
-            loaded.settings.tool_deny,
-            loaded.settings.approval_allow,
-            loaded.settings.approval_deny,
-            loaded.settings.approval_ask,
-        ) == ("automation",)
-    finally:
-        asyncio.run(registry.close())
-
-
-def test_stale_approval_selector_is_reported(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    _write(home, '[approval]\nallow = ["automation"]\n')
-    loaded = load_settings(home=home)
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    try:
-        assert unknown_policy_selectors(
-            registry,
-            loaded.settings.tool_allow or (),
-            loaded.settings.tool_deny,
-            loaded.settings.approval_allow,
-            loaded.settings.approval_deny,
-            loaded.settings.approval_ask,
-        ) == ("automation",)
-    finally:
-        asyncio.run(registry.close())
-
-
-def test_mcp_and_wildcard_selectors_are_not_reported(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    try:
-        assert unknown_policy_selectors(
-            registry,
-            ("remote__tool", "remote__*", "missing*"),
-            (),
-            ("remote__tool",),
-        ) == ()
-    finally:
-        asyncio.run(registry.close())
 
 
 def test_removed_automations_table_is_ignored(tmp_path: Path) -> None:

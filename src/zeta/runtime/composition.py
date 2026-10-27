@@ -26,7 +26,7 @@ from ..protocol.types import CompletionBackend, StreamEvent
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from ..tools._shared.user_discovery import ExternalToolDiscovery, apply_external_tools
-from ..tools.registry import ToolRegistry, unknown_policy_selectors
+from ..tools.registry import ToolRegistry
 from .loop import AgentLoop
 from .loop.skill_refresh import RuntimePrompt
 
@@ -63,7 +63,6 @@ class RuntimeComposition:
     external_tools: ExternalToolDiscovery
     budget_pinned: bool
     memory_reconciler: AutoMemoryReconciler | None = None
-    settings_notices: tuple[str, ...] = ()
 
 
 def compose_runtime(
@@ -350,17 +349,6 @@ def compose_runtime(
             allow_external_tools=config.allow_external_tools,
         )
         loop.tool_schemas = list(loop.tool_registry.schemas)
-        settings_notices = tuple(
-            f"settings · configured selector {selector!r} names no registered tool"
-            for selector in unknown_policy_selectors(
-                loop.tool_registry,
-                config.tool_allow or (),
-                config.tool_deny,
-                config.approval_allow,
-                config.approval_deny,
-                config.approval_ask,
-            )
-        )
         if background_event_sink is not None:
             loop.set_background_event_sink(background_event_sink)
         composition = RuntimeComposition(
@@ -371,7 +359,6 @@ def compose_runtime(
             external_tools=external_tools,
             budget_pinned=budget_pinned,
             memory_reconciler=memory_reconciler,
-            settings_notices=settings_notices,
         )
         cleanup.pop_all()
         return composition
