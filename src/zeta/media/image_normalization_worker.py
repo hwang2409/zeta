@@ -344,7 +344,7 @@ def _run(handle: BinaryIO, file_size: int, policy: ImagePolicy) -> dict[str, obj
     )
     if dimensions is None and media_type == "image/jpeg":
         handle.seek(0)
-        dimensions = jpeg_dimensions(handle.read(8 * 1024 * 1024))
+        dimensions = jpeg_dimensions(handle.read(min(file_size, 8 * 1024 * 1024)))
     if (
         media_type == "image/jpeg"
         and dimensions is not None
