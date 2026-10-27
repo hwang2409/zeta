@@ -120,7 +120,7 @@ async def test_watcher_registration_failure_leaves_no_process_zombie_or_fd(
         os.kill(child_pid, 0)
     with pytest.raises(ChildProcessError):
         await asyncio.to_thread(os.waitpid, child_pid, os.WNOHANG)
-    assert len(os.listdir("/dev/fd")) <= baseline_fds
+    assert len(os.listdir("/dev/fd")) == baseline_fds
 
 
 async def _assert_launcher_failure_is_reaped(
@@ -147,7 +147,7 @@ async def _assert_launcher_failure_is_reaped(
         os.killpg(child_pid, 0)
     with pytest.raises(ChildProcessError):
         await asyncio.to_thread(os.waitpid, child_pid, os.WNOHANG)
-    assert len(os.listdir("/dev/fd")) <= baseline_fds
+    assert len(os.listdir("/dev/fd")) == baseline_fds
 
 
 @pytest.mark.asyncio
