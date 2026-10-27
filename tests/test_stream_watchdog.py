@@ -54,6 +54,8 @@ from zeta.runtime.headless import drive_turn
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 
+pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
 ANTHROPIC_SSE = (
     'event: message_start\n'
     'data: {"type":"message_start","message":{"id":"msg-1","model":"claude-test",'

@@ -46,6 +46,8 @@ from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 
+pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
 
 def anthropic_request_bytes(
     messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]

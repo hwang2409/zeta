@@ -87,6 +87,8 @@ from zeta.tui.app import TUIApp
 from zeta.tui.render import render_approval_card, render_event
 from zeta.tui.todo import TodoWidget
 
+pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
 
 async def _collect(events):
     return [event async for event in events]
@@ -2284,24 +2286,78 @@ async def test_follow_up_wakes_worker_waiting_in_finish_gate(
     original_wait = channel.wait
 
     async def wait_for_follow_up(instance_id: str) -> None:
+        wait_task = asyncio.create_task(original_wait(instance_id))
+        await asyncio.sleep(0)
         waiting_for_follow_up.set()
-        await original_wait(instance_id)
+        await wait_task
 
     monkeypatch.setattr(channel, "wait", wait_for_follow_up)
-    backend.release_gate_turn.set()
-    await asyncio.wait_for(waiting_for_follow_up.wait(), timeout=10)
     child_handle = next(iter(store.agent_children()))
-    assert await send_to_run(
-        store,
-        child_handle,
-        "follow-up while waiting",
-        channel=channel,
-    ) is None
+    try:
+        backend.release_gate_turn.set()
+        await asyncio.wait_for(waiting_for_follow_up.wait(), timeout=10)
+        assert await send_to_run(
+            store,
+            child_handle,
+            "follow-up while waiting",
+            channel=channel,
+        ) is None
 
-    await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=10)
-    assert backend.follow_up_prompts == ["follow-up while waiting"]
-    await _wait_for_notification(store, "completed")
-    await loop.close()
+        await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=10)
+        assert backend.follow_up_prompts == ["follow-up while waiting"]
+        await _wait_for_notification(store, "completed")
+    finally:
+        channel.wake(child_handle)
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_follow_up_after_finish_gate_queue_check_is_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FollowUpFinishGateBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.gate_started.wait(), timeout=10)
+    channel = loop._background_owner.conversation_channel
+    child_handle = next(iter(store.agent_children()))
+    flow = channel._delivery_targets[child_handle].flow
+    original_admit_terminal = flow.admit_terminal
+    queue_checked = asyncio.Event()
+    release_queue_check = asyncio.Event()
+
+    async def pause_after_empty_queue(
+        intent: pending_delivery_module.TerminalIntent,
+    ) -> pending_delivery_module.TerminalResult:
+        result = await original_admit_terminal(intent)
+        if intent == "finish_gate_wait" and not result.pending:
+            queue_checked.set()
+            await release_queue_check.wait()
+        return result
+
+    monkeypatch.setattr(flow, "admit_terminal", pause_after_empty_queue)
+    try:
+        backend.release_gate_turn.set()
+        await asyncio.wait_for(queue_checked.wait(), timeout=10)
+        assert await send_to_run(
+            store,
+            child_handle,
+            "follow-up after queue check",
+            channel=channel,
+        ) is None
+        release_queue_check.set()
+
+        await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=10)
+        assert backend.follow_up_prompts == ["follow-up after queue check"]
+        await _wait_for_notification(store, "completed")
+    finally:
+        release_queue_check.set()
+        channel.wake(child_handle)
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
