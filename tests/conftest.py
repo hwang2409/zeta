@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import sys
+import threading
 import uuid
 from collections.abc import Generator
 from contextlib import ExitStack
@@ -12,6 +13,7 @@ from functools import wraps
 from hashlib import sha256
 from pathlib import Path
 from runpy import run_path
+from statistics import median
 from tempfile import TemporaryDirectory
 
 import httpx
@@ -397,6 +399,15 @@ _FD_BREACHES: list[str] = []
 _FD_HIGH_WATER = 768
 _FD_MAX = -1
 _FD_OPEN_MAX = 0
+_FD_RETAINED_COUNTS: list[int] = []
+_FD_CURRENT_NODE = "between-tests"
+_FD_PEAK_MAX = -1
+_FD_PEAK_OPEN = 0
+_FD_PEAK_NODE = "none"
+_FD_MONITOR_STOP: threading.Event | None = None
+_FD_MONITOR: threading.Thread | None = None
+_OS_LISTDIR = os.listdir
+_OS_FSTAT = os.fstat
 
 
 def _describe_fd(descriptor: int, directory: str) -> str:
@@ -428,14 +439,14 @@ def _describe_fd(descriptor: int, directory: str) -> str:
 def _open_file_descriptors() -> dict[int, str]:
     for directory in ("/proc/self/fd", "/dev/fd"):
         try:
-            names = os.listdir(directory)
+            names = _OS_LISTDIR(directory)
         except OSError:
             continue
         descriptors = {}
         for name in names:
             try:
                 descriptor = int(name)
-                os.fstat(descriptor)
+                _OS_FSTAT(descriptor)
             except (OSError, ValueError):
                 continue
             descriptors[descriptor] = _describe_fd(descriptor, directory)
@@ -443,19 +454,53 @@ def _open_file_descriptors() -> dict[int, str]:
     return {}
 
 
+def _fd_numbers() -> list[int]:
+    try:
+        return [int(name) for name in _OS_LISTDIR("/proc/self/fd")]
+    except (OSError, ValueError):
+        return []
+
+
+def _monitor_fd_peak(stop: threading.Event) -> None:
+    global _FD_PEAK_MAX, _FD_PEAK_OPEN, _FD_PEAK_NODE
+    while not stop.wait(0.02):
+        descriptors = _fd_numbers()
+        highest = max(descriptors, default=-1)
+        if highest > _FD_PEAK_MAX:
+            _FD_PEAK_MAX = highest
+            _FD_PEAK_OPEN = len(descriptors)
+            _FD_PEAK_NODE = _FD_CURRENT_NODE
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    global _FD_MONITOR_STOP, _FD_MONITOR
+    if sys.platform.startswith("linux") and hasattr(session.config, "workerinput"):
+        _FD_MONITOR_STOP = threading.Event()
+        _FD_MONITOR = threading.Thread(
+            target=_monitor_fd_peak,
+            args=(_FD_MONITOR_STOP,),
+            name="pytest-fd-peak",
+            daemon=True,
+        )
+        _FD_MONITOR.start()
+
+
 @pytest.hookimpl(hookwrapper=True, trylast=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     """Report retained fds and stop workers before they approach FD_SETSIZE."""
     del nextitem
-    global _FD_MAX, _FD_OPEN_MAX
+    global _FD_CURRENT_NODE, _FD_MAX, _FD_OPEN_MAX
     # Stable pytest/xdist descriptors and session fixtures predate this snapshot.
     before = _open_file_descriptors()
     _FD_MAX = max((_FD_MAX, *before), default=-1)
     _FD_OPEN_MAX = max(_FD_OPEN_MAX, len(before))
+    _FD_CURRENT_NODE = item.nodeid
     yield
+    _FD_CURRENT_NODE = "between-tests"
     after = _open_file_descriptors()
     _FD_MAX = max((_FD_MAX, *after), default=-1)
     _FD_OPEN_MAX = max(_FD_OPEN_MAX, len(after))
+    _FD_RETAINED_COUNTS.append(len(after))
     retained = sorted(after.keys() - before.keys())
     _FD_GROWTH.append((len(retained), item.nodeid))
     if retained:
@@ -476,14 +521,30 @@ def _fd_summary() -> str:
     top = sorted(_FD_GROWTH, reverse=True)[:5]
     offenders = "; ".join(f"{nodeid} (+{count})" for count, nodeid in top)
     breach = _FD_BREACHES[0] if _FD_BREACHES else "none"
+    if _FD_RETAINED_COUNTS:
+        quarter = max(1, len(_FD_RETAINED_COUNTS) // 4)
+        retained = (
+            f"start={_FD_RETAINED_COUNTS[0]} end={_FD_RETAINED_COUNTS[-1]} "
+            f"max={max(_FD_RETAINED_COUNTS)} "
+            f"q1_median={median(_FD_RETAINED_COUNTS[:quarter]):.1f} "
+            f"q4_median={median(_FD_RETAINED_COUNTS[-quarter:]):.1f}"
+        )
+    else:
+        retained = "start=0 end=0 max=0 q1_median=0.0 q4_median=0.0"
     return (
-        f"fd-summary worker={worker} max_fd={_FD_MAX} max_open={_FD_OPEN_MAX} "
+        f"fd-summary worker={worker} retained_open=[{retained}] "
+        f"retained_max_fd={_FD_MAX} active_peak_fd={_FD_PEAK_MAX} "
+        f"active_peak_open={_FD_PEAK_OPEN} active_peak_test={_FD_PEAK_NODE} "
         f"top_retained=[{offenders}] breach=[{breach}]"
     )
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
+    if _FD_MONITOR_STOP is not None:
+        _FD_MONITOR_STOP.set()
+    if _FD_MONITOR is not None:
+        _FD_MONITOR.join(timeout=1)
     summary = _fd_summary()
     if _FD_BREACHES:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
