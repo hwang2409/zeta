@@ -665,6 +665,7 @@ async def test_shift_tab_toggles_plan_mode() -> None:
     from zeta.tui.key_bindings import build_key_bindings
 
     toggles: list[str] = []
+    prompt_ready = asyncio.Event()
     toggle_seen = asyncio.Event()
 
     def on_plan_toggle() -> None:
@@ -682,8 +683,13 @@ async def test_shift_tab_toggles_plan_mode() -> None:
             ),
             multiline=True,
         )
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0)
+        def on_prompt_ready() -> None:
+            prompt_ready.set()
+
+        task = asyncio.create_task(
+            session.prompt_async(" > ", pre_run=on_prompt_ready)
+        )
+        await asyncio.wait_for(prompt_ready.wait(), timeout=5)
         pipe.send_text("\x1b[Z")  # shift+tab
         await asyncio.wait_for(toggle_seen.wait(), timeout=1)
         assert toggles == ["toggle"]
