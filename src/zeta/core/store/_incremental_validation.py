@@ -21,12 +21,15 @@ class IncrementalValidationMixin:
         self._active_approval_requests: dict[str, ConversationEntry] = {}
         self._active_approval_resolutions: dict[str, str] = {}
         self._active_tool_results: dict[str, ToolResult] = {}
+        self._notification_ids: set[str] = set()
         self._active_notifications: dict[str, ConversationEntry] = {}
         self._active_completion_notifications: dict[str, ConversationEntry] = {}
-        self._active_notification_acks: set[str] = set()
         self._active_notification_presentations: set[str] = set()
-        self._active_pending_prompts: set[str] = set()
-        self._active_pending_prompt_acks: set[str] = set()
+        self._pending_prompt_ids: set[str] = set()
+        self._active_pending_prompt_entries: dict[str, ConversationEntry] = {}
+        self._active_pending_prompt_messages: dict[str, Message] = {}
+        self._active_notification_delivery_message: Message | None = None
+        self._active_last_message: Message | None = None
 
     def _rebuild_incremental_validation_state(self) -> None:
         """Build O(1) integrity indexes after a complete validation pass."""
@@ -57,16 +60,25 @@ class IncrementalValidationMixin:
         staged._active_approval_requests = dict(self._active_approval_requests)
         staged._active_approval_resolutions = dict(self._active_approval_resolutions)
         staged._active_tool_results = dict(self._active_tool_results)
+        staged._notification_ids = set(self._notification_ids)
         staged._active_notifications = dict(self._active_notifications)
         staged._active_completion_notifications = dict(
             self._active_completion_notifications
         )
-        staged._active_notification_acks = set(self._active_notification_acks)
         staged._active_notification_presentations = set(
             self._active_notification_presentations
         )
-        staged._active_pending_prompts = set(self._active_pending_prompts)
-        staged._active_pending_prompt_acks = set(self._active_pending_prompt_acks)
+        staged._pending_prompt_ids = set(self._pending_prompt_ids)
+        staged._active_pending_prompt_entries = dict(
+            self._active_pending_prompt_entries
+        )
+        staged._active_pending_prompt_messages = dict(
+            self._active_pending_prompt_messages
+        )
+        staged._active_notification_delivery_message = (
+            self._active_notification_delivery_message
+        )
+        staged._active_last_message = self._active_last_message
         staged._task_notification_ids = set(self._task_notification_ids)
         for index, entry in enumerate(entries):
             # Large off-thread refreshes must release the GIL often enough for
@@ -81,16 +93,21 @@ class IncrementalValidationMixin:
         self._active_approval_requests = staged._active_approval_requests
         self._active_approval_resolutions = staged._active_approval_resolutions
         self._active_tool_results = staged._active_tool_results
+        self._notification_ids = staged._notification_ids
         self._active_notifications = staged._active_notifications
         self._active_completion_notifications = (
             staged._active_completion_notifications
         )
-        self._active_notification_acks = staged._active_notification_acks
         self._active_notification_presentations = (
             staged._active_notification_presentations
         )
-        self._active_pending_prompts = staged._active_pending_prompts
-        self._active_pending_prompt_acks = staged._active_pending_prompt_acks
+        self._pending_prompt_ids = staged._pending_prompt_ids
+        self._active_pending_prompt_entries = staged._active_pending_prompt_entries
+        self._active_pending_prompt_messages = staged._active_pending_prompt_messages
+        self._active_notification_delivery_message = (
+            staged._active_notification_delivery_message
+        )
+        self._active_last_message = staged._active_last_message
         self._task_notification_ids = staged._task_notification_ids
         # Publish entries last so readers never see rows without matching indexes.
         self._entries = staged._entries
@@ -133,19 +150,44 @@ class IncrementalValidationMixin:
                 self._task_notification_ids.add(task_id)
         return True
 
+    def _record_message_entry(self, entry: ConversationEntry) -> None:
+        message = Message.from_dict(entry.data["message"])
+        self._active_last_message = message
+        prompt_id = message.metadata.get("zeta.pending_prompt_id")
+        if type(prompt_id) is str:
+            self._active_pending_prompt_messages[prompt_id] = message
+        identity = message.metadata.get("zeta.step_delivery")
+        if isinstance(identity, dict) and identity.get("notification_ids"):
+            self._active_notification_delivery_message = message
+        tool_result = message.tool_result
+        if tool_result is not None:
+            self._active_tool_results[tool_result.tool_call_id] = tool_result
+        for request in entry.data.get("approval_requests", []):
+            request_id = request.get("request_id")
+            if type(request_id) is str and request_id:
+                if request_id in self._active_approval_requests:
+                    raise ConversationIntegrityError(
+                        f"duplicate approval request: {request_id}"
+                    )
+                self._active_approval_requests[request_id] = entry
+
+    def _record_notification_entry(self, entry: ConversationEntry) -> None:
+        self._notification_ids.add(entry.id)
+        self._active_notifications[entry.id] = entry
+        if (
+            entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
+            == AGENT_COMPLETION_NOTIFICATION_KIND
+            and type(child_id := entry.data.get("child_instance_id")) is str
+        ):
+            self._active_completion_notifications.setdefault(child_id, entry)
+
+    def _record_pending_prompt_entry(self, entry: ConversationEntry) -> None:
+        self._pending_prompt_ids.add(entry.id)
+        self._active_pending_prompt_entries[entry.id] = entry
+
     def _record_active_entry(self, entry: ConversationEntry) -> None:
         if entry.type == "message":
-            tool_result = Message.from_dict(entry.data["message"]).tool_result
-            if tool_result is not None:
-                self._active_tool_results[tool_result.tool_call_id] = tool_result
-            for request in entry.data.get("approval_requests", []):
-                request_id = request.get("request_id")
-                if type(request_id) is str and request_id:
-                    if request_id in self._active_approval_requests:
-                        raise ConversationIntegrityError(
-                            f"duplicate approval request: {request_id}"
-                        )
-                    self._active_approval_requests[request_id] = entry
+            self._record_message_entry(entry)
         elif entry.type == "approval_request":
             raise ConversationIntegrityError(
                 "standalone approval requests are not supported"
@@ -162,27 +204,21 @@ class IncrementalValidationMixin:
                 )
             self._active_approval_resolutions[request_id] = entry.data["decision"]
         elif entry.type == "notification":
-            self._active_notifications[entry.id] = entry
-            if (
-                entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
-                == AGENT_COMPLETION_NOTIFICATION_KIND
-                and type(child_id := entry.data.get("child_instance_id")) is str
-            ):
-                self._active_completion_notifications.setdefault(child_id, entry)
+            self._record_notification_entry(entry)
         elif entry.type == "notification_ack":
             notification_id = entry.data.get("notification_id")
-            if notification_id not in self._active_notifications:
+            if notification_id not in self._notification_ids:
                 raise ConversationIntegrityError(
                     f"notification acknowledgement is not linked: {notification_id}"
                 )
-            if notification_id in self._active_notification_acks:
+            if notification_id not in self._active_notifications:
                 raise ConversationIntegrityError(
                     f"duplicate notification acknowledgement: {notification_id}"
                 )
-            self._active_notification_acks.add(notification_id)
+            del self._active_notifications[notification_id]
         elif entry.type == "notification_tui_presented":
             notification_id = entry.data.get("notification_id")
-            if notification_id not in self._active_notifications:
+            if notification_id not in self._notification_ids:
                 raise ConversationIntegrityError(
                     f"notification TUI presentation is not linked: {notification_id}"
                 )
@@ -192,15 +228,16 @@ class IncrementalValidationMixin:
                 )
             self._active_notification_presentations.add(notification_id)
         elif entry.type == "pending_prompt":
-            self._active_pending_prompts.add(entry.id)
+            self._record_pending_prompt_entry(entry)
         elif entry.type == "pending_prompt_ack":
             prompt_id = entry.data.get("prompt_id")
-            if prompt_id not in self._active_pending_prompts:
+            if prompt_id not in self._pending_prompt_ids:
                 raise ConversationIntegrityError(
                     f"pending prompt acknowledgement is not linked: {prompt_id}"
                 )
-            if prompt_id in self._active_pending_prompt_acks:
+            if prompt_id not in self._active_pending_prompt_entries:
                 raise ConversationIntegrityError(
                     f"duplicate pending prompt acknowledgement: {prompt_id}"
                 )
-            self._active_pending_prompt_acks.add(prompt_id)
+            del self._active_pending_prompt_entries[prompt_id]
+            self._active_pending_prompt_messages.pop(prompt_id, None)

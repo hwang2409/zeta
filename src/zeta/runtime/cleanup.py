@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -29,6 +30,6 @@ async def close_session(
             finally:
                 try:
                     if snapshots is not None:
-                        snapshots.close()
+                        await asyncio.to_thread(snapshots.close)
                 finally:
-                    loop.store.close()
+                    await asyncio.to_thread(loop.store.close)

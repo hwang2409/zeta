@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +26,6 @@ from ...core.session_files import (
     session_root,
     write_session_json,
 )
-from ...core.store import ConversationStore
 from .background_log_writer import _OrderedLogWriter
 from .background_output_archive import _BackgroundOutputArchive
 from .background_spawn import (
@@ -74,6 +73,20 @@ class BackgroundTaskShutdownNotice:
 
 
 BackgroundTaskNoticeSinkValue = BackgroundTaskNotice | BackgroundTaskShutdownNotice
+
+
+@dataclass(frozen=True, slots=True)
+class TaskExitInput:
+    """Detached task-exit data for the resident delivery flow."""
+
+    task_id: str
+    command: str
+    exit_code: int | None
+    output_tail: str = ""
+    log_path: str | None = None
+    note: str | None = None
+    owner: str = "run_background"
+    phase: str = "natural_exit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,8 +160,7 @@ class BackgroundTaskRegistry:
         term_grace: float = BACKGROUND_TERM_GRACE_SECONDS,
         stdin_drain_timeout: float = BACKGROUND_STDIN_DRAIN_TIMEOUT,
         notice_sink: Callable[[BackgroundTaskNoticeSinkValue], None] | None = None,
-        notification_store: ConversationStore | None = None,
-        notification_callback: Callable[[], None] | None = None,
+        notification_sink: Callable[[TaskExitInput], Awaitable[object]] | None = None,
         command_niceness: int = 10,
     ) -> None:
         if type(output_limit) is not int or output_limit < 1:
@@ -167,8 +179,7 @@ class BackgroundTaskRegistry:
         self.stdin_drain_timeout = stdin_drain_timeout
         self.command_niceness = command_niceness
         self._notice_sink = notice_sink
-        self._notification_store = notification_store
-        self._notification_callback = notification_callback
+        self._notification_sink = notification_sink
         self._pending_recovery: dict[str, str] = {}
         self._records: dict[str, _BackgroundRecord] = {}
         self._session_dir: Path | None = None
@@ -236,12 +247,24 @@ class BackgroundTaskRegistry:
     def set_notice_sink(self, sink: Callable[[BackgroundTaskNoticeSinkValue], None] | None) -> None:
         self._notice_sink = sink
 
-    def set_notification_sink(self, store: ConversationStore | None, callback: Callable[[], None] | None) -> None:
-        self._notification_store = store
-        self._notification_callback = callback
-        # Recovery notifications are deferred until a store exists because the
-        # registry is built before the notification sink is installed.
-        self._flush_recovery()
+    def set_notification_sink(
+        self,
+        sink: Callable[[TaskExitInput], Awaitable[object]] | None,
+    ) -> tuple[TaskExitInput, ...]:
+        self._notification_sink = sink
+        if sink is None:
+            return ()
+        recovered = tuple(
+            TaskExitInput(
+                task_id=task_id,
+                command=_command_headline(command),
+                exit_code=None,
+                note="exit not observed (zeta restarted)",
+            )
+            for task_id, command in self._pending_recovery.items()
+        )
+        self._pending_recovery.clear()
+        return recovered
 
     def bind_session_dir(self, session_dir: str | Path, directory_fd: int) -> None:
         self._require_open()
@@ -375,7 +398,7 @@ class BackgroundTaskRegistry:
                 # Macro-owned starts have no equivalent tool card, so retain
                 # their durable notification.
                 if notify_on_exit and owner != "run_background":
-                    self._notify_exit(
+                    await self._notify_exit(
                         task_id,
                         command,
                         None,
@@ -855,7 +878,7 @@ class BackgroundTaskRegistry:
                 )
                 self._persist()
                 if record.notify_on_exit:
-                    self._notify_exit(
+                    await self._notify_exit(
                         record.task_id,
                         record.command,
                         record.exit_code,
@@ -963,7 +986,7 @@ class BackgroundTaskRegistry:
         )
         self._persist()
         if record.notify_on_exit:
-            self._notify_exit(
+            await self._notify_exit(
                 record.task_id,
                 record.command,
                 record.exit_code,
@@ -1032,7 +1055,7 @@ class BackgroundTaskRegistry:
         if self._notice_sink is not None:
             self._notice_sink(notice)
 
-    def _notify_exit(
+    async def _notify_exit(
         self,
         task_id: str,
         command: str,
@@ -1044,19 +1067,20 @@ class BackgroundTaskRegistry:
         owner: str = "run_background",
         phase: str = "natural_exit",
     ) -> None:
-        if self._notification_store is None:
+        if self._notification_sink is None:
             return
-        self._notification_store.append_task_notification(
-            task_id=task_id,
-            command=_command_headline(command),
-            exit_code=exit_code,
-            output_tail=output_tail,
-            log_path=str(log_path) if log_path is not None else None,
-            note=note,
-            background_metadata=(owner, phase),
+        await self._notification_sink(
+            TaskExitInput(
+                task_id=task_id,
+                command=_command_headline(command),
+                exit_code=exit_code,
+                output_tail=output_tail,
+                log_path=str(log_path) if log_path is not None else None,
+                note=note,
+                owner=owner,
+                phase=phase,
+            )
         )
-        if self._notification_callback is not None:
-            self._notification_callback()
 
     def _load_previous(self) -> None:
         if self._directory_fd is None:
@@ -1095,23 +1119,6 @@ class BackgroundTaskRegistry:
             )
             if was_running:
                 self._pending_recovery[task_id] = command
-        self._flush_recovery()
-
-    def _flush_recovery(self) -> None:
-        """Emit one recovery notification per unobserved previously-running task."""
-        if self._notification_store is None or not self._pending_recovery:
-            return
-        observed = {
-            entry.data.get("task_id")
-            for entry in self._notification_store.agent_notifications(pending_only=False)
-            if entry.data.get("kind", "agent_completion") == "task_exited"
-        }
-        for task_id, command in tuple(self._pending_recovery.items()):
-            if task_id not in observed:
-                self._notify_exit(
-                    task_id, command, None, "", None, "exit not observed (zeta restarted)"
-                )
-            self._pending_recovery.pop(task_id, None)
 
     def _persist(self) -> None:
         if self._directory_fd is None or self._temporary_log_root is not None:

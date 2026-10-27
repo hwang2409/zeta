@@ -81,7 +81,6 @@ __all__ = [
     "time",
 ]
 
-
 MAX_AGENT_VIEW_LINES = 240
 MAX_AGENT_LINE_CHARS = 2_000
 MAX_AGENT_SCAN_BYTES = MAX_AGENT_VIEW_LINES * (MAX_AGENT_LINE_CHARS + 256)
@@ -89,7 +88,6 @@ _TRUNCATION_MARKER = "[older lines omitted]"
 _TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 _AGENT_REFRESH_INTERVAL_SECONDS = 1.0
 _AGENT_IDLE_REFRESH_INTERVAL_SECONDS = 4.0
-
 
 def agent_navigation_style_rules() -> dict[str, str]:
     """Return the prompt-toolkit style rules for the subagent navigator.
@@ -215,6 +213,13 @@ def _message_lines(
     message: dict[str, Any], *, tail: int | None = None
 ) -> Iterator[str]:
     role = _short(message.get("role", "message"), 32)
+    metadata = message.get("metadata")
+    if (
+        role == "user"
+        and isinstance(metadata, dict)
+        and metadata.get("zeta.origin") == "agent_send"
+    ):
+        role = "parent message"
     content = message.get("content")
     if isinstance(content, list):
         for block in content:

@@ -16,7 +16,7 @@ import os
 import time
 import warnings
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from ...agent.receipt import encode_json
@@ -30,7 +30,7 @@ from ..session_files import open_session_file, read_session_file
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
-    from ...protocol.types import ToolResult
+    from ...protocol.types import Message, ToolResult
     from ._client_delivery import ClientDelivery
     from ._store import ConversationStore
 
@@ -65,12 +65,15 @@ class _DetachedLogState:
     active_approval_requests: dict[str, ConversationEntry]
     active_approval_resolutions: dict[str, str]
     active_tool_results: dict[str, ToolResult]
+    notification_ids: set[str]
     active_notifications: dict[str, ConversationEntry]
     active_completion_notifications: dict[str, ConversationEntry]
-    active_notification_acks: set[str]
     active_notification_presentations: set[str]
-    active_pending_prompts: set[str]
-    active_pending_prompt_acks: set[str]
+    pending_prompt_ids: set[str]
+    active_pending_prompt_entries: dict[str, ConversationEntry]
+    active_pending_prompt_messages: dict[str, Message]
+    active_notification_delivery_message: Message | None
+    active_last_message: Message | None
     task_notification_ids: set[str]
     client_deliveries: OrderedDict[str, ClientDelivery]
     client_delivery_outcomes: dict[bytes, bytes]
@@ -92,12 +95,17 @@ class ConversationLogMixin:
             active_approval_requests=self._active_approval_requests,
             active_approval_resolutions=self._active_approval_resolutions,
             active_tool_results=self._active_tool_results,
+            notification_ids=self._notification_ids,
             active_notifications=self._active_notifications,
             active_completion_notifications=self._active_completion_notifications,
-            active_notification_acks=self._active_notification_acks,
             active_notification_presentations=self._active_notification_presentations,
-            active_pending_prompts=self._active_pending_prompts,
-            active_pending_prompt_acks=self._active_pending_prompt_acks,
+            pending_prompt_ids=self._pending_prompt_ids,
+            active_pending_prompt_entries=self._active_pending_prompt_entries,
+            active_pending_prompt_messages=self._active_pending_prompt_messages,
+            active_notification_delivery_message=(
+                self._active_notification_delivery_message
+            ),
+            active_last_message=self._active_last_message,
             task_notification_ids=self._task_notification_ids,
             client_deliveries=self._client_deliveries,
             client_delivery_outcomes=self._client_delivery_outcomes,
@@ -105,6 +113,34 @@ class ConversationLogMixin:
             log_offset=self._log_offset,
             log_mtime_ns=self._log_mtime_ns,
             log_prefix_fingerprint=self._log_prefix_fingerprint,
+        )
+
+    def _snapshot_log_state(self: ConversationStore) -> _DetachedLogState:
+        """Copy mutable indexes so a retained writer can keep its own state."""
+        state = self._detach_log_state()
+        return replace(
+            state,
+            entries=list(state.entries),
+            entry_ids=set(state.entry_ids),
+            active_approval_requests=dict(state.active_approval_requests),
+            active_approval_resolutions=dict(state.active_approval_resolutions),
+            active_tool_results=dict(state.active_tool_results),
+            notification_ids=set(state.notification_ids),
+            active_notifications=dict(state.active_notifications),
+            active_completion_notifications=dict(
+                state.active_completion_notifications
+            ),
+            active_notification_presentations=set(
+                state.active_notification_presentations
+            ),
+            pending_prompt_ids=set(state.pending_prompt_ids),
+            active_pending_prompt_entries=dict(state.active_pending_prompt_entries),
+            active_pending_prompt_messages=dict(
+                state.active_pending_prompt_messages
+            ),
+            task_notification_ids=set(state.task_notification_ids),
+            client_deliveries=state.client_deliveries.copy(),
+            client_delivery_outcomes=dict(state.client_delivery_outcomes),
         )
 
     def _install_log_state(
@@ -118,12 +154,17 @@ class ConversationLogMixin:
         self._active_approval_requests = state.active_approval_requests
         self._active_approval_resolutions = state.active_approval_resolutions
         self._active_tool_results = state.active_tool_results
+        self._notification_ids = state.notification_ids
         self._active_notifications = state.active_notifications
         self._active_completion_notifications = state.active_completion_notifications
-        self._active_notification_acks = state.active_notification_acks
         self._active_notification_presentations = state.active_notification_presentations
-        self._active_pending_prompts = state.active_pending_prompts
-        self._active_pending_prompt_acks = state.active_pending_prompt_acks
+        self._pending_prompt_ids = state.pending_prompt_ids
+        self._active_pending_prompt_entries = state.active_pending_prompt_entries
+        self._active_pending_prompt_messages = state.active_pending_prompt_messages
+        self._active_notification_delivery_message = (
+            state.active_notification_delivery_message
+        )
+        self._active_last_message = state.active_last_message
         self._task_notification_ids = state.task_notification_ids
         self._client_deliveries = state.client_deliveries
         self._client_delivery_outcomes = state.client_delivery_outcomes

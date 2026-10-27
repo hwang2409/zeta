@@ -385,6 +385,7 @@ async def _background_event_transcript_count(
     ],
     *,
     shutdown_output_error: type[Exception] | None = None,
+    app_sink: Callable[[TUIApp], None] | None = None,
 ) -> tuple[int, str]:
     output = StringIO()
     store = ConversationStore(tmp_path / "session", cwd=tmp_path)
@@ -398,6 +399,8 @@ async def _background_event_transcript_count(
         model="offline",
         console=Console(file=output, force_terminal=False, width=160),
     )
+    if app_sink is not None:
+        app_sink(app)
     command = {
         "start": "sleep 30",
         "natural_exit_success": "exit 0",
@@ -628,6 +631,201 @@ async def test_background_event_renders_exactly_once_end_to_end(
 
 
 @pytest.mark.asyncio
+async def test_live_notification_presentation_survives_tui_resume(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    store = ConversationStore(tmp_path / "session")
+    notification = store.append_agent_notification(
+        "child-presentation",
+        child_session_path="/tmp/child-presentation",
+        description="child",
+        status="completed",
+        text="child presentation done",
+    )
+    loop = AgentLoop(
+        FakeBackend([]), store, skill_catalog=SkillCatalog.empty(), skip_mcp_mount=True
+    )
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False, width=160),
+    )
+    flow = await loop._ensure_step_delivery()
+    prepared = await flow.prepare_request("terminal_fallback", [], None)
+    assert prepared.notification_ids == (notification.id,)
+    event = loop._delivery_publication_events(flow.active_publications)[0]
+    rendered = render_event(event)
+    assert rendered is not None
+
+    await app._print_special_event(
+        event,
+        rendered,
+        suppress_errors=False,
+        user_text="",
+        retry_message=Message(MessageRole.USER, [TextContent("")]),
+    )
+
+    assert store.agent_notifications()
+    assert store.is_agent_notification_presented_to_tui(notification.id)
+    retry_event = loop._delivery_publication_events(flow.active_publications)[0]
+    assert retry_event.data["tui_presented"] is True
+    assert render_event(retry_event) is None
+    reopened = ConversationStore(store.root_dir, session_id=store.session_id)
+    resumed_output = StringIO()
+    resumed_app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            reopened,
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=resumed_output, force_terminal=False, width=160),
+    )
+    try:
+        resumed_app._rebuild_transcript()
+        visible = output.getvalue() + resumed_output.getvalue()
+        assert visible.count("child · completed") == 1
+    finally:
+        await resumed_app.loop.close()
+        reopened.close()
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_canceled_live_notification_marks_presentation_before_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = StringIO()
+    store = ConversationStore(tmp_path / "session")
+    notification = store.append_agent_notification(
+        "child-canceled-presentation",
+        child_session_path="/tmp/child-canceled-presentation",
+        description="child",
+        status="completed",
+        text="child canceled presentation done",
+    )
+    loop = AgentLoop(
+        FakeBackend([]), store, skill_catalog=SkillCatalog.empty(), skip_mcp_mount=True
+    )
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False, width=160),
+    )
+    flow = await loop._ensure_step_delivery()
+    await flow.prepare_request("terminal_fallback", [], None)
+    event = loop._delivery_publication_events(flow.active_publications)[0]
+    rendered = render_event(event)
+    assert rendered is not None
+    rendered_output = asyncio.Event()
+    original_print_unit = app._print_unit
+
+    def record_print(*args: object, **kwargs: object) -> None:
+        original_print_unit(*args, **kwargs)
+        rendered_output.set()
+
+    monkeypatch.setattr(app, "_print_unit", record_print)
+    await store._async_write_lock.acquire()
+    presentation = asyncio.create_task(
+        app._print_special_event(
+            event,
+            rendered,
+            suppress_errors=False,
+            user_text="",
+            retry_message=Message(MessageRole.USER, [TextContent("")]),
+        )
+    )
+    try:
+        await rendered_output.wait()
+        assert output.getvalue().count("child · completed") == 1
+        assert not store.is_agent_notification_presented_to_tui(notification.id)
+        presentation.cancel()
+        await asyncio.sleep(0)
+        store._async_write_lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await presentation
+
+        reopened = ConversationStore(store.root_dir, session_id=store.session_id)
+        resumed_output = StringIO()
+        resumed_app = TUIApp(
+            AgentLoop(
+                FakeBackend([]),
+                reopened,
+                skill_catalog=SkillCatalog.empty(),
+                skip_mcp_mount=True,
+            ),
+            provider="codex",
+            model="offline",
+            console=Console(file=resumed_output, force_terminal=False, width=160),
+        )
+        try:
+            assert reopened.is_agent_notification_presented_to_tui(notification.id)
+            resumed_app._rebuild_transcript()
+            visible = output.getvalue() + resumed_output.getvalue()
+            assert visible.count("child · completed") == 1
+        finally:
+            await resumed_app.loop.close()
+            reopened.close()
+    finally:
+        if store._async_write_lock.locked():
+            store._async_write_lock.release()
+        if not presentation.done():
+            presentation.cancel()
+            await asyncio.gather(presentation, return_exceptions=True)
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_background_completion_is_rendered_when_exit_overtakes_acknowledgement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_durable_write = ConversationStore._run_durable_write
+    ack_committed = threading.Event()
+    release_ack = threading.Event()
+    apps: list[TUIApp] = []
+
+    def pause_after_ack_commit(self, method_name, args, kwargs):
+        result = original_durable_write(self, method_name, args, kwargs)
+        if method_name == "_acknowledge_staged_delivery":
+            ack_committed.set()
+            assert release_ack.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(ConversationStore, "_run_durable_write", pause_after_ack_commit)
+    transcript = asyncio.create_task(
+        _background_event_transcript_count(
+            tmp_path,
+            "background_macro",
+            "natural_exit_success",
+            app_sink=apps.append,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(ack_committed.wait, 5)
+        assert len(apps) == 1
+        apps[0].request_exit()
+        release_ack.set()
+        count, rendered = await transcript
+        assert count == 1, rendered
+        markers = {
+            entry.type for entry in apps[0].loop.store.tui_replay_entries()
+        }
+        assert "notification_tui_presented" in markers
+    finally:
+        release_ack.set()
+        if not transcript.done():
+            transcript.cancel()
+            await asyncio.gather(transcript, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
     [
@@ -677,26 +875,66 @@ def test_shutdown_does_not_surface_task_kill_notification_after_snapshot(
     store.close()
 
 
-def test_run_background_shutdown_output_failure_persists_fallback(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_run_background_shutdown_output_failure_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    flow = await loop._ensure_step_delivery()
+    producer_started = asyncio.Event()
+    allow_producer = asyncio.Event()
+    original_produce = flow.produce
+
+    async def gated_produce(item):
+        producer_started.set()
+        await allow_producer.wait()
+        return await original_produce(item)
+
+    monkeypatch.setattr(flow, "produce", gated_produce)
     app = SimpleNamespace(
         _print=lambda value: (_ for _ in ()).throw(BrokenPipeError("closed pipe")),
         _invalidate_prompt=lambda: None,
-        loop=SimpleNamespace(store=store),
+        loop=loop,
     )
 
-    background_notice(
-        app,
-        BackgroundTaskShutdownNotice(
-            "background tasks killed on session exit: task-1",
-            tasks=(("task-1", "run_background"),),
-        ),
-    )
+    async def close_registry() -> tuple[str, ...]:
+        background_notice(
+            app,
+            BackgroundTaskShutdownNotice(
+                "background tasks killed on session exit: task-1",
+                tasks=(("task-1", "run_background"),),
+            ),
+        )
+        return ()
 
-    notifications = store.agent_notifications()
-    assert len(notifications) == 1
-    assert notifications[0].data["task_id"] == "task-1"
-    assert notifications[0].data["background_phase"] == "session_shutdown"
+    monkeypatch.setattr(registry, "close", close_registry)
+    ticks = 0
+    stop_ticker = asyncio.Event()
+
+    async def tick() -> None:
+        nonlocal ticks
+        while not stop_ticker.is_set():
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    ticker = asyncio.create_task(tick())
+    close_task = asyncio.create_task(loop.close())
+    await asyncio.wait_for(producer_started.wait(), 1)
+    with pytest.raises(RuntimeError, match="shutdown delivery admission timed out"):
+        await asyncio.wait_for(close_task, 2)
+    stop_ticker.set()
+    await ticker
+
+    assert ticks > 10
+    assert not loop._tracked_tasks
+    assert store.agent_notifications() == []
 
 
 def test_other_background_notices_remain_visible() -> None:
@@ -1636,6 +1874,10 @@ def test_scrollback_stream_events_render() -> None:
             StreamEventType.AGENT_NOTIFICATION,
             data=_notification_payloads()["agent_completion"],
         ),
+        StreamEventType.CHILD_MESSAGE_DELIVERED: StreamEvent(
+            StreamEventType.CHILD_MESSAGE_DELIVERED,
+            data={"child_label": "root:1", "preview": "check the retry"},
+        ),
         StreamEventType.ACCOUNT_LIMIT: StreamEvent(
             StreamEventType.ACCOUNT_LIMIT,
             data={
@@ -1687,6 +1929,20 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert result is not None
     assert isinstance(result, Panel)
     assert "read README.md" in renderable_plain(result)
+
+
+def test_agent_card_labels_staged_agent_send_as_parent_message(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="child")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("check the retry")]),
+            MessageOrigin.AGENT_SEND,
+        )
+    )
+
+    assert read_agent_transcript(store.session_dir) == [
+        "parent message: check the retry"
+    ]
 
 
 @pytest.mark.asyncio
@@ -4687,6 +4943,26 @@ def test_background_start_event_reaches_presenter_with_depth(tmp_path: Path) -> 
     assert "depth 2" in output.getvalue()
 
 
+def test_child_message_delivered_background_event_renders_parent_receipt(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path), output)
+
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.CHILD_MESSAGE_DELIVERED,
+            data={
+                "agent_instance_id": "root:1",
+                "child_label": "worker",
+                "preview": "check the retry",
+            },
+        )
+    )
+
+    assert "delivered to worker: check the retry" in output.getvalue()
+
+
 def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:
     child = ConversationStore(tmp_path, session_id="child")
     child.start_agent_lifecycle(
@@ -5304,7 +5580,10 @@ def test_canceled_agent_card_can_expand_with_persisted_child_tail(tmp_path: Path
     assert "cancelled task" in Text.from_ansi(transcript.render(120)).plain
 
 
-def test_recovered_canceled_agent_card_expands_with_child_tail(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_recovered_canceled_agent_card_expands_with_child_tail(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path, session_id="parent")
     call = ToolCall(
         "agent-recovered",
@@ -5324,22 +5603,29 @@ def test_recovered_canceled_agent_card_expands_with_child_tail(tmp_path: Path) -
         turns_used=2,
     )
 
-    AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    await loop.activate()
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     event = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
         tool_call=call,
         tool_result=result,
     )
-    transcript = TranscriptWidget()
-    transcript.start_tool(
-        call.id,
-        call,
-        render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)),
-    )
-    transcript.finish_tool(call.id, render_event(event), event)
+    def render_transcript() -> str:
+        transcript = TranscriptWidget()
+        transcript.start_tool(
+            call.id,
+            call,
+            render_event(
+                StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+            ),
+        )
+        transcript.finish_tool(call.id, render_event(event), event)
+        return Text.from_ansi(transcript.render(120)).plain
 
-    rendered = Text.from_ansi(transcript.render(120)).plain
+    rendered = await asyncio.to_thread(render_transcript)
     assert "saved child tail" in rendered
     assert "2 turns" in rendered
 
@@ -9653,7 +9939,7 @@ async def test_run_delivers_queued_follow_up_after_current_turn(tmp_path: Path) 
         await backend.started.wait()
         pipe.send_text("second\r")
         backend.release.set()
-        await wait_until(lambda: len(backend.calls) == 2)
+        await wait_until(lambda: len(store.messages()) == 4)
         pipe.send_text("\x04")
         await run_task
 
@@ -11990,31 +12276,45 @@ async def test_user_turn_still_shows_no_response_after_failed_nudge(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("model", "expected_budget"),
-    [("qwen3:4b", 40_960), ("locally-created-model", 8_192)],
+    ("start_model", "start_budget", "model", "expected_budget"),
+    [
+        ("big-model", 1_000_000, "small-model", 8_192),
+        ("small-model", 8_192, "big-model", 1_000_000),
+    ],
 )
 async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
-    tmp_path: Path, model: str, expected_budget: int
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start_model: str,
+    start_budget: int,
+    model: str,
+    expected_budget: int,
 ) -> None:
+    from zeta.core.slash import MODEL_CONTEXT_WINDOWS
+
+    monkeypatch.setitem(
+        MODEL_CONTEXT_WINDOWS,
+        "ollama",
+        {"big-model": 1_000_000, "small-model": 8_192},
+    )
     manager = SessionManager(tmp_path / "home")
     opened = await asyncio.to_thread(
         manager.create,
         provider="ollama",
-        model="claude-sonnet-4-6",
+        model=start_model,
         cwd=tmp_path,
-        compaction_budget=100_000,
-        budget_pinned=True,
+        compaction_budget=start_budget,
+        budget_pinned=False,
     )
     loop = AgentLoop(
         FakeBackend([]),
         opened.store,
         skill_catalog=SkillCatalog.empty(),
-        token_budget=100_000,
+        token_budget=start_budget,
     )
-    backend = OllamaBackend(model="claude-sonnet-4-6", token_budget=100_000)
+    backend = OllamaBackend(model=start_model, token_budget=start_budget)
     loop.backend = backend
-    loop.context_assembler.backend = backend
-    loop.context_assembler.compaction_policy.backend = backend
+    loop.context_assembler.update_backend(backend)
 
     context = SessionAccountContext.load(
         manager.home, manager, opened.metadata
@@ -12023,7 +12323,7 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
 
     async def persist_model_and_effective_budget(selected: str):
         def prepare(metadata):
-            budget = min(metadata.compaction_budget, budget_for_model("ollama", selected))
+            budget = budget_for_model("ollama", selected)
             return manager._apply_session_settings(
                 metadata,
                 model=selected,
@@ -12044,7 +12344,7 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
     app = TUIApp(
         loop,
         provider="ollama",
-        model="claude-sonnet-4-6",
+        model=start_model,
         on_model_change=persist_model_and_effective_budget,
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -12070,7 +12370,20 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
         persisted = manager.read_metadata(opened.metadata.session_id)
         assert persisted.compaction_budget == expected_budget
         assert loop.context_assembler.token_budget == expected_budget
+        assert loop.context_assembler.trigger_token_budget == int(expected_budget * 0.9)
+        expected_allowance = 512 if expected_budget == 8_192 else 8_192
+        assert loop.context_assembler.delivery_notification_budget == expected_allowance
         assert payloads[0]["options"]["num_ctx"] == expected_budget
+        loop.store.append_agent_notification_if_absent(
+            "pending-child",
+            child_session_path="/tmp/child",
+            description="pending",
+            status="completed",
+            text="done",
+        )
+        flow = await loop._ensure_step_delivery()
+        prepared = await flow.prepare_request("after_tools", [], None)
+        assert prepared.notification_ids
     finally:
         await loop.close()
         opened.store.close()
@@ -12387,6 +12700,71 @@ async def test_tui_shutdown_with_switch_lock_held_exits_bounded(
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_account_switch_applies_prepared_compaction_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    home = tmp_path / "home"
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "work").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
+    )
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create,
+        provider="codex",
+        model="gpt-5.6-sol",
+        cwd=tmp_path,
+        compaction_budget=8_192,
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        skill_catalog=SkillCatalog.empty(),
+        token_budget=8_192,
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop.account_context = context
+    original = manager._apply_account_selection
+
+    def prepare_with_larger_budget(metadata, account, **kwargs):
+        return replace(
+            original(metadata, account, **kwargs), compaction_budget=1_000_000
+        )
+
+    monkeypatch.setattr(manager, "_apply_account_selection", prepare_with_larger_budget)
+    try:
+        await context.switch_active(
+            loop,
+            AccountId("codex", "work"),
+            boundary=0,
+            provider="codex",
+            build_backend=lambda _account: OllamaBackend(
+                model="big-model", token_budget=8_192
+            ),
+        )
+        assert loop.context_assembler.token_budget == 1_000_000
+        assert loop.context_assembler.trigger_token_budget == 900_000
+        assert loop.context_assembler.delivery_notification_budget == 8_192
+        assert loop.backend.token_budget == 1_000_000
+        loop.store.append_agent_notification_if_absent(
+            "pending-child",
+            child_session_path="/tmp/child",
+            description="pending",
+            status="completed",
+            text="done",
+        )
+        flow = await loop._ensure_step_delivery()
+        assert (await flow.prepare_request("after_tools", [], None)).notification_ids
+    finally:
+        await loop.close()
         opened.store.close()
 
 
@@ -12779,3 +13157,62 @@ async def test_account_limit_event_lists_accounts_off_loop(
         await ticker_task
         holder.join(timeout=1)
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_low_capacity_notice_real_render_path(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    assembler = ContextAssembler(store, token_budget=8_192)
+    minimum = assembler.estimator_token_budget
+    low, high = 0, assembler.estimator_token_budget * 8
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = Message(MessageRole.SYSTEM, [TextContent("k" * middle)])
+        if assembler.estimate_messages((candidate,)) <= (
+            assembler.estimator_token_budget - minimum + 1
+        ):
+            low = middle
+        else:
+            high = middle - 1
+    assembler.system_prompt = Message(MessageRole.SYSTEM, [TextContent("k" * low)])
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        context_assembler=assembler,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    output = StringIO()
+    _app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False, width=500),
+    )
+    assert loop.step_delivery is not None
+    await loop.step_delivery.initialize()
+    store.append_agent_notification_if_absent(
+        "c" * 80,
+        child_session_path="p" * 200,
+        description="d" * 120,
+        status="completed",
+        text="x" * 256,
+        report={
+            "status": "done",
+            "verdict": "pass",
+            "head_sha": "a" * 40,
+            "summary": "x" * 256,
+            "pr_number": 1_111_111_111,
+        },
+    )
+    loop.step_delivery.wake("notification")
+
+    _events = [event async for event in loop.run_notification_turn()]
+
+    rendered = Text.from_ansi(output.getvalue()).plain
+    expected = (
+        f"1 background updates waiting; context too small to show them; full records: "
+        f"{store.path}"
+    )
+    assert rendered.count(expected) == 1, rendered
+    assert not getattr(loop.backend, "calls", [])
+    await loop.close()

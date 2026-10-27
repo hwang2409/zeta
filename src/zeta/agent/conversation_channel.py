@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ..core.checkpoints import ConversationEntry
-from ..core.store import ConversationStore
+from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 
 if TYPE_CHECKING:
     from .background import BackgroundAgentOwner
+    from .pending_delivery import DeliveryInput, ProducerResult, StepDeliveryFlow
+
+
+@dataclass(slots=True)
+class _DeliveryTarget:
+    loop: asyncio.AbstractEventLoop
+    flow: StepDeliveryFlow
+    accepted: set[asyncio.Future[Any]] = field(default_factory=set)
 
 
 def has_follow_up_loop(*, accepts_follow_ups: bool, background: bool) -> bool:
@@ -52,6 +61,7 @@ class ConversationChannel:
         self._owner = owner
         self._root_store = root_store
         self._wakes: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Event]] = {}
+        self._delivery_targets: dict[str | None, _DeliveryTarget] = {}
         self._root_wake: Callable[[], None] | None = None
 
     def set_root_wake(self, callback: Callable[[], None] | None) -> None:
@@ -63,9 +73,60 @@ class ConversationChannel:
     def unregister_loop(self, instance_id: str) -> None:
         self._wakes.pop(instance_id, None)
 
+    def register_delivery_flow(
+        self,
+        instance_id: str | None,
+        flow: StepDeliveryFlow,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
+        if instance_id in self._delivery_targets:
+            raise RuntimeError(f"delivery flow already registered: {instance_id!r}")
+        self._delivery_targets[instance_id] = _DeliveryTarget(
+            loop or asyncio.get_running_loop(), flow
+        )
+
+    async def unregister_delivery_flow(self, instance_id: str | None) -> None:
+        target = self._delivery_targets.pop(instance_id, None)
+        if target is not None and target.accepted:
+            await asyncio.gather(*tuple(target.accepted), return_exceptions=True)
+
+    async def produce_to(
+        self, target_instance_id: str | None, item: DeliveryInput, /
+    ) -> ProducerResult:
+        target = self._delivery_targets.get(target_instance_id)
+        if target is None:
+            raise LookupError(f"no live delivery flow: {target_instance_id!r}")
+        return await self._produce_to_target(target, item)
+
+    async def _produce_to_target(
+        self, target: _DeliveryTarget, item: DeliveryInput, /
+    ) -> ProducerResult:
+        if target.loop is asyncio.get_running_loop():
+            return await target.flow.produce(item)
+        concurrent = asyncio.run_coroutine_threadsafe(
+            target.flow.produce(item), target.loop
+        )
+        future = asyncio.wrap_future(concurrent)
+        target.accepted.add(future)
+        try:
+            return await future
+        finally:
+            target.accepted.discard(future)
+
+    async def produce_to_parent_of(
+        self, child_instance_id: str, item: DeliveryInput, /
+    ) -> ProducerResult:
+        _store, parent_id = self._live_parent(child_instance_id)
+        return await self.produce_to(parent_id, item)
+
     async def wait(self, instance_id: str) -> None:
         _loop, event = self._wakes[instance_id]
         await event.wait()
+        event.clear()
+
+    def clear_wake(self, instance_id: str) -> None:
+        _loop, event = self._wakes[instance_id]
         event.clear()
 
     def wake(self, instance_id: str | None) -> None:
@@ -78,7 +139,7 @@ class ConversationChannel:
             loop, event = target
             loop.call_soon_threadsafe(event.set)
 
-    def publish_idle(
+    async def publish_idle(
         self,
         *,
         child_instance_id: str,
@@ -86,7 +147,9 @@ class ConversationChannel:
         description: str,
         text: str,
     ) -> ConversationEntry | None:
-        """Persist one nonterminal idle notice and wake the direct parent."""
+        """Persist one nonterminal idle notice through recipient flows."""
+
+        from .pending_delivery import NotificationInput
 
         parent_store, parent_id = self._live_parent(child_instance_id)
         question_id = next(
@@ -98,31 +161,40 @@ class ConversationChannel:
             ),
             None,
         )
-        notification = self._root_store.append_child_idle_notification(
-            child_instance_id,
-            child_session_path=child_session_path,
-            description=description,
-            text=text,
-            ask_parent_question_id=(
-                question_id if isinstance(question_id, str) else None
-            ),
-            display_only=self._root_store is not parent_store,
-        )
-        if self._root_store is not parent_store:
-            parent_store.append_child_idle_notification(
-                child_instance_id,
-                child_session_path=child_session_path,
-                description=description,
-                text=text,
-                ask_parent_question_id=(
-                    question_id if isinstance(question_id, str) else None
-                ),
-            )
-        if notification is not None:
-            self.wake(parent_id)
-        return notification
 
-    def publish_completion(
+        def data_for(*, display_only: bool) -> dict[str, Any]:
+            data: dict[str, Any] = {
+                "origin": "notification",
+                "kind": "child_idle",
+                "child_instance_id": child_instance_id,
+                "child_session_path": child_session_path,
+                "description": description,
+                "status": "child_idle",
+                "text": text[-MAX_AGENT_NOTIFICATION_TEXT:],
+            }
+            if isinstance(question_id, str):
+                data["ask_parent_question_id"] = question_id
+            if display_only:
+                data["display_only"] = True
+            return data
+
+        if self._root_store is parent_store:
+            result = await self.produce_to(
+                parent_id,
+                NotificationInput("child_idle", data_for(display_only=False)),
+            )
+            return result.entries[0] if result.entries else None
+        root_result = await self.produce_to(
+            None,
+            NotificationInput("child_idle", data_for(display_only=True)),
+        )
+        await self.produce_to(
+            parent_id,
+            NotificationInput("child_idle", data_for(display_only=False)),
+        )
+        return root_result.entries[0] if root_result.entries else None
+
+    async def publish_completion(
         self,
         *,
         child_instance_id: str,
@@ -137,24 +209,14 @@ class ConversationChannel:
         killed_task_ids_truncated: bool,
         report: dict[str, object] | None = None,
     ) -> ConversationEntry:
-        """Persist a child completion for its recipients, then wake its parent."""
+        """Persist a child completion through each resident recipient flow."""
+
+        from .pending_delivery import NotificationInput
 
         parent_store, parent_id = self._live_parent(child_instance_id)
-        notification = self._root_store.append_agent_notification(
-            child_instance_id,
-            child_session_path=child_session_path,
-            description=description,
-            status=status,
-            text=text,
-            stats=stats,
-            killed_task_ids=killed_task_ids,
-            killed_task_count=killed_task_count,
-            killed_task_ids_truncated=killed_task_ids_truncated,
-            display_only=self._root_store is not parent_store,
-            report=report,
-        )
-        if self._root_store is not parent_store:
-            parent_store.append_agent_notification(
+
+        def data_for(store: ConversationStore, *, display_only: bool) -> dict[str, Any]:
+            return store._agent_notification_data(
                 child_instance_id,
                 child_session_path=child_session_path,
                 description=description,
@@ -164,13 +226,47 @@ class ConversationChannel:
                 killed_task_ids=killed_task_ids,
                 killed_task_count=killed_task_count,
                 killed_task_ids_truncated=killed_task_ids_truncated,
+                display_only=display_only,
                 report=report,
             )
-        parent_store.finish_agent_child(marker_key)
-        self.wake(parent_id)
+
+        def finish_parent_marker() -> bool:
+            parent_store._finish_agent_child_unlocked(marker_key)
+            return True
+
+        if self._root_store is parent_store:
+            result = await self.produce_to(
+                parent_id,
+                NotificationInput(
+                    "child_completion",
+                    data_for(parent_store, display_only=False),
+                    dedupe_key=child_instance_id,
+                    after_commit=finish_parent_marker,
+                ),
+            )
+            notification = result.entries[0]
+        else:
+            root_result = await self.produce_to(
+                None,
+                NotificationInput(
+                    "child_completion",
+                    data_for(self._root_store, display_only=True),
+                    dedupe_key=child_instance_id,
+                ),
+            )
+            result = await self.produce_to(
+                parent_id,
+                NotificationInput(
+                    "child_completion",
+                    data_for(parent_store, display_only=False),
+                    dedupe_key=child_instance_id,
+                    after_commit=finish_parent_marker,
+                ),
+            )
+            notification = root_result.entries[0]
         return notification
 
-    def publish_question(
+    async def publish_question(
         self,
         *,
         child_instance_id: str,
@@ -178,24 +274,45 @@ class ConversationChannel:
         question: str,
         options: list[str] | None,
     ) -> ConversationStore:
+        from .pending_delivery import NotificationInput
+
         parent_store, parent_id = self._live_parent(child_instance_id)
         routed = parent_id != self._owner.original_parent_instance_id(
             child_instance_id
         )
-        parent_store.append_child_question(
-            child_instance_id=child_instance_id,
-            question_id=question_id,
-            question=question,
-            options=options,
-            routed_from_parent=routed,
+        data: dict[str, Any] = {
+            "origin": "notification",
+            "kind": "child_question",
+            "child_instance_id": child_instance_id,
+            "question_id": question_id,
+            "question": question,
+            "description": "child question",
+            "status": "pending",
+            "text": (
+                f"child {child_instance_id} asks: {question}\n"
+                f"Answer with agent_send to {child_instance_id}; you can reference "
+                f"question id {question_id} in the message."
+            ),
+        }
+        if options is not None:
+            data["options"] = list(options)
+        if routed:
+            data["routing_note"] = (
+                "direct parent is no longer alive; routed to the next live ancestor"
+            )
+        await self.produce_to(
+            parent_id,
+            NotificationInput("child_question", data, dedupe_key=question_id),
         )
-        self.wake(parent_id)
         return parent_store
 
-    def reroute_questions_from(self, dead_parent: ConversationStore) -> int:
+    async def reroute_questions_from(self, dead_parent: ConversationStore) -> int:
         """Move unanswered descendant questions to their next live ancestor."""
 
+        from .pending_delivery import NotificationInput
+
         moved = 0
+        dead_parent_id = self._target_for_store(dead_parent)
         for entry in dead_parent.agent_notifications():
             if entry.data.get("kind") != "child_question":
                 continue
@@ -205,31 +322,67 @@ class ConversationChannel:
             target, parent_id = self._live_parent(child_id)
             if target is dead_parent:
                 continue
-            question_id = str(entry.data["question_id"])
-            exists = any(
-                item.data.get("kind") == "child_question"
-                and item.data.get("question_id") == question_id
-                for item in target.agent_notifications(pending_only=False)
+            data = dict(entry.data)
+            data["routing_note"] = (
+                "direct parent is no longer alive; routed to the next live ancestor"
             )
-            if not exists:
-                options = entry.data.get("options")
-                target.append_child_question(
-                    child_instance_id=child_id,
-                    question_id=question_id,
-                    question=str(entry.data["question"]),
-                    options=options if type(options) is list else None,
-                    routed_from_parent=True,
-                )
-            dead_parent.acknowledge_agent_notification(entry.id)
-            self.wake(parent_id)
+            await self.produce_to(
+                parent_id,
+                NotificationInput(
+                    "child_question", data, dedupe_key=str(data["question_id"])
+                ),
+            )
+            await self.produce_to(
+                dead_parent_id,
+                NotificationInput(
+                    "question_answer_ack",
+                    {
+                        "child_instance_id": child_id,
+                        "question_id": str(data["question_id"]),
+                    },
+                ),
+            )
             moved += 1
         return moved
 
-    def close_questions(self, child_instance_id: str, *, reason: str) -> int:
-        closed = 0
-        for store in self._owner.conversation_stores():
-            closed += store.close_child_questions(child_instance_id, reason=reason)
-        return closed
+    async def close_questions(self, child_instance_id: str, *, reason: str) -> int:
+        from .pending_delivery import NotificationInput
+
+        item = NotificationInput(
+            "child_question_close",
+            {"child_instance_id": child_instance_id, "reason": reason},
+        )
+        targets_by_store = {
+            id(target.flow.store): target
+            for target in self._delivery_targets.values()
+        }
+        targets = tuple(
+            target
+            for store in self._owner.conversation_stores()
+            if (target := targets_by_store.get(id(store))) is not None
+        )
+        reservations = tuple(
+            (target, asyncio.get_running_loop().create_future())
+            for target in targets
+        )
+        for target, reservation in reservations:
+            target.accepted.add(reservation)
+        try:
+            results = [
+                await self._produce_to_target(target, item) for target in targets
+            ]
+        finally:
+            for target, reservation in reservations:
+                target.accepted.discard(reservation)
+                if not reservation.done():
+                    reservation.set_result(None)
+        return sum(result.affected for result in results)
+
+    def _target_for_store(self, store: ConversationStore) -> str | None:
+        for target_id, target in self._delivery_targets.items():
+            if target.flow.store is store:
+                return target_id
+        raise LookupError(f"no live delivery flow for store {store.session_id!r}")
 
     def _live_parent(
         self, child_instance_id: str

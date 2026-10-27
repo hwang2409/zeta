@@ -18,9 +18,9 @@ from pathlib import Path
 
 import pytest
 
+import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.background import BackgroundAgentOwner
-from zeta.agent.notifications import NotificationWake
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -42,6 +42,7 @@ from zeta.tools._shared import process as process_module
 from zeta.tools._shared.background_output_archive import _BackgroundOutputArchive
 from zeta.tools._shared.process import (
     BackgroundTaskRegistry,
+    TaskExitInput,
     _BackgroundRecord,
     _group_exists,
     _OrderedLogWriter,
@@ -55,6 +56,35 @@ def _python(*parts: str) -> str:
 
 async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None:
     await asyncio.wait_for(registry.wait(task_id), timeout=30)
+
+
+def _task_notification(item: TaskExitInput) -> pending_delivery_module.NotificationInput:
+    data: dict[str, object] = {
+        "task_id": item.task_id,
+        "headline": item.command,
+        "exit_code": item.exit_code,
+        "output_tail": item.output_tail,
+        "background_owner": item.owner,
+        "background_phase": item.phase,
+    }
+    if item.log_path is not None:
+        data["log_path"] = item.log_path
+    if item.note is not None:
+        data["note"] = item.note
+    return pending_delivery_module.NotificationInput(
+        "task_exit", data, dedupe_key=item.task_id
+    )
+
+
+def _notification_registry(
+    store: ConversationStore,
+    *,
+    wake_sink=None,
+) -> BackgroundTaskRegistry:
+    flow = pending_delivery_module.StepDeliveryFlow(store, wake_sink=wake_sink)
+    return BackgroundTaskRegistry(
+        notification_sink=lambda item: flow.produce(_task_notification(item))
+    )
 
 
 @pytest.mark.asyncio
@@ -164,7 +194,7 @@ async def test_background_exit_persists_task_notification(tmp_path: Path) -> Non
         nonlocal wakes
         wakes += 1
 
-    registry = BackgroundTaskRegistry(notification_store=store, notification_callback=wake)
+    registry = _notification_registry(store, wake_sink=lambda _source: wake())
     task_id, _ = await registry.start(_python("print('task output')"), Path.cwd())
     await _wait_for_exit(registry, task_id)
     notifications = store.agent_notifications()
@@ -187,7 +217,7 @@ async def test_session_close_kills_without_notification(tmp_path: Path) -> None:
         nonlocal wakes
         wakes += 1
 
-    registry = BackgroundTaskRegistry(notification_store=store, notification_callback=wake)
+    registry = _notification_registry(store, wake_sink=lambda _source: wake())
     task_id, _ = await registry.start(_python("import time; time.sleep(30)"), Path.cwd())
     killed = await registry.close()
     assert task_id in killed
@@ -226,6 +256,7 @@ async def test_task_exit_recovered_after_restart_exactly_once(tmp_path: Path) ->
     store1 = ConversationStore(tmp_path, session_id="restart")
     seed_running_row(store1)
     loop1 = AgentLoop(FakeBackend([]), store1, max_turns=1, skill_catalog=SkillCatalog.empty())
+    await loop1.activate()
     recovered = task_exits(store1)
     assert len(recovered) == 1
     assert recovered[0].data["task_id"] == "task-seed"
@@ -239,6 +270,7 @@ async def test_task_exit_recovered_after_restart_exactly_once(tmp_path: Path) ->
     store2 = ConversationStore(tmp_path, session_id="restart")
     seed_running_row(store2)
     loop2 = AgentLoop(FakeBackend([]), store2, max_turns=1, skill_catalog=SkillCatalog.empty())
+    await loop2.activate()
     assert len(task_exits(store2)) == 1
     await loop2.close()
     store2.close()
@@ -249,7 +281,7 @@ async def test_failed_run_background_start_uses_tool_error_as_canonical_result(t
     # A failed run_background start is rendered by its error tool card; do not
     # persist a second task_exited receipt.
     store = ConversationStore(tmp_path / "session")
-    registry = BackgroundTaskRegistry(notification_store=store)
+    registry = _notification_registry(store)
     with pytest.raises(ValueError):
         await registry.start("echo hi", tmp_path / "does-not-exist")
     assert store.agent_notifications() == []
@@ -282,7 +314,7 @@ async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) 
 async def test_task_kill_produces_exactly_one_notification(tmp_path: Path) -> None:
     # S6: killing a modeled task notifies exactly once.
     store = ConversationStore(tmp_path / "session")
-    registry = BackgroundTaskRegistry(notification_store=store)
+    registry = _notification_registry(store)
     task_id, _ = await registry.start(_python("import time; time.sleep(30)"), Path.cwd())
     await registry.kill(task_id)
     task_exits = [
@@ -329,7 +361,8 @@ def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
     assert active[0].data["exit_code"] == 1
 
 
-def test_tui_presented_notification_remains_available_to_notification_wake(
+@pytest.mark.asyncio
+async def test_tui_presented_notification_remains_available_to_notification_wake(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -343,9 +376,11 @@ def test_tui_presented_notification_remains_available_to_notification_wake(
     )
     store.mark_agent_notification_presented_to_tui(notification.id)
 
-    message = NotificationWake(store).pending_message()
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    flow.initialize_resident_edges()
+    prepared = await flow.prepare_request("idle_start", [], None)
+    message = prepared.messages[-1]
 
-    assert message is not None
     assert message.metadata["notifications"] == [
         {
             "notification_id": notification.id,
@@ -355,7 +390,8 @@ def test_tui_presented_notification_remains_available_to_notification_wake(
     ]
 
 
-def test_legacy_notification_without_kind_is_agent_completion_in_wake_payload(
+@pytest.mark.asyncio
+async def test_legacy_notification_without_kind_is_agent_completion_in_wake_payload(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="legacy")
@@ -370,9 +406,11 @@ def test_legacy_notification_without_kind_is_agent_completion_in_wake_payload(
         },
     )
 
-    message = NotificationWake(store).pending_message()
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    flow.initialize_resident_edges()
+    prepared = await flow.prepare_request("idle_start", [], None)
+    message = prepared.messages[-1]
 
-    assert message is not None
     assert message.metadata["notifications"][0]["kind"] == "agent_completion"
 
 
@@ -2185,12 +2223,11 @@ async def test_registry_setup_ignores_corrupt_background_state(
 @pytest.mark.asyncio
 async def test_explicit_finish_task_safety_deadline_kills_and_wakes(tmp_path: Path) -> None:
     from zeta.agent.explicit_finish import kill_tasks_after_deadline
-    from zeta.tools._shared.process import BackgroundTaskRegistry
 
     wake = asyncio.Event()
     store = ConversationStore(tmp_path)
-    registry = BackgroundTaskRegistry(
-        notification_store=store, notification_callback=wake.set
+    registry = _notification_registry(
+        store, wake_sink=lambda _source: wake.set()
     )
     task_id, _ = await registry.start(
         _python("import time; time.sleep(60)"), tmp_path

@@ -17,9 +17,10 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
+import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support.fake_backend import FakeBackend
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
-from zeta.core.context import BudgetExceeded
+from zeta.core.context import BudgetExceeded, ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -624,7 +625,10 @@ async def test_new_wake_after_permanent_failure_dispatches_normally(
     timers = _capture_notification_timers(monkeypatch)
 
     app._submissions.wake()
-    await _wait(lambda: "automatic retry stopped" in app.console.file.getvalue())
+    await _wait(
+        lambda: "automatic retry stopped" in app.console.file.getvalue()
+        and not app._submissions.active
+    )
     app.loop.store.append_agent_notification(
         "child-2",
         child_session_path="/tmp/child-2",
@@ -634,9 +638,14 @@ async def test_new_wake_after_permanent_failure_dispatches_normally(
     )
     app._submissions.wake()
     await _wait(lambda: len(backend.calls) == 2 and not app._submissions.active)
+    await asyncio.sleep(0.05)
 
+    assert len(backend.calls) == 2
     assert timers == []
     assert app.console.file.getvalue().count("automatic retry stopped") == 1
+    assert [entry.data["child_instance_id"] for entry in app.loop.store.agent_notifications()] == [
+        "child-2"
+    ]
     assert any(
         message.role is MessageRole.ASSISTANT
         and not message.metadata.get("turn_failed")
@@ -657,7 +666,7 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     app._submissions.wake()
     await _wait(lambda: len(timers) == 1)
     entries = app.loop.store.entries
-    assert [entry.type for entry in entries].count("notification_ack") == 1
+    assert [entry.type for entry in entries].count("notification_ack") == 0
     assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
     assert not any(
         message.role is MessageRole.ASSISTANT
@@ -680,6 +689,7 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
         and not message.metadata.get("turn_failed")
         for message in app.loop.store.messages()
     ) == 1
+    assert [entry.type for entry in app.loop.store.entries].count("notification_ack") == 1
 
     app.loop.store.append_agent_notification(
         "child-2",
@@ -1316,3 +1326,141 @@ async def test_passthrough_respects_approval_policy(tmp_path: Path) -> None:
     assert "denied" in receipts[0]
     assert backend.calls == []
     await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_8k_steering_alone_over_budget_keeps_main_requeue(
+    tmp_path: Path,
+) -> None:
+    tool_call = ToolCall("oversize-tool", "noop", {})
+
+    async def noop_tool(arguments, abort_signal, publisher) -> str:
+        del arguments, abort_signal, publisher
+        return "ok"
+
+    backend = SteerToolBackend(tool_call)
+    store = ConversationStore(tmp_path / "sessions")
+    assembler = ContextAssembler(store, token_budget=8_192, retained_tail=1)
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            store,
+            tools={"noop": noop_tool},
+            max_turns=3,
+            context_assembler=assembler,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False, width=300),
+    )
+    oversized = "oversized-steering-" * 10_000
+    app._submit_input("prompt")
+    await backend.turn1_streaming.wait()
+    assert app.loop.step_delivery is not None
+    app._submit_input(oversized)
+    await _wait(lambda: app.loop.has_pending_steering)
+    captured = store.pending_client_steering()
+    assert captured is not None
+    steering_tokens = assembler.estimate_messages(captured.messages)
+    await app.loop.step_delivery.produce(
+        pending_delivery_module.PromptInput(
+            "agent-send-waits", MessageOrigin.AGENT_SEND, None
+        )
+    )
+    backend.release_turn1.set()
+    await _wait(lambda: not app._submissions.active)
+
+    expected = (
+        "your message was not sent: it is larger than this model's context window "
+        f"({steering_tokens} "
+        f"of {assembler.estimator_token_budget} tokens). shorten it and resend it, "
+        "or switch to a larger model."
+    )
+    assert all(
+        not any(
+            isinstance(block, TextContent) and block.text == oversized
+            for message in call
+            for block in message.content
+        )
+        for call in backend.calls
+    )
+    assert app.loop.step_delivery.prompt_priority is not None
+    assert app.loop.step_delivery.active_prompt_id is None
+    assert expected in app.console.file.getvalue()
+    assert any(
+        message.role is MessageRole.USER
+        and any(
+            isinstance(block, TextContent) and block.text == oversized
+            for block in message.content
+        )
+        for message in store.messages()
+    )
+    if app._active_task is not None:
+        await _drive(app._active_task)
+    await app._submissions.close()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_agent_send_and_steering_share_one_ordered_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification_if_absent(
+        "root:1:1",
+        child_session_path="/child/one/conversation.jsonl",
+        description="first",
+        status="completed",
+        text="first done",
+    )
+    prompt = await asyncio.to_thread(
+        store.pending_prompt_queue.append,
+        "agent send",
+        origin=MessageOrigin.AGENT_SEND,
+    )
+    steering = with_message_origin(
+        Message(MessageRole.USER, [TextContent("steer")]), MessageOrigin.USER
+    )
+    store.queue_client_steering(steering)
+    assembler = ContextAssembler(store, token_budget=8_192)
+    flow = pending_delivery_module.StepDeliveryFlow(store, context_assembler=assembler)
+
+    prepared = await flow.prepare_request(
+        "after_tools", await assembler.assemble(), store.pending_client_steering()
+    )
+    retry = await flow.prepare_request(
+        "retry", prepared.messages, store.pending_client_steering()
+    )
+    assert retry.notification_ids == prepared.notification_ids
+    assert retry.prompt_id == prepared.prompt_id
+    assert [message.role for message in retry.messages[-3:]] == [
+        MessageRole.SYSTEM,
+        MessageRole.USER,
+        MessageRole.USER,
+    ]
+    assert retry.messages[-1].content[0].text == "steer"
+    assert (
+        assembler.estimate_messages(retry.messages) <= assembler.estimator_token_budget
+    )
+
+    store.append_agent_notification_if_absent(
+        "root:2:1",
+        child_session_path="/child/two/conversation.jsonl",
+        description="second",
+        status="completed",
+        text="second done",
+    )
+    publications = await flow.acknowledge_active()
+
+    assert prepared.prompt_id == prompt.id
+    assert prepared.steering is not None
+    assert len(prepared.notification_ids) == 1
+    assert publications.delivered_prompt is not None
+    assert publications.delivered_prompt.id == prompt.id
+    assert tuple(entry.id for entry in publications.notifications) == (
+        prepared.notification_ids
+    )
+    remaining = store.agent_notifications()
+    assert len(remaining) == 1
+    assert remaining[0].data["description"] == "second"

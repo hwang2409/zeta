@@ -564,7 +564,9 @@ kind. On protocol 1.2, `sub_agent_receipt` carries agent completion notification
 and unknown future kinds; `task_exit_notification`,
 `project_inbox_notification`, `child_question`, `child_question_withdrawn`, and
 `child_idle` carry their durable notification `data` object with the matching
-known kind.
+known kind. `child_message_delivered` is emitted for the parent session after a
+running child starts answering a staged `agent_send`; its data contains the
+child label and the bounded one-line message preview.
 
 ### reconnecting sessions and background completions
 
@@ -579,12 +581,20 @@ as `send` and `resume` return the existing `-32004` busy error; they cannot take
 the reserved turn.
 
 The wake claims one notification batch without consuming it. Receipt events
-are streamed from that claim. The server acknowledges the full batch only
-after the parent turn succeeds. Provider failure, cancellation, or client
-disconnection releases the claim without acknowledgement, so the same batch
-remains pending for the next attach. Repeated reconnects or resumes do not
-schedule another parent turn for a batch that completed successfully. If a
-turn is active, the server does not start a concurrent notification turn.
+are streamed from that claim. Each receipt includes a stable
+`data.notification_id`. Within one serve process, the server sends at most one
+receipt per id after a successful write. A failed or canceled write remains
+retryable, so a receipt can repeat but is not lost. A canceled write to a
+client that does not read waits at most one second, then the server closes
+that connection. A still-pending notification can be sent again after a reconnect or serve
+restart, so clients must deduplicate receipts by `notification_id`.
+
+Model delivery remains exactly once and is acknowledged only after provider
+answer evidence. Provider failure, cancellation, or client disconnection
+releases an unacknowledged claim, so the same batch remains pending for the
+next attach. Repeated reconnects or resumes do not schedule another parent turn
+for a batch that completed successfully. If a turn is active, the server does
+not start a concurrent notification turn.
 
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"usage","session_id":"abc123","usage":{"input_tokens":10,"output_tokens":4}}}
@@ -754,6 +764,7 @@ Event fields are:
 | `child_question` | `event`, `data: object` | `session_id` |
 | `child_question_withdrawn` | `event`, `data: object` | `session_id` |
 | `child_idle` | `event`, `data: object` | `session_id` |
+| `child_message_delivered` | `event`, `data: object` | `session_id` |
 | `retry` | `event`, `data: object` | `session_id` |
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id` |
