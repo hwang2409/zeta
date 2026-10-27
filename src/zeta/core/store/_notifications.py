@@ -178,9 +178,8 @@ class NotificationStateMixin:
             pending = next(
                 (
                     entry
-                    for notification_id, entry in self._active_notifications.items()
-                    if notification_id not in self._active_notification_acks
-                    and entry.data.get("kind") == PROJECT_INBOX_NOTIFICATION_KIND
+                    for entry in self._active_notifications.values()
+                    if entry.data.get("kind") == PROJECT_INBOX_NOTIFICATION_KIND
                 ),
                 None,
             )
@@ -262,9 +261,8 @@ class NotificationStateMixin:
             self._load()
             questions = [
                 entry
-                for notification_id, entry in self._active_notifications.items()
-                if notification_id not in self._active_notification_acks
-                and entry.data.get("kind") == CHILD_QUESTION_NOTIFICATION_KIND
+                for entry in self._active_notifications.values()
+                if entry.data.get("kind") == CHILD_QUESTION_NOTIFICATION_KIND
                 and entry.data.get("child_instance_id") == child_instance_id
             ]
             if not questions:
@@ -471,14 +469,15 @@ class NotificationStateMixin:
     ) -> list[ConversationEntry]:
         """Return durable background-child notifications on the active branch."""
 
+        entries = (
+            self._active_notifications.values()
+            if pending_only
+            else (entry for entry in self.replay() if entry.type == "notification")
+        )
         return [
             self._snapshot_entry(entry)
-            for notification_id, entry in self._active_notifications.items()
-            if not pending_only
-            or (
-                notification_id not in self._active_notification_acks
-                and entry.data.get("display_only") is not True
-            )
+            for entry in entries
+            if not pending_only or entry.data.get("display_only") is not True
         ]
 
     def is_agent_notification_presented_to_tui(

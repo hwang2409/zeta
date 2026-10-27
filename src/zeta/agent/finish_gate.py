@@ -143,6 +143,11 @@ class FinishGateState:
                     if close is not None:
                         await close()
         except TimeoutError:
+            flow = getattr(child_loop, "step_delivery", None)
+            if flow is not None and (
+                await flow.admit_terminal("finish_gate_timeout")
+            ).pending:
+                return None
             task_existed = (
                 task_running_at_entry
                 or task_registry.task_start_generation != task_start_generation
@@ -185,6 +190,11 @@ class FinishGateState:
         loop = asyncio.get_running_loop()
         deadline = self._task_deadline() if tasks_running else self._child_deadline()
         if loop.time() >= deadline:
+            flow = getattr(child_loop, "step_delivery", None)
+            if flow is not None and (
+                await flow.admit_terminal("finish_gate_timeout")
+            ).pending:
+                return None
             return self._wait_timeout_result(child_loop, tasks_running=tasks_running)
         try:
             async with asyncio.timeout_at(deadline):
@@ -192,6 +202,11 @@ class FinishGateState:
                     child_loop.agent_instance_id or ""
                 )
         except TimeoutError:
+            flow = getattr(child_loop, "step_delivery", None)
+            if flow is not None and (
+                await flow.admit_terminal("finish_gate_timeout")
+            ).pending:
+                return None
             return self._wait_timeout_result(child_loop, tasks_running=tasks_running)
         if tasks_running and loop.time() >= self._child_deadline():
             self.task_outlived_child_bound = True
@@ -252,7 +267,6 @@ async def run_finish_gate(
         tasks,
         consume_events,
         failed,
-        delivering_prompt_id,
     )
 
 
@@ -263,7 +277,6 @@ async def _run_finish_gate(
     tasks: tuple[tuple[str, str], ...],
     consume_events: ConsumeEvents,
     failed: Callable[[], bool],
-    delivering_prompt_id: str | None,
 ) -> FinishGateResult:
     async def handoff(arguments: dict[str, Any]) -> str:
         state._control().handoff = (arguments["reason"], arguments["outputs"])
@@ -287,7 +300,6 @@ async def _run_finish_gate(
             child_loop,
             consume_events,
             failed,
-            delivering_prompt_id,
         )
     finally:
         child_loop.tool_registry.unregister("agent_handoff")
@@ -298,7 +310,6 @@ async def _wait_for_finish(
     child_loop: AgentLoop,
     consume_events: ConsumeEvents,
     failed: Callable[[], bool],
-    delivering_prompt_id: str | None,
 ) -> FinishGateResult:
     while not failed():
         children = state.owned_children(child_loop)
@@ -306,18 +317,22 @@ async def _wait_for_finish(
         state.note_task_outlived_child_bound(bool(tasks))
         state.begin_post_task_turns(bool(tasks))
         pending_notification = child_loop.notification_system_message() is not None
+        flow = getattr(child_loop, "step_delivery", None)
+        delivery_pending = bool(
+            flow is not None
+            and (await flow.admit_terminal("finish_gate_wait")).pending
+        )
         terminal = await _terminal_transition(
             child_loop,
             children,
             tasks,
-            pending_notification,
-            delivering_prompt_id,
+            pending_notification or delivery_pending,
         )
         if terminal is not None:
             return terminal
         if state.should_wait_without_model(bool(tasks)):
             result = await state.wait_transition(child_loop, tasks_running=True)
-        elif pending_notification:
+        elif pending_notification or delivery_pending:
             result = await state.run_model_turn(
                 child_loop, child_loop.run_notification_turn(), consume_events
             )
@@ -335,13 +350,7 @@ async def _terminal_transition(
     children: tuple[tuple[str, str], ...],
     tasks: tuple[tuple[str, str], ...],
     pending_notification: bool,
-    delivering_prompt_id: str | None,
 ) -> FinishGateResult | None:
-    pending_prompts = await child_loop.store._to_thread_durable(
-        child_loop.store.pending_prompts
-    )
-    if any(prompt.id != delivering_prompt_id for prompt in pending_prompts):
-        return FinishGateResult("completed")
     if not children and not tasks and not pending_notification:
         return FinishGateResult("completed")
     return None

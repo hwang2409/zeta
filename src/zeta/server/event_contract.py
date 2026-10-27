@@ -54,6 +54,7 @@ STREAM_EVENT_WIRE_EVENTS = {
     StreamEventType.TOOL_EXECUTION_UPDATE: "tool_output",
     StreamEventType.TOOL_EXECUTION_END: "tool_end",
     StreamEventType.AGENT_NOTIFICATION: "notification_by_kind",
+    StreamEventType.CHILD_MESSAGE_DELIVERED: "child_message_delivered",
     StreamEventType.ACCOUNT_LIMIT: "account_limit",
     StreamEventType.ACCOUNT_STATE_UNKNOWN: "account_state_unknown",
     StreamEventType.TURN_END: "turn_end",

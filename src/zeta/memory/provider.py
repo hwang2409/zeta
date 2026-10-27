@@ -1,4 +1,4 @@
-"""Completion-backend adapter for one memory reconciliation request."""
+"""Completion backend for project-memory work, not live session requests."""
 
 from __future__ import annotations
 

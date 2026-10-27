@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +14,7 @@ from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.background import recover_agent_children
+from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -55,31 +55,34 @@ def _register_missing_background_child(
     return child_id
 
 
-def test_recovery_does_not_duplicate_notification_appended_after_indexing(
+@pytest.mark.asyncio
+async def test_recovery_does_not_duplicate_notification_appended_after_indexing(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="recovery-race")
     child_1 = _register_missing_background_child(store, 1)
     child_2 = _register_missing_background_child(store, 2)
     external = ConversationStore(tmp_path, session_id="recovery-race")
-    original_append_lock = store._append_lock
-    staged = False
+    original_sync = store.sync_agent_completion_notification
 
-    @contextmanager
-    def lock_after_external_completion():
-        nonlocal staged
-        if not staged:
-            staged = True
+    def sync_after_external_completion(child_instance_id: str):
+        if child_instance_id == child_2:
             _append_notification(external, child_2)
-        with original_append_lock():
-            yield
+        return original_sync(child_instance_id)
 
     loop = SimpleNamespace(
         store=store,
         _background_owner=SimpleNamespace(notification_store=store),
     )
-    with patch.object(store, "_append_lock", lock_after_external_completion):
-        recover_agent_children(loop)
+    with patch.object(
+        store,
+        "sync_agent_completion_notification",
+        side_effect=sync_after_external_completion,
+    ):
+        deliveries = await asyncio.to_thread(recover_agent_children, loop)
+        flow = StepDeliveryFlow(store)
+        for delivery in deliveries:
+            await flow.produce(delivery)
 
     notifications = [
         entry
@@ -94,7 +97,8 @@ def test_recovery_does_not_duplicate_notification_appended_after_indexing(
     )
 
 
-def test_nested_recovery_refreshes_both_notification_stores_per_child(
+@pytest.mark.asyncio
+async def test_nested_recovery_refreshes_both_notification_stores_per_child(
     tmp_path: Path,
 ) -> None:
     root_store = ConversationStore(tmp_path / "root", session_id="root")
@@ -114,15 +118,12 @@ def test_nested_recovery_refreshes_both_notification_stores_per_child(
         )
 
     external_nested = ConversationStore(tmp_path / "nested", session_id="nested")
-    original_append = root_store.append_agent_notification_if_absent
-    staged = False
+    original_sync = root_store.sync_agent_completion_notification
 
-    def append_after_indexes(*args: object, **kwargs: object):
-        nonlocal staged
-        if not staged:
-            staged = True
+    def sync_after_indexes(child_instance_id: str):
+        if child_instance_id == "nested:2":
             _append_notification(external_nested, "nested:2")
-        return original_append(*args, **kwargs)
+        return original_sync(child_instance_id)
 
     loop = SimpleNamespace(
         store=nested_store,
@@ -130,24 +131,28 @@ def test_nested_recovery_refreshes_both_notification_stores_per_child(
     )
     with patch.object(
         root_store,
-        "append_agent_notification_if_absent",
-        side_effect=append_after_indexes,
+        "sync_agent_completion_notification",
+        side_effect=sync_after_indexes,
     ):
-        recover_agent_children(loop)
+        deliveries = await asyncio.to_thread(recover_agent_children, loop)
+        flow = StepDeliveryFlow(root_store)
+        for delivery in deliveries:
+            await flow.produce(delivery)
 
     with ConversationStore(child_paths[2].parent, session_id="2") as child_2:
         assert child_2.agent_canceled() is None
     assert [
         (entry.data["child_instance_id"], entry.data["status"])
         for entry in root_store.agent_notifications(pending_only=False)
-    ] == [("nested:1", "canceled")]
+    ] == [("nested:1", "canceled"), ("nested:2", "completed")]
     assert [
         (entry.data["child_instance_id"], entry.data["status"])
         for entry in nested_store.agent_notifications(pending_only=False)
-    ] == [("nested:2", "completed"), ("nested:1", "canceled")]
+    ] == [("nested:2", "completed")]
 
 
-def test_nested_recovery_uses_notification_returned_by_second_store(
+@pytest.mark.asyncio
+async def test_nested_recovery_uses_notification_returned_by_second_store(
     tmp_path: Path,
 ) -> None:
     root_store = ConversationStore(tmp_path / "root", session_id="root")
@@ -164,15 +169,11 @@ def test_nested_recovery_uses_notification_returned_by_second_store(
     )
 
     external_nested = ConversationStore(tmp_path / "nested", session_id="nested")
-    original_append = nested_store.append_agent_notification_if_absent
-    staged = False
+    original_sync = nested_store.sync_agent_completion_notification
 
-    def append_after_fallback(*args: object, **kwargs: object):
-        nonlocal staged
-        if not staged:
-            staged = True
-            _append_notification(external_nested, "nested:1")
-        return original_append(*args, **kwargs)
+    def sync_after_fallback(child_instance_id: str):
+        _append_notification(external_nested, child_instance_id)
+        return original_sync(child_instance_id)
 
     loop = SimpleNamespace(
         store=nested_store,
@@ -180,15 +181,18 @@ def test_nested_recovery_uses_notification_returned_by_second_store(
     )
     with patch.object(
         nested_store,
-        "append_agent_notification_if_absent",
-        side_effect=append_after_fallback,
+        "sync_agent_completion_notification",
+        side_effect=sync_after_fallback,
     ):
-        recover_agent_children(loop)
+        deliveries = await asyncio.to_thread(recover_agent_children, loop)
+        flow = StepDeliveryFlow(root_store)
+        for delivery in deliveries:
+            await flow.produce(delivery)
 
     with ConversationStore(child_path.parent, session_id=child_path.name) as child:
         assert child.agent_canceled() is None
     assert root_store.agent_notifications(pending_only=False)[0].data["status"] == (
-        "canceled"
+        "completed"
     )
     assert nested_store.agent_notifications(pending_only=False)[0].data["status"] == (
         "completed"

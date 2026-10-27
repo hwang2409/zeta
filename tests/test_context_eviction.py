@@ -21,6 +21,7 @@ from zeta.context_eviction import (
     recall_history,
 )
 from zeta.core.context import CompactionPolicy, ContextAssembler
+from zeta.core.context_parts.tool_results import truncate_tool_results
 from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
@@ -1729,8 +1730,8 @@ def test_eviction_matches_independent_full_recount_reference(tmp_path: Path) -> 
     }
     fitting_target = actual.tokens_after - 400
     assembler = ContextAssembler(ConversationStore(tmp_path / "fitting"))
-    fitted_actual = assembler._truncate_tool_results(
-        actual.messages, fitting_target, actual_seqs
+    fitted_actual = truncate_tool_results(
+        actual.messages, fitting_target, actual_seqs, assembler.token_counter
     )
     fitted_reference = _full_recount_truncation_reference(
         reference.messages,
@@ -1823,13 +1824,13 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
         retained_tail=1,
         telemetry_sink=telemetry.append,
     )
-    assembler._calibration.provider_token_total = 4321
+    assembler._request_budget.calibration.provider_token_total = 4321
     assembler.last_compaction_telemetry = {"existing": True}
     assembler.last_usage = {"input_tokens": 91}
     before_entries = store.replay()
     before_state = (
         assembler.last_context,
-        assembler._calibration.provider_token_total,
+        assembler._request_budget.calibration.provider_token_total,
         dict(assembler.last_compaction_telemetry),
         dict(assembler.last_usage),
         assembler.tokens_used_this_session,
@@ -1870,7 +1871,7 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
     assert not any(entry.type == "compaction" for entry in store.replay())
     assert (
         assembler.last_context,
-        assembler._calibration.provider_token_total,
+        assembler._request_budget.calibration.provider_token_total,
         dict(assembler.last_compaction_telemetry),
         dict(assembler.last_usage),
         assembler.tokens_used_this_session,

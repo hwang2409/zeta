@@ -411,7 +411,7 @@ class ServerRuntime:
                 project_id=opened.metadata.project_id,
             )
         except BaseException:
-            opened.store.close()
+            await asyncio.to_thread(opened.store.close)
             raise
         await self._replace(composition)
         return self.metadata
@@ -448,9 +448,14 @@ class ServerRuntime:
         else:
             session_id = state.session_id
             state.loop.set_background_event_sink(lambda event: sink(session_id, event))
+        memory_sink = self._memory_notice_sink
+        state.loop.set_mcp_notice_sink(
+            None
+            if memory_sink is None
+            else lambda message: memory_sink(state.session_id, message)
+        )
         reconciler = state.loop.memory_reconciler
         if reconciler is not None:
-            memory_sink = self._memory_notice_sink
             reconciler.notice = (
                 None
                 if memory_sink is None

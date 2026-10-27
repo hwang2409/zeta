@@ -194,11 +194,11 @@ def test_notification_queries_use_incremental_state_without_branch_scan(
     )
     store.mark_agent_notification_presented_to_tui(notification.id)
     store.acknowledge_agent_notification(notification.id)
-    store._active_branch = _unexpected_history_scan  # type: ignore[method-assign]
-
     assert [entry.id for entry in store.agent_notifications(pending_only=False)] == [
         notification.id
     ]
+    store._active_branch = _unexpected_history_scan  # type: ignore[method-assign]
+
     assert store.agent_notifications() == []
     assert store.is_agent_notification_presented_to_tui(notification.id)
 
@@ -232,8 +232,11 @@ def test_index_parity_with_replay(tmp_path: Path) -> None:
             for entry in branch
             if entry.type == "notification_tui_presented"
         }
-        assert list(store._active_notifications) == list(notifications), operation
-        assert store._active_notification_acks == acknowledgements, operation
+        assert list(store._active_notifications) == [
+            notification_id
+            for notification_id in notifications
+            if notification_id not in acknowledgements
+        ], operation
         assert store._active_notification_presentations == presentations, operation
         assert [
             entry.id for entry in store.agent_notifications(pending_only=False)

@@ -360,6 +360,7 @@ def test_recovery_and_send_release_borrowed_child_stores(
 ) -> None:
     from tests.support.fake_backend import FakeBackend
     from zeta.agent.background import recover_agent_children
+    from zeta.agent.pending_delivery import StepDeliveryFlow
     from zeta.protocol.types import ToolCall
     from zeta.tools.agent_send import send_to_run
 
@@ -382,6 +383,10 @@ def test_recovery_and_send_release_borrowed_child_stores(
         opened.store.append_task_notification(
             task_id="task-exited", command="echo done", exit_code=0,
         )
+    resident_child = ConversationStore(
+        opened.store.session_dir / "agents", session_id="1"
+    )
+    channel = loop._background_owner.conversation_channel
     retained = []
     original_init = ConversationStore.__init__
 
@@ -389,19 +394,24 @@ def test_recovery_and_send_release_borrowed_child_stores(
         original_init(self, *args, **kwargs)
         retained.append(self)
 
-    monkeypatch.setattr(ConversationStore, "__init__", record)
-    assert asyncio.run(
-        send_to_run(
+    async def exercise() -> None:
+        flow = StepDeliveryFlow(resident_child)
+        await flow.initialize()
+        channel.register_delivery_flow("child", flow)
+        monkeypatch.setattr(ConversationStore, "__init__", record)
+        assert await send_to_run(
             opened.store,
             "child",
             "follow-up",
-            channel=loop._background_owner.conversation_channel,
-        )
-    ) is None
-    recover_agent_children(loop)
-    assert len(retained) == 3
+            channel=channel,
+        ) is None
+        await asyncio.to_thread(recover_agent_children, loop)
+        await loop.close()
+
+    asyncio.run(exercise())
+    assert len(retained) == 2
     assert all(not store._release_lease.alive for store in retained)
-    asyncio.run(loop.close())
+    resident_child.close()
     opened.store.close()
     manager.delete(opened.metadata.session_id)
 

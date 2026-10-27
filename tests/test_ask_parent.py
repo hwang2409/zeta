@@ -7,6 +7,7 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.background import BackgroundAgentOwner
+from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.runtime.loop import AgentLoop
@@ -41,6 +42,18 @@ def _setup(tmp_path: Path):
     channel = getattr(owner, "conversation_channel", None)
     if channel is not None:
         channel.register_loop(handle)
+        channel.register_delivery_flow(
+            None,
+            StepDeliveryFlow(
+                parent, wake_sink=lambda _source: channel.wake(None)
+            ),
+        )
+        channel.register_delivery_flow(
+            handle,
+            StepDeliveryFlow(
+                child, wake_sink=lambda _source: channel.wake(handle)
+            ),
+        )
     registry = ToolRegistry(
         tmp_path,
         register_builtin=False,
@@ -137,13 +150,13 @@ async def test_child_finish_and_cancel_withdraw_pending_questions(
     parent, _child, _registry, handle, owner = _setup_without_loop(tmp_path)
     channel = owner.conversation_channel
     for reason in ("finished", "canceled"):
-        channel.publish_question(
+        await channel.publish_question(
             child_instance_id=handle,
             question_id=reason,
             question=f"Question before {reason}?",
             options=None,
         )
-        assert channel.close_questions(handle, reason=reason) == 1
+        assert await channel.close_questions(handle, reason=reason) == 1
 
     pending = parent.agent_notifications()
     assert [entry.data["kind"] for entry in pending] == [
@@ -156,12 +169,13 @@ async def test_child_finish_and_cancel_withdraw_pending_questions(
     ]
 
 
-def test_resume_closes_question_for_child_that_no_longer_runs_once(
+@pytest.mark.asyncio
+async def test_resume_closes_question_for_child_that_no_longer_runs_once(
     tmp_path: Path,
 ) -> None:
     parent, child, _registry, handle, owner = _setup_without_loop(tmp_path)
     child.mark_agent_parent("agent-1", agent_type="worker")
-    owner.conversation_channel.publish_question(
+    await owner.conversation_channel.publish_question(
         child_instance_id=handle,
         question_id="resume-question",
         question="Still there?",
@@ -177,6 +191,7 @@ def test_resume_closes_question_for_child_that_no_longer_runs_once(
     loop = AgentLoop(
         FakeBackend([]), resumed, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
+    await loop.activate()
     pending = resumed.agent_notifications()
     assert [entry.data["kind"] for entry in pending] == [
         "child_question_withdrawn",
@@ -190,15 +205,17 @@ def test_resume_closes_question_for_child_that_no_longer_runs_once(
     second = AgentLoop(
         FakeBackend([]), reopened, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
+    await second.activate()
     assert len(reopened.agent_notifications()) == 2
     assert loop is not second
 
 
-def test_resume_with_no_child_marker_withdraws_orphaned_question(
+@pytest.mark.asyncio
+async def test_resume_with_no_child_marker_withdraws_orphaned_question(
     tmp_path: Path,
 ) -> None:
     parent, child, _registry, handle, owner = _setup_without_loop(tmp_path)
-    owner.conversation_channel.publish_question(
+    await owner.conversation_channel.publish_question(
         child_instance_id=handle,
         question_id="orphan",
         question="Anyone there?",
@@ -212,7 +229,8 @@ def test_resume_with_no_child_marker_withdraws_orphaned_question(
     resumed = ConversationStore(
         parent_path.parent, session_id=parent_path.name, cwd=tmp_path
     )
-    AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    await loop.activate()
     pending = resumed.agent_notifications()
     assert len(pending) == 1
     assert pending[0].data["kind"] == "child_question_withdrawn"
@@ -248,8 +266,18 @@ async def test_grandchild_question_wakes_direct_parent_then_routes_to_live_ances
     )
     channel = owner.conversation_channel
     channel.register_loop("root:1")
+    channel.register_delivery_flow(
+        None,
+        StepDeliveryFlow(root, wake_sink=lambda _source: channel.wake(None)),
+    )
+    channel.register_delivery_flow(
+        "root:1",
+        StepDeliveryFlow(
+            parent, wake_sink=lambda _source: channel.wake("root:1")
+        ),
+    )
 
-    channel.publish_question(
+    await channel.publish_question(
         child_instance_id="root:1:1",
         question_id="direct",
         question="Direct?",
@@ -263,7 +291,7 @@ async def test_grandchild_question_wakes_direct_parent_then_routes_to_live_ances
 
     channel.unregister_loop("root:1")
     owner.unregister("root:1")
-    channel.publish_question(
+    await channel.publish_question(
         child_instance_id="root:1:1",
         question_id="adopted",
         question="Ancestor?",
@@ -295,5 +323,14 @@ def _setup_without_loop(tmp_path: Path):
         None,  # type: ignore[arg-type] - watcher state is not used by this store test
         parent_store=parent,
         active_store=child,
+    )
+    channel = owner.conversation_channel
+    channel.register_delivery_flow(
+        None,
+        StepDeliveryFlow(parent, wake_sink=lambda _source: channel.wake(None)),
+    )
+    channel.register_delivery_flow(
+        handle,
+        StepDeliveryFlow(child, wake_sink=lambda _source: channel.wake(handle)),
     )
     return parent, child, None, handle, owner

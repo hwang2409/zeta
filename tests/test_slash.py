@@ -505,7 +505,7 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
     assembler = ContextAssembler(
         store,
         backend=backend,
-        token_budget=80,
+        token_budget=164,
         retained_tail=1,
         token_counter=token_count,
     )

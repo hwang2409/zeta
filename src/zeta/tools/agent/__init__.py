@@ -1017,7 +1017,9 @@ def register(registry: ToolRegistry) -> None:
             "paths resolve there instead of your own working directory. The "
             "returned child_instance_id is the "
             "stable handle for agent_status. Background completion is announced "
-            "automatically when idle or at the next turn boundary; do not poll. "
+            "automatically: while you run, after your current tool call and "
+            "before your next model call; while you are idle, at your next "
+            "turn. Do not poll. "
             "Built-in types: "
             f"{agent_description}"
         ),
