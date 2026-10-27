@@ -10,6 +10,7 @@ import queue
 import socketserver
 import sys
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Generic, Protocol, TextIO, TypeVar
@@ -19,7 +20,7 @@ import httpx
 
 
 TokenT = TypeVar("TokenT")
-# Two waits stay within the publication budget while tolerating loop congestion.
+# Tolerates loop congestion; every wait is also capped by the publication deadline.
 _PUBLICATION_DECISION_TIMEOUT_SECONDS = 20.0
 
 
@@ -31,8 +32,10 @@ class _PublicationArbiter:
         loop: asyncio.AbstractEventLoop,
         task: asyncio.Task[object],
         commit: Callable[[], bool],
+        deadline: float,
     ) -> None:
         self._loop = loop
+        self._deadline = deadline
         self._task = task
         self._commit = commit
         self.cancel_requested = False
@@ -42,6 +45,10 @@ class _PublicationArbiter:
     def cancel(self) -> None:
         self.cancel_requested = True
 
+    def _wait_seconds(self) -> float:
+        remaining = max(0.0, self._deadline - time.monotonic())
+        return min(_PUBLICATION_DECISION_TIMEOUT_SECONDS, remaining)
+
     def is_set(self) -> bool:
         response: concurrent.futures.Future[bool] = concurrent.futures.Future()
         try:
@@ -50,15 +57,13 @@ class _PublicationArbiter:
             self.decision_failed = True
             return True
         try:
-            return not response.result(timeout=_PUBLICATION_DECISION_TIMEOUT_SECONDS)
+            return not response.result(timeout=self._wait_seconds())
         except TimeoutError:
             if response.cancel():
                 self.decision_failed = True
                 return True
             try:
-                return not response.result(
-                    timeout=_PUBLICATION_DECISION_TIMEOUT_SECONDS
-                )
+                return not response.result(timeout=self._wait_seconds())
             except TimeoutError:
                 self.decision_failed = True
                 return True
@@ -98,6 +103,20 @@ async def _wait_bounded_work(
     return cancelled
 
 
+def _save_by_deadline(
+    provider: LoginProvider[TokenT],
+    tokens: TokenT,
+    deadline: float,
+    arbiter: _PublicationArbiter,
+) -> None:
+    # The lock wait starts when the worker runs, so it gets only the time left.
+    provider.credential_store.save(
+        tokens,
+        lock_timeout=max(0.0, deadline - time.monotonic()),
+        cancel_event=arbiter,
+    )
+
+
 async def _publish_credentials(
     provider: LoginProvider[TokenT],
     tokens: TokenT,
@@ -108,17 +127,13 @@ async def _publish_credentials(
         await asyncio.to_thread(provider.credential_store.save, tokens)
         return None
 
+    deadline = time.monotonic() + timeout
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
     assert task is not None
-    arbiter = _PublicationArbiter(loop, task, commit or (lambda: True))
+    arbiter = _PublicationArbiter(loop, task, commit or (lambda: True), deadline)
     publication = asyncio.create_task(
-        asyncio.to_thread(
-            provider.credential_store.save,
-            tokens,
-            lock_timeout=timeout,
-            cancel_event=arbiter,
-        )
+        asyncio.to_thread(_save_by_deadline, provider, tokens, deadline, arbiter)
     )
     cancelled = await _wait_bounded_work(publication, arbiter.cancel)
     if cancelled and not arbiter.committed:

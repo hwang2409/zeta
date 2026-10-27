@@ -425,7 +425,7 @@ def test_login_publication_decision_denies_when_loop_stops_or_closes(
         login_flow, "_PUBLICATION_DECISION_TIMEOUT_SECONDS", 0.05
     )
     arbiter = login_flow._PublicationArbiter(
-        StoppedLoop(), Task(), commit  # type: ignore[arg-type]
+        StoppedLoop(), Task(), commit, time.monotonic() + 60  # type: ignore[arg-type]
     )
     decision: list[bool] = []
 
@@ -449,7 +449,7 @@ def test_login_publication_decision_denies_when_loop_stops_or_closes(
     closed_loop = asyncio.new_event_loop()
     closed_loop.close()
     closed_arbiter = login_flow._PublicationArbiter(
-        closed_loop, Task(), commit  # type: ignore[arg-type]
+        closed_loop, Task(), commit, time.monotonic() + 60  # type: ignore[arg-type]
     )
     assert closed_arbiter.is_set()
     assert closed_arbiter.decision_failed
@@ -641,3 +641,31 @@ async def test_login_reraises_non_port_bind_error(monkeypatch: pytest.MonkeyPatc
         await run_login(provider, lambda: ("verifier", "challenge", "state"))
 
     assert exc_info.value.errno == errno.EACCES
+
+
+@pytest.mark.asyncio
+async def test_publication_decision_shares_the_publication_deadline() -> None:
+    # The lock wait uses most of the publication budget; then the loop is busy.
+    # The decision must not wait past the one publication deadline.
+    loop = asyncio.get_running_loop()
+    decisions: list[bool] = []
+
+    class Store:
+        def save(
+            self, _tokens: object, *, lock_timeout: float, cancel_event: object
+        ) -> None:
+            time.sleep(0.04)
+            loop.call_soon_threadsafe(time.sleep, 0.4)
+            decisions.append(cancel_event.is_set())  # type: ignore[attr-defined]
+
+    class Provider:
+        credential_store = Store()
+
+    with pytest.raises(login_flow.LoginPublicationError):
+        await login_flow._publish_credentials(
+            Provider(),  # type: ignore[arg-type]
+            OAuthTokens("access", "refresh", 4_000_000_000),
+            0.05,
+            lambda: True,
+        )
+    assert decisions == [True]
