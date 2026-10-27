@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 import json
 import os
 import stat
@@ -390,35 +389,90 @@ def isolate_zeta_home(
         live_home_write_guard.assert_clean()
 
 
-def _open_file_descriptors() -> set[int]:
+_FD_GROWTH: list[tuple[int, str]] = []
+_FD_MAX = -1
+_FD_OPEN_MAX = 0
+
+
+def _describe_fd(descriptor: int, directory: str) -> str:
+    try:
+        target = os.readlink(f"{directory}/{descriptor}")
+    except OSError:
+        target = "unknown"
+    try:
+        mode = os.fstat(descriptor).st_mode
+    except OSError:
+        return target
+    kind = next(
+        (
+            name
+            for predicate, name in (
+                (stat.S_ISREG, "file"),
+                (stat.S_ISDIR, "directory"),
+                (stat.S_ISFIFO, "pipe"),
+                (stat.S_ISSOCK, "socket"),
+                (stat.S_ISCHR, "character-device"),
+            )
+            if predicate(mode)
+        ),
+        "other",
+    )
+    return f"{target} ({kind})"
+
+
+def _open_file_descriptors() -> dict[int, str]:
     for directory in ("/proc/self/fd", "/dev/fd"):
         try:
             names = os.listdir(directory)
         except OSError:
             continue
-        descriptors = set()
+        descriptors = {}
         for name in names:
             try:
                 descriptor = int(name)
                 os.fstat(descriptor)
             except (OSError, ValueError):
                 continue
-            descriptors.add(descriptor)
+            descriptors[descriptor] = _describe_fd(descriptor, directory)
         return descriptors
-    return set()
+    return {}
 
 
-@pytest.hookimpl(hookwrapper=True, trylast=True)
-def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
-    """Collect abandoned runtime cycles before their descriptors accumulate."""
-    del item, nextitem
+@pytest.fixture(autouse=True)
+def no_retained_file_descriptors(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+    """Report retained fds and stop workers before they approach FD_SETSIZE."""
+    global _FD_MAX, _FD_OPEN_MAX
+    # Stable pytest/xdist descriptors and session fixtures predate this snapshot.
     before = _open_file_descriptors()
+    _FD_MAX = max((_FD_MAX, *before), default=-1)
+    _FD_OPEN_MAX = max(_FD_OPEN_MAX, len(before))
     yield
     after = _open_file_descriptors()
-    if after != before:
-        gc.collect()
-        after = _open_file_descriptors()
-    assert max(after, default=-1) < 1024, "test worker exceeded select() FD_SETSIZE"
+    _FD_MAX = max((_FD_MAX, *after), default=-1)
+    _FD_OPEN_MAX = max(_FD_OPEN_MAX, len(after))
+    retained = sorted(after.keys() - before.keys())
+    _FD_GROWTH.append((len(retained), request.node.nodeid))
+    if retained:
+        details = ", ".join(f"fd {fd}: {after[fd]}" for fd in retained)
+        print(f"fd-retained nodeid={request.node.nodeid} {details}", flush=True)
+    highest = max(after, default=-1)
+    if highest >= 512:
+        pytest.fail(
+            f"{request.node.nodeid} reached fd {highest}; retained descriptors: "
+            f"{details if retained else 'none added by this test'}"
+        )
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    del session, exitstatus
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    top = sorted(_FD_GROWTH, reverse=True)[:5]
+    offenders = "; ".join(f"{nodeid} (+{count})" for count, nodeid in top)
+    print(
+        f"fd-summary worker={worker} max_fd={_FD_MAX} max_open={_FD_OPEN_MAX} "
+        f"top_retained=[{offenders}]",
+        flush=True,
+    )
 
 
 @pytest.fixture(autouse=True)
