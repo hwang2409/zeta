@@ -20,6 +20,27 @@ import httpx
 TokenT = TypeVar("TokenT")
 
 
+class _LoginCancellation(threading.Event):
+    def __init__(self, task: asyncio.Task[object]) -> None:
+        super().__init__()
+        self._task = task
+        self._publication_started = False
+        self._state_lock = threading.Lock()
+
+    @property
+    def publication_started(self) -> bool:
+        with self._state_lock:
+            return self._publication_started
+
+    def is_set(self) -> bool:
+        with self._state_lock:
+            # Task.cancel() records the request before CancelledError reaches this task.
+            if self._task.cancelling() > 0 or super().is_set():
+                return True
+            self._publication_started = True
+            return False
+
+
 class CredentialSink(Protocol[TokenT]):
     """The part of a provider credential store used by login."""
 
@@ -233,7 +254,9 @@ async def run_login(
         if publication_timeout_seconds is None:
             await asyncio.to_thread(provider.credential_store.save, tokens)
         else:
-            cancel_publication = threading.Event()
+            task = asyncio.current_task()
+            assert task is not None
+            cancel_publication = _LoginCancellation(task)
             publication = asyncio.create_task(
                 asyncio.to_thread(
                     provider.credential_store.save,
@@ -249,7 +272,10 @@ async def run_login(
                 await asyncio.shield(
                     asyncio.gather(publication, return_exceptions=True)
                 )
-                raise
+                if not cancel_publication.publication_started:
+                    raise
+                task.uncancel()
+                publication.result()
         return provider.token_handle(tokens)
     finally:
         # Cancellation can arrive after exchange, while shutdown is running.

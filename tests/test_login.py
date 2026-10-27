@@ -286,6 +286,120 @@ def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_login_does_not_publish_before_task_observes_cancellation() -> None:
+    tokens = OAuthTokens("access", "refresh", 4_000_000_000)
+    save_entered = threading.Event()
+    release_save = threading.Event()
+    save_finished = threading.Event()
+
+    class Store:
+        saved: OAuthTokens | None = None
+
+        def save(
+            self,
+            value: OAuthTokens,
+            *,
+            lock_timeout: float,
+            cancel_event: threading.Event,
+        ) -> None:
+            del lock_timeout
+            save_entered.set()
+            release_save.wait()
+            try:
+                if not cancel_event.is_set():
+                    self.saved = value
+            finally:
+                save_finished.set()
+
+    store = Store()
+
+    def build_url(state: str, challenge: str, redirect_uri: str) -> str:
+        del challenge
+        threading.Thread(
+            target=_post_callback,
+            args=(redirect_uri, {"code": "code", "state": state}),
+            daemon=True,
+        ).start()
+        return "https://authorize.invalid/"
+
+    async def exchange(*_args: object) -> OAuthTokens:
+        return tokens
+
+    task = asyncio.create_task(
+        run_login(
+            _provider(store, build_url, exchange),  # type: ignore[arg-type]
+            lambda: ("verifier", "challenge", "state"),
+            timeout_seconds=2,
+            publication_timeout_seconds=2,
+        )
+    )
+    assert await asyncio.to_thread(save_entered.wait, 2)
+
+    task.cancel()
+    release_save.set()
+    # Keep the event loop from delivering CancelledError until the save thread
+    # checks whether cancellation was requested.
+    assert save_finished.wait(2)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.saved is None
+
+
+@pytest.mark.asyncio
+async def test_login_cancel_after_publication_starts_reports_success() -> None:
+    tokens = OAuthTokens("access", "refresh", 4_000_000_000)
+    publication_started = threading.Event()
+    release_save = threading.Event()
+
+    class Store:
+        saved: OAuthTokens | None = None
+
+        def save(
+            self,
+            value: OAuthTokens,
+            *,
+            lock_timeout: float,
+            cancel_event: threading.Event,
+        ) -> None:
+            del lock_timeout
+            assert not cancel_event.is_set()
+            publication_started.set()
+            release_save.wait()
+            self.saved = value
+
+    store = Store()
+
+    def build_url(state: str, challenge: str, redirect_uri: str) -> str:
+        del challenge
+        threading.Thread(
+            target=_post_callback,
+            args=(redirect_uri, {"code": "code", "state": state}),
+            daemon=True,
+        ).start()
+        return "https://authorize.invalid/"
+
+    async def exchange(*_args: object) -> OAuthTokens:
+        return tokens
+
+    task = asyncio.create_task(
+        run_login(
+            _provider(store, build_url, exchange),  # type: ignore[arg-type]
+            lambda: ("verifier", "challenge", "state"),
+            timeout_seconds=2,
+            publication_timeout_seconds=2,
+        )
+    )
+    assert await asyncio.to_thread(publication_started.wait, 2)
+
+    task.cancel()
+    release_save.set()
+
+    assert await task == "access"
+    assert store.saved == tokens
+
+
+@pytest.mark.asyncio
 async def test_login_rejects_state_mismatch() -> None:
     store = _Store()
     exchanged = False
