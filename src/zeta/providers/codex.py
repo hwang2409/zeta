@@ -39,7 +39,10 @@ from .stream_errors import decode_stream_error
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
+    HTTPClientLease,
+    SSEEventAccumulator,
     StreamFinished,
+    build_response_error,
     cleanup_transport,
     close_resource,
     is_control_exception,
@@ -126,46 +129,6 @@ class _ItemState:
     blocks: set[BlockKey] = field(default_factory=set)
 
 
-class _SSEDecoder:
-    def __init__(self) -> None:
-        self.event = "message"
-        self.data: list[str] = []
-
-    def feed(self, line: str) -> tuple[str, dict[str, Any]] | None:
-        if not line:
-            return self._finish()
-        if line.startswith(":"):
-            return None
-        field, _, value = line.partition(":")
-        value = value.removeprefix(" ")
-        if field == "event":
-            self.event = value
-        elif field == "data":
-            self.data.append(value)
-        return None
-
-    def finish(self) -> tuple[str, dict[str, Any]] | None:
-        return self._finish()
-
-    def _finish(self) -> tuple[str, dict[str, Any]] | None:
-        if not self.data:
-            self.event = "message"
-            return None
-        event = self.event
-        value = "\n".join(self.data)
-        self.event = "message"
-        self.data = []
-        if value == "[DONE]":
-            return event, {"type": "done"}
-        try:
-            payload = json.loads(value)
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise CodexStreamError("Codex returned invalid SSE JSON") from exc
-        if not isinstance(payload, dict):
-            raise CodexStreamError("Codex SSE payload is not an object")
-        return event, payload
-
-
 class CodexBackend(CompletionBackend):
     """One-completion Codex Responses streaming backend."""
 
@@ -230,12 +193,7 @@ class CodexBackend(CompletionBackend):
             await close_resource(attempts)
 
     async def _refresh_token(self) -> str:
-        client = self.client or httpx.AsyncClient(timeout=None)
-        try:
-            return await self.token_store.refresh_token(client)
-        finally:
-            if self.client is None:
-                await close_resource(client)
+        return await HTTPClientLease(self.client).refresh(self.token_store.refresh_token)
 
     async def _complete_once(
         self,
@@ -244,7 +202,8 @@ class CodexBackend(CompletionBackend):
         *,
         token: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        client = self.client or httpx.AsyncClient(timeout=None)
+        lease = HTTPClientLease(self.client)
+        client = lease.client
         stream_context: Any = None
         entered = False
         primary_exception: BaseException | None = None
@@ -279,14 +238,13 @@ class CodexBackend(CompletionBackend):
             entered = True
             try:
                 if response.status_code >= 400:
-                    body = await _read_error_body(response)
-                    failure = _http_error(
-                        response.status_code,
-                        body,
-                        response.headers,
-                        account=getattr(self.token_store, "account", None),
+                    account = getattr(self.token_store, "account", None)
+                    raise await build_response_error(
+                        response,
+                        lambda status, body, headers: _http_error(
+                            status, body, headers, account=account
+                        ),
                     )
-                    raise failure
                 async for event in _decode_response(
                     response,
                     self.stall_seconds,
@@ -326,7 +284,7 @@ class CodexBackend(CompletionBackend):
                 stream_context=stream_context,
                 entered=entered,
                 client=client,
-                owns_client=self.client is None,
+                owns_client=lease.owned,
                 primary_exception=primary_exception,
                 http_error_type=CodexHTTPError,
             )
@@ -341,15 +299,6 @@ class CodexBackend(CompletionBackend):
             error,
             retries=retries,
         )
-
-
-async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes:
-    body = bytearray()
-    async for chunk in response.aiter_bytes():
-        body.extend(chunk[: limit - len(body)])
-        if len(body) >= limit:
-            break
-    return bytes(body)
 
 
 def _http_error(
@@ -400,7 +349,7 @@ async def _decode_response(
     *,
     diagnostics_path: Path | None = None,
 ) -> AsyncIterator[StreamEvent]:
-    decoder = _SSEDecoder()
+    decoder = SSEEventAccumulator("Codex", CodexStreamError)
     response_state = "not-started"
     items: dict[int, _ItemState] = {}
     blocks: dict[BlockKey, _BlockState] = {}
