@@ -173,6 +173,10 @@ class Logins:
             result = await self._attempt(login_provider, url, operation)
         except asyncio.CancelledError:
             cancelled = True
+        except (OSError, RuntimeError, ValueError, httpx.HTTPError):
+            result = failure(
+                "login_failed", "Could not complete sign-in. Please try again."
+            )
 
         if locked:
             release = asyncio.create_task(
