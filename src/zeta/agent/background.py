@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from collections.abc import Awaitable, Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from .recovery_lease import AgentLoopForRecovery, acquire_recovery_subtree
 from .terminal_fence import TerminalTransitionFence
 
 _AGENT_CANCEL_CONFIRM_TIMEOUT = 1.0
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,8 @@ class BackgroundAgentOwner:
         self._stores: list[ConversationStore] = []
         self._pending_stores: set[ConversationStore] = set()
         self._store_close_tasks: set[asyncio.Task[Any]] = set()
+        self._cancellation_tasks: set[asyncio.Task[Any]] = set()
+        self._cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
             str, Callable[[], CancellationRequest | asyncio.Task[None] | None]
         ] = {}
@@ -109,6 +113,7 @@ class BackgroundAgentOwner:
         self._cancel_confirmations: dict[
             str, asyncio.Task[bool] | asyncio.Task[None]
         ] = {}
+        self._cancel_cleanups: dict[str, asyncio.Task[None]] = {}
         self._parent_ids: dict[str, str | None] = {}
         self._original_parent_ids: dict[str, str | None] = {}
         self._wake_callback: Callable[[], None] | None = None
@@ -125,6 +130,22 @@ class BackgroundAgentOwner:
     def notify_wake(self) -> None:
         """Wake the frontend after a durable completion notification."""
         self._notify_frontend()
+
+    def create_cancellation_task[TaskResult](
+        self, awaitable: Awaitable[TaskResult]
+    ) -> asyncio.Task[TaskResult]:
+        """Keep cancellation confirmation alive for the agent tree lifetime."""
+
+        task = asyncio.create_task(awaitable)
+        self._cancellation_tasks.add(task)
+        task.add_done_callback(self._cancellation_tasks.discard)
+        return task
+
+    def create_cleanup_task(self, awaitable: Awaitable[None]) -> asyncio.Task[None]:
+        task = asyncio.create_task(awaitable)
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+        return task
 
     def cancel(self, instance_id: str) -> bool:
         """Request cancellation of one child and its owned descendants."""
@@ -174,9 +195,7 @@ class BackgroundAgentOwner:
             return CancellationOutcome("unconfirmed")
         return CancellationOutcome("confirmed")
 
-    def cancel_subtree(
-        self, instance_id: str
-    ) -> tuple[_CancellationConfirmation, ...]:
+    def _subtree_ids(self, instance_id: str) -> set[str]:
         selected = {instance_id}
         changed = True
         while changed:
@@ -185,6 +204,12 @@ class BackgroundAgentOwner:
                 if child not in selected and parent in selected:
                     selected.add(child)
                     changed = True
+        return selected
+
+    def cancel_subtree(
+        self, instance_id: str
+    ) -> tuple[_CancellationConfirmation, ...]:
+        selected = self._subtree_ids(instance_id)
         confirmations: list[_CancellationConfirmation] = []
         for child in tuple(self._cancellers):
             if child not in selected:
@@ -196,6 +221,7 @@ class BackgroundAgentOwner:
                     result = self._cancellers[child]()
                     if isinstance(result, CancellationRequest):
                         confirmation = result.confirmation
+                        self._cancel_cleanups[child] = result.cleanup
                     elif isinstance(result, asyncio.Task):
                         confirmation = result
                     if confirmation is not None:
@@ -203,6 +229,23 @@ class BackgroundAgentOwner:
             if confirmation is not None:
                 confirmations.append(_CancellationConfirmation(child, confirmation))
         return tuple(confirmations)
+
+    async def cancel_descendants_and_wait(self, instance_id: str) -> None:
+        """Cancel descendants before their parent loop can close."""
+
+        descendants = self._subtree_ids(instance_id) - {instance_id}
+        self.cancel_subtree(instance_id)
+        tasks = [
+            task
+            for child in descendants
+            for task in (
+                self._cancel_cleanups.get(child),
+                self._watchers.get(child),
+            )
+            if task is not None and task is not asyncio.current_task()
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def owns_running(self, instance_id: str) -> bool:
         return instance_id in self._cancellers
@@ -280,6 +323,7 @@ class BackgroundAgentOwner:
         self._original_parent_ids.pop(instance_id, None)
         self._cancel_requested.discard(instance_id)
         self._cancel_confirmations.pop(instance_id, None)
+        self._cancel_cleanups.pop(instance_id, None)
 
     def adopt(
         self,
@@ -322,6 +366,39 @@ class BackgroundAgentOwner:
     def running(self) -> bool:
         return bool(self._cancellers)
 
+    async def wait_for_shutdown(self, timeout: float) -> tuple[str, ...]:
+        """Join the agent tree, then force remaining work after the deadline."""
+
+        caller = asyncio.current_task()
+        waiter = asyncio.create_task(self.wait(excluding=caller))
+        done, _ = await asyncio.wait({waiter}, timeout=timeout)
+        if done:
+            await asyncio.gather(waiter, return_exceptions=True)
+            return ()
+        live = tuple(self._cancellers)
+        _LOGGER.warning(
+            "agent shutdown timed out with live children: %s",
+            ", ".join(live) or "unknown",
+        )
+        await self._force_shutdown(waiter, excluding=caller)
+        return live
+
+    async def _force_shutdown(
+        self, waiter: asyncio.Task[None], *, excluding: asyncio.Task[Any] | None
+    ) -> None:
+        waits = {
+            task
+            for task in (*self._cancellation_tasks, *self._watchers.values())
+            if task is not excluding
+        }
+        for task in waits:
+            task.cancel()
+        if waits or self._cleanup_tasks:
+            await asyncio.gather(
+                *waits, *tuple(self._cleanup_tasks), return_exceptions=True
+            )
+        await asyncio.gather(waiter, return_exceptions=True)
+
     @property
     def active_descriptions(self) -> tuple[str, ...]:
         return tuple(self._descriptions.values())
@@ -343,8 +420,8 @@ class BackgroundAgentOwner:
             await asyncio.gather(*close_tasks, return_exceptions=False)
             self._store_close_tasks.difference_update(close_tasks)
 
-    async def wait(self) -> None:
-        current = asyncio.current_task()
+    async def wait(self, *, excluding: asyncio.Task[Any] | None = None) -> None:
+        current = excluding or asyncio.current_task()
         while True:
             for instance_id, watcher in tuple(self._watchers.items()):
                 if watcher.done():

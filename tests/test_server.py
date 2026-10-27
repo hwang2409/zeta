@@ -28,6 +28,7 @@ import pytest
 
 import zeta.accounts.session as account_session_module
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.runtime.loop.agent as agent_loop_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
@@ -52,6 +53,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import ApprovalLifecycle
 from zeta.server.event_contract import (
@@ -66,6 +68,42 @@ from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 
 TIMEOUT = 3
+
+
+@pytest.mark.asyncio
+async def test_serve_close_joins_cancellation_resistant_child_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.server.runtime import ServerRuntime
+
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    owner = loop._background_owner
+
+    async def watcher() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(asyncio.sleep(0.04))
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            owner.unregister("root:1")
+
+    child = asyncio.create_task(watcher())
+    owner.register("root:1", lambda: None, child, description="child")
+    await asyncio.sleep(0)
+    monkeypatch.setattr(agent_loop_module, "SHUTDOWN_DELIVERY_TIMEOUT_SECONDS", 0.01)
+
+    await asyncio.wait_for(
+        ServerRuntime._close_state(SimpleNamespace(loop=loop)), timeout=0.2
+    )
+
+    assert child.done()
+    assert not owner.running
 
 
 def test_every_durable_notification_kind_has_an_explicit_wire_event() -> None:

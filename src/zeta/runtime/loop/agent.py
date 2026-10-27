@@ -512,7 +512,9 @@ class AgentLoop(
             if cancel_background and watchers:
                 await asyncio.gather(*watchers, return_exceptions=True)
             if cancel_background and self.agent_depth == 0:
-                await self._background_owner.wait()
+                await self._background_owner.wait_for_shutdown(
+                    SHUTDOWN_DELIVERY_TIMEOUT_SECONDS
+                )
             tracked_tasks = tuple(
                 task
                 for task in self._tracked_tasks

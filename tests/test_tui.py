@@ -52,6 +52,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 import zeta.accounts.session as account_session_module
+import zeta.runtime.loop.agent as agent_loop_module
 from tests.support.credentials import (
     anthropic_credentials,
     codex_credentials,
@@ -562,6 +563,39 @@ async def _background_event_transcript_count(
         )
     visible = terminal + "\n" + resumed if event == "session_shutdown" else combined
     return visible.count(needle), visible
+
+
+@pytest.mark.asyncio
+async def test_tui_close_joins_cancellation_resistant_child_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    owner = loop._background_owner
+
+    async def watcher() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(asyncio.sleep(0.04))
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            owner.unregister("root:1")
+
+    child = asyncio.create_task(watcher())
+    owner.register("root:1", lambda: None, child, description="child")
+    await asyncio.sleep(0)
+    monkeypatch.setattr(agent_loop_module, "SHUTDOWN_DELIVERY_TIMEOUT_SECONDS", 0.01)
+    app = TUIApp(loop, provider="codex", model="offline")
+
+    await asyncio.wait_for(app.close(), timeout=0.2)
+
+    assert child.done()
+    assert not owner.running
 
 
 @pytest.mark.asyncio
