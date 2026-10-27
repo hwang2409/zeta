@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -119,6 +120,10 @@ from .plan_mode_runtime import PlanModeRuntimeMixin
 from .project_inbox import ProjectInboxNotificationMixin
 from .skill_refresh import RuntimePrompt, SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
+
+_LOGGER = logging.getLogger(__name__)
+# Match the existing delivery-shutdown budget: both operations are local cleanup.
+_AGENT_SHUTDOWN_TIMEOUT_SECONDS = SHUTDOWN_DELIVERY_TIMEOUT_SECONDS
 
 
 def _sanitize_account_message(message: Message) -> Message:
@@ -512,7 +517,20 @@ class AgentLoop(
             if cancel_background and watchers:
                 await asyncio.gather(*watchers, return_exceptions=True)
             if cancel_background and self.agent_depth == 0:
-                await self._background_owner.wait()
+                owner_wait = asyncio.create_task(self._background_owner.wait())
+                done, _ = await asyncio.wait(
+                    {owner_wait}, timeout=_AGENT_SHUTDOWN_TIMEOUT_SECONDS
+                )
+                if not done:
+                    live = self._background_owner.running_instance_ids
+                    _LOGGER.warning(
+                        "agent shutdown timed out with live children: %s",
+                        ", ".join(live) or "unknown",
+                    )
+                    owner_wait.cancel()
+                    await self._background_owner.force_shutdown(
+                        _AGENT_SHUTDOWN_TIMEOUT_SECONDS
+                    )
             tracked_tasks = tuple(
                 task
                 for task in self._tracked_tasks

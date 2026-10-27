@@ -2373,7 +2373,6 @@ async def test_follow_up_wakes_worker_waiting_in_finish_gate(
     finally:
         backend.release_grandchild.set()
         channel.wake(child_handle)
-        await loop._background_owner.wait()
         await loop.close()
         store.close()
 
@@ -3468,6 +3467,29 @@ async def test_background_persistence_failure_does_not_block_close(
     await asyncio.wait_for(loop.close(), timeout=1)
 
     assert not loop.background_children_running
+
+
+@pytest.mark.asyncio
+async def test_close_forces_live_child_after_shutdown_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    watcher = asyncio.create_task(asyncio.Event().wait())
+    loop._background_owner.register(
+        "root:1",
+        lambda: None,
+        watcher,
+        description="blocked child",
+    )
+    monkeypatch.setattr(agent_loop_module, "_AGENT_SHUTDOWN_TIMEOUT_SECONDS", 0.01)
+
+    with caplog.at_level("WARNING", logger=agent_loop_module.__name__):
+        await asyncio.wait_for(loop.close(), timeout=0.2)
+
+    assert watcher.cancelled()
+    assert not loop.background_children_running
+    assert "agent shutdown timed out with live children: root:1" in caplog.text
 
 
 @pytest.mark.asyncio
