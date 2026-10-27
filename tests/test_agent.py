@@ -1367,13 +1367,12 @@ async def _wait_for_notification(store: ConversationStore, status: str) -> objec
 
 
 async def _wait_for_background_event(
-    events: list[StreamEvent], event_type: StreamEventType
+    events: list[StreamEvent], event_type: StreamEventType, ready: asyncio.Event
 ) -> StreamEvent:
-    for _ in range(100):
-        for event in events:
-            if event.type is event_type:
-                return event
-        await asyncio.sleep(0.01)
+    await asyncio.wait_for(ready.wait(), timeout=5)
+    for event in events:
+        if event.type is event_type:
+            return event
     raise AssertionError(f"missing {event_type.value} background event")
 
 
@@ -1916,14 +1915,21 @@ async def test_background_multibyte_receipt_fits_persisted_limit(
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     background_events: list[StreamEvent] = []
-    loop.set_background_event_sink(background_events.append)
+    background_event_ready = asyncio.Event()
+
+    def record_background_event(event: StreamEvent) -> None:
+        background_events.append(event)
+        if event.type is StreamEventType.TOOL_EXECUTION_END:
+            background_event_ready.set()
+
+    loop.set_background_event_sink(record_background_event)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
 
     terminal = await _wait_for_background_event(
-        background_events, StreamEventType.TOOL_EXECUTION_END
+        background_events, StreamEventType.TOOL_EXECUTION_END, background_event_ready
     )
     assert terminal.tool_result is not None
     assert terminal.tool_result.content.count("error=false") == 1
@@ -2102,7 +2108,14 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     background_events: list[StreamEvent] = []
-    loop.set_background_event_sink(background_events.append)
+    background_event_ready = asyncio.Event()
+
+    def record_background_event(event: StreamEvent) -> None:
+        background_events.append(event)
+        if event.type is StreamEventType.TOOL_EXECUTION_END:
+            background_event_ready.set()
+
+    loop.set_background_event_sink(record_background_event)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     loop.abort()
@@ -2111,7 +2124,7 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     assert notification.data["text"].count("error=false") == 1
     assert notification.data["text"].count("canceled=true") == 1
     terminal = await _wait_for_background_event(
-        background_events, StreamEventType.TOOL_EXECUTION_END
+        background_events, StreamEventType.TOOL_EXECUTION_END, background_event_ready
     )
     assert terminal.tool_result is not None
     assert terminal.tool_result.is_error is False
@@ -8552,7 +8565,7 @@ class _TaskFinishGateBackend(CompletionBackend):
         self.release_grandchild = asyncio.Event()
         self.task_output_read = asyncio.Event()
         self.follow_up_processed = asyncio.Event()
-        self.noise_notification_turns = 0
+        self.noise_notification_processed = asyncio.Event()
 
     async def complete(
         self,
@@ -8660,7 +8673,7 @@ class _TaskFinishGateBackend(CompletionBackend):
         elif gate is not None and notification and killed:
             blocks = [TextContent("child stopped task and finished")]
         elif gate is not None and notification and noise_notification:
-            self.noise_notification_turns += 1
+            self.noise_notification_processed.set()
             blocks = [TextContent("WAIT")]
         elif gate is not None and notification and self.action == "wait":
             task_id = re.search(r"task-[0-9a-f]+", self.gate_text)
@@ -8940,13 +8953,10 @@ async def test_finish_gate_turn_cap_does_not_kill_running_task(
                 dedupe_key=f"noise-{index}",
             ),
         )
-        await asyncio.sleep(0.01)
-        deadline = asyncio.get_running_loop().time() + 0.2
-        while (
-            backend.noise_notification_turns < min(index + 1, 1)
-            and asyncio.get_running_loop().time() < deadline
-        ):
-            await asyncio.sleep(0)
+        if index == 0:
+            await asyncio.wait_for(
+                backend.noise_notification_processed.wait(), timeout=5
+            )
         assert not [
             entry
             for entry in store.agent_notifications(pending_only=False)
