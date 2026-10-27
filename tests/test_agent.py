@@ -3484,7 +3484,7 @@ async def test_close_forces_live_child_after_shutdown_deadline(
     )
     monkeypatch.setattr(agent_loop_module, "_AGENT_SHUTDOWN_TIMEOUT_SECONDS", 0.01)
 
-    with caplog.at_level("WARNING", logger=agent_loop_module.__name__):
+    with caplog.at_level("WARNING", logger=agent_background_module.__name__):
         await asyncio.wait_for(loop.close(), timeout=0.2)
 
     assert watcher.cancelled()

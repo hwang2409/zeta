@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from collections.abc import Awaitable, Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from .recovery_lease import AgentLoopForRecovery, acquire_recovery_subtree
 from .terminal_fence import TerminalTransitionFence
 
 _AGENT_CANCEL_CONFIRM_TIMEOUT = 1.0
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -333,13 +335,24 @@ class BackgroundAgentOwner:
     def running(self) -> bool:
         return bool(self._cancellers)
 
-    @property
-    def running_instance_ids(self) -> tuple[str, ...]:
-        return tuple(self._cancellers)
+    async def wait_for_shutdown(self, timeout: float) -> tuple[str, ...]:
+        """Join the agent tree, then force remaining work after the deadline."""
 
-    async def force_shutdown(self, timeout: float) -> None:
-        """Cancel all remaining tree-owned work without extending shutdown forever."""
+        waiter = asyncio.create_task(self.wait())
+        done, _ = await asyncio.wait({waiter}, timeout=timeout)
+        if done:
+            await asyncio.gather(waiter, return_exceptions=True)
+            return ()
+        live = tuple(self._cancellers)
+        _LOGGER.warning(
+            "agent shutdown timed out with live children: %s",
+            ", ".join(live) or "unknown",
+        )
+        waiter.cancel()
+        await self._force_shutdown(timeout)
+        return live
 
+    async def _force_shutdown(self, timeout: float) -> None:
         tasks = {
             *self._cancellation_tasks,
             *self._watchers.values(),
