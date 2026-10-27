@@ -100,6 +100,7 @@ class BackgroundAgentOwner:
         self._pending_stores: set[ConversationStore] = set()
         self._store_close_tasks: set[asyncio.Task[Any]] = set()
         self._cancellation_tasks: set[asyncio.Task[Any]] = set()
+        self._cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
             str, Callable[[], CancellationRequest | asyncio.Task[None] | None]
         ] = {}
@@ -133,11 +134,21 @@ class BackgroundAgentOwner:
     def create_cancellation_task[TaskResult](
         self, awaitable: Awaitable[TaskResult]
     ) -> asyncio.Task[TaskResult]:
-        """Keep cancellation work alive for the lifetime of the agent tree."""
+        """Keep cancellation confirmation alive for the agent tree lifetime."""
 
         task = asyncio.create_task(awaitable)
         self._cancellation_tasks.add(task)
         task.add_done_callback(self._cancellation_tasks.discard)
+        return task
+
+    def create_cleanup_task(
+        self, awaitable: Awaitable[None]
+    ) -> asyncio.Task[None]:
+        """Keep critical child cleanup alive until it reaches a safe state."""
+
+        task = asyncio.create_task(awaitable)
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
         return task
 
     def cancel(self, instance_id: str) -> bool:
@@ -374,26 +385,25 @@ class BackgroundAgentOwner:
             ", ".join(live) or "unknown",
         )
         waiter.cancel()
-        await self._force_shutdown(timeout, excluding=caller)
+        await self._force_shutdown(excluding=caller)
+        await asyncio.gather(waiter, return_exceptions=True)
         return live
 
     async def _force_shutdown(
-        self, timeout: float, *, excluding: asyncio.Task[Any] | None
+        self, *, excluding: asyncio.Task[Any] | None
     ) -> None:
-        tasks = {
-            task
-            for task in (*self._cancellation_tasks, *self._watchers.values())
-            if task is not excluding
+        waits = {
+            task for task in self._cancellation_tasks if task is not excluding
         }
-        for task in tasks:
+        for task in waits:
             task.cancel()
-        if tasks:
-            done, pending = await asyncio.wait(tasks, timeout=timeout)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*done, return_exceptions=True)
-        for instance_id in tuple(self._cancellers):
-            self.unregister(instance_id)
+        if waits or self._cleanup_tasks:
+            await asyncio.gather(
+                *waits,
+                *tuple(self._cleanup_tasks),
+                return_exceptions=True,
+            )
+        await self.wait(excluding=excluding)
 
     @property
     def active_descriptions(self) -> tuple[str, ...]:

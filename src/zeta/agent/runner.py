@@ -959,7 +959,7 @@ async def run_agent_tool(
         confirmation = loop._background_owner.create_cancellation_task(
             confirm_child_cancel()
         )
-        cleanup = loop._background_owner.create_cancellation_task(
+        cleanup = loop._background_owner.create_cleanup_task(
             cleanup_canceled_child(confirmation)
         )
         return CancellationRequest(confirmation, cleanup)

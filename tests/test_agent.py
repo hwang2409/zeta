@@ -74,6 +74,7 @@ from zeta.protocol.types import (
 from zeta.providers.codex import CodexStreamError
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
+from zeta.runtime.cleanup import close_session
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop._completion import observed_completion
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
@@ -3469,27 +3470,73 @@ async def test_background_persistence_failure_does_not_block_close(
     assert not loop.background_children_running
 
 
+async def _finish_after_cancellation(
+    owner: BackgroundAgentOwner,
+    instance_id: str,
+    *,
+    delay: float,
+) -> None:
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        cleanup = asyncio.create_task(asyncio.sleep(delay))
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                pass
+        await cleanup
+    finally:
+        owner.unregister(instance_id)
+
+
 @pytest.mark.asyncio
-async def test_close_forces_live_child_after_shutdown_deadline(
+async def test_close_joins_cancellation_resistant_cleanup_after_soft_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     store = ConversationStore(tmp_path)
     loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
-    watcher = asyncio.create_task(asyncio.Event().wait())
-    loop._background_owner.register(
-        "root:1",
-        lambda: None,
-        watcher,
-        description="blocked child",
+    owner = loop._background_owner
+    watcher = asyncio.create_task(
+        _finish_after_cancellation(owner, "root:1", delay=0.06)
     )
+    owner.register("root:1", lambda: None, watcher, description="blocked child")
+    await asyncio.sleep(0)
     monkeypatch.setattr(agent_loop_module, "SHUTDOWN_DELIVERY_TIMEOUT_SECONDS", 0.01)
 
     with caplog.at_level("WARNING", logger=agent_background_module.__name__):
         await asyncio.wait_for(loop.close(), timeout=0.2)
 
-    assert watcher.cancelled()
-    assert not loop.background_children_running
+    assert watcher.done()
+    assert not owner.running
     assert "agent shutdown timed out with live children: root:1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_close_awaits_bounded_critical_fallback_and_leaves_recoverable_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="root")
+    child = _seed_recoverable_child(store)
+    child.close()
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    owner = loop._background_owner
+    watcher = asyncio.create_task(
+        _finish_after_cancellation(owner, "root:1", delay=0.04)
+    )
+    owner.register("root:1", lambda: None, watcher, description="blocked fsync")
+    await asyncio.sleep(0)
+    monkeypatch.setattr(agent_loop_module, "SHUTDOWN_DELIVERY_TIMEOUT_SECONDS", 0.01)
+
+    await asyncio.wait_for(close_session(loop), timeout=0.2)
+
+    assert watcher.done()
+    observed = ConversationStore(tmp_path, session_id="root")
+    assert observed.agent_children()
+    resumed = AgentLoop(FakeBackend([]), observed, skill_catalog=SkillCatalog.empty())
+    await resumed.activate()
+    assert not observed.agent_children()
+    await close_session(resumed)
 
 
 @pytest.mark.asyncio
