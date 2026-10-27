@@ -7,7 +7,6 @@ import uuid
 from collections.abc import Generator
 from contextlib import ExitStack
 from dataclasses import dataclass
-from functools import wraps
 from hashlib import sha256
 from pathlib import Path
 from runpy import run_path
@@ -497,40 +496,6 @@ def pytest_testnodedown(node, error) -> None:
     summary = node.workeroutput.get("fd_summary")
     if summary is not None:
         print(summary, flush=True)
-
-
-@pytest.fixture(autouse=True)
-async def close_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
-    """Close every test-created store and registry after fixture teardown."""
-    from zeta.core.store import ConversationStore
-    from zeta.tools import ToolRegistry
-
-    stores: list[ConversationStore] = []
-    registries: list[ToolRegistry] = []
-    store_init = ConversationStore.__init__
-    registry_init = ToolRegistry.__init__
-    store_close = ConversationStore.close
-    registry_close = ToolRegistry.close
-
-    @wraps(store_init)
-    def tracked_store_init(store, *args, **kwargs):
-        store_init(store, *args, **kwargs)
-        stores.append(store)
-
-    @wraps(registry_init)
-    def tracked_registry_init(registry, *args, **kwargs):
-        registry_init(registry, *args, **kwargs)
-        registries.append(registry)
-
-    monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
-    monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
-    yield
-    for registry in reversed(registries):
-        if not registry._closed:
-            await registry_close(registry)
-    for store in reversed(stores):
-        if not store._closed:
-            store_close(store)
 
 
 @pytest.fixture(autouse=True)

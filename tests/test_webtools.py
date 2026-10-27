@@ -22,6 +22,23 @@ from zeta.tools import fetch as fetch_tool
 _ASYNC_CLIENT = httpx.AsyncClient
 
 
+@pytest.fixture(autouse=True)
+async def owned_tool_registries(monkeypatch: pytest.MonkeyPatch):
+    """Keep registry spills alive through assertions, then close every owner."""
+    registry_type = ToolRegistry
+    registries: list[ToolRegistry] = []
+
+    def create_registry(*args, **kwargs):
+        registry = registry_type(*args, **kwargs)
+        registries.append(registry)
+        return registry
+
+    monkeypatch.setitem(globals(), "ToolRegistry", create_registry)
+    yield
+    for registry in reversed(registries):
+        await registry.close()
+
+
 class _ChunkedByteStream(httpx.AsyncByteStream):
     def __init__(self, content: bytes, *, first_chunk_size: int | None = None) -> None:
         self.content = content
