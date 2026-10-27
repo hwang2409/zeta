@@ -110,6 +110,48 @@ class Logins:
             return {"state": "cancelled"}
         return task.result() if task.done() else {"state": "pending"}
 
+    async def _attempt(
+        self,
+        login_provider: str,
+        url: asyncio.Future[str],
+        operation: _LoginOperation,
+    ) -> dict:
+        try:
+            login = await asyncio.to_thread(
+                build_login_provider, login_provider, self.home
+            )
+            async with asyncio.timeout(self.timeout):
+                await run_login(
+                    login,
+                    pkce_values,
+                    # The outer deadline covers the exchange as well as the callback.
+                    timeout_seconds=self.timeout + 1,
+                    on_authorization_url=url.set_result,
+                    publication_timeout_seconds=LOGIN_PUBLICATION_TIMEOUT_SECONDS,
+                    on_publication_commit=operation.commit,
+                )
+            return {"state": "succeeded"}
+        except TimeoutError:
+            return failure("login_timeout", "Sign-in timed out. Log in again to retry.")
+        except AccountCredentialLockTimeoutError:
+            return failure(
+                "login_lock_timeout",
+                "Sign-in could not save credentials because the account is busy. Please try again.",
+            )
+        except LoginPortInUseError as exc:
+            provider_label = exc.provider.capitalize()
+            return failure(
+                "login_port_in_use",
+                f"{provider_label} login cannot start because port {exc.port} is already in use. "
+                f"Close any other {provider_label} login and retry.",
+            )
+        except LoginError:
+            return failure("login_callback_error", "Sign-in was rejected or the browser callback was invalid. Please try again.")
+        except (OSError, RuntimeError, ValueError, httpx.HTTPError):
+            # Provider responses can contain tokens or callback codes. Do not
+            # forward exception text to the wire or transcript.
+            return failure("login_failed", "Could not complete sign-in. Please try again.")
+
     async def _run(
         self,
         provider: str,
@@ -128,42 +170,9 @@ class Logins:
             locked = acquisition.exception() is None
             if cancelled:
                 raise asyncio.CancelledError
-            login = await asyncio.to_thread(
-                build_login_provider, login_provider, self.home
-            )
-            async with asyncio.timeout(self.timeout):
-                await run_login(
-                    login,
-                    pkce_values,
-                    # The outer deadline covers the exchange as well as the callback.
-                    timeout_seconds=self.timeout + 1,
-                    on_authorization_url=url.set_result,
-                    publication_timeout_seconds=LOGIN_PUBLICATION_TIMEOUT_SECONDS,
-                    on_publication_commit=operation.commit,
-                )
-            result = {"state": "succeeded"}
+            result = await self._attempt(login_provider, url, operation)
         except asyncio.CancelledError:
             cancelled = True
-        except TimeoutError:
-            result = failure("login_timeout", "Sign-in timed out. Log in again to retry.")
-        except AccountCredentialLockTimeoutError:
-            result = failure(
-                "login_lock_timeout",
-                "Sign-in could not save credentials because the account is busy. Please try again.",
-            )
-        except LoginPortInUseError as exc:
-            provider_label = exc.provider.capitalize()
-            result = failure(
-                "login_port_in_use",
-                f"{provider_label} login cannot start because port {exc.port} is already in use. "
-                f"Close any other {provider_label} login and retry.",
-            )
-        except LoginError:
-            result = failure("login_callback_error", "Sign-in was rejected or the browser callback was invalid. Please try again.")
-        except (OSError, RuntimeError, ValueError, httpx.HTTPError):
-            # Provider responses can contain tokens or callback codes. Do not
-            # forward exception text to the wire or transcript.
-            result = failure("login_failed", "Could not complete sign-in. Please try again.")
 
         if locked:
             release = asyncio.create_task(

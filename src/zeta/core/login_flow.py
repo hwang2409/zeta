@@ -75,6 +75,52 @@ async def _wait_bounded_work(
     return cancelled
 
 
+async def _publish_credentials(
+    provider: LoginProvider[TokenT],
+    tokens: TokenT,
+    timeout: float | None,
+    commit: Callable[[], bool] | None,
+) -> _PublicationArbiter | None:
+    if timeout is None:
+        await asyncio.to_thread(provider.credential_store.save, tokens)
+        return None
+
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    assert task is not None
+    arbiter = _PublicationArbiter(loop, task, commit or (lambda: True))
+    publication = asyncio.create_task(
+        asyncio.to_thread(
+            provider.credential_store.save,
+            tokens,
+            lock_timeout=timeout,
+            cancel_event=arbiter,
+        )
+    )
+    cancelled = await _wait_bounded_work(publication, arbiter.cancel)
+    if cancelled and not arbiter.committed:
+        raise asyncio.CancelledError
+    return arbiter
+
+
+async def _close_listener(
+    server: http.server.ThreadingHTTPServer,
+    server_thread: threading.Thread,
+    publication_arbiter: _PublicationArbiter | None,
+) -> None:
+    def close() -> None:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+    cleanup = asyncio.create_task(asyncio.to_thread(close))
+    cancelled = await _wait_bounded_work(cleanup)
+    if cancelled and (
+        publication_arbiter is None or not publication_arbiter.committed
+    ):
+        raise asyncio.CancelledError
+
+
 class CredentialSink(Protocol[TokenT]):
     """The part of a provider credential store used by login."""
 
@@ -238,8 +284,6 @@ async def run_login(
     verifier, challenge, state = build_pkce()
     callback_ready = asyncio.Event()
     loop = asyncio.get_running_loop()
-    task = asyncio.current_task()
-    assert task is not None
     publication_arbiter: _PublicationArbiter | None = None
 
     def notify() -> None:
@@ -289,40 +333,16 @@ async def run_login(
                 verifier,
                 redirect_uri,
             )
-        if publication_timeout_seconds is None:
-            await asyncio.to_thread(provider.credential_store.save, tokens)
-        else:
-            publication_arbiter = _PublicationArbiter(
-                loop, task, on_publication_commit or (lambda: True)
-            )
-            publication = asyncio.create_task(
-                asyncio.to_thread(
-                    provider.credential_store.save,
-                    tokens,
-                    lock_timeout=publication_timeout_seconds,
-                    cancel_event=publication_arbiter,
-                )
-            )
-            cancelled = await _wait_bounded_work(
-                publication, publication_arbiter.cancel
-            )
-            if cancelled and not publication_arbiter.committed:
-                raise asyncio.CancelledError
+        publication_arbiter = await _publish_credentials(
+            provider,
+            tokens,
+            publication_timeout_seconds,
+            on_publication_commit,
+        )
         return provider.token_handle(tokens)
     finally:
-        # Cancellation can arrive after exchange, while shutdown is running.
         # Finish closing the listener before reporting a terminal login state.
-        def close_listener() -> None:
-            server.shutdown()
-            server.server_close()
-            server_thread.join(timeout=2)
-
-        cleanup = asyncio.create_task(asyncio.to_thread(close_listener))
-        cancelled = await _wait_bounded_work(cleanup)
-        if cancelled and (
-            publication_arbiter is None or not publication_arbiter.committed
-        ):
-            raise asyncio.CancelledError
+        await _close_listener(server, server_thread, publication_arbiter)
 
 
 __all__ = ["LoginError", "LoginPortInUseError", "LoginProvider", "run_login"]
