@@ -58,6 +58,8 @@ from tests.support.credentials import (
     named_account_credentials,
 )
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.notification_fixtures import notification_payloads
+from tests.support.tui_render import render_full_screen as _render_full_screen
 from zeta.accounts import AccountId, AccountStore, AccountUsage, SessionAccountContext
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
@@ -101,6 +103,16 @@ from zeta.tui.composer import (
     parse_input,
 )
 from zeta.tui.slash_handlers.accounts_picker import AccountsPicker
+
+
+def render_full_screen(
+    session: FullScreenPromptSession, width: int, height: int = 24
+) -> Screen:
+    session.app.output = SimpleNamespace(
+        get_size=lambda: Size(rows=height, columns=width),
+    )
+    return _render_full_screen(session, width, height)
+
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -195,26 +207,6 @@ def _fixed_terminal_env(home: Path) -> dict[str, str]:
         ),
     )
     return env
-
-
-def _render_full_screen(
-    session: FullScreenPromptSession, width: int, height: int
-) -> Screen:
-    session.app.output = SimpleNamespace(
-        get_size=lambda: Size(rows=height, columns=width),
-    )
-    screen = Screen(initial_width=width, initial_height=height)
-    with set_app(session.app):
-        session.layout.update_parents_relations()
-        session.layout.container.write_to_screen(
-            screen,
-            MouseHandlers(),
-            WritePosition(0, 0, width, height),
-            "",
-            False,
-            None,
-        )
-    return screen
 
 
 def _force_terminal_env(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
@@ -1347,7 +1339,11 @@ class AlwaysErrorBackend(CompletionBackend):
     ) -> AsyncIterator[StreamEvent]:
         del messages, tool_schemas
         yield StreamEvent(StreamEventType.MESSAGE_START)
-        raise TimeoutError("provider timeout")
+        yield StreamEvent(
+            StreamEventType.ERROR,
+            error=ErrorInfo("timeout", "provider timeout"),
+            data={"retry_after": 0.0},
+        )
 
 
 class WaitingFailureBackend(CompletionBackend):
@@ -1368,7 +1364,11 @@ class WaitingFailureBackend(CompletionBackend):
         )
         self.started.set()
         await self.release.wait()
-        raise ConnectionError("network disconnected")
+        yield StreamEvent(
+            StreamEventType.ERROR,
+            error=ErrorInfo("transport_error", "network disconnected"),
+            data={"retry_after": 0.0},
+        )
 
 
 class RaisedErrorBackend(CompletionBackend):
@@ -1582,61 +1582,7 @@ def terminal_plain(renderable: object) -> str:
 
 
 def _notification_payloads() -> dict[str, dict[str, object]]:
-    return {
-        "agent_completion": {
-            "origin": "notification",
-            "kind": "agent_completion",
-            "child_instance_id": "root:1",
-            "child_session_path": "/sessions/root/agents/1",
-            "description": "worker",
-            "status": "completed",
-            "text": "done",
-        },
-        "child_idle": {
-            "origin": "notification",
-            "kind": "child_idle",
-            "child_instance_id": "root:1",
-            "child_session_path": "/sessions/root/agents/1",
-            "description": "worker",
-            "status": "child_idle",
-            "text": "waiting",
-        },
-        "task_exited": {
-            "origin": "notification",
-            "kind": "task_exited",
-            "task_id": "task-1",
-            "headline": "command finished",
-            "exit_code": 0,
-        },
-        "project_inbox": {
-            "origin": "notification",
-            "kind": "project_inbox",
-            "status": "new",
-            "project_id": "project-1",
-            "message_ids": ["message-1"],
-            "text": "new project message",
-        },
-        "child_question": {
-            "origin": "notification",
-            "kind": "child_question",
-            "child_instance_id": "root:1",
-            "question_id": "question-1",
-            "description": "worker",
-            "status": "pending",
-            "question": "continue?",
-            "text": "worker asks a question",
-        },
-        "child_question_withdrawn": {
-            "origin": "notification",
-            "kind": "child_question_withdrawn",
-            "child_instance_id": "root:1",
-            "question_id": "question-1",
-            "description": "worker",
-            "status": "withdrawn",
-            "text": "question withdrawn",
-        },
-    }
-
+    return notification_payloads()
 
 def test_every_durable_notification_kind_has_non_error_rendering() -> None:
     payloads = _notification_payloads()
@@ -9018,7 +8964,7 @@ async def test_agent_list_rows_fit_short_full_screen_layouts(
     _force_terminal_env(monkeypatch, tmp_path / "zeta-home")
     _, session = _agent_list_session(tmp_path, child_count)
 
-    screen = _render_full_screen(session, 80, height)
+    screen = render_full_screen(session, 80, height)
     rendered_rows = [
         row
         for row in range(height)
@@ -9046,7 +8992,7 @@ async def test_agent_list_highlight_tracks_focus_in_full_layout(
     navigation.selected_index = 2
 
     navigation.focus_list()
-    focused = _render_full_screen(session, 80, 12)
+    focused = render_full_screen(session, 80, 12)
     focused_list_styles = [
         focused.data_buffer[row][column].style
         for row in range(12)
@@ -9065,7 +9011,7 @@ async def test_agent_list_highlight_tracks_focus_in_full_layout(
     assert "> Agent 2" in focused_text
 
     navigation.focus_composer()
-    unfocused = _render_full_screen(session, 80, 12)
+    unfocused = render_full_screen(session, 80, 12)
     unfocused_list_styles = [
         unfocused.data_buffer[row][column].style
         for row in range(12)
@@ -9085,7 +9031,7 @@ async def test_agent_list_highlight_tracks_focus_in_full_layout(
     assert "> Agent 2" not in unfocused_text
 
     navigation.focus_list()
-    refocused = _render_full_screen(session, 80, 12)
+    refocused = render_full_screen(session, 80, 12)
     refocused_text = "\n".join(
         "".join(refocused.data_buffer[row][column].char for column in range(80))
         for row in range(12)
@@ -9105,7 +9051,7 @@ async def test_short_layout_prioritizes_composer_over_agent_list(
     _force_terminal_env(monkeypatch, tmp_path / "zeta-home")
     _, session = _agent_list_session(tmp_path, 5)
 
-    screen = _render_full_screen(session, 80, 9)
+    screen = render_full_screen(session, 80, 9)
     rendered_list_rows = [
         row
         for row in range(9)
@@ -9141,7 +9087,7 @@ async def test_pending_todo_keeps_priority_over_agent_list_across_short_heights(
 
     panels_by_height: dict[int, tuple[bool, bool]] = {}
     for height in range(8, 15):
-        screen = _render_full_screen(session, 80, height)
+        screen = render_full_screen(session, 80, height)
         list_visible = any(
             "agent-list" in screen.data_buffer[row][column].style
             for row in range(height)
