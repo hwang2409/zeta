@@ -390,6 +390,7 @@ def isolate_zeta_home(
 
 
 _FD_GROWTH: list[tuple[int, str]] = []
+_FD_BREACHES: list[str] = []
 _FD_MAX = -1
 _FD_OPEN_MAX = 0
 
@@ -458,25 +459,30 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
         print(f"fd-retained nodeid={item.nodeid} {details}", flush=True)
     highest = max(after, default=-1)
     if highest >= 512:
-        pytest.fail(
+        breach = (
             f"{item.nodeid} reached fd {highest}; retained descriptors: "
             f"{details if retained else 'none added by this test'}"
         )
+        _FD_BREACHES.append(breach)
+        item.session.shouldstop = breach
 
 
 def _fd_summary() -> str:
     worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
     top = sorted(_FD_GROWTH, reverse=True)[:5]
     offenders = "; ".join(f"{nodeid} (+{count})" for count, nodeid in top)
+    breach = _FD_BREACHES[0] if _FD_BREACHES else "none"
     return (
         f"fd-summary worker={worker} max_fd={_FD_MAX} max_open={_FD_OPEN_MAX} "
-        f"top_retained=[{offenders}]"
+        f"top_retained=[{offenders}] breach=[{breach}]"
     )
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
     summary = _fd_summary()
+    if _FD_BREACHES:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
     worker_output = getattr(session.config, "workeroutput", None)
     if worker_output is not None:
         worker_output["fd_summary"] = summary

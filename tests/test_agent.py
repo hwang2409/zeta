@@ -8,6 +8,7 @@ import sys
 import threading
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
+from functools import wraps
 from io import StringIO
 from itertools import pairwise
 from pathlib import Path
@@ -86,6 +87,25 @@ from zeta.tui.agent_card import AgentRunCommandMixin
 from zeta.tui.app import TUIApp
 from zeta.tui.render import render_approval_card, render_event
 from zeta.tui.todo import TodoWidget
+
+
+@pytest.fixture(autouse=True)
+async def owned_agent_loops(monkeypatch: pytest.MonkeyPatch):
+    """Close every loop graph created by this module after its assertions."""
+    loops: list[AgentLoop] = []
+    original_init = AgentLoop.__init__
+
+    @wraps(original_init)
+    def tracked_init(loop, *args, **kwargs):
+        original_init(loop, *args, **kwargs)
+        loops.append(loop)
+
+    monkeypatch.setattr(AgentLoop, "__init__", tracked_init)
+    yield
+    for loop in reversed(loops):
+        await loop.close()
+        await loop.tool_registry.close()
+        loop.store.close()
 
 
 async def _collect(events):
