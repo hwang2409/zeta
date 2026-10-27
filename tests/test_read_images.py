@@ -1216,3 +1216,27 @@ async def test_read_corrupt_image_errors_cleanly(tmp_path: Path) -> None:
 
     assert result["isError"] is True
     assert result["content"][0]["text"].startswith("could not decode image:")
+
+
+def test_worker_jpeg_rescan_reads_only_the_declared_file_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.media import image_normalization_worker as worker
+    from zeta.media.image_policy import ANTHROPIC_IMAGE_POLICY
+
+    data = _jpeg_with_late_large_sof()
+    declared = 100
+    seen: list[int] = []
+
+    class Scanned(Exception):
+        pass
+
+    def capture(buffer: bytes) -> None:
+        seen.append(len(buffer))
+        raise Scanned
+
+    monkeypatch.setattr(worker, "jpeg_dimensions", capture)
+    with pytest.raises(Scanned):
+        worker._run(io.BytesIO(data), declared, ANTHROPIC_IMAGE_POLICY)
+
+    assert seen == [declared]

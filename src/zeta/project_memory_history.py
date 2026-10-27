@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .memory.entry_history import EntryMemoryHistoryMixin
+from .memory.entry_history import EntryMemoryHistoryMixin, logical_history
 from .memory.entry_views import GENERATED_MIRROR_HEADER
 from .memory.version_store import (
     PreparedVersion,
@@ -702,37 +702,6 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         os.fsync(versions_fd)
         os.fsync(blobs_fd)
 
-    @staticmethod
-    def _logical_history(
-        records: list[dict[str, object]],
-    ) -> tuple[dict[str, object], ...]:
-        logical: list[dict[str, object]] = []
-        seen: set[str] = set()
-        fields = (
-            "version",
-            "kind",
-            "created_at",
-            "files",
-            "target_version",
-            "provenance",
-            "source_digest",
-            "automatic_files",
-            "before_automatic_files",
-        )
-        for record in records:
-            imported = record.get("source_history")
-            candidates = [*imported, record] if isinstance(imported, list) else [record]
-            for candidate in candidates:
-                if not isinstance(candidate, dict):
-                    continue
-                version = candidate.get("version")
-                if isinstance(version, str) and version in seen:
-                    continue
-                summary = {key: candidate[key] for key in fields if key in candidate}
-                if isinstance(version, str):
-                    seen.add(version)
-                logical.append(summary)
-        return tuple(logical)
 
     def export_memory(self, project_id: str) -> MemoryExport:
         """Export logical memory without exposing the version-store layout."""
@@ -744,7 +713,20 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
                 return MemoryExport(
                     dict(snapshot.contents),
                     snapshot.digest,
-                    self._logical_history(records),
+                    logical_history(
+                        records,
+                        (
+                            "version",
+                            "kind",
+                            "created_at",
+                            "files",
+                            "target_version",
+                            "provenance",
+                            "source_digest",
+                            "automatic_files",
+                            "before_automatic_files",
+                        ),
+                    ),
                     tuple(sorted(self._automatic_files_from_records(records))),
                 )
             finally:

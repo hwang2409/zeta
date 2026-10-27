@@ -59,25 +59,6 @@ from .driver import (
 )
 
 
-def _bounded(value: str, limit: int = TOOL_RESULT_MAX_BYTES) -> str:
-    data = value.encode("utf-8")
-    if len(data) <= limit:
-        return value
-    kept = data[:limit].decode("utf-8", errors="ignore")
-    dropped = len(data) - limit
-    return kept + f"... [truncated: {dropped} bytes]"
-
-
-def _bounded_arguments(
-    arguments: dict[str, object],
-    limit: int = TOOL_RESULT_MAX_BYTES,
-) -> dict[str, object] | str:
-    serialized = json.dumps(arguments, separators=(",", ":"), ensure_ascii=False)
-    if len(serialized.encode("utf-8")) <= limit:
-        return arguments
-    return _bounded(serialized, limit)
-
-
 def _emit_jsonl(stream: IO[str], event: dict[str, Any]) -> None:
     stream.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False))
     stream.write("\n")

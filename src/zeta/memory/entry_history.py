@@ -56,6 +56,27 @@ FORMAT_TWO_CAPABILITIES = frozenset(
 )
 
 
+def logical_history(
+    records: list[dict[str, object]], fields: tuple[str, ...]
+) -> tuple[dict[str, object], ...]:
+    logical: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for record in records:
+        imported = record.get("source_history")
+        candidates = [*imported, record] if isinstance(imported, list) else [record]
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            version = candidate.get("version")
+            if isinstance(version, str) and version in seen:
+                continue
+            summary = {key: candidate[key] for key in fields if key in candidate}
+            if isinstance(version, str):
+                seen.add(version)
+            logical.append(summary)
+    return tuple(logical)
+
+
 def _format_two_capabilities() -> frozenset[str]:
     from zeta import project_memory_commands
     from zeta.core import project_context
@@ -320,35 +341,6 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         )
         return snapshot
 
-    @staticmethod
-    def _logical_entry_history(
-        records: list[dict[str, object]],
-    ) -> tuple[dict[str, object], ...]:
-        fields = (
-            "version",
-            "kind",
-            "created_at",
-            "operations",
-            "reconciliation_key",
-            "source_digest",
-            "provenance",
-        )
-        logical: list[dict[str, object]] = []
-        seen: set[str] = set()
-        for record in records:
-            imported = record.get("source_history")
-            candidates = [*imported, record] if isinstance(imported, list) else [record]
-            for candidate in candidates:
-                if not isinstance(candidate, dict):
-                    continue
-                version = candidate.get("version")
-                if isinstance(version, str) and version in seen:
-                    continue
-                summary = {key: candidate[key] for key in fields if key in candidate}
-                if isinstance(version, str):
-                    seen.add(version)
-                logical.append(summary)
-        return tuple(logical)
 
     def _export_entry_memory(self, project_id: str) -> EntryMemoryExport:
         """Export one format-2 fixture without exposing storage layout."""
@@ -374,7 +366,18 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                     snapshot.state,
                     snapshot.digest,
                     snapshot.version,
-                    self._logical_entry_history(records),
+                    logical_history(
+                        records,
+                        (
+                            "version",
+                            "kind",
+                            "created_at",
+                            "operations",
+                            "reconciliation_key",
+                            "source_digest",
+                            "provenance",
+                        ),
+                    ),
                 )
             finally:
                 os.close(directory_fd)

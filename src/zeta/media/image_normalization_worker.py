@@ -13,12 +13,11 @@ from io import BytesIO
 from typing import Any, BinaryIO
 
 from .image_policy import AnimationPolicy, ImagePolicy, WireLimitUnit
-from .images import detect_image_media_type, image_dimensions
+from .images import detect_image_media_type, image_dimensions, jpeg_dimensions
 
 _FORMAT_NAMES = {"GIF": "gif", "JPEG": "jpeg", "PNG": "png", "WEBP": "webp"}
 _MEDIA_TYPES = {name: f"image/{name}" for name in ("gif", "jpeg", "png", "webp")}
 _QUALITY_STEPS = (90, 80, 70, 60, 50, 40, 30, 20)
-_MAX_JPEG_HEADER_SCAN = 8 * 1024 * 1024
 _MAX_NORMALIZABLE_PIXELS = 1_000_000_000
 
 
@@ -333,40 +332,6 @@ def _normalize_pillow(
         )
 
 
-def _jpeg_dimensions(handle: BinaryIO, file_size: int) -> tuple[int, int] | None:
-    handle.seek(0)
-    data = handle.read(min(file_size, _MAX_JPEG_HEADER_SCAN))
-    if len(data) < 2 or data[:2] != b"\xff\xd8":
-        return None
-    offset = 2
-    while offset < len(data):
-        if data[offset] != 0xFF:
-            return None
-        while offset < len(data) and data[offset] == 0xFF:
-            offset += 1
-        if offset >= len(data):
-            return None
-        marker = data[offset]
-        offset += 1
-        if marker == 0xDA or marker == 0xD9:
-            return None
-        if marker == 0x00 or marker == 0xD8 or 0xD0 <= marker <= 0xD7:
-            continue
-        if offset + 2 > len(data):
-            return None
-        segment_size = int.from_bytes(data[offset : offset + 2], "big")
-        if segment_size < 2 or offset + segment_size > len(data):
-            return None
-        if 0xC0 <= marker <= 0xC3 or 0xC5 <= marker <= 0xC7 or 0xC9 <= marker <= 0xCB or 0xCD <= marker <= 0xCF:
-            if segment_size < 7:
-                return None
-            height = int.from_bytes(data[offset + 3 : offset + 5], "big")
-            width = int.from_bytes(data[offset + 5 : offset + 7], "big")
-            return (width, height) if width and height else None
-        offset += segment_size
-    return None
-
-
 def _run(handle: BinaryIO, file_size: int, policy: ImagePolicy) -> dict[str, object]:
     header = handle.read(64 * 1024)
     media_type = detect_image_media_type(header)
@@ -378,7 +343,8 @@ def _run(handle: BinaryIO, file_size: int, policy: ImagePolicy) -> dict[str, obj
         else None
     )
     if dimensions is None and media_type == "image/jpeg":
-        dimensions = _jpeg_dimensions(handle, file_size)
+        handle.seek(0)
+        dimensions = jpeg_dimensions(handle.read(min(file_size, 8 * 1024 * 1024)))
     if (
         media_type == "image/jpeg"
         and dimensions is not None
