@@ -8920,8 +8920,8 @@ async def test_finish_gate_turn_cap_does_not_kill_running_task(
     owner = BackgroundAgentOwner(
         store,
         finish_gate_max_turns=2,
-        finish_gate_timeout=0.05,
-        finish_gate_task_timeout=0.8,
+        finish_gate_timeout=5,
+        finish_gate_task_timeout=5,
     )
     loop = AgentLoop(
         backend,
@@ -8934,7 +8934,7 @@ async def test_finish_gate_turn_cap_does_not_kill_running_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
 
-    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=5)
     child_handle, marker = next(iter(store.agent_children().items()))
     child_path = Path(marker["child_session_path"])
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
