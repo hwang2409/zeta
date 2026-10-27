@@ -7,18 +7,18 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.background import BackgroundAgentOwner
-from zeta.agent.notifications import NotificationWake
+from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, TextContent
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 
 
-def _publish_completion(
+async def _publish_completion(
     owner: BackgroundAgentOwner,
     child_instance_id: str,
 ) -> None:
-    owner.conversation_channel.publish_completion(
+    await owner.conversation_channel.publish_completion(
         child_instance_id=child_instance_id,
         marker_key="child-call",
         child_session_path=f"/sessions/{child_instance_id}",
@@ -52,14 +52,23 @@ async def test_grandchild_completion_is_display_only_for_root_while_parent_lives
         parent_instance_id=parent_id,
     )
     owner.conversation_channel.register_loop(parent_id)
+    parent_flow = StepDeliveryFlow(
+        parent_store,
+        wake_sink=lambda _source: owner.conversation_channel.wake(parent_id),
+    )
+    root_flow = StepDeliveryFlow(
+        root_store,
+        wake_sink=lambda _source: owner.conversation_channel.wake(None),
+    )
+    owner.conversation_channel.register_delivery_flow(parent_id, parent_flow)
+    owner.conversation_channel.register_delivery_flow(None, root_flow)
     root_wakes: list[None] = []
     owner.set_wake_callback(lambda: root_wakes.append(None))
 
-    _publish_completion(owner, grandchild_id)
+    await _publish_completion(owner, grandchild_id)
     await asyncio.wait_for(owner.conversation_channel.wait(parent_id), timeout=1)
 
-    parent_wake = NotificationWake(parent_store)
-    parent_message = parent_wake.pending_message()
+    parent_message = (await parent_flow.prepare_request("idle_start", [], None)).messages[-1]
     assert parent_message is not None
     assert parent_message.metadata["notifications"][0]["child_instance_id"] == (
         grandchild_id
@@ -68,9 +77,10 @@ async def test_grandchild_completion_is_display_only_for_root_while_parent_lives
     assert len(root_entries) == 1
     assert root_entries[0].data["display_only"] is True
     assert root_store.agent_notifications() == []
-    assert NotificationWake(root_store).pending_message() is None
+    assert (await root_flow.prepare_request("idle_start", [], None)).messages == ()
     assert root_wakes == []
 
+    await owner.conversation_channel.unregister_delivery_flow(None)
     backend = FakeBackend([ScriptedTurn([TextContent("root reply")])])
     root_loop = AgentLoop(
         backend,
@@ -110,12 +120,17 @@ async def test_grandchild_completion_reaches_root_when_parent_is_not_live(
         parent_store=parent_store,
         parent_instance_id=parent_id,
     )
+    root_flow = StepDeliveryFlow(
+        root_store,
+        wake_sink=lambda _source: owner.conversation_channel.wake(None),
+    )
+    owner.conversation_channel.register_delivery_flow(None, root_flow)
     root_wakes: list[None] = []
     owner.set_wake_callback(lambda: root_wakes.append(None))
 
-    _publish_completion(owner, grandchild_id)
+    await _publish_completion(owner, grandchild_id)
 
-    root_message = NotificationWake(root_store).pending_message()
+    root_message = (await root_flow.prepare_request("idle_start", [], None)).messages[-1]
     assert root_message is not None
     assert root_message.metadata["notifications"][0]["child_instance_id"] == (
         grandchild_id
@@ -132,10 +147,17 @@ async def test_direct_child_completion_remains_pending_for_root(tmp_path: Path) 
     watcher = asyncio.current_task()
     assert watcher is not None
     owner.register(child_id, lambda: None, watcher, parent_store=root_store)
+    owner.conversation_channel.register_delivery_flow(
+        None,
+        StepDeliveryFlow(
+            root_store,
+            wake_sink=lambda _source: owner.conversation_channel.wake(None),
+        ),
+    )
     root_wakes: list[None] = []
     owner.set_wake_callback(lambda: root_wakes.append(None))
 
-    _publish_completion(owner, child_id)
+    await _publish_completion(owner, child_id)
 
     notifications = root_store.agent_notifications()
     assert len(notifications) == 1

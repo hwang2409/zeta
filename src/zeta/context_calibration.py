@@ -113,6 +113,14 @@ class ContextCalibration:
     def estimator_budget(self, provider_budget: int) -> int:
         return max(1, math.floor(provider_budget / self.ratio))
 
+    def update_provider_limit(self, provider_limit: int) -> None:
+        """Change the current model limit without discarding measured calibration."""
+
+        if provider_limit <= 0:
+            raise ValueError("provider limit must be positive")
+        self._provider_limit = provider_limit
+        self.provider_token_total = None
+
     def reset_provider_total(self) -> None:
         self.provider_token_total = None
 

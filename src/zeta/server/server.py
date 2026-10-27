@@ -32,6 +32,7 @@ from . import (
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
 from .delivery import DeliveryRequests, TurnOutcome
 from .model_inputs import PendingModelInputs
+from .notification_presentation import NotificationPresentation
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
     PROJECT_REQUESTS,
@@ -44,6 +45,7 @@ from .protocol import (
     FrameCodec,
     ProtocolError,
     bounded,
+    finish_frame_write,
     negotiate_protocol_version,
 )
 from .runtime import BackendFactory, ServerRuntime
@@ -100,6 +102,7 @@ class ZetaServer:
         self._client_active = False
         self._client: _Client | None = None
         self._socket_created = False
+        self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
 
     @property
@@ -777,7 +780,12 @@ class _Client:
             )
         finally:
             if not started and loop.notification_turn_state == "scheduled":
-                await loop.finish_notification_turn(success=False)
+                loop.cancel_scheduled_notification_turn()
+            if (
+                outcome is TurnOutcome.FOREGROUND_CANCELED
+                and loop.notification_system_message() is not None
+            ):
+                self._schedule_background_wake(session_id)
             self.deliveries.finalize_turn(
                 session_id, state, outcome, schedule_wake=agent_end is None
             )
@@ -974,11 +982,9 @@ class _Client:
             )
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
-            notification = dict(event.data)
-            event_name = event_contract.notification_wire_event(
-                notification.get("kind", "agent_completion"), self.protocol_version
+            await self.server.notification_presentations.publish(
+                session_id, event.data, self.protocol_version, self._notify
             )
-            await self._notify(event_name, session_id, data=notification)
             return
         if kind is StreamEventType.ERROR:
             error = (
@@ -1027,10 +1033,10 @@ class _Client:
 
     async def _notify(
         self, event: str, session_id: str | None = None, **fields: object
-    ) -> None:
+    ) -> bool:
         if session_id is None and self.server.runtime.opened is not None:
             session_id = self.server.runtime.session_id
-        await self._write(self.codec.notification(event, session_id, **fields))
+        return await self._write(self.codec.notification(event, session_id, **fields))
 
     def _list_sessions(
         self, request_id: str | int, params: dict[str, Any]
@@ -1129,9 +1135,9 @@ class _Client:
                 suppress_write_errors=suppress_write_errors,
             )
 
-    async def _write(self, payload: bytes) -> None:
+    async def _write(self, payload: bytes) -> bool:
         async with self._write_lock:
-            await self.codec.write(self.writer, payload)
+            return await finish_frame_write(self.codec, self.writer, payload)
 
     def _turn_busy(self) -> bool:
         loop = self.server.runtime.loop

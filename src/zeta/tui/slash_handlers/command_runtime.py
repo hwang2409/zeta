@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from uuid import uuid4
 
+from ...agent.pending_delivery import NotificationInput
 from ...core.abort import AbortSignal
 from ...core.commands.custom_commands import CustomCommand
 from ...protocol.types import StreamEvent, StreamEventType, ToolCall, ToolResult
@@ -288,17 +289,20 @@ class CommandRuntimeMixin:
                 else:
                     status = "error"
                     text = f"background macro /{command.name} failed with exit {exit_code}"
-                self.loop.store.append_agent_notification(
-                    instance_id,
-                    child_session_path=str(log_path),
-                    description=f"/{command.name}",
-                    status=status,
-                    text=f"{text}; log {log_path}",
-                    background_metadata=("background_macro", phase),
+                await self.loop.step_delivery.produce(
+                    NotificationInput(
+                        "macro_completion",
+                        {
+                            "child_instance_id": instance_id,
+                            "child_session_path": str(log_path),
+                            "description": f"/{command.name}",
+                            "status": status,
+                            "text": f"{text}; log {log_path}",
+                            "background_owner": "background_macro",
+                            "background_phase": phase,
+                        },
+                    )
                 )
-                # The registry suppresses its own task_exited for macro-owned
-                # background tasks, so this receipt path owns the single wake.
-                self.loop.notify_background_persisted()
             finally:
                 self.loop._background_owner.unregister(instance_id)
 

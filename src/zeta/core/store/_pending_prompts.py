@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import time
 import weakref
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from ...protocol.types import Message, MessageOrigin
+from ...protocol.types import MessageOrigin
 from ..checkpoints import ConversationEntry
 
 if TYPE_CHECKING:
@@ -25,6 +25,10 @@ class PendingPromptsClosedError(RuntimeError):
 
 class PendingPromptCommitTimeoutError(TimeoutError):
     """Raised when a pending-prompt commit misses its pre-write deadline."""
+
+
+class PendingPromptWriterReloadedError(PendingPromptCommitTimeoutError):
+    """Raised after a writer reload consumes its timed commit window."""
 
 
 class PendingPromptLoopThreadLockError(RuntimeError):
@@ -76,18 +80,6 @@ class PendingPromptStoreMixin:
             persisted_notification_ids=persisted_notification_ids
         )
 
-    def _acknowledge_pending_prompt_messages(
-        self, messages: list[Message], prompt_ids: tuple[str, ...]
-    ) -> None:
-        self.pending_prompt_queue.acknowledge_messages(messages, prompt_ids=prompt_ids)
-
-    async def acknowledge_pending_prompt_messages(
-        self, messages: list[Message], *, prompt_ids: tuple[str, ...] = ()
-    ) -> None:
-        await self._to_thread_durable(
-            self._acknowledge_pending_prompt_messages, messages, prompt_ids
-        )
-
 
 def _require_off_loop_lock() -> None:
     try:
@@ -131,7 +123,13 @@ class PendingPromptQueue:
         if len(text) > MAX_PENDING_PROMPT_TEXT:
             raise ValueError("pending prompt text is too long")
         with self._lock(deadline=deadline):
+            reload_started = time.monotonic()
             self._store._load()
+            if (
+                deadline is not None
+                and reload_started < deadline <= time.monotonic()
+            ):
+                raise PendingPromptWriterReloadedError
             self._check_deadline(deadline)
             if self._queue_closed_unlocked():
                 raise PendingPromptsClosedError("pending prompt queue is closed")
@@ -163,29 +161,6 @@ class PendingPromptQueue:
                 self._store._append_row_unlocked(
                     "pending_prompt_ack", {"prompt_id": prompt_id}
                 )
-
-    def acknowledge_messages(
-        self, messages: list[Message], *, prompt_ids: Iterable[str] = ()
-    ) -> None:
-        """Consume pending prompts included in one provider context."""
-        prompt_ids = set(prompt_ids) | {
-            prompt_id
-            for message in messages
-            if isinstance(
-                prompt_id := message.metadata.get(PENDING_PROMPT_ID_METADATA), str
-            )
-        }
-        if not prompt_ids:
-            return
-        with self._lock():
-            self._store._load()
-            pending_ids = {entry.id for entry in self._pending_unlocked()}
-            rows = [
-                ("pending_prompt_ack", {"prompt_id": prompt_id})
-                for prompt_id in prompt_ids & pending_ids
-            ]
-            if rows:
-                self._store._append_many_unlocked(rows)
 
     def close_if_empty(self) -> list[ConversationEntry]:
         with self._lock():
@@ -225,8 +200,7 @@ class PendingPromptQueue:
             pending_notifications = [
                 entry
                 for notification_id, entry in self._store._active_notifications.items()
-                if notification_id not in self._store._active_notification_acks
-                and notification_id not in persisted_notification_ids
+                if notification_id not in persisted_notification_ids
                 and entry.data.get("display_only") is not True
             ]
             if pending_notifications:
@@ -293,8 +267,7 @@ class PendingPromptQueue:
         if self._terminal_transition_unlocked() is not None or self._pending_unlocked():
             return False
         return not any(
-            notification_id not in self._store._active_notification_acks
-            and notification_id not in persisted_notification_ids
+            notification_id not in persisted_notification_ids
             and entry.data.get("display_only") is not True
             for notification_id, entry in self._store._active_notifications.items()
         )
@@ -315,14 +288,7 @@ class PendingPromptQueue:
         )
 
     def _pending_unlocked(self) -> list[ConversationEntry]:
-        branch = self._store.replay()
-        acknowledged = {
-            entry.data["prompt_id"]
-            for entry in branch
-            if entry.type == "pending_prompt_ack"
-        }
         return [
             self._store._snapshot_entry(entry)
-            for entry in branch
-            if entry.type == "pending_prompt" and entry.id not in acknowledged
+            for entry in self._store._active_pending_prompt_entries.values()
         ]

@@ -151,13 +151,17 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
     backend = FakeBackend([ScriptedTurn([TextContent("handled")])])
     server, reader, writer, _ = await _ready(tmp_path, backend, features=[FEATURE])
     store = server.runtime.opened.store
-    original_durable_write = store._run_durable_write
+    original_durable_write = type(store)._run_durable_write
     append_committed = threading.Event()
     release_append = threading.Event()
 
-    def pause_after_notification_commit(method_name, args, kwargs):
-        result = original_durable_write(method_name, args, kwargs)
-        message = args[0] if method_name == "append_message" else None
+    def pause_after_notification_commit(self, method_name, args, kwargs):
+        result = original_durable_write(self, method_name, args, kwargs)
+        message = (
+            result[0].notification_message
+            if method_name == "_stage_delivery_request"
+            else None
+        )
         if (
             message is not None
             and message.metadata.get("zeta_event") == "agent_notifications"
@@ -166,7 +170,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
             assert release_append.wait(timeout=5)
         return result
 
-    monkeypatch.setattr(store, "_run_durable_write", pause_after_notification_commit)
+    monkeypatch.setattr(type(store), "_run_durable_write", pause_after_notification_commit)
     try:
         if with_context:
             await _request(reader, writer, 3, "set_turn_context", {"text": CONTEXT})
@@ -188,7 +192,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
 
-        monkeypatch.setattr(store, "_run_durable_write", original_durable_write)
+        monkeypatch.setattr(type(store), "_run_durable_write", original_durable_write)
         if store.agent_notifications():
             server._client._schedule_background_wake(server.runtime.session_id)
         else:
@@ -217,25 +221,114 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
 
 
 @pytest.mark.asyncio
+async def test_persisted_notification_retry_attaches_new_context_once(
+    tmp_path, monkeypatch
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("handled")]),
+            ScriptedTurn([TextContent("handled again")]),
+        ]
+    )
+    server, reader, writer, _ = await _ready(tmp_path, backend, features=[FEATURE])
+    store = server.runtime.opened.store
+    original_durable_write = type(store)._run_durable_write
+    append_committed = threading.Event()
+    release_append = threading.Event()
+
+    def pause_after_notification_commit(self, method_name, args, kwargs):
+        result = original_durable_write(self, method_name, args, kwargs)
+        message = (
+            result[0].notification_message
+            if method_name == "_stage_delivery_request"
+            else None
+        )
+        if (
+            message is not None
+            and message.metadata.get("zeta_event") == "agent_notifications"
+        ):
+            append_committed.set()
+            assert release_append.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(type(store), "_run_durable_write", pause_after_notification_commit)
+    try:
+        store.append_agent_notification(
+            "child-1",
+            child_session_path="/tmp/child-1",
+            description="child",
+            status="completed",
+            text="child-1 done",
+        )
+        server._client._schedule_background_wake(server.runtime.session_id)
+        assert await asyncio.to_thread(append_committed.wait, 2)
+        turn_task = server._client._turn_task
+        assert turn_task is not None
+        turn_task.cancel()
+        release_append.set()
+        with pytest.raises(asyncio.CancelledError):
+            await turn_task
+        while server.runtime.loop.notification_turn_state != "idle":
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(type(store), "_run_durable_write", original_durable_write)
+        await _request(reader, writer, 3, "set_turn_context", {"text": CONTEXT})
+        server._client._schedule_background_wake(server.runtime.session_id)
+        await _frames_until_event(reader, "agent_end")
+        while server.runtime.loop.notification_turn_state != "idle":
+            await asyncio.sleep(0)
+
+        assert len(backend.calls) == 1
+        provider_notifications = _context_messages(backend, 0)
+        assert len(provider_notifications) == 1
+        assert provider_notifications[0].content[0].text.count(CONTEXT) == 1
+        assert provider_notifications[0].content[0].text.index(CONTEXT) < (
+            provider_notifications[0].content[0].text.index("Background updates only")
+        )
+        await _notify(server, reader, "child-2")
+        assert len(backend.calls) == 2
+        assert CONTEXT not in _context_messages(backend, 1)[-1].content[0].text
+        persisted_context = [
+            message for message in store.messages() if message.metadata.get("turn_context")
+        ]
+        assert len(persisted_context) == 1
+        assert store.agent_notifications() == []
+    finally:
+        release_append.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_failed_persistence_releases_context_for_exactly_one_retry(
     tmp_path, monkeypatch
 ) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("handled")])])
     server, reader, writer, _ = await _ready(tmp_path, backend, features=[FEATURE])
     store = server.runtime.opened.store
-    original_append = store.append_message_async
+    original_stage = type(store)._stage_delivery_request
     failed = False
 
-    async def fail_context_append(message, *, parent_id=None, on_persisted=None):
+    def fail_context_append(
+        self, notification_budget, token_counter, selector, notification_context=None
+    ):
         nonlocal failed
-        if message.metadata.get("turn_context") and not failed:
+        if (
+            notification_context is not None
+            and notification_context.metadata.get("turn_context")
+            and not failed
+        ):
             failed = True
             raise OSError("injected persistence failure")
-        return await original_append(
-            message, parent_id=parent_id, on_persisted=on_persisted
+        return original_stage(
+            self,
+            notification_budget,
+            token_counter,
+            selector,
+            notification_context,
         )
 
-    monkeypatch.setattr(store, "append_message_async", fail_context_append)
+    fail_context_append.__name__ = "_stage_delivery_request"
+    monkeypatch.setattr(type(store), "_stage_delivery_request", fail_context_append)
     try:
         await _request(reader, writer, 3, "set_turn_context", {"text": CONTEXT})
         store.append_agent_notification(
@@ -292,12 +385,13 @@ async def test_reconnect_keeps_context_released_after_persistence_failure(
         tmp_path, backend, features=[FEATURE]
     )
     store = server.runtime.opened.store
-    original_append = store.append_message_async
+    original_stage = type(store)._stage_delivery_request
 
-    async def fail_append(message, *, parent_id=None, on_persisted=None):
+    def fail_append(self, *args, **kwargs):
         raise OSError("injected persistence failure")
 
-    monkeypatch.setattr(store, "append_message_async", fail_append)
+    fail_append.__name__ = "_stage_delivery_request"
+    monkeypatch.setattr(type(store), "_stage_delivery_request", fail_append)
     await _request(reader, writer, 3, "set_turn_context", {"text": CONTEXT})
     store.append_agent_notification(
         "child-1",
@@ -313,7 +407,7 @@ async def test_reconnect_keeps_context_released_after_persistence_failure(
     writer.close()
     await writer.wait_closed()
     await asyncio.sleep(0.05)
-    monkeypatch.setattr(store, "append_message_async", original_append)
+    monkeypatch.setattr(type(store), "_stage_delivery_request", original_stage)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         await _request(
@@ -347,14 +441,15 @@ async def test_session_switch_keeps_pending_contexts_separate(
         tmp_path, backend, features=[FEATURE]
     )
     first_store = server.runtime.opened.store
-    original_append = first_store.append_message_async
+    original_stage = type(first_store)._stage_delivery_request
 
-    async def fail_append(message, *, parent_id=None, on_persisted=None):
+    def fail_append(self, *args, **kwargs):
         raise OSError("injected persistence failure")
 
+    fail_append.__name__ = "_stage_delivery_request"
     try:
         await _request(reader, writer, 3, "set_turn_context", {"text": first_context})
-        monkeypatch.setattr(first_store, "append_message_async", fail_append)
+        monkeypatch.setattr(type(first_store), "_stage_delivery_request", fail_append)
         first_store.append_agent_notification(
             "first-attempt",
             child_session_path="/tmp/first-attempt",
@@ -366,7 +461,7 @@ async def test_session_switch_keeps_pending_contexts_separate(
         await _frames_until_event(reader, "error")
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
-        monkeypatch.setattr(first_store, "append_message_async", original_append)
+        monkeypatch.setattr(type(first_store), "_stage_delivery_request", original_stage)
 
         created = await _request(reader, writer, 4, "new_session")
         second_session = created[-1]["result"]["session"]["session_id"]

@@ -873,4 +873,8 @@ class AgentRunCommandMixin:
         )
         if error is not None:
             return error
-        return f"queued for {run_id}; it arrives at the run's next turn boundary"
+        return (
+            f"queued for {run_id}; a running child receives it after its current "
+            "tool call, before its next model call; an idle child receives it at "
+            "its next turn"
+        )

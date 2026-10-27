@@ -864,7 +864,7 @@ async def test_calibrated_eviction_targets_provider_space(
         else 10,
         safety_margin=0.1,
     )
-    assembler._provider_budgets = assembler._calibration.calibrate(100, 200)
+    assembler._request_budget.provider_budgets = assembler._request_budget.calibration.calibrate(100, 200)
     raw_target = 55
     targets: list[int] = []
     raw_results = []
@@ -910,7 +910,7 @@ async def test_emergency_eviction_targets_half_provider_limit(
         if message.metadata.get("context_evicted")
         else 10,
     )
-    assembler._provider_budgets = assembler._calibration.calibrate(100, 200)
+    assembler._request_budget.provider_budgets = assembler._request_budget.calibration.calibrate(100, 200)
     raw_target = 50
     targets: list[int] = []
     raw_results = []
@@ -936,7 +936,7 @@ def test_summary_usage_does_not_change_context_calibration(
     context_root: Path,
 ) -> None:
     assembler = ContextAssembler(ConversationStore(context_root))
-    assembler._provider_budgets = assembler._calibration.calibrate(100, 200)
+    assembler._request_budget.provider_budgets = assembler._request_budget.calibration.calibrate(100, 200)
 
     assembler._record_session_usage({"input_tokens": 1})
 
@@ -1169,6 +1169,8 @@ async def test_same_state_recompaction_survives_cold_reload(context_root: Path) 
             MessageRole.COMPACTION,
         } or message.metadata.get("compaction_summary"):
             return 1
+        if message.content[0].text.startswith("Summarize the conversation range"):
+            return 10
         return 100
 
     assembler = ContextAssembler(
@@ -1264,6 +1266,67 @@ async def test_stale_branch_discards_summary(context_root: Path) -> None:
     assert not any(entry.type == "compaction" for entry in store.entries)
 
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_backend", [False, True])
+async def test_compaction_request_over_budget_is_not_dispatched(
+    context_root: Path, replace_backend: bool
+) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(
+        with_message_origin(text(MessageRole.USER, "old " * 100), MessageOrigin.USER)
+    )
+    store.append_message(
+        with_message_origin(text(MessageRole.USER, "current"), MessageOrigin.USER)
+    )
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
+    assembler = ContextAssembler(
+        store,
+        token_budget=200,
+        retained_tail=1,
+        token_counter=count,
+        backend=backend,
+        compaction_policy=CompactionPolicy(backend, summary_prompt="s" * 300),
+    )
+
+    dispatched_backend = backend
+    if replace_backend:
+        dispatched_backend = FakeBackend([])
+        assembler.update_backend(dispatched_backend)
+
+    with pytest.raises(BudgetExceeded, match="provider request"):
+        await assembler.assemble(force=True)
+
+    assert dispatched_backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispatched_compaction_request_equals_admitted_request(
+    context_root: Path,
+) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(
+        with_message_origin(text(MessageRole.USER, "old " * 100), MessageOrigin.USER)
+    )
+    store.append_message(
+        with_message_origin(text(MessageRole.USER, "current"), MessageOrigin.USER)
+    )
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
+    assembler = ContextAssembler(
+        store,
+        token_budget=1_000,
+        retained_tail=1,
+        token_counter=count,
+        backend=backend,
+    )
+
+    await assembler.assemble(force=True)
+
+    dispatched_messages, dispatched_tools = backend.calls[-1]
+    assert assembler.provider_attempt_estimate == assembler.estimate_request(
+        dispatched_messages, dispatched_tools
+    )
 
 
 @pytest.mark.asyncio
@@ -1817,6 +1880,8 @@ async def test_bounded_fallback_keeps_small_compacted_context_in_budget(
             return (len(message.content[0].text) + 3) // 4
         if message.content[0].text == "tail":
             return 1
+        if message.content[0].text.startswith("Summarize the conversation range"):
+            return 10
         return 30
 
     assembler = ContextAssembler(

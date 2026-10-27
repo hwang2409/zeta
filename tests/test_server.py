@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import gc
 import inspect
 import json
 import multiprocessing
@@ -15,6 +16,7 @@ import stat
 import subprocess
 import sys
 import threading
+import weakref
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -25,6 +27,8 @@ from typing import Any
 import pytest
 
 import zeta.accounts.session as account_session_module
+import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import AccountId, AccountStore, AccountUsage
@@ -54,6 +58,7 @@ from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
 )
+from zeta.server.notification_presentation import NotificationPresentation
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
 from zeta.server.server import _approval_display_fields, _Client
 from zeta.server.slash_commands import ServerSlashSession
@@ -75,6 +80,317 @@ def test_every_durable_notification_kind_has_an_explicit_wire_event() -> None:
 def test_every_stream_event_has_a_wire_mapping() -> None:
     assert set(STREAM_EVENT_WIRE_EVENTS) == set(StreamEventType)
     assert all(STREAM_EVENT_WIRE_EVENTS.values())
+
+
+@pytest.mark.asyncio
+async def test_notification_presentation_retries_failed_send() -> None:
+    presentation = NotificationPresentation()
+    attempts = 0
+
+    async def send(*args: object, **kwargs: object) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError("send failed")
+        return True
+
+    notification = {"notification_id": "notification-1"}
+    with pytest.raises(ConnectionError, match="send failed"):
+        await presentation.publish("session-1", notification, "1.0", send)
+    await presentation.publish("session-1", notification, "1.0", send)
+
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_notification_presentation_retries_disconnected_codec_write(
+    tmp_path: Path,
+) -> None:
+    class DisconnectedWriter:
+        def write(self, payload: bytes) -> None:
+            raise ConnectionError("disconnected")
+
+        async def drain(self) -> None:
+            raise AssertionError("drain must not run after a failed write")
+
+    class HealthyWriter:
+        def __init__(self) -> None:
+            self.frames: list[bytes] = []
+
+        def write(self, payload: bytes) -> None:
+            self.frames.append(payload)
+
+        async def drain(self) -> None:
+            pass
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    client = _Client(server, asyncio.StreamReader(), DisconnectedWriter())
+    notification = {"notification_id": "notification-1"}
+
+    await server.notification_presentations.publish(
+        "session-1", notification, "1.0", client._notify
+    )
+    healthy = HealthyWriter()
+    client.writer = healthy
+    await server.notification_presentations.publish(
+        "session-1", notification, "1.0", client._notify
+    )
+
+    receipts = [
+        json.loads(frame)
+        for frame in healthy.frames
+        if json.loads(frame)["params"]["event"] == "sub_agent_receipt"
+    ]
+    assert len(receipts) == 1
+    assert receipts[0]["params"]["data"]["notification_id"] == "notification-1"
+
+
+@pytest.mark.asyncio
+async def test_notification_presentation_retries_after_cancel_before_write(
+    tmp_path: Path,
+) -> None:
+    class HealthyWriter:
+        def __init__(self) -> None:
+            self.frames: list[bytes] = []
+
+        def write(self, payload: bytes) -> None:
+            self.frames.append(payload)
+
+        async def drain(self) -> None:
+            pass
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    healthy = HealthyWriter()
+    client = _Client(server, asyncio.StreamReader(), healthy)
+    notification = {"notification_id": "notification-1"}
+
+    await client._write_lock.acquire()
+    blocked = asyncio.create_task(
+        server.notification_presentations.publish(
+            "session-1", notification, "1.0", client._notify
+        )
+    )
+    while not client._write_lock._waiters:
+        await asyncio.sleep(0)
+    blocked.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await blocked
+    client._write_lock.release()
+    assert healthy.frames == []
+
+    await server.notification_presentations.publish(
+        "session-1", notification, "1.0", client._notify
+    )
+
+    receipts = [
+        json.loads(frame)
+        for frame in healthy.frames
+        if json.loads(frame)["params"]["event"] == "sub_agent_receipt"
+    ]
+    assert len(receipts) == 1
+    assert receipts[0]["params"]["data"]["notification_id"] == "notification-1"
+
+
+@pytest.mark.asyncio
+async def test_canceled_write_to_stalled_client_aborts_within_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.05)
+
+    class StalledTransport:
+        def __init__(self) -> None:
+            self.aborted = False
+            self.closed = asyncio.Event()
+
+        def abort(self) -> None:
+            self.aborted = True
+            self.closed.set()
+
+    class StalledWriter:
+        def __init__(self) -> None:
+            self.transport = StalledTransport()
+            self.frames: list[bytes] = []
+
+        def write(self, payload: bytes) -> None:
+            self.frames.append(payload)
+
+        async def drain(self) -> None:
+            await self.transport.closed.wait()
+            raise ConnectionResetError("aborted")
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    writer = StalledWriter()
+    client = _Client(server, asyncio.StreamReader(), writer)
+    notification = {"notification_id": "notification-1"}
+    publish = asyncio.create_task(
+        server.notification_presentations.publish(
+            "session-1", notification, "1.0", client._notify
+        )
+    )
+    while not writer.frames:
+        await asyncio.sleep(0)
+    publish.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(publish, 2)
+    assert writer.transport.aborted
+    assert not client._write_lock.locked()
+
+    healthy = asyncio.Event()
+    writer.transport.closed = healthy
+    healthy.set()
+    sent: list[str] = []
+
+    async def record(event: str, session_id: str | None = None, **fields: object) -> bool:
+        sent.append(event)
+        return True
+
+    await server.notification_presentations.publish(
+        "session-1", notification, "1.0", record
+    )
+    assert sent == ["sub_agent_receipt"]
+
+
+@pytest.mark.asyncio
+async def test_canceled_write_ignoring_abort_and_cancel_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.05)
+    release = asyncio.Event()
+
+    class StubbornWriter:
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+    started = asyncio.Event()
+    codec = protocol_module.FrameCodec()
+    original = codec.write
+
+    async def write(writer: object, payload: bytes) -> bool:
+        started.set()
+        return await original(writer, payload)
+
+    codec.write = write  # type: ignore[method-assign]
+    outcomes: list[bool] = []
+
+    async def publish() -> None:
+        try:
+            await protocol_module.finish_frame_write(codec, StubbornWriter(), b"{}")
+        except protocol_module.FrameWriteCancelled as cancelled:
+            outcomes.append(cancelled.written)
+            raise
+
+    task = asyncio.create_task(publish())
+    try:
+        await started.wait()
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert done == {task}
+        assert outcomes == [False]
+    finally:
+        release.set()
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_detached_canceled_write_is_owned_until_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.01)
+    release = False
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    write_ref: weakref.ReferenceType[asyncio.Task[bool]] | None = None
+
+    class CancellationResistantWriter:
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            nonlocal write_ref
+            task = asyncio.current_task()
+            assert task is not None
+            write_ref = weakref.ref(task)
+            started.set()
+            try:
+                while not release:
+                    try:
+                        await asyncio.get_running_loop().create_future()
+                    except asyncio.CancelledError:
+                        continue
+            finally:
+                stopped.set()
+
+    loop = asyncio.get_running_loop()
+    loop_errors: list[str] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(
+        lambda _loop, context: loop_errors.append(str(context.get("message", "")))
+    )
+    caller = asyncio.create_task(
+        protocol_module.finish_frame_write(
+            protocol_module.FrameCodec(), CancellationResistantWriter(), b"{}"
+        )
+    )
+    try:
+        await started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        del caller
+        for _ in range(3):
+            await asyncio.sleep(0)
+            gc.collect()
+        assert write_ref is not None
+        detached = write_ref()
+        assert detached is not None
+        assert detached in getattr(protocol_module, "_DETACHED_FRAME_WRITES", set())
+        assert loop_errors == []
+    finally:
+        release = True
+        if write_ref is not None and (detached := write_ref()) is not None:
+            detached.cancel()
+            await stopped.wait()
+            await asyncio.sleep(0)
+        loop.set_exception_handler(previous_handler)
+
+    assert protocol_module._DETACHED_FRAME_WRITES == set()
+    assert loop_errors == []
+
+
+@pytest.mark.asyncio
+async def test_canceled_write_surfaces_unexpected_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 1.0)
+    fail = asyncio.Event()
+
+    class FailingWriter:
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            await fail.wait()
+            raise RuntimeError("codec bug")
+
+    task = asyncio.create_task(
+        protocol_module.finish_frame_write(
+            protocol_module.FrameCodec(), FailingWriter(), b"{}"
+        )
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    fail.set()
+    with pytest.raises(RuntimeError, match="codec bug"):
+        await asyncio.wait_for(task, 2)
 
 
 def test_serve_maps_account_state_unknown() -> None:
@@ -156,6 +472,33 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
             *(NOTIFICATION_WIRE_EVENTS[kind] for kind in NOTIFICATION_KINDS),
             "sub_agent_receipt",
         ]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_child_message_delivered_event_maps_from_background_run(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        assert server._client is not None
+        await server._client._event(
+            StreamEvent(
+                StreamEventType.CHILD_MESSAGE_DELIVERED,
+                data={"child_label": "worker", "preview": "check the retry"},
+            ),
+            session_id="parent",
+        )
+
+        notification = await _read(reader)
+        assert notification["params"] == {
+            "event": "child_message_delivered",
+            "session_id": "parent",
+            "data": {"child_label": "worker", "preview": "check the retry"},
+        }
     finally:
         await _close(server, writer)
 
@@ -2191,9 +2534,13 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
     monkeypatch.setattr(server._client, "_notify", notify)
     old_session_id = server.runtime.session_id
     assert server.runtime.opened is not None
+    old_store = server.runtime.opened.store
     for index in range(300):
-        server.runtime.opened.store.append_message(
-            with_message_origin(Message(MessageRole.USER, [TextContent(f"history-{index}")]), MessageOrigin.USER)
+        old_store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"history-{index}")]),
+                MessageOrigin.USER,
+            )
         )
     try:
         await _request(reader, writer, 3, "send", {"text": "start"})
@@ -2212,21 +2559,12 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
             if frame.get("params") is not None
         )
 
-        terminal = next(
-            (
-                frame
-                for frame in swap_frames
-                if frame.get("params", {}).get("event") == "tool_end"
-                and frame.get("params", {}).get("data", {}).get("notification_id")
-            ),
-            None,
+        old_notifications = old_store.agent_notifications()
+        assert old_notifications
+        assert all(
+            entry.data["child_instance_id"].startswith(f"{old_session_id}:")
+            for entry in old_notifications
         )
-        while terminal is None:
-            frame = json.loads(await asyncio.wait_for(reader.readline(), TIMEOUT))
-            params = frame.get("params", {})
-            if params.get("event") == "tool_end" and params.get("data", {}).get("notification_id"):
-                terminal = frame
-        assert terminal["params"]["session_id"] == old_session_id
         status = await _request(reader, writer, 5, "status")
         assert status[-1]["result"]["session"]["session_id"] == new_session_id
     finally:
@@ -2885,6 +3223,84 @@ async def test_reconnect_streams_pending_notification_turn(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_notification_receipt_is_not_republished_after_canceled_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first")]),
+            ScriptedTurn([TextContent("retry")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    client = server._client
+    assert client is not None
+    published = asyncio.Event()
+    release_publication = asyncio.Event()
+    original_write = client.codec.write
+
+    async def gate_after_receipt_bytes(target: object, payload: bytes) -> bool:
+        written = await original_write(target, payload)
+        if b'"sub_agent_receipt"' in payload and not published.is_set():
+            published.set()
+            await release_publication.wait()
+        return written
+
+    monkeypatch.setattr(client.codec, "write", gate_after_receipt_bytes)
+    notification = server.runtime.opened.store.append_agent_notification(
+        "child-retry",
+        child_session_path="/tmp/child-retry",
+        description="child",
+        status="completed",
+        text="child retry done",
+    )
+    try:
+        client._schedule_background_wake(session_id)
+        await asyncio.wait_for(published.wait(), TIMEOUT)
+        first_turn = client._turn_task
+        assert first_turn is not None
+        first_turn.cancel()
+        release_publication.set()
+        await asyncio.gather(first_turn, return_exceptions=True)
+        assert [
+            entry.id for entry in server.runtime.opened.store.agent_notifications()
+        ] == [notification.id]
+
+        client._schedule_background_wake(session_id)
+        frames = await _frames_until_event(reader, "turn_end")
+        receipts = [
+            frame["params"]
+            for frame in frames
+            if frame.get("params", {}).get("event") == "sub_agent_receipt"
+        ]
+        matching = [
+            receipt
+            for receipt in receipts
+            if receipt.get("data", {}).get("notification_id") == notification.id
+        ]
+        assert len(matching) == 1
+        assert len(backend.calls) == 2
+        for messages, _tools in backend.calls:
+            assert sum(
+                message.metadata.get("zeta_event") == "agent_notifications"
+                and notification.id
+                in message.metadata.get("zeta.step_delivery", {}).get(
+                    "notification_ids", []
+                )
+                for message in messages
+            ) == 1
+    finally:
+        release_publication.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_session_history_handles_task_legacy_and_unknown_kinds(
     tmp_path: Path,
 ) -> None:
@@ -3173,6 +3589,72 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_model", "start_budget", "target_model", "target_budget"),
+    [
+        ("gpt-5.6-luna", 1_000_000, "gpt-5.6-sol", 8_192),
+        ("gpt-5.6-sol", 8_192, "gpt-5.6-luna", 1_000_000),
+    ],
+)
+async def test_serve_model_transition_recomputes_every_budget_and_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start_model: str,
+    start_budget: int,
+    target_model: str,
+    target_budget: int,
+) -> None:
+    from zeta.core.slash import MODEL_CONTEXT_WINDOWS
+    monkeypatch.setitem(
+        MODEL_CONTEXT_WINDOWS,
+        "codex",
+        {"gpt-5.6-luna": 1_000_000, "gpt-5.6-sol": 8_192},
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="codex",
+        model=start_model,
+    )
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        runtime = server.runtime
+        response = (
+            await _request(
+                reader,
+                writer,
+                "settings",
+                "set_settings",
+                {
+                    "session_id": sid,
+                    "model": target_model,
+                    "approval_mode": "deny",
+                },
+            )
+        )[-1]
+        assert "result" in response, response
+        assert response["result"]["model"] == target_model
+        assembler = runtime.loop.context_assembler
+        assert assembler.token_budget == target_budget
+        assert assembler.trigger_token_budget == int(target_budget * 0.9)
+        assert assembler.delivery_notification_budget == (
+            512 if target_budget == 8_192 else 8_192
+        )
+        runtime.loop.store.append_agent_notification_if_absent(
+            "pending-child",
+            child_session_path="/tmp/child",
+            description="pending",
+            status="completed",
+            text="done",
+        )
+        flow = await runtime.loop._ensure_step_delivery()
+        prepared = await flow.prepare_request("after_tools", [], None)
+        assert prepared.notification_ids
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pinned", [False, True])
 @pytest.mark.parametrize("failure", [None, "backend", "metadata"])
 async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, failure):
@@ -3430,7 +3912,6 @@ async def test_cross_provider_settings_preserve_session_and_budget(tmp_path, mon
             assert response["result"] == {"model": "gpt-5.4", "approval_mode": "deny"}
             assert loop.backend is not backend
             assert loop.context_assembler.backend is loop.backend
-            assert loop.context_assembler.compaction_policy.backend is loop.backend
             expected = 123456 if pinned else budget_for_model("codex", "gpt-5.4")
             assert loop.context_assembler.token_budget == expected
             assert runtime.metadata.compaction_budget == expected
@@ -3798,7 +4279,6 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
         assert metadata.compaction_budget == old_budget
         assert runtime.loop.context_assembler.token_budget == old_budget
         assert runtime.loop.backend is runtime.loop.context_assembler.backend
-        assert runtime.loop.backend is runtime.loop.context_assembler.compaction_policy.backend
         assert runtime.policy.default.value == "deny"
         await _request(reader, writer, 7, "send", {"text": "next request"})
         message = await _event(reader, "assistant_message")
@@ -5295,7 +5775,9 @@ async def test_failed_wake_turn_keeps_durable_notification_input(tmp_path: Path)
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
         assert backend.calls == 1
-        assert store.agent_notifications() == []
+        assert [entry.data["text"] for entry in store.agent_notifications()] == [
+            "done"
+        ]
         assert sum(
             message.metadata.get("zeta_event") == "agent_notifications"
             for message in store.messages()
@@ -5355,69 +5837,6 @@ async def test_foreground_abort_retries_interrupted_notification_turn(
 
 
 @pytest.mark.asyncio
-async def test_foreground_abort_before_notification_persistence_delivers_once(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    backend = FakeBackend([ScriptedTurn([TextContent("delivered")])])
-    server = ZetaServer(
-        home=tmp_path,
-        port=0,
-        provider="codex",
-        backend_factory=lambda provider, model, home: (backend, model or "offline"),
-    )
-    reader, writer, _session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
-    original_append = store.append_message_async
-    append_started = asyncio.Event()
-    append_calls = 0
-
-    async def block_first_append(message, *, on_persisted=None):
-        nonlocal append_calls
-        append_calls += 1
-        if append_calls == 1:
-            append_started.set()
-            await asyncio.Event().wait()
-        await original_append(message, on_persisted=on_persisted)
-
-    monkeypatch.setattr(store, "append_message_async", block_first_append)
-    store.append_agent_notification(
-        "child",
-        child_session_path="/tmp/child",
-        description="child",
-        status="completed",
-        text="done",
-    )
-    writer.close()
-    await writer.wait_closed()
-    await asyncio.sleep(0.05)
-    try:
-        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-        await _request(
-            reader,
-            writer,
-            4,
-            "hello",
-            {"protocol_version": "1.1", "features": ["abort_scope"]},
-        )
-        await asyncio.wait_for(append_started.wait(), TIMEOUT)
-        frames = await _request(
-            reader, writer, 5, "abort", {"scope": "foreground"}
-        )
-        assert frames[-1]["result"]["aborted"] is True
-        await _frames_until_event(reader, "agent_end")
-        assert len(backend.calls) == 1
-        assert append_calls == 2
-        assert store.agent_notifications() == []
-        assert sum(
-            message.metadata.get("zeta_event") == "agent_notifications"
-            for message in store.messages()
-        ) == 1
-    finally:
-        await _close(server, writer)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("scope", [None, "session"])
 async def test_session_abort_does_not_retry_notification_turn(
     tmp_path: Path,
@@ -5458,7 +5877,7 @@ async def test_session_abort_does_not_retry_notification_turn(
         assert frames[-1]["result"]["aborted"] is True
         await asyncio.sleep(0.05)
         assert backend.calls == 1
-        assert store.agent_notifications() == []
+        assert len(store.agent_notifications()) == 1
         assert sum(
             message.metadata.get("zeta_event") == "agent_notifications"
             for message in store.messages()
@@ -5609,7 +6028,7 @@ async def test_disconnected_wake_turn_reuses_durable_notification_input(
         await writer.wait_closed()
         while server._client_active:
             await asyncio.sleep(0)
-        assert store.agent_notifications() == []
+        assert len(store.agent_notifications()) == 1
 
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         await _request(reader, writer, 5, "hello", {"protocol_version": "1.0"})
@@ -5952,6 +6371,9 @@ async def test_serve_cross_provider_model_change_updates_account_context(
         runtime.loop.store.append_message(native)
 
         await model_selection.apply(runtime, "claude-sonnet-4-6", "ask")
+        assert runtime.loop.context_assembler.trigger_token_budget == int(
+            runtime.loop.context_assembler.token_budget * 0.9
+        )
         assert runtime.loop.account_context.active_provider == "anthropic"
         assert runtime.loop.account_context.switch_sequence == 1
         assert runtime.loop._account_safe_context([native])[0].content == [
@@ -5959,6 +6381,9 @@ async def test_serve_cross_provider_model_change_updates_account_context(
             TextContent("answer"),
         ]
         await model_selection.apply(runtime, "gpt-5.4", "ask")
+        assert runtime.loop.context_assembler.trigger_token_budget == int(
+            runtime.loop.context_assembler.token_budget * 0.9
+        )
         assert runtime.loop.account_context.active_provider == "codex"
         assert runtime.loop.account_context.switch_sequence == 1
         assert runtime.loop._account_safe_context([native])[0].content == native.content
@@ -6276,3 +6701,171 @@ async def test_serve_shutdown_with_switch_lock_held_exits_bounded(
         writer.close()
         await writer.wait_closed()
         await asyncio.gather(request_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_8k_steering_alone_over_budget_keeps_main_requeue_serve(
+    tmp_path: Path,
+) -> None:
+    class BlockingBackend:
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                self.started.set()
+                await self.release.wait()
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+            )
+
+    backend = BlockingBackend()
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        assembler = server.runtime.loop.context_assembler
+        assembler.update_token_budget(8_192)
+        assembler.system_prompt = Message(
+            MessageRole.SYSTEM, [TextContent("short system prompt")]
+        )
+        oversized = "oversized-steering-" * 10_000
+        await _request(reader, writer, 3, "send", {"text": "start"})
+        await asyncio.wait_for(backend.started.wait(), TIMEOUT)
+        await _request(
+            reader,
+            writer,
+            4,
+            "steer",
+            {"text": oversized, "delivery_id": "oversized-steering"},
+        )
+        captured = server.runtime.loop.store.pending_client_steering()
+        assert captured is not None
+        steering_tokens = assembler.estimate_messages(captured.messages)
+        assert server.runtime.loop.step_delivery is not None
+        await server.runtime.loop.step_delivery.produce(
+            pending_delivery_module.PromptInput(
+                "agent-send-waits", MessageOrigin.AGENT_SEND, None
+            )
+        )
+        backend.release.set()
+        error = await _event(reader, "error")
+        await _event(reader, "agent_end")
+
+        expected = (
+            "your message was not sent: it is larger than this model's context "
+            f"window ({steering_tokens} of {assembler.estimator_token_budget} "
+            "tokens). shorten it and resend it, or switch to a larger model."
+        )
+        assert error["error"]["message"] == expected
+        assert not server.runtime.loop.has_pending_steering
+        status = await _request(
+            reader,
+            writer,
+            5,
+            "delivery_status",
+            {"delivery_id": "oversized-steering"},
+        )
+        assert status[-1]["result"]["status"] == "dropped"
+        assert (
+            server.runtime.loop.store.client_delivery("oversized-steering").reason
+            == "failed"
+        )
+        assert server.runtime.loop.step_delivery.prompt_priority is not None
+        assert all(
+            not any(
+                isinstance(block, TextContent) and block.text == oversized
+                for message in call_messages
+                for block in message.content
+            )
+            for call_messages in backend.calls
+        )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_low_capacity_notice_wire_path(tmp_path: Path) -> None:
+    backend = FakeBackend([])
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["memory_updated"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        loop = server.runtime.loop
+        assembler = loop.context_assembler
+        assembler.update_token_budget(8_192)
+        minimum = assembler.estimator_token_budget
+        low, high = 0, assembler.estimator_token_budget * 8
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = Message(MessageRole.SYSTEM, [TextContent("k" * middle)])
+            if assembler.estimate_messages((candidate,)) <= (
+                assembler.estimator_token_budget - minimum + 1
+            ):
+                low = middle
+            else:
+                high = middle - 1
+        assembler.system_prompt = Message(MessageRole.SYSTEM, [TextContent("k" * low)])
+        assert loop.step_delivery is not None
+        await loop.step_delivery.produce(
+            pending_delivery_module.NotificationInput(
+                "child_completion",
+                {
+                    "child_instance_id": "c" * 80,
+                    "child_session_path": "p" * 200,
+                    "description": "d" * 120,
+                    "status": "completed",
+                    "text": "x" * 256,
+                    "report": {
+                        "status": "done",
+                        "verdict": "pass",
+                        "head_sha": "a" * 40,
+                        "summary": "x" * 256,
+                        "pr_number": 1_111_111_111,
+                    },
+                },
+                dedupe_key="c" * 80,
+            )
+        )
+
+        notice = await _event(reader, "memory_updated")
+
+        expected = (
+            "1 background updates waiting; context too small to show them; full "
+            f"records: {loop.store.path}"
+        )
+        assert notice["message"] == expected
+        assert backend.calls == []
+    finally:
+        await _close(server, writer)
