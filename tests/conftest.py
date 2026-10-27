@@ -6,6 +6,7 @@ import stat
 import sys
 import threading
 import uuid
+import weakref
 from collections.abc import Generator
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -23,6 +24,12 @@ from rich.console import Console
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    for item in items:
+        if item.path.resolve().is_relative_to(_TEST_SITE_PACKAGES):
+            item.fixturenames.append("close_direct_test_runtime_owners")
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -561,6 +568,46 @@ def pytest_testnodedown(node, error) -> None:
     summary = node.workeroutput.get("fd_summary")
     if summary is not None:
         print(summary, flush=True)
+
+
+@pytest.fixture
+async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
+    """Close stores and registries constructed directly by repository tests."""
+    from zeta.core.store import ConversationStore
+    from zeta.tools import ToolRegistry
+
+    stores: list[weakref.ReferenceType[ConversationStore]] = []
+    registries: list[weakref.ReferenceType[ToolRegistry]] = []
+    store_init = ConversationStore.__init__
+    registry_init = ToolRegistry.__init__
+    store_close = ConversationStore.close
+    registry_close = ToolRegistry.close
+
+    @wraps(store_init)
+    def tracked_store_init(store, *args, **kwargs):
+        store_init(store, *args, **kwargs)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if caller.is_relative_to(_TEST_SITE_PACKAGES):
+            stores.append(weakref.ref(store))
+
+    @wraps(registry_init)
+    def tracked_registry_init(registry, *args, **kwargs):
+        registry_init(registry, *args, **kwargs)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if caller.is_relative_to(_TEST_SITE_PACKAGES):
+            registries.append(weakref.ref(registry))
+
+    monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
+    yield
+    for reference in reversed(registries):
+        registry = reference()
+        if registry is not None and not registry._closed:
+            await registry_close(registry)
+    for reference in reversed(stores):
+        store = reference()
+        if store is not None and not store._closed:
+            store_close(store)
 
 
 @pytest.fixture
