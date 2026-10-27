@@ -1746,6 +1746,8 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
     finally:
         for registry in set(registries.values()):
             await registry.close()
+        for store in stores:
+            store.close()
 
 
 @pytest.mark.asyncio
@@ -7830,6 +7832,8 @@ async def test_async_rebuild_freezes_once_per_process_only_for_resume(
     new_session = make_app("new-session", resumed=False)
     await new_session._rebuild_transcript_async(batch_size=8)
     assert freezes == [None]
+    for app in (fresh, resumed, second_resume, new_session):
+        await app.close()
 
 
 def test_gc_freeze_helper_populates_permanent_generation() -> None:
@@ -11855,6 +11859,8 @@ async def test_app_draft_round_trip_and_send_clear(tmp_path: Path) -> None:
     second._record_prompt("sent prompt")
     await second._draft.flush_pending()
     assert not (store.session_dir / "draft").exists()
+    await first.close()
+    await second.close()
 
 
 @pytest.mark.asyncio

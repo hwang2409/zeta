@@ -22,7 +22,14 @@ import pytest
 from rich.console import Console
 
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
-_IS_REPOSITORY_TESTS = (_TEST_SITE_PACKAGES.parent / "pyproject.toml").is_file()
+_REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
+_IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
+
+
+def _is_repository_test_path(path: Path) -> bool:
+    return path.is_relative_to(_REPOSITORY_ROOT) and "tests" in path.relative_to(
+        _REPOSITORY_ROOT
+    ).parts
 
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 
@@ -595,14 +602,14 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     def tracked_store_init(store, *args, **kwargs):
         store_init(store, *args, **kwargs)
         caller = Path(sys._getframe(1).f_code.co_filename).resolve()
-        if caller.is_relative_to(_TEST_SITE_PACKAGES):
+        if _is_repository_test_path(caller):
             stores.append(weakref.ref(store))
 
     @wraps(registry_init)
     def tracked_registry_init(registry, *args, **kwargs):
         registry_init(registry, *args, **kwargs)
         caller = Path(sys._getframe(1).f_code.co_filename).resolve()
-        if caller.is_relative_to(_TEST_SITE_PACKAGES):
+        if _is_repository_test_path(caller):
             registries.append(weakref.ref(registry))
 
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
@@ -633,7 +640,7 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
     def tracked_init(loop, *args, **kwargs):
         loop_init(loop, *args, **kwargs)
         caller = Path(sys._getframe(1).f_code.co_filename).resolve()
-        if caller.is_relative_to(_TEST_SITE_PACKAGES):
+        if _is_repository_test_path(caller):
             loops.append(loop)
 
     monkeypatch.setattr(AgentLoop, "__init__", tracked_init)
