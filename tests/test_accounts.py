@@ -32,6 +32,7 @@ from zeta.accounts import (
     SessionAccountContext,
 )
 from zeta.agent.runner import resolve_child_backend
+from zeta.core.login_flow import LoginPublicationError
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -534,6 +535,22 @@ def test_cli_login_does_not_overwrite_legacy_login_without_replace(
     )
     assert not legacy.exists()
     assert json.loads(destination.read_text()) == expected
+
+
+def test_cli_login_decision_expiry_shows_safe_message(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail_login(*_args: object) -> None:
+        raise LoginPublicationError
+
+    monkeypatch.setattr(cli_main, "_run_login", fail_login)
+    args = SimpleNamespace(provider="anthropic", account="default", replace=False)
+
+    assert cli_main._handle_login(args) == 1
+    assert capsys.readouterr().err == (
+        "login failed: Login could not be saved; try again.\n"
+    )
 
 
 def test_accounts_list_shows_migrated_legacy_login(

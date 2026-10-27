@@ -286,6 +286,239 @@ def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_login_does_not_publish_before_task_observes_cancellation() -> None:
+    tokens = OAuthTokens("access", "refresh", 4_000_000_000)
+    save_entered = threading.Event()
+    release_save = threading.Event()
+    save_finished = threading.Event()
+
+    class Store:
+        saved: OAuthTokens | None = None
+
+        def save(
+            self,
+            value: OAuthTokens,
+            *,
+            lock_timeout: float,
+            cancel_event: threading.Event,
+        ) -> None:
+            del lock_timeout
+            save_entered.set()
+            release_save.wait()
+            try:
+                if not cancel_event.is_set():
+                    self.saved = value
+            finally:
+                save_finished.set()
+
+    store = Store()
+
+    def build_url(state: str, challenge: str, redirect_uri: str) -> str:
+        del challenge
+        threading.Thread(
+            target=_post_callback,
+            args=(redirect_uri, {"code": "code", "state": state}),
+            daemon=True,
+        ).start()
+        return "https://authorize.invalid/"
+
+    async def exchange(*_args: object) -> OAuthTokens:
+        return tokens
+
+    task = asyncio.create_task(
+        run_login(
+            _provider(store, build_url, exchange),  # type: ignore[arg-type]
+            lambda: ("verifier", "challenge", "state"),
+            timeout_seconds=2,
+            publication_timeout_seconds=2,
+        )
+    )
+    assert await asyncio.to_thread(save_entered.wait, 2)
+
+    task.cancel()
+    release_save.set()
+    assert await asyncio.to_thread(save_finished.wait, 2)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.saved is None
+
+
+@pytest.mark.asyncio
+async def test_login_double_cancel_during_publication_reports_success() -> None:
+    tokens = OAuthTokens("access", "refresh", 4_000_000_000)
+    publication_started = threading.Event()
+    release_save = threading.Event()
+
+    class Store:
+        saved: OAuthTokens | None = None
+
+        def save(
+            self,
+            value: OAuthTokens,
+            *,
+            lock_timeout: float,
+            cancel_event: threading.Event,
+        ) -> None:
+            del lock_timeout
+            assert not cancel_event.is_set()
+            publication_started.set()
+            release_save.wait()
+            self.saved = value
+
+    store = Store()
+
+    def build_url(state: str, challenge: str, redirect_uri: str) -> str:
+        del challenge
+        threading.Thread(
+            target=_post_callback,
+            args=(redirect_uri, {"code": "code", "state": state}),
+            daemon=True,
+        ).start()
+        return "https://authorize.invalid/"
+
+    async def exchange(*_args: object) -> OAuthTokens:
+        return tokens
+
+    task = asyncio.create_task(
+        run_login(
+            _provider(store, build_url, exchange),  # type: ignore[arg-type]
+            lambda: ("verifier", "challenge", "state"),
+            timeout_seconds=2,
+            publication_timeout_seconds=2,
+        )
+    )
+    assert await asyncio.to_thread(publication_started.wait, 2)
+
+    task.cancel()
+    task.cancel()
+    release_save.set()
+
+    assert await task == "access"
+    assert task.cancelling() == 0
+    assert store.saved == tokens
+
+
+def test_login_publication_decision_denies_when_loop_stops_or_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks: list[tuple[Callable[..., None], tuple[object, ...]]] = []
+    committed = False
+    credential_lock = threading.Lock()
+
+    class StoppedLoop:
+        def call_soon_threadsafe(
+            self, callback: Callable[..., None], *args: object
+        ) -> None:
+            callbacks.append((callback, args))
+
+    class Task:
+        def cancelling(self) -> int:
+            return 0
+
+    def commit() -> bool:
+        nonlocal committed
+        committed = True
+        return True
+
+    monkeypatch.setattr(
+        login_flow, "_PUBLICATION_DECISION_TIMEOUT_SECONDS", 0.05
+    )
+    arbiter = login_flow._PublicationArbiter(
+        StoppedLoop(), Task(), commit, time.monotonic() + 60  # type: ignore[arg-type]
+    )
+    decision: list[bool] = []
+
+    def save() -> None:
+        with credential_lock:
+            decision.append(arbiter.is_set())
+
+    worker = threading.Thread(target=save, daemon=True)
+    worker.start()
+    worker.join(timeout=0.5)
+
+    assert not worker.is_alive()
+    assert decision == [True]
+    assert arbiter.decision_failed
+    assert credential_lock.acquire(timeout=0.1)
+    credential_lock.release()
+    callback, args = callbacks.pop()
+    callback(*args)
+    assert not committed
+
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+    closed_arbiter = login_flow._PublicationArbiter(
+        closed_loop, Task(), commit, time.monotonic() + 60  # type: ignore[arg-type]
+    )
+    assert closed_arbiter.is_set()
+    assert closed_arbiter.decision_failed
+    assert not committed
+
+
+@pytest.mark.asyncio
+async def test_login_publication_commit_is_arbitrated_on_loop_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = OAuthTokens("access", "refresh", 4_000_000_000)
+    loop_thread = threading.get_ident()
+    loop_task = asyncio.current_task()
+    assert loop_task is not None
+
+    class TaskProbe:
+        def cancelling(self) -> int:
+            assert threading.get_ident() == loop_thread
+            return loop_task.cancelling()
+
+        def uncancel(self) -> int:
+            assert threading.get_ident() == loop_thread
+            return loop_task.uncancel()
+
+    monkeypatch.setattr(asyncio, "current_task", lambda: TaskProbe())
+    commit_threads: list[int] = []
+    save_threads: list[int] = []
+
+    class Store:
+        def save(
+            self,
+            value: OAuthTokens,
+            *,
+            lock_timeout: float,
+            cancel_event: threading.Event,
+        ) -> None:
+            del value, lock_timeout
+            save_threads.append(threading.get_ident())
+            assert not cancel_event.is_set()
+
+    def build_url(state: str, challenge: str, redirect_uri: str) -> str:
+        del challenge
+        threading.Thread(
+            target=_post_callback,
+            args=(redirect_uri, {"code": "code", "state": state}),
+            daemon=True,
+        ).start()
+        return "https://authorize.invalid/"
+
+    async def exchange(*_args: object) -> OAuthTokens:
+        return tokens
+
+    def commit() -> bool:
+        commit_threads.append(threading.get_ident())
+        return True
+
+    await run_login(
+        _provider(Store(), build_url, exchange),  # type: ignore[arg-type]
+        lambda: ("verifier", "challenge", "state"),
+        timeout_seconds=2,
+        publication_timeout_seconds=2,
+        on_publication_commit=commit,
+    )
+
+    assert commit_threads == [loop_thread]
+    assert save_threads and save_threads[0] != loop_thread
+
+
+@pytest.mark.asyncio
 async def test_login_rejects_state_mismatch() -> None:
     store = _Store()
     exchanged = False
@@ -408,3 +641,31 @@ async def test_login_reraises_non_port_bind_error(monkeypatch: pytest.MonkeyPatc
         await run_login(provider, lambda: ("verifier", "challenge", "state"))
 
     assert exc_info.value.errno == errno.EACCES
+
+
+@pytest.mark.asyncio
+async def test_publication_decision_shares_the_publication_deadline() -> None:
+    # The lock wait uses most of the publication budget; then the loop is busy.
+    # The decision must not wait past the one publication deadline.
+    loop = asyncio.get_running_loop()
+    decisions: list[bool] = []
+
+    class Store:
+        def save(
+            self, _tokens: object, *, lock_timeout: float, cancel_event: object
+        ) -> None:
+            time.sleep(0.04)
+            loop.call_soon_threadsafe(time.sleep, 0.4)
+            decisions.append(cancel_event.is_set())  # type: ignore[attr-defined]
+
+    class Provider:
+        credential_store = Store()
+
+    with pytest.raises(login_flow.LoginPublicationError):
+        await login_flow._publish_credentials(
+            Provider(),  # type: ignore[arg-type]
+            OAuthTokens("access", "refresh", 4_000_000_000),
+            0.05,
+            lambda: True,
+        )
+    assert decisions == [True]

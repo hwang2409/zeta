@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import errno
 import http.server
 import queue
 import socketserver
 import sys
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Generic, Protocol, TextIO, TypeVar
@@ -18,6 +20,145 @@ import httpx
 
 
 TokenT = TypeVar("TokenT")
+# Tolerates loop congestion; every wait is also capped by the publication deadline.
+_PUBLICATION_DECISION_TIMEOUT_SECONDS = 20.0
+
+
+class _PublicationArbiter:
+    """Move the credential worker's final publication decision onto the loop."""
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        task: asyncio.Task[object],
+        commit: Callable[[], bool],
+        deadline: float,
+    ) -> None:
+        self._loop = loop
+        self._deadline = deadline
+        self._task = task
+        self._commit = commit
+        self.cancel_requested = False
+        self.committed = False
+        self.decision_failed = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _wait_seconds(self) -> float:
+        remaining = max(0.0, self._deadline - time.monotonic())
+        return min(_PUBLICATION_DECISION_TIMEOUT_SECONDS, remaining)
+
+    def is_set(self) -> bool:
+        response: concurrent.futures.Future[bool] = concurrent.futures.Future()
+        try:
+            self._loop.call_soon_threadsafe(self._decide, response)
+        except RuntimeError:
+            self.decision_failed = True
+            return True
+        try:
+            return not response.result(timeout=self._wait_seconds())
+        except TimeoutError:
+            if response.cancel():
+                self.decision_failed = True
+                return True
+            try:
+                return not response.result(timeout=self._wait_seconds())
+            except TimeoutError:
+                self.decision_failed = True
+                return True
+
+    def _decide(self, response: concurrent.futures.Future[bool]) -> None:
+        if not response.set_running_or_notify_cancel():
+            return
+        allowed = (
+            not self.cancel_requested
+            and self._task.cancelling() == 0
+            and self._commit()
+        )
+        self.committed = allowed
+        response.set_result(allowed)
+
+
+async def _wait_bounded_work(
+    task: asyncio.Task[object],
+    on_cancel: Callable[[], None] | None = None,
+) -> bool:
+    """Wait for bounded worker work and report whether cancellation arrived."""
+
+    cancelled = False
+    current = asyncio.current_task()
+    assert current is not None
+    baseline = current.cancelling()
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            if on_cancel is not None:
+                on_cancel()
+    while current.cancelling() > baseline:
+        current.uncancel()
+    task.result()
+    return cancelled
+
+
+def _save_by_deadline(
+    provider: LoginProvider[TokenT],
+    tokens: TokenT,
+    deadline: float,
+    arbiter: _PublicationArbiter,
+) -> None:
+    # The lock wait starts when the worker runs, so it gets only the time left.
+    provider.credential_store.save(
+        tokens,
+        lock_timeout=max(0.0, deadline - time.monotonic()),
+        cancel_event=arbiter,
+    )
+
+
+async def _publish_credentials(
+    provider: LoginProvider[TokenT],
+    tokens: TokenT,
+    timeout: float | None,
+    commit: Callable[[], bool] | None,
+) -> _PublicationArbiter | None:
+    if timeout is None:
+        await asyncio.to_thread(provider.credential_store.save, tokens)
+        return None
+
+    deadline = time.monotonic() + timeout
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    assert task is not None
+    arbiter = _PublicationArbiter(loop, task, commit or (lambda: True), deadline)
+    publication = asyncio.create_task(
+        asyncio.to_thread(_save_by_deadline, provider, tokens, deadline, arbiter)
+    )
+    cancelled = await _wait_bounded_work(publication, arbiter.cancel)
+    if cancelled and not arbiter.committed:
+        raise asyncio.CancelledError
+    if arbiter.decision_failed:
+        raise LoginPublicationError
+    return arbiter
+
+
+async def _close_listener(
+    server: http.server.ThreadingHTTPServer,
+    server_thread: threading.Thread,
+    publication_arbiter: _PublicationArbiter | None,
+) -> None:
+    def close() -> None:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+    cleanup = asyncio.create_task(asyncio.to_thread(close))
+    cancelled = await _wait_bounded_work(cleanup)
+    if cancelled and (
+        publication_arbiter is None or not publication_arbiter.committed
+    ):
+        raise asyncio.CancelledError
 
 
 class CredentialSink(Protocol[TokenT]):
@@ -55,6 +196,13 @@ class LoginProvider(Generic[TokenT]):
 
 class LoginError(RuntimeError):
     """Raised for user-facing login failures."""
+
+
+class LoginPublicationError(LoginError):
+    """Raised when the event loop cannot authorize credential publication."""
+
+    def __init__(self) -> None:
+        super().__init__("Login could not be saved; try again.")
 
 
 class LoginPortInUseError(LoginError):
@@ -176,12 +324,14 @@ async def run_login(
     output: TextIO | None = None,
     on_authorization_url: Callable[[str], None] | None = None,
     publication_timeout_seconds: float | None = None,
+    on_publication_commit: Callable[[], bool] | None = None,
 ) -> str | None:
     """Run one provider login and return its optional account handle."""
 
     verifier, challenge, state = build_pkce()
     callback_ready = asyncio.Event()
     loop = asyncio.get_running_loop()
+    publication_arbiter: _PublicationArbiter | None = None
 
     def notify() -> None:
         loop.call_soon_threadsafe(callback_ready.set)
@@ -230,41 +380,22 @@ async def run_login(
                 verifier,
                 redirect_uri,
             )
-        if publication_timeout_seconds is None:
-            await asyncio.to_thread(provider.credential_store.save, tokens)
-        else:
-            cancel_publication = threading.Event()
-            publication = asyncio.create_task(
-                asyncio.to_thread(
-                    provider.credential_store.save,
-                    tokens,
-                    lock_timeout=publication_timeout_seconds,
-                    cancel_event=cancel_publication,
-                )
-            )
-            try:
-                await asyncio.shield(publication)
-            except asyncio.CancelledError:
-                cancel_publication.set()
-                await asyncio.shield(
-                    asyncio.gather(publication, return_exceptions=True)
-                )
-                raise
+        publication_arbiter = await _publish_credentials(
+            provider,
+            tokens,
+            publication_timeout_seconds,
+            on_publication_commit,
+        )
         return provider.token_handle(tokens)
     finally:
-        # Cancellation can arrive after exchange, while shutdown is running.
         # Finish closing the listener before reporting a terminal login state.
-        def close_listener() -> None:
-            server.shutdown()
-            server.server_close()
-            server_thread.join(timeout=2)
-
-        cleanup = asyncio.create_task(asyncio.to_thread(close_listener))
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await cleanup
-            raise
+        await _close_listener(server, server_thread, publication_arbiter)
 
 
-__all__ = ["LoginError", "LoginPortInUseError", "LoginProvider", "run_login"]
+__all__ = [
+    "LoginError",
+    "LoginPortInUseError",
+    "LoginProvider",
+    "LoginPublicationError",
+    "run_login",
+]
