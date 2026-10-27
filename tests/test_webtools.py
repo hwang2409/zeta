@@ -81,12 +81,9 @@ async def _execute_fetch(
         max_output_chars=max_output_chars,
         skill_catalog=SkillCatalog.empty(),
     )
-    try:
-        return await registry.execute(
-            ToolCall("fetch-1", "fetch", arguments or {"url": "example.com"})
-        )
-    finally:
-        await registry.close()
+    return await registry.execute(
+        ToolCall("fetch-1", "fetch", arguments or {"url": "example.com"})
+    )
 
 
 def test_fetch_schema_documents_max_bytes(tmp_path: Path) -> None:
