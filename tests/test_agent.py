@@ -2272,6 +2272,72 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
 
 
 @pytest.mark.asyncio
+async def test_close_cancels_adopted_grandchild_after_child_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FinishGateBackend("handoff", background_child=True)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    owner = loop._background_owner
+    completion_published = asyncio.Event()
+    release_child_watcher = asyncio.Event()
+    cancellation_requested = asyncio.Event()
+    original_publish = owner.conversation_channel.publish_completion
+    original_cancel_all = owner.cancel_all
+    original_create_task = AgentLoop._create_task
+
+    async def pause_after_publication(**kwargs):
+        notification = await original_publish(**kwargs)
+        if kwargs["child_instance_id"].count(":") == 1:
+            completion_published.set()
+            await release_child_watcher.wait()
+        return notification
+
+    async def hold_child_loop_cancellation(coroutine):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            coroutine.close()
+
+    def create_task(loop_self, coroutine):
+        if loop_self.agent_depth == 1 and coroutine.cr_code.co_name in {
+            "confirm_child_cancel",
+            "cleanup_canceled_child",
+        }:
+            return original_create_task(
+                loop_self, hold_child_loop_cancellation(coroutine)
+            )
+        return original_create_task(loop_self, coroutine)
+
+    def cancel_all() -> None:
+        original_cancel_all()
+        cancellation_requested.set()
+
+    monkeypatch.setattr(
+        owner.conversation_channel, "publish_completion", pause_after_publication
+    )
+    monkeypatch.setattr(AgentLoop, "_create_task", create_task)
+    monkeypatch.setattr(owner, "cancel_all", cancel_all)
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(completion_published.wait(), timeout=2)
+    closing = asyncio.create_task(loop.close())
+    try:
+        await asyncio.wait_for(cancellation_requested.wait(), timeout=1)
+        release_child_watcher.set()
+        await asyncio.wait_for(closing, timeout=1)
+        assert not owner.running
+    finally:
+        release_child_watcher.set()
+        backend.release_grandchild.set()
+        if not closing.done():
+            closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        await asyncio.wait_for(owner.wait(), timeout=2)
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_follow_up_wakes_worker_waiting_in_finish_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
