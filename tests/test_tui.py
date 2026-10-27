@@ -1746,6 +1746,8 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
     finally:
         for registry in set(registries.values()):
             await registry.close()
+        for store in stores:
+            store.close()
 
 
 @pytest.mark.asyncio
@@ -4208,6 +4210,7 @@ skill_catalog=SkillCatalog.empty(),
     plain = "\n".join(renderable_plain(item) for item in rendered)
     assert "provider failure · " in plain
     assert str(error) in plain
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -5591,6 +5594,7 @@ def test_finished_agent_card_keeps_elapsed_time_after_clock_moves(
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert "5.0s" in rendered
     assert "105.0s" not in rendered
+    child.close()
 
 
 def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
@@ -6610,6 +6614,8 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
         line.strip() for line in Text.from_ansi(output.getvalue()).plain.splitlines()
     )
     assert "✱ thought · 0.2s\nplan" in rendered
+    monkeypatch.undo()
+    asyncio.run(app.close())
 
 
 def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
@@ -7826,6 +7832,8 @@ async def test_async_rebuild_freezes_once_per_process_only_for_resume(
     new_session = make_app("new-session", resumed=False)
     await new_session._rebuild_transcript_async(batch_size=8)
     assert freezes == [None]
+    for app in (fresh, resumed, second_resume, new_session):
+        await app.close()
 
 
 def test_gc_freeze_helper_populates_permanent_generation() -> None:
@@ -11851,6 +11859,8 @@ async def test_app_draft_round_trip_and_send_clear(tmp_path: Path) -> None:
     second._record_prompt("sent prompt")
     await second._draft.flush_pending()
     assert not (store.session_dir / "draft").exists()
+    await first.close()
+    await second.close()
 
 
 @pytest.mark.asyncio

@@ -3,22 +3,47 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import uuid
+import weakref
 from collections.abc import Generator
 from contextlib import ExitStack
 from dataclasses import dataclass
+from functools import wraps
 from hashlib import sha256
 from pathlib import Path
 from runpy import run_path
+from statistics import median
 from tempfile import TemporaryDirectory
 
 import httpx
 import pytest
 from rich.console import Console
 
-_TEST_SITE_PACKAGES = Path(__file__).parent
+_TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
+_REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
+_IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
+
+
+def _is_repository_test_path(path: Path) -> bool:
+    return path.is_relative_to(_REPOSITORY_ROOT) and "tests" in path.relative_to(
+        _REPOSITORY_ROOT
+    ).parts
 
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if not _IS_REPOSITORY_TESTS or not config.pluginmanager.hasplugin("asyncio"):
+        return
+    for item in items:
+        path = item.path.resolve()
+        # These modules patch process-wide clock/config during fixture teardown.
+        if path.is_relative_to(_TEST_SITE_PACKAGES) and path.name not in {
+            "test_test_environment.py",
+            "test_tui.py",
+        }:
+            item.fixturenames.append("close_direct_test_runtime_owners")
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -387,6 +412,206 @@ def isolate_zeta_home(
             == isolated_home.resolve()
         )
         live_home_write_guard.assert_clean()
+
+
+_FD_GROWTH: list[tuple[int, str]] = []
+_FD_BREACHES: list[str] = []
+# Leave 25% of FD_SETSIZE free for pytest, xdist, and a test's active work.
+_FD_HIGH_WATER = 768
+_FD_RETAINED_COUNTS: list[int] = []
+_FD_RETAINED_MAX: tuple[str, int, int, tuple[str, ...]] | None = None
+_OS_LISTDIR = os.listdir
+_OS_FSTAT = os.fstat
+
+
+def _describe_fd(descriptor: int, directory: str) -> str:
+    try:
+        target = os.readlink(f"{directory}/{descriptor}")
+    except OSError:
+        target = "unknown"
+    try:
+        mode = os.fstat(descriptor).st_mode
+    except OSError:
+        return target
+    kind = next(
+        (
+            name
+            for predicate, name in (
+                (stat.S_ISREG, "file"),
+                (stat.S_ISDIR, "directory"),
+                (stat.S_ISFIFO, "pipe"),
+                (stat.S_ISSOCK, "socket"),
+                (stat.S_ISCHR, "character-device"),
+            )
+            if predicate(mode)
+        ),
+        "other",
+    )
+    return f"{target} ({kind})"
+
+
+def _open_file_descriptors() -> dict[int, str]:
+    for directory in ("/proc/self/fd", "/dev/fd"):
+        try:
+            names = _OS_LISTDIR(directory)
+        except OSError:
+            continue
+        descriptors = {}
+        for name in names:
+            try:
+                descriptor = int(name)
+                _OS_FSTAT(descriptor)
+            except (OSError, ValueError):
+                continue
+            descriptors[descriptor] = _describe_fd(descriptor, directory)
+        return descriptors
+    return {}
+
+
+@pytest.hookimpl(hookwrapper=True, trylast=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
+    """Report retained fds and stop workers before they approach FD_SETSIZE."""
+    del nextitem
+    global _FD_RETAINED_MAX
+    # Stable pytest/xdist descriptors and session fixtures predate this snapshot.
+    before = _open_file_descriptors()
+    yield
+    after = _open_file_descriptors()
+    retained = sorted(after.keys() - before.keys())
+    added = tuple(f"fd {fd}: {after[fd]}" for fd in retained)
+    _FD_GROWTH.append((len(retained), item.nodeid))
+    if added:
+        print(f"fd-retained nodeid={item.nodeid} {', '.join(added)}", flush=True)
+    highest = max(after, default=-1)
+    if _FD_RETAINED_MAX is None or len(after) > _FD_RETAINED_MAX[1]:
+        _FD_RETAINED_MAX = (item.nodeid, len(after), highest, added)
+    _FD_RETAINED_COUNTS.append(len(after))
+    if highest >= _FD_HIGH_WATER:
+        breach = (
+            f"{item.nodeid} reached fd {highest}; retained descriptors: "
+            f"{', '.join(added) if added else 'none added by this test'}"
+        )
+        _FD_BREACHES.append(breach)
+        item.session.shouldstop = breach
+
+
+def _fd_summary() -> str:
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    top = sorted(_FD_GROWTH, reverse=True)[:5]
+    offenders = "; ".join(f"{nodeid} (+{count})" for count, nodeid in top)
+    breach = _FD_BREACHES[0] if _FD_BREACHES else "none"
+    if _FD_RETAINED_MAX is not None:
+        nodeid, count, highest, added = _FD_RETAINED_MAX
+        retained_max = (
+            f"nodeid={nodeid} open={count} highest={highest} "
+            f"added={', '.join(added) if added else 'none'}"
+        )
+    else:
+        retained_max = "none"
+    if _FD_RETAINED_COUNTS:
+        quarter = max(1, len(_FD_RETAINED_COUNTS) // 4)
+        retained = (
+            f"start={_FD_RETAINED_COUNTS[0]} end={_FD_RETAINED_COUNTS[-1]} "
+            f"max={max(_FD_RETAINED_COUNTS)} "
+            f"q1_median={median(_FD_RETAINED_COUNTS[:quarter]):.1f} "
+            f"q4_median={median(_FD_RETAINED_COUNTS[-quarter:]):.1f}"
+        )
+    else:
+        retained = "start=0 end=0 max=0 q1_median=0.0 q4_median=0.0"
+    return (
+        f"fd-summary worker={worker} retained_open=[{retained}] "
+        f"retained_max=[{retained_max}] "
+        f"top_retained_additions=[{offenders}] breach=[{breach}]"
+    )
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    del exitstatus
+    summary = _fd_summary()
+    if _FD_BREACHES:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    worker_output = getattr(session.config, "workeroutput", None)
+    if worker_output is not None:
+        worker_output["fd_summary"] = summary
+    elif _FD_RETAINED_MAX is not None:
+        print(summary, flush=True)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error) -> None:
+    del error
+    summary = node.workeroutput.get("fd_summary")
+    if summary is not None:
+        print(summary, flush=True)
+
+
+@pytest.fixture
+async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
+    """Close stores and registries constructed directly by repository tests."""
+    from zeta.core.store import ConversationStore
+    from zeta.tools import ToolRegistry
+
+    stores: list[weakref.ReferenceType[ConversationStore]] = []
+    registries: list[weakref.ReferenceType[ToolRegistry]] = []
+    store_init = ConversationStore.__init__
+    registry_init = ToolRegistry.__init__
+    store_close = ConversationStore.close
+    registry_close = ToolRegistry.close
+
+    @wraps(store_init)
+    def tracked_store_init(store, *args, **kwargs):
+        store_init(store, *args, **kwargs)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            stores.append(weakref.ref(store))
+
+    @wraps(registry_init)
+    def tracked_registry_init(registry, *args, **kwargs):
+        registry_init(registry, *args, **kwargs)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            registries.append(weakref.ref(registry))
+
+    monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
+    yield
+    for reference in reversed(registries):
+        registry = reference()
+        if registry is not None and not registry._closed:
+            await registry_close(registry)
+    for reference in reversed(stores):
+        store = reference()
+        if store is not None and not store._closed:
+            store_close(store)
+
+
+@pytest.fixture
+async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
+    """Close AgentLoops whose constructor caller is test code, never src/zeta."""
+    from zeta.runtime.loop import AgentLoop
+    from zeta.tools import ToolRegistry
+
+    loops: list[AgentLoop] = []
+    loop_init = AgentLoop.__init__
+    loop_close = AgentLoop.close
+    registry_close = ToolRegistry.close
+
+    @wraps(loop_init)
+    def tracked_init(loop, *args, **kwargs):
+        loop_init(loop, *args, **kwargs)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            loops.append(loop)
+
+    monkeypatch.setattr(AgentLoop, "__init__", tracked_init)
+    yield
+    for loop in reversed(loops):
+        if not loop._closed:
+            await loop_close(loop)
+        if not loop.tool_registry._closed:
+            await registry_close(loop.tool_registry)
+        if not loop.store._closed:
+            loop.store.close()
 
 
 @pytest.fixture(autouse=True)

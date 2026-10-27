@@ -87,6 +87,8 @@ from zeta.tui.app import TUIApp
 from zeta.tui.render import render_approval_card, render_event
 from zeta.tui.todo import TodoWidget
 
+pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
 
 async def _collect(events):
     return [event async for event in events]

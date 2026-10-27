@@ -90,7 +90,7 @@ async def test_fork_switch_cancels_finder_and_restores_composer(
 
     assert not app._active_finder.finder_active
     assert resumed.default_buffer.document == draft
-    await app._close_finder_workers()
+    await app.close()
 
 
 # -- return arming (review minor #2) ----------------------------------------

@@ -22,6 +22,23 @@ from zeta.tools import fetch as fetch_tool
 _ASYNC_CLIENT = httpx.AsyncClient
 
 
+@pytest.fixture(autouse=True)
+async def owned_tool_registries(monkeypatch: pytest.MonkeyPatch):
+    """Keep registry spills alive through assertions, then close every owner."""
+    registry_type = ToolRegistry
+    registries: list[ToolRegistry] = []
+
+    def create_registry(*args, **kwargs):
+        registry = registry_type(*args, **kwargs)
+        registries.append(registry)
+        return registry
+
+    monkeypatch.setitem(globals(), "ToolRegistry", create_registry)
+    yield
+    for registry in reversed(registries):
+        await registry.close()
+
+
 class _ChunkedByteStream(httpx.AsyncByteStream):
     def __init__(self, content: bytes, *, first_chunk_size: int | None = None) -> None:
         self.content = content
@@ -76,7 +93,11 @@ async def _execute_fetch(
         return response
 
     _mock_client(monkeypatch, handler)
-    registry = ToolRegistry(tmp_path, max_output_chars=max_output_chars, skill_catalog=SkillCatalog.empty())
+    registry = ToolRegistry(
+        tmp_path,
+        max_output_chars=max_output_chars,
+        skill_catalog=SkillCatalog.empty(),
+    )
     return await registry.execute(
         ToolCall("fetch-1", "fetch", arguments or {"url": "example.com"})
     )
@@ -384,6 +405,7 @@ async def test_parallel_fetches_cancel_on_production_dispatch_abort(
         ToolCall("fetch-a", "fetch", {"url": "example.com/a"}),
         ToolCall("fetch-b", "fetch", {"url": "example.com/b"}),
     ]
+    loop = None
     if with_stream:
 
         async def run_streaming() -> list[object]:
@@ -429,6 +451,9 @@ async def test_parallel_fetches_cancel_on_production_dispatch_abort(
             if event.type is StreamEventType.TOOL_EXECUTION_END
             and event.tool_result is not None
         ] == ["tool execution canceled", "tool execution canceled"]
+    if loop is not None:
+        await loop.close()
+        loop.store.close()
 
 
 @pytest.mark.asyncio
@@ -778,24 +803,29 @@ async def test_fetch_pagination_repeats_notices_without_advancing_offset(
     )
     offset = 0
     body_pages: list[str] = []
-
-    while True:
-        result = await ToolRegistry(tmp_path, max_output_chars=128, skill_catalog=SkillCatalog.empty()).execute(
-            ToolCall(
-                "fetch-1",
-                "fetch",
-                {"url": "http://printer.local", "offset": offset},
+    registry = ToolRegistry(
+        tmp_path, max_output_chars=128, skill_catalog=SkillCatalog.empty()
+    )
+    try:
+        while True:
+            result = await registry.execute(
+                ToolCall(
+                    "fetch-1",
+                    "fetch",
+                    {"url": "http://printer.local", "offset": offset},
+                )
             )
-        )
-        block = result["content"][0]
-        assert block["text"].startswith(notice)
-        page = block["text"][len(notice) :]
-        body_pages.append(page)
-        assert page == body[offset : offset + len(page)]
-        if not block["truncated"]:
-            break
-        assert block["next_offset"] == offset + len(page)
-        offset = block["next_offset"]
+            block = result["content"][0]
+            assert block["text"].startswith(notice)
+            page = block["text"][len(notice) :]
+            body_pages.append(page)
+            assert page == body[offset : offset + len(page)]
+            if not block["truncated"]:
+                break
+            assert block["next_offset"] == offset + len(page)
+            offset = block["next_offset"]
+    finally:
+        await registry.close()
 
     assert "".join(body_pages) == body
 
@@ -1138,17 +1168,20 @@ async def test_discovery_and_approval_gate_network_tools(
 skill_catalog=SkillCatalog.empty(),
     )
 
-    assert {"fetch", "websearch"} <= registry.definitions_by_name.keys()
-    fetch_result = await registry.execute(
-        ToolCall("fetch-1", "fetch", {"url": "example.com"})
-    )
-    search_result = await registry.execute(
-        ToolCall("search-1", "websearch", {"query": "zeta"})
-    )
+    try:
+        assert {"fetch", "websearch"} <= registry.definitions_by_name.keys()
+        fetch_result = await registry.execute(
+            ToolCall("fetch-1", "fetch", {"url": "example.com"})
+        )
+        search_result = await registry.execute(
+            ToolCall("search-1", "websearch", {"query": "zeta"})
+        )
 
-    assert fetch_result["content"][0]["text"] == "tool execution denied"
-    assert search_result["content"][0]["text"] == "tool execution denied"
-    assert calls == 0
+        assert fetch_result["content"][0]["text"] == "tool execution denied"
+        assert search_result["content"][0]["text"] == "tool execution denied"
+        assert calls == 0
+    finally:
+        store.close()
 
 
 @pytest.mark.asyncio

@@ -179,6 +179,7 @@ def test_ephemeral_creates_and_cleans_up_tempdir(
 
     from zeta.cli.main import _cleanup_ephemeral
 
+    asyncio.run(app.close())
     _cleanup_ephemeral(app)
     assert not root.exists()
 
@@ -433,6 +434,7 @@ def test_ephemeral_history_does_not_touch_shared_history(
 
     from zeta.cli.main import _cleanup_ephemeral
 
+    asyncio.run(app.close())
     _cleanup_ephemeral(app)
 
     assert history.read_bytes() == baseline_bytes
