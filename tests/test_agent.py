@@ -12549,12 +12549,13 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     registry._agent_owner = owner
     original_wait = agent_background_module.asyncio.wait
     first_wait = True
+    confirm_timeouts: list[object] = []
 
     async def controlled_wait(awaitables, *, timeout=None):
         nonlocal first_wait
         if first_wait:
             first_wait = False
-            assert timeout == 1.0
+            confirm_timeouts.append(timeout)
             wait_started.set()
             await wait_gate.wait()
             return set(), set(awaitables)
@@ -12568,6 +12569,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
         call = ToolCall("cancel-1", "agent_cancel", {"handle": "root:1"})
         pending = asyncio.create_task(registry.execute(call))
         await wait_started.wait()
+        assert confirm_timeouts == [1.0]
         wait_gate.set()
         unconfirmed = await pending
         assert unconfirmed["isError"] is True
@@ -12602,6 +12604,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
             for entry in child_store.active_branch_snapshot()
         ) == 1
     finally:
+        wait_gate.set()
         owner.unregister("root:1")
         watcher.cancel()
         await asyncio.gather(watcher, return_exceptions=True)
