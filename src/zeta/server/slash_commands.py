@@ -63,7 +63,6 @@ CLIENT_ONLY_BUILTINS: frozenset[str] = frozenset(
         "runs",
         "send",
         "mcp",
-        "automations",
     }
 )
 
@@ -333,10 +332,6 @@ class ServerSlashSession:
     async def slash_mcp(self, args: str) -> str | ModelInputEnvelope:
         del args
         return self._client_only("mcp")
-
-    async def slash_automations(self, args: str) -> str:
-        del args
-        return self._client_only("automations")
 
     async def slash_mcp_prompt(
         self, name: str, arguments: dict[str, str]

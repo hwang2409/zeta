@@ -12,14 +12,12 @@ def zsh_script() -> str:
 
 _zeta() {
     local context state line command_index command_name token
-    local -a commands session_verbs automation_verbs project_verbs project_index_verbs webhook_verbs mcp_verbs original_words
+    local -a commands session_verbs project_verbs project_index_verbs mcp_verbs original_words
     typeset -A opt_args
-    commands=(login accounts serve session project inbox automation mcp stalls completion)
+    commands=(login accounts serve session project inbox mcp stalls completion)
     session_verbs=(list rename delete export push pull)
-    automation_verbs=(list show approve disable import daemon webhook)
     project_verbs=(create init discover list show memory index)
     project_index_verbs=(status rebuild search)
-    webhook_verbs=(url show-secret rotate-secret rotate-url)
     mcp_verbs=(add list show remove enable disable test login logout trust untrust)
     original_words=("${words[@]}")
     command_index=2
@@ -47,10 +45,6 @@ _zeta() {
                 ;;
         esac
     done
-    if [[ $command_name == automation && ${original_words[command_index+1]} == daemon && ${original_words[CURRENT]} == --* ]]; then
-        compadd -- --webhook-host --webhook-port --allow-non-loopback
-        return
-    fi
     _arguments -C \
         '(-h --help)'{-h,--help}'[show help]' \
         '(-c --continue --resume --no-session)'{-c,--continue}'[resume the most recent session]' \
@@ -124,21 +118,6 @@ _zeta() {
                 inbox)
                     _arguments '--project=[project name or ID]:project:'
                     ;;
-                automation)
-                    case ${original_words[command_index+1]} in
-                        list) _message 'no arguments' ;;
-                        daemon) _arguments '--webhook-host=[webhook bind host]:host:' '--webhook-port=[webhook bind port]:port:' '--allow-non-loopback[allow a non-loopback webhook bind]' ;;
-                        show|approve|disable) _arguments '1:name:' ;;
-                        import) _arguments '*:JSON path:_files' ;;
-                        webhook)
-                            case ${original_words[command_index+2]} in
-                                url|show-secret|rotate-secret|rotate-url) _arguments '1:name:' ;;
-                                *) _describe 'webhook verb' webhook_verbs ;;
-                            esac
-                            ;;
-                        *) _describe 'verb' automation_verbs ;;
-                    esac
-                    ;;
                 mcp)
                     case ${original_words[command_index+1]} in
                         add) _arguments '--scope=[configuration scope]:scope:(user project)' '--url=[HTTP server URL]:URL:' '--oauth[use OAuth]' '*--env=[environment reference]:KEY=VALUE:' '*--header=[HTTP header reference]:HEADER=VALUE:' '1:name:' '*:server command:' ;;
@@ -208,7 +187,7 @@ def bash_script() -> str:
         verb="${COMP_WORDS[command_index+1]}"
     fi
     local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --auto-memory --no-auto-memory --token-budget --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt"
-    local commands="login serve session project inbox automation mcp stalls completion"
+    local commands="login serve session project inbox mcp stalls completion"
 
     if (( command_index == 0 )); then
         if [[ "$cur" == -* ]]; then
@@ -261,15 +240,6 @@ def bash_script() -> str:
             ;;
         inbox)
             COMPREPLY=( $(compgen -W "--project" -- "$cur") )
-            ;;
-        automation)
-            if (( COMP_CWORD <= command_index + 1 )); then
-                COMPREPLY=( $(compgen -W "list show approve disable import daemon webhook" -- "$cur") )
-            elif [[ "$verb" == "webhook" && $COMP_CWORD -le $((command_index + 2)) ]]; then
-                COMPREPLY=( $(compgen -W "url show-secret rotate-secret rotate-url" -- "$cur") )
-            elif [[ "$verb" == "daemon" ]]; then
-                COMPREPLY=( $(compgen -W "--webhook-host --webhook-port --allow-non-loopback" -- "$cur") )
-            fi
             ;;
         mcp)
             if (( COMP_CWORD <= command_index + 1 )); then

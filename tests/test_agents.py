@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 
@@ -16,7 +15,6 @@ from zeta.media.image_policy import ANTHROPIC_IMAGE_POLICY, CODEX_IMAGE_POLICY
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop import AgentLoop
-from zeta.runtime.unattended import build_unattended_loop
 from zeta.skills.agent_catalog import (
     AgentCatalog,
     discover_packaged_agents,
@@ -214,34 +212,6 @@ def test_session_metadata_restores_agent_snapshot(tmp_path: Path) -> None:
     assert AgentCatalog.from_snapshot(reopened.metadata.agent_catalog) == stored
     opened.store.close()
     reopened.store.close()
-
-
-@pytest.mark.asyncio
-async def test_unattended_runtime_uses_packaged_agents_only(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    _write_agent(home / "agents" / "custom.md", "custom", "custom", "body")
-    custom_catalog = discover_session_agents(home=home)
-    session = await asyncio.to_thread(lambda: SessionManager(home).create(
-        provider="codex",
-        model="fake",
-        cwd=tmp_path,
-        skill_catalog=SkillCatalog.empty(),
-        agent_catalog=custom_catalog,
-        system_prompt="system",
-    ))
-    loop = build_unattended_loop(
-        session,
-        home=home,
-        allow=(),
-        backend=FakeBackend([]),
-    )
-    schema = next(item for item in loop.tool_schemas if item["name"] == "agent")
-    assert "custom" not in schema["parameters"]["properties"]["agent_type"]["enum"]
-    assert schema["parameters"]["properties"]["agent_type"]["enum"] == (
-        discover_packaged_agents().names()
-    )
-    await loop.close()
-    session.store.close()
 
 
 @pytest.mark.asyncio

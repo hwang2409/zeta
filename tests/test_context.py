@@ -765,6 +765,43 @@ async def test_provider_usage_informs_next_assembly(context_root: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_removed_automation_session_fixture_evicts(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    transcript_path = store.path
+    session_id = store.session_id
+    store.close()
+    fixture = Path(__file__).parent / "fixtures" / "automation-session-compat.jsonl"
+    with transcript_path.open("ab") as transcript:
+        transcript.write(fixture.read_bytes())
+    reopened = ConversationStore(tmp_path, session_id=session_id)
+    assembler = ContextAssembler(
+        reopened,
+        token_budget=100,
+        retained_tail=1,
+        token_counter=lambda message: 1
+        if message.metadata.get("context_evicted")
+        else 40,
+        safety_margin=0.1,
+    )
+    assembler.last_context = assembler._context(
+        [Message(MessageRole.ASSISTANT, [TextContent("previous")])], False
+    )
+    assembler.record_usage({"input_tokens": 48})
+
+    compacted = await assembler.assemble_context()
+
+    assert compacted.compacted is True
+    assert any(
+        message.metadata.get("context_evicted")
+        for message in compacted.messages
+    )
+    assert any(
+        message.metadata.get("response_state") == "synthetic"
+        for message in reopened.messages()
+    )
+
+
+@pytest.mark.asyncio
 async def test_eviction_triggers_with_safety_margin_and_calibration(
     context_root: Path,
 ) -> None:

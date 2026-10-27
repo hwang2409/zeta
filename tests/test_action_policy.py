@@ -4,12 +4,10 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.automations.services import validate_permissions
 from zeta.config.settings import load_settings
 from zeta.config.tool_policy import ToolPolicy, parse_tool_selector
 from zeta.core.approval import (
@@ -171,48 +169,6 @@ async def test_policy_authorizes_resolved_capability_only(tmp_path: Path) -> Non
     assert not result["isError"]
 
 
-def test_automation_and_live_matching_share_one_resolver(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    rules = ("task(output)", "task(start pytest*)")
-    registry = _registry(tmp_path)
-    resolve = registry.resolve_approval_rule
-    resolved: list[str] = []
-
-    def recording_resolver(rule: str | ApprovalRule) -> ApprovalRule:
-        resolved.append(str(rule))
-        return resolve(rule)
-
-    monkeypatch.setattr(registry, "resolve_approval_rule", recording_resolver)
-    policy = ApprovalPolicy(always_allow=rules, default="deny")
-    registry.set_approval_policy(policy)
-    validate_permissions(SimpleNamespace(allow=rules), registry)  # type: ignore[arg-type]
-    calls = (
-        ({"action": "output", "task_id": "1"}, ApprovalDecision.ALLOW),
-        ({"action": "start", "command": "pytest -q"}, ApprovalDecision.ALLOW),
-        ({"action": "start", "command": "ruff"}, ApprovalDecision.DENY),
-    )
-
-    assert resolved.count("task(output)") == 2
-    assert resolved.count("task(start pytest*)") == 2
-    assert [
-        policy.decide(registry.resolve_call("task", arguments))
-        for arguments, _expected in calls
-    ] == [expected for _arguments, expected in calls]
-
-
-@pytest.mark.parametrize(
-    "rule",
-    ["task(start )", "task()", "task(bogus x)", "task(output x)"],
-)
-def test_automation_rejects_malformed_action_rules(
-    tmp_path: Path, rule: str
-) -> None:
-    registry = _registry(tmp_path)
-    with pytest.raises(ValueError, match="invalid approval rule"):
-        validate_permissions(SimpleNamespace(allow=(rule,)), registry)  # type: ignore[arg-type]
-
-
 def test_existing_tool_payloads_match_pre_action_policy_snapshots(
     tmp_path: Path,
 ) -> None:
@@ -236,10 +192,10 @@ def test_existing_tool_payloads_match_pre_action_policy_snapshots(
         "ollama": ollama_tools(existing_schemas),
     }
     expected = {
-        "schemas": "d6117c4bbf5900c217e62ef6d28b3febf656e782055c8b873a40745196f34184",
-        "anthropic": "7be5a3c5a522f862598c5c08f2e181d73b38e67c148ac08053073825dcd4e0bc",
-        "codex": "58866158b6df6157a135433675383c8b418e7f07fb2792b99964fd51c2c0062f",
-        "ollama": "be1b03bb68fa4fda6b01d03d8362b982c6a3a1e9af4a76010bf363de7c56fa8f",
+        "schemas": "9e2ee41eb396a27a0819bad9cc949076e5b016dc222684a87bae4129564f373f",
+        "anthropic": "f36fd962829b52c36581776c089f4c0f72cd906206119d6c9c87745a894a0dcf",
+        "codex": "ce8c67a8b9e4664903513f9dd1f3f0cd7f57d7f26e83ebf3ee9f1708ac22a0b3",
+        "ollama": "a1d81d50e266aa9ac8da5e06aae6ca15adbc14933f57bf9124a67b156e3477e2",
     }
 
     assert {

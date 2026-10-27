@@ -1651,7 +1651,6 @@ async def test_default_registered_tools_render_start_and_end(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> None:
     from zeta.agent.explicit_finish import register_handoff
-    from zeta.runtime.unattended import build_unattended_loop
     from zeta.tools.ask_parent import register_ask_parent
     from zeta.tools.finish import register as register_finish
     from zeta.tools.resolve_attention import register_fork
@@ -1710,21 +1709,6 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
     )
     attention_fork.unregister("request_attention")
     register_fork(attention_fork)
-    automation_session = await asyncio.to_thread(
-        SessionManager(tmp_path / "automation").create,
-        provider="codex",
-        model="fake",
-        cwd=tmp_path,
-        skill_catalog=SkillCatalog.empty(),
-        system_prompt="system",
-    )
-    automation_loop = await asyncio.to_thread(
-        build_unattended_loop,
-        automation_session,
-        home=tmp_path / "automation",
-        allow=(),
-        backend=FakeBackend([]),
-    )
     registries = {
         "top-level": top_level,
         "serve": top_level,
@@ -1732,7 +1716,6 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
         "background child": background_child,
         "background child with explicit finish": explicit_child,
         "attention fork": attention_fork,
-        "automation": automation_loop.tool_registry,
     }
     try:
         runtime_names = set().union(
@@ -1761,10 +1744,8 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
                     source_names.add(node.args[0].value)
         assert source_names <= runtime_names
     finally:
-        for registry in set(registries.values()) - {automation_loop.tool_registry}:
+        for registry in set(registries.values()):
             await registry.close()
-        await automation_loop.close()
-        automation_session.store.close()
 
 
 @pytest.mark.asyncio

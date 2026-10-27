@@ -6,7 +6,6 @@ _LAZY_EXPORTS = {
     "DENIAL_MARKER": (".driver", "DENIAL_MARKER"),
     "TOOL_RESULT_MAX_BYTES": (".driver", "TOOL_RESULT_MAX_BYTES"),
     "RuntimeComposition": (".composition", "RuntimeComposition"),
-    "build_unattended_loop": (".unattended", "build_unattended_loop"),
     "compose_runtime": (".composition", "compose_runtime"),
     "drive_turn": (".driver", "drive_turn"),
 }

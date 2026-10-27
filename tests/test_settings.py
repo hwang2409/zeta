@@ -310,6 +310,15 @@ def test_unknown_top_level_key_is_dropped_with_notice(tmp_path: Path) -> None:
     assert any("unknown" in notice for notice in loaded.notices)
 
 
+def test_removed_automations_table_is_ignored(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write(home, "[automations]\nenabled = true\n")
+
+    loaded = load_settings(home=home, project_dir=None)
+
+    assert any("automations" in notice for notice in loaded.notices)
+
+
 def test_keybindings_table_is_loaded_but_reserved(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write(

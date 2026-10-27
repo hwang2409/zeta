@@ -109,6 +109,4 @@ trust`. Skill and agent files are Markdown, not executable plugins.
 
 Project MCP stdio servers are host processes. They do not start until the user
 trusts the exact project definition with `zeta mcp trust`; changing its command,
-arguments, or related settings invalidates that trust. MCP HTTP definitions do
-not execute local programs. Automation sessions do not load command hooks and
-use their approved tool and MCP allowlists.
+arguments, or related settings invalidates that trust. MCP HTTP definitions do not execute local programs.

@@ -289,9 +289,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_project_subcommand(commands)
     _add_inbox_subcommand(commands)
 
-    from ..automations.cli import add_subcommand as _add_automation_subcommand
-
-    _add_automation_subcommand(commands)
     mcp = commands.add_parser("mcp", help="manage MCP servers")
     mcp_commands = mcp.add_subparsers(dest="mcp_action", required=True)
     add = mcp_commands.add_parser("add")
@@ -629,10 +626,6 @@ def main(argv: list[str] | None = None) -> int:
         except (MCPManagementError, OSError, ValueError, KeyError) as exc:
             print(f"mcp error: {exc}", file=sys.stderr)
             return 2
-    if args.command == "automation":
-        from ..automations.cli import run as run_automation
-
-        return run_automation(args)
     if args.command == "session":
         from .session import run as _run_session
 

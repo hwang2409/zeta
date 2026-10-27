@@ -68,7 +68,7 @@ def _anthropic_credential(
 ) -> AnthropicCredential:
     """Pick Claude's credential source, defaulting to subscription OAuth.
 
-    API-key auth is opt-in only: it exists for evaluation/automation (see
+    API-key auth is opt-in only: it exists for evaluation (see
     docs/design.md ZETA-87), never as an implicit fallback for an interactive
     session that merely has ANTHROPIC_API_KEY set in its environment.
     """

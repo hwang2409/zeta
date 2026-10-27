@@ -20,19 +20,8 @@ from tests.test_agent import (
     _run_handle_from_receipt,
     _wait_for_notification,
 )
-from tests.test_automations import (
-    DUE,
-    RecordingDelivery,
-    _arm,
-    _empty_mount,
-    _job,
-)
 from tests.test_server import _close, _connect, _frames_until_event, _request
 from tests.test_steering import SteerToolBackend
-from zeta.automations.runner import _receipt, run_claimed
-from zeta.automations.store import SQLiteStore
-from zeta.automations.tick import tick
-from zeta.core.session import SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.mcp import MCPPrompt, MCPPromptArgument
@@ -119,29 +108,6 @@ async def test_headless_prompt_is_labeled_user(tmp_path: Path) -> None:
 
     assert code == 0
     assert _label(store.entries[0].to_dict()) == "user"
-    await loop.close()
-
-
-@pytest.mark.asyncio
-async def test_automation_prompt_is_not_labeled_user(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    loop = AgentLoop(
-        FakeBackend([ScriptedTurn([TextContent("done")])]),
-        store,
-        skill_catalog=SkillCatalog.empty(),
-    )
-
-    code = await drive_turn(
-        loop,
-        "saved automation prompt",
-        format="text",
-        stdout=StringIO(),
-        stderr=StringIO(),
-        origin=MessageOrigin.AUTOMATION_PROMPT,
-    )
-
-    assert code == 0
-    assert _label(store.entries[0].to_dict()) == "automation_prompt"
     await loop.close()
 
 
@@ -718,39 +684,6 @@ def test_headless_entry_persists_user_origin(
 
 
 @pytest.mark.asyncio
-async def test_automation_runner_persists_automation_prompt_origin(
-    tmp_path: Path,
-) -> None:
-    with SQLiteStore(tmp_path) as automation_store:
-        _arm(automation_store, _job(tmp_path))
-        occurrence = tick(automation_store, DUE)[0]
-        run_id = automation_store.claim(occurrence)
-        assert run_id is not None
-        await run_claimed(
-            automation_store,
-            occurrence,
-            run_id,
-            home=tmp_path,
-            backend=FakeBackend([ScriptedTurn([TextContent("brief")])]),
-            mount_factory=_empty_mount,
-            delivery=RecordingDelivery(),
-        )
-        session_id = automation_store.runs("brief")[0].session_id
-    session = SessionManager(tmp_path).open(session_id)
-    row = next(
-        entry.to_dict()
-        for entry in session.store.entries
-        if entry.type == "message"
-        and entry.data["message"]["role"] == MessageRole.USER.value
-    )
-    metadata = row["data"]["message"]["metadata"]
-    assert metadata[MESSAGE_ORIGIN_METADATA] == "automation_prompt"
-    assert "zeta.user_display_text" not in metadata
-    assert _label(row) == "automation_prompt"
-    session.store.close()
-
-
-@pytest.mark.asyncio
 async def test_child_spawn_persists_agent_prompt_origin(tmp_path: Path) -> None:
     backend = FakeBackend(
         [
@@ -833,13 +766,6 @@ def test_agent_completion_notification_is_not_labeled_user(tmp_path: Path) -> No
 
     assert entry.data["origin"] == MessageOrigin.NOTIFICATION
     assert _label(entry.to_dict()) == "harness_notification"
-
-
-def test_automation_receipt_is_labeled_harness(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    _receipt(store, "delivered")
-
-    assert _label(store.entries[-1].to_dict()) == "harness"
 
 
 def _unmarked_user_message() -> Message:

@@ -9,7 +9,6 @@ import multiprocessing
 import os
 import stat
 import threading
-from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -33,8 +32,6 @@ from zeta.accounts import (
     SessionAccountContext,
 )
 from zeta.agent.runner import resolve_child_backend
-from zeta.automations.models import parse_job
-from zeta.automations.store import SQLiteStore
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -48,7 +45,6 @@ from zeta.protocol.types import (
     ThinkingContent,
 )
 from zeta.providers.factory import build_backend, credential_store
-from zeta.runtime import unattended
 from zeta.server.login import Logins
 from zeta.skills import SkillCatalog
 from zeta.tools import websearch
@@ -619,7 +615,6 @@ def test_migration_then_every_reader_uses_the_account_store(
     AccountStore(tmp_path).migrate()
 
     primary, _ = build_backend("claude", None, home=tmp_path)
-    automation, _ = unattended.build_backend("claude", None, home=tmp_path)
     memory, _ = build_backend("claude", None, home=tmp_path)
     child, error = resolve_child_backend(
         SimpleNamespace(
@@ -652,7 +647,6 @@ def test_migration_then_every_reader_uses_the_account_store(
     stores = [
         primary.token_store,
         child.token_store,
-        automation.token_store,
         memory.token_store,
         credential_store("claude", home=tmp_path),
     ]
@@ -1466,22 +1460,6 @@ def test_label_is_display_only_and_id_stays_stable(tmp_path: Path) -> None:
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     manager.record_account_selection(opened.metadata, account, boundary=0)
     opened.store.close()
-    job = parse_job(
-        "stable-account",
-        {
-            "prompt": "test",
-            "trigger": {"kind": "schedule", "cron": "0 8 * * 1-5"},
-            "servers": [],
-            "allow": [],
-            "provider": "codex",
-            "model": "offline",
-            "cwd": str(tmp_path),
-        },
-    )
-    with SQLiteStore(home) as automations:
-        revision = automations.draft(job)
-        automations.approve(job.name, revision.revision, None, datetime.now(UTC))
-        assert automations.get(job.name).job.account == str(account)
     credential = store.credential_path(account)
     credential_inode = credential.stat().st_ino
 
@@ -1499,8 +1477,6 @@ def test_label_is_display_only_and_id_stays_stable(tmp_path: Path) -> None:
     assert manager.read_metadata(opened.metadata.session_id).selected_accounts == {
         "codex": "codex:work"
     }
-    with SQLiteStore(home) as automations:
-        assert automations.get(job.name).job.account == str(account)
     assert named_account_credentials(home, "codex", "work").read() == tokens()
     assert not (home / ".account-rename.json").exists()
 

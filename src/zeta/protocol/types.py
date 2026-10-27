@@ -48,6 +48,7 @@ class MessageOrigin(StrEnum):
     AGENT_PROMPT = "agent_prompt"
     AGENT_SEND = "agent_send"
     HARNESS_NUDGE = "harness_nudge"
+    # Persisted origins remain valid after the automation runtime was retired.
     AUTOMATION_PROMPT = "automation_prompt"
     AUTOMATION_RECEIPT = "automation_receipt"
     NOTIFICATION = "notification"
