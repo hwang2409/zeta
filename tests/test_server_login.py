@@ -449,9 +449,11 @@ async def test_cancel_during_provider_lock_release_reports_success(
 
         task = server._client.logins.tasks["claude"]
         task.cancel()
+        task.cancel()
         release_exit.set()
 
         assert (await rpc(reader, writer, "login_cancel", provider="claude"))["result"] == {"state": "succeeded"}
+        assert task.cancelling() == 0
         saved = await asyncio.to_thread(credential_store, "claude", home=server.home)
         assert await asyncio.to_thread(saved.read) == expected
     finally:

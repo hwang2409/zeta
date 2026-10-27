@@ -19,6 +19,7 @@ import httpx
 
 
 TokenT = TypeVar("TokenT")
+_PUBLICATION_DECISION_TIMEOUT_SECONDS = 1.0
 
 
 class _PublicationArbiter:
@@ -41,10 +42,25 @@ class _PublicationArbiter:
 
     def is_set(self) -> bool:
         response: concurrent.futures.Future[bool] = concurrent.futures.Future()
-        self._loop.call_soon_threadsafe(self._decide, response)
-        return not response.result()
+        try:
+            self._loop.call_soon_threadsafe(self._decide, response)
+        except RuntimeError:
+            return True
+        try:
+            return not response.result(timeout=_PUBLICATION_DECISION_TIMEOUT_SECONDS)
+        except TimeoutError:
+            if response.cancel():
+                return True
+            try:
+                return not response.result(
+                    timeout=_PUBLICATION_DECISION_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                return True
 
     def _decide(self, response: concurrent.futures.Future[bool]) -> None:
+        if not response.set_running_or_notify_cancel():
+            return
         allowed = (
             not self.cancel_requested
             and self._task.cancelling() == 0
@@ -63,6 +79,7 @@ async def _wait_bounded_work(
     cancelled = False
     current = asyncio.current_task()
     assert current is not None
+    baseline = current.cancelling()
     while not task.done():
         try:
             await asyncio.shield(task)
@@ -70,7 +87,8 @@ async def _wait_bounded_work(
             cancelled = True
             if on_cancel is not None:
                 on_cancel()
-            current.uncancel()
+    while current.cancelling() > baseline:
+        current.uncancel()
     task.result()
     return cancelled
 

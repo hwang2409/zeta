@@ -99,7 +99,7 @@ the normalized snapshot and refresh-attempt state. files are `0600`; directories
 are `0700`. secrets, auth headers, authorization codes, provider bodies, and
 exception text never enter logs, notices, model input, transcripts, tool results,
 or serve responses. serve login already uses fixed safe error messages
-([`server/login.py:72-97`](../src/zeta/server/login.py#L72-L97)). serve login cancellation uses one loop-owned operation phase from publication
+([`server/login.py:125-144`](../src/zeta/server/login.py#L125-L144)). serve login cancellation uses one loop-owned operation phase from publication
 through listener cleanup and provider-login-lock release. the credential worker asks
 the event loop for the final commit decision while it holds the account lock. a
 cancellation accepted before that decision publishes nothing; after commit, any

@@ -8,7 +8,12 @@ from pathlib import Path
 import httpx
 
 from ..accounts import AccountCredentialLockTimeoutError, AccountStore
-from ..core.login_flow import LoginError, LoginPortInUseError, run_login
+from ..core.login_flow import (
+    LoginError,
+    LoginPortInUseError,
+    _wait_bounded_work,
+    run_login,
+)
 from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
 from .protocol import ProtocolError
@@ -42,20 +47,6 @@ class _LoginOperation:
 
     def finish(self, result: dict) -> None:
         self.phase = result["state"]
-
-
-async def _wait_for_cleanup(task: asyncio.Task[object]) -> bool:
-    cancelled = False
-    current = asyncio.current_task()
-    assert current is not None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            cancelled = True
-            current.uncancel()
-    task.result()
-    return cancelled
 
 
 class Logins:
@@ -166,7 +157,7 @@ class Logins:
         cancelled = False
         result: dict | None = None
         try:
-            cancelled = await _wait_for_cleanup(acquisition)
+            cancelled = await _wait_bounded_work(acquisition)
             locked = acquisition.exception() is None
             if cancelled:
                 raise asyncio.CancelledError
@@ -182,7 +173,7 @@ class Logins:
             release = asyncio.create_task(
                 asyncio.to_thread(lock.__exit__, None, None, None)
             )
-            release_cancelled = await _wait_for_cleanup(release)
+            release_cancelled = await _wait_bounded_work(release)
             cancelled = cancelled or release_cancelled
         if cancelled and not operation.committed:
             operation.phase = "cancelled"

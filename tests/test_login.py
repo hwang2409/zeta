@@ -391,12 +391,67 @@ async def test_login_double_cancel_during_publication_reports_success() -> None:
     assert await asyncio.to_thread(publication_started.wait, 2)
 
     task.cancel()
-    await asyncio.sleep(0)
     task.cancel()
     release_save.set()
 
     assert await task == "access"
+    assert task.cancelling() == 0
     assert store.saved == tokens
+
+
+def test_login_publication_decision_denies_when_loop_stops_or_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks: list[tuple[Callable[..., None], tuple[object, ...]]] = []
+    committed = False
+    credential_lock = threading.Lock()
+
+    class StoppedLoop:
+        def call_soon_threadsafe(
+            self, callback: Callable[..., None], *args: object
+        ) -> None:
+            callbacks.append((callback, args))
+
+    class Task:
+        def cancelling(self) -> int:
+            return 0
+
+    def commit() -> bool:
+        nonlocal committed
+        committed = True
+        return True
+
+    monkeypatch.setattr(
+        login_flow, "_PUBLICATION_DECISION_TIMEOUT_SECONDS", 0.05
+    )
+    arbiter = login_flow._PublicationArbiter(
+        StoppedLoop(), Task(), commit  # type: ignore[arg-type]
+    )
+    decision: list[bool] = []
+
+    def save() -> None:
+        with credential_lock:
+            decision.append(arbiter.is_set())
+
+    worker = threading.Thread(target=save, daemon=True)
+    worker.start()
+    worker.join(timeout=0.5)
+
+    assert not worker.is_alive()
+    assert decision == [True]
+    assert credential_lock.acquire(timeout=0.1)
+    credential_lock.release()
+    callback, args = callbacks.pop()
+    callback(*args)
+    assert not committed
+
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+    closed_arbiter = login_flow._PublicationArbiter(
+        closed_loop, Task(), commit  # type: ignore[arg-type]
+    )
+    assert closed_arbiter.is_set()
+    assert not committed
 
 
 @pytest.mark.asyncio
