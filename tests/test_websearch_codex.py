@@ -20,8 +20,10 @@ from zeta.tools.websearch.codex import CodexSearchResult
 
 
 @pytest.fixture
-def registry(tmp_path: Path) -> ToolRegistry:
-    return ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+async def registry(tmp_path: Path):
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    yield registry
+    await registry.close()
 
 
 async def execute(registry: ToolRegistry) -> dict:

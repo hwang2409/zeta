@@ -4208,6 +4208,7 @@ skill_catalog=SkillCatalog.empty(),
     plain = "\n".join(renderable_plain(item) for item in rendered)
     assert "provider failure · " in plain
     assert str(error) in plain
+    await app.close()
 
 
 @pytest.mark.asyncio

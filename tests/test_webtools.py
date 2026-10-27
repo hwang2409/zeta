@@ -76,10 +76,17 @@ async def _execute_fetch(
         return response
 
     _mock_client(monkeypatch, handler)
-    registry = ToolRegistry(tmp_path, max_output_chars=max_output_chars, skill_catalog=SkillCatalog.empty())
-    return await registry.execute(
-        ToolCall("fetch-1", "fetch", arguments or {"url": "example.com"})
+    registry = ToolRegistry(
+        tmp_path,
+        max_output_chars=max_output_chars,
+        skill_catalog=SkillCatalog.empty(),
     )
+    try:
+        return await registry.execute(
+            ToolCall("fetch-1", "fetch", arguments or {"url": "example.com"})
+        )
+    finally:
+        await registry.close()
 
 
 def test_fetch_schema_documents_max_bytes(tmp_path: Path) -> None:
@@ -778,24 +785,29 @@ async def test_fetch_pagination_repeats_notices_without_advancing_offset(
     )
     offset = 0
     body_pages: list[str] = []
-
-    while True:
-        result = await ToolRegistry(tmp_path, max_output_chars=128, skill_catalog=SkillCatalog.empty()).execute(
-            ToolCall(
-                "fetch-1",
-                "fetch",
-                {"url": "http://printer.local", "offset": offset},
+    registry = ToolRegistry(
+        tmp_path, max_output_chars=128, skill_catalog=SkillCatalog.empty()
+    )
+    try:
+        while True:
+            result = await registry.execute(
+                ToolCall(
+                    "fetch-1",
+                    "fetch",
+                    {"url": "http://printer.local", "offset": offset},
+                )
             )
-        )
-        block = result["content"][0]
-        assert block["text"].startswith(notice)
-        page = block["text"][len(notice) :]
-        body_pages.append(page)
-        assert page == body[offset : offset + len(page)]
-        if not block["truncated"]:
-            break
-        assert block["next_offset"] == offset + len(page)
-        offset = block["next_offset"]
+            block = result["content"][0]
+            assert block["text"].startswith(notice)
+            page = block["text"][len(notice) :]
+            body_pages.append(page)
+            assert page == body[offset : offset + len(page)]
+            if not block["truncated"]:
+                break
+            assert block["next_offset"] == offset + len(page)
+            offset = block["next_offset"]
+    finally:
+        await registry.close()
 
     assert "".join(body_pages) == body
 
