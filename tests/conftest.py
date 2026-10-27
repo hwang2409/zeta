@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import stat
@@ -387,6 +388,37 @@ def isolate_zeta_home(
             == isolated_home.resolve()
         )
         live_home_write_guard.assert_clean()
+
+
+def _open_file_descriptors() -> set[int]:
+    for directory in ("/proc/self/fd", "/dev/fd"):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        descriptors = set()
+        for name in names:
+            try:
+                descriptor = int(name)
+                os.fstat(descriptor)
+            except (OSError, ValueError):
+                continue
+            descriptors.add(descriptor)
+        return descriptors
+    return set()
+
+
+@pytest.hookimpl(hookwrapper=True, trylast=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
+    """Collect abandoned runtime cycles before their descriptors accumulate."""
+    del item, nextitem
+    before = _open_file_descriptors()
+    yield
+    after = _open_file_descriptors()
+    if after != before:
+        gc.collect()
+        after = _open_file_descriptors()
+    assert max(after, default=-1) < 1024, "test worker exceeded select() FD_SETSIZE"
 
 
 @pytest.fixture(autouse=True)
