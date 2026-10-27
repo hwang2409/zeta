@@ -112,6 +112,7 @@ class BackgroundAgentOwner:
         self._cancel_confirmations: dict[
             str, asyncio.Task[bool] | asyncio.Task[None]
         ] = {}
+        self._cancel_cleanups: dict[str, asyncio.Task[None]] = {}
         self._parent_ids: dict[str, str | None] = {}
         self._original_parent_ids: dict[str, str | None] = {}
         self._wake_callback: Callable[[], None] | None = None
@@ -187,9 +188,7 @@ class BackgroundAgentOwner:
             return CancellationOutcome("unconfirmed")
         return CancellationOutcome("confirmed")
 
-    def cancel_subtree(
-        self, instance_id: str
-    ) -> tuple[_CancellationConfirmation, ...]:
+    def _subtree_ids(self, instance_id: str) -> set[str]:
         selected = {instance_id}
         changed = True
         while changed:
@@ -198,6 +197,12 @@ class BackgroundAgentOwner:
                 if child not in selected and parent in selected:
                     selected.add(child)
                     changed = True
+        return selected
+
+    def cancel_subtree(
+        self, instance_id: str
+    ) -> tuple[_CancellationConfirmation, ...]:
+        selected = self._subtree_ids(instance_id)
         confirmations: list[_CancellationConfirmation] = []
         for child in tuple(self._cancellers):
             if child not in selected:
@@ -209,6 +214,7 @@ class BackgroundAgentOwner:
                     result = self._cancellers[child]()
                     if isinstance(result, CancellationRequest):
                         confirmation = result.confirmation
+                        self._cancel_cleanups[child] = result.cleanup
                     elif isinstance(result, asyncio.Task):
                         confirmation = result
                     if confirmation is not None:
@@ -216,6 +222,23 @@ class BackgroundAgentOwner:
             if confirmation is not None:
                 confirmations.append(_CancellationConfirmation(child, confirmation))
         return tuple(confirmations)
+
+    async def cancel_descendants_and_wait(self, instance_id: str) -> None:
+        """Cancel descendants before their parent loop can close."""
+
+        descendants = self._subtree_ids(instance_id) - {instance_id}
+        self.cancel_subtree(instance_id)
+        tasks = [
+            task
+            for child in descendants
+            for task in (
+                self._cancel_cleanups.get(child),
+                self._watchers.get(child),
+            )
+            if task is not None and task is not asyncio.current_task()
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def owns_running(self, instance_id: str) -> bool:
         return instance_id in self._cancellers
@@ -293,6 +316,7 @@ class BackgroundAgentOwner:
         self._original_parent_ids.pop(instance_id, None)
         self._cancel_requested.discard(instance_id)
         self._cancel_confirmations.pop(instance_id, None)
+        self._cancel_cleanups.pop(instance_id, None)
 
     def adopt(
         self,
