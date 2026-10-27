@@ -39,7 +39,8 @@ class _OversizedInteger:
 class FrameWriteCancelled(asyncio.CancelledError):
     """Cancellation that arrived after a frame write started.
 
-    The write ran to completion first; ``written`` is its result.
+    ``written`` is false if the bounded write did not finish, including after
+    transport abort when a cancellation-resistant drain had to be detached.
     """
 
     def __init__(self, written: bool) -> None:
@@ -50,6 +51,7 @@ class FrameWriteCancelled(asyncio.CancelledError):
 # How long a canceled caller waits for a started frame write to drain before
 # the transport is aborted. A stalled client must not hang abort or shutdown.
 FRAME_CANCEL_GRACE = 1.0
+_DETACHED_FRAME_WRITES: set[asyncio.Future[bool]] = set()
 
 
 async def finish_frame_write(codec: FrameCodec, writer: Any, payload: bytes) -> bool:
@@ -80,6 +82,7 @@ async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> boo
             if aborted:
                 # The write ignored abort and cancellation; stop waiting but
                 # keep ownership so its outcome is still observed.
+                _DETACHED_FRAME_WRITES.add(task)
                 task.add_done_callback(_observe_write)
                 return False
             aborted = True
@@ -102,8 +105,11 @@ async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> boo
 
 
 def _observe_write(task: asyncio.Future[bool]) -> None:
-    if not task.cancelled():
-        task.exception()
+    try:
+        if not task.cancelled():
+            task.exception()
+    finally:
+        _DETACHED_FRAME_WRITES.discard(task)
 
 
 class ProtocolError(Exception):

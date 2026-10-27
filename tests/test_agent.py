@@ -12679,39 +12679,64 @@ async def test_agent_cancel_propagates_caller_cancellation(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_question_close_ignores_a_sibling_finishing_delivery_cleanup(
+async def test_question_close_keeps_recipient_targets_stable_during_cleanup(
     tmp_path: Path,
 ) -> None:
     parent = ConversationStore(tmp_path / "parent")
     first_child = ConversationStore(tmp_path / "first-child")
     second_child = ConversationStore(tmp_path / "second-child")
+    second_child.append_child_question(
+        child_instance_id="root:2", question_id="question", question="done?"
+    )
     owner = BackgroundAgentOwner(parent)
+    owner.track_store(second_child)
     channel = owner.conversation_channel
+    first_flow = pending_delivery_module.StepDeliveryFlow(parent)
     flows = {
-        None: pending_delivery_module.StepDeliveryFlow(parent),
+        None: first_flow,
         "root:1": pending_delivery_module.StepDeliveryFlow(first_child),
         "root:2": pending_delivery_module.StepDeliveryFlow(second_child),
     }
     for target_id, flow in flows.items():
         channel.register_delivery_flow(target_id, flow)
-    owner.track_store(first_child)
-    owner.track_store(second_child)
 
-    cleanup_gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-    channel._delivery_targets["root:1"].accepted.add(cleanup_gate)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    first_produce = first_flow.produce
+
+    async def gated_first_produce(
+        item: pending_delivery_module.DeliveryInput,
+    ) -> pending_delivery_module.ProducerResult:
+        first_started.set()
+        await release_first.wait()
+        return await first_produce(item)
+
+    first_flow.produce = gated_first_produce  # type: ignore[method-assign]
+    closing = asyncio.create_task(
+        channel.close_questions("root:2", reason="finished")
+    )
+    await first_started.wait()
     cleanup_started = asyncio.Event()
+    cleanup_finished = asyncio.Event()
 
-    async def unregister_first_child() -> None:
+    async def unregister_second_child() -> None:
         cleanup_started.set()
-        await channel.unregister_delivery_flow("root:1")
+        await channel.unregister_delivery_flow("root:2")
+        cleanup_finished.set()
 
-    cleanup = asyncio.create_task(unregister_first_child())
+    cleanup = asyncio.create_task(unregister_second_child())
     await cleanup_started.wait()
     try:
-        assert await channel.close_questions("root:2", reason="finished") == 0
-    finally:
-        cleanup_gate.set_result(None)
+        assert not cleanup_finished.is_set()
+        release_first.set()
+        assert await closing == 1
         await cleanup
+        assert second_child.agent_notifications()[-1].data["kind"] == (
+            "child_question_withdrawn"
+        )
+    finally:
+        release_first.set()
+        await asyncio.gather(closing, cleanup, return_exceptions=True)
         parent.close()
         first_child.close()
         second_child.close()

@@ -97,17 +97,21 @@ class ConversationChannel:
         target = self._delivery_targets.get(target_instance_id)
         if target is None:
             raise LookupError(f"no live delivery flow: {target_instance_id!r}")
+        return await self._start_produce(target, item)
+
+    def _start_produce(
+        self, target: _DeliveryTarget, item: DeliveryInput, /
+    ) -> asyncio.Future[ProducerResult]:
         if target.loop is asyncio.get_running_loop():
-            return await target.flow.produce(item)
-        concurrent = asyncio.run_coroutine_threadsafe(
-            target.flow.produce(item), target.loop
-        )
-        future = asyncio.wrap_future(concurrent)
+            future = asyncio.create_task(target.flow.produce(item))
+        else:
+            concurrent = asyncio.run_coroutine_threadsafe(
+                target.flow.produce(item), target.loop
+            )
+            future = asyncio.wrap_future(concurrent)
         target.accepted.add(future)
-        try:
-            return await future
-        finally:
-            target.accepted.discard(future)
+        future.add_done_callback(target.accepted.discard)
+        return future
 
     async def produce_to_parent_of(
         self, child_instance_id: str, item: DeliveryInput, /
@@ -343,22 +347,16 @@ class ConversationChannel:
     async def close_questions(self, child_instance_id: str, *, reason: str) -> int:
         from .pending_delivery import NotificationInput
 
-        closed = 0
-        for store in self._owner.conversation_stores():
-            try:
-                target_id = self._target_for_store(store)
-            except LookupError:
-                # A sibling cleanup removes its flow before releasing its store.
-                continue
-            result = await self.produce_to(
-                target_id,
-                NotificationInput(
-                    "child_question_close",
-                    {"child_instance_id": child_instance_id, "reason": reason},
-                ),
-            )
-            closed += result.affected
-        return closed
+        item = NotificationInput(
+            "child_question_close",
+            {"child_instance_id": child_instance_id, "reason": reason},
+        )
+        futures = tuple(
+            self._start_produce(target, item)
+            for target in tuple(self._delivery_targets.values())
+        )
+        results = await asyncio.gather(*futures)
+        return sum(result.affected for result in results)
 
     def _target_for_store(self, store: ConversationStore) -> str | None:
         for target_id, target in self._delivery_targets.items():

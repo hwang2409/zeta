@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import gc
 import inspect
 import json
 import multiprocessing
@@ -15,6 +16,7 @@ import stat
 import subprocess
 import sys
 import threading
+import weakref
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -295,6 +297,72 @@ async def test_canceled_write_ignoring_abort_and_cancel_is_bounded(
     finally:
         release.set()
         await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_detached_canceled_write_is_owned_until_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.01)
+    release = False
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    write_ref: weakref.ReferenceType[asyncio.Task[bool]] | None = None
+
+    class CancellationResistantWriter:
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            nonlocal write_ref
+            task = asyncio.current_task()
+            assert task is not None
+            write_ref = weakref.ref(task)
+            started.set()
+            try:
+                while not release:
+                    try:
+                        await asyncio.get_running_loop().create_future()
+                    except asyncio.CancelledError:
+                        continue
+            finally:
+                stopped.set()
+
+    loop = asyncio.get_running_loop()
+    loop_errors: list[str] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(
+        lambda _loop, context: loop_errors.append(str(context.get("message", "")))
+    )
+    caller = asyncio.create_task(
+        protocol_module.finish_frame_write(
+            protocol_module.FrameCodec(), CancellationResistantWriter(), b"{}"
+        )
+    )
+    try:
+        await started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        del caller
+        for _ in range(3):
+            await asyncio.sleep(0)
+            gc.collect()
+        assert write_ref is not None
+        detached = write_ref()
+        assert detached is not None
+        assert detached in getattr(protocol_module, "_DETACHED_FRAME_WRITES", set())
+        assert loop_errors == []
+    finally:
+        release = True
+        if write_ref is not None and (detached := write_ref()) is not None:
+            detached.cancel()
+            await stopped.wait()
+            await asyncio.sleep(0)
+        loop.set_exception_handler(previous_handler)
+
+    assert protocol_module._DETACHED_FRAME_WRITES == set()
+    assert loop_errors == []
 
 
 @pytest.mark.asyncio
