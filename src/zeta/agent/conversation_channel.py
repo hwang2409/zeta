@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 class _DeliveryTarget:
     loop: asyncio.AbstractEventLoop
     flow: StepDeliveryFlow
-    accepted: set[asyncio.Future[ProducerResult]] = field(default_factory=set)
+    accepted: set[asyncio.Future[Any]] = field(default_factory=set)
 
 
 def has_follow_up_loop(*, accepts_follow_ups: bool, background: bool) -> bool:
@@ -97,21 +97,22 @@ class ConversationChannel:
         target = self._delivery_targets.get(target_instance_id)
         if target is None:
             raise LookupError(f"no live delivery flow: {target_instance_id!r}")
-        return await self._start_produce(target, item)
+        return await self._produce_to_target(target, item)
 
-    def _start_produce(
+    async def _produce_to_target(
         self, target: _DeliveryTarget, item: DeliveryInput, /
-    ) -> asyncio.Future[ProducerResult]:
+    ) -> ProducerResult:
         if target.loop is asyncio.get_running_loop():
-            future = asyncio.create_task(target.flow.produce(item))
-        else:
-            concurrent = asyncio.run_coroutine_threadsafe(
-                target.flow.produce(item), target.loop
-            )
-            future = asyncio.wrap_future(concurrent)
+            return await target.flow.produce(item)
+        concurrent = asyncio.run_coroutine_threadsafe(
+            target.flow.produce(item), target.loop
+        )
+        future = asyncio.wrap_future(concurrent)
         target.accepted.add(future)
-        future.add_done_callback(target.accepted.discard)
-        return future
+        try:
+            return await future
+        finally:
+            target.accepted.discard(future)
 
     async def produce_to_parent_of(
         self, child_instance_id: str, item: DeliveryInput, /
@@ -351,11 +352,30 @@ class ConversationChannel:
             "child_question_close",
             {"child_instance_id": child_instance_id, "reason": reason},
         )
-        futures = tuple(
-            self._start_produce(target, item)
-            for target in tuple(self._delivery_targets.values())
+        targets_by_store = {
+            id(target.flow.store): target
+            for target in self._delivery_targets.values()
+        }
+        targets = tuple(
+            target
+            for store in self._owner.conversation_stores()
+            if (target := targets_by_store.get(id(store))) is not None
         )
-        results = await asyncio.gather(*futures)
+        reservations = tuple(
+            (target, asyncio.get_running_loop().create_future())
+            for target in targets
+        )
+        for target, reservation in reservations:
+            target.accepted.add(reservation)
+        try:
+            results = [
+                await self._produce_to_target(target, item) for target in targets
+            ]
+        finally:
+            for target, reservation in reservations:
+                target.accepted.discard(reservation)
+                if not reservation.done():
+                    reservation.set_result(None)
         return sum(result.affected for result in results)
 
     def _target_for_store(self, store: ConversationStore) -> str | None:
