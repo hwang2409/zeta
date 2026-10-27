@@ -104,7 +104,11 @@ through listener cleanup and provider-login-lock release. the credential worker 
 the event loop for the final commit decision while it holds the account lock. a
 cancellation accepted before that decision publishes nothing; after commit, any
 number of cancellation requests let bounded cleanup finish and the operation reports
-success, so the result always agrees with the credentials on disk.
+success. if a stopped event loop cannot decide within the 20-second decision bound,
+credential publication is denied and login fails with `Login could not be saved; try
+again.` after the account and provider locks are released. the bound can consume at
+most 40 seconds across the two arbitration waits, within the 60-second publication
+budget, so the result always agrees with the credentials on disk.
 
 ## labels
 

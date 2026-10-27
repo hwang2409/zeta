@@ -11,6 +11,7 @@ from ..accounts import AccountCredentialLockTimeoutError, AccountStore
 from ..core.login_flow import (
     LoginError,
     LoginPortInUseError,
+    LoginPublicationError,
     _wait_bounded_work,
     run_login,
 )
@@ -129,6 +130,8 @@ class Logins:
                 "login_lock_timeout",
                 "Sign-in could not save credentials because the account is busy. Please try again.",
             )
+        except LoginPublicationError as exc:
+            return failure("login_save_failed", str(exc))
         except LoginPortInUseError as exc:
             provider_label = exc.provider.capitalize()
             return failure(

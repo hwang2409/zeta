@@ -439,6 +439,7 @@ def test_login_publication_decision_denies_when_loop_stops_or_closes(
 
     assert not worker.is_alive()
     assert decision == [True]
+    assert arbiter.decision_failed
     assert credential_lock.acquire(timeout=0.1)
     credential_lock.release()
     callback, args = callbacks.pop()
@@ -451,6 +452,7 @@ def test_login_publication_decision_denies_when_loop_stops_or_closes(
         closed_loop, Task(), commit  # type: ignore[arg-type]
     )
     assert closed_arbiter.is_set()
+    assert closed_arbiter.decision_failed
     assert not committed
 
 

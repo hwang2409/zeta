@@ -19,7 +19,8 @@ import httpx
 
 
 TokenT = TypeVar("TokenT")
-_PUBLICATION_DECISION_TIMEOUT_SECONDS = 1.0
+# Two waits stay within the publication budget while tolerating loop congestion.
+_PUBLICATION_DECISION_TIMEOUT_SECONDS = 20.0
 
 
 class _PublicationArbiter:
@@ -36,6 +37,7 @@ class _PublicationArbiter:
         self._commit = commit
         self.cancel_requested = False
         self.committed = False
+        self.decision_failed = False
 
     def cancel(self) -> None:
         self.cancel_requested = True
@@ -45,17 +47,20 @@ class _PublicationArbiter:
         try:
             self._loop.call_soon_threadsafe(self._decide, response)
         except RuntimeError:
+            self.decision_failed = True
             return True
         try:
             return not response.result(timeout=_PUBLICATION_DECISION_TIMEOUT_SECONDS)
         except TimeoutError:
             if response.cancel():
+                self.decision_failed = True
                 return True
             try:
                 return not response.result(
                     timeout=_PUBLICATION_DECISION_TIMEOUT_SECONDS
                 )
             except TimeoutError:
+                self.decision_failed = True
                 return True
 
     def _decide(self, response: concurrent.futures.Future[bool]) -> None:
@@ -118,6 +123,8 @@ async def _publish_credentials(
     cancelled = await _wait_bounded_work(publication, arbiter.cancel)
     if cancelled and not arbiter.committed:
         raise asyncio.CancelledError
+    if arbiter.decision_failed:
+        raise LoginPublicationError
     return arbiter
 
 
@@ -174,6 +181,13 @@ class LoginProvider(Generic[TokenT]):
 
 class LoginError(RuntimeError):
     """Raised for user-facing login failures."""
+
+
+class LoginPublicationError(LoginError):
+    """Raised when the event loop cannot authorize credential publication."""
+
+    def __init__(self) -> None:
+        super().__init__("Login could not be saved; try again.")
 
 
 class LoginPortInUseError(LoginError):
@@ -363,4 +377,10 @@ async def run_login(
         await _close_listener(server, server_thread, publication_arbiter)
 
 
-__all__ = ["LoginError", "LoginPortInUseError", "LoginProvider", "run_login"]
+__all__ = [
+    "LoginError",
+    "LoginPortInUseError",
+    "LoginProvider",
+    "LoginPublicationError",
+    "run_login",
+]

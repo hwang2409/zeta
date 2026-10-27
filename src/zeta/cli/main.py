@@ -15,7 +15,7 @@ from ..accounts import AccountError, AccountId, AccountStore, AccountUsage
 from ..accounts.usage import format_usage_lines, usage_json
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
-from ..core.login_flow import run_login
+from ..core.login_flow import LoginPublicationError, run_login
 from ..core.session import SessionError, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..providers.login import build_login_provider, pkce_values
@@ -425,7 +425,7 @@ def _handle_login(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("login cancelled", file=sys.stderr)
         return 1
-    except (AccountError, ValueError) as exc:
+    except (AccountError, LoginPublicationError, ValueError) as exc:
         print(f"login failed: {exc}", file=sys.stderr)
         return 1
     except Exception:

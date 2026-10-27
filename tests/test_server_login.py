@@ -12,6 +12,7 @@ import pytest
 
 from tests.test_server import _close, _connect, _request
 from zeta.accounts import AccountStore
+from zeta.core import login_flow
 from zeta.core.login_flow import LoginPortInUseError
 from zeta.providers import anthropic
 from zeta.providers import login as providers
@@ -251,6 +252,71 @@ async def test_serve_login_publication_does_not_block_event_loop(
             "message": "Sign-in could not save credentials because the account is busy. Please try again.",
         },
     }
+
+
+async def test_serve_login_decision_expiry_reports_failure_and_releases_locks(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "zeta"
+    expected = OAuthTokens("access", "refresh", 4_000_000_000)
+    captured = {}
+    loop = asyncio.get_running_loop()
+    loop_blocked = threading.Event()
+
+    def build(state, _challenge, redirect):
+        captured.update(state=state, redirect=redirect)
+        return "https://authorize.invalid/"
+
+    async def exchange(*_args):
+        return expected
+
+    provider = replace(
+        await asyncio.to_thread(providers.build_login_provider, "anthropic", home),
+        callback_port=0,
+        build_authorization_url=build,
+        exchange_authorization_code=exchange,
+    )
+    real_save = provider.credential_store.save
+
+    def block_loop() -> None:
+        loop_blocked.set()
+        threading.Event().wait(0.15)
+
+    def observed_save(*args, **kwargs):
+        loop.call_soon_threadsafe(block_loop)
+        assert loop_blocked.wait(timeout=1)
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(provider.credential_store, "save", observed_save)
+    monkeypatch.setattr(server_login, "build_login_provider", lambda *_args: provider)
+    monkeypatch.setattr(login_flow, "_PUBLICATION_DECISION_TIMEOUT_SECONDS", 0.05)
+    server, reader, writer, _ = await connect(tmp_path)
+    try:
+        assert (await rpc(reader, writer, "login_start", provider="claude"))["result"]["state"] == "pending"
+        await callback(
+            captured["redirect"],
+            {"code": "synthetic", "state": captured["state"]},
+        )
+        result = await asyncio.wait_for(server._client.logins.tasks["claude"], 3)
+
+        assert result == {
+            "state": "failed",
+            "error": {
+                "code": "login_save_failed",
+                "message": "Login could not be saved; try again.",
+            },
+        }
+        assert await asyncio.wait_for(
+            asyncio.to_thread(provider.credential_store.read), 1
+        ) is None
+
+        def acquire_provider_lock() -> None:
+            with AccountStore(home).provider_login_lock("anthropic"):
+                pass
+
+        await asyncio.wait_for(asyncio.to_thread(acquire_provider_lock), 1)
+    finally:
+        await _close(server, writer)
 
 
 async def test_cancelled_serve_login_never_publishes_and_releases_locks(
