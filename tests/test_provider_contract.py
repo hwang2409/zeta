@@ -73,6 +73,9 @@ class ProviderContract:
     stale_token: str
     fresh_token: str
     success_sse: str
+    retry_statuses: tuple[int, ...]
+    retry_after: float
+    rate_limit_sse: str
 
     def store(self, path: Path):
         credentials = (anthropic_credentials if self.name == "anthropic" else codex_credentials)(path)
@@ -82,11 +85,24 @@ class ProviderContract:
 
 PROVIDERS = [
     pytest.param(
-        ProviderContract("anthropic", AnthropicBackend, AnthropicAuthError, r"Anthropic.*zeta login", AnthropicHTTPError, "stale-access", "fresh-access", ANTHROPIC_SSE),
+        ProviderContract(
+            "anthropic", AnthropicBackend, AnthropicAuthError,
+            r"Anthropic.*zeta login", AnthropicHTTPError,
+            "stale-access", "fresh-access", ANTHROPIC_SSE, (429,), 4.0,
+            'data: {"type":"error","error":{"type":"rate_limit_error",'
+            '"message":"slow down"}}\n\n',
+        ),
         id="anthropic",
     ),
     pytest.param(
-        ProviderContract("codex", CodexBackend, CodexAuthError, r"Codex authentication failed after token refresh; run `zeta login --provider codex`", CodexHTTPError, _codex_access_token("stale-account"), _codex_access_token("fresh-account"), _codex_sse()),
+        ProviderContract(
+            "codex", CodexBackend, CodexAuthError,
+            r"Codex authentication failed after token refresh; run `zeta login --provider codex`",
+            CodexHTTPError, _codex_access_token("stale-account"),
+            _codex_access_token("fresh-account"), _codex_sse(), (429, 503), 2.0,
+            'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error",'
+            '"message":"slow down"}}\n\n',
+        ),
         id="codex",
     ),
 ]
@@ -204,6 +220,62 @@ async def test_server_error_retries_without_refresh(provider, tmp_path, monkeypa
         await _collect(backend)
     assert len(requests) == 5
     assert refreshes == []
+    await client.aclose()
+
+
+async def _assert_retry_after(provider, status, tmp_path, monkeypatch):
+    requests, sleeps = [], []
+
+    async def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                status, headers={"retry-after": str(provider.retry_after)},
+                json={"error": {"message": "busy"}}, request=request,
+            )
+        return httpx.Response(200, text=provider.success_sse, request=request)
+
+    async def no_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(transport_module.asyncio, "sleep", no_sleep)
+    _store, client, backend = _setup(provider, tmp_path, handler)
+    events = await _collect(backend)
+    retries = [event for event in events if event.type is StreamEventType.RETRY]
+    assert len(requests) == 2
+    assert sleeps == [provider.retry_after]
+    assert len(retries) == 1
+    if provider.name == "anthropic":
+        assert retries[0].data["text"] == "429 rate limited, retrying in 4s (attempt 2/5)"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", PROVIDERS)
+async def test_retry_after_controls_wait_and_notice(provider, tmp_path, monkeypatch):
+    for status in provider.retry_statuses:
+        await _assert_retry_after(provider, status, tmp_path, monkeypatch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", PROVIDERS)
+async def test_stream_rate_limit_retry_notice_uses_429_label(provider, tmp_path, monkeypatch):
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        text = provider.rate_limit_sse if len(requests) == 1 else provider.success_sse
+        return httpx.Response(200, text=text, request=request)
+
+    async def no_sleep(_delay):
+        pass
+
+    monkeypatch.setattr(transport_module.asyncio, "sleep", no_sleep)
+    _store, client, backend = _setup(provider, tmp_path, handler)
+    events = await _collect(backend)
+    retry = next(event for event in events if event.type is StreamEventType.RETRY)
+    assert len(requests) == 2
+    assert retry.data["text"].startswith("429 rate limited, retrying")
     await client.aclose()
 
 
