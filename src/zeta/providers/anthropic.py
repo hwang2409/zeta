@@ -273,7 +273,7 @@ class AnthropicCredentialDriver:
 class AnthropicApiKeyCredential:
     """Static `ANTHROPIC_API_KEY` credential, opt-in only (see docs/design.md).
 
-    Evaluation/automation only: no refresh is possible for a static key, so a
+    Evaluation only: no refresh is possible for a static key, so a
     401 must surface a clear "check your key" error instead of attempting the
     OAuth refresh-on-401 dance from ZETA-11.
     """

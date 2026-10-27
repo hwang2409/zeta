@@ -8,7 +8,6 @@ import sys
 
 ROOT = Path(__file__).parents[1] / "src" / "zeta"
 FORBIDDEN = {
-    "automations": {"tui", "cli"},
     "codex": {"providers", "tools"},
     "oauth": {"providers", "tools"},
     "runtime": {"tui", "cli"},

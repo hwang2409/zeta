@@ -29,7 +29,7 @@ def build_unattended_loop(
         home, manager, metadata, validate=backend is None
     )
     if metadata.provider == "ollama":
-        raise ValueError("Ollama automations are not yet supported")
+        raise ValueError("Ollama unattended sessions are not supported")
     if backend is None:
         backend, _model = build_backend(
             metadata.provider,
@@ -43,8 +43,7 @@ def build_unattended_loop(
     if session.metadata.skill_catalog is None:
         raise ValueError("unattended sessions require a skill catalog")
     skill_catalog = SkillCatalog.from_snapshot(session.metadata.skill_catalog)
-    # Automation sessions never mount user-defined agents, even if metadata
-    # was modified outside the restricted runner.
+    # Unattended sessions never mount user-defined agents.
     agent_catalog = discover_packaged_agents()
     registry = ToolRegistry(
         metadata.cwd,
@@ -70,7 +69,7 @@ def build_unattended_loop(
         approval_policy=policy,
         max_turns=25,
         skip_mcp_mount=True,
-        # Approved automation revisions keep their persisted skill snapshot.
+        # Unattended sessions keep their persisted skill snapshot.
         freeze_skill_catalog=True,
         system_prompt=metadata.system_prompt,
         on_completion_success=lambda: asyncio.to_thread(

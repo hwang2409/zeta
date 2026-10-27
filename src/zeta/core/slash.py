@@ -544,8 +544,6 @@ class SlashSession(Protocol):
 
     async def slash_mcp(self, args: str) -> str | ModelInputEnvelope: ...
 
-    async def slash_automations(self, args: str) -> str: ...
-
     async def slash_mcp_prompt(
         self, name: str, arguments: dict[str, str]
     ) -> str: ...
@@ -1021,10 +1019,6 @@ async def _run_mcp(session: SlashSession, args: str) -> str | ModelInputEnvelope
     return await session.slash_mcp(args.strip())
 
 
-async def _run_automations(session: SlashSession, args: str) -> str:
-    return await session.slash_automations(args.strip())
-
-
 def _run_model(session: SlashSession, args: str) -> str:
     return session.slash_model(args.strip())
 
@@ -1156,13 +1150,6 @@ def create_slash_registry(
     registry.register(SlashCommand("status", _run_status, "show session status"))
     registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
-    registry.register(
-        SlashCommand(
-            "automations",
-            _run_automations,
-            "inspect or approve automation drafts",
-        )
-    )
     registry.register(
         SlashCommand("model", _run_model, "pick a model or switch to one: /model [name]")
     )

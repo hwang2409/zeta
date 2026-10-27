@@ -7,7 +7,6 @@ from pathlib import Path
 import httpx
 import pytest
 
-from zeta.automations.delivery import SlackDelivery
 from zeta.core.abort import AbortSignal
 from zeta.mcp import (
     MCPConfig,
@@ -217,22 +216,6 @@ async def test_mcp_filtered_tool_call_fails_closed(
         assert client.calls == []
         unknown = await registry.execute(ToolCall("old", "files__write_file", {}))
         assert unknown["isError"] is True
-    finally:
-        await mount.close()
-
-
-@pytest.mark.asyncio
-async def test_mcp_automation_resolve_fails_closed_for_filtered_tool(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = MCPServerConfig(
-        "slack", "stdio", "unused", allowed_tools=("slack_send_message",)
-    )
-    _registry, mount, client = await _mount(monkeypatch, tmp_path, config)
-    try:
-        with pytest.raises(ValueError, match="filtered"):
-            await SlackDelivery(mount).resolve("slack:@austin")
-        assert client.calls == []
     finally:
         await mount.close()
 

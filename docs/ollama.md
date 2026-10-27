@@ -42,7 +42,7 @@ provider = "ollama"
 model = "qwen3:4b-instruct"
 ```
 
-Ollama automations are not yet supported; Ollama `-p`/`--print` headless runs,
+Ollama `-p`/`--print` headless runs,
 `--format json` output, interactive TUI, and `zeta serve` sessions are supported.
 Image input is intentionally unsupported. Native thinking is shown live in the
 TUI, but is not stored or replayed; headless/print output excludes it. Ollama

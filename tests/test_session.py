@@ -716,44 +716,41 @@ def test_status_lists_private_instructions_file(
     assert f"context_files: {private.resolve()}" in output
 
 
-def test_resume_renders_legacy_computer_tool_messages(
+def test_resume_renders_removed_automation_session_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Removed tools remain readable through the generic transcript card."""
+    """Removed tools and receipt metadata remain readable after retirement."""
 
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
     opened = create_app(_args())
-    call = ToolCall("legacy-computer-call", "computer__click", {"x": 12, "y": 34})
-    opened.loop.store.append_message(
-        Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
-    )
-    opened.loop.store.append_message(
-        Message(
-            MessageRole.TOOL_RESULT,
-            tool_result=ToolResult(call.id, "legacy click completed"),
-        )
-    )
     session_id = opened.loop.store.session_id
+    transcript_path = opened.loop.store.path
     opened.loop.store.close()
+    fixture = Path(__file__).parent / "fixtures" / "automation-session-compat.jsonl"
+    with transcript_path.open("ab") as transcript:
+        transcript.write(fixture.read_bytes())
 
     resumed = create_app(_args("--resume", session_id))
     capsys.readouterr()
     resumed._rebuild_transcript()
     rendered = Text.from_ansi(capsys.readouterr().out).plain
 
-    assert "computer__click" in rendered
-    assert "x=12" in rendered
-    assert "legacy click completed" in rendered
-    results = [
-        message.tool_result.content
-        for message in resumed.loop.store.messages()
-        if message.tool_result
-    ]
-    assert results == ["legacy click completed"]
+    assert "automation" in rendered
+    assert "action=list" in rendered
+    assert "No automations found." in rendered
+    assert "Automation interrupted; not automatically replayed." in rendered
+    assert "saved automation prompt" in rendered
+    messages = resumed.loop.store.messages()
+    assert any(
+        message.metadata.get("response_state") == "synthetic" for message in messages
+    )
+    assert "automation" not in resumed.loop.tool_registry.registered_names
+    assert MessageOrigin("automation_prompt") is MessageOrigin.AUTOMATION_PROMPT
+    assert MessageOrigin("automation_receipt") is MessageOrigin.AUTOMATION_RECEIPT
 
 
 def test_resume_rebuilds_default_context_from_stored_directory(

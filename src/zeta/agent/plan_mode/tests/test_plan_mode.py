@@ -151,7 +151,6 @@ def test_plan_mode_wraps_and_restores_the_system_prompt(tmp_path: Path) -> None:
     assert "deliver" in text
     # ZETA-65 deleted the approval-gated exit, so the plan-mode preamble must
     # never tell the model to seek approval. Scope this to the preamble: the
-    # identity block legitimately says "approve" about arming automations, and
     # asserting over the whole composed prompt made unrelated prompt edits fail.
     assert "approve" not in PLAN_MODE_PREAMBLE
     loop.set_plan_mode(False)

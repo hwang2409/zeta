@@ -2599,6 +2599,65 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_serve_resume_renders_removed_automation_session_fixture(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    opened = await asyncio.to_thread(
+        lambda: manager.create(provider="codex", model="offline", cwd=tmp_path)
+    )
+    session_id = opened.metadata.session_id
+    transcript_path = opened.store.path
+    opened.store.close()
+    fixture = Path(__file__).parent / "fixtures" / "automation-session-compat.jsonl"
+    with transcript_path.open("ab") as transcript:
+        transcript.write(fixture.read_bytes())
+
+    server = ZetaServer(
+        home=tmp_path,
+        provider="codex",
+        port=0,
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    await server.runtime.resume_session(session_id)
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        history = (
+            await _request(
+                reader,
+                writer,
+                2,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        call = next(
+            block["tool_call"]
+            for message in history
+            for block in message["content"]
+            if block["type"] == "tool_use"
+        )
+        assert call["name"] == "automation"
+        assert any(
+            message["tool_result"]
+            and message["tool_result"]["content"] == "No automations found."
+            for message in history
+        )
+        assert any(
+            block.get("text")
+            == "Automation interrupted; not automatically replayed."
+            for message in history
+            for block in message["content"]
+        )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_resume_renders_legacy_browser_tool_messages(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="offline", cwd=tmp_path))

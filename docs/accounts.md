@@ -68,8 +68,8 @@ error, and no bootstrap token is copied into metadata or usage state.
 
 ## identity and storage
 
-an `AccountId` is the immutable `(provider, id)` stored by sessions and
-automations. provider is `anthropic` or `codex`. the id and mutable display label
+an `AccountId` is the immutable `(provider, id)` stored by sessions. provider is
+`anthropic` or `codex`. the id and mutable display label
 use lower-case, case-insensitive slugs of 1–32 ascii letters, digits, `_`, or
 `-`; `.` and `..` are invalid. rows display `provider:label`. labels are unique
 per provider across both ids and labels, so a reference is never ambiguous.
@@ -110,9 +110,8 @@ from the label when the account is created.
 
 `zeta accounts rename <provider>:<id-or-label> <new-label>` and `n` in
 `/accounts` change only the registry label. credential and lock directories,
-global defaults, saved session pins, and approved automation revisions keep the
-same immutable `AccountId`. command arguments and `--account` accept either the
-id or label.
+global defaults and saved session pins keep the same immutable `AccountId`.
+command arguments and `--account` accept either the id or label.
 
 ## crash-safe legacy migration
 
@@ -307,8 +306,7 @@ longer exists at load, fail with a clear error that names `/accounts`; do not
 silently choose another account. a resumed pre-rollout session therefore pins
 the default at its first load after rollout. children and session-owned
 background memory calls pin the session selection at creation; later
-parent/default changes never retarget them. automations pin the approved
-account and require re-approval to change it. serve methods require `session_id`
+parent/default changes never retarget them. serve methods require `session_id`
 for a switch; list is account-scoped and never changes selection.
 
 switching persists selection, the native-context boundary, and the per-session
@@ -322,9 +320,9 @@ restore the prior backend and selection; do not report success. test resume and
 `a → b → a`.
 
 all backend creation asks one session account context with explicit auth mode: session account
-for interactive, child, automation, and memory calls; the global-default fallback
+for interactive, child, and memory calls; the global-default fallback
 follows the session-load rule above; API-key mode only when explicitly enabled.
-add attribution tests for primary, child, automation, and memory calls, including
+add attribution tests for primary, child, and memory calls, including
 resume of pre-rollout metadata without a saved selection.
 
 ## exhaustion recovery
