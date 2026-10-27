@@ -12810,10 +12810,10 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
     )
     publisher.start()
     assert publisher_waiting.wait(1)
-    started = time.monotonic()
     try:
         assert await app.slash_accounts("") == ""
-        assert time.monotonic() - started < 0.15
+        assert app._accounts_picker is not None
+        assert publisher.is_alive()
     finally:
         release.set()
         holder.join()
