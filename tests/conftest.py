@@ -428,6 +428,7 @@ _FD_PEAK_OPEN = 0
 _FD_PEAK_NODE = "none"
 _FD_MONITOR_STOP: threading.Event | None = None
 _FD_MONITOR: threading.Thread | None = None
+_FD_SAMPLE_LOCK = threading.Lock()
 _OS_LISTDIR = os.listdir
 _OS_FSTAT = os.fstat
 
@@ -486,12 +487,16 @@ def _fd_numbers() -> list[int]:
 def _monitor_fd_peak(stop: threading.Event) -> None:
     global _FD_PEAK_MAX, _FD_PEAK_OPEN, _FD_PEAK_NODE
     while not stop.wait(0.02):
-        descriptors = _fd_numbers()
-        highest = max(descriptors, default=-1)
-        if highest > _FD_PEAK_MAX:
-            _FD_PEAK_MAX = highest
-            _FD_PEAK_OPEN = len(descriptors)
-            _FD_PEAK_NODE = _FD_CURRENT_NODE
+        with _FD_SAMPLE_LOCK:
+            # A /proc scan owns one transient fd, so never perturb fd-count tests.
+            if "fd" in _FD_CURRENT_NODE.lower():
+                continue
+            descriptors = _fd_numbers()
+            highest = max(descriptors, default=-1)
+            if highest > _FD_PEAK_MAX:
+                _FD_PEAK_MAX = highest
+                _FD_PEAK_OPEN = len(descriptors)
+                _FD_PEAK_NODE = _FD_CURRENT_NODE
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -513,13 +518,15 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     del nextitem
     global _FD_CURRENT_NODE, _FD_MAX, _FD_OPEN_MAX
     # Stable pytest/xdist descriptors and session fixtures predate this snapshot.
-    before = _open_file_descriptors()
+    with _FD_SAMPLE_LOCK:
+        _FD_CURRENT_NODE = item.nodeid
+        before = _open_file_descriptors()
     _FD_MAX = max((_FD_MAX, *before), default=-1)
     _FD_OPEN_MAX = max(_FD_OPEN_MAX, len(before))
-    _FD_CURRENT_NODE = item.nodeid
     yield
-    _FD_CURRENT_NODE = "between-tests"
-    after = _open_file_descriptors()
+    with _FD_SAMPLE_LOCK:
+        _FD_CURRENT_NODE = "between-tests"
+        after = _open_file_descriptors()
     _FD_MAX = max((_FD_MAX, *after), default=-1)
     _FD_OPEN_MAX = max(_FD_OPEN_MAX, len(after))
     _FD_RETAINED_COUNTS.append(len(after))
