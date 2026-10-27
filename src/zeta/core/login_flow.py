@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import errno
 import http.server
 import queue
@@ -20,25 +21,58 @@ import httpx
 TokenT = TypeVar("TokenT")
 
 
-class _LoginCancellation(threading.Event):
-    def __init__(self, task: asyncio.Task[object]) -> None:
-        super().__init__()
-        self._task = task
-        self._publication_started = False
-        self._state_lock = threading.Lock()
+class _PublicationArbiter:
+    """Move the credential worker's final publication decision onto the loop."""
 
-    @property
-    def publication_started(self) -> bool:
-        with self._state_lock:
-            return self._publication_started
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        task: asyncio.Task[object],
+        commit: Callable[[], bool],
+    ) -> None:
+        self._loop = loop
+        self._task = task
+        self._commit = commit
+        self.cancel_requested = False
+        self.committed = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
 
     def is_set(self) -> bool:
-        with self._state_lock:
-            # Task.cancel() records the request before CancelledError reaches this task.
-            if self._task.cancelling() > 0 or super().is_set():
-                return True
-            self._publication_started = True
-            return False
+        response: concurrent.futures.Future[bool] = concurrent.futures.Future()
+        self._loop.call_soon_threadsafe(self._decide, response)
+        return not response.result()
+
+    def _decide(self, response: concurrent.futures.Future[bool]) -> None:
+        allowed = (
+            not self.cancel_requested
+            and self._task.cancelling() == 0
+            and self._commit()
+        )
+        self.committed = allowed
+        response.set_result(allowed)
+
+
+async def _wait_bounded_work(
+    task: asyncio.Task[object],
+    on_cancel: Callable[[], None] | None = None,
+) -> bool:
+    """Wait for bounded worker work and report whether cancellation arrived."""
+
+    cancelled = False
+    current = asyncio.current_task()
+    assert current is not None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            if on_cancel is not None:
+                on_cancel()
+            current.uncancel()
+    task.result()
+    return cancelled
 
 
 class CredentialSink(Protocol[TokenT]):
@@ -197,6 +231,7 @@ async def run_login(
     output: TextIO | None = None,
     on_authorization_url: Callable[[str], None] | None = None,
     publication_timeout_seconds: float | None = None,
+    on_publication_commit: Callable[[], bool] | None = None,
 ) -> str | None:
     """Run one provider login and return its optional account handle."""
 
@@ -205,7 +240,7 @@ async def run_login(
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
     assert task is not None
-    cancel_publication: _LoginCancellation | None = None
+    publication_arbiter: _PublicationArbiter | None = None
 
     def notify() -> None:
         loop.call_soon_threadsafe(callback_ready.set)
@@ -257,26 +292,22 @@ async def run_login(
         if publication_timeout_seconds is None:
             await asyncio.to_thread(provider.credential_store.save, tokens)
         else:
-            cancel_publication = _LoginCancellation(task)
+            publication_arbiter = _PublicationArbiter(
+                loop, task, on_publication_commit or (lambda: True)
+            )
             publication = asyncio.create_task(
                 asyncio.to_thread(
                     provider.credential_store.save,
                     tokens,
                     lock_timeout=publication_timeout_seconds,
-                    cancel_event=cancel_publication,
+                    cancel_event=publication_arbiter,
                 )
             )
-            try:
-                await asyncio.shield(publication)
-            except asyncio.CancelledError:
-                cancel_publication.set()
-                await asyncio.shield(
-                    asyncio.gather(publication, return_exceptions=True)
-                )
-                if not cancel_publication.publication_started:
-                    raise
-                task.uncancel()
-                publication.result()
+            cancelled = await _wait_bounded_work(
+                publication, publication_arbiter.cancel
+            )
+            if cancelled and not publication_arbiter.committed:
+                raise asyncio.CancelledError
         return provider.token_handle(tokens)
     finally:
         # Cancellation can arrive after exchange, while shutdown is running.
@@ -287,13 +318,11 @@ async def run_login(
             server_thread.join(timeout=2)
 
         cleanup = asyncio.create_task(asyncio.to_thread(close_listener))
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await cleanup
-            if cancel_publication is None or not cancel_publication.publication_started:
-                raise
-            task.uncancel()
+        cancelled = await _wait_bounded_work(cleanup)
+        if cancelled and (
+            publication_arbiter is None or not publication_arbiter.committed
+        ):
+            raise asyncio.CancelledError
 
 
 __all__ = ["LoginError", "LoginPortInUseError", "LoginProvider", "run_login"]

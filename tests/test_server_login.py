@@ -412,6 +412,53 @@ async def test_login_action_uses_failed_provider_before_model_revert(tmp_path, v
         await _close(server, writer)
 
 
+async def test_cancel_during_provider_lock_release_reports_success(
+    tmp_path, monkeypatch
+):
+    expected = OAuthTokens("access", "refresh", 4_000_000_000)
+    captured = {}
+    release_entered = threading.Event()
+    release_exit = threading.Event()
+
+    class LoginLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            release_entered.set()
+            assert release_exit.wait(3)
+
+    def provider_login_lock(_self, _provider):
+        return LoginLock()
+
+    def build(state, _challenge, redirect):
+        captured.update(state=state, redirect=redirect)
+        return "https://authorize.invalid/"
+
+    async def exchange(*_args):
+        return expected
+
+    monkeypatch.setattr(AccountStore, "provider_login_lock", provider_login_lock)
+    monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
+    monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
+    server, reader, writer, _ = await connect(tmp_path)
+    try:
+        assert (await rpc(reader, writer, "login_start", provider="claude"))["result"]["state"] == "pending"
+        await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]})
+        assert await asyncio.to_thread(release_entered.wait, 3)
+
+        task = server._client.logins.tasks["claude"]
+        task.cancel()
+        release_exit.set()
+
+        assert (await rpc(reader, writer, "login_cancel", provider="claude"))["result"] == {"state": "succeeded"}
+        saved = await asyncio.to_thread(credential_store, "claude", home=server.home)
+        assert await asyncio.to_thread(saved.read) == expected
+    finally:
+        release_exit.set()
+        await _close(server, writer)
+
+
 async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, monkeypatch):
     import threading
 
