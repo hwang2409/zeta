@@ -310,11 +310,15 @@ async def test_serve_login_decision_expiry_reports_failure_and_releases_locks(
             asyncio.to_thread(provider.credential_store.read), 1
         ) is None
 
-        def acquire_provider_lock() -> None:
+        def acquire_locks() -> None:
+            with provider.credential_store.store.credential_guard(
+                provider.credential_store.account, timeout=0.5
+            ):
+                pass
             with AccountStore(home).provider_login_lock("anthropic"):
                 pass
 
-        await asyncio.wait_for(asyncio.to_thread(acquire_provider_lock), 1)
+        await asyncio.wait_for(asyncio.to_thread(acquire_locks), 1)
     finally:
         await _close(server, writer)
 
