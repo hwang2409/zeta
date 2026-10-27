@@ -362,7 +362,8 @@ class BackgroundAgentOwner:
     async def wait_for_shutdown(self, timeout: float) -> tuple[str, ...]:
         """Join the agent tree, then force remaining work after the deadline."""
 
-        waiter = asyncio.create_task(self.wait())
+        caller = asyncio.current_task()
+        waiter = asyncio.create_task(self.wait(excluding=caller))
         done, _ = await asyncio.wait({waiter}, timeout=timeout)
         if done:
             await asyncio.gather(waiter, return_exceptions=True)
@@ -373,13 +374,16 @@ class BackgroundAgentOwner:
             ", ".join(live) or "unknown",
         )
         waiter.cancel()
-        await self._force_shutdown(timeout)
+        await self._force_shutdown(timeout, excluding=caller)
         return live
 
-    async def _force_shutdown(self, timeout: float) -> None:
+    async def _force_shutdown(
+        self, timeout: float, *, excluding: asyncio.Task[Any] | None
+    ) -> None:
         tasks = {
-            *self._cancellation_tasks,
-            *self._watchers.values(),
+            task
+            for task in (*self._cancellation_tasks, *self._watchers.values())
+            if task is not excluding
         }
         for task in tasks:
             task.cancel()
@@ -412,8 +416,8 @@ class BackgroundAgentOwner:
             await asyncio.gather(*close_tasks, return_exceptions=False)
             self._store_close_tasks.difference_update(close_tasks)
 
-    async def wait(self) -> None:
-        current = asyncio.current_task()
+    async def wait(self, *, excluding: asyncio.Task[Any] | None = None) -> None:
+        current = excluding or asyncio.current_task()
         while True:
             for instance_id, watcher in tuple(self._watchers.items()):
                 if watcher.done():

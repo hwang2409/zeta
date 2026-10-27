@@ -120,9 +120,6 @@ from .project_inbox import ProjectInboxNotificationMixin
 from .skill_refresh import RuntimePrompt, SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 
-# Match the existing delivery-shutdown budget: both operations are local cleanup.
-_AGENT_SHUTDOWN_TIMEOUT_SECONDS = SHUTDOWN_DELIVERY_TIMEOUT_SECONDS
-
 
 def _sanitize_account_message(message: Message) -> Message:
     content = [
@@ -516,7 +513,7 @@ class AgentLoop(
                 await asyncio.gather(*watchers, return_exceptions=True)
             if cancel_background and self.agent_depth == 0:
                 await self._background_owner.wait_for_shutdown(
-                    _AGENT_SHUTDOWN_TIMEOUT_SECONDS
+                    SHUTDOWN_DELIVERY_TIMEOUT_SECONDS
                 )
             tracked_tasks = tuple(
                 task
