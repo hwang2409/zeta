@@ -12517,6 +12517,8 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     owner = BackgroundAgentOwner(parent_store)
     watcher = asyncio.create_task(asyncio.Event().wait())
     release = asyncio.Event()
+    wait_started = asyncio.Event()
+    wait_gate = asyncio.Event()
     fence = TerminalTransitionFence(child_store)
     attempts = 0
 
@@ -12532,13 +12534,29 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
 
     owner.register("root:1", cancel, watcher)
     registry._agent_owner = owner
-    monkeypatch.setattr(agent_background_module, "_AGENT_CANCEL_CONFIRM_TIMEOUT", 0.01)
+    original_wait = agent_background_module.asyncio.wait
+    first_wait = True
+
+    async def controlled_wait(awaitables, *, timeout=None):
+        nonlocal first_wait
+        if first_wait:
+            first_wait = False
+            assert timeout == agent_background_module._AGENT_CANCEL_CONFIRM_TIMEOUT
+            wait_started.set()
+            await wait_gate.wait()
+            return set(), set(awaitables)
+        return await original_wait(awaitables, timeout=timeout)
+
+    monkeypatch.setattr(agent_background_module.asyncio, "wait", controlled_wait)
     monkeypatch.setattr(
         "zeta.tools.agent._read_agent_status", lambda _: [{"handle": "root:1"}]
     )
     try:
         call = ToolCall("cancel-1", "agent_cancel", {"handle": "root:1"})
-        unconfirmed = await registry.execute(call)
+        pending = asyncio.create_task(registry.execute(call))
+        await wait_started.wait()
+        wait_gate.set()
+        unconfirmed = await pending
         assert unconfirmed["isError"] is True
         assert unconfirmed["structuredContent"]["status"] == "cancellation_unconfirmed"
         assert "not confirmed" in unconfirmed["content"][0]["text"]
