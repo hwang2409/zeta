@@ -3521,9 +3521,17 @@ async def test_close_awaits_bounded_critical_fallback_and_leaves_recoverable_mar
     child.close()
     loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
     owner = loop._background_owner
-    watcher = asyncio.create_task(
-        _finish_after_cancellation(owner, "root:1", delay=0.04)
-    )
+
+    async def watcher_with_bounded_hung_step() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.Event().wait(), timeout=0.04)
+        finally:
+            owner.unregister("root:1")
+
+    watcher = asyncio.create_task(watcher_with_bounded_hung_step())
     owner.register("root:1", lambda: None, watcher, description="blocked fsync")
     await asyncio.sleep(0)
     monkeypatch.setattr(agent_loop_module, "SHUTDOWN_DELIVERY_TIMEOUT_SECONDS", 0.01)
