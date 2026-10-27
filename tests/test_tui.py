@@ -59,7 +59,7 @@ from tests.support.credentials import (
 )
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.notification_fixtures import notification_payloads
-from tests.support.tui_render import render_full_screen
+from tests.support.tui_render import render_full_screen as _render_full_screen
 from zeta.accounts import AccountId, AccountStore, AccountUsage, SessionAccountContext
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
@@ -103,6 +103,16 @@ from zeta.tui.composer import (
     parse_input,
 )
 from zeta.tui.slash_handlers.accounts_picker import AccountsPicker
+
+
+def render_full_screen(
+    session: FullScreenPromptSession, width: int, height: int = 24
+) -> Screen:
+    session.app.output = SimpleNamespace(
+        get_size=lambda: Size(rows=height, columns=width),
+    )
+    return _render_full_screen(session, width, height)
+
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -1093,7 +1103,8 @@ class AlwaysErrorBackend(CompletionBackend):
         yield StreamEvent(StreamEventType.MESSAGE_START)
         yield StreamEvent(
             StreamEventType.ERROR,
-            error=ErrorInfo("timeout", "provider timeout", status_code=400),
+            error=ErrorInfo("timeout", "provider timeout"),
+            data={"retry_after": 0.0},
         )
 
 
@@ -1117,7 +1128,8 @@ class WaitingFailureBackend(CompletionBackend):
         await self.release.wait()
         yield StreamEvent(
             StreamEventType.ERROR,
-            error=ErrorInfo("transport_error", "network disconnected", status_code=400),
+            error=ErrorInfo("transport_error", "network disconnected"),
+            data={"retry_after": 0.0},
         )
 
 
