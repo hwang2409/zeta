@@ -203,6 +203,9 @@ async def run_login(
     verifier, challenge, state = build_pkce()
     callback_ready = asyncio.Event()
     loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    assert task is not None
+    cancel_publication: _LoginCancellation | None = None
 
     def notify() -> None:
         loop.call_soon_threadsafe(callback_ready.set)
@@ -254,8 +257,6 @@ async def run_login(
         if publication_timeout_seconds is None:
             await asyncio.to_thread(provider.credential_store.save, tokens)
         else:
-            task = asyncio.current_task()
-            assert task is not None
             cancel_publication = _LoginCancellation(task)
             publication = asyncio.create_task(
                 asyncio.to_thread(
@@ -290,7 +291,9 @@ async def run_login(
             await asyncio.shield(cleanup)
         except asyncio.CancelledError:
             await cleanup
-            raise
+            if cancel_publication is None or not cancel_publication.publication_started:
+                raise
+            task.uncancel()
 
 
 __all__ = ["LoginError", "LoginPortInUseError", "LoginProvider", "run_login"]

@@ -412,7 +412,7 @@ async def test_login_action_uses_failed_provider_before_model_revert(tmp_path, v
         await _close(server, writer)
 
 
-async def test_cancel_during_success_cleanup_waits_for_listener_close(tmp_path, monkeypatch):
+async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, monkeypatch):
     import threading
 
     from zeta.core import login_flow
@@ -449,13 +449,13 @@ async def test_cancel_during_success_cleanup_waits_for_listener_close(tmp_path, 
         await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]})
         await asyncio.wait_for(entered.wait(), 3)
         task = server._client.logins.tasks["claude"]
-        # Force cancellation at exactly the cleanup boundary, then exercise
-        # the RPC's second cancellation path while cleanup is still pending.
+        # Publication already committed, so cancellation cannot report that
+        # credentials were left unchanged.
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done()
         release.set()
-        assert (await rpc(reader, writer, "login_cancel", provider="claude"))["result"] == {"state": "cancelled"}
+        assert (await rpc(reader, writer, "login_cancel", provider="claude"))["result"] == {"state": "succeeded"}
         listener = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", urlsplit(captured["redirect"]).port)
         listener.close()
         await listener.wait_closed()
