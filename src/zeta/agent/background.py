@@ -141,11 +141,7 @@ class BackgroundAgentOwner:
         task.add_done_callback(self._cancellation_tasks.discard)
         return task
 
-    def create_cleanup_task(
-        self, awaitable: Awaitable[None]
-    ) -> asyncio.Task[None]:
-        """Keep critical child cleanup alive until it reaches a safe state."""
-
+    def create_cleanup_task(self, awaitable: Awaitable[None]) -> asyncio.Task[None]:
         task = asyncio.create_task(awaitable)
         self._cleanup_tasks.add(task)
         task.add_done_callback(self._cleanup_tasks.discard)
@@ -388,10 +384,7 @@ class BackgroundAgentOwner:
         return live
 
     async def _force_shutdown(
-        self,
-        waiter: asyncio.Task[None],
-        *,
-        excluding: asyncio.Task[Any] | None,
+        self, waiter: asyncio.Task[None], *, excluding: asyncio.Task[Any] | None
     ) -> None:
         waits = {
             task
@@ -402,9 +395,7 @@ class BackgroundAgentOwner:
             task.cancel()
         if waits or self._cleanup_tasks:
             await asyncio.gather(
-                *waits,
-                *tuple(self._cleanup_tasks),
-                return_exceptions=True,
+                *waits, *tuple(self._cleanup_tasks), return_exceptions=True
             )
         await asyncio.gather(waiter, return_exceptions=True)
 
