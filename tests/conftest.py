@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import uuid
 from collections.abc import Generator
 from contextlib import ExitStack
 from dataclasses import dataclass
+from functools import wraps
 from hashlib import sha256
 from pathlib import Path
 from runpy import run_path
@@ -16,7 +18,7 @@ import httpx
 import pytest
 from rich.console import Console
 
-_TEST_SITE_PACKAGES = Path(__file__).parent
+_TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 
@@ -496,6 +498,35 @@ def pytest_testnodedown(node, error) -> None:
     summary = node.workeroutput.get("fd_summary")
     if summary is not None:
         print(summary, flush=True)
+
+
+@pytest.fixture
+async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
+    """Close AgentLoops whose constructor caller is test code, never src/zeta."""
+    from zeta.runtime.loop import AgentLoop
+    from zeta.tools import ToolRegistry
+
+    loops: list[AgentLoop] = []
+    loop_init = AgentLoop.__init__
+    loop_close = AgentLoop.close
+    registry_close = ToolRegistry.close
+
+    @wraps(loop_init)
+    def tracked_init(loop, *args, **kwargs):
+        loop_init(loop, *args, **kwargs)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if caller.is_relative_to(_TEST_SITE_PACKAGES):
+            loops.append(loop)
+
+    monkeypatch.setattr(AgentLoop, "__init__", tracked_init)
+    yield
+    for loop in reversed(loops):
+        if not loop._closed:
+            await loop_close(loop)
+        if not loop.tool_registry._closed:
+            await registry_close(loop.tool_registry)
+        if not loop.store._closed:
+            loop.store.close()
 
 
 @pytest.fixture(autouse=True)
