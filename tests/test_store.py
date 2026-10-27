@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.support.notification_fixtures import notification_payloads
 from zeta.core import agent_state
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
@@ -45,60 +46,7 @@ def message(role: MessageRole, text: str) -> Message:
 
 
 def test_every_notification_kind_has_a_validator() -> None:
-    payloads = {
-        "agent_completion": {
-            "origin": "notification",
-            "kind": "agent_completion",
-            "child_instance_id": "root:1",
-            "child_session_path": "/sessions/root/agents/1",
-            "description": "worker",
-            "status": "completed",
-            "text": "done",
-        },
-        "child_idle": {
-            "origin": "notification",
-            "kind": "child_idle",
-            "child_instance_id": "root:1",
-            "child_session_path": "/sessions/root/agents/1",
-            "description": "worker",
-            "status": "child_idle",
-            "text": "waiting",
-        },
-        "task_exited": {
-            "origin": "notification",
-            "kind": "task_exited",
-            "task_id": "task-1",
-            "headline": "command finished",
-            "exit_code": 0,
-        },
-        "project_inbox": {
-            "origin": "notification",
-            "kind": "project_inbox",
-            "status": "new",
-            "project_id": "project-1",
-            "message_ids": ["message-1"],
-            "text": "new project message",
-        },
-        "child_question": {
-            "origin": "notification",
-            "kind": "child_question",
-            "child_instance_id": "root:1",
-            "question_id": "question-1",
-            "description": "worker",
-            "status": "pending",
-            "question": "continue?",
-            "text": "worker asks a question",
-        },
-        "child_question_withdrawn": {
-            "origin": "notification",
-            "kind": "child_question_withdrawn",
-            "child_instance_id": "root:1",
-            "question_id": "question-1",
-            "description": "worker",
-            "status": "withdrawn",
-            "text": "question withdrawn",
-        },
-    }
+    payloads = notification_payloads()
 
     assert set(NOTIFICATION_VALIDATORS) == set(NOTIFICATION_KINDS) == set(payloads)
     for kind in NOTIFICATION_KINDS:

@@ -10,12 +10,12 @@ from prompt_toolkit.application.current import set_app
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
-from prompt_toolkit.layout.mouse_handlers import MouseHandlers
-from prompt_toolkit.layout.screen import Screen, WritePosition
+from prompt_toolkit.layout.screen import Screen
 from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.tui_render import render_full_screen
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -51,21 +51,6 @@ def _app(
     return app, session
 
 
-def _render(session: FullScreenPromptSession, width: int, height: int = 24) -> Screen:
-    screen = Screen(initial_width=width, initial_height=height)
-    with set_app(session.app):
-        session.layout.update_parents_relations()
-        session.layout.container.write_to_screen(
-            screen,
-            MouseHandlers(),
-            WritePosition(0, 0, width, height),
-            "",
-            False,
-            None,
-        )
-    return screen
-
-
 def _composer_rows(screen: Screen, width: int) -> list[int]:
     return [
         y
@@ -79,7 +64,7 @@ def _composer_rows(screen: Screen, width: int) -> list[int]:
 def _layout_metrics(
     session: FullScreenPromptSession, width: int
 ) -> tuple[int, int, int, int, bool]:
-    screen = _render(session, width)
+    screen = render_full_screen(session, width)
     content = session.layout.container.children[0].content
     bottom = content.children[1]
     footer_on_bottom = any(
@@ -138,7 +123,7 @@ async def test_completion_menu_stays_above_bottom_chrome_with_todos(
             insert_common_part=False,
             complete_event=CompleteEvent(completion_requested=True),
         )
-    screen = _render(session, 80, terminal_height)
+    screen = render_full_screen(session, 80, terminal_height)
     with set_app(session.app):
         screen.draw_all_floats()
 
@@ -195,7 +180,7 @@ async def test_composer_height_tracks_word_wrap(
     _, session = _app(tmp_path)
     session.default_buffer.set_document(Document("x" * 140))
 
-    rows = _composer_rows(_render(session, width), width)
+    rows = _composer_rows(render_full_screen(session, width), width)
 
     assert len(rows) == expected_rows
 
@@ -218,7 +203,7 @@ async def test_composer_fill_and_footer_share_terminal_edges(
     )
     with set_app(session.app):
         session.default_buffer.set_document(Document(input_text))
-    screen = _render(session, terminal_width)
+    screen = render_full_screen(session, terminal_width)
 
     composer_rows = _composer_rows(screen, terminal_width)
     assert len(composer_rows) == expected_rows
@@ -281,7 +266,7 @@ async def test_wide_cwd_footer_marker_reaches_composer_edge(
     cwd = tmp_path / "项目"
     cwd.mkdir()
     _, session = _app(tmp_path, cwd=cwd)
-    screen = _render(session, terminal_width)
+    screen = render_full_screen(session, terminal_width)
     footer_row = max(
         row
         for row in range(len(screen.data_buffer))
@@ -310,7 +295,7 @@ async def test_wide_status_does_not_overflow_footer(
     cwd.mkdir()
     app, session = _app(tmp_path, cwd=cwd)
     app.model = "😀" * 30
-    screen = _render(session, terminal_width)
+    screen = render_full_screen(session, terminal_width)
     footer_row = next(
         row
         for row in range(len(screen.data_buffer))
@@ -340,7 +325,7 @@ async def test_composer_height_shrinks_with_deleted_content(
     _, session = _app(tmp_path)
     session.default_buffer.set_document(Document(text))
 
-    rows = _composer_rows(_render(session, 80), 80)
+    rows = _composer_rows(render_full_screen(session, 80), 80)
 
     assert len(rows) == expected_rows
 
@@ -351,7 +336,7 @@ async def test_composer_height_caps_and_keeps_cursor_visible(tmp_path: Path) -> 
     text = " ".join(f"word{index}" for index in range(100))
     session.default_buffer.set_document(Document(text, cursor_position=len(text)))
 
-    screen = _render(session, 80)
+    screen = render_full_screen(session, 80)
     rows = _composer_rows(screen, 80)
     composer_window = next(
         window
@@ -364,7 +349,7 @@ async def test_composer_height_caps_and_keeps_cursor_visible(tmp_path: Path) -> 
     assert cursor.y in rows
 
     session.default_buffer.set_document(Document())
-    assert len(_composer_rows(_render(session, 80), 80)) == 1 + 2 * COMPOSER_PAD_Y
+    assert len(_composer_rows(render_full_screen(session, 80), 80)) == 1 + 2 * COMPOSER_PAD_Y
 
 
 @pytest.mark.asyncio
@@ -374,7 +359,7 @@ async def test_short_terminal_shrinks_multiline_composer(tmp_path: Path) -> None
     text = "\n".join(f"line {index}" for index in range(9))
     session.default_buffer.set_document(Document(text, cursor_position=len(text)))
 
-    screen = _render(session, 80, height=10)
+    screen = render_full_screen(session, 80, height=10)
     composer_rows = _composer_rows(screen, 80)
     composer_window = next(
         window
