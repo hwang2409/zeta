@@ -69,24 +69,41 @@ async def finish_frame_write(codec: FrameCodec, writer: Any, payload: bytes) -> 
 
 
 async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> bool:
+    """Wait at most two grace periods; abort the transport after the first."""
+
     loop = asyncio.get_running_loop()
     deadline = loop.time() + FRAME_CANCEL_GRACE
     aborted = False
     while not task.done():
         remaining = deadline - loop.time()
-        if remaining <= 0 and not aborted:
+        if remaining <= 0:
+            if aborted:
+                # The write ignored abort and cancellation; stop waiting but
+                # keep ownership so its outcome is still observed.
+                task.add_done_callback(_observe_write)
+                return False
             aborted = True
+            deadline = loop.time() + FRAME_CANCEL_GRACE
             transport = getattr(writer, "transport", None)
             if transport is not None:
                 transport.abort()
             task.cancel()
+            continue
         try:
-            await asyncio.wait({task}, timeout=None if aborted else remaining)
+            await asyncio.wait({task}, timeout=remaining)
         except asyncio.CancelledError:
             continue
-    if task.cancelled() or task.exception() is not None:
+    if task.cancelled():
         return False
+    error = task.exception()
+    if error is not None:
+        raise error
     return not aborted and task.result()
+
+
+def _observe_write(task: asyncio.Future[bool]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 class ProtocolError(Exception):

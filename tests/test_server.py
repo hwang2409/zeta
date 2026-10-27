@@ -249,6 +249,82 @@ async def test_canceled_write_to_stalled_client_aborts_within_grace(
     assert sent == ["sub_agent_receipt"]
 
 
+@pytest.mark.asyncio
+async def test_canceled_write_ignoring_abort_and_cancel_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.05)
+    release = asyncio.Event()
+
+    class StubbornWriter:
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+    started = asyncio.Event()
+    codec = protocol_module.FrameCodec()
+    original = codec.write
+
+    async def write(writer: object, payload: bytes) -> bool:
+        started.set()
+        return await original(writer, payload)
+
+    codec.write = write  # type: ignore[method-assign]
+    outcomes: list[bool] = []
+
+    async def publish() -> None:
+        try:
+            await protocol_module.finish_frame_write(codec, StubbornWriter(), b"{}")
+        except protocol_module.FrameWriteCancelled as cancelled:
+            outcomes.append(cancelled.written)
+            raise
+
+    task = asyncio.create_task(publish())
+    try:
+        await started.wait()
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert done == {task}
+        assert outcomes == [False]
+    finally:
+        release.set()
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_canceled_write_surfaces_unexpected_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 1.0)
+    fail = asyncio.Event()
+
+    class FailingWriter:
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            await fail.wait()
+            raise RuntimeError("codec bug")
+
+    task = asyncio.create_task(
+        protocol_module.finish_frame_write(
+            protocol_module.FrameCodec(), FailingWriter(), b"{}"
+        )
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    fail.set()
+    with pytest.raises(RuntimeError, match="codec bug"):
+        await asyncio.wait_for(task, 2)
+
+
 def test_serve_maps_account_state_unknown() -> None:
     assert (
         STREAM_EVENT_WIRE_EVENTS[StreamEventType.ACCOUNT_STATE_UNKNOWN]
