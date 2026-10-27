@@ -384,16 +384,19 @@ class BackgroundAgentOwner:
             "agent shutdown timed out with live children: %s",
             ", ".join(live) or "unknown",
         )
-        waiter.cancel()
-        await self._force_shutdown(excluding=caller)
-        await asyncio.gather(waiter, return_exceptions=True)
+        await self._force_shutdown(waiter, excluding=caller)
         return live
 
     async def _force_shutdown(
-        self, *, excluding: asyncio.Task[Any] | None
+        self,
+        waiter: asyncio.Task[None],
+        *,
+        excluding: asyncio.Task[Any] | None,
     ) -> None:
         waits = {
-            task for task in self._cancellation_tasks if task is not excluding
+            task
+            for task in (*self._cancellation_tasks, *self._watchers.values())
+            if task is not excluding
         }
         for task in waits:
             task.cancel()
@@ -403,7 +406,7 @@ class BackgroundAgentOwner:
                 *tuple(self._cleanup_tasks),
                 return_exceptions=True,
             )
-        await self.wait(excluding=excluding)
+        await asyncio.gather(waiter, return_exceptions=True)
 
     @property
     def active_descriptions(self) -> tuple[str, ...]:
