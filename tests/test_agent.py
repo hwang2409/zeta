@@ -10625,10 +10625,23 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     loop.explicit_finish = True
     background_events: list[StreamEvent] = []
-    loop.set_background_event_sink(background_events.append)
+    terminal_published = asyncio.Event()
+
+    def collect_event(event: StreamEvent) -> None:
+        background_events.append(event)
+        if (
+            event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_call is not None
+            and event.tool_call.name == "agent"
+        ):
+            terminal_published.set()
+
+    loop.set_background_event_sink(collect_event)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     notification = await _wait_for_notification(store, "completed")
+    # Persistence precedes terminal-card publication, so synchronize on the sink too.
+    await asyncio.wait_for(terminal_published.wait(), timeout=2)
     terminal = next(
         event
         for event in background_events
@@ -12541,7 +12554,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
         nonlocal first_wait
         if first_wait:
             first_wait = False
-            assert timeout == agent_background_module._AGENT_CANCEL_CONFIRM_TIMEOUT
+            assert timeout == 1.0
             wait_started.set()
             await wait_gate.wait()
             return set(), set(awaitables)
