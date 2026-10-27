@@ -8,7 +8,13 @@ from pathlib import Path
 import httpx
 
 from ..accounts import AccountCredentialLockTimeoutError, AccountStore
-from ..core.login_flow import LoginError, LoginPortInUseError, run_login
+from ..core.login_flow import (
+    LoginError,
+    LoginPortInUseError,
+    LoginPublicationError,
+    _wait_bounded_work,
+    run_login,
+)
 from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
 from .protocol import ProtocolError
@@ -19,6 +25,29 @@ LOGIN_PUBLICATION_TIMEOUT_SECONDS = 60.0
 
 def failure(code: str, message: str) -> dict:
     return {"state": "failed", "error": {"code": code, "message": message}}
+
+
+class _LoginOperation:
+    def __init__(self) -> None:
+        self.phase = "pending"
+
+    @property
+    def committed(self) -> bool:
+        return self.phase == "committing"
+
+    def commit(self) -> bool:
+        if self.phase != "pending":
+            return False
+        self.phase = "committing"
+        return True
+
+    def cancel(self, task: asyncio.Task[dict]) -> None:
+        if self.phase == "pending":
+            self.phase = "cancelled"
+            task.cancel()
+
+    def finish(self, result: dict) -> None:
+        self.phase = result["state"]
 
 
 class Logins:
@@ -32,6 +61,7 @@ class Logins:
         self.home = home
         self.timeout = timeout
         self.tasks: dict[str, asyncio.Task[dict]] = {}
+        self.operations: dict[str, _LoginOperation] = {}
 
     def providers(self) -> dict:
         rows = []
@@ -55,8 +85,10 @@ class Logins:
             if task is not None and not task.done():
                 raise ProtocolError(-32005, "login is already pending", {"code": "login_in_progress"})
             url = asyncio.get_running_loop().create_future()
-            task = asyncio.create_task(self._run(provider, url))
+            operation = _LoginOperation()
+            task = asyncio.create_task(self._run(provider, url, operation))
             self.tasks[provider] = task
+            self.operations[provider] = operation
             await asyncio.wait((url, task), return_when=asyncio.FIRST_COMPLETED)
             if task.done():
                 return task.result()
@@ -64,30 +96,19 @@ class Logins:
         if task is None:
             return {"state": "idle"}
         if method == "login_cancel" and not task.done():
-            if not task.cancelling():
-                task.cancel()
+            self.operations[provider].cancel(task)
             await asyncio.gather(task, return_exceptions=True)
         if task.cancelled():
             return {"state": "cancelled"}
         return task.result() if task.done() else {"state": "pending"}
 
-    async def _run(self, provider: str, url: asyncio.Future[str]) -> dict:
-        login_provider = "anthropic" if provider == "claude" else provider
-        lock = AccountStore(self.home).provider_login_lock(login_provider)
-        locked = False
-        acquisition = asyncio.create_task(asyncio.to_thread(lock.__enter__))
+    async def _attempt(
+        self,
+        login_provider: str,
+        url: asyncio.Future[str],
+        operation: _LoginOperation,
+    ) -> dict:
         try:
-            try:
-                await asyncio.shield(acquisition)
-                locked = True
-            except asyncio.CancelledError:
-                result = (
-                    await asyncio.shield(
-                        asyncio.gather(acquisition, return_exceptions=True)
-                    )
-                )[0]
-                locked = not isinstance(result, BaseException)
-                raise
             login = await asyncio.to_thread(
                 build_login_provider, login_provider, self.home
             )
@@ -99,6 +120,7 @@ class Logins:
                     timeout_seconds=self.timeout + 1,
                     on_authorization_url=url.set_result,
                     publication_timeout_seconds=LOGIN_PUBLICATION_TIMEOUT_SECONDS,
+                    on_publication_commit=operation.commit,
                 )
             return {"state": "succeeded"}
         except TimeoutError:
@@ -108,6 +130,8 @@ class Logins:
                 "login_lock_timeout",
                 "Sign-in could not save credentials because the account is busy. Please try again.",
             )
+        except LoginPublicationError as exc:
+            return failure("login_save_failed", str(exc))
         except LoginPortInUseError as exc:
             provider_label = exc.provider.capitalize()
             return failure(
@@ -121,15 +145,50 @@ class Logins:
             # Provider responses can contain tokens or callback codes. Do not
             # forward exception text to the wire or transcript.
             return failure("login_failed", "Could not complete sign-in. Please try again.")
-        finally:
-            if locked:
-                await asyncio.shield(
-                    asyncio.to_thread(lock.__exit__, None, None, None)
-                )
+
+    async def _run(
+        self,
+        provider: str,
+        url: asyncio.Future[str],
+        operation: _LoginOperation | None = None,
+    ) -> dict:
+        operation = operation or _LoginOperation()
+        login_provider = "anthropic" if provider == "claude" else provider
+        lock = AccountStore(self.home).provider_login_lock(login_provider)
+        locked = False
+        acquisition = asyncio.create_task(asyncio.to_thread(lock.__enter__))
+        cancelled = False
+        result: dict | None = None
+        try:
+            cancelled = await _wait_bounded_work(acquisition)
+            locked = acquisition.exception() is None
+            if cancelled:
+                raise asyncio.CancelledError
+            result = await self._attempt(login_provider, url, operation)
+        except asyncio.CancelledError:
+            cancelled = True
+        except (OSError, RuntimeError, ValueError, httpx.HTTPError):
+            result = failure(
+                "login_failed", "Could not complete sign-in. Please try again."
+            )
+
+        if locked:
+            release = asyncio.create_task(
+                asyncio.to_thread(lock.__exit__, None, None, None)
+            )
+            release_cancelled = await _wait_bounded_work(release)
+            cancelled = cancelled or release_cancelled
+        if cancelled and not operation.committed:
+            operation.phase = "cancelled"
+            raise asyncio.CancelledError
+        assert result is not None
+        operation.finish(result)
+        return result
 
     async def close(self) -> None:
-        for task in self.tasks.values():
-            if not task.done() and not task.cancelling():
-                task.cancel()
+        for provider, task in self.tasks.items():
+            if not task.done():
+                self.operations[provider].cancel(task)
         await asyncio.gather(*self.tasks.values(), return_exceptions=True)
         self.tasks.clear()
+        self.operations.clear()

@@ -650,6 +650,8 @@ def test_plan_mode_persists_and_restores_session_metadata(
         build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
     )
     assert resumed.loop.plan_mode is True
+    asyncio.run(app.close())
+    asyncio.run(resumed.close())
 
 
 # --- the shift+tab binding -------------------------------------------------

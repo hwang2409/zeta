@@ -473,6 +473,8 @@ async def test_tui_replay_scans_notifications_constant_times_and_batches_markers
     )
     assert await second_app._rebuild_transcript_async(batch_size=3)
     assert "notification child-" not in Text.from_ansi(second_output.getvalue()).plain
+    await second_app.close()
+    await app.close()
 
 
 @pytest.mark.asyncio

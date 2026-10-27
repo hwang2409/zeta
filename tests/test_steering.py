@@ -547,8 +547,7 @@ async def test_permanent_notification_failure_is_not_retried(
     assert timers == []
     assert app.console.file.getvalue().count("automatic retry stopped") == 1
     assert not app._submissions._notification_retry.pending
-    await app._submissions.close()
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -610,8 +609,7 @@ async def test_transient_notification_failure_is_retried(
     assert timers[0][0] == 1.0
     assert app.console.file.getvalue().count("retrying automatically") == 1
     assert app._submissions._notification_retry.pending
-    await app._submissions.close()
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio

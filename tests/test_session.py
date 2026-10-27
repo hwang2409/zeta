@@ -2060,31 +2060,46 @@ def test_resume_picker_matches_direct_resume(
     monkeypatch.chdir(tmp_path)
     first = create_app(_args())
     second = create_app(_args())
-    first.loop.store.append_message(
-        with_message_origin(Message(MessageRole.USER, [TextContent("first session")]), MessageOrigin.USER)
-    )
-    second.loop.store.append_message(
-        with_message_origin(Message(MessageRole.USER, [TextContent("second session")]), MessageOrigin.USER)
-    )
-    manager = SessionManager(home)
-    first_metadata = manager.open(first.loop.store.session_id).metadata
-    second_metadata = manager.open(second.loop.store.session_id).metadata
-    first_metadata.updated_at = "2020-01-01T00:00:00+00:00"
-    second_metadata.updated_at = "2030-01-01T00:00:00+00:00"
-    manager._write(first_metadata)
-    manager._write(second_metadata)
-    monkeypatch.setattr("builtins.input", lambda prompt: "2")
-
-    picked = create_app(
-        build_parser().parse_args(["--resume", "--provider", "codex"])
-    )
-    direct = create_app(
-        build_parser().parse_args(
-            ["--resume", first.loop.store.session_id, "--provider", "codex"]
+    picked = direct = None
+    try:
+        first.loop.store.append_message(
+            with_message_origin(Message(MessageRole.USER, [TextContent("first session")]), MessageOrigin.USER)
         )
-    )
+        second.loop.store.append_message(
+            with_message_origin(Message(MessageRole.USER, [TextContent("second session")]), MessageOrigin.USER)
+        )
+        manager = SessionManager(home)
+        first_opened = manager.open(first.loop.store.session_id)
+        second_opened = manager.open(second.loop.store.session_id)
+        try:
+            first_metadata = first_opened.metadata
+            second_metadata = second_opened.metadata
+            first_metadata.updated_at = "2020-01-01T00:00:00+00:00"
+            second_metadata.updated_at = "2030-01-01T00:00:00+00:00"
+            manager._write(first_metadata)
+            manager._write(second_metadata)
+        finally:
+            first_opened.store.close()
+            second_opened.store.close()
+        monkeypatch.setattr("builtins.input", lambda prompt: "2")
 
-    assert picked.loop.store.session_id == direct.loop.store.session_id
+        picked = create_app(
+            build_parser().parse_args(["--resume", "--provider", "codex"])
+        )
+        direct = create_app(
+            build_parser().parse_args(
+                ["--resume", first.loop.store.session_id, "--provider", "codex"]
+            )
+        )
+
+        assert picked.loop.store.session_id == direct.loop.store.session_id
+    finally:
+        async def close_apps() -> None:
+            for app in (direct, picked, second, first):
+                if app is not None:
+                    await app.close()
+
+        asyncio.run(close_apps())
 
 
 @pytest.mark.parametrize("terminal_width", [200, 120, 80, 40])
