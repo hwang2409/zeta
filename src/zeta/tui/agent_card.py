@@ -562,16 +562,10 @@ class AgentTranscriptControl(UIControl):
         if path != self._path:
             self._reset_rendered(path)
         if self._source is None or self._source.path != path:
-            replacement = asyncio.create_task(self._replace(path))
-            self._replacement_task = replacement
             try:
-                if not await replacement:
-                    return False
+                await self._replace_tracked(path)
             except (ConversationIntegrityError, OSError, ValueError):
                 return False
-            finally:
-                if self._replacement_task is replacement:
-                    self._replacement_task = None
         return await self.sync(path)
 
     async def sync(self, path: Path) -> bool:
@@ -651,14 +645,22 @@ class AgentTranscriptControl(UIControl):
         self._path = path
         self._snapshot = None
 
-    async def _replace(self, path: Path) -> bool:
+    async def _replace_tracked(self, path: Path) -> None:
+        replacement = asyncio.create_task(self._replace(path))
+        self._replacement_task = replacement
+        try:
+            await replacement
+        finally:
+            if self._replacement_task is replacement:
+                self._replacement_task = None
+
+    async def _replace(self, path: Path) -> None:
         previous, self._source = self._source, None
         source = await asyncio.to_thread(self._replace_source, path, previous)
         if self._closed:
             await asyncio.to_thread(source.close)
-            return False
-        self._source = source
-        return True
+        else:
+            self._source = source
 
     @staticmethod
     def _replace_source(
