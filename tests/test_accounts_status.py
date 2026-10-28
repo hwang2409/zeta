@@ -163,6 +163,58 @@ def test_accounts_status_missing_login_is_nonzero(
     assert status["access_token_expires_at"] is None
 
 
+def test_accounts_status_corrupt_login_keeps_json_valid_and_reports_other_accounts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    corrupt_path = _save_account(tmp_path, name="corrupt")
+    _save_account(tmp_path, name="healthy")
+    corrupt_path.write_text("{broken secret-file-content")
+
+    assert _run_json(tmp_path, monkeypatch) == 1
+    captured = capsys.readouterr()
+    statuses = json.loads(captured.out)
+    assert statuses == [
+        {
+            "provider": "codex",
+            "account": "corrupt",
+            "is_default": True,
+            "logged_in": False,
+            "access_token_expires_at": None,
+            "error": "invalid_credentials",
+        },
+        {
+            "provider": "codex",
+            "account": "healthy",
+            "is_default": False,
+            "logged_in": True,
+            "access_token_expires_at": "2286-11-20T17:46:39Z",
+        },
+    ]
+    assert "secret-file-content" not in captured.out + captured.err
+
+
+def test_accounts_status_corrupt_login_human_output_has_one_line_per_account(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    corrupt_path = _save_account(tmp_path, name="corrupt")
+    _save_account(tmp_path, name="healthy")
+    corrupt_path.write_text("{broken secret-file-content")
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+
+    assert cli_main.main(["accounts", "status"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "codex:corrupt  login invalid (invalid_credentials)  expires unknown  default",
+        "codex:healthy  logged in  expires 2286-11-20T17:46:39Z",
+    ]
+    assert "Traceback" not in captured.out + captured.err
+    assert "secret-file-content" not in captured.out + captured.err
+
+
 def test_accounts_status_provider_filter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

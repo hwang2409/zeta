@@ -471,12 +471,80 @@ def _expiry_iso(expires_at: float) -> str:
     return datetime.fromtimestamp(expires_at, UTC).isoformat().replace("+00:00", "Z")
 
 
+def _refresh_failure(exc: RuntimeError) -> dict[str, object]:
+    code = getattr(exc, "code", "http_error")
+    if code not in {"auth_error", "http_error"}:
+        code = "http_error"
+    return {
+        "ok": False,
+        "code": code,
+        "retryable": (
+            getattr(exc, "retryable", None) if code == "http_error" else None
+        ),
+    }
+
+
+async def _account_status(
+    store: AccountStore,
+    account: AccountId,
+    label: str,
+    default: AccountId | None,
+    *,
+    refresh: bool,
+    client: httpx.AsyncClient,
+) -> tuple[dict[str, object], bool]:
+    credentials = credential_store(
+        "claude" if account.provider == "anthropic" else account.provider,
+        home=store.home,
+        account=account,
+    )
+    assert credentials is not None
+    error = None
+    try:
+        tokens = await asyncio.to_thread(credentials.read)
+    except AccountError:
+        tokens = None
+        error = "invalid_credentials"
+    status: dict[str, object] = {
+        "provider": account.provider,
+        "account": label,
+        "is_default": default == account,
+        "logged_in": tokens is not None,
+        "access_token_expires_at": (
+            _expiry_iso(tokens.expires_at) if tokens is not None else None
+        ),
+    }
+    if error is not None:
+        status["error"] = error
+    if not refresh:
+        return status, tokens is not None
+    if tokens is None:
+        result: dict[str, object] = {
+            "ok": False,
+            "code": "auth_error",
+            "retryable": None,
+        }
+    else:
+        try:
+            await credentials.refresh_token(client)
+        except RuntimeError as exc:
+            result = _refresh_failure(exc)
+        else:
+            result = {"ok": True, "code": None, "retryable": None}
+            refreshed = await asyncio.to_thread(credentials.read)
+            status["access_token_expires_at"] = (
+                _expiry_iso(refreshed.expires_at) if refreshed is not None else None
+            )
+    status["refresh"] = result
+    return status, bool(result["ok"])
+
+
 async def _account_statuses(
     store: AccountStore, provider: str | None, *, refresh: bool
 ) -> tuple[list[dict[str, object]], bool]:
     accounts = [
         item
-        for item in await asyncio.to_thread(store.list_display)
+        for item in await asyncio.to_thread(store.list_catalog)
         if provider is None or item.account.provider == provider
     ]
     defaults = {
@@ -487,62 +555,16 @@ async def _account_statuses(
     all_ok = bool(accounts)
     async with httpx.AsyncClient() as client:
         for item in accounts:
-            account = item.account
-            credentials = credential_store(
-                "claude" if account.provider == "anthropic" else account.provider,
-                home=store.home,
-                account=account,
+            status, ok = await _account_status(
+                store,
+                item.account,
+                item.label,
+                defaults[item.account.provider],
+                refresh=refresh,
+                client=client,
             )
-            assert credentials is not None
-            try:
-                tokens = await asyncio.to_thread(credentials.read)
-            except AccountError:
-                tokens = None
-            status: dict[str, object] = {
-                "provider": account.provider,
-                "account": item.label,
-                "is_default": defaults[account.provider] == account,
-                "logged_in": tokens is not None,
-                "access_token_expires_at": (
-                    _expiry_iso(tokens.expires_at) if tokens is not None else None
-                ),
-            }
-            if tokens is None:
-                all_ok = False
-            if refresh:
-                if tokens is None:
-                    result: dict[str, object] = {
-                        "ok": False,
-                        "code": "auth_error",
-                        "retryable": None,
-                    }
-                else:
-                    try:
-                        await credentials.refresh_token(client)
-                    except RuntimeError as exc:  # provider errors are reduced to safe fields
-                        code = getattr(exc, "code", "http_error")
-                        if code not in {"auth_error", "http_error"}:
-                            code = "http_error"
-                        result = {
-                            "ok": False,
-                            "code": code,
-                            "retryable": (
-                                getattr(exc, "retryable", None)
-                                if code == "http_error"
-                                else None
-                            ),
-                        }
-                    else:
-                        result = {"ok": True, "code": None, "retryable": None}
-                        refreshed = await asyncio.to_thread(credentials.read)
-                        status["access_token_expires_at"] = (
-                            _expiry_iso(refreshed.expires_at)
-                            if refreshed is not None
-                            else None
-                        )
-                status["refresh"] = result
-                all_ok = all_ok and bool(result["ok"])
             statuses.append(status)
+            all_ok = all_ok and ok
     return statuses, all_ok
 
 
@@ -552,7 +574,10 @@ def _print_account_statuses(statuses: list[dict[str, object]], *, as_json: bool)
         return
     lines = []
     for status in statuses:
-        state = "logged in" if status["logged_in"] else "login missing"
+        if error := status.get("error"):
+            state = f"login invalid ({error})"
+        else:
+            state = "logged in" if status["logged_in"] else "login missing"
         default = "  default" if status["is_default"] else ""
         expiry = status["access_token_expires_at"] or "unknown"
         line = f"{status['provider']}:{status['account']}  {state}  expires {expiry}{default}"

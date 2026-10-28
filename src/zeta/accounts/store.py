@@ -223,6 +223,17 @@ class AccountStore:
                 for key in self._read_registry(home_fd)["accounts"]
             ]
 
+    def list_catalog(self) -> list[AccountDisplay]:
+        with self._home() as home_fd, self._registry_guard(home_fd):
+            value = self._read_registry(home_fd)
+            return [
+                AccountDisplay(
+                    AccountId(*key.split(":", 1)),
+                    value["labels"].get(key, key.split(":", 1)[1]),
+                )
+                for key in value["accounts"]
+            ]
+
     def list_display(self) -> list[AccountDisplay]:
         result = []
         with self._home() as home_fd:
