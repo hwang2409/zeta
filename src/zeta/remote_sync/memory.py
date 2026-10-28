@@ -34,6 +34,7 @@ from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
 from .errors import RemoteSyncError
 from .project_publish import (
+    _ATOMIC_TEMPORARY,
     ProjectPublicationError,
     materialize_project_transfer,
     normalize_project_digest,
@@ -1015,11 +1016,9 @@ def _valid_digest(value: object) -> bool:
 
 def _write_state(project: Path, peer: str, state: object) -> None:
     path = project / "sync" / f"{peer}.json"
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
+    _atomic_write_file(
+        (json.dumps(state, indent=2, sort_keys=True) + "\n").encode(), path
+    )
 
 
 def _keep_conflict(source: Path, destination: Path, name: str, *, peer: str) -> None:
@@ -1096,7 +1095,7 @@ def _atomic_write_file(payload: bytes, destination: Path) -> None:
 
 def _atomic_copy_file(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         info = os.fstat(source_fd)
@@ -1104,7 +1103,7 @@ def _atomic_copy_file(source: Path, destination: Path) -> None:
             raise RemoteSyncError("project snapshot file is unsafe")
         with (
             os.fdopen(source_fd, "rb", closefd=False) as source_stream,
-            temporary.open("wb") as destination_stream,
+            temporary.open("xb") as destination_stream,
         ):
             shutil.copyfileobj(source_stream, destination_stream)
         temporary.chmod(0o600)
@@ -1124,6 +1123,8 @@ def _copy_tree(source: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)
+        if _ATOMIC_TEMPORARY.fullmatch(path.name):
+            continue
         if path.is_symlink():
             raise RemoteSyncError(f"project snapshot contains a symlink: {relative}")
         target = destination / relative

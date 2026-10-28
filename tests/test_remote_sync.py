@@ -570,6 +570,33 @@ def test_opposite_direction_memory_syncs_do_not_deadlock(tmp_path: Path) -> None
             process.join(timeout=1)
 
 
+def test_project_snapshot_ignores_disappearing_atomic_temporary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source" / "p_test"
+    sync = source / "sync"
+    sync.mkdir(parents=True)
+    (source / "project.json").write_text("{}", encoding="utf-8")
+    expected_digest = project_digest(source)
+    temporary = sync / f".peer.json.{uuid.uuid4().hex}.tmp"
+    temporary.write_text("in flight\n", encoding="utf-8")
+    real_is_file = Path.is_file
+
+    def replace_after_snapshot_listing(path: Path) -> bool:
+        result = real_is_file(path)
+        if path == temporary:
+            temporary.replace(sync / "peer.json")
+        return result
+
+    monkeypatch.setattr(Path, "is_file", replace_after_snapshot_listing)
+
+    assert project_digest(source) == expected_digest
+    destination = tmp_path / "snapshot"
+    memory_module.copy_project_snapshot(source, destination)
+
+    assert not list(destination.rglob(".*.tmp"))
+
+
 def test_memory_pull_rejects_unknown_conflict_key_without_changing_local_record(
     tmp_path: Path,
 ) -> None:

@@ -37,6 +37,7 @@ MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions
 _MIRROR_TEMPORARY = re.compile(
     rf"\.{project_schema.KIND_KEY_PATTERN}\.md\.[0-9a-f]{{32}}\.tmp"
 )
+_ATOMIC_TEMPORARY = re.compile(r"^\..+\.(?:[0-9]+|[0-9a-f]{32})\.tmp$")
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
 _MAX_HISTORY = 128
@@ -309,7 +310,8 @@ def project_digest(root: Path) -> str:
     paths = (
         path
         for path in root.rglob("*")
-        if path.is_file()
+        if not _ATOMIC_TEMPORARY.fullmatch(path.name)
+        and path.is_file()
         and not _is_memory_mirror_temporary(root, path)
         and not path.is_symlink()
         and path.name not in _EXCLUDED_NAMES
