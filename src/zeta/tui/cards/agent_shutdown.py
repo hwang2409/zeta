@@ -5,11 +5,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 
 SHUTDOWN_BUDGET_SECONDS = 2.0
 _LATE_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
 _LOGGER = logging.getLogger(__name__)
+
+
+async def close_agent_owners(
+    *actions: Callable[[float], Awaitable[None]],
+) -> None:
+    """Close independent navigation owners within one shared budget."""
+
+    deadline = time.monotonic() + SHUTDOWN_BUDGET_SECONDS
+    results = await asyncio.gather(
+        *(action(deadline) for action in actions), return_exceptions=True
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
 
 
 async def finish_cleanup_or_handoff(
@@ -45,4 +59,8 @@ async def finish_cleanup_or_handoff(
     cleanup.add_done_callback(cleanup_done)
 
 
-__all__ = ["SHUTDOWN_BUDGET_SECONDS", "finish_cleanup_or_handoff"]
+__all__ = [
+    "SHUTDOWN_BUDGET_SECONDS",
+    "close_agent_owners",
+    "finish_cleanup_or_handoff",
+]

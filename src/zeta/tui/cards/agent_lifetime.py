@@ -51,7 +51,7 @@ class AgentTranscriptLifetime:
             raise
         return source
 
-    async def close(self, *, deadline: float | None = None) -> None:
+    async def close(self, deadline: float | None = None) -> None:
         if self._close_task is None:
             if deadline is None:
                 deadline = time.monotonic() + SHUTDOWN_BUDGET_SECONDS

@@ -226,7 +226,7 @@ class AgentTodoControl:
         self._snapshot_path = None
         self.request(None, invalidate)
 
-    async def close(self, *, deadline: float | None = None) -> None:
+    async def close(self, deadline: float | None = None) -> None:
         if self._closed:
             return
         self._closed = True
