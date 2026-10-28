@@ -2400,28 +2400,44 @@ async def test_follow_up_after_finish_gate_queue_check_is_delivered(
 
 
 @pytest.mark.asyncio
-async def test_follow_up_between_gate_turns_is_delivered_once(tmp_path: Path) -> None:
+async def test_follow_up_between_gate_turns_is_delivered_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     backend = FollowUpFinishGateBackend()
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    channel = loop._background_owner.conversation_channel
+    before_wait = asyncio.Event()
+    release_wait = asyncio.Event()
+    original_wait = channel.wait
 
+    async def pause_before_wait(instance_id: str) -> None:
+        before_wait.set()
+        await release_wait.wait()
+        await original_wait(instance_id)
+
+    monkeypatch.setattr(channel, "wait", pause_before_wait)
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
         await asyncio.wait_for(backend.gate_started.wait(), timeout=2)
         child_handle = next(iter(store.agent_children()))
+        backend.release_gate_turn.set()
+        await asyncio.wait_for(before_wait.wait(), timeout=10)
         assert await send_to_run(
             store,
             child_handle,
             "follow-up between gate turns",
-            channel=loop._background_owner.conversation_channel,
+            channel=channel,
         ) is None
-        backend.release_gate_turn.set()
+        release_wait.set()
 
         await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=10)
         await _wait_for_notification(store, "completed")
         assert backend.follow_up_prompts == ["follow-up between gate turns"]
     finally:
+        release_wait.set()
         backend.release_grandchild.set()
+        channel.wake(next(iter(store.agent_children()), None))
         try:
             await _bounded_finish_gate_cleanup(
                 loop._background_owner.wait(), "finish background agents"
