@@ -313,7 +313,9 @@ async def retry_provider_completion(
         ):
             if pending_truncated_end is not None:
                 yield pending_truncated_end
-            StreamDiagnostics.record_failure_decision(error, will_retry=False)
+            StreamDiagnostics.record_failure_decision(
+                error, provider="codex", will_retry=False
+            )
             raise error
         if is_unauthorized(error):
             if refreshed:
@@ -329,7 +331,9 @@ async def retry_provider_completion(
             owner="transport",
             event_data={"retryable": True} if stalled else None,
         )
-        StreamDiagnostics.record_failure_decision(error, will_retry=plan is not None)
+        StreamDiagnostics.record_failure_decision(
+            error, provider="codex", will_retry=plan is not None
+        )
         if plan is None:
             if budget.exhausted:
                 on_exhausted(error, budget.attempts - 1)

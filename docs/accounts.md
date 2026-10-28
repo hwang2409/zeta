@@ -4,6 +4,14 @@
 
 phase 1 account storage, selection, mutable display labels, and offline identity display are implemented. phase 2 verified explicit usage refresh and phase 3 verified exhaustion recovery are implemented.
 
+## separate account home
+
+set `ZETA_ACCOUNT_HOME` to an absolute directory to keep provider accounts,
+credentials, migrations, and account locks outside `ZETA_HOME`. this lets a
+throwaway zeta home share the canonical account store without copying refresh
+tokens. sessions, projects, and settings remain under `ZETA_HOME`. an empty or
+relative `ZETA_ACCOUNT_HOME` is an error.
+
 ## problem and v1 outcome
 
 henry has several claude and chatgpt/codex subscriptions. zeta currently has one

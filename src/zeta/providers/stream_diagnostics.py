@@ -44,11 +44,13 @@ class StreamDiagnostics:
         self,
         path: Path,
         *,
+        provider: str,
         headers: Mapping[str, str],
         model: str | None,
         started_at: float,
     ) -> None:
         self.path = path
+        self.provider = provider
         self.headers = headers
         self.model = model
         self.started_at = started_at
@@ -77,6 +79,7 @@ class StreamDiagnostics:
         )
         record = {
             "timestamp": time.time(),
+            "provider": self.provider,
             "cause": cause,
             "stream_age_seconds": max(0.0, now - self.started_at),
             "bytes_received": bytes_received,
@@ -93,7 +96,9 @@ class StreamDiagnostics:
         self.written = True
 
     @staticmethod
-    def record_failure_decision(error: BaseException, *, will_retry: bool) -> None:
+    def record_failure_decision(
+        error: BaseException, *, provider: str, will_retry: bool
+    ) -> None:
         """Record one Codex failure after its retry owner makes the decision."""
         diagnostic = getattr(error, "stream_diagnostic", None)
         if not isinstance(diagnostic, tuple) or len(diagnostic) != 4:
@@ -108,7 +113,7 @@ class StreamDiagnostics:
                 "timestamp": time.time(),
                 "cause": "provider_stream_failure",
                 "model": model,
-                "provider": "codex",
+                "provider": provider,
                 "code": getattr(error, "code", None),
                 "status": getattr(error, "status_code", None),
                 "response_id": context.get("response_id"),
@@ -123,13 +128,16 @@ class StreamDiagnostics:
         )
 
     @staticmethod
-    def record_reassembly_mismatches(path: Path, *, count: int) -> None:
+    def record_reassembly_mismatches(
+        path: Path, *, provider: str, count: int
+    ) -> None:
         """Record mismatch frequency without logging provider content."""
 
         write_stream_diagnostic(
             path,
             {
                 "timestamp": time.time(),
+                "provider": provider,
                 "cause": "codex_reassembly_mismatch",
                 "reassembly_mismatches": count,
                 **fd_diagnostics(),
@@ -141,6 +149,7 @@ class StreamDiagnostics:
         path: Path,
         error: BaseException,
         *,
+        provider: str,
         retries: int,
         decision: str = "budget-exhausted",
     ) -> None:
@@ -148,6 +157,7 @@ class StreamDiagnostics:
             path,
             {
                 "timestamp": time.time(),
+                "provider": provider,
                 "cause": type(error),
                 "retries": retries,
                 "decision": decision,

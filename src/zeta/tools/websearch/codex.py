@@ -21,7 +21,7 @@ from ...codex import (
     CodexStreamError,
 )
 from ...core.abort import AbortSignal
-from ...core.session import env_home
+from ...core.session import account_home
 
 CODEX_SEARCH_MODEL = DEFAULT_CODEX_MODEL
 CODEX_SEARCH_TIMEOUT = 120.0
@@ -206,7 +206,7 @@ async def search(
     account: AccountId | None = None,
     home: Path | None = None,
 ) -> CodexSearchResult:
-    registry = AccountStore(home or env_home())
+    registry = AccountStore(account_home(home))
     selected = account or await asyncio.to_thread(registry.resolve_account, "codex")
     return await _search_with_account(query, abort_signal, selected, registry)
 

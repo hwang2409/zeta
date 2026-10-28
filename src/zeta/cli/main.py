@@ -24,7 +24,7 @@ from ..accounts.usage import format_usage_lines, usage_json
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.login_flow import LoginPublicationError, run_login
-from ..core.session import SessionError, env_home
+from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
 from ..providers.factory import credential_store
@@ -399,7 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _run_login(
     provider: str, label: str = "default", replace_existing: bool = False
 ) -> str | None:
-    home = env_home()
+    home = account_home(env_home())
     store = AccountStore(home)
     with store.provider_login_lock(provider):
         store.migrate()
@@ -420,7 +420,7 @@ def _login_label(args: argparse.Namespace) -> str:
         return args.account
     if not sys.stdin.isatty():
         raise AccountError("account label required; use --account <label>")
-    store = AccountStore(env_home())
+    store = AccountStore(account_home(env_home()))
     store.migrate()
     first = not any(item.provider == args.provider for item in store.list())
     prompt = "account label [default]: " if first else "account label: "
@@ -660,7 +660,7 @@ def _handle_accounts(args: argparse.Namespace) -> int:
             )
         )
     try:
-        store = AccountStore(env_home())
+        store = AccountStore(account_home(env_home()))
         try:
             store.migrate()
         except AccountError:
@@ -835,11 +835,10 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 cli_yolo=args.yolo,
             )
+            asyncio.run(run_server(server))
         except (SessionError, ValueError) as exc:
             print(f"zeta serve: {exc}", file=sys.stderr)
             return 2
-        try:
-            asyncio.run(run_server(server))
         except KeyboardInterrupt:
             return 130
         return 0
@@ -861,6 +860,9 @@ def main(argv: list[str] | None = None) -> int:
                 app = create_app(args)
         except SessionError as exc:
             parser.error(str(exc))
+        except ValueError as exc:
+            print(f"zeta: {exc}", file=sys.stderr)
+            return 1
         try:
             with patch_stdout(raw=True):
                 asyncio.run(_run_tui(app, args))
