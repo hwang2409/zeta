@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable, Iterable
 
 SHUTDOWN_BUDGET_SECONDS = 2.0
@@ -26,7 +27,7 @@ async def finish_cleanup_or_handoff(
             await asyncio.to_thread(close)
 
     cleanup = asyncio.create_task(finish())
-    timeout = max(0.0, deadline - asyncio.get_running_loop().time())
+    timeout = max(0.0, deadline - time.monotonic())
     done, _ = await asyncio.wait({cleanup}, timeout=timeout)
     if done:
         await cleanup

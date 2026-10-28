@@ -232,7 +232,7 @@ class AgentTodoControl:
         self._closed = True
         self._refresh_requested = False
         if deadline is None:
-            deadline = asyncio.get_running_loop().time() + SHUTDOWN_BUDGET_SECONDS
+            deadline = time.monotonic() + SHUTDOWN_BUDGET_SECONDS
         tasks = (
             {self._task}
             if self._task is not None and not self._task.done()

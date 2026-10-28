@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from .agent_shutdown import SHUTDOWN_BUDGET_SECONDS, finish_cleanup_or_handoff
@@ -53,7 +54,7 @@ class AgentTranscriptLifetime:
     async def close(self, *, deadline: float | None = None) -> None:
         if self._close_task is None:
             if deadline is None:
-                deadline = asyncio.get_running_loop().time() + SHUTDOWN_BUDGET_SECONDS
+                deadline = time.monotonic() + SHUTDOWN_BUDGET_SECONDS
             self._close_task = asyncio.create_task(
                 self._close_transcript_lifetime(deadline)
             )

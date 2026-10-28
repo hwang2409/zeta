@@ -846,10 +846,7 @@ class AgentNavigation:
         return self._todo_control.snapshot(self.current_path)
 
     async def close(self) -> None:
-        deadline = (
-            asyncio.get_running_loop().time()
-            + agent_shutdown.SHUTDOWN_BUDGET_SECONDS
-        )
+        deadline = time.monotonic() + agent_shutdown.SHUTDOWN_BUDGET_SECONDS
         results = await asyncio.gather(
             self.transcript_control.close(deadline=deadline),
             self._todo_control.close(deadline=deadline),
