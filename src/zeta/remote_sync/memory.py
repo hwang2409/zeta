@@ -538,15 +538,23 @@ def _publish_memory_snapshot(
                             != merged.state.entries.get(entry_id)
                         )
                     )
-            _import_merged_memory_locked(
-                registry,
-                root_fd,
-                project_id,
-                merged,
-                expected_digest=current.digest,
-                changed_entry_ids=changed_entry_ids or (),
-                provenance=provenance,
-            )
+            if isinstance(merged, EntryMemoryExport):
+                registry._import_entry_memory_locked(
+                    root_fd,
+                    project_id,
+                    merged,
+                    expected_digest=current.digest,
+                    changed_entry_ids=changed_entry_ids or (),
+                    provenance=provenance,
+                )
+            else:
+                registry._import_memory_locked(
+                    root_fd,
+                    project_id,
+                    merged,
+                    expected_digest=current.digest,
+                    provenance=provenance,
+                )
             source_memory = snapshot / "memory"
             if source_memory.is_dir():
                 for source in sorted(source_memory.iterdir()):
@@ -561,35 +569,6 @@ def _publish_memory_snapshot(
                     _atomic_copy_file(source, project / "sync" / source.name)
     except ProjectRegistryError as exc:
         raise RemoteSyncError(f"project memory changed during sync: {exc}") from exc
-
-
-def _import_merged_memory_locked(
-    registry: ProjectRegistry,
-    root_fd: int,
-    project_id: str,
-    merged: MemorySyncExport,
-    *,
-    expected_digest: str,
-    changed_entry_ids: tuple[str, ...],
-    provenance: dict[str, str],
-) -> None:
-    if isinstance(merged, EntryMemoryExport):
-        registry._import_entry_memory_locked(
-            root_fd,
-            project_id,
-            merged,
-            expected_digest=expected_digest,
-            changed_entry_ids=changed_entry_ids,
-            provenance=provenance,
-        )
-    else:
-        registry._import_memory_locked(
-            root_fd,
-            project_id,
-            merged,
-            expected_digest=expected_digest,
-            provenance=provenance,
-        )
 
 
 def _materialize_memory_export(snapshot: Path, project_id: str) -> MemorySyncExport:
