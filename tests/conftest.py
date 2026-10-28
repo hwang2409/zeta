@@ -423,6 +423,7 @@ _FD_HIGH_WATER = 768
 _FD_PER_TEST_LIMIT = 32
 _FD_RETAINED_COUNTS: list[int] = []
 _FD_RETAINED_MAX: tuple[str, int, int, tuple[str, ...]] | None = None
+_FD_OWNERS: dict[int, tuple[str, str]] = {}
 _OS_LISTDIR = os.listdir
 _OS_FSTAT = os.fstat
 
@@ -486,8 +487,20 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     global _FD_RETAINED_MAX
     # Stable pytest/xdist descriptors and session fixtures predate this snapshot.
     before = _open_file_descriptors()
+    if not _FD_OWNERS:
+        _FD_OWNERS.update(
+            (descriptor, (description, "pre-suite"))
+            for descriptor, description in before.items()
+        )
     yield
     after = _open_file_descriptors()
+    for descriptor in tuple(_FD_OWNERS):
+        if descriptor not in after:
+            del _FD_OWNERS[descriptor]
+    for descriptor, description in after.items():
+        previous = _FD_OWNERS.get(descriptor)
+        if previous is None or previous[0] != description:
+            _FD_OWNERS[descriptor] = (description, item.nodeid)
     retained = sorted(after.keys() - before.keys())
     added = tuple(after[fd] for fd in retained)
     grouped = _group_fds_by_path_prefix(added)
@@ -513,6 +526,10 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
 
 def _fd_summary() -> str:
     worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    persistent_owners = Counter(owner for _description, owner in _FD_OWNERS.values())
+    persistent = "; ".join(
+        f"{nodeid} (+{count})" for nodeid, count in persistent_owners.most_common(5)
+    )
     top = sorted(_FD_GROWTH, reverse=True)[:5]
     offenders = "; ".join(f"{nodeid} (+{count})" for count, nodeid in top)
     breach = _FD_BREACHES[0] if _FD_BREACHES else "none"
@@ -537,6 +554,7 @@ def _fd_summary() -> str:
     return (
         f"fd-summary worker={worker} retained_open=[{retained}] "
         f"retained_max=[{retained_max}] "
+        f"persistent_owners=[{persistent}] "
         f"top_retained_additions=[{offenders}] breach=[{breach}]"
     )
 

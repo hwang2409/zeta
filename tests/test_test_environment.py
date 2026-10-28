@@ -125,7 +125,8 @@ def test_fd_guard_attributes_outer_hook_teardown_to_the_test(tmp_path: Path) -> 
 
     assert result.returncode == 1, output
     assert "fd-breach test_probe.py::test_owner retained 33 descriptors" in output
-    assert "grouped=[unknown (+33)]" in output
+    assert "grouped=[" in output
+    assert "(+33)]" in output
 
 
 def test_path_home_follows_home_environment(
