@@ -24,6 +24,7 @@ from .anthropic_payload import (
     _validate_thinking_parameters,
     build_messages_payload as _build_messages_payload,
 )
+from ..oauth import ProviderLoginRequiredError
 from .anthropic_errors import (
     AnthropicAuthError,
     AnthropicBackendError,
@@ -208,6 +209,10 @@ class AnthropicCredential(Protocol):
     def beta_header(self) -> str: ...
 
 
+class AnthropicLoginRequiredError(AnthropicAuthError, ProviderLoginRequiredError):
+    """Raised when no Claude OAuth login is available."""
+
+
 class AnthropicCredentialDriver:
     """Read Claude bootstrap credentials and implement provider OAuth behavior."""
 
@@ -216,7 +221,7 @@ class AnthropicCredentialDriver:
     provider_label = "Claude"
 
     def login_required_error(self, message: str) -> AnthropicAuthError:
-        return AnthropicAuthError(message)
+        return AnthropicLoginRequiredError(message)
 
     def __init__(self, *, token_url: str = TOKEN_URL) -> None:
         self.token_url = token_url

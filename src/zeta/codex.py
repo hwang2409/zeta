@@ -19,7 +19,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .oauth import OAuthTokens
+from .oauth import OAuthTokens, ProviderLoginRequiredError
 
 
 class CodexBackendError(RuntimeError):
@@ -38,7 +38,7 @@ class CodexAuthError(CodexBackendError):
         self.status_code = status_code
 
 
-class CodexLoginRequiredError(CodexAuthError):
+class CodexLoginRequiredError(CodexAuthError, ProviderLoginRequiredError):
     """Raised when no Codex OAuth login is available."""
 
 

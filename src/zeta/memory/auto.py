@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..context_eviction import estimated_text_tokens
+from ..oauth import ProviderLoginRequiredError
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import ProjectRegistry, ProjectRegistryError
 from ..protocol.types import (
@@ -75,6 +76,7 @@ class AutoMemoryConfig:
 
     enabled: bool = True
     model: str = "gpt-5.6-luna"
+    provider: str = "codex"
     token_threshold: int = 50_000
     idle_seconds: float = 600.0
     cas_retries: int = 3
@@ -158,6 +160,7 @@ class AutoMemoryReconciler:
         self._drained.set()
         self._worker_task: asyncio.Task[None] | None = None
         self._closing = False
+        self._paused_for_login = False
         self._busy = False
         self._activity_generation = 0
         self._seen_activity_generation = 0
@@ -192,6 +195,8 @@ class AutoMemoryReconciler:
 
     def retry_terminal(self, key: str) -> bool:
         """Re-queue one terminal receipt for this session."""
+        if self._paused_for_login:
+            return False
         queued = self.state.retry_terminal(key, now=self._retry_clock())
         if queued and not self._closing:
             self._begin_work_cycle()
@@ -203,7 +208,7 @@ class AutoMemoryReconciler:
     def activity(self, seq: int | None = None) -> None:
         """Report a transcript append after it has been durably persisted."""
         del seq  # The worker reads the authoritative durable sequence itself.
-        if not self.config.enabled or self._closing:
+        if not self.config.enabled or self._closing or self._paused_for_login:
             return
         self._begin_work_cycle()
         self._activity_generation += 1
@@ -214,7 +219,12 @@ class AutoMemoryReconciler:
 
     def before_eviction(self, seq_start: int, seq_end: int) -> None:
         """Queue every sequence in the exact range that will leave context."""
-        if not self.config.enabled or self._closing or seq_end < seq_start:
+        if (
+            not self.config.enabled
+            or self._closing
+            or self._paused_for_login
+            or seq_end < seq_start
+        ):
             return
         self._begin_work_cycle()
         self._add_pending(seq_start, seq_end, "eviction")
@@ -224,7 +234,7 @@ class AutoMemoryReconciler:
 
     async def drain(self) -> None:
         """Wait until all work currently caused by activity has settled."""
-        if not self.config.enabled:
+        if not self.config.enabled or self._paused_for_login:
             return
         self._begin_work_cycle()
         self._ensure_worker()
@@ -259,7 +269,7 @@ class AutoMemoryReconciler:
 
     def catch_up(self) -> None:
         """Queue durable transcript content left behind by an earlier shutdown."""
-        if not self.config.enabled or self._closing:
+        if not self.config.enabled or self._closing or self._paused_for_login:
             return
         self._begin_work_cycle()
         self._resume_catch_up = True
@@ -386,6 +396,9 @@ class AutoMemoryReconciler:
                 try:
                     await self._reconcile_range(item)
                     self._conflict_retries = 0
+                except ProviderLoginRequiredError:
+                    self._pause_for_login()
+                    return
                 except _ConcurrentMemoryUpdate:
                     self._conflict_retries += 1
                     if not self._closing:
@@ -415,6 +428,8 @@ class AutoMemoryReconciler:
                     self._busy = False
                     self._last_request_finished = self._clock()
                     self._idle_deadline = self._clock() + self.config.idle_seconds
+                    if self._paused_for_login:
+                        self._drained.set()
                 continue
             self._drained.set()
             if self._closing:
@@ -605,7 +620,7 @@ class AutoMemoryReconciler:
                             "project memory update failed"
                         ) from exc
                     break
-                except _ConcurrentMemoryUpdate:
+                except (ProviderLoginRequiredError, _ConcurrentMemoryUpdate):
                     raise
                 except Exception as unit_error:  # noqa: BLE001 - durable failure receipt
                     failure = unit_error
@@ -716,6 +731,26 @@ class AutoMemoryReconciler:
             "Return a corrected JSON object. Cite only top-level seq values shown "
             f"in Completed transcript rows.\n{prompt}"
         )
+
+    def _pause_for_login(self) -> None:
+        self._paused_for_login = True
+        self._pending.clear()
+        self._resume_catch_up = False
+        self._early_pending_end = None
+        self._early_deadline = None
+        self._early_window_started_at = None
+        if self.notice is not None:
+            model = self.config.model
+            provider = self.config.provider
+            self.notice(
+                "automatic project-memory reconciliation paused: "
+                f"model {model} uses provider {provider}, but {provider} is not "
+                "logged in. Run "
+                f"`zeta accounts login {provider} <name>`, set `[memory] model` "
+                "in settings.toml to a model on a logged-in provider, or set "
+                "`[memory] auto = false`. Reconciliation will retry when this "
+                "session next starts."
+            )
 
     def _publish_failure_notice(self) -> None:
         if (

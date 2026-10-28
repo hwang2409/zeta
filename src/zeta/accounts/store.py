@@ -587,7 +587,7 @@ class AccountCredentials:
             async with self._async_guard(registry=False) as home_fd:
                 tokens = _read_account_tokens(home_fd, self.account)
                 if tokens is None:
-                    raise self._login_required_error()
+                    raise self.login_required_error()
                 if tokens.is_valid():
                     return tokens.access_token
                 return await self._refresh_locked(home_fd, tokens, client)
@@ -597,7 +597,7 @@ class AccountCredentials:
     ) -> str:
         tokens = _read_account_tokens(home_fd, self.account)
         if tokens is None:
-            raise self._login_required_error()
+            raise self.login_required_error()
         if tokens.is_valid():
             return tokens.access_token
         return await self._refresh_locked(home_fd, tokens, client)
@@ -609,7 +609,7 @@ class AccountCredentials:
             async with self._async_guard(registry=False) as home_fd:
                 tokens = _read_account_tokens(home_fd, self.account)
                 if tokens is None:
-                    raise self._login_required_error()
+                    raise self.login_required_error()
                 return await self._refresh_locked(home_fd, tokens, client)
 
     async def refresh(
@@ -654,14 +654,14 @@ class AccountCredentials:
             if tokens is None:
                 tokens = self._driver.bootstrap()
                 if tokens is None:
-                    raise self._login_required_error()
+                    raise self.login_required_error()
                 self._publish(home_fd, tokens)
             if not refresh and tokens.is_valid():
                 return tokens.access_token
         async with self._async_guard(registry=False) as home_fd:
             tokens = _read_account_tokens(home_fd, self.account)
             if tokens is None:
-                raise self._login_required_error()
+                raise self.login_required_error()
             return await self._refresh_locked(home_fd, tokens, client)
 
     def _write(self, home_fd: int, tokens: OAuthTokens) -> None:
@@ -685,7 +685,8 @@ class AccountCredentials:
         with _open_account_directory(home_fd, self.account) as account_fd:
             _delete_publication_pending(account_fd)
 
-    def _login_required_error(self) -> RuntimeError:
+    def login_required_error(self) -> RuntimeError:
+        """Return the provider driver's missing-login error."""
         return self._driver.login_required_error(
             f"no {self.provider_label} OAuth login found; log in first"
         )

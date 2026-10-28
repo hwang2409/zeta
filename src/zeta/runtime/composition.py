@@ -296,6 +296,7 @@ def compose_runtime(
                                 config.memory_model,
                                 home=home,
                                 account=memory_account,
+                                require_credentials=True,
                                 stall_seconds=config.stream_stall_seconds,
                                 stall_retries=config.stream_stall_retries,
                                 token_budget=effective_budget,
@@ -310,6 +311,7 @@ def compose_runtime(
                 invoke=invoke_memory,
                 config=AutoMemoryConfig(
                     model=config.memory_model,
+                    provider=memory_provider,
                     token_threshold=config.memory_token_threshold,
                     idle_seconds=config.memory_idle_minutes * 60,
                 ),
