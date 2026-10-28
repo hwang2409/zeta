@@ -540,70 +540,84 @@ def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(
     project, opened = _session(home, repo)
     opened.store.close()
     project_path = home / "projects" / project.project_id
+    (project_path / "sessions.jsonl").unlink()
     sync_state = project_path / "sync" / "peer.json"
     sync_state.parent.mkdir()
     sync_state.write_text("old\n", encoding="utf-8")
-    replacement = tmp_path / "replacement.json"
-    replacement.write_text("new\n", encoding="utf-8")
-    real_project_digest = memory_module.project_digest
-
-    def replace_sync_state_after_digest(path: Path) -> str:
-        digest = real_project_digest(path)
-        memory_module._atomic_copy_file(replacement, sync_state)
-        return digest
-
-    monkeypatch.setattr(memory_module, "project_digest", replace_sync_state_after_digest)
-    destination = tmp_path / "snapshot"
-
-    reported = memory_module.fetch_local_project(
-        home, project.project_id, destination, peer="peer"
-    )
-
-    assert reported == real_project_digest(destination)
-
-
-def test_sync_state_publication_holds_project_registry_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "home"
-    repo = tmp_path / "repo"
-    _git_repo(repo)
-    project, opened = _session(home, repo)
-    opened.store.close()
-    project_path = home / "projects" / project.project_id
-    snapshot = tmp_path / "snapshot" / project.project_id
-    memory_module.copy_project_snapshot(project_path, snapshot)
-    snapshot.parent.chmod(0o700)
-    sync_state = snapshot / "sync" / "peer.json"
-    sync_state.parent.mkdir(exist_ok=True)
-    sync_state.write_text("state\n", encoding="utf-8")
+    publication = tmp_path / "publication" / project.project_id
+    memory_module.copy_project_snapshot(project_path, publication)
+    publication.parent.chmod(0o700)
+    (publication / "sync" / "peer.json").write_text("new\n", encoding="utf-8")
     expected = memory_module._materialize_memory_export(
         project_path, project.project_id
     )
+    real_project_digest = memory_module.project_digest
     real_atomic_copy = memory_module._atomic_copy_file
-    lock_was_held = False
+    real_flock = fcntl.flock
+    main_thread = threading.current_thread()
+    sync_copy_ready = threading.Event()
+    release_sync_copy = threading.Event()
+    sync_copy_done = threading.Event()
+    publication_errors: list[BaseException] = []
 
-    def assert_registry_lock(source: Path, destination: Path) -> None:
-        nonlocal lock_was_held
-        if destination == project_path / "sync" / "peer.json":
-            with (
-                (home / "projects" / ".lock").open("rb") as lock,
-                pytest.raises(BlockingIOError),
-            ):
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lock_was_held = True
+    def pause_sync_state_copy(source: Path, destination: Path) -> None:
+        if destination == sync_state:
+            sync_copy_ready.set()
+            assert release_sync_copy.wait(timeout=5)
+            real_atomic_copy(source, destination)
+            sync_copy_done.set()
+            return
         real_atomic_copy(source, destination)
 
-    monkeypatch.setattr(memory_module, "_atomic_copy_file", assert_registry_lock)
+    def acquire_fetch_lock(file: object, operation: int) -> object:
+        if threading.current_thread() is main_thread and operation & fcntl.LOCK_EX:
+            try:
+                return real_flock(file, operation | fcntl.LOCK_NB)
+            except BlockingIOError:
+                release_sync_copy.set()
+        return real_flock(file, operation)
 
-    memory_module._publish_memory_snapshot(
-        project_path,
-        snapshot,
-        expected_export=expected,
-        provenance={"source": "test"},
-    )
+    def release_copy_after_digest(path: Path) -> str:
+        digest = real_project_digest(path)
+        release_sync_copy.set()
+        assert sync_copy_done.wait(timeout=5)
+        return digest
 
-    assert lock_was_held
+    def publish() -> None:
+        try:
+            memory_module._publish_memory_snapshot(
+                project_path,
+                publication,
+                expected_export=expected,
+                provenance={"source": "test"},
+            )
+        except Exception as exc:  # noqa: BLE001 - propagate thread failures
+            publication_errors.append(exc)
+
+    monkeypatch.setattr(memory_module, "_atomic_copy_file", pause_sync_state_copy)
+    monkeypatch.setattr(fcntl, "flock", acquire_fetch_lock)
+    monkeypatch.setattr(memory_module, "project_digest", release_copy_after_digest)
+    publication_thread = threading.Thread(target=publish)
+    publication_thread.start()
+    assert sync_copy_ready.wait(timeout=5)
+    destination = tmp_path / "snapshot"
+
+    try:
+        reported = memory_module.fetch_local_project(
+            home, project.project_id, destination, peer="peer"
+        )
+    except RemoteSyncError as exc:
+        assert "project registry busy" in str(exc)
+        publication_thread.join(timeout=5)
+        reported = memory_module.fetch_local_project(
+            home, project.project_id, destination, peer="peer"
+        )
+    publication_thread.join(timeout=5)
+
+    assert not publication_thread.is_alive()
+    assert not publication_errors
+    assert reported == real_project_digest(destination)
+    assert sync_state.read_text(encoding="utf-8") == "new\n"
 
 
 def test_opposite_direction_memory_syncs_do_not_deadlock(tmp_path: Path) -> None:

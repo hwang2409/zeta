@@ -391,8 +391,9 @@ def fetch_local_project(
             path = project / "memory" / name
             if path.is_file() and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE:
                 raise RemoteSyncError(f"memory file {name} is too large")
+        digest = project_digest(project)
         copy_project_snapshot(project, destination)
-        return project_digest(destination)
+        return digest
 
 
 def publish_local_project(
