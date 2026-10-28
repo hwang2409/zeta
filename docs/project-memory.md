@@ -83,14 +83,22 @@ Use `--no-auto-memory` or `--auto-memory` for one session.
 
 Each model-backed pass appends a content-free health record to
 `<ZETA_HOME>/logs/memory-reconciliation.jsonl` after its memory decision and
-cursor are durable. Records report an `applied`, `no_change`, or `failed`
-outcome and token usage. A login-required pause reports one `paused` row per
-process when it first observes the pause; a restart writes a new one. The row
-uses the fixed pause code `login_required`. Failed records use one of five fixed
-codes: `provider_error`, `invalid_response`, `request_too_large`, `commit_error`, or
-`storage_error`. Detailed failure text remains only in the session-private
-`memory-reconcile.json`, `memory-reconcile-errors.jsonl`, and
-`memory-reconcile-receipts.jsonl` files, all with mode `0600`.
+cursor are durable. The row shapes are:
+
+- `applied`: `timestamp`, `project_id`, `session_id`, `seq_start`, `seq_end`,
+  `outcome`, and `entries`.
+- `no_change`: the same fields except `entries`.
+- `failed`: the `no_change` fields plus `attempt_count`.
+- `paused`: `timestamp`, `project_id`, `session_id`, `outcome`, `pause_code`,
+  and `provider`.
+
+An authoritative commit that changed memory writes exactly one `applied` row
+for its reconciliation key, including after crash recovery. A login-required
+pause writes one `paused` row per process when it first observes the pause; a
+restart writes a new one. Its fixed pause code is `login_required`. Detailed
+failure text remains only in the session-private `memory-reconcile.json`,
+`memory-reconcile-errors.jsonl`, and `memory-reconcile-receipts.jsonl` files,
+all with mode `0600`.
 
 The shared diagnostics writer rotates the health file at 1 MiB and keeps one
 previous file. The guaranteed look-back after rotation is about one full file,

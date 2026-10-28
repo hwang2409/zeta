@@ -2059,9 +2059,11 @@ async def test_reconciliation_retry_is_idempotent_after_cursor_crash(
     assert replacement.last_reconciled_seq == 1
     diagnostics = registry.root.parent / "logs" / "memory-reconciliation.jsonl"
     records = [json.loads(line) for line in diagnostics.read_text().splitlines()]
-    key = replacement.state.reconciliation_key(1, 1)
     assert sum(
-        record["reconciliation_key"] == key and record["outcome"] == "applied"
+        record["project_id"] == project_id
+        and record["seq_start"] == 1
+        and record["seq_end"] == 1
+        and record["outcome"] == "applied"
         for record in records
     ) == 1
 

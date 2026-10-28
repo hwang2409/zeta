@@ -37,7 +37,6 @@ from .reconciler import (
 )
 from .reconciliation_state import (
     MAX_SCHEDULED_ATTEMPTS,
-    FailureCode,
     ReconciliationFailure,
     ReconciliationOutcome,
     ReconciliationState,
@@ -66,33 +65,6 @@ def _failure_summary(error: Exception) -> str:
     if isinstance(error, (ReconciliationError, UnsupportedMemoryFormatError)):
         return str(error)
     return type(error).__name__
-
-
-def _failure_code(error: Exception) -> FailureCode:
-    cause = error.__cause__
-    if isinstance(error, RequestTooLargeError):
-        return "request_too_large"
-    if isinstance(error, _StorageOperationError):
-        return "storage_error"
-    if isinstance(error, ReconciliationError) and isinstance(
-        cause, ProjectRegistryError
-    ):
-        return "commit_error"
-    if isinstance(error, _ProviderOperationError) or isinstance(
-        cause, _ProviderOperationError
-    ):
-        return "provider_error"
-    if isinstance(error, (ReconciliationError, UnsupportedMemoryFormatError)):
-        return "invalid_response"
-    return "provider_error"
-
-
-class _ProviderOperationError(Exception):
-    """A failure from the configured completion provider."""
-
-
-class _StorageOperationError(Exception):
-    """A failure from local reconciliation storage."""
 
 
 class _ConcurrentMemoryUpdate(Exception):
@@ -450,7 +422,6 @@ class AutoMemoryReconciler:
                         seq_start=item.start,
                         seq_end=item.end,
                         validation_summary=_failure_summary(exc),
-                        failure_code=_failure_code(exc),
                         reason="+".join(sorted(item.reasons)),
                         usage={},
                         retry_backoff_seconds=self.config.retry_backoff_seconds,
@@ -507,12 +478,9 @@ class AutoMemoryReconciler:
         while cursor <= item.end:
             if self._closing:
                 return
-            try:
-                rows, end_offset, end_tokens, scanned_end = await asyncio.to_thread(
-                    self._transcript_chunk, cursor, item.end
-                )
-            except OSError as exc:
-                raise _StorageOperationError from exc
+            rows, end_offset, end_tokens, scanned_end = await asyncio.to_thread(
+                self._transcript_chunk, cursor, item.end
+            )
             if not rows:
                 if scanned_end < cursor:
                     break
@@ -559,7 +527,7 @@ class AutoMemoryReconciler:
                                 project_id=self.project_id,
                                 transcript=raw_transcript,
                                 reconciliation_key=self.state.reconciliation_key,
-                                invoke=self._invoke_provider,
+                                invoke=self.invoke,
                                 cas_retries=self.config.cas_retries,
                                 as_of=today,
                                 now=datetime.now(UTC).isoformat(timespec="microseconds").replace(
@@ -569,8 +537,6 @@ class AutoMemoryReconciler:
                         except EntryReconciliationFailure as exc:
                             usage = dict(exc.usage)
                             raise
-                        except (ProjectRegistryError, OSError) as exc:
-                            raise _StorageOperationError from exc
                         selected_start = entry_result.seq_start
                         selected_end = entry_result.seq_end
                         usage = dict(entry_result.usage)
@@ -596,8 +562,6 @@ class AutoMemoryReconciler:
                                 },
                             )
                         break
-                    except (ProjectRegistryError, OSError) as exc:
-                        raise _StorageOperationError from exc
                     request = prepare_request(
                         raw_transcript,
                         snapshot.contents,
@@ -662,8 +626,6 @@ class AutoMemoryReconciler:
                         raise ReconciliationError(
                             "project memory update failed"
                         ) from exc
-                    except OSError as exc:
-                        raise _StorageOperationError from exc
                     break
                 except (ProviderLoginRequiredError, _ConcurrentMemoryUpdate):
                     raise
@@ -685,7 +647,6 @@ class AutoMemoryReconciler:
                             end_tokens=end_tokens,
                             usage=usage,
                             validation_summary=summary,
-                            failure_code=_failure_code(failure),
                             terminal=terminal_failure,
                         )
                     )
@@ -695,7 +656,6 @@ class AutoMemoryReconciler:
                         seq_start=selected_start,
                         seq_end=selected_end,
                         validation_summary=summary,
-                        failure_code=_failure_code(failure),
                         reason=reason,
                         usage=usage,
                         retry_backoff_seconds=self.config.retry_backoff_seconds,
@@ -748,24 +708,15 @@ class AutoMemoryReconciler:
             if failures:
                 self._publish_failure_notice()
 
-    async def _invoke_provider(self, prompt: str) -> InvokeResult:
-        try:
-            raw = self.invoke(prompt)
-            if inspect.isawaitable(raw):
-                raw = await raw
-            return raw
-        except (ProviderLoginRequiredError, RequestTooLargeError, ReconciliationError):
-            raise
-        except Exception as exc:
-            raise _ProviderOperationError from exc
-
     async def _invoke_request(
         self, prompt: str, budget: ProviderRetryBudget
     ) -> tuple[str, dict[str, int]]:
         if self._closing:
             raise asyncio.CancelledError
         with use_retry_budget(budget):
-            raw = await self._invoke_provider(prompt)
+            raw = self.invoke(prompt)
+            if inspect.isawaitable(raw):
+                raw = await raw
         if isinstance(raw, ReconciliationResponse):
             return raw.text, dict(raw.usage)
         return raw, {}

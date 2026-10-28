@@ -11,8 +11,9 @@ from zeta.codex import CodexCredentialDriver
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import EntryReconciliationResult
 from zeta.memory.profiles import memory_profile
-from zeta.memory.reconciler import ReconciliationResponse
+from zeta.memory.reconciler import ReconciliationResponse, RequestTooLargeError
 from zeta.memory.user_authorization import MemoryMutationAuthorization
+from zeta.oauth import ProviderLoginRequiredError
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 from zeta.providers.anthropic import AnthropicCredentialDriver
@@ -501,9 +502,11 @@ async def test_crash_resume_has_no_duplicate_history(tmp_path: Path) -> None:
     assert replacement.last_reconciled_seq == 2
     diagnostics = registry.root.parent / "logs" / "memory-reconciliation.jsonl"
     records = [json.loads(line) for line in diagnostics.read_text().splitlines()]
-    key = replacement.state.reconciliation_key(1, 2)
     assert sum(
-        record["reconciliation_key"] == key and record["outcome"] == "applied"
+        record["project_id"] == project_id
+        and record["seq_start"] == 1
+        and record["seq_end"] == 2
+        and record["outcome"] == "applied"
         for record in records
     ) == 1
 
@@ -1179,7 +1182,6 @@ def test_terminal_receipts_move_to_bounded_archive(tmp_path: Path) -> None:
             seq_start=seq,
             seq_end=seq,
             validation_summary="terminal test failure",
-            failure_code="provider_error",
             reason="test",
             usage={},
             retry_backoff_seconds=0,
@@ -1270,6 +1272,75 @@ async def test_repair_aggregates_usage_into_committed_provenance(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_entry_repair_login_required_pauses_without_retry(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> ReconciliationResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ReconciliationResponse("not json", {})
+        raise ProviderLoginRequiredError("login required")
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path,
+        invoke,
+        entry_format=True,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = [
+        json.loads(line) for line in diagnostics.read_text(encoding="utf-8").splitlines()
+    ]
+    assert calls == 2
+    assert records == [
+        {
+            "timestamp": records[0]["timestamp"],
+            "project_id": runner.project_id,
+            "session_id": SESSION,
+            "outcome": "paused",
+            "pause_code": "login_required",
+            "provider": runner.config.provider,
+        }
+    ]
+    assert runner.last_failure is None
+    assert not runner.position_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_entry_repair_request_too_large_is_terminal(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> ReconciliationResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ReconciliationResponse("not json", {})
+        raise RequestTooLargeError("request too large")
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path,
+        invoke,
+        entry_format=True,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    assert calls == 2
+    assert runner.last_failure is not None
+    assert runner.last_failure.terminal is True
+    assert len(runner.terminal_receipts()) == 1
+
+
+@pytest.mark.asyncio
 async def test_applied_pass_writes_success_diagnostic(tmp_path: Path) -> None:
     async def invoke(prompt: str) -> ReconciliationResponse:
         return ReconciliationResponse(
@@ -1290,12 +1361,10 @@ async def test_applied_pass_writes_success_diagnostic(tmp_path: Path) -> None:
         "timestamp": record["timestamp"],
         "project_id": project_id,
         "session_id": SESSION,
-        "reconciliation_key": runner.state.reconciliation_key(1, 1),
         "seq_start": 1,
         "seq_end": 1,
         "outcome": "applied",
         "entries": 1,
-        "usage": {"input_tokens": 7, "output_tokens": 3},
     }
     assert "range 1-1" not in records[0]
     assert "# Decisions" not in records[0]
@@ -1316,79 +1385,14 @@ async def test_no_change_pass_writes_success_diagnostic(tmp_path: Path) -> None:
 
     diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
     record = json.loads(diagnostics.read_text(encoding="utf-8"))
-    assert record["outcome"] == "no_change"
-    assert record["seq_start"] == 1
-    assert record["seq_end"] == 1
-    assert record["usage"] == {"input_tokens": 4, "output_tokens": 1}
-    assert "entries" not in record
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("entry_format", [False, True])
-@pytest.mark.parametrize(
-    "error",
-    [TimeoutError("provider timed out"), ConnectionError("provider disconnected")],
-)
-async def test_provider_transport_failure_is_reported_as_provider_error(
-    tmp_path: Path, error: Exception, *, entry_format: bool
-) -> None:
-    async def invoke(_prompt: str) -> str:
-        raise error
-
-    runner, _registry, _project_id, _notices = _runner(
-        tmp_path,
-        invoke,
-        entry_format=entry_format,
-        transcript_count=1,
-        minimum_interval=0,
-        retry_backoff_seconds=60,
-    )
-    runner.before_eviction(1, 1)
-    await runner.drain()
-
-    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
-    record = json.loads(diagnostics.read_text(encoding="utf-8"))
-    assert record["outcome"] == "failed"
-    assert record["failure_code"] == "provider_error"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("entry_format", [False, True])
-@pytest.mark.parametrize(
-    "error",
-    [
-        ProjectRegistryError("cannot open registry lock"),
-        TimeoutError("registry lock timed out"),
-        OSError("flock failed"),
-    ],
-)
-async def test_registry_failure_is_reported_as_storage_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    error: Exception,
-    *,
-    entry_format: bool,
-) -> None:
-    runner, registry, _project_id, _notices = _runner(
-        tmp_path,
-        entry_format=entry_format,
-        transcript_count=1,
-        minimum_interval=0,
-        retry_backoff_seconds=60,
-    )
-
-    def fail_snapshot(_project_id: str) -> None:
-        raise error
-
-    method = "_entry_memory_state" if entry_format else "memory_snapshot"
-    monkeypatch.setattr(registry, method, fail_snapshot)
-    runner.before_eviction(1, 1)
-    await runner.drain()
-
-    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
-    record = json.loads(diagnostics.read_text(encoding="utf-8"))
-    assert record["outcome"] == "failed"
-    assert record["failure_code"] == "storage_error"
+    assert record == {
+        "timestamp": record["timestamp"],
+        "project_id": runner.project_id,
+        "session_id": SESSION,
+        "seq_start": 1,
+        "seq_end": 1,
+        "outcome": "no_change",
+    }
 
 
 @pytest.mark.asyncio
@@ -1407,10 +1411,20 @@ async def test_commit_failure_writes_no_success_diagnostic(
     await runner.drain()
 
     diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
-    records = [json.loads(line) for line in diagnostics.read_text(encoding="utf-8").splitlines()]
-    assert records
-    assert all(record["outcome"] == "failed" for record in records)
-    assert {record["failure_code"] for record in records} == {"commit_error"}
+    records = [
+        json.loads(line) for line in diagnostics.read_text(encoding="utf-8").splitlines()
+    ]
+    assert records == [
+        {
+            "timestamp": records[0]["timestamp"],
+            "project_id": project_id,
+            "session_id": SESSION,
+            "seq_start": 1,
+            "seq_end": 1,
+            "attempt_count": 1,
+            "outcome": "failed",
+        }
+    ]
     assert runner.last_reconciled_seq == 0
     assert registry.memory_snapshot(project_id).contents["decisions.md"] == "# Decisions\n"
 
@@ -1438,11 +1452,15 @@ async def test_failure_writes_persistent_file_log_without_stderr(
     records = diagnostics.read_text(encoding="utf-8").splitlines()
     assert len(records) == 1
     record = json.loads(records[0])
-    assert record["failure_code"] == "invalid_response"
-    assert "validation_summary" not in record
-    assert record["outcome"] == "failed"
-    assert record["usage"] == {"input_tokens": 4, "output_tokens": 2}
-    assert record["attempt_count"] == 1
+    assert record == {
+        "timestamp": record["timestamp"],
+        "project_id": runner.project_id,
+        "session_id": SESSION,
+        "seq_start": 1,
+        "seq_end": 1,
+        "attempt_count": 1,
+        "outcome": "failed",
+    }
     assert capsys.readouterr().err == ""
 
 
@@ -1616,7 +1634,6 @@ async def test_repartitioned_retry_replaces_original_failure(
         seq_start=1,
         seq_end=2,
         validation_summary="initial failure",
-        failure_code="provider_error",
         reason="eviction",
         usage={},
         retry_backoff_seconds=10,
@@ -1672,7 +1689,6 @@ async def test_drain_bounds_attempts_when_retry_key_stays_due(
         seq_start=1,
         seq_end=1,
         validation_summary="initial failure",
-        failure_code="provider_error",
         reason="eviction",
         usage={},
         retry_backoff_seconds=0,

@@ -15,23 +15,13 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from ..providers.stream_diagnostics import write_stream_diagnostic
 
 MAX_SCHEDULED_ATTEMPTS = 3
 _MAX_RECENT_TERMINAL_RECEIPTS = 100
 _MAX_RECEIPT_ARCHIVE_BYTES = 4 * 1024 * 1024
-
-# Closed, content-free codes written to the home-level health log.
-FailureCode = Literal[
-    "provider_error",
-    "invalid_response",
-    "request_too_large",
-    "commit_error",
-    "storage_error",
-]
-
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationFailure:
@@ -86,7 +76,6 @@ class ReconciliationOutcome:
     usage: Mapping[str, int]
     entries: int | None = None
     validation_summary: str | None = None
-    failure_code: FailureCode | None = None
     terminal: bool = False
 
 
@@ -172,7 +161,6 @@ class ReconciliationState:
         seq_start: int,
         seq_end: int,
         validation_summary: str,
-        failure_code: FailureCode,
         reason: str,
         usage: Mapping[str, int],
         retry_backoff_seconds: float,
@@ -243,9 +231,7 @@ class ReconciliationState:
         )
         self._value["last_failure"] = self._failure_dict(failure)
         self._publish(reason)
-        self._write_diagnostic(
-            failure, failure_code, key, attempt_count, aggregated_usage
-        )
+        self._write_diagnostic(failure, attempt_count)
         return failure
 
     def record_success(
@@ -291,7 +277,6 @@ class ReconciliationState:
                 seq_start=seq_start,
                 seq_end=seq_end,
                 entries=entries,
-                usage=usage,
                 occurred_at=occurred_at,
             )
 
@@ -342,9 +327,7 @@ class ReconciliationState:
         self._remove_archived_receipt(key)
 
         failures: list[ReconciliationFailure] = []
-        diagnostics: list[
-            tuple[ReconciliationFailure, FailureCode, str, int, dict[str, int]]
-        ] = []
+        diagnostics: list[tuple[ReconciliationFailure, int]] = []
         successes: list[ReconciliationOutcome] = []
         for outcome in outcomes:
             if outcome.validation_summary is None:
@@ -360,8 +343,6 @@ class ReconciliationState:
                     successes.append(outcome)
                 continue
 
-            if outcome.failure_code is None:
-                raise ValueError("failed retry outcome requires a failure code")
             outcome_key = (
                 key
                 if (outcome.seq_start, outcome.seq_end)
@@ -411,9 +392,7 @@ class ReconciliationState:
                 terminal=terminal,
             )
             failures.append(failure)
-            diagnostics.append(
-                (failure, outcome.failure_code, outcome_key, attempt_count, usage)
-            )
+            diagnostics.append((failure, attempt_count))
 
         if failures:
             self._value["last_failure"] = self._failure_dict(failures[-1])
@@ -713,9 +692,7 @@ class ReconciliationState:
     def _write_outcome_diagnostics(
         self,
         successes: list[ReconciliationOutcome],
-        failures: list[
-            tuple[ReconciliationFailure, FailureCode, str, int, dict[str, int]]
-        ],
+        failures: list[tuple[ReconciliationFailure, int]],
         occurred_at: str,
     ) -> None:
         for outcome in successes:
@@ -723,37 +700,26 @@ class ReconciliationState:
                 seq_start=outcome.seq_start,
                 seq_end=outcome.seq_end,
                 entries=outcome.entries or 0,
-                usage=outcome.usage,
                 occurred_at=occurred_at,
             )
-        for failure, failure_code, outcome_key, attempt_count, usage in failures:
-            self._write_diagnostic(
-                failure, failure_code, outcome_key, attempt_count, usage
-            )
+        for failure, attempt_count in failures:
+            self._write_diagnostic(failure, attempt_count)
 
     def _write_diagnostic(
         self,
         failure: ReconciliationFailure,
-        failure_code: FailureCode,
-        key: str,
         attempt_count: int,
-        usage: Mapping[str, int],
     ) -> None:
         write_stream_diagnostic(
             self.diagnostics_path,
             {
                 "timestamp": failure.occurred_at,
-                "cause": "memory_reconciliation_failure",
-                "outcome": "failed",
                 "project_id": self.project_id,
                 "session_id": self.session_id,
-                "reconciliation_key": key,
                 "seq_start": failure.seq_start,
                 "seq_end": failure.seq_end,
                 "attempt_count": attempt_count,
-                "terminal": failure.terminal,
-                "failure_code": failure_code,
-                "usage": self._valid_usage(usage),
+                "outcome": "failed",
             },
         )
 
@@ -763,18 +729,15 @@ class ReconciliationState:
         seq_start: int,
         seq_end: int,
         entries: int,
-        usage: Mapping[str, int],
         occurred_at: str,
     ) -> None:
         record: dict[str, object] = {
             "timestamp": occurred_at,
             "project_id": self.project_id,
             "session_id": self.session_id,
-            "reconciliation_key": self.reconciliation_key(seq_start, seq_end),
             "seq_start": seq_start,
             "seq_end": seq_end,
             "outcome": "applied" if entries else "no_change",
-            "usage": self._valid_usage(usage),
         }
         if entries:
             record["entries"] = entries
