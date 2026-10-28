@@ -8,11 +8,13 @@ import pytest
 import zeta.core.session as core_session
 from tests.support.credentials import named_account_credentials
 from zeta.accounts import AccountId, AccountStore
+from zeta.cli.main import main
 from zeta.config.settings import load_settings
 from zeta.core.session import SessionManager, env_home
 from zeta.oauth import OAuthTokens
 from zeta.project_registry import ProjectRegistry
 from zeta.providers.factory import build_backend, credential_store
+from zeta.providers.stream_diagnostics import write_stream_diagnostic
 
 
 def _tokens(access: str, refresh: str, expires_at: float = 4_000_000_000) -> OAuthTokens:
@@ -68,6 +70,43 @@ async def test_refresh_writes_token_and_lock_to_account_home(
     assert not (zeta_home / "account-locks").exists()
 
 
+def test_provider_runtime_state_stays_in_zeta_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    zeta_home = tmp_path / "zeta"
+    account_home = tmp_path / "accounts"
+    zeta_home.mkdir()
+    account_home.mkdir()
+    (zeta_home / "settings.toml").write_text(
+        'ollama_base_url = "http://runtime.example"\n'
+    )
+    (account_home / "settings.toml").write_text(
+        'ollama_base_url = "http://account.example"\n'
+    )
+    named_account_credentials(account_home, "anthropic", "work").save(
+        _tokens("claude-access", "claude-refresh")
+    )
+    named_account_credentials(account_home, "codex", "work").save(
+        _tokens("codex-access", "codex-refresh")
+    )
+    monkeypatch.setenv("ZETA_HOME", str(zeta_home))
+    monkeypatch.setenv("ZETA_ACCOUNT_HOME", str(account_home))
+
+    ollama, _ = build_backend("ollama", None)
+    claude, _ = build_backend("claude", None)
+    codex, _ = build_backend("codex", None)
+
+    assert ollama.base_url == "http://runtime.example"
+    assert claude.token_store.path.is_relative_to(account_home)
+    assert codex.token_store.path.is_relative_to(account_home)
+    for backend in (claude, codex):
+        write_stream_diagnostic(backend.diagnostics_path, {"provider": backend.model})
+        assert backend.diagnostics_path == zeta_home / "logs/stream-diagnostics.jsonl"
+    assert (zeta_home / "logs/stream-diagnostics.jsonl").is_file()
+    assert not (account_home / "logs").exists()
+    assert not (account_home / "accounts/codex/work/logs").exists()
+
+
 def test_non_account_state_stays_in_zeta_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -102,6 +141,30 @@ def test_account_home_expands_user(
     monkeypatch.setenv("ZETA_ACCOUNT_HOME", "~/shared-accounts")
 
     assert core_session.account_home() == tmp_path / "shared-accounts"
+
+
+@pytest.mark.parametrize(
+    ("argv", "prefix"),
+    [
+        ([], "zeta:"),
+        (["serve", "--port", "0", "--provider", "ollama"], "zeta serve:"),
+    ],
+)
+def test_invalid_account_home_startup_is_one_line(
+    argv: list[str],
+    prefix: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("ZETA_ACCOUNT_HOME", "relative/accounts")
+
+    assert main(argv) != 0
+
+    stderr = capsys.readouterr().err
+    assert stderr.splitlines() == [
+        f"{prefix} ZETA_ACCOUNT_HOME must be an absolute path"
+    ]
+    assert "Traceback" not in stderr
 
 
 @pytest.mark.parametrize("value", ["", "relative/accounts"])

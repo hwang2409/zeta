@@ -15,7 +15,7 @@ from pathlib import Path
 from ..accounts import AccountCredentials, AccountId, AccountStore
 from ..codex import CodexCredentialDriver
 from ..config.settings import load_settings
-from ..core.session import account_home
+from ..core.session import account_home, env_home
 from ..core.slash import budget_for_model, effective_budget_for_model
 from ..models.catalog import provider_for_model
 from ..protocol.types import CompletionBackend
@@ -64,7 +64,7 @@ def credential_store(
 
 
 def _anthropic_credential(
-    auth_home: Path, account: AccountId | None = None
+    runtime_home: Path, account: AccountId | None = None
 ) -> AnthropicCredential:
     """Pick Claude's credential source, defaulting to subscription OAuth.
 
@@ -74,7 +74,7 @@ def _anthropic_credential(
     """
 
     if os.environ.get(API_KEY_OPT_IN_VAR) != "1":
-        credential = credential_store("claude", home=auth_home, account=account)
+        credential = credential_store("claude", home=runtime_home, account=account)
         assert credential is not None
         return credential
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -101,7 +101,7 @@ def build_backend(
 ) -> tuple[CompletionBackend, str]:
     """Build a network provider backend and report the model it settled on."""
 
-    auth_home = account_home(home)
+    runtime_home = Path(home) if home is not None else env_home()
     stall_kwargs = {
         "stall_seconds": (
             DEFAULT_STREAM_STALL_SECONDS if stall_seconds is None else stall_seconds
@@ -111,18 +111,18 @@ def build_backend(
         ),
     }
     if provider == "claude":
-        credential = _anthropic_credential(auth_home, account)
+        credential = _anthropic_credential(runtime_home, account)
         selected_model = model or DEFAULT_CLAUDE_MODEL
         if require_credentials:
             _require_credentials(credential)
         return AnthropicBackend(
             model=selected_model,
             token_store=credential,
-            diagnostics_path=auth_home / "logs" / "stream-diagnostics.jsonl",
+            diagnostics_path=runtime_home / "logs" / "stream-diagnostics.jsonl",
             **stall_kwargs,
         ), selected_model
     if provider == "codex":
-        credential = credential_store("codex", home=auth_home, account=account)
+        credential = credential_store("codex", home=runtime_home, account=account)
         assert credential is not None
         if require_credentials:
             _require_credentials(credential)
@@ -130,11 +130,12 @@ def build_backend(
         return CodexBackend(
             model=selected_model,
             token_store=credential,
+            diagnostics_path=runtime_home / "logs" / "stream-diagnostics.jsonl",
             **stall_kwargs,
         ), selected_model
     if provider == "ollama":
         selected_model = model or DEFAULT_OLLAMA_MODEL
-        configured_url = load_settings(home=auth_home).settings.ollama_base_url
+        configured_url = load_settings(home=runtime_home).settings.ollama_base_url
         base_url = (
             ollama_base_url
             or os.environ.get("ZETA_OLLAMA_BASE_URL")

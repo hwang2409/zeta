@@ -667,11 +667,10 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 cli_yolo=args.yolo,
             )
+            asyncio.run(run_server(server))
         except (SessionError, ValueError) as exc:
             print(f"zeta serve: {exc}", file=sys.stderr)
             return 2
-        try:
-            asyncio.run(run_server(server))
         except KeyboardInterrupt:
             return 130
         return 0
@@ -693,6 +692,9 @@ def main(argv: list[str] | None = None) -> int:
                 app = create_app(args)
         except SessionError as exc:
             parser.error(str(exc))
+        except ValueError as exc:
+            print(f"zeta: {exc}", file=sys.stderr)
+            return 1
         try:
             with patch_stdout(raw=True):
                 asyncio.run(_run_tui(app, args))
