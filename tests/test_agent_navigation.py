@@ -56,7 +56,7 @@ pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
 
 @pytest.fixture(autouse=True)
-def close_direct_transcript_controls(monkeypatch: pytest.MonkeyPatch):
+async def close_direct_transcript_controls(monkeypatch: pytest.MonkeyPatch):
     controls: list[AgentTranscriptControl] = []
     control_init = AgentTranscriptControl.__init__
 
@@ -67,9 +67,7 @@ def close_direct_transcript_controls(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(AgentTranscriptControl, "__init__", tracked_init)
     yield
     for control in reversed(controls):
-        source, control._source = control._source, None
-        if source is not None:
-            source.close()
+        await control.close()
 
 
 def _child(
@@ -505,8 +503,8 @@ def test_navigation_close_releases_selected_child_todo_lease(tmp_path: Path) -> 
     child_store = source._store
     assert child_store is not None
 
-    navigation.close()
-    navigation.close()
+    asyncio.run(navigation.close())
+    asyncio.run(navigation.close())
 
     assert child_store._closed
     root.close()
@@ -570,7 +568,7 @@ def test_todo_child_without_state_yet_shows_no_todos(
     child.joinpath("session_state.json").unlink()
     navigation.refresh(force=True)
     assert navigation.todo_snapshot().unavailable
-    navigation.close()
+    asyncio.run(navigation.close())
     root.close()
 
 
@@ -584,7 +582,7 @@ def test_todo_missing_child_directory_is_unavailable(tmp_path: Path) -> None:
     navigation.refresh(force=True)
     snapshot = navigation.todo_snapshot()
     assert snapshot is not None and snapshot.unavailable
-    navigation.close()
+    asyncio.run(navigation.close())
     root.close()
 
 

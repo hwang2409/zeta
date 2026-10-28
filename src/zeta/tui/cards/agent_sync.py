@@ -221,16 +221,17 @@ class AgentTodoControl:
         self._snapshot_path = None
         self.request(None, invalidate)
 
-    def close(self) -> None:
+    async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         self._refresh_requested = False
-        if self._task is not None:
+        if self._task is not None and not self._task.done():
             self._task.cancel()
-        if self._source is not None:
-            self._source.close()
-        self._source = None
+            await asyncio.gather(self._task, return_exceptions=True)
+        source, self._source = self._source, None
+        if source is not None:
+            await asyncio.to_thread(source.close)
         self._snapshot = None
         self._snapshot_path = None
 

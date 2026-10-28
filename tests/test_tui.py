@@ -96,6 +96,7 @@ from zeta.tui.app import (
     background_notice,
     build_backend,
 )
+from zeta.tui.cards import agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
@@ -10790,6 +10791,132 @@ async def test_approval_shortcuts_only_fire_on_an_empty_composer() -> None:
         await asyncio.gather(task, return_exceptions=True)
 
 
+def _fd_count() -> int:
+    for directory in ("/proc/self/fd", "/dev/fd"):
+        try:
+            return len(os.listdir(directory))
+        except OSError:
+            continue
+    pytest.skip("file descriptor directory is unavailable")
+
+
+@pytest.mark.asyncio
+async def test_tui_close_rejects_inflight_transcript_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
+    child.close()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    baseline = _fd_count()
+    opened = threading.Event()
+    release = threading.Event()
+    sources: list[agent_sync.AgentTranscriptSource] = []
+    original_init = agent_sync.AgentTranscriptSource.__init__
+    original_refresh = agent_sync.AgentTranscriptSource.refresh
+
+    def record_init(source, *args, **kwargs) -> None:
+        original_init(source, *args, **kwargs)
+        sources.append(source)
+
+    def gated_refresh(source, *args, **kwargs):
+        tree = original_refresh(source, *args, **kwargs)
+        opened.set()
+        assert release.wait(5)
+        return tree
+
+    monkeypatch.setattr(agent_sync.AgentTranscriptSource, "__init__", record_init)
+    monkeypatch.setattr(agent_sync.AgentTranscriptSource, "refresh", gated_refresh)
+    app._agent_navigation.selected_index = 1
+    app._agent_navigation.open_selected()
+    await wait_until(opened.is_set)
+
+    close_task = asyncio.create_task(app.close())
+    await asyncio.sleep(0)
+    assert not close_task.done()
+    release.set()
+    await close_task
+
+    assert sources and sources[0]._closed
+    assert sources[0]._stores == {}
+    assert app._agent_navigation.transcript_control._source is None
+    assert _fd_count() <= baseline
+
+
+@pytest.mark.asyncio
+async def test_transcript_source_close_runs_off_event_loop() -> None:
+    control = AgentTranscriptControl()
+    loop_thread = threading.get_ident()
+    lock_threads: list[int] = []
+    store_threads: list[int] = []
+
+    class RecordingLock:
+        def __enter__(self):
+            lock_threads.append(threading.get_ident())
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    class RecordingStore:
+        def close(self) -> None:
+            store_threads.append(threading.get_ident())
+
+    class RecordingSource:
+        path = Path("child")
+
+        def close(self) -> None:
+            with RecordingLock():
+                RecordingStore().close()
+
+    control._source = RecordingSource()
+    await control.close()
+    await control.close()
+
+    assert lock_threads and all(thread != loop_thread for thread in lock_threads)
+    assert store_threads == lock_threads
+
+
+@pytest.mark.asyncio
+async def test_repeated_child_navigation_tui_close_restores_fd_count(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
+    child.close()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    baseline = _fd_count()
+    navigation = app._agent_navigation
+
+    for _ in range(8):
+        navigation.selected_index = 1
+        navigation.open_selected()
+        assert navigation.transcript_control._sync_task is not None
+        await navigation.transcript_control._sync_task
+        navigation.exit_navigation()
+
+    await app.close()
+
+    assert navigation.transcript_control._closed
+    assert navigation.transcript_control._source is None
+    assert _fd_count() <= baseline
+
+
 @pytest.mark.asyncio
 async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
@@ -10956,7 +11083,7 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
         session.app.exit()
         await task
 
-    navigation.close()
+    await navigation.close()
     assert navigation.transcript_control._source is None
     grandchild.close()
     child.close()

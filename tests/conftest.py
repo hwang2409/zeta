@@ -525,6 +525,30 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
         item.session.shouldstop = breach
 
 
+def _format_retained_counts() -> str:
+    if not _FD_RETAINED_COUNTS:
+        return "start=0 end=0 max=0 q1_median=0.0 q4_median=0.0"
+    quarter = max(1, len(_FD_RETAINED_COUNTS) // 4)
+    start = _FD_START_COUNT if _FD_START_COUNT is not None else 0
+    return (
+        f"start={start} end={_FD_RETAINED_COUNTS[-1]} "
+        f"max={max(_FD_RETAINED_COUNTS)} "
+        f"q1_median={median(_FD_RETAINED_COUNTS[:quarter]):.1f} "
+        f"q4_median={median(_FD_RETAINED_COUNTS[-quarter:]):.1f}"
+    )
+
+
+def _format_retained_max() -> str:
+    if _FD_RETAINED_MAX is None:
+        return "none"
+    nodeid, count, highest, added = _FD_RETAINED_MAX
+    grouped = _group_fds_by_path_prefix(added) if added else "none"
+    return (
+        f"nodeid={nodeid} open={count} highest={highest} "
+        f"added_grouped={grouped}"
+    )
+
+
 def _fd_summary() -> str:
     worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
     persistent_owners = Counter(owner for _description, owner in _FD_OWNERS.values())
@@ -537,28 +561,9 @@ def _fd_summary() -> str:
         for count, nodeid, grouped in top
     )
     breach = _FD_BREACHES[0] if _FD_BREACHES else "none"
-    if _FD_RETAINED_MAX is not None:
-        nodeid, count, highest, added = _FD_RETAINED_MAX
-        retained_max = (
-            f"nodeid={nodeid} open={count} highest={highest} "
-            f"added_grouped={_group_fds_by_path_prefix(added) if added else 'none'}"
-        )
-    else:
-        retained_max = "none"
-    if _FD_RETAINED_COUNTS:
-        quarter = max(1, len(_FD_RETAINED_COUNTS) // 4)
-        start = _FD_START_COUNT if _FD_START_COUNT is not None else 0
-        retained = (
-            f"start={start} end={_FD_RETAINED_COUNTS[-1]} "
-            f"max={max(_FD_RETAINED_COUNTS)} "
-            f"q1_median={median(_FD_RETAINED_COUNTS[:quarter]):.1f} "
-            f"q4_median={median(_FD_RETAINED_COUNTS[-quarter:]):.1f}"
-        )
-    else:
-        retained = "start=0 end=0 max=0 q1_median=0.0 q4_median=0.0"
     return (
-        f"fd-summary worker={worker} retained_open=[{retained}] "
-        f"retained_max=[{retained_max}] "
+        f"fd-summary worker={worker} retained_open=[{_format_retained_counts()}] "
+        f"retained_max=[{_format_retained_max()}] "
         f"persistent_owners=[{persistent}] "
         f"top_retained_additions=[{offenders}] breach=[{breach}]"
     )
