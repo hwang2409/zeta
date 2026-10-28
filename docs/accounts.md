@@ -210,9 +210,33 @@ zeta accounts logout anthropic:work
 call and creates no session. for each account it reports the provider, account
 label, default state, login state, and access-token expiry. `--refresh` uses the
 normal locked OAuth refresh path, including token rotation, and adds a safe
-refresh result without printing credentials. exit status `0` means every selected
-account is logged in and every requested refresh succeeded. exit status `1` means
-there are no selected accounts, a login is missing, or a refresh failed.
+refresh result without printing credentials.
+
+`status --json` returns an array with one object per selected account. each object
+has this closed schema:
+
+- `provider`: `"anthropic"` or `"codex"`.
+- `account`: the account label.
+- `is_default`: boolean.
+- `logged_in`: boolean, or `null` when a lock timeout makes the state unknown.
+- `access_token_expires_at`: an RFC 3339 UTC string, or `null` when missing or
+  unknown.
+- `error`, when present: `"invalid_credentials"` or `"lock_timeout"`.
+- `retryable`, present with `error: "lock_timeout"`: `true`.
+- `refresh`, present with `--refresh`: an object with boolean `ok`, `code`, and
+  `retryable`. `code` is `null` on success, `"auth_error"` for a rejected or
+  missing login, or `"http_error"` for other HTTP failures. `retryable` is a
+  boolean only for `"http_error"`; otherwise it is `null`.
+
+The exhaustive safe failure values across `error` and `refresh.code` are
+`invalid_credentials`, `lock_timeout`, `auth_error`, and `http_error`. no
+exception message or credential content is included. a lock timeout leaves
+`logged_in` unknown instead of claiming that the account is logged out.
+
+Exit status `0` means every selected account is logged in and every requested
+refresh succeeded. exit status `1` means there are no selected accounts, a login
+is missing or invalid, a credential lock timed out, or a refresh failed. parse
+errors reported by argparse retain exit status `2`.
 
 `default` changes the global default, which a session uses only when it has no
 saved selection at load (see the session-load rule above). `switch` is reserved for

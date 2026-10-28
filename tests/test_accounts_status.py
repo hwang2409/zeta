@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -161,6 +165,75 @@ def test_accounts_status_missing_login_is_nonzero(
     [status] = json.loads(capsys.readouterr().out)
     assert status["logged_in"] is False
     assert status["access_token_expires_at"] is None
+
+
+def test_accounts_status_lock_timeout_keeps_json_valid_and_reports_other_accounts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    locked = AccountId("codex", "locked")
+    _save_account(tmp_path, name=locked.name)
+    _save_account(tmp_path, name="healthy")
+    ready = tmp_path / "lock-ready"
+    release = tmp_path / "lock-release"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys,time; from pathlib import Path; "
+                "from zeta.accounts import AccountId,AccountStore; "
+                "home,ready,release=map(Path,sys.argv[1:]); "
+                "account=AccountId('codex','locked'); "
+                "guard=AccountStore(home).lifecycle_guard(account); "
+                "guard.__enter__(); ready.touch(); "
+                "\nwhile not release.exists(): time.sleep(0.01)\n"
+                "guard.__exit__(None,None,None)"
+            ),
+            str(tmp_path),
+            str(ready),
+            str(release),
+        ]
+    )
+    deadline = time.monotonic() + 10
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists()
+    monkeypatch.setattr(
+        cli_main, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.1, raising=False
+    )
+    fallback_release = threading.Timer(1, release.touch)
+    fallback_release.start()
+
+    started = time.monotonic()
+    try:
+        assert _run_json(tmp_path, monkeypatch) == 1
+    finally:
+        release.touch()
+        fallback_release.cancel()
+        fallback_release.join(timeout=2)
+        process.wait(timeout=10)
+    assert process.returncode == 0
+    assert time.monotonic() - started < 0.5
+    assert json.loads(capsys.readouterr().out) == [
+        {
+            "provider": "codex",
+            "account": "healthy",
+            "is_default": False,
+            "logged_in": True,
+            "access_token_expires_at": "2286-11-20T17:46:39Z",
+        },
+        {
+            "provider": "codex",
+            "account": "locked",
+            "is_default": True,
+            "logged_in": None,
+            "access_token_expires_at": None,
+            "error": "lock_timeout",
+            "retryable": True,
+        },
+    ]
 
 
 def test_accounts_status_corrupt_login_keeps_json_valid_and_reports_other_accounts(

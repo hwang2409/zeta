@@ -236,11 +236,10 @@ class AccountStore:
 
     def list_display(self) -> list[AccountDisplay]:
         result = []
+        catalog = self.list_catalog()
         with self._home() as home_fd:
-            value = self._read_registry(home_fd)
-            for key in value["accounts"]:
-                account = AccountId(*key.split(":", 1))
-                tokens = _read_account_tokens(home_fd, account)
+            for item in catalog:
+                tokens = _read_account_tokens(home_fd, item.account)
                 details = (
                     tuple(filter(None, (tokens.email, tokens.workspace)))
                     if tokens
@@ -250,10 +249,10 @@ class AccountStore:
 
                 result.append(
                     AccountDisplay(
-                        account,
-                        value["labels"].get(key, account.name),
+                        item.account,
+                        item.label,
                         " · ".join(details) or None,
-                        read_usage(self, account),
+                        read_usage(self, item.account),
                     )
                 )
         return result
@@ -572,8 +571,10 @@ class AccountCredentials:
         self.provider_label = driver.provider_label
         self._async_lock = asyncio.Lock()
 
-    def read(self) -> OAuthTokens | None:
-        with self.store.lifecycle_guard(self.account) as home_fd:
+    def read(self, *, lock_timeout: float | None = None) -> OAuthTokens | None:
+        with self.store.lifecycle_guard(
+            self.account, timeout=lock_timeout
+        ) as home_fd:
             return _read_account_tokens(home_fd, self.account)
 
     def save(

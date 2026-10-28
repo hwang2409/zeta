@@ -29,8 +29,8 @@ class FixtureAccountCredentials(AccountCredentials):
             raise error[0]
         return result[0] if result else None
 
-    def read(self):
-        return self._thread_call(super().read)
+    def read(self, **kwargs: Any):
+        return self._thread_call(super().read, **kwargs)
 
     def save(self, *args: Any, **kwargs: Any) -> None:
         self._thread_call(super().save, *args, **kwargs)
