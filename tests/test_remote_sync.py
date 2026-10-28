@@ -570,15 +570,18 @@ def test_opposite_direction_memory_syncs_do_not_deadlock(tmp_path: Path) -> None
             process.join(timeout=1)
 
 
+@pytest.mark.parametrize(
+    "temporary_suffix", ["6034", f"zeta-atomic-{uuid.uuid4().hex}"]
+)
 def test_project_snapshot_ignores_disappearing_atomic_temporary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, temporary_suffix: str
 ) -> None:
     source = tmp_path / "source" / "p_test"
     sync = source / "sync"
     sync.mkdir(parents=True)
     (source / "project.json").write_text("{}", encoding="utf-8")
     expected_digest = project_digest(source)
-    temporary = sync / f".peer.json.{uuid.uuid4().hex}.tmp"
+    temporary = sync / f".peer.json.{temporary_suffix}.tmp"
     temporary.write_text("in flight\n", encoding="utf-8")
     real_is_file = Path.is_file
 

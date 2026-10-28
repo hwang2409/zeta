@@ -37,7 +37,8 @@ MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions
 _MIRROR_TEMPORARY = re.compile(
     rf"\.{project_schema.KIND_KEY_PATTERN}\.md\.[0-9a-f]{{32}}\.tmp"
 )
-_ATOMIC_TEMPORARY = re.compile(r"^\..+\.(?:[0-9]+|[0-9a-f]{32})\.tmp$")
+_ATOMIC_TEMPORARY = re.compile(r"^\..+\.zeta-atomic-[0-9a-f]{32}\.tmp$")
+_LEGACY_SYNC_TEMPORARY = re.compile(r"^\..+\.json\.[0-9]+\.tmp$")
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
 _MAX_HISTORY = 128
@@ -303,6 +304,13 @@ def _is_memory_mirror_temporary(root: Path, path: Path) -> bool:
     )
 
 
+def _is_atomic_temporary(root: Path, path: Path) -> bool:
+    return bool(_ATOMIC_TEMPORARY.fullmatch(path.name)) or (
+        path.parent == root / "sync"
+        and bool(_LEGACY_SYNC_TEMPORARY.fullmatch(path.name))
+    )
+
+
 def project_digest(root: Path) -> str:
     if not root.exists():
         return _MISSING
@@ -310,7 +318,7 @@ def project_digest(root: Path) -> str:
     paths = (
         path
         for path in root.rglob("*")
-        if not _ATOMIC_TEMPORARY.fullmatch(path.name)
+        if not _is_atomic_temporary(root, path)
         and path.is_file()
         and not _is_memory_mirror_temporary(root, path)
         and not path.is_symlink()
