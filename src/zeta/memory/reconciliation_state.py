@@ -29,6 +29,7 @@ FailureCode = Literal[
     "invalid_response",
     "request_too_large",
     "commit_error",
+    "storage_error",
 ]
 
 
@@ -293,6 +294,20 @@ class ReconciliationState:
                 usage=usage,
                 occurred_at=occurred_at,
             )
+
+    def record_pause(self, *, provider: str, occurred_at: str) -> None:
+        """Publish one content-free login-required pause health row."""
+        write_stream_diagnostic(
+            self.diagnostics_path,
+            {
+                "timestamp": occurred_at,
+                "project_id": self.project_id,
+                "session_id": self.session_id,
+                "outcome": "paused",
+                "pause_code": "login_required",
+                "provider": provider,
+            },
+        )
 
     def record_retry_outcomes(
         self,

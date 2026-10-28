@@ -29,6 +29,7 @@ from .profiles import early_update_debounce_seconds, early_update_max_wait_secon
 from .reconciler import (
     ReconciliationError,
     ReconciliationResponse,
+    RequestTooLargeError,
     Transcript,
     parse_proposal,
     prepare_request,
@@ -68,13 +69,17 @@ def _failure_summary(error: Exception) -> str:
 
 
 def _failure_code(error: Exception) -> FailureCode:
-    if str(error) == "user row exceeds the request limit":
-        return "request_too_large"
     cause = error.__cause__
-    if str(error) == "project memory update failed" or isinstance(
+    if isinstance(error, RequestTooLargeError):
+        return "request_too_large"
+    if isinstance(error, ReconciliationError) and isinstance(
         cause, ProjectRegistryError
     ):
         return "commit_error"
+    if isinstance(error, (ProjectRegistryError, OSError)) or isinstance(
+        cause, OSError
+    ):
+        return "storage_error"
     if (
         isinstance(error, EntryReconciliationFailure)
         and cause is not None
@@ -417,6 +422,11 @@ class AutoMemoryReconciler:
                     await self._reconcile_range(item)
                     self._conflict_retries = 0
                 except ProviderLoginRequiredError:
+                    await asyncio.to_thread(
+                        self.state.record_pause,
+                        provider=self.config.provider,
+                        occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                    )
                     self._pause_for_login()
                     return
                 except _ConcurrentMemoryUpdate:
@@ -646,10 +656,7 @@ class AutoMemoryReconciler:
                     raise
                 except Exception as unit_error:  # noqa: BLE001 - durable failure receipt
                     failure = unit_error
-                    terminal_failure = (
-                        isinstance(unit_error, ReconciliationError)
-                        and str(unit_error) == "user row exceeds the request limit"
-                    )
+                    terminal_failure = isinstance(unit_error, RequestTooLargeError)
                     break
             else:
                 raise _ConcurrentMemoryUpdate

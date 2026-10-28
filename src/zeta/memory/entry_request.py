@@ -14,6 +14,7 @@ from typing import Any
 from .entry_store import MAX_ENTRY_TEXT_BYTES, MemoryEntry, MemoryState
 from .reconciler import (
     ReconciliationError,
+    RequestTooLargeError,
     Transcript,
     _bounded_value,
     _is_lossy_generated_row,
@@ -411,7 +412,7 @@ def _prepare_request(
     if safe_rows and not selected_count:
         safe = safe_rows[0]
         if _is_user_authored_row(safe):
-            raise ReconciliationError("user row exceeds the request limit")
+            raise RequestTooLargeError("user row exceeds the request limit")
         data = safe.get("data")
         message = data.get("message") if isinstance(data, Mapping) else None
         if not (

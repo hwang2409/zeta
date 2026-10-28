@@ -84,10 +84,12 @@ Use `--no-auto-memory` or `--auto-memory` for one session.
 Each model-backed pass appends a content-free health record to
 `<ZETA_HOME>/logs/memory-reconciliation.jsonl` after its memory decision and
 cursor are durable. Records report an `applied`, `no_change`, or `failed`
-outcome and token usage. Failed records use one of four fixed codes:
-`provider_error`, `invalid_response`, `request_too_large`, or `commit_error`.
-Detailed failure text remains only in the session-private
-`memory-reconcile-errors.jsonl` file (mode `0600`).
+outcome and token usage. A login-required pause reports `paused` once with the
+fixed pause code `login_required`. Failed records use one of five fixed codes:
+`provider_error`, `invalid_response`, `request_too_large`, `commit_error`, or
+`storage_error`. Detailed failure text remains only in the session-private
+`memory-reconcile.json`, `memory-reconcile-errors.jsonl`, and
+`memory-reconcile-receipts.jsonl` files, all with mode `0600`.
 
 The shared diagnostics writer rotates the health file at 1 MiB and keeps one
 previous file. The guaranteed look-back after rotation is about one full file,

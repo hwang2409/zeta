@@ -180,6 +180,18 @@ async def test_refresh_invalid_grant_pauses_session_without_retry_or_cursor_adva
         "Reconciliation will retry when this session next starts."
     )
     assert notices == [expected_notice]
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = diagnostics.read_text(encoding="utf-8").splitlines()
+    assert len(records) == 1
+    record = json.loads(records[0])
+    assert record == {
+        "timestamp": record["timestamp"],
+        "project_id": runner.project_id,
+        "session_id": SESSION,
+        "outcome": "paused",
+        "pause_code": "login_required",
+        "provider": provider,
+    }
 
     runner.before_eviction(2, 2)
     await runner.drain()
@@ -187,6 +199,7 @@ async def test_refresh_invalid_grant_pauses_session_without_retry_or_cursor_adva
     assert calls == 1
     assert runner.last_reconciled_seq == 0
     assert len(notices) == 1
+    assert diagnostics.read_text(encoding="utf-8").splitlines() == records
     assert not runner.position_path.exists()
 
 
@@ -1308,6 +1321,35 @@ async def test_no_change_pass_writes_success_diagnostic(tmp_path: Path) -> None:
     assert record["seq_end"] == 1
     assert record["usage"] == {"input_tokens": 4, "output_tokens": 1}
     assert "entries" not in record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ProjectRegistryError("cannot open registry lock"),
+        TimeoutError("registry lock timed out"),
+        OSError("flock failed"),
+    ],
+)
+async def test_registry_failure_is_reported_as_storage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    runner, registry, _project_id, _notices = _runner(
+        tmp_path, transcript_count=1, minimum_interval=0, retry_backoff_seconds=60
+    )
+
+    def fail_snapshot(_project_id: str) -> None:
+        raise error
+
+    monkeypatch.setattr(registry, "memory_snapshot", fail_snapshot)
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    record = json.loads(diagnostics.read_text(encoding="utf-8"))
+    assert record["outcome"] == "failed"
+    assert record["failure_code"] == "storage_error"
 
 
 @pytest.mark.asyncio
