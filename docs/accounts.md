@@ -202,8 +202,17 @@ zeta accounts
 zeta accounts --json
 zeta accounts default anthropic:work
 zeta accounts refresh
+zeta accounts status [--refresh] [--json] [anthropic|codex]
 zeta accounts logout anthropic:work
 ```
+
+`status` is a cheap CLI-only credential check for watchdogs. it makes no model
+call and creates no session. for each account it reports the provider, account
+label, default state, login state, and access-token expiry. `--refresh` uses the
+normal locked OAuth refresh path, including token rotation, and adds a safe
+refresh result without printing credentials. exit status `0` means every selected
+account is logged in and every requested refresh succeeded. exit status `1` means
+there are no selected accounts, a login is missing, or a refresh failed.
 
 `default` changes the global default, which a session uses only when it has no
 saved selection at load (see the session-load rule above). `switch` is reserved for
