@@ -104,6 +104,45 @@ async def _bounded_finish_gate_cleanup(awaitable, action: str) -> None:
         )
 
 
+class _HeldFinishGateTaskDeadlines:
+    def __init__(self) -> None:
+        self.started: list[tuple[FinishGateState, float]] = []
+        self._held: set[int] = set()
+
+    def hold(self, state: FinishGateState, configured_timeout: float) -> None:
+        self.started.append((state, configured_timeout))
+        self._held.add(id(state))
+
+    def deadline(self, state: FinishGateState, fallback: float) -> float:
+        return float("inf") if id(state) in self._held else fallback
+
+    def expire(self, state: FinishGateState) -> None:
+        self._held.remove(id(state))
+        state.task_deadline = asyncio.get_running_loop().time()
+
+
+def _hold_finish_gate_task_deadlines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> _HeldFinishGateTaskDeadlines:
+    deadlines = _HeldFinishGateTaskDeadlines()
+    original_start = FinishGateState.start
+    original_task_deadline = FinishGateState._task_deadline
+
+    def start(state: FinishGateState, child_loop: AgentLoop) -> None:
+        starting = state.control is None
+        configured_timeout = child_loop._background_owner.finish_gate_task_timeout
+        original_start(state, child_loop)
+        if starting:
+            deadlines.hold(state, configured_timeout)
+
+    def task_deadline(state: FinishGateState) -> float:
+        return deadlines.deadline(state, original_task_deadline(state))
+
+    monkeypatch.setattr(FinishGateState, "start", start)
+    monkeypatch.setattr(FinishGateState, "_task_deadline", task_deadline)
+    return deadlines
+
+
 def _approval_capability(
     name: str, arguments: dict[str, object]
 ) -> ResolvedCapability:
@@ -8901,8 +8940,9 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
 
 @pytest.mark.asyncio
 async def test_finish_gate_task_deadline_starts_when_gate_starts(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     backend = _TaskFinishGateBackend(
         _python("import time; time.sleep(30)"), pause_before_gate=True
     )
@@ -8920,21 +8960,35 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
 
-    await asyncio.wait_for(backend.child_turn_paused.wait(), timeout=2)
-    owner.finish_gate_task_timeout = 0.08
-    backend.release_child_turn.set()
-    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
-    await asyncio.wait_for(run, timeout=2)
-    notification = await _wait_completion(store)
-    assert "finish-gate task safety bound expired" in notification.data["text"]
-    assert notification.data.get("killed_task_ids")
-    await loop.close()
+    try:
+        await asyncio.wait_for(backend.child_turn_paused.wait(), timeout=2)
+        assert deadlines.started == []
+        owner.finish_gate_task_timeout = 0.08
+        backend.release_child_turn.set()
+        await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+        assert len(deadlines.started) == 1
+        state, configured_timeout = deadlines.started[0]
+        assert configured_timeout == 0.08
+
+        deadlines.expire(state)
+        await asyncio.wait_for(run, timeout=2)
+        notification = await _wait_completion(store)
+        assert "finish-gate task safety bound expired" in notification.data["text"]
+        assert notification.data.get("killed_task_ids")
+    finally:
+        try:
+            await _bounded_finish_gate_cleanup(loop.close(), "close the agent loop")
+        finally:
+            await _bounded_finish_gate_cleanup(
+                asyncio.gather(run, return_exceptions=True), "finish the root turn"
+            )
 
 
 @pytest.mark.asyncio
 async def test_finish_gate_follow_up_keeps_original_task_deadline(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     backend = _TaskFinishGateBackend(_python("import time; time.sleep(30)"))
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(
@@ -8956,6 +9010,10 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
 
     try:
         await asyncio.wait_for(backend.gate_seen.wait(), timeout=10)
+        assert len(deadlines.started) == 1
+        state, configured_timeout = deadlines.started[0]
+        assert configured_timeout == 1
+        original_deadline = state.task_deadline
         owner.finish_gate_task_timeout = 10
         child_handle = next(iter(store.agent_children()))
         assert await send_to_run(
@@ -8965,7 +9023,12 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
             channel=owner.conversation_channel,
         ) is None
 
-        await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=10)
+        try:
+            await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=10)
+        except TimeoutError:
+            pytest.fail("finish-gate follow-up was not processed after its wake")
+        assert state.task_deadline == original_deadline
+        deadlines.expire(state)
         notification = await asyncio.wait_for(_wait_completion(store), timeout=2)
         assert "finish-gate task safety bound expired" in notification.data["text"]
         assert notification.data.get("killed_task_ids")
