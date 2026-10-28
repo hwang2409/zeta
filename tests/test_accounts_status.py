@@ -674,3 +674,46 @@ def test_accounts_status_provider_filter(
     empty_home = tmp_path / "empty"
     assert _run_json(empty_home, monkeypatch, "codex") == 1
     assert json.loads(capsys.readouterr().out) == []
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_accounts_status_never_blocks_on_any_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    refresh: bool,
+) -> None:
+    # The invariant, checked at the one seam every zeta lock goes through:
+    # nothing the status command reaches may take a lock without LOCK_NB,
+    # so a lock added later anywhere is caught here too.
+    import fcntl
+
+    _save_account(tmp_path, expires_at=1)
+    _use_token_endpoint(
+        monkeypatch,
+        tmp_path,
+        httpx.Response(
+            200,
+            json={
+                "access_token": "rotated-access-secret",
+                "refresh_token": "rotated-refresh-secret",
+                "expires_in": 3600,
+            },
+        ),
+    )
+    real_flock = fcntl.flock
+    blocking: list[int] = []
+
+    def nonblocking_only(fd: int, operation: int) -> None:
+        if operation & (fcntl.LOCK_EX | fcntl.LOCK_SH) and not operation & fcntl.LOCK_NB:
+            blocking.append(operation)
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", nonblocking_only)
+
+    args = ("--refresh",) if refresh else ()
+    _run_json(tmp_path, monkeypatch, *args)
+    [row] = json.loads(capsys.readouterr().out)
+    if refresh:
+        assert row["refresh"] == {"ok": True, "code": None, "retryable": None}
+    assert blocking == []
