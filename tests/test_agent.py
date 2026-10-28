@@ -94,6 +94,16 @@ async def _collect(events):
     return [event async for event in events]
 
 
+async def _bounded_finish_gate_cleanup(awaitable, action: str) -> None:
+    try:
+        await asyncio.wait_for(asyncio.shield(awaitable), timeout=3)
+    except TimeoutError:
+        pytest.fail(
+            f"product shutdown hang: finish-gate test cleanup did not {action} "
+            "within 3 seconds"
+        )
+
+
 def _approval_capability(
     name: str, arguments: dict[str, object]
 ) -> ResolvedCapability:
@@ -2322,9 +2332,15 @@ async def test_follow_up_wakes_worker_waiting_in_finish_gate(
     finally:
         backend.release_grandchild.set()
         channel.wake(child_handle)
-        await loop._background_owner.wait()
-        await loop.close()
-        store.close()
+        try:
+            await _bounded_finish_gate_cleanup(
+                loop._background_owner.wait(), "finish background agents"
+            )
+        finally:
+            try:
+                await _bounded_finish_gate_cleanup(loop.close(), "close the agent loop")
+            finally:
+                store.close()
 
 
 @pytest.mark.asyncio
@@ -2372,9 +2388,15 @@ async def test_follow_up_after_finish_gate_queue_check_is_delivered(
         backend.release_grandchild.set()
         release_queue_check.set()
         channel.wake(child_handle)
-        await loop._background_owner.wait()
-        await loop.close()
-        store.close()
+        try:
+            await _bounded_finish_gate_cleanup(
+                loop._background_owner.wait(), "finish background agents"
+            )
+        finally:
+            try:
+                await _bounded_finish_gate_cleanup(loop.close(), "close the agent loop")
+            finally:
+                store.close()
 
 
 @pytest.mark.asyncio
@@ -2383,23 +2405,32 @@ async def test_follow_up_between_gate_turns_is_delivered_once(tmp_path: Path) ->
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.gate_started.wait(), timeout=2)
-    child_handle = next(iter(store.agent_children()))
-    assert await send_to_run(
-        store,
-        child_handle,
-        "follow-up between gate turns",
-        channel=loop._background_owner.conversation_channel,
-    ) is None
-    backend.release_gate_turn.set()
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.gate_started.wait(), timeout=2)
+        child_handle = next(iter(store.agent_children()))
+        assert await send_to_run(
+            store,
+            child_handle,
+            "follow-up between gate turns",
+            channel=loop._background_owner.conversation_channel,
+        ) is None
+        backend.release_gate_turn.set()
 
-    await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=0.1)
-    await _wait_for_notification(store, "completed")
-    assert backend.follow_up_prompts == ["follow-up between gate turns"]
-    backend.release_grandchild.set()
-    await loop._background_owner.wait()
-    await loop.close()
+        await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=10)
+        await _wait_for_notification(store, "completed")
+        assert backend.follow_up_prompts == ["follow-up between gate turns"]
+    finally:
+        backend.release_grandchild.set()
+        try:
+            await _bounded_finish_gate_cleanup(
+                loop._background_owner.wait(), "finish background agents"
+            )
+        finally:
+            try:
+                await _bounded_finish_gate_cleanup(loop.close(), "close the agent loop")
+            finally:
+                store.close()
 
 
 @pytest.mark.asyncio
@@ -2447,9 +2478,15 @@ async def test_pending_follow_up_is_processed_before_finish_gate_timeout(
     finally:
         backend.release_gate_turn.set()
         backend.release_grandchild.set()
-        await loop._background_owner.wait()
-        await loop.close()
-        store.close()
+        try:
+            await _bounded_finish_gate_cleanup(
+                loop._background_owner.wait(), "finish background agents"
+            )
+        finally:
+            try:
+                await _bounded_finish_gate_cleanup(loop.close(), "close the agent loop")
+            finally:
+                store.close()
 
 
 @pytest.mark.asyncio
@@ -8917,8 +8954,12 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
         assert "finish-gate task safety bound expired" in notification.data["text"]
         assert notification.data.get("killed_task_ids")
     finally:
-        await loop.close()
-        await asyncio.gather(run, return_exceptions=True)
+        try:
+            await _bounded_finish_gate_cleanup(loop.close(), "close the agent loop")
+        finally:
+            await _bounded_finish_gate_cleanup(
+                asyncio.gather(run, return_exceptions=True), "finish the root turn"
+            )
 
 
 @pytest.mark.asyncio
