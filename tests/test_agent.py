@@ -6,7 +6,7 @@ import shlex
 import subprocess
 import sys
 import threading
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import replace
 from io import StringIO
 from itertools import pairwise
@@ -32,7 +32,11 @@ from zeta.agent.background import (
     finish_background_child,
     recover_agent_children,
 )
-from zeta.agent.finish_gate import FinishGateControl, FinishGateState
+from zeta.agent.finish_gate import (
+    FinishGateControl,
+    FinishGateResult,
+    FinishGateState,
+)
 from zeta.agent.presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
@@ -102,6 +106,184 @@ async def _bounded_finish_gate_cleanup(awaitable, action: str) -> None:
             f"product shutdown hang: finish-gate test cleanup did not {action} "
             "within 3 seconds"
         )
+
+
+class _ControlledFinishGateTimeout:
+    def __init__(
+        self,
+        deadlines: "_HeldFinishGateTaskDeadlines",
+        state: FinishGateState,
+        timeout: asyncio.Timeout,
+    ) -> None:
+        self._deadlines = deadlines
+        self._state = state
+        self._timeout = timeout
+
+    async def __aenter__(self) -> asyncio.Timeout:
+        entered = await self._timeout.__aenter__()
+        self._deadlines.activate(self._state, self._timeout)
+        return entered
+
+    async def __aexit__(self, *args: object) -> bool | None:
+        self._deadlines.deactivate(self._state, self._timeout)
+        return await self._timeout.__aexit__(*args)
+
+
+class _HeldFinishGateTaskDeadlines:
+    def __init__(self, *, hold_child_bound: bool) -> None:
+        self.started: list[tuple[FinishGateState, float]] = []
+        self.started_event = asyncio.Event()
+        self._held: set[int] = set()
+        self._child_held: set[int] = set()
+        self._hold_child_bound = hold_child_bound
+        self._active: dict[int, set[asyncio.Timeout]] = {}
+        self._released: set[int] = set()
+        self._arming: dict[asyncio.Task[object], FinishGateState] = {}
+        self._wakes: dict[int, tuple[object, str | None]] = {}
+
+    def hold(
+        self,
+        state: FinishGateState,
+        configured_timeout: float,
+        child_loop: AgentLoop,
+    ) -> None:
+        self.started.append((state, configured_timeout))
+        self.started_event.set()
+        self._held.add(id(state))
+        if self._hold_child_bound:
+            self._child_held.add(id(state))
+        self._wakes[id(state)] = (
+            child_loop._background_owner.conversation_channel,
+            child_loop.agent_instance_id,
+        )
+
+    def deadline(self, state: FinishGateState, fallback: float) -> float:
+        return float("inf") if id(state) in self._held else fallback
+
+    def child_deadline(self, state: FinishGateState, fallback: float) -> float:
+        return float("inf") if id(state) in self._child_held else fallback
+
+    def arm(self, state: FinishGateState) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self._arming[task] = state
+
+    def disarm(self, state: FinishGateState) -> None:
+        task = asyncio.current_task()
+        if task is not None and self._arming.get(task) is state:
+            self._arming.pop(task)
+
+    def timeout_at(
+        self,
+        deadline: float | None,
+        original_timeout_at: Callable[[float | None], asyncio.Timeout],
+    ) -> asyncio.Timeout | _ControlledFinishGateTimeout:
+        task = asyncio.current_task()
+        state = self._arming.pop(task, None) if task is not None else None
+        if state is None or id(state) in self._released:
+            return original_timeout_at(deadline)
+        return _ControlledFinishGateTimeout(
+            self, state, original_timeout_at(float("inf"))
+        )
+
+    def activate(self, state: FinishGateState, timeout: asyncio.Timeout) -> None:
+        self._active.setdefault(id(state), set()).add(timeout)
+
+    def deactivate(self, state: FinishGateState, timeout: asyncio.Timeout) -> None:
+        active = self._active.get(id(state))
+        if active is None:
+            return
+        active.discard(timeout)
+        if not active:
+            self._active.pop(id(state))
+
+    def expire_model_bound(self, state: FinishGateState) -> None:
+        self._released.add(id(state))
+        now = asyncio.get_running_loop().time()
+        state.child_deadline = now
+        self._expire_active(state, now=now)
+
+    def expire_child_bound(self, state: FinishGateState) -> None:
+        self._released.add(id(state))
+        self._child_held.remove(id(state))
+        now = asyncio.get_running_loop().time()
+        state.child_deadline = now
+        self._expire_active(state, now=now)
+        channel, instance_id = self._wakes[id(state)]
+        channel.wake(instance_id)
+
+    def expire(self, state: FinishGateState) -> None:
+        self._released.add(id(state))
+        self._held.remove(id(state))
+        now = asyncio.get_running_loop().time()
+        state.task_deadline = now
+        self._expire_active(state, now=now)
+        channel, instance_id = self._wakes[id(state)]
+        channel.wake(instance_id)
+
+    def _expire_active(
+        self, state: FinishGateState, *, now: float | None = None
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() if now is None else now
+        for timeout in tuple(self._active.get(id(state), ())):
+            timeout.reschedule(deadline)
+
+
+def _hold_finish_gate_task_deadlines(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    hold_child_bound: bool = False,
+) -> _HeldFinishGateTaskDeadlines:
+    deadlines = _HeldFinishGateTaskDeadlines(hold_child_bound=hold_child_bound)
+    original_start = FinishGateState.start
+    original_task_deadline = FinishGateState._task_deadline
+    original_child_deadline = FinishGateState._child_deadline
+    original_run_model_turn = FinishGateState.run_model_turn
+    original_wait_transition = FinishGateState.wait_transition
+    original_timeout_at = asyncio.timeout_at
+
+    def start(state: FinishGateState, child_loop: AgentLoop) -> None:
+        starting = state.control is None
+        configured_timeout = child_loop._background_owner.finish_gate_task_timeout
+        original_start(state, child_loop)
+        if starting:
+            deadlines.hold(state, configured_timeout, child_loop)
+
+    def task_deadline(state: FinishGateState) -> float:
+        return deadlines.deadline(state, original_task_deadline(state))
+
+    def child_deadline(state: FinishGateState) -> float:
+        return deadlines.child_deadline(state, original_child_deadline(state))
+
+    async def run_model_turn(
+        state: FinishGateState, *args: object, **kwargs: object
+    ) -> FinishGateResult | None:
+        deadlines.arm(state)
+        try:
+            return await original_run_model_turn(state, *args, **kwargs)
+        finally:
+            deadlines.disarm(state)
+
+    async def wait_transition(
+        state: FinishGateState, *args: object, **kwargs: object
+    ) -> FinishGateResult | None:
+        deadlines.arm(state)
+        try:
+            return await original_wait_transition(state, *args, **kwargs)
+        finally:
+            deadlines.disarm(state)
+
+    monkeypatch.setattr(FinishGateState, "start", start)
+    monkeypatch.setattr(FinishGateState, "_task_deadline", task_deadline)
+    monkeypatch.setattr(FinishGateState, "_child_deadline", child_deadline)
+    monkeypatch.setattr(FinishGateState, "run_model_turn", run_model_turn)
+    monkeypatch.setattr(FinishGateState, "wait_transition", wait_transition)
+    monkeypatch.setattr(
+        asyncio,
+        "timeout_at",
+        lambda deadline: deadlines.timeout_at(deadline, original_timeout_at),
+    )
+    return deadlines
 
 
 def _approval_capability(
@@ -2649,8 +2831,9 @@ async def test_child_finish_gate_counts_model_turns_and_adopts_after_bound(
 
 @pytest.mark.asyncio
 async def test_finish_gate_model_timeout_defers_task_exit_during_cancellation(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.01)
     task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=True)
@@ -2665,8 +2848,11 @@ async def test_finish_gate_model_timeout_defers_task_exit_during_cancellation(
     state = FinishGateState()
     state.start(child_loop)
 
+    model_started = asyncio.Event()
+
     async def events() -> AsyncIterator[StreamEvent]:
         try:
+            model_started.set()
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             task.running = False
@@ -2682,7 +2868,12 @@ async def test_finish_gate_model_timeout_defers_task_exit_during_cancellation(
         async for _event in stream:
             pass
 
-    result = await state.run_model_turn(child_loop, events(), consume)
+    model_turn = asyncio.create_task(
+        state.run_model_turn(child_loop, events(), consume)
+    )
+    await model_started.wait()
+    deadlines.expire_model_bound(state)
+    result = await asyncio.wait_for(model_turn, timeout=2)
 
     assert result is None
     store.close()
@@ -2856,10 +3047,14 @@ def _finish_gate_with_running_task(
 async def test_finish_gate_ollama_close_obeys_task_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
+    stream_started = asyncio.Event()
+
     class Response:
         status_code = 200
 
         async def aiter_lines(self) -> AsyncIterator[str]:
+            stream_started.set()
             yield '{"message":{"content":"partial"}}'
             await asyncio.Event().wait()
 
@@ -2902,8 +3097,6 @@ async def test_finish_gate_ollama_close_obeys_task_deadline(
     store, child_loop, state = _finish_gate_with_running_task(
         tmp_path, task_timeout=0.02
     )
-    started = asyncio.get_running_loop().time()
-
     async def consume_stream(
         stream: AsyncIterator[StreamEvent], control: FinishGateControl | None
     ) -> None:
@@ -2911,16 +3104,16 @@ async def test_finish_gate_ollama_close_obeys_task_deadline(
         async for _event in stream:
             pass
 
-    result = await asyncio.wait_for(
+    model_turn = asyncio.create_task(
         state.run_model_turn(
             child_loop, OllamaBackend(stall_seconds=0).complete([], []), consume_stream
-        ),
-        timeout=0.1,
+        )
     )
-    elapsed = asyncio.get_running_loop().time() - started
+    await stream_started.wait()
+    deadlines.expire(state)
+    result = await asyncio.wait_for(model_turn, timeout=2)
     await asyncio.sleep(0)
 
-    assert elapsed < 0.05
     assert result is not None
     assert result.outcome == "task_safety_expired"
     assert clients and clients[0].stream_context.close_cancelled.is_set()
@@ -2931,23 +3124,22 @@ async def test_finish_gate_ollama_close_obeys_task_deadline(
 
 @pytest.mark.asyncio
 async def test_finish_gate_real_transport_close_obeys_task_deadline(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     store, child_loop, state = _finish_gate_with_running_task(
         tmp_path, task_timeout=0.02
     )
     transport = _BlockingTransportClose()
     before = set(asyncio.all_tasks())
-    started = asyncio.get_running_loop().time()
-
-    result = await asyncio.wait_for(
-        state.run_model_turn(child_loop, transport.events(), _consume_one_event),
-        timeout=0.1,
+    model_turn = asyncio.create_task(
+        state.run_model_turn(child_loop, transport.events(), _consume_one_event)
     )
-    elapsed = asyncio.get_running_loop().time() - started
+    await transport.response_started.wait()
+    deadlines.expire(state)
+    result = await asyncio.wait_for(model_turn, timeout=2)
     await asyncio.sleep(0)
 
-    assert elapsed < 0.05
     assert result is not None
     assert result.outcome == "task_safety_expired"
     assert transport.response_closed.is_set()
@@ -2985,7 +3177,10 @@ async def test_finish_gate_real_transport_close_propagates_caller_cancellation(
 
 
 @pytest.mark.asyncio
-async def test_finish_gate_task_deadline_bounds_stream_close(tmp_path: Path) -> None:
+async def test_finish_gate_task_deadline_bounds_stream_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(
         store, finish_gate_timeout=1, finish_gate_task_timeout=0.03
@@ -3024,14 +3219,14 @@ async def test_finish_gate_task_deadline_bounds_stream_close(tmp_path: Path) -> 
     ) -> None:
         del stream, control
 
-    started = asyncio.get_running_loop().time()
-    result = await asyncio.wait_for(
-        state.run_model_turn(child_loop, Events(), consume), timeout=0.15
+    model_turn = asyncio.create_task(
+        state.run_model_turn(child_loop, Events(), consume)
     )
+    await close_started.wait()
+    deadlines.expire(state)
+    result = await asyncio.wait_for(model_turn, timeout=2)
 
-    assert close_started.is_set()
     assert close_cancelled.is_set()
-    assert asyncio.get_running_loop().time() - started < 0.15
     assert result is not None
     assert result.outcome == "task_safety_expired"
     store.close()
@@ -3089,8 +3284,11 @@ async def test_finish_gate_uses_task_deadline_to_deliver_late_task_exit(
 
 @pytest.mark.asyncio
 async def test_child_finish_gate_wait_timeout_adopts(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(
+        monkeypatch, hold_child_bound=True
+    )
     backend = FinishGateBackend("wait")
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(
@@ -3104,9 +3302,13 @@ async def test_child_finish_gate_wait_timeout_adopts(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    await asyncio.wait_for(
-        _collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=1
+    run = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
+    await deadlines.started_event.wait()
+    state, _configured_timeout = deadlines.started[0]
+    deadlines.expire_child_bound(state)
+    await asyncio.wait_for(run, timeout=2)
 
     assert store.agent_children()
     backend.release_grandchild.set()
@@ -8833,8 +9035,9 @@ async def _start_task_gate(
 
 @pytest.mark.asyncio
 async def test_finish_gate_wait_outlives_default_bound_for_running_task(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     release = tmp_path / "release"
     command = (
         f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
@@ -8855,6 +9058,9 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
     )
 
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    assert len(deadlines.started) == 1
+    state, _configured_timeout = deadlines.started[0]
+    deadlines.expire_model_bound(state)
     await asyncio.wait_for(backend.gate_delay_cancelled.wait(), timeout=2)
     release.touch()
     await asyncio.wait_for(run, timeout=2)
@@ -8866,8 +9072,9 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
 
 @pytest.mark.asyncio
 async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_bound(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     release = tmp_path / "release"
     command = (
         f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
@@ -8888,6 +9095,9 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
     )
 
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    assert len(deadlines.started) == 1
+    state, _configured_timeout = deadlines.started[0]
+    deadlines.expire_model_bound(state)
     await asyncio.wait_for(backend.gate_delay_cancelled.wait(), timeout=2)
     release.touch()
     await asyncio.wait_for(backend.task_output_read.wait(), timeout=10)
@@ -8901,8 +9111,9 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
 
 @pytest.mark.asyncio
 async def test_finish_gate_task_deadline_starts_when_gate_starts(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     backend = _TaskFinishGateBackend(
         _python("import time; time.sleep(30)"), pause_before_gate=True
     )
@@ -8920,21 +9131,35 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
 
-    await asyncio.wait_for(backend.child_turn_paused.wait(), timeout=2)
-    owner.finish_gate_task_timeout = 0.08
-    backend.release_child_turn.set()
-    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
-    await asyncio.wait_for(run, timeout=2)
-    notification = await _wait_completion(store)
-    assert "finish-gate task safety bound expired" in notification.data["text"]
-    assert notification.data.get("killed_task_ids")
-    await loop.close()
+    try:
+        await asyncio.wait_for(backend.child_turn_paused.wait(), timeout=2)
+        assert deadlines.started == []
+        owner.finish_gate_task_timeout = 0.08
+        backend.release_child_turn.set()
+        await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+        assert len(deadlines.started) == 1
+        state, configured_timeout = deadlines.started[0]
+        assert configured_timeout == 0.08
+
+        deadlines.expire(state)
+        await asyncio.wait_for(run, timeout=2)
+        notification = await _wait_completion(store)
+        assert "finish-gate task safety bound expired" in notification.data["text"]
+        assert notification.data.get("killed_task_ids")
+    finally:
+        try:
+            await _bounded_finish_gate_cleanup(loop.close(), "close the agent loop")
+        finally:
+            await _bounded_finish_gate_cleanup(
+                asyncio.gather(run, return_exceptions=True), "finish the root turn"
+            )
 
 
 @pytest.mark.asyncio
 async def test_finish_gate_follow_up_keeps_original_task_deadline(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     backend = _TaskFinishGateBackend(_python("import time; time.sleep(30)"))
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(
@@ -8956,6 +9181,10 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
 
     try:
         await asyncio.wait_for(backend.gate_seen.wait(), timeout=10)
+        assert len(deadlines.started) == 1
+        state, configured_timeout = deadlines.started[0]
+        assert configured_timeout == 1
+        original_deadline = state.task_deadline
         owner.finish_gate_task_timeout = 10
         child_handle = next(iter(store.agent_children()))
         assert await send_to_run(
@@ -8965,7 +9194,12 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
             channel=owner.conversation_channel,
         ) is None
 
-        await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=10)
+        try:
+            await asyncio.wait_for(backend.follow_up_processed.wait(), timeout=10)
+        except TimeoutError:
+            pytest.fail("finish-gate follow-up was not processed after its wake")
+        assert state.task_deadline == original_deadline
+        deadlines.expire(state)
         notification = await asyncio.wait_for(_wait_completion(store), timeout=2)
         assert "finish-gate task safety bound expired" in notification.data["text"]
         assert notification.data.get("killed_task_ids")
@@ -9045,8 +9279,9 @@ async def test_finish_gate_turn_cap_does_not_kill_running_task(
 
 @pytest.mark.asyncio
 async def test_finish_gate_task_without_exit_reports_safety_bound(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     backend = _TaskFinishGateBackend(_python("import time; time.sleep(30)"))
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.02)
@@ -9062,6 +9297,9 @@ async def test_finish_gate_task_without_exit_reports_safety_bound(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
 
+    await deadlines.started_event.wait()
+    state, _configured_timeout = deadlines.started[0]
+    deadlines.expire(state)
     await asyncio.wait_for(run, timeout=2)
     notification = await _wait_completion(store)
     text = notification.data["text"]
@@ -9150,8 +9388,9 @@ async def test_child_finish_gate_task_handoff_kills_task(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_child_finish_gate_task_turn_bound_defers_to_task_safety(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(
         store,
@@ -9168,9 +9407,13 @@ async def test_child_finish_gate_task_turn_bound_defers_to_task_safety(
         skill_catalog=SkillCatalog.empty(),
     )
 
-    await asyncio.wait_for(
-        _collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=5
+    run = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=5)
+    state, _configured_timeout = deadlines.started[0]
+    deadlines.expire(state)
+    await asyncio.wait_for(run, timeout=5)
     notification = await _wait_completion(store)
     assert backend.gate_seen.is_set()
     assert "finish-gate task safety bound expired" in notification.data["text"]
@@ -9179,7 +9422,10 @@ async def test_child_finish_gate_task_turn_bound_defers_to_task_safety(
 
 
 @pytest.mark.asyncio
-async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) -> None:
+async def test_child_completion_reports_killed_tasks_in_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     # S2: a child that still owns a running task when it completes has the task
     # killed without a notification; close() returns the ids and the runner
     # folds them into the child's completion receipt (text + data).
@@ -9207,7 +9453,13 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
             receipt_published.set()
 
     loop.set_background_event_sink(collect_event)
-    events.extend(await _collect(loop.run_turn("start", origin=MessageOrigin.USER)))
+    run = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    await deadlines.started_event.wait()
+    state, _configured_timeout = deadlines.started[0]
+    deadlines.expire(state)
+    events.extend(await asyncio.wait_for(run, timeout=5))
     notification = await _wait_completion(store)
     # Persistence precedes terminal-card publication, so synchronize on the sink too.
     await asyncio.wait_for(receipt_published.wait(), timeout=2)
