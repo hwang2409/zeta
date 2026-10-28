@@ -72,23 +72,27 @@ def _failure_code(error: Exception) -> FailureCode:
     cause = error.__cause__
     if isinstance(error, RequestTooLargeError):
         return "request_too_large"
+    if isinstance(error, _StorageOperationError):
+        return "storage_error"
     if isinstance(error, ReconciliationError) and isinstance(
         cause, ProjectRegistryError
     ):
         return "commit_error"
-    if isinstance(error, (ProjectRegistryError, OSError)) or isinstance(
-        cause, OSError
-    ):
-        return "storage_error"
-    if (
-        isinstance(error, EntryReconciliationFailure)
-        and cause is not None
-        and not isinstance(cause, ReconciliationError)
+    if isinstance(error, _ProviderOperationError) or isinstance(
+        cause, _ProviderOperationError
     ):
         return "provider_error"
     if isinstance(error, (ReconciliationError, UnsupportedMemoryFormatError)):
         return "invalid_response"
     return "provider_error"
+
+
+class _ProviderOperationError(Exception):
+    """A failure from the configured completion provider."""
+
+
+class _StorageOperationError(Exception):
+    """A failure from local reconciliation storage."""
 
 
 class _ConcurrentMemoryUpdate(Exception):
@@ -503,9 +507,12 @@ class AutoMemoryReconciler:
         while cursor <= item.end:
             if self._closing:
                 return
-            rows, end_offset, end_tokens, scanned_end = await asyncio.to_thread(
-                self._transcript_chunk, cursor, item.end
-            )
+            try:
+                rows, end_offset, end_tokens, scanned_end = await asyncio.to_thread(
+                    self._transcript_chunk, cursor, item.end
+                )
+            except OSError as exc:
+                raise _StorageOperationError from exc
             if not rows:
                 if scanned_end < cursor:
                     break
@@ -552,7 +559,7 @@ class AutoMemoryReconciler:
                                 project_id=self.project_id,
                                 transcript=raw_transcript,
                                 reconciliation_key=self.state.reconciliation_key,
-                                invoke=self.invoke,
+                                invoke=self._invoke_provider,
                                 cas_retries=self.config.cas_retries,
                                 as_of=today,
                                 now=datetime.now(UTC).isoformat(timespec="microseconds").replace(
@@ -562,6 +569,8 @@ class AutoMemoryReconciler:
                         except EntryReconciliationFailure as exc:
                             usage = dict(exc.usage)
                             raise
+                        except (ProjectRegistryError, OSError) as exc:
+                            raise _StorageOperationError from exc
                         selected_start = entry_result.seq_start
                         selected_end = entry_result.seq_end
                         usage = dict(entry_result.usage)
@@ -587,6 +596,8 @@ class AutoMemoryReconciler:
                                 },
                             )
                         break
+                    except (ProjectRegistryError, OSError) as exc:
+                        raise _StorageOperationError from exc
                     request = prepare_request(
                         raw_transcript,
                         snapshot.contents,
@@ -651,6 +662,8 @@ class AutoMemoryReconciler:
                         raise ReconciliationError(
                             "project memory update failed"
                         ) from exc
+                    except OSError as exc:
+                        raise _StorageOperationError from exc
                     break
                 except (ProviderLoginRequiredError, _ConcurrentMemoryUpdate):
                     raise
@@ -735,15 +748,24 @@ class AutoMemoryReconciler:
             if failures:
                 self._publish_failure_notice()
 
+    async def _invoke_provider(self, prompt: str) -> InvokeResult:
+        try:
+            raw = self.invoke(prompt)
+            if inspect.isawaitable(raw):
+                raw = await raw
+            return raw
+        except (ProviderLoginRequiredError, RequestTooLargeError, ReconciliationError):
+            raise
+        except Exception as exc:
+            raise _ProviderOperationError from exc
+
     async def _invoke_request(
         self, prompt: str, budget: ProviderRetryBudget
     ) -> tuple[str, dict[str, int]]:
         if self._closing:
             raise asyncio.CancelledError
         with use_retry_budget(budget):
-            raw = self.invoke(prompt)
-            if inspect.isawaitable(raw):
-                raw = await raw
+            raw = await self._invoke_provider(prompt)
         if isinstance(raw, ReconciliationResponse):
             return raw.text, dict(raw.usage)
         return raw, {}

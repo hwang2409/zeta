@@ -1324,6 +1324,36 @@ async def test_no_change_pass_writes_success_diagnostic(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("entry_format", [False, True])
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError("provider timed out"), ConnectionError("provider disconnected")],
+)
+async def test_provider_transport_failure_is_reported_as_provider_error(
+    tmp_path: Path, error: Exception, *, entry_format: bool
+) -> None:
+    async def invoke(_prompt: str) -> str:
+        raise error
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path,
+        invoke,
+        entry_format=entry_format,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    record = json.loads(diagnostics.read_text(encoding="utf-8"))
+    assert record["outcome"] == "failed"
+    assert record["failure_code"] == "provider_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry_format", [False, True])
 @pytest.mark.parametrize(
     "error",
     [
@@ -1333,16 +1363,25 @@ async def test_no_change_pass_writes_success_diagnostic(tmp_path: Path) -> None:
     ],
 )
 async def test_registry_failure_is_reported_as_storage_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    *,
+    entry_format: bool,
 ) -> None:
     runner, registry, _project_id, _notices = _runner(
-        tmp_path, transcript_count=1, minimum_interval=0, retry_backoff_seconds=60
+        tmp_path,
+        entry_format=entry_format,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
     )
 
     def fail_snapshot(_project_id: str) -> None:
         raise error
 
-    monkeypatch.setattr(registry, "memory_snapshot", fail_snapshot)
+    method = "_entry_memory_state" if entry_format else "memory_snapshot"
+    monkeypatch.setattr(registry, method, fail_snapshot)
     runner.before_eviction(1, 1)
     await runner.drain()
 
