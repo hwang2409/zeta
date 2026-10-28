@@ -33,15 +33,16 @@ from .cards.agent import (
     render_agent_progress,
     render_agent_receipt,
 )
+from .cards.agent_lifetime import AgentTranscriptLifetime
 from .cards.agent_list import (
     AGENT_LIST_PAGE_SIZE,
     MAX_AGENT_LIST_ROWS,
     AgentListControl,
 )
+from .cards.agent_shutdown import close_agent_owners
 from .cards.agent_sync import (
     AgentTodoControl,
     AgentTranscriptSnapshot,
-    AgentTranscriptSource,
 )
 from .cards.shared import (
     MAX_CARD_COLUMNS,
@@ -502,8 +503,6 @@ def _read_bounded_messages(
     return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
 
 
-
-
 def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list[str]:
     """Read one agent's direct transcript, without nested child sessions."""
 
@@ -518,7 +517,7 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     return result or ["transcript unavailable"]
 
 
-class AgentTranscriptControl(UIControl):
+class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
     """Scrollable child transcript synchronized through a read-only store."""
 
     _RENDER_BATCH_SIZE = 4
@@ -535,7 +534,7 @@ class AgentTranscriptControl(UIControl):
         )
         self._tool_calls: dict[str, ToolCall] = {}
         self._path: Path | None = None
-        self._source: AgentTranscriptSource | None = None
+        self._initialize_transcript_lifetime()
         self._snapshot: AgentTranscriptSnapshot | None = None
         self._entry_units: dict[str, list[Any]] = {}
         self._unit_entries: dict[Any, str] = {}
@@ -553,11 +552,13 @@ class AgentTranscriptControl(UIControl):
     async def load(self, path: Path) -> bool:
         """Load a selected child without doing storage work on the event loop."""
 
+        if self._closed:
+            return False
         if path != self._path:
             self._reset_rendered(path)
         if self._source is None or self._source.path != path:
             try:
-                await asyncio.to_thread(self._replace_source, path)
+                await self._replace_tracked(path)
             except (ConversationIntegrityError, OSError, ValueError):
                 return False
         return await self.sync(path)
@@ -565,15 +566,20 @@ class AgentTranscriptControl(UIControl):
     async def sync(self, path: Path) -> bool:
         """Apply one active-branch snapshot, yielding between render batches."""
 
+        if self._closed:
+            return False
         if path != self._path or self._source is None:
             return await self.load(path)
         try:
             tree = await asyncio.to_thread(self._source.refresh)
         except (ConversationIntegrityError, OSError, ValueError):
             return False
-        snapshot = tree.transcript(path)
-        if snapshot is None:
+        if self._closed:
             return False
+        snapshot = tree.transcript(path)
+        return False if snapshot is None else await self._apply_snapshot(snapshot, path)
+
+    async def _apply_snapshot(self, snapshot: AgentTranscriptSnapshot, path: Path) -> bool:
         previous = self._snapshot
         if snapshot == previous:
             return False
@@ -586,13 +592,18 @@ class AgentTranscriptControl(UIControl):
             await self._replay_batches(snapshot.messages[len(previous.messages) :], path)
         else:
             await self._rebuild(snapshot, path)
+        if self._closed:
+            return False
         self._snapshot = snapshot
         return True
+
     def request_sync(
         self, path: Path, invalidate: Callable[[], None] | None = None
     ) -> bool:
         """Coalesce a UI refresh onto one asynchronous synchronization task."""
 
+        if self._closed:
+            return False
         self._pending_path = path
         try:
             loop = asyncio.get_running_loop()
@@ -624,18 +635,7 @@ class AgentTranscriptControl(UIControl):
         self._path = path
         self._snapshot = None
 
-    def _replace_source(self, path: Path) -> None:
-        previous, self._source = self._source, None
-        if previous is not None:
-            previous.close()
-        source = AgentTranscriptSource(path)
-        # Open and validate the read-only store before publishing the source.
-        source.refresh()
-        self._source = source
-
-    async def _rebuild(
-        self, snapshot: AgentTranscriptSnapshot, path: Path
-    ) -> None:
+    async def _rebuild(self, snapshot: AgentTranscriptSnapshot, path: Path) -> None:
         anchor_id, anchor_unit_index, anchor_offset, follow_tail = self._capture_anchor()
         old_entry_ids = (
             self._snapshot.entry_ids if self._snapshot is not None else ()
@@ -646,6 +646,8 @@ class AgentTranscriptControl(UIControl):
         self._entry_units.clear()
         self._unit_entries.clear()
         await self._replay_batches(snapshot.messages, path)
+        if self._closed:
+            return
         if not follow_tail:
             target = self._nearest_entry(
                 anchor_id, old_entry_ids, snapshot.entry_ids
@@ -659,6 +661,8 @@ class AgentTranscriptControl(UIControl):
         self, messages: list[tuple[str, dict[str, Any]]] | tuple[tuple[str, dict[str, Any]], ...], path: Path
     ) -> None:
         for start in range(0, len(messages), self._RENDER_BATCH_SIZE):
+            if self._closed:
+                return
             for entry_id, raw_message in messages[start : start + self._RENDER_BATCH_SIZE]:
                 self._replay(entry_id, raw_message, path)
             await asyncio.sleep(0.001)
@@ -831,22 +835,18 @@ class AgentNavigation:
         return handle if type(handle) is str and handle else None
 
     def child_queued_messages(self) -> tuple[str, tuple[str, ...]] | None:
-        """Label and unconsumed follow-ups of the viewed child, or None in main."""
-
         if not self.child_view_active:
             return None
         label = self.child_instance_id() or self.current_path.name
         return label, self.transcript_control.pending_prompts(self.current_path)
 
     def todo_snapshot(self) -> TodoSnapshot | None:
-        """Return only cached in-memory state for the selected session."""
-
         if not self.child_view_active:
             return TodoSnapshot(tuple(self.store.todo_items()), self.store.todo_dismissed)
         return self._todo_control.snapshot(self.current_path)
 
-    def close(self) -> None:
-        self._todo_control.close()
+    async def close(self) -> None:
+        await close_agent_owners(self.transcript_control.close, self._todo_control.close)
 
     def child_view_focused(self) -> bool:
         return self._layout is not None and self._layout.has_focus(self.transcript_window)

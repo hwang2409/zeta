@@ -52,6 +52,23 @@ from zeta.tui.cards.agent_sync import AgentTodoSource
 from zeta.tui.checkpoints import render_replayed_message
 from zeta.tui.todo import TodoWidget
 
+pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
+
+@pytest.fixture(autouse=True)
+async def close_direct_transcript_controls(monkeypatch: pytest.MonkeyPatch):
+    controls: list[AgentTranscriptControl] = []
+    control_init = AgentTranscriptControl.__init__
+
+    def tracked_init(control, *args, **kwargs):
+        control_init(control, *args, **kwargs)
+        controls.append(control)
+
+    monkeypatch.setattr(AgentTranscriptControl, "__init__", tracked_init)
+    yield
+    for control in reversed(controls):
+        await control.close()
+
 
 def _child(
     store: ConversationStore,
@@ -71,7 +88,9 @@ def _child(
             }
         )
     )
-    return child.session_dir
+    path = child.session_dir
+    child.close()
+    return path
 
 
 def _message(path: Path, role: str, blocks: list[dict[str, object]]) -> None:
@@ -484,8 +503,8 @@ def test_navigation_close_releases_selected_child_todo_lease(tmp_path: Path) -> 
     child_store = source._store
     assert child_store is not None
 
-    navigation.close()
-    navigation.close()
+    asyncio.run(navigation.close())
+    asyncio.run(navigation.close())
 
     assert child_store._closed
     root.close()
@@ -549,7 +568,7 @@ def test_todo_child_without_state_yet_shows_no_todos(
     child.joinpath("session_state.json").unlink()
     navigation.refresh(force=True)
     assert navigation.todo_snapshot().unavailable
-    navigation.close()
+    asyncio.run(navigation.close())
     root.close()
 
 
@@ -563,7 +582,7 @@ def test_todo_missing_child_directory_is_unavailable(tmp_path: Path) -> None:
     navigation.refresh(force=True)
     snapshot = navigation.todo_snapshot()
     assert snapshot is not None and snapshot.unavailable
-    navigation.close()
+    asyncio.run(navigation.close())
     root.close()
 
 
@@ -2393,6 +2412,7 @@ async def test_child_approval_surfaces_when_view_is_closed_or_open(
     assert not app.pending_approvals
     assert child_store.approval_states()[call.id][1] == "allow"
     await app.close()
+    child_store.close()
 
 
 @pytest.mark.asyncio
@@ -2446,3 +2466,4 @@ async def test_child_approval_exits_navigation_in_full_screen(
     await app._handle_prompt_value(f"/approve {app.pending_approvals[0].key}")
     assert not app.pending_approvals
     await app.close()
+    child_store.close()
