@@ -52,6 +52,23 @@ from zeta.tui.cards.agent_sync import AgentTodoSource
 from zeta.tui.checkpoints import render_replayed_message
 from zeta.tui.todo import TodoWidget
 
+pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
+
+@pytest.fixture(autouse=True)
+def close_direct_transcript_controls(monkeypatch: pytest.MonkeyPatch):
+    controls: list[AgentTranscriptControl] = []
+    control_init = AgentTranscriptControl.__init__
+
+    def tracked_init(control, *args, **kwargs):
+        control_init(control, *args, **kwargs)
+        controls.append(control)
+
+    monkeypatch.setattr(AgentTranscriptControl, "__init__", tracked_init)
+    yield
+    for control in reversed(controls):
+        control.close()
+
 
 def _child(
     store: ConversationStore,
@@ -71,7 +88,9 @@ def _child(
             }
         )
     )
-    return child.session_dir
+    path = child.session_dir
+    child.close()
+    return path
 
 
 def _message(path: Path, role: str, blocks: list[dict[str, object]]) -> None:
@@ -2320,6 +2339,7 @@ async def test_large_subagent_append_keeps_event_loop_responsive(
     assert control.transcript._lazy_viewport
     assert batch_sizes
     assert max(batch_sizes) <= AgentTranscriptControl._RENDER_BATCH_SIZE
+    control.close()
 
 
 def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) -> None:
@@ -2393,6 +2413,7 @@ async def test_child_approval_surfaces_when_view_is_closed_or_open(
     assert not app.pending_approvals
     assert child_store.approval_states()[call.id][1] == "allow"
     await app.close()
+    child_store.close()
 
 
 @pytest.mark.asyncio
@@ -2446,3 +2467,4 @@ async def test_child_approval_exits_navigation_in_full_screen(
     await app._handle_prompt_value(f"/approve {app.pending_approvals[0].key}")
     assert not app.pending_approvals
     await app.close()
+    child_store.close()

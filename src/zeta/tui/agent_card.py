@@ -624,10 +624,13 @@ class AgentTranscriptControl(UIControl):
         self._path = path
         self._snapshot = None
 
+    def close(self) -> None:
+        source, self._source = self._source, None
+        if source is not None:
+            source.close()
+
     def _replace_source(self, path: Path) -> None:
-        previous, self._source = self._source, None
-        if previous is not None:
-            previous.close()
+        self.close()
         source = AgentTranscriptSource(path)
         # Open and validate the read-only store before publishing the source.
         source.refresh()
@@ -846,6 +849,7 @@ class AgentNavigation:
         return self._todo_control.snapshot(self.current_path)
 
     def close(self) -> None:
+        self.transcript_control.close()
         self._todo_control.close()
 
     def child_view_focused(self) -> bool:

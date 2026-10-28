@@ -415,12 +415,13 @@ def isolate_zeta_home(
         live_home_write_guard.assert_clean()
 
 
-_FD_GROWTH: list[tuple[int, str]] = []
+_FD_GROWTH: list[tuple[int, str, str]] = []
 _FD_BREACHES: list[str] = []
 # Leave 25% of FD_SETSIZE free for pytest, xdist, and a test's active work.
 _FD_HIGH_WATER = 768
-# Ordinary runtime-owner tests retain at most 24 descriptors.
-_FD_PER_TEST_LIMIT = 32
+# Covers stable pytest/plugin drift while rejecting repeated small test leaks.
+_FD_SESSION_BUDGET = 32
+_FD_START_COUNT: int | None = None
 _FD_RETAINED_COUNTS: list[int] = []
 _FD_RETAINED_MAX: tuple[str, int, int, tuple[str, ...]] | None = None
 _FD_OWNERS: dict[int, tuple[str, str]] = {}
@@ -480,48 +481,48 @@ def _open_file_descriptors() -> dict[int, str]:
     return {}
 
 
-@pytest.hookimpl(hookwrapper=True, tryfirst=True)
-def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
-    """Report retained fds and stop workers before they approach FD_SETSIZE."""
-    del nextitem
-    global _FD_RETAINED_MAX
-    # Stable pytest/xdist descriptors and session fixtures predate this snapshot.
-    before = _open_file_descriptors()
-    if not _FD_OWNERS:
-        _FD_OWNERS.update(
-            (descriptor, (description, "pre-suite"))
-            for descriptor, description in before.items()
-        )
-    yield
-    after = _open_file_descriptors()
+def _update_fd_owners(after: dict[int, str], nodeid: str) -> None:
     for descriptor in tuple(_FD_OWNERS):
         if descriptor not in after:
             del _FD_OWNERS[descriptor]
     for descriptor, description in after.items():
         previous = _FD_OWNERS.get(descriptor)
         if previous is None or previous[0] != description:
-            _FD_OWNERS[descriptor] = (description, item.nodeid)
-    retained = sorted(after.keys() - before.keys())
-    added = tuple(after[fd] for fd in retained)
+            _FD_OWNERS[descriptor] = (description, nodeid)
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
+    """Report retained fds and stop workers before they approach FD_SETSIZE."""
+    del nextitem
+    global _FD_RETAINED_MAX, _FD_START_COUNT
+    before = _open_file_descriptors()
+    if _FD_START_COUNT is None:
+        _FD_START_COUNT = len(before)
+        _FD_OWNERS.update(
+            (descriptor, (description, "pre-suite"))
+            for descriptor, description in before.items()
+        )
+    yield
+    after = _open_file_descriptors()
+    _update_fd_owners(after, item.nodeid)
+    added = tuple(after[fd] for fd in sorted(after.keys() - before.keys()))
     grouped = _group_fds_by_path_prefix(added)
-    _FD_GROWTH.append((len(retained), item.nodeid))
+    _FD_GROWTH.append((len(added), item.nodeid, grouped))
     if added:
         print(f"fd-retained nodeid={item.nodeid} grouped=[{grouped}]", flush=True)
     highest = max(after, default=-1)
     if _FD_RETAINED_MAX is None or len(after) > _FD_RETAINED_MAX[1]:
         _FD_RETAINED_MAX = (item.nodeid, len(after), highest, added)
     _FD_RETAINED_COUNTS.append(len(after))
-    reasons = []
-    if len(added) > _FD_PER_TEST_LIMIT:
-        reasons.append(f"retained {len(added)} descriptors (limit {_FD_PER_TEST_LIMIT})")
     if highest >= _FD_HIGH_WATER:
-        reasons.append(f"reached fd {highest} (limit {_FD_HIGH_WATER - 1})")
-    if reasons:
-        breach = f"{item.nodeid} {' and '.join(reasons)}; grouped=[{grouped or 'none'}]"
+        breach = (
+            f"{item.nodeid} reached fd {highest} (limit {_FD_HIGH_WATER - 1}); "
+            f"grouped=[{grouped or 'none'}]"
+        )
         _FD_BREACHES.append(breach)
         print(f"fd-breach {breach}", flush=True)
-        if highest >= _FD_HIGH_WATER:
-            item.session.shouldstop = breach
+        item.session.shouldstop = breach
 
 
 def _fd_summary() -> str:
@@ -531,7 +532,10 @@ def _fd_summary() -> str:
         f"{nodeid} (+{count})" for nodeid, count in persistent_owners.most_common(5)
     )
     top = sorted(_FD_GROWTH, reverse=True)[:5]
-    offenders = "; ".join(f"{nodeid} (+{count})" for count, nodeid in top)
+    offenders = "; ".join(
+        f"{nodeid} (+{count}, grouped=[{grouped or 'none'}])"
+        for count, nodeid, grouped in top
+    )
     breach = _FD_BREACHES[0] if _FD_BREACHES else "none"
     if _FD_RETAINED_MAX is not None:
         nodeid, count, highest, added = _FD_RETAINED_MAX
@@ -543,8 +547,9 @@ def _fd_summary() -> str:
         retained_max = "none"
     if _FD_RETAINED_COUNTS:
         quarter = max(1, len(_FD_RETAINED_COUNTS) // 4)
+        start = _FD_START_COUNT if _FD_START_COUNT is not None else 0
         retained = (
-            f"start={_FD_RETAINED_COUNTS[0]} end={_FD_RETAINED_COUNTS[-1]} "
+            f"start={start} end={_FD_RETAINED_COUNTS[-1]} "
             f"max={max(_FD_RETAINED_COUNTS)} "
             f"q1_median={median(_FD_RETAINED_COUNTS[:quarter]):.1f} "
             f"q4_median={median(_FD_RETAINED_COUNTS[-quarter:]):.1f}"
@@ -561,6 +566,15 @@ def _fd_summary() -> str:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
+    end = _open_file_descriptors()
+    _FD_RETAINED_COUNTS.append(len(end))
+    start = _FD_START_COUNT if _FD_START_COUNT is not None else len(end)
+    growth = len(end) - start
+    if growth > _FD_SESSION_BUDGET:
+        _FD_BREACHES.append(
+            f"worker retained {growth} descriptors "
+            f"(budget {_FD_SESSION_BUDGET}); top tests are in top_retained_additions"
+        )
     summary = _fd_summary()
     if _FD_BREACHES:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED

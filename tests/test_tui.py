@@ -10956,6 +10956,12 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
         session.app.exit()
         await task
 
+    navigation.close()
+    assert navigation.transcript_control._source is None
+    grandchild.close()
+    child.close()
+    store.close()
+
 
 @pytest.mark.parametrize("value", ["", "  \n  "])
 def test_parse_input_rejects_blank_turns(value: str) -> None:
