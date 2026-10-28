@@ -255,13 +255,19 @@ class AnthropicCredentialDriver:
                 headers={"accept": "application/json"},
             )
         except httpx.HTTPError as exc:
-            raise self.auth_error_type(
+            raise self.http_error_type(
                 f"{self.provider_label} OAuth token refresh failed"
             ) from exc
         if response.status_code >= 400:
-            raise self.http_error_type(
+            error_type = (
+                self.auth_error_type
+                if response.status_code in {400, 401}
+                else self.http_error_type
+            )
+            raise error_type(
                 f"{self.provider_label} OAuth token refresh failed with HTTP "
-                f"{response.status_code}"
+                f"{response.status_code}",
+                status_code=response.status_code,
             )
         try:
             return _tokens_from_response(response.json(), refresh_token)

@@ -248,10 +248,16 @@ class CodexCredentialDriver:
                 headers={"accept": "application/json"},
             )
         except httpx.HTTPError as exc:
-            raise CodexAuthError("Codex OAuth token refresh failed") from exc
+            raise CodexHTTPError("Codex OAuth token refresh failed") from exc
         if response.status_code >= 400:
-            raise CodexHTTPError(
-                f"Codex OAuth token refresh failed with HTTP {response.status_code}"
+            error_type = (
+                CodexAuthError
+                if response.status_code in {400, 401}
+                else CodexHTTPError
+            )
+            raise error_type(
+                f"Codex OAuth token refresh failed with HTTP {response.status_code}",
+                status_code=response.status_code,
             )
         try:
             value = response.json()

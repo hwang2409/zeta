@@ -240,6 +240,62 @@ def test_provider_driver_refresh_through_account_credentials_keeps_headers_and_r
     assert persisted.refresh_token == "new-refresh"
 
 
+@pytest.mark.parametrize(
+    ("provider", "driver_type"),
+    [
+        ("anthropic", anthropic_module.AnthropicCredentialDriver),
+        ("codex", codex_module.CodexCredentialDriver),
+    ],
+)
+@pytest.mark.parametrize(
+    ("status_code", "expected_code"),
+    [(400, "auth_error"), (401, "auth_error"), (429, "http_error"), (500, "http_error")],
+)
+def test_oauth_refresh_response_classifies_auth_rejection_only(
+    provider: str,
+    driver_type: type,
+    status_code: int,
+    expected_code: str,
+) -> None:
+    driver = driver_type(token_url="https://refresh.test/token")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(status_code, json={"error": "rejected"})
+            )
+        ) as client:
+            with pytest.raises(RuntimeError) as raised:
+                await driver.refresh("old-refresh", client)
+        assert raised.value.code == expected_code
+        assert raised.value.status_code == status_code
+        assert str(raised.value) == (
+            f"{'Claude' if provider == 'anthropic' else 'Codex'} OAuth token refresh "
+            f"failed with HTTP {status_code}"
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "driver_type",
+    [anthropic_module.AnthropicCredentialDriver, codex_module.CodexCredentialDriver],
+)
+def test_oauth_refresh_network_failure_is_not_auth_error(driver_type: type) -> None:
+    driver = driver_type(token_url="https://refresh.test/token")
+
+    def disconnect(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection failed", request=request)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(disconnect)) as client:
+            with pytest.raises(RuntimeError) as raised:
+                await driver.refresh("old-refresh", client)
+        assert raised.value.code != "auth_error"
+
+    asyncio.run(run())
+
+
 def test_anthropic_email_address_captured_on_refresh(tmp_path: Path) -> None:
     credential = named_account_credentials(tmp_path, "anthropic")
     credential.save(OAuthTokens("old-access", "old-refresh", 1.0))
