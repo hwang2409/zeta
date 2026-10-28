@@ -391,9 +391,8 @@ def fetch_local_project(
             path = project / "memory" / name
             if path.is_file() and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE:
                 raise RemoteSyncError(f"memory file {name} is too large")
-        digest = project_digest(project)
         copy_project_snapshot(project, destination)
-        return digest
+        return project_digest(destination)
 
 
 def publish_local_project(
@@ -500,51 +499,96 @@ def _publish_memory_snapshot(
     changed_entry_ids: tuple[str, ...] | None = None,
     provenance: dict[str, str],
 ) -> None:
-    """Publish memory by pointer swap, then atomically publish sync state files."""
+    """Publish memory, conflicts, and sync state under one registry lock."""
 
     project_id = project.name
-    if not project.is_dir():
-        raise RemoteSyncError(f"project {project_id} was not found")
-    current = _materialize_memory_export(project, project_id)
-    if type(current) is not type(expected_export) or current.digest != expected_export.digest:
-        raise RemoteSyncError("local project memory changed during sync; retry")
     merged = _materialize_memory_export(snapshot, project_id)
-    if type(merged) is not type(current):
-        raise RemoteSyncError(
-            "mixed project memory formats cannot synchronize; migration is required"
-        )
-    if isinstance(merged, EntryMemoryExport):
-        assert isinstance(current, EntryMemoryExport)
-        if changed_entry_ids is None:
-            changed_entry_ids = tuple(
-                sorted(
-                    entry_id
-                    for entry_id in current.state.entries.keys() | merged.state.entries.keys()
-                    if current.state.entries.get(entry_id)
-                    != merged.state.entries.get(entry_id)
-                )
-            )
+    registry = ProjectRegistry(project.parent)
     try:
-        _import_merged_memory(
-            project,
-            project_id,
-            merged,
-            changed_entry_ids=changed_entry_ids or (),
-            provenance=provenance,
-        )
+        with registry._locked(write=True) as root_fd:
+            if not project.is_dir():
+                raise RemoteSyncError(f"project {project_id} was not found")
+            if registry._memory_format_locked(root_fd, project_id) == 2:
+                current: MemorySyncExport = registry._export_entry_memory_locked(
+                    root_fd, project_id
+                )
+            else:
+                current = registry._export_memory_locked(root_fd, project_id)
+            if (
+                type(current) is not type(expected_export)
+                or current.digest != expected_export.digest
+            ):
+                raise RemoteSyncError("local project memory changed during sync; retry")
+            if type(merged) is not type(current):
+                raise RemoteSyncError(
+                    "mixed project memory formats cannot synchronize; migration is required"
+                )
+            if isinstance(merged, EntryMemoryExport):
+                assert isinstance(current, EntryMemoryExport)
+                if changed_entry_ids is None:
+                    changed_entry_ids = tuple(
+                        sorted(
+                            entry_id
+                            for entry_id in (
+                                current.state.entries.keys()
+                                | merged.state.entries.keys()
+                            )
+                            if current.state.entries.get(entry_id)
+                            != merged.state.entries.get(entry_id)
+                        )
+                    )
+            _import_merged_memory_locked(
+                registry,
+                root_fd,
+                project_id,
+                merged,
+                expected_digest=current.digest,
+                changed_entry_ids=changed_entry_ids or (),
+                provenance=provenance,
+            )
+            source_memory = snapshot / "memory"
+            if source_memory.is_dir():
+                for source in sorted(source_memory.iterdir()):
+                    if source.is_file() and any(
+                        source.name.startswith(f"{name}.conflict-")
+                        for name in MEMORY_FILES
+                    ):
+                        _atomic_copy_file(source, project / "memory" / source.name)
+            source_sync = snapshot / "sync"
+            if source_sync.is_dir():
+                for source in sorted(source_sync.glob("*.json")):
+                    _atomic_copy_file(source, project / "sync" / source.name)
     except ProjectRegistryError as exc:
         raise RemoteSyncError(f"project memory changed during sync: {exc}") from exc
-    source_memory = snapshot / "memory"
-    if source_memory.is_dir():
-        for source in sorted(source_memory.iterdir()):
-            if source.is_file() and any(
-                source.name.startswith(f"{name}.conflict-") for name in MEMORY_FILES
-            ):
-                _atomic_copy_file(source, project / "memory" / source.name)
-    source_sync = snapshot / "sync"
-    if source_sync.is_dir():
-        for source in sorted(source_sync.glob("*.json")):
-            _atomic_copy_file(source, project / "sync" / source.name)
+
+
+def _import_merged_memory_locked(
+    registry: ProjectRegistry,
+    root_fd: int,
+    project_id: str,
+    merged: MemorySyncExport,
+    *,
+    expected_digest: str,
+    changed_entry_ids: tuple[str, ...],
+    provenance: dict[str, str],
+) -> None:
+    if isinstance(merged, EntryMemoryExport):
+        registry._import_entry_memory_locked(
+            root_fd,
+            project_id,
+            merged,
+            expected_digest=expected_digest,
+            changed_entry_ids=changed_entry_ids,
+            provenance=provenance,
+        )
+    else:
+        registry._import_memory_locked(
+            root_fd,
+            project_id,
+            merged,
+            expected_digest=expected_digest,
+            provenance=provenance,
+        )
 
 
 def _materialize_memory_export(snapshot: Path, project_id: str) -> MemorySyncExport:

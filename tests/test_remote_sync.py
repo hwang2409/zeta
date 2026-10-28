@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import concurrent.futures
+import fcntl
 import hashlib
 import io
 import json
@@ -530,6 +531,81 @@ def test_ssh_remote_install_rejects_byte_bomb_and_cleans_staging(
     assert not list((remote / "sessions").glob(".*.incoming-*"))
 
 
+def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(home, repo)
+    opened.store.close()
+    project_path = home / "projects" / project.project_id
+    sync_state = project_path / "sync" / "peer.json"
+    sync_state.parent.mkdir()
+    sync_state.write_text("old\n", encoding="utf-8")
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text("new\n", encoding="utf-8")
+    real_project_digest = memory_module.project_digest
+
+    def replace_sync_state_after_digest(path: Path) -> str:
+        digest = real_project_digest(path)
+        memory_module._atomic_copy_file(replacement, sync_state)
+        return digest
+
+    monkeypatch.setattr(memory_module, "project_digest", replace_sync_state_after_digest)
+    destination = tmp_path / "snapshot"
+
+    reported = memory_module.fetch_local_project(
+        home, project.project_id, destination, peer="peer"
+    )
+
+    assert reported == real_project_digest(destination)
+
+
+def test_sync_state_publication_holds_project_registry_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(home, repo)
+    opened.store.close()
+    project_path = home / "projects" / project.project_id
+    snapshot = tmp_path / "snapshot" / project.project_id
+    memory_module.copy_project_snapshot(project_path, snapshot)
+    snapshot.parent.chmod(0o700)
+    sync_state = snapshot / "sync" / "peer.json"
+    sync_state.parent.mkdir(exist_ok=True)
+    sync_state.write_text("state\n", encoding="utf-8")
+    expected = memory_module._materialize_memory_export(
+        project_path, project.project_id
+    )
+    real_atomic_copy = memory_module._atomic_copy_file
+    lock_was_held = False
+
+    def assert_registry_lock(source: Path, destination: Path) -> None:
+        nonlocal lock_was_held
+        if destination == project_path / "sync" / "peer.json":
+            with (
+                (home / "projects" / ".lock").open("rb") as lock,
+                pytest.raises(BlockingIOError),
+            ):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_was_held = True
+        real_atomic_copy(source, destination)
+
+    monkeypatch.setattr(memory_module, "_atomic_copy_file", assert_registry_lock)
+
+    memory_module._publish_memory_snapshot(
+        project_path,
+        snapshot,
+        expected_export=expected,
+        provenance={"source": "test"},
+    )
+
+    assert lock_was_held
+
+
 def test_opposite_direction_memory_syncs_do_not_deadlock(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -560,7 +636,9 @@ def test_opposite_direction_memory_syncs_do_not_deadlock(tmp_path: Path) -> None
         assert all(not process.is_alive() for process in processes)
         outcomes = [results.get(timeout=1) for _ in processes]
         assert all(
-            status == "ok" or "project registry busy" in message
+            status == "ok"
+            or "project registry busy" in message
+            or "remote changed during transfer" in message
             for status, message in outcomes
         ), outcomes
     finally:
