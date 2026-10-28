@@ -886,9 +886,9 @@ async def _provider_retry_frames(
         await _close(server, writer)
 
 
-async def _ready(server: ZetaServer):
+async def _ready(server: ZetaServer, protocol_version: str = "1.0"):
     reader, writer = await _connect(server)
-    await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+    await _request(reader, writer, 1, "hello", {"protocol_version": protocol_version})
     await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     return reader, writer
 
@@ -956,10 +956,11 @@ async def test_server_streams_display_safe_thinking_body_without_metadata(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_version", ["1.0", "1.1"])
 @pytest.mark.parametrize("status_code", [400, 401])
 @pytest.mark.parametrize("provider", ["anthropic", "codex"])
 async def test_oauth_refresh_rejection_reaches_serve_as_auth_error(
-    tmp_path: Path, provider: str, status_code: int
+    tmp_path: Path, provider: str, status_code: int, protocol_version: str
 ) -> None:
     from zeta.codex import CodexCredentialDriver
     from zeta.providers.anthropic import AnthropicCredentialDriver
@@ -976,7 +977,7 @@ async def test_oauth_refresh_rejection_reaches_serve_as_auth_error(
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda _provider, model, _home: (backend, model or "offline"),
     )
-    reader, writer = await _ready(server)
+    reader, writer = await _ready(server, protocol_version)
     try:
         await _request(reader, writer, 3, "send", {"text": "trigger refresh"})
         error = await _event(reader, "error")
@@ -3184,7 +3185,7 @@ async def test_session_history_hides_passive_harness_message(tmp_path: Path) -> 
     ("code", "status_code", "expected_code"),
     [
         ("backend_error", None, "backend_error"),
-        ("auth_error", None, "model_access_error"),
+        ("auth_error", None, "auth_error"),
         ("model_not_found", None, "model_access_error"),
         ("permission_denied", None, "model_access_error"),
     ],

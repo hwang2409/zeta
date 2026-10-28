@@ -141,7 +141,7 @@ def _failed_turn_history(message: Mapping[str, object]) -> dict[str, object] | N
         return {"code": "backend_error", "message": "turn failed"}
     provider_error = error.get("provider_error") is True
     status_code = error.get("status_code")
-    entitlement_failure = provider_error and (
+    entitlement_failure = code != "auth_error" and provider_error and (
         code in ENTITLEMENT_ERROR_CODES
         or status_code in {400, 401, 403, 404}
     )

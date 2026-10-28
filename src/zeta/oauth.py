@@ -14,6 +14,7 @@ import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote_plus
@@ -25,6 +26,31 @@ OAUTH_REFRESH_TIMEOUT_SECONDS = DEFAULT_STREAM_STALL_SECONDS
 
 class ProviderLoginRequiredError(RuntimeError):
     """Raised when a provider cannot run until the operator logs in."""
+
+
+class OAuthRefreshFailure(Enum):
+    LOGIN_REQUIRED = "login_required"
+    TRANSIENT = "transient"
+    PERMANENT = "permanent"
+
+
+def classify_oauth_refresh_failure(
+    *,
+    status_code: int | None = None,
+    response_body: object = None,
+    exception: BaseException | None = None,
+) -> OAuthRefreshFailure:
+    """Classify one failed token refresh without provider-specific error types."""
+    if exception is not None or status_code == 429 or (
+        status_code is not None and status_code >= 500
+    ):
+        return OAuthRefreshFailure.TRANSIENT
+    oauth_error = (
+        response_body.get("error") if isinstance(response_body, Mapping) else None
+    )
+    if status_code == 401 or (status_code == 400 and oauth_error == "invalid_grant"):
+        return OAuthRefreshFailure.LOGIN_REQUIRED
+    return OAuthRefreshFailure.PERMANENT
 
 
 _SENSITIVE_ERROR_NAMES = frozenset(

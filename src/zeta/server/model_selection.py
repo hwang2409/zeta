@@ -125,7 +125,7 @@ def entitlement_error(error: ErrorInfo) -> bool:
 
 async def recover_async(runtime: ServerRuntime, info: ErrorInfo) -> dict:
     error = {"code": info.code, "message": info.message}
-    if not entitlement_error(info):
+    if info.code == "auth_error" or not entitlement_error(info):
         return error
     error["code"] = "model_access_error"
     fallback = runtime.metadata.model_fallback
