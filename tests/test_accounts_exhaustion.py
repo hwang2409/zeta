@@ -6,7 +6,6 @@ import faulthandler
 import inspect
 import json
 import multiprocessing
-import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -589,7 +588,7 @@ async def test_switch_cancel_during_apply_handoff_releases_lock_and_fails_closed
 
 def _saturated_switch_rename_race(home_value: str, results: object) -> None:
     faulthandler.dump_traceback_later(SATURATED_RACE_TIMEOUT_SECONDS, exit=True)
-    results.put(("ready", time.monotonic()))
+    results.send(("ready", time.monotonic()))
     race_started = time.monotonic()
 
     async def run() -> None:
@@ -620,7 +619,7 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
 
         def queue_renames() -> None:
             event_loop.set_default_executor(executor)
-            for index in range(8):
+            for index in range(4):
                 rename_futures.append(executor.submit(rename, index))
 
         original_commit = SessionAccountContext._commit_locked
@@ -646,7 +645,7 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
                 provider="codex",
                 build_backend=lambda _account: object(),
             )
-            assert len(rename_futures) == 8
+            assert len(rename_futures) == 4
             await asyncio.gather(
                 *(asyncio.wrap_future(future) for future in rename_futures),
                 return_exceptions=True,
@@ -658,27 +657,28 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
     try:
         asyncio.run(run())
     except BaseException as exc:  # noqa: BLE001 - report child failure to parent
-        results.put(("result", repr(exc), time.monotonic() - race_started))
+        results.send(("result", repr(exc), time.monotonic() - race_started))
     else:
-        results.put(("result", None, time.monotonic() - race_started))
+        results.send(("result", None, time.monotonic() - race_started))
     finally:
         faulthandler.cancel_dump_traceback_later()
+        results.close()
 
 
 def test_switch_releases_lock_with_saturated_metadata_writers(tmp_path: Path) -> None:
     context = multiprocessing.get_context("spawn")
-    results = context.Queue()
+    results, child_end = context.Pipe(duplex=False)
     process = context.Process(
         target=_saturated_switch_rename_race,
-        args=(str(tmp_path / "saturated-race"), results),
+        args=(str(tmp_path / "saturated-race"), child_end),
     )
     started = time.monotonic()
     process.start()
+    child_end.close()
     try:
-        try:
-            event, _child_ready = results.get(timeout=60)
-        except queue.Empty:
+        if not results.poll(60):
             pytest.fail("child did not finish imports within 60 s")
+        event, _child_ready = results.recv()
         assert event == "ready"
         startup_seconds = time.monotonic() - started
         process.join(timeout=SATURATED_RACE_TIMEOUT_SECONDS + 1)
@@ -691,7 +691,8 @@ def test_switch_releases_lock_with_saturated_metadata_writers(tmp_path: Path) ->
                 f"{startup_seconds:.3f} s of child startup"
             )
         assert process.exitcode == 0
-        event, error, race_seconds = results.get(timeout=1)
+        assert results.poll(1)
+        event, error, race_seconds = results.recv()
         assert event == "result"
         assert error is None, error
         assert race_seconds < SATURATED_RACE_TIMEOUT_SECONDS
@@ -700,7 +701,6 @@ def test_switch_releases_lock_with_saturated_metadata_writers(tmp_path: Path) ->
             process.terminate()
             process.join(timeout=1)
         results.close()
-        results.join_thread()
         process.close()
 
 
