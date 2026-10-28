@@ -88,25 +88,29 @@ class EntryMemoryViewMixin:
     def memory_format(self, project_id: str) -> int:
         """Return the authoritative format without activating either format."""
         def read(root_fd: int) -> int:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                pointer = self._pointer(directory_fd)
-                if pointer is None:
-                    return 1
+            return self._memory_format_locked(root_fd, project_id)
+
+        return self._read(read)
+
+    def _memory_format_locked(self, root_fd: int, project_id: str) -> int:
+        directory_fd = self._project_dir(root_fd, project_id)
+        try:
+            pointer = self._pointer(directory_fd)
+            if pointer is None:
+                value = 1
+            else:
                 root, blobs_fd, versions_fd = self._version_handles(
                     directory_fd, create=False
                 )
                 try:
                     record = self._manifest(versions_fd, str(pointer["current"]))
-                    return int(record.get("format", 1))
+                    value = int(record.get("format", 1))
                 finally:
                     os.close(versions_fd)
                     os.close(blobs_fd)
                     os.close(root)
-            finally:
-                os.close(directory_fd)
-
-        value = self._read(read)
+        finally:
+            os.close(directory_fd)
         if value not in {1, 2}:
             raise ProjectRegistryError("unsupported project memory format")
         return value

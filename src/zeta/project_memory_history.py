@@ -706,33 +706,38 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
     def export_memory(self, project_id: str) -> MemoryExport:
         """Export logical memory without exposing the version-store layout."""
         def read(root_fd: int) -> MemoryExport:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                snapshot = self._snapshot_locked(directory_fd)
-                records = self._records_locked(directory_fd)
-                return MemoryExport(
-                    dict(snapshot.contents),
-                    snapshot.digest,
-                    logical_history(
-                        records,
-                        (
-                            "version",
-                            "kind",
-                            "created_at",
-                            "files",
-                            "target_version",
-                            "provenance",
-                            "source_digest",
-                            "automatic_files",
-                            "before_automatic_files",
-                        ),
-                    ),
-                    tuple(sorted(self._automatic_files_from_records(records))),
-                )
-            finally:
-                os.close(directory_fd)
+            return self._export_memory_locked(root_fd, project_id)
 
         return self._read(read)
+
+    def _export_memory_locked(
+        self, root_fd: int, project_id: str
+    ) -> MemoryExport:
+        directory_fd = self._project_dir(root_fd, project_id)
+        try:
+            snapshot = self._snapshot_locked(directory_fd)
+            records = self._records_locked(directory_fd)
+            return MemoryExport(
+                dict(snapshot.contents),
+                snapshot.digest,
+                logical_history(
+                    records,
+                    (
+                        "version",
+                        "kind",
+                        "created_at",
+                        "files",
+                        "target_version",
+                        "provenance",
+                        "source_digest",
+                        "automatic_files",
+                        "before_automatic_files",
+                    ),
+                ),
+                tuple(sorted(self._automatic_files_from_records(records))),
+            )
+        finally:
+            os.close(directory_fd)
 
     def import_memory(
         self,
@@ -743,6 +748,24 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         provenance: Mapping[str, object] | None = None,
     ) -> MemoryCASResult:
         """CAS-import one logical snapshot as a version with its source history."""
+        with self._locked(write=True) as root_fd:
+            return self._import_memory_locked(
+                root_fd,
+                project_id,
+                exported,
+                expected_digest=expected_digest,
+                provenance=provenance,
+            )
+
+    def _import_memory_locked(
+        self,
+        root_fd: int,
+        project_id: str,
+        exported: MemoryExport,
+        *,
+        expected_digest: str,
+        provenance: Mapping[str, object] | None,
+    ) -> MemoryCASResult:
         if not isinstance(exported, MemoryExport):
             raise ProjectRegistryError("invalid memory export")
         self._validate_updates(exported.contents)
@@ -764,49 +787,48 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         if automatic_files is None or tuple(sorted(automatic_files)) != exported.automatic_files:
             raise ProjectRegistryError("invalid memory export")
         source_history = [dict(item) for item in exported.versions]
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                before = self._snapshot_locked(directory_fd)
-                if before.digest != expected_digest:
-                    raise ProjectRegistryError("project memory digest mismatch")
-                records = self._records_locked(directory_fd)
-                if (
-                    before.contents == exported.contents
-                    and self._automatic_files_from_records(records) == automatic_files
-                ):
-                    pointer = self._pointer(directory_fd)
-                    version = "" if pointer is None else str(pointer["current"])
-                    if pointer is not None:
-                        self._refresh_memory_mirror(
-                            directory_fd,
-                            before.contents,
-                            mirror_path=self.root / project_id / "memory",
-                        )
-                    return MemoryCASResult(
-                        list(exported.contents.items()), False, version
+        directory_fd = self._project_dir(root_fd, project_id)
+        try:
+            before = self._snapshot_locked(directory_fd)
+            if before.digest != expected_digest:
+                raise ProjectRegistryError("project memory digest mismatch")
+            records = self._records_locked(directory_fd)
+            if (
+                before.contents == exported.contents
+                and self._automatic_files_from_records(records) == automatic_files
+            ):
+                pointer = self._pointer(directory_fd)
+                version = "" if pointer is None else str(pointer["current"])
+                if pointer is not None:
+                    self._refresh_memory_mirror(
+                        directory_fd,
+                        before.contents,
+                        mirror_path=self.root / project_id / "memory",
                     )
-                version = self._publish_version(
-                    directory_fd,
-                    project_id=project_id,
-                    contents=exported.contents,
-                    before=before.contents,
-                    kind="import",
-                    files=[
-                        name
-                        for name in PROJECT_MEMORY_FILES
-                        if before.contents.get(name) != exported.contents[name]
-                    ],
-                    provenance=provenance,
-                    source_digest=exported.digest,
-                    source_history=source_history,
-                    source_automatic_files=automatic_files,
-                )
                 return MemoryCASResult(
-                    list(exported.contents.items()), True, version
+                    list(exported.contents.items()), False, version
                 )
-            finally:
-                os.close(directory_fd)
+            version = self._publish_version(
+                directory_fd,
+                project_id=project_id,
+                contents=exported.contents,
+                before=before.contents,
+                kind="import",
+                files=[
+                    name
+                    for name in PROJECT_MEMORY_FILES
+                    if before.contents.get(name) != exported.contents[name]
+                ],
+                provenance=provenance,
+                source_digest=exported.digest,
+                source_history=source_history,
+                source_automatic_files=automatic_files,
+            )
+            return MemoryCASResult(
+                list(exported.contents.items()), True, version
+            )
+        finally:
+            os.close(directory_fd)
 
     def memory_state(self, project_id: str) -> MemoryState:
         """Read the current authoritative snapshot and origin flags atomically."""
