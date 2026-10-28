@@ -1374,7 +1374,7 @@ async def test_health_log_never_contains_transcript_or_model_text(
 
     async def invoke(prompt: str) -> ReconciliationResponse:
         if fails:
-            output = f"not json {private_literal}"
+            output = json.dumps({"operations": [{"op": private_literal}]})
         else:
             proposal = json.loads(_proposal(prompt))
             proposal["changes"][0]["content"] = f"# Decisions\n\n{private_literal}\n"
@@ -1387,10 +1387,11 @@ async def test_health_log_never_contains_transcript_or_model_text(
         transcript_count=1,
         minimum_interval=0,
         retry_backoff_seconds=60,
+        entry_format=fails,
     )
     transcript_path = runner.session_dir / "conversation.jsonl"
     transcript = transcript_path.read_text(encoding="utf-8").replace(
-        "fact 1", private_literal
+        "fact 1", f"remember `{private_literal}`"
     )
     transcript_path.write_text(transcript, encoding="utf-8")
 
