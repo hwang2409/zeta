@@ -15,6 +15,7 @@ from ..core.login_flow import (
     _wait_bounded_work,
     run_login,
 )
+from ..core.session import account_home
 from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
 from .protocol import ProtocolError
@@ -154,7 +155,7 @@ class Logins:
     ) -> dict:
         operation = operation or _LoginOperation()
         login_provider = "anthropic" if provider == "claude" else provider
-        lock = AccountStore(self.home).provider_login_lock(login_provider)
+        lock = AccountStore(account_home(self.home)).provider_login_lock(login_provider)
         locked = False
         acquisition = asyncio.create_task(asyncio.to_thread(lock.__enter__))
         cancelled = False

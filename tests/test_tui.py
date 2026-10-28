@@ -74,6 +74,7 @@ from zeta.diagnostics import tui_stalls as tui_stalls_module
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.providers.anthropic import (
     AnthropicBackend,
+    AnthropicCredentialDriver,
     OAuthTokens,
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend
@@ -4173,6 +4174,45 @@ async def test_provider_failure_card_is_visible_in_both_modes(
     assert "provider failure · backend_error" in plain
     assert "reason: boom" in plain
     assert "retry: ctrl+y" in plain
+
+
+@pytest.mark.asyncio
+async def test_oauth_refresh_rejection_renders_as_login_problem(tmp_path: Path) -> None:
+    driver = AnthropicCredentialDriver(token_url="https://refresh.test/token")
+
+    class RefreshFailureBackend:
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(
+                        400, json={"error": "invalid_grant"}
+                    )
+                )
+            ) as client:
+                await driver.refresh("expired-refresh", client)
+            if False:
+                yield
+
+    app = TUIApp(
+        AgentLoop(
+            RefreshFailureBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="claude",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered: list[object] = []
+    app._print = rendered.append
+
+    await app._consume_turn("prompt")
+
+    plain = "\n".join(renderable_plain(item) for item in rendered)
+    assert "login required · auth_error" in plain
+    assert "reason: Claude OAuth token refresh failed with HTTP 400" in plain
+    await app.close()
 
 
 @pytest.mark.asyncio

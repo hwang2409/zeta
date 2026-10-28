@@ -14,7 +14,9 @@ limited to 1 MiB.
 The server accepts one client. A second connection receives a JSON-RPC error
 with code `-32001`, then closes. The server uses a Unix socket by default:
 `$ZETA_HOME/run/serve.sock`. `zeta serve --socket PATH` selects another Unix
-socket. `zeta serve --port N` selects `127.0.0.1:N`.
+socket. `zeta serve --port N` selects `127.0.0.1:N`. set
+`ZETA_ACCOUNT_HOME` to an absolute directory when served sessions must use a
+shared provider account store while all other state remains under `ZETA_HOME`.
 
 ## handshake
 
@@ -877,9 +879,11 @@ tools, approvals, and background agents with `-32004`.
 
 Session fallback metadata is storage-only and never appears in wire responses.
 For foreground provider failures, 1.1 error events use `model_access_error` when
-HTTP 400/401/403/404 or an authentication/access code identifies a rejected
-completion. They use `model_reverted` after restoring a pending model fallback.
-The frontend client offers Open Settings for these two codes only. MCP setup and background
+HTTP 400/401/403/404 or a model-access code identifies a rejected completion.
+Provider login failures retain `auth_error` so clients can request a new login instead
+of opening model settings. Other access failures use `model_reverted` after restoring
+a pending model fallback. The frontend client offers Open Settings for the model-access
+codes only. MCP setup and background
 errors retain their original codes. Protocol 1.0 always retains the original
 error code and message. Provider status and origin remain internal.
 

@@ -24,6 +24,7 @@ import zeta.core.store._log as store_log_module
 import zeta.runtime.execution as execution_module
 import zeta.runtime.loop.agent as agent_loop_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.processes import wait_for_path_command
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.background import (
     BackgroundAgentOwner,
@@ -9039,10 +9040,7 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
 ) -> None:
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     release = tmp_path / "release"
-    command = (
-        f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
-        "echo task-evidence"
-    )
+    command = f"{wait_for_path_command(release)} && echo task-evidence"
     backend = _TaskFinishGateBackend(command, gate_delay=True)
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.05)
@@ -9076,10 +9074,7 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
 ) -> None:
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     release = tmp_path / "release"
-    command = (
-        f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
-        "echo task-evidence"
-    )
+    command = f"{wait_for_path_command(release)} && echo task-evidence"
     backend = _TaskFinishGateBackend(command, mixed_child=True, gate_delay=True)
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store, finish_gate_timeout=0.05)
@@ -9217,10 +9212,7 @@ async def test_finish_gate_turn_cap_does_not_kill_running_task(
     tmp_path: Path,
 ) -> None:
     release = tmp_path / "release"
-    command = (
-        f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
-        "echo task-evidence"
-    )
+    command = f"{wait_for_path_command(release)} && echo task-evidence"
     backend = _TaskFinishGateBackend(command)
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(
@@ -9312,17 +9304,13 @@ async def test_finish_gate_task_without_exit_reports_safety_bound(
 @pytest.mark.asyncio
 async def test_child_finish_gate_lists_task_and_wakes_on_exit(tmp_path: Path) -> None:
     release = tmp_path / "release"
-    command = (
-        f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; "
-        "echo task-evidence"
-    )
+    command = f"{wait_for_path_command(release)} && echo task-evidence"
     backend = _TaskFinishGateBackend(command)
     store, loop, run = await _start_task_gate(tmp_path / "session", backend)
 
     await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
     assert "background tasks" in backend.gate_text
     assert "task-" in backend.gate_text
-    assert "while [ ! -e" in backend.gate_text
     assert not [
         entry
         for entry in store.agent_notifications(pending_only=False)
@@ -12286,6 +12274,7 @@ def _start_child_lease_holder(
     append_finished: Path | None = None,
 ) -> subprocess.Popen[str]:
     script = """
+import os
 import sys
 import time
 from pathlib import Path
@@ -12305,9 +12294,24 @@ stop = Path(sys.argv[4])
 append_started = None if sys.argv[5] == "-" else Path(sys.argv[5])
 recovery_done = None if sys.argv[6] == "-" else Path(sys.argv[6])
 append_finished = None if sys.argv[7] == "-" else Path(sys.argv[7])
+owner_pid = int(sys.argv[8])
+deadline = time.monotonic() + 120
+
+def owner_is_alive():
+    try:
+        os.kill(owner_pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
 if append_started is not None:
     index = 0
-    while not recovery_done.exists() and not stop.exists():
+    while (
+        not recovery_done.exists()
+        and not stop.exists()
+        and owner_is_alive()
+        and time.monotonic() < deadline
+    ):
         store.append_message(
             with_message_origin(
                 Message(MessageRole.USER, [TextContent(f"concurrent append {index}")]),
@@ -12325,8 +12329,12 @@ if append_started is not None:
             )
         )
         append_finished.write_text("finished")
-while not stop.exists():
-    time.sleep(0.01)
+while (
+    not stop.exists()
+    and owner_is_alive()
+    and time.monotonic() < deadline
+):
+    time.sleep(0.1)
 store.close()
 """
     process = subprocess.Popen(
@@ -12341,6 +12349,7 @@ store.close()
             str(append_started) if append_started is not None else "-",
             str(recovery_done) if recovery_done is not None else "-",
             str(append_finished) if append_finished is not None else "-",
+            str(os.getpid()),
         ],
         text=True,
     )

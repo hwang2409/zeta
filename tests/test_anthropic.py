@@ -669,6 +669,7 @@ async def test_retry_exhaustion_records_class_only_diagnostic(
     assert records == [
         {
             "timestamp": records[0]["timestamp"],
+            "provider": "claude",
             "cause": "zeta.providers.anthropic_errors.AnthropicHTTPError",
             "retries": 4,
             "decision": "budget-exhausted",
@@ -2336,14 +2337,14 @@ def test_thinking_tool_turn_replays_assistant_blocks_before_tool_result() -> Non
 
 
 @pytest.mark.asyncio
-async def test_http_failure_is_typed(tmp_path: Path) -> None:
+async def test_refresh_auth_failure_is_typed(tmp_path: Path) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
 
     store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
-    with pytest.raises(AnthropicHTTPError):
+    with pytest.raises(AnthropicAuthError):
         await anext(AnthropicBackend(client=client, token_store=store).complete([], []))
     await client.aclose()
 
@@ -2383,6 +2384,7 @@ async def test_early_stream_end_is_typed(tmp_path: Path) -> None:
     record = json.loads(
         (tmp_path / "logs" / "stream-diagnostics.jsonl").read_text().strip()
     )
+    assert record["provider"] == "claude"
     assert record["cause"] == "clean-eof"
     assert record["stream_age_seconds"] >= 0
     assert record["bytes_received"] > 0

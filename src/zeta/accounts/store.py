@@ -30,7 +30,13 @@ from ..core.session_files import (
     open_session_file,
     require_off_loop_lock,
 )
-from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens, credential_file_lock
+from ..oauth import (
+    OAUTH_REFRESH_TIMEOUT_SECONDS,
+    OAuthRefreshFailure,
+    OAuthTokens,
+    classify_oauth_refresh_failure,
+    credential_file_lock,
+)
 
 _PROVIDERS = {"anthropic", "codex"}
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
@@ -526,6 +532,7 @@ def rename_account_command(store: AccountStore, args: str) -> str:
 
 class _CredentialDriver(Protocol):
     auth_error_type: type[RuntimeError]
+    http_error_type: type[RuntimeError]
     provider_label: str
 
     def bootstrap(self) -> OAuthTokens | None: ...
@@ -550,6 +557,7 @@ class AccountCredentials:
         self._driver = driver
         self.path = store.credential_path(account)
         self.auth_error_type = driver.auth_error_type
+        self.http_error_type = driver.http_error_type
         self.provider_label = driver.provider_label
         self._async_lock = asyncio.Lock()
 
@@ -632,8 +640,10 @@ class AccountCredentials:
                 timeout=OAUTH_REFRESH_TIMEOUT_SECONDS,
             )
         except TimeoutError as exc:
-            raise self.auth_error_type(
-                f"{self.provider_label} OAuth token refresh stalled"
+            outcome = classify_oauth_refresh_failure(exception=exc)
+            raise self.http_error_type(
+                f"{self.provider_label} OAuth token refresh stalled",
+                retryable=outcome is OAuthRefreshFailure.TRANSIENT,
             ) from exc
         if not refreshed.email or not refreshed.workspace:
             refreshed = OAuthTokens(

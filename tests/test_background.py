@@ -20,6 +20,7 @@ import pytest
 
 import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.processes import wait_for_path_command
 from zeta.agent.background import BackgroundAgentOwner
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.session import SessionManager
@@ -2106,7 +2107,7 @@ skill_catalog=SkillCatalog.empty(),
 async def test_more_than_eight_background_tasks_run_concurrently(tmp_path: Path) -> None:
     tasks = BackgroundTaskRegistry()
     gate = tmp_path / "release"
-    command = f"while ! test -e {shlex.quote(str(gate))}; do sleep 0.01; done"
+    command = wait_for_path_command(gate)
     task_ids = [await tasks.start(command, tmp_path) for _ in range(12)]
     assert len(task_ids) == 12
     for _ in range(1000):

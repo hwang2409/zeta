@@ -24,6 +24,7 @@ from textwrap import dedent
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 import zeta.accounts.session as account_session_module
@@ -31,6 +32,7 @@ import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.processes import wait_for_path_command
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
@@ -650,6 +652,25 @@ async def _close(server: ZetaServer, writer: asyncio.StreamWriter) -> None:
     await asyncio.wait_for(server.close(), TIMEOUT)
 
 
+class OAuthRefreshFailureBackend:
+    def __init__(self, driver: Any, status_code: int) -> None:
+        self.driver = driver
+        self.status_code = status_code
+
+    async def complete(self, messages, tool_schemas):
+        del messages, tool_schemas
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(
+                    self.status_code, json={"error": "invalid_grant"}
+                )
+            )
+        ) as client:
+            await self.driver.refresh("expired-refresh", client)
+        if False:
+            yield
+
+
 class FailingWakeBackend:
     def __init__(self) -> None:
         self.calls = 0
@@ -866,9 +887,9 @@ async def _provider_retry_frames(
         await _close(server, writer)
 
 
-async def _ready(server: ZetaServer):
+async def _ready(server: ZetaServer, protocol_version: str = "1.0"):
     reader, writer = await _connect(server)
-    await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+    await _request(reader, writer, 1, "hello", {"protocol_version": protocol_version})
     await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     return reader, writer
 
@@ -931,6 +952,43 @@ async def test_server_streams_display_safe_thinking_body_without_metadata(
             {"type": "thinking", "text": "summary", "body": "summary"}
         ]
         assert "metadata" not in message
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_version", ["1.0", "1.1"])
+@pytest.mark.parametrize("status_code", [400, 401])
+@pytest.mark.parametrize("provider", ["anthropic", "codex"])
+async def test_oauth_refresh_rejection_reaches_serve_as_auth_error(
+    tmp_path: Path, provider: str, status_code: int, protocol_version: str
+) -> None:
+    from zeta.codex import CodexCredentialDriver
+    from zeta.providers.anthropic import AnthropicCredentialDriver
+
+    driver_type = (
+        AnthropicCredentialDriver if provider == "anthropic" else CodexCredentialDriver
+    )
+    backend = OAuthRefreshFailureBackend(
+        driver_type(token_url="https://refresh.test/token"), status_code
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda _provider, model, _home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server, protocol_version)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "trigger refresh"})
+        error = await _event(reader, "error")
+        assert error["error"] == {
+            "code": "auth_error",
+            "message": (
+                f"{'Claude' if provider == 'anthropic' else 'Codex'} OAuth token "
+                f"refresh failed with HTTP {status_code}"
+            ),
+        }
     finally:
         await _close(server, writer)
 
@@ -1731,16 +1789,10 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
     marker = tmp_path / "foreground-finished"
     release = tmp_path / "release-foreground"
     pid_path = tmp_path / "foreground-pid"
-    script = (
-        "import os,pathlib,time\n"
-        f"pid_path = pathlib.Path({str(pid_path)!r})\n"
-        f"release = pathlib.Path({str(release)!r})\n"
-        f"marker = pathlib.Path({str(marker)!r})\n"
-        "pid_path.write_text(str(os.getpid()))\n"
-        "while not release.exists(): time.sleep(0.01)\n"
-        "marker.write_text('done')\n"
+    command = (
+        f"echo $$ > {shlex.quote(str(pid_path))} && "
+        f"{wait_for_path_command(release)} && touch {shlex.quote(str(marker))}"
     )
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
     backend = BackgroundChildAndForegroundToolBackend(command)
     server = ZetaServer(provider="codex",
         home=tmp_path,
@@ -3128,7 +3180,7 @@ async def test_session_history_hides_passive_harness_message(tmp_path: Path) -> 
     ("code", "status_code", "expected_code"),
     [
         ("backend_error", None, "backend_error"),
-        ("auth_error", None, "model_access_error"),
+        ("auth_error", None, "auth_error"),
         ("model_not_found", None, "model_access_error"),
         ("permission_denied", None, "model_access_error"),
     ],

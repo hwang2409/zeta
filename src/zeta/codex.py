@@ -19,7 +19,12 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .oauth import OAuthTokens, ProviderLoginRequiredError
+from .oauth import (
+    OAuthRefreshFailure,
+    OAuthTokens,
+    ProviderLoginRequiredError,
+    classify_oauth_refresh_failure,
+)
 
 
 class CodexBackendError(RuntimeError):
@@ -54,11 +59,13 @@ class CodexHTTPError(CodexBackendError):
         status_code: int | None = None,
         retry_after: float | None = None,
         response_body: bytes | None = None,
+        retryable: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retry_after = retry_after
         self.response_body = response_body
+        self.retryable = retryable
 
 
 class CodexStreamError(CodexBackendError):
@@ -216,6 +223,7 @@ class CodexCredentialDriver:
     """Read Codex bootstrap credentials and implement provider OAuth behavior."""
 
     auth_error_type = CodexAuthError
+    http_error_type = CodexHTTPError
     provider_label = "Codex"
 
     def login_required_error(self, message: str) -> CodexLoginRequiredError:
@@ -248,10 +256,30 @@ class CodexCredentialDriver:
                 headers={"accept": "application/json"},
             )
         except httpx.HTTPError as exc:
-            raise CodexAuthError("Codex OAuth token refresh failed") from exc
-        if response.status_code >= 400:
+            outcome = classify_oauth_refresh_failure(exception=exc)
             raise CodexHTTPError(
+                "Codex OAuth token refresh failed",
+                retryable=outcome is OAuthRefreshFailure.TRANSIENT,
+            ) from exc
+        if response.status_code >= 400:
+            try:
+                response_body = response.json()
+            except (TypeError, ValueError, json.JSONDecodeError):
+                response_body = None
+            outcome = classify_oauth_refresh_failure(
+                status_code=response.status_code, response_body=response_body
+            )
+            message = (
                 f"Codex OAuth token refresh failed with HTTP {response.status_code}"
+            )
+            if outcome is OAuthRefreshFailure.LOGIN_REQUIRED:
+                raise CodexLoginRequiredError(
+                    message, status_code=response.status_code
+                )
+            raise CodexHTTPError(
+                message,
+                status_code=response.status_code,
+                retryable=outcome is OAuthRefreshFailure.TRANSIENT,
             )
         try:
             value = response.json()

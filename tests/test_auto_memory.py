@@ -4,9 +4,10 @@ import asyncio
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
-from zeta.codex import CodexLoginRequiredError
+from zeta.codex import CodexCredentialDriver
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import EntryReconciliationResult
 from zeta.memory.profiles import memory_profile
@@ -14,6 +15,7 @@ from zeta.memory.reconciler import ReconciliationResponse
 from zeta.memory.user_authorization import MemoryMutationAuthorization
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_registry import ProjectRegistry, ProjectRegistryError
+from zeta.providers.anthropic import AnthropicCredentialDriver
 
 SESSION = "a" * 32
 
@@ -130,22 +132,35 @@ def _runner(
 
 
 @pytest.mark.asyncio
-async def test_login_required_pauses_session_without_retry_or_cursor_advance(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("provider", "driver_type"),
+    [("anthropic", AnthropicCredentialDriver), ("codex", CodexCredentialDriver)],
+)
+async def test_refresh_invalid_grant_pauses_session_without_retry_or_cursor_advance(
+    tmp_path: Path, provider: str, driver_type: type
 ) -> None:
     calls = 0
+    driver = driver_type(token_url="https://refresh.test/token")
 
     async def invoke(_prompt: str) -> str:
         nonlocal calls
         calls += 1
-        raise CodexLoginRequiredError("no Codex OAuth login found")
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(
+                    400, json={"error": "invalid_grant"}
+                )
+            )
+        ) as client:
+            await driver.refresh("expired-refresh", client)
+        raise AssertionError("unreachable")
 
     runner, _registry, _project_id, notices = _runner(
         tmp_path,
         invoke,
         transcript_count=2,
         model="gpt-5.6-luna",
-        provider="codex",
+        provider=provider,
         minimum_interval=0,
         retry_backoff_seconds=0,
     )
@@ -159,8 +174,8 @@ async def test_login_required_pauses_session_without_retry_or_cursor_advance(
     assert not runner.failure_log_path.exists()
     expected_notice = (
         "automatic project-memory reconciliation paused: model gpt-5.6-luna "
-        "uses provider codex, but codex is not logged in. Run "
-        "`zeta accounts login codex <name>`, set `[memory] model` in settings.toml "
+        f"uses provider {provider}, but {provider} is not logged in. Run "
+        f"`zeta accounts login {provider} <name>`, set `[memory] model` in settings.toml "
         "to a model on a logged-in provider, or set `[memory] auto = false`. "
         "Reconciliation will retry when this session next starts."
     )
