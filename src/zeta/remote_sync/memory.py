@@ -29,26 +29,29 @@ from ..memory.entry_sync import (
     parse_resolution_candidates,
     select_resolution_choices,
 )
+from ..memory.entry_views import GENERATED_MIRROR_HEADER
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
 from .errors import RemoteSyncError
 from .project_publish import (
+    MAX_SYNC_STATE_SIZE,
     ProjectPublicationError,
     materialize_project_transfer,
     normalize_project_digest,
     prepare_project_transfer,
     project_digest,
+    synchronized_payload_paths,
+    validated_side_file_payloads,
 )
 from .project_publish import (
     publish_local_project as _publish_local_project,
 )
 
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
-_EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
 _MACHINE_ID = ".machine-id"
-_MAX_STATE_BYTES = 512 * 1024
+_MAX_STATE_BYTES = MAX_SYNC_STATE_SIZE
 MemorySyncExport = MemoryExport | EntryMemoryExport
 
 
@@ -121,13 +124,13 @@ def sync_project_memory(
             if direction == "pull":
                 raise RemoteSyncError(f"remote project {project_id} was not found")
             copy_project_snapshot(local, remote)
-            remote_export = local_export
+            remote_export = _materialize_memory_export(remote, project_id)
         else:
             _validate_project_snapshot(remote, project_id)
             remote_export = _materialize_memory_export(remote, project_id)
         if local_expected == _MISSING:
             copy_project_snapshot(remote, local)
-            local_export = remote_export
+            local_export = _materialize_memory_export(local, project_id)
         if local_export is None or remote_export is None:
             raise RemoteSyncError("project memory snapshot is missing")
         source, destination = (local, remote) if direction == "push" else (remote, local)
@@ -210,6 +213,7 @@ def sync_project_memory(
                 changed_entry_ids=local_changed,
                 provenance={"source": "remote_sync", "peer": peer},
             )
+        _materialize_readable_mirrors(remote, merged)
         transport.publish_project(
             project_id, remote, expected_digest=remote_expected
         )
@@ -366,6 +370,7 @@ def resolve_project_memory(
             merged,
             provenance={"source": "remote_sync", "peer": peer},
         )
+        _materialize_readable_mirrors(remote, merged)
         transport.publish_project(
             project_id, remote, expected_digest=remote_expected
         )
@@ -415,52 +420,32 @@ def publish_local_project(
 
 
 def copy_project_snapshot(source: Path, destination: Path) -> None:
-    """Copy only project identity, standard memory, history, and sync state."""
+    """Copy the canonical synchronized project payload."""
 
+    try:
+        payload = synchronized_payload_paths(source)
+    except ProjectPublicationError as exc:
+        raise RemoteSyncError(str(exc)) from exc
+    if source / "project.json" not in payload:
+        raise RemoteSyncError("project record is missing or unsafe")
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-    record = source / "project.json"
-    if not record.is_file() or record.is_symlink():
-        raise RemoteSyncError("project record is missing or unsafe")
-    _atomic_copy_file(record, destination / "project.json")
-    source_memory = source / "memory"
-    destination_memory = destination / "memory"
-    destination_memory.mkdir(mode=0o700)
-    try:
-        memory_info = source_memory.lstat()
-    except FileNotFoundError:
-        memory_info = None
-    if memory_info is not None:
-        if not stat.S_ISDIR(memory_info.st_mode) or stat.S_ISLNK(memory_info.st_mode):
-            raise RemoteSyncError("project memory directory is unsafe")
-        for path in sorted(source_memory.iterdir()):
-            if path.name in MEMORY_FILES or any(
-                path.name.startswith(f"{name}.conflict-") for name in MEMORY_FILES
-            ):
-                if not path.is_file() or path.is_symlink():
-                    raise RemoteSyncError("project memory file is unsafe")
-                _atomic_copy_file(path, destination_memory / path.name)
-    for relative in (
-        Path("memory/history"),
-        Path("memory-versions"),
-        Path("memory-current.json"),
-        Path("history"),
-        Path("sync"),
-    ):
-        path = source / relative
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(info.st_mode):
-            raise RemoteSyncError(f"project snapshot member is unsafe: {relative}")
-        if stat.S_ISDIR(info.st_mode):
-            _copy_tree(path, destination / relative)
-        elif stat.S_ISREG(info.st_mode):
-            _atomic_copy_file(path, destination / relative)
-        else:
-            raise RemoteSyncError(f"project snapshot member is unsafe: {relative}")
+    directories = {
+        parent
+        for path in payload
+        for parent in path.relative_to(source).parents
+        if parent != Path(".")
+    }
+    for relative in sorted(directories, key=lambda item: (len(item.parts), item.parts)):
+        directory = destination / relative
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+    memory = destination / "memory"
+    memory.mkdir(mode=0o700, exist_ok=True)
+    memory.chmod(0o700)
+    for path in payload:
+        _atomic_copy_file(path, destination / path.relative_to(source))
 
 
 def _import_merged_memory(
@@ -499,51 +484,71 @@ def _publish_memory_snapshot(
     changed_entry_ids: tuple[str, ...] | None = None,
     provenance: dict[str, str],
 ) -> None:
-    """Publish memory by pointer swap, then atomically publish sync state files."""
+    """Publish memory, conflicts, and sync state under one registry lock."""
 
     project_id = project.name
-    if not project.is_dir():
-        raise RemoteSyncError(f"project {project_id} was not found")
-    current = _materialize_memory_export(project, project_id)
-    if type(current) is not type(expected_export) or current.digest != expected_export.digest:
-        raise RemoteSyncError("local project memory changed during sync; retry")
-    merged = _materialize_memory_export(snapshot, project_id)
-    if type(merged) is not type(current):
-        raise RemoteSyncError(
-            "mixed project memory formats cannot synchronize; migration is required"
-        )
-    if isinstance(merged, EntryMemoryExport):
-        assert isinstance(current, EntryMemoryExport)
-        if changed_entry_ids is None:
-            changed_entry_ids = tuple(
-                sorted(
-                    entry_id
-                    for entry_id in current.state.entries.keys() | merged.state.entries.keys()
-                    if current.state.entries.get(entry_id)
-                    != merged.state.entries.get(entry_id)
-                )
-            )
     try:
-        _import_merged_memory(
-            project,
-            project_id,
-            merged,
-            changed_entry_ids=changed_entry_ids or (),
-            provenance=provenance,
-        )
+        side_file_payloads = validated_side_file_payloads(snapshot)
+    except ProjectPublicationError as exc:
+        raise RemoteSyncError(str(exc)) from exc
+    merged = _materialize_memory_export(snapshot, project_id)
+    registry = ProjectRegistry(project.parent)
+    try:
+        with registry._locked(write=True) as root_fd:
+            if not project.is_dir():
+                raise RemoteSyncError(f"project {project_id} was not found")
+            if registry._memory_format_locked(root_fd, project_id) == 2:
+                current: MemorySyncExport = registry._export_entry_memory_locked(
+                    root_fd, project_id
+                )
+            else:
+                current = registry._export_memory_locked(root_fd, project_id)
+            if (
+                type(current) is not type(expected_export)
+                or current.digest != expected_export.digest
+            ):
+                raise RemoteSyncError("local project memory changed during sync; retry")
+            if type(merged) is not type(current):
+                raise RemoteSyncError(
+                    "mixed project memory formats cannot synchronize; migration is required"
+                )
+            if isinstance(merged, EntryMemoryExport):
+                assert isinstance(current, EntryMemoryExport)
+                if changed_entry_ids is None:
+                    changed_entry_ids = tuple(
+                        sorted(
+                            entry_id
+                            for entry_id in (
+                                current.state.entries.keys()
+                                | merged.state.entries.keys()
+                            )
+                            if current.state.entries.get(entry_id)
+                            != merged.state.entries.get(entry_id)
+                        )
+                    )
+            if isinstance(merged, EntryMemoryExport):
+                registry._import_entry_memory_locked(
+                    root_fd,
+                    project_id,
+                    merged,
+                    expected_digest=current.digest,
+                    changed_entry_ids=changed_entry_ids or (),
+                    provenance=provenance,
+                )
+            else:
+                registry._import_memory_locked(
+                    root_fd,
+                    project_id,
+                    merged,
+                    expected_digest=current.digest,
+                    provenance=provenance,
+                )
+            for relative, payload in side_file_payloads:
+                if relative.parent == Path("memory") and relative.name in MEMORY_FILES:
+                    continue
+                _atomic_write_file(payload, project / relative)
     except ProjectRegistryError as exc:
         raise RemoteSyncError(f"project memory changed during sync: {exc}") from exc
-    source_memory = snapshot / "memory"
-    if source_memory.is_dir():
-        for source in sorted(source_memory.iterdir()):
-            if source.is_file() and any(
-                source.name.startswith(f"{name}.conflict-") for name in MEMORY_FILES
-            ):
-                _atomic_copy_file(source, project / "memory" / source.name)
-    source_sync = snapshot / "sync"
-    if source_sync.is_dir():
-        for source in sorted(source_sync.glob("*.json")):
-            _atomic_copy_file(source, project / "sync" / source.name)
 
 
 def _materialize_memory_export(snapshot: Path, project_id: str) -> MemorySyncExport:
@@ -557,6 +562,17 @@ def _materialize_memory_export(snapshot: Path, project_id: str) -> MemorySyncExp
     for name, content in exported.contents.items():
         _atomic_write_file(content.encode("utf-8"), snapshot / "memory" / name)
     return exported
+
+
+def _materialize_readable_mirrors(
+    snapshot: Path, exported: MemorySyncExport
+) -> None:
+    if isinstance(exported, MemoryExport) and (snapshot / "memory-current.json").is_file():
+        for name, content in exported.contents.items():
+            _atomic_write_file(
+                (GENERATED_MIRROR_HEADER + content).encode("utf-8"),
+                snapshot / "memory" / name,
+            )
 
 
 def _validate_project_snapshot(snapshot: Path, project_id: str) -> None:
@@ -1015,11 +1031,9 @@ def _valid_digest(value: object) -> bool:
 
 def _write_state(project: Path, peer: str, state: object) -> None:
     path = project / "sync" / f"{peer}.json"
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
+    _atomic_write_file(
+        (json.dumps(state, indent=2, sort_keys=True) + "\n").encode(), path
+    )
 
 
 def _keep_conflict(source: Path, destination: Path, name: str, *, peer: str) -> None:
@@ -1096,7 +1110,9 @@ def _atomic_write_file(payload: bytes, destination: Path) -> None:
 
 def _atomic_copy_file(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    temporary = destination.with_name(
+        f".{destination.name}.zeta-atomic-{uuid.uuid4().hex}.tmp"
+    )
     source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         info = os.fstat(source_fd)
@@ -1104,7 +1120,7 @@ def _atomic_copy_file(source: Path, destination: Path) -> None:
             raise RemoteSyncError("project snapshot file is unsafe")
         with (
             os.fdopen(source_fd, "rb", closefd=False) as source_stream,
-            temporary.open("wb") as destination_stream,
+            temporary.open("xb") as destination_stream,
         ):
             shutil.copyfileobj(source_stream, destination_stream)
         temporary.chmod(0o600)
@@ -1112,27 +1128,6 @@ def _atomic_copy_file(source: Path, destination: Path) -> None:
     finally:
         os.close(source_fd)
         temporary.unlink(missing_ok=True)
-
-
-def _copy_tree(source: Path, destination: Path) -> None:
-    try:
-        root_info = source.lstat()
-    except FileNotFoundError as exc:
-        raise RemoteSyncError("project snapshot directory is unsafe") from exc
-    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
-        raise RemoteSyncError("project snapshot directory is unsafe")
-    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for path in sorted(source.rglob("*")):
-        relative = path.relative_to(source)
-        if path.is_symlink():
-            raise RemoteSyncError(f"project snapshot contains a symlink: {relative}")
-        target = destination / relative
-        if path.is_dir():
-            target.mkdir(parents=True, exist_ok=True, mode=0o700)
-        elif path.is_file():
-            _atomic_copy_file(path, target)
-        else:
-            raise RemoteSyncError(f"project snapshot contains an unsupported file: {relative}")
 
 
 def _machine_id(home: Path) -> str:

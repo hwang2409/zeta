@@ -345,44 +345,49 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
     def _export_entry_memory(self, project_id: str) -> EntryMemoryExport:
         """Export one format-2 fixture without exposing storage layout."""
         def read(root_fd: int) -> EntryMemoryExport:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                snapshot = self._entry_snapshot_locked(directory_fd)
-                pointer = self._pointer(directory_fd)
-                assert pointer is not None
-                root, blobs_fd, versions_fd = self._version_handles(
-                    directory_fd, create=False
-                )
-                try:
-                    records = [
-                        self._manifest(versions_fd, version)
-                        for version in pointer["history"]
-                    ]
-                finally:
-                    os.close(versions_fd)
-                    os.close(blobs_fd)
-                    os.close(root)
-                return EntryMemoryExport(
-                    snapshot.state,
-                    snapshot.digest,
-                    snapshot.version,
-                    logical_history(
-                        records,
-                        (
-                            "version",
-                            "kind",
-                            "created_at",
-                            "operations",
-                            "reconciliation_key",
-                            "source_digest",
-                            "provenance",
-                        ),
-                    ),
-                )
-            finally:
-                os.close(directory_fd)
+            return self._export_entry_memory_locked(root_fd, project_id)
 
         return self._read(read)
+
+    def _export_entry_memory_locked(
+        self, root_fd: int, project_id: str
+    ) -> EntryMemoryExport:
+        directory_fd = self._project_dir(root_fd, project_id)
+        try:
+            snapshot = self._entry_snapshot_locked(directory_fd)
+            pointer = self._pointer(directory_fd)
+            assert pointer is not None
+            root, blobs_fd, versions_fd = self._version_handles(
+                directory_fd, create=False
+            )
+            try:
+                records = [
+                    self._manifest(versions_fd, version)
+                    for version in pointer["history"]
+                ]
+            finally:
+                os.close(versions_fd)
+                os.close(blobs_fd)
+                os.close(root)
+            return EntryMemoryExport(
+                snapshot.state,
+                snapshot.digest,
+                snapshot.version,
+                logical_history(
+                    records,
+                    (
+                        "version",
+                        "kind",
+                        "created_at",
+                        "operations",
+                        "reconciliation_key",
+                        "source_digest",
+                        "provenance",
+                    ),
+                ),
+            )
+        finally:
+            os.close(directory_fd)
 
     def _import_entry_memory(
         self,
@@ -394,6 +399,26 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         provenance: Mapping[str, object],
     ) -> EntryMemorySnapshot:
         """CAS-import one validated format-2 snapshot."""
+        with self._locked(write=True) as root_fd:
+            return self._import_entry_memory_locked(
+                root_fd,
+                project_id,
+                exported,
+                expected_digest=expected_digest,
+                changed_entry_ids=changed_entry_ids,
+                provenance=provenance,
+            )
+
+    def _import_entry_memory_locked(
+        self,
+        root_fd: int,
+        project_id: str,
+        exported: EntryMemoryExport,
+        *,
+        expected_digest: str,
+        changed_entry_ids: tuple[str, ...],
+        provenance: Mapping[str, object],
+    ) -> EntryMemorySnapshot:
         if (
             not isinstance(exported, EntryMemoryExport)
             or exported.state.project_id != project_id
@@ -409,61 +434,60 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             not isinstance(record, dict) for record in exported.versions
         ):
             raise ProjectRegistryError("format-2 memory export history is too large")
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                current = self._entry_snapshot_locked(directory_fd)
-                if current.digest != expected_digest:
-                    raise ProjectRegistryError("project memory digest mismatch")
-                actual_changed = tuple(
-                    sorted(
-                        entry_id
-                        for entry_id in (
-                            current.state.entries.keys() | exported.state.entries.keys()
-                        )
-                        if current.state.entries.get(entry_id)
-                        != exported.state.entries.get(entry_id)
+        directory_fd = self._project_dir(root_fd, project_id)
+        try:
+            current = self._entry_snapshot_locked(directory_fd)
+            if current.digest != expected_digest:
+                raise ProjectRegistryError("project memory digest mismatch")
+            actual_changed = tuple(
+                sorted(
+                    entry_id
+                    for entry_id in (
+                        current.state.entries.keys() | exported.state.entries.keys()
                     )
+                    if current.state.entries.get(entry_id)
+                    != exported.state.entries.get(entry_id)
                 )
-                if actual_changed != tuple(sorted(set(changed_entry_ids))):
-                    raise ProjectRegistryError(
-                        "format-2 memory import changed-entry receipt is invalid"
-                    )
-                if current.digest == exported.digest:
-                    self._refresh_entry_memory_mirror(
-                        directory_fd,
-                        current.state,
-                        mirror_path=self.root / project_id / "memory",
-                    )
-                    return current
-                receipt = OperationReceipt(
-                    operation_id=new_operation_id(),
-                    type="sync",
-                    target_ids=tuple(
-                        entry_id
-                        for entry_id in actual_changed
-                        if entry_id in current.state.entries
-                    ),
-                    result_ids=tuple(
-                        entry_id
-                        for entry_id in actual_changed
-                        if entry_id in exported.state.entries
-                    ),
-                    reason="synchronized memory entries",
-                    reconciliation_key=None,
-                    automatic=False,
+            )
+            if actual_changed != tuple(sorted(set(changed_entry_ids))):
+                raise ProjectRegistryError(
+                    "format-2 memory import changed-entry receipt is invalid"
                 )
-                return self._publish_entry_version(
+            if current.digest == exported.digest:
+                self._refresh_entry_memory_mirror(
                     directory_fd,
-                    state=exported.state,
-                    before=current.state,
-                    kind="entry-import",
-                    receipts=(receipt,),
-                    source_history=exported.versions,
-                    provenance=provenance,
+                    current.state,
+                    mirror_path=self.root / project_id / "memory",
                 )
-            finally:
-                os.close(directory_fd)
+                return current
+            receipt = OperationReceipt(
+                operation_id=new_operation_id(),
+                type="sync",
+                target_ids=tuple(
+                    entry_id
+                    for entry_id in actual_changed
+                    if entry_id in current.state.entries
+                ),
+                result_ids=tuple(
+                    entry_id
+                    for entry_id in actual_changed
+                    if entry_id in exported.state.entries
+                ),
+                reason="synchronized memory entries",
+                reconciliation_key=None,
+                automatic=False,
+            )
+            return self._publish_entry_version(
+                directory_fd,
+                state=exported.state,
+                before=current.state,
+                kind="entry-import",
+                receipts=(receipt,),
+                source_history=exported.versions,
+                provenance=provenance,
+            )
+        finally:
+            os.close(directory_fd)
 
     def _activate_entry_memory_locked(
         self, directory_fd: int, project_id: str, profile: str
