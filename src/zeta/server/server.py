@@ -72,6 +72,7 @@ class ZetaServer:
         allow_hooks: bool | None = None,
         auto_memory: bool | None = None,
         cli_yolo: bool | None = None,
+        max_turns: int | None = None,
         backend_factory: BackendFactory | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
@@ -96,6 +97,7 @@ class ZetaServer:
             allow_hooks=allow_hooks,
             auto_memory=auto_memory,
             cli_yolo=cli_yolo,
+            max_turns=max_turns,
             backend_factory=backend_factory,
         )
         self._server: asyncio.AbstractServer | None = None

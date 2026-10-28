@@ -548,6 +548,23 @@ the committed message object with `role` and `content`.
 {"jsonrpc":"2.0","method":"event","params":{"event":"tool_end","session_id":"abc123","tool_call":{"id":"tool-call-1","name":"read","arguments":{"path":"README.md"}},"tool_result":{"tool_call_id":"tool-call-1","content":"ok","is_error":false},"data":{}}}
 ```
 
+When a served session reaches the configured provider-turn limit, the
+terminal error event is:
+
+```json
+{"jsonrpc":"2.0","method":"event","params":{"event":"error","session_id":"abc123","error":{"code":"max_turns","message":"maximum turns reached: 1"},"data":{}}}
+```
+
+The server then sends the terminal `agent_end` event:
+
+```json
+{"jsonrpc":"2.0","method":"event","params":{"event":"agent_end","session_id":"abc123","data":{}}}
+```
+
+This is the only serve protocol currently implemented by zeta; there is no
+separate ACP or app-server mapping. The `max_turns` error code is preserved
+on the wire.
+
 `approval_request` carries `request_id` and `tool_call`. It also carries
 `delegated: true` and `agent_instance_id` for delegated approvals. `approval_end`
 carries the same `request_id` as its matching `approval_request`, the tool call,
