@@ -417,6 +417,7 @@ def isolate_zeta_home(
 
 _FD_GROWTH: list[tuple[int, str, str]] = []
 _FD_BREACHES: list[str] = []
+_FD_WORKER_BREACHES: list[str] = []
 # Leave 25% of FD_SETSIZE free for pytest, xdist, and a test's active work.
 _FD_HIGH_WATER = 768
 # Covers stable pytest/plugin drift while rejecting repeated small test leaks.
@@ -581,13 +582,17 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             f"(budget {_FD_SESSION_BUDGET}); top tests are in top_retained_additions"
         )
     summary = _fd_summary()
-    if _FD_BREACHES:
+    if _FD_BREACHES or _FD_WORKER_BREACHES:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
     worker_output = getattr(session.config, "workeroutput", None)
     if worker_output is not None:
         worker_output["fd_summary"] = summary
-    elif _FD_RETAINED_MAX is not None:
-        print(summary, flush=True)
+        worker_output["fd_breach"] = bool(_FD_BREACHES)
+    else:
+        for breach in _FD_WORKER_BREACHES:
+            print(f"fd-breach {breach}", flush=True)
+        if _FD_RETAINED_MAX is not None:
+            print(summary, flush=True)
 
 
 @pytest.hookimpl(optionalhook=True)
@@ -596,6 +601,8 @@ def pytest_testnodedown(node, error) -> None:
     summary = node.workeroutput.get("fd_summary")
     if summary is not None:
         print(summary, flush=True)
+        if node.workeroutput.get("fd_breach"):
+            _FD_WORKER_BREACHES.append(summary)
 
 
 @pytest.fixture
