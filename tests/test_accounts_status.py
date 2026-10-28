@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -197,6 +199,89 @@ def test_accounts_status_retries_registry_replacement_and_keeps_json_valid(
         assert json.loads(capsys.readouterr().out)[0]["logged_in"] is True
 
 
+def test_accounts_status_reports_pending_legacy_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "codex-oauth.json").write_text(
+        json.dumps(OAuthTokens(_ACCESS_SECRET, _REFRESH_SECRET, 1).to_dict())
+    )
+
+    assert _run_json(tmp_path, monkeypatch, "--refresh") == 1
+    output = capsys.readouterr().out
+    assert json.loads(output) == [
+        {
+            "provider": "codex",
+            "account": "default",
+            "is_default": True,
+            "logged_in": None,
+            "access_token_expires_at": None,
+            "error": "migration_pending",
+            "retryable": False,
+            "refresh": {
+                "ok": False,
+                "code": "migration_pending",
+                "retryable": False,
+            },
+        }
+    ]
+    assert _ACCESS_SECRET not in output
+    assert _REFRESH_SECRET not in output
+
+
+def test_accounts_status_does_not_wait_for_migration_lock(
+    tmp_path: Path,
+) -> None:
+    _save_account(tmp_path)
+    ready = tmp_path / "migration-lock-ready"
+    release = tmp_path / "migration-lock-release"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl,sys,time; from pathlib import Path; "
+                "home,ready,release=map(Path,sys.argv[1:]); "
+                "lock=(home/'.accounts-migration.lock').open('a+'); "
+                "fcntl.flock(lock,fcntl.LOCK_EX); ready.touch(); "
+                "\nwhile not release.exists(): time.sleep(0.01)\n"
+            ),
+            str(tmp_path),
+            str(ready),
+            str(release),
+        ]
+    )
+    deadline = time.monotonic() + 10
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists()
+
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from zeta.cli.main import main; "
+                    "raise SystemExit(main(['accounts','status','--json']))"
+                ),
+            ],
+            env={**os.environ, "ZETA_HOME": str(tmp_path)},
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    finally:
+        release.touch()
+        process.wait(timeout=10)
+
+    assert process.returncode == 0
+    assert result.returncode == 0
+    assert json.loads(result.stdout)[0]["logged_in"] is True
+
+
 def test_accounts_status_lock_timeout_keeps_json_valid_and_reports_other_accounts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -264,6 +349,80 @@ def test_accounts_status_lock_timeout_keeps_json_valid_and_reports_other_account
             "retryable": True,
         },
     ]
+
+
+def test_accounts_status_refresh_lock_timeout_after_initial_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _save_account(tmp_path, expires_at=1)
+    _use_token_endpoint(
+        monkeypatch,
+        tmp_path,
+        httpx.Response(
+            200,
+            json={
+                "access_token": "rotated-access-secret",
+                "refresh_token": "rotated-refresh-secret",
+                "expires_in": 3600,
+            },
+        ),
+    )
+    ready = tmp_path / "refresh-race-lock-ready"
+    release = tmp_path / "refresh-race-lock-release"
+    process: subprocess.Popen[bytes] | None = None
+    real_read = cli_main._read_safe_account_status
+
+    async def read_then_lock(credentials):
+        nonlocal process
+        result = await real_read(credentials)
+        if process is None:
+            process = await asyncio.to_thread(
+                subprocess.Popen,
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys,time; from pathlib import Path; "
+                        "from zeta.accounts import AccountId,AccountStore; "
+                        "home,ready,release=map(Path,sys.argv[1:]); "
+                        "guard=AccountStore(home).lifecycle_guard("
+                        "AccountId('codex','default')); "
+                        "guard.__enter__(); ready.touch(); "
+                        "\nwhile not release.exists(): time.sleep(0.01)\n"
+                        "guard.__exit__(None,None,None)"
+                    ),
+                    str(tmp_path),
+                    str(ready),
+                    str(release),
+                ]
+            )
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert ready.exists()
+        return result
+
+    monkeypatch.setattr(cli_main, "_read_safe_account_status", read_then_lock)
+    monkeypatch.setattr(
+        account_store_module, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.01
+    )
+
+    try:
+        assert _run_json(tmp_path, monkeypatch, "--refresh") == 1
+    finally:
+        release.touch()
+        assert process is not None
+        process.wait(timeout=10)
+
+    assert process.returncode == 0
+    [status] = json.loads(capsys.readouterr().out)
+    assert status["refresh"] == {
+        "ok": False,
+        "code": "lock_timeout",
+        "retryable": True,
+    }
 
 
 def test_accounts_status_refresh_lock_timeout_has_refresh_result(

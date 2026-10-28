@@ -480,6 +480,8 @@ def _expiry_iso(expires_at: float) -> str:
 
 
 def _refresh_failure(exc: RuntimeError) -> dict[str, object]:
+    if isinstance(exc.__cause__, AccountCredentialLockTimeoutError):
+        return {"ok": False, "code": "lock_timeout", "retryable": True}
     code = getattr(exc, "code", "http_error")
     if code not in {"auth_error", "http_error"}:
         code = "http_error"
@@ -577,17 +579,49 @@ async def _account_status(
 async def _account_statuses(
     store: AccountStore, provider: str | None, *, refresh: bool
 ) -> tuple[list[dict[str, object]], bool]:
+    pending_providers = {
+        name
+        for name in ("anthropic", "codex")
+        if (store.home / f"{name}-oauth.json").is_file()
+        and provider in {None, name}
+    }
     accounts = [
         item
         for item in await asyncio.to_thread(store.list_catalog)
-        if provider is None or item.account.provider == provider
+        if (provider is None or item.account.provider == provider)
+        and not (
+            item.account.name == "default"
+            and item.account.provider in pending_providers
+        )
     ]
     defaults = {
         name: await asyncio.to_thread(store.default, name)
         for name in {item.account.provider for item in accounts}
     }
-    statuses: list[dict[str, object]] = []
-    all_ok = bool(accounts)
+    statuses: list[dict[str, object]] = [
+        {
+            "provider": name,
+            "account": "default",
+            "is_default": defaults.get(name) in {None, AccountId(name, "default")},
+            "logged_in": None,
+            "access_token_expires_at": None,
+            "error": "migration_pending",
+            "retryable": False,
+            **(
+                {
+                    "refresh": {
+                        "ok": False,
+                        "code": "migration_pending",
+                        "retryable": False,
+                    }
+                }
+                if refresh
+                else {}
+            ),
+        }
+        for name in sorted(pending_providers)
+    ]
+    all_ok = bool(accounts) and not pending_providers
     async with httpx.AsyncClient() as client:
         for item in accounts:
             status, ok = await _account_status(
@@ -666,11 +700,8 @@ def _handle_accounts(args: argparse.Namespace) -> int:
         )
     try:
         store = AccountStore(account_home(env_home()))
-        try:
+        if args.action != "status":
             store.migrate()
-        except AccountError:
-            if args.action != "status":
-                raise
         return _run_accounts_action(store, args)
     except (AccountError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

@@ -229,18 +229,25 @@ has this closed schema:
 - `logged_in`: boolean, or `null` when a lock timeout makes the state unknown.
 - `access_token_expires_at`: an RFC 3339 UTC string, or `null` when missing or
   unknown.
-- `error`, when present: `"invalid_credentials"` or `"lock_timeout"`.
-- `retryable`, present with `error: "lock_timeout"`: `true`.
+- `error`, when present: `"invalid_credentials"`, `"lock_timeout"`, or
+  `"migration_pending"` when a legacy login must be migrated by another account
+  command.
+- `retryable`, present with `error: "lock_timeout"` or `"migration_pending"`:
+  `true` for a lock timeout and `false` for pending migration.
 - `refresh`, present with `--refresh`: an object with boolean `ok`, `code`, and
   `retryable`. `code` is `null` on success, `"auth_error"` for a rejected or
-  missing login, `"http_error"` for other HTTP failures, or `"lock_timeout"`
-  when the credential lock prevents a refresh attempt. `retryable` is `true`
-  for `"lock_timeout"`, a boolean for `"http_error"`, and `null` otherwise.
+  missing login, `"http_error"` for other HTTP failures, `"lock_timeout"`
+  when the credential lock prevents a refresh attempt, or `"migration_pending"`
+  when migration is required. `retryable` is `true` for `"lock_timeout"`, a
+  boolean for `"http_error"`, `false` for `"migration_pending"`, and `null`
+  otherwise.
 
 The exhaustive safe failure values across `error` and `refresh.code` are
-`invalid_credentials`, `lock_timeout`, `auth_error`, and `http_error`. no
-exception message or credential content is included. a lock timeout leaves
-`logged_in` unknown instead of claiming that the account is logged out.
+`invalid_credentials`, `lock_timeout`, `migration_pending`, `auth_error`, and
+`http_error`. no exception message or credential content is included. a lock
+timeout or pending migration leaves `logged_in` unknown instead of claiming
+that the account is logged out. `status` never performs migration or waits on
+migration, registry, or unbounded lifecycle locks.
 
 Exit status `0` means every selected account is logged in and every requested
 refresh succeeded. exit status `1` means there are no selected accounts, a login
