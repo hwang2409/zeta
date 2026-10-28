@@ -6677,6 +6677,7 @@ async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
         if "provider failure · backend_error" in renderable_plain(item)
     )
     assert line_index < error_index
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -6715,6 +6716,7 @@ async def test_verbose_error_flushes_before_raw_error(tmp_path: Path) -> None:
         if "provider failure · backend_error" in renderable_plain(item)
     )
     assert line_index < raw_error_index < pretty_error_index
+    await app.close()
 
 
 @pytest.mark.parametrize(
@@ -6780,6 +6782,7 @@ async def test_verbose_transition_flushes_before_raw_event(
         and raw_marker in item.plain
     )
     assert line_index < raw_index
+    await app.close()
 
 
 def _panel(app: TUIApp) -> QueuedPanel:
@@ -9529,6 +9532,7 @@ async def test_spinner_pulses_on_timer(tmp_path: Path) -> None:
         await asyncio.gather(task, return_exceptions=True)
 
     assert app._spinner_frame >= 2
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -9814,6 +9818,7 @@ skill_catalog=SkillCatalog.empty(),
         for line in panel_lines
         if line.startswith(("  ╭", "  ╰"))
     )
+    await app.close()
 
 
 @pytest.mark.parametrize("terminal_width", [200, 120, 80, 40])

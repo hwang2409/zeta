@@ -235,6 +235,7 @@ def test_fd_guard_propagates_worker_breach_to_xdist_controller(
     if close_fds:
         assert output.count("breach=[none]") == 2
     else:
+        assert "fd-breach fd-summary worker=gw" in output
         assert "worker retained 36 descriptors (budget 32)" in output
         assert "test_probe.py::test_leaker (+36" in output
 
