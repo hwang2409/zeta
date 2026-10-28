@@ -598,10 +598,12 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 @pytest.hookimpl(optionalhook=True)
 def pytest_testnodedown(node, error) -> None:
     del error
-    summary = node.workeroutput.get("fd_summary")
+    # A crashed worker goes down without workeroutput; xdist reports the crash.
+    worker_output = getattr(node, "workeroutput", None) or {}
+    summary = worker_output.get("fd_summary")
     if summary is not None:
         print(summary, flush=True)
-        if node.workeroutput.get("fd_breach"):
+        if worker_output.get("fd_breach"):
             _FD_WORKER_BREACHES.append(summary)
 
 

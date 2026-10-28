@@ -718,3 +718,30 @@ def test_environment_was_sanitized():
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_fd_guard_tolerates_crashed_xdist_worker(tmp_path: Path) -> None:
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    for name in ("conftest.py", "sitecustomize.py"):
+        shutil.copyfile(Path(__file__).with_name(name), probe / name)
+    (probe / "test_probe.py").write_text(
+        "import os\n"
+        "def test_crash(): os._exit(17)\n"
+        "def test_other_worker(): pass\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-n", "2", "--confcutdir", str(probe)],
+        cwd=probe,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+
+    assert "INTERNALERROR" not in output, output
+    assert result.returncode == 1, output
+    assert "test_probe.py::test_crash" in output
