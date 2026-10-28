@@ -624,15 +624,11 @@ class AgentTranscriptControl(UIControl):
         self._path = path
         self._snapshot = None
 
-    def close(self) -> None:
-        source, self._source = self._source, None
-        if source is not None:
-            source.close()
-
     def _replace_source(self, path: Path) -> None:
-        self.close()
+        previous, self._source = self._source, None
+        if previous is not None:
+            previous.close()
         source = AgentTranscriptSource(path)
-        # Open and validate the read-only store before publishing the source.
         source.refresh()
         self._source = source
 
@@ -834,22 +830,20 @@ class AgentNavigation:
         return handle if type(handle) is str and handle else None
 
     def child_queued_messages(self) -> tuple[str, tuple[str, ...]] | None:
-        """Label and unconsumed follow-ups of the viewed child, or None in main."""
-
         if not self.child_view_active:
             return None
         label = self.child_instance_id() or self.current_path.name
         return label, self.transcript_control.pending_prompts(self.current_path)
 
     def todo_snapshot(self) -> TodoSnapshot | None:
-        """Return only cached in-memory state for the selected session."""
-
         if not self.child_view_active:
             return TodoSnapshot(tuple(self.store.todo_items()), self.store.todo_dismissed)
         return self._todo_control.snapshot(self.current_path)
 
     def close(self) -> None:
-        self.transcript_control.close()
+        source, self.transcript_control._source = self.transcript_control._source, None
+        if source is not None:
+            source.close()
         self._todo_control.close()
 
     def child_view_focused(self) -> bool:

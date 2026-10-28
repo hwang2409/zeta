@@ -55,6 +55,8 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 
+pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
 SSE = """event: message_start
 data: {"type":"message_start","message":{"id":"msg-1","model":"claude-test","role":"assistant","usage":{"input_tokens":12}}}
 

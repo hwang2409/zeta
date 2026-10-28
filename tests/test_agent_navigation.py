@@ -67,7 +67,9 @@ def close_direct_transcript_controls(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(AgentTranscriptControl, "__init__", tracked_init)
     yield
     for control in reversed(controls):
-        control.close()
+        source, control._source = control._source, None
+        if source is not None:
+            source.close()
 
 
 def _child(
@@ -2339,7 +2341,6 @@ async def test_large_subagent_append_keeps_event_loop_responsive(
     assert control.transcript._lazy_viewport
     assert batch_sizes
     assert max(batch_sizes) <= AgentTranscriptControl._RENDER_BATCH_SIZE
-    control.close()
 
 
 def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) -> None:
