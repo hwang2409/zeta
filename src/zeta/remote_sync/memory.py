@@ -441,6 +441,9 @@ def copy_project_snapshot(source: Path, destination: Path) -> None:
         directory = destination / relative
         directory.mkdir(mode=0o700)
         directory.chmod(0o700)
+    memory = destination / "memory"
+    memory.mkdir(mode=0o700, exist_ok=True)
+    memory.chmod(0o700)
     for path in payload:
         _atomic_copy_file(path, destination / path.relative_to(source))
 
@@ -562,7 +565,7 @@ def _materialize_memory_export(snapshot: Path, project_id: str) -> MemorySyncExp
 def _materialize_readable_mirrors(
     snapshot: Path, exported: MemorySyncExport
 ) -> None:
-    if isinstance(exported, MemoryExport):
+    if isinstance(exported, MemoryExport) and (snapshot / "memory-current.json").is_file():
         for name, content in exported.contents.items():
             _atomic_write_file(
                 (GENERATED_MIRROR_HEADER + content).encode("utf-8"),
