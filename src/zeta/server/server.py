@@ -51,7 +51,6 @@ from .protocol import (
 from .runtime import BackendFactory, ServerRuntime
 from .turn_context import PendingTurnContexts
 
-# Echoed user text stays well inside the 1 MiB frame after JSON escaping.
 USER_MESSAGE_MAX_BYTES = 262_144
 
 class ZetaServer:
@@ -72,6 +71,7 @@ class ZetaServer:
         allow_hooks: bool | None = None,
         auto_memory: bool | None = None,
         cli_yolo: bool | None = None,
+        max_turns: int | None = None,
         backend_factory: BackendFactory | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
@@ -96,6 +96,7 @@ class ZetaServer:
             allow_hooks=allow_hooks,
             auto_memory=auto_memory,
             cli_yolo=cli_yolo,
+            max_turns=max_turns,
             backend_factory=backend_factory,
         )
         self._server: asyncio.AbstractServer | None = None

@@ -99,6 +99,43 @@ class BlockingBackend:
 
 
 @pytest.mark.asyncio
+async def test_max_turns_emits_terminal_error(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("data")
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("read-1", "read", {"path": str(target)})]
+            ),
+            ScriptedTurn(tool_calls=[ToolCall("read-2", "read", {"path": str(target)})]),
+        ]
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path, "-max-turns"),
+        max_turns=1,
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "read"})
+        await _event(reader, "approval_request")
+        await _request(reader, writer, 4, "deny", {"request_id": "read-1"})
+        error = await _event(reader, "error")
+        assert error["error"] == {
+            "code": "max_turns",
+            "message": "maximum turns reached: 1",
+        }
+        assert (await _event(reader, "agent_end"))["event"] == "agent_end"
+        assert len(backend.calls) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_duplicate_send_starts_one_turn(tmp_path: Path) -> None:
     backend = BlockingBackend()
     server = ZetaServer(provider="codex",

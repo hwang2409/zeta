@@ -666,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
                     else args.auto_memory
                 ),
                 cli_yolo=args.yolo,
+                max_turns=args.max_turns,
             )
             asyncio.run(run_server(server))
         except (SessionError, ValueError) as exc:

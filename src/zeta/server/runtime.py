@@ -172,6 +172,7 @@ class ServerRuntime:
         allow_hooks: bool | None = None,
         auto_memory: bool | None = None,
         cli_yolo: bool | None = None,
+        max_turns: int | None = None,
         backend_factory: BackendFactory | None = None,
     ) -> None:
         self.home = Path(home).expanduser().resolve()
@@ -184,6 +185,7 @@ class ServerRuntime:
         self._allow_hooks = allow_hooks
         self._auto_memory = auto_memory
         self._cli_yolo = cli_yolo
+        self._max_turns = max_turns
         self._server_provider = self._config(None, None).provider
         self._test_scripted_provider = os.environ.get(TEST_SCRIPTED_PROVIDER_ENV) == "1"
         self.backend_factory = backend_factory
@@ -349,6 +351,7 @@ class ServerRuntime:
             skill_catalog=skill_catalog,
             agent_catalog=agent_catalog,
             project_id=session_project.project_id if session_project is not None else None,
+            max_turns=self._max_turns,
         )
         await self._replace(composition)
         return self.metadata
@@ -409,6 +412,7 @@ class ServerRuntime:
                 agent_catalog=agent_catalog,
                 opened=opened,
                 project_id=opened.metadata.project_id,
+                max_turns=self._max_turns,
             )
         except BaseException:
             await asyncio.to_thread(opened.store.close)

@@ -357,3 +357,25 @@ def test_completion_command_prints_without_reading_runtime_state(capsys) -> None
 
     assert output.startswith("# install: zeta completion bash")
     assert "complete -F _zeta_completions zeta" in output
+
+
+def test_global_max_turns_reaches_served_sessions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import zeta.server
+
+    seen: dict[str, object] = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs: object) -> None:
+            seen.update(kwargs)
+
+    async def fake_run_server(server: object) -> None:
+        seen["ran"] = isinstance(server, FakeServer)
+
+    monkeypatch.setattr(zeta.server, "ZetaServer", FakeServer)
+    monkeypatch.setattr(zeta.server, "run_server", fake_run_server)
+
+    assert main(["--max-turns", "7", "serve", "--cwd", str(tmp_path)]) == 0
+    assert seen["max_turns"] == 7
+    assert seen["ran"] is True
