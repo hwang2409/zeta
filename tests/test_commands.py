@@ -63,6 +63,24 @@ def _write_command(directory: Path, name: str, content: str) -> None:
     (directory / f"{name}.md").write_text(content, encoding="utf-8")
 
 
+def _approval_presentation_event(
+    monkeypatch: pytest.MonkeyPatch,
+    app: TUIApp,
+    output: StringIO,
+    expected: str,
+) -> asyncio.Event:
+    approval_presented = asyncio.Event()
+    present_pending_approvals = app._present_pending_approvals
+
+    def record_approval_presentation() -> None:
+        present_pending_approvals()
+        if app.pending_approvals and expected in output.getvalue():
+            approval_presented.set()
+
+    monkeypatch.setattr(app, "_present_pending_approvals", record_approval_presentation)
+    return approval_presented
+
+
 def test_loads_home_and_project_commands_with_project_precedence(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
@@ -1926,15 +1944,12 @@ async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
         console=Console(file=output, force_terminal=False),
     )
 
-    approval_presented = asyncio.Event()
-    present_pending_approvals = app._present_pending_approvals
-
-    def record_approval_presentation() -> None:
-        present_pending_approvals()
-        if app.pending_approvals and "command=printf approved-now" in output.getvalue():
-            approval_presented.set()
-
-    monkeypatch.setattr(app, "_present_pending_approvals", record_approval_presentation)
+    approval_presented = _approval_presentation_event(
+        monkeypatch,
+        app,
+        output,
+        "command=printf approved-now",
+    )
     task = asyncio.create_task(app._handle_prompt_value("/deploy now"))
     await asyncio.wait_for(approval_presented.wait(), timeout=5)
     assert "command=printf approved-now" in output.getvalue()
@@ -1990,6 +2005,7 @@ def test_render_approval_card_ignores_provider_supplied_display_fields() -> None
 
 async def test_exec_macro_approval_card_shows_argv_via_trusted_display(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The rendered card must show argv for the actual macro tool call."""
 
@@ -2011,15 +2027,16 @@ async def test_exec_macro_approval_card_shows_argv_via_trusted_display(
         console=Console(file=output, force_terminal=False, width=120),
     )
 
+    approval_presented = _approval_presentation_event(
+        monkeypatch,
+        app,
+        output,
+        "argv:",
+    )
     task = asyncio.create_task(
         app._handle_prompt_value("/deploy staging release-42 $HOME")
     )
-    for _ in range(100):
-        if app.pending_approvals:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("macro approval did not appear")
+    await asyncio.wait_for(approval_presented.wait(), timeout=5)
 
     card = output.getvalue()
     assert "argv:" in card
