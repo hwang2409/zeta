@@ -92,6 +92,42 @@ def test_session_home_guard_ignores_external_writes_and_catches_home_leaks(
         assert leak_path in output
 
 
+def test_fd_guard_attributes_outer_hook_teardown_to_the_test(tmp_path: Path) -> None:
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    for name in ("conftest.py", "sitecustomize.py"):
+        shutil.copyfile(Path(__file__).with_name(name), probe / name)
+    with (probe / "conftest.py").open("a", encoding="utf-8") as conftest:
+        conftest.write("\npytest_plugins = ['retain_fds']\n")
+    (probe / "retain_fds.py").write_text(
+        "import os\n"
+        "import pytest\n"
+        "RETAINED = []\n"
+        "@pytest.hookimpl(hookwrapper=True)\n"
+        "def pytest_runtest_protocol():\n"
+        "    yield\n"
+        "    RETAINED.extend(os.open('/dev/null', os.O_RDONLY) for _ in range(33))\n",
+        encoding="utf-8",
+    )
+    (probe / "test_probe.py").write_text(
+        "def test_owner():\n    pass\n", encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--confcutdir", str(probe)],
+        cwd=probe,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 1, output
+    assert "fd-breach test_probe.py::test_owner retained 33 descriptors" in output
+    assert "grouped=[unknown (+33)]" in output
+
+
 def test_path_home_follows_home_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

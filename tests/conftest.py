@@ -6,6 +6,7 @@ import stat
 import sys
 import uuid
 import weakref
+from collections import Counter
 from collections.abc import Generator
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -418,6 +419,8 @@ _FD_GROWTH: list[tuple[int, str]] = []
 _FD_BREACHES: list[str] = []
 # Leave 25% of FD_SETSIZE free for pytest, xdist, and a test's active work.
 _FD_HIGH_WATER = 768
+# Ordinary runtime-owner tests retain at most 24 descriptors.
+_FD_PER_TEST_LIMIT = 32
 _FD_RETAINED_COUNTS: list[int] = []
 _FD_RETAINED_MAX: tuple[str, int, int, tuple[str, ...]] | None = None
 _OS_LISTDIR = os.listdir
@@ -450,6 +453,14 @@ def _describe_fd(descriptor: int, directory: str) -> str:
     return f"{target} ({kind})"
 
 
+def _group_fds_by_path_prefix(descriptions: tuple[str, ...]) -> str:
+    targets = (description.rsplit(" (", 1)[0] for description in descriptions)
+    groups = Counter(str(Path(target).parent) if "/" in target else target for target in targets)
+    return "; ".join(
+        f"{prefix} (+{count})" for prefix, count in groups.most_common()
+    )
+
+
 def _open_file_descriptors() -> dict[int, str]:
     for directory in ("/proc/self/fd", "/dev/fd"):
         try:
@@ -468,7 +479,7 @@ def _open_file_descriptors() -> dict[int, str]:
     return {}
 
 
-@pytest.hookimpl(hookwrapper=True, trylast=True)
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     """Report retained fds and stop workers before they approach FD_SETSIZE."""
     del nextitem
@@ -478,21 +489,26 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     yield
     after = _open_file_descriptors()
     retained = sorted(after.keys() - before.keys())
-    added = tuple(f"fd {fd}: {after[fd]}" for fd in retained)
+    added = tuple(after[fd] for fd in retained)
+    grouped = _group_fds_by_path_prefix(added)
     _FD_GROWTH.append((len(retained), item.nodeid))
     if added:
-        print(f"fd-retained nodeid={item.nodeid} {', '.join(added)}", flush=True)
+        print(f"fd-retained nodeid={item.nodeid} grouped=[{grouped}]", flush=True)
     highest = max(after, default=-1)
     if _FD_RETAINED_MAX is None or len(after) > _FD_RETAINED_MAX[1]:
         _FD_RETAINED_MAX = (item.nodeid, len(after), highest, added)
     _FD_RETAINED_COUNTS.append(len(after))
+    reasons = []
+    if len(added) > _FD_PER_TEST_LIMIT:
+        reasons.append(f"retained {len(added)} descriptors (limit {_FD_PER_TEST_LIMIT})")
     if highest >= _FD_HIGH_WATER:
-        breach = (
-            f"{item.nodeid} reached fd {highest}; retained descriptors: "
-            f"{', '.join(added) if added else 'none added by this test'}"
-        )
+        reasons.append(f"reached fd {highest} (limit {_FD_HIGH_WATER - 1})")
+    if reasons:
+        breach = f"{item.nodeid} {' and '.join(reasons)}; grouped=[{grouped or 'none'}]"
         _FD_BREACHES.append(breach)
-        item.session.shouldstop = breach
+        print(f"fd-breach {breach}", flush=True)
+        if highest >= _FD_HIGH_WATER:
+            item.session.shouldstop = breach
 
 
 def _fd_summary() -> str:
@@ -504,7 +520,7 @@ def _fd_summary() -> str:
         nodeid, count, highest, added = _FD_RETAINED_MAX
         retained_max = (
             f"nodeid={nodeid} open={count} highest={highest} "
-            f"added={', '.join(added) if added else 'none'}"
+            f"added_grouped={_group_fds_by_path_prefix(added) if added else 'none'}"
         )
     else:
         retained_max = "none"
