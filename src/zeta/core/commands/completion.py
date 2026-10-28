@@ -81,7 +81,7 @@ _zeta() {
                     _arguments '--account=[account name]:account:' '--replace[replace existing account]' '1:provider:(anthropic codex)'
                     ;;
                 accounts)
-                    _arguments '--json[print JSON]' '1:action:(default)' '2:account:'
+                    _arguments '--json[print JSON]' '--refresh[refresh credentials for status]' '--replace[replace existing account]' '1:action:(default login refresh rename status)' '2:account or provider:' '3:new label:'
                     ;;
                 serve)
                     _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]' '--auto-memory[enable automatic project memory]' '--no-auto-memory[disable automatic project memory]'
@@ -187,7 +187,7 @@ def bash_script() -> str:
         verb="${COMP_WORDS[command_index+1]}"
     fi
     local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --auto-memory --no-auto-memory --token-budget --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt"
-    local commands="login serve session project inbox mcp stalls completion"
+    local commands="login accounts serve session project inbox mcp stalls completion"
 
     if (( command_index == 0 )); then
         if [[ "$cur" == -* ]]; then
@@ -203,7 +203,7 @@ def bash_script() -> str:
             COMPREPLY=( $(compgen -W "anthropic codex --account --replace" -- "$cur") )
             ;;
         accounts)
-            COMPREPLY=( $(compgen -W "--json default" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--json --refresh --replace default login refresh rename status anthropic codex" -- "$cur") )
             ;;
         serve)
             COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd --tools --disallowed-tools --require-tools --allow-hooks --auto-memory --no-auto-memory" -- "$cur") )

@@ -23,6 +23,28 @@ def _tokens(access: str, refresh: str, expires_at: float = 4_000_000_000) -> OAu
     return OAuthTokens(access, refresh, expires_at)
 
 
+def test_accounts_status_uses_account_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    zeta_home = tmp_path / "zeta"
+    account_home = tmp_path / "accounts"
+    named_account_credentials(zeta_home, "codex", "from-a").save(
+        _tokens("access-a", "refresh-a")
+    )
+    named_account_credentials(account_home, "codex", "from-b").save(
+        _tokens("access-b", "refresh-b")
+    )
+    monkeypatch.setenv("ZETA_HOME", str(zeta_home))
+    monkeypatch.setenv("ZETA_ACCOUNT_HOME", str(account_home))
+
+    assert main(["accounts", "status", "--json"]) == 0
+
+    statuses = json.loads(capsys.readouterr().out)
+    assert [status["account"] for status in statuses] == ["from-b"]
+
+
 def test_provider_credentials_use_account_home_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

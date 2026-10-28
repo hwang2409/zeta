@@ -26,6 +26,7 @@ from typing import Any, Protocol
 import httpx
 
 from ..core.session_files import (
+    SessionFileReplaced,
     child_directory,
     open_session_file,
     require_off_loop_lock,
@@ -223,13 +224,23 @@ class AccountStore:
                 for key in self._read_registry(home_fd)["accounts"]
             ]
 
-    def list_display(self) -> list[AccountDisplay]:
-        result = []
+    def list_catalog(self) -> list[AccountDisplay]:
         with self._home() as home_fd:
             value = self._read_registry(home_fd)
-            for key in value["accounts"]:
-                account = AccountId(*key.split(":", 1))
-                tokens = _read_account_tokens(home_fd, account)
+        return [
+            AccountDisplay(
+                AccountId(*key.split(":", 1)),
+                value["labels"].get(key, key.split(":", 1)[1]),
+            )
+            for key in value["accounts"]
+        ]
+
+    def list_display(self) -> list[AccountDisplay]:
+        result = []
+        catalog = self.list_catalog()
+        with self._home() as home_fd:
+            for item in catalog:
+                tokens = _read_account_tokens(home_fd, item.account)
                 details = (
                     tuple(filter(None, (tokens.email, tokens.workspace)))
                     if tokens
@@ -239,10 +250,10 @@ class AccountStore:
 
                 result.append(
                     AccountDisplay(
-                        account,
-                        value["labels"].get(key, account.name),
+                        item.account,
+                        item.label,
                         " · ".join(details) or None,
-                        read_usage(self, account),
+                        read_usage(self, item.account),
                     )
                 )
         return result
@@ -472,7 +483,13 @@ class AccountStore:
 
     def _read_registry(self, home_fd: int) -> dict[str, Any]:
         try:
-            raw = _read_optional(home_fd, "accounts.json")
+            for attempt in range(5):
+                try:
+                    raw = _read_optional(home_fd, "accounts.json")
+                    break
+                except SessionFileReplaced:
+                    if attempt == 4:
+                        raise
             if raw is None:
                 return {"version": 1, "accounts": {}, "defaults": {}, "labels": {}}
             value = json.loads(raw)
@@ -561,8 +578,10 @@ class AccountCredentials:
         self.provider_label = driver.provider_label
         self._async_lock = asyncio.Lock()
 
-    def read(self) -> OAuthTokens | None:
-        with self.store.lifecycle_guard(self.account) as home_fd:
+    def read(self, *, lock_timeout: float | None = None) -> OAuthTokens | None:
+        with self.store.lifecycle_guard(
+            self.account, timeout=lock_timeout
+        ) as home_fd:
             return _read_account_tokens(home_fd, self.account)
 
     def save(
@@ -614,11 +633,19 @@ class AccountCredentials:
         async with self._async_lock:
             if not await asyncio.to_thread(self.store.contains, self.account):
                 return await self._bootstrap_access_token(client, refresh=True)
-            async with self._async_guard(registry=False) as home_fd:
-                tokens = _read_account_tokens(home_fd, self.account)
-                if tokens is None:
-                    raise self.login_required_error()
-                return await self._refresh_locked(home_fd, tokens, client)
+            return await self._refresh_existing_token(client)
+
+    async def refresh_existing_token(self, client: httpx.AsyncClient) -> str:
+        """Refresh a catalog account without registry lookup or bootstrap."""
+        async with self._async_lock:
+            return await self._refresh_existing_token(client)
+
+    async def _refresh_existing_token(self, client: httpx.AsyncClient) -> str:
+        async with self._async_guard(registry=False) as home_fd:
+            tokens = _read_account_tokens(home_fd, self.account)
+            if tokens is None:
+                raise self.login_required_error()
+            return await self._refresh_locked(home_fd, tokens, client)
 
     async def refresh(
         self, refresh_token: str, client: httpx.AsyncClient

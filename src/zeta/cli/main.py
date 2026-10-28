@@ -8,16 +8,27 @@ import copy
 import json
 import os
 import sys
+from datetime import UTC, datetime
 
+import httpx
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from ..accounts import AccountError, AccountId, AccountStore, AccountUsage
+from ..accounts import (
+    AccountCredentialLockTimeoutError,
+    AccountCredentials,
+    AccountError,
+    AccountId,
+    AccountStore,
+    AccountUsage,
+)
 from ..accounts.usage import format_usage_lines, usage_json
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.login_flow import LoginPublicationError, run_login
 from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
+from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
+from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
 from ..tui.app import create_app
 from ..tui.key_bindings import TerminalRenderError
@@ -275,11 +286,12 @@ def build_parser() -> argparse.ArgumentParser:
         "accounts", help="manage subscription accounts"
     )
     accounts_parser.add_argument(
-        "action", nargs="?", choices=("default", "login", "refresh", "rename")
+        "action", nargs="?", choices=("default", "login", "refresh", "rename", "status")
     )
     accounts_parser.add_argument("account", nargs="?")
     accounts_parser.add_argument("new_label", nargs="?")
     accounts_parser.add_argument("--json", action="store_true")
+    accounts_parser.add_argument("--refresh", dest="status_refresh", action="store_true")
     accounts_parser.add_argument("--replace", action="store_true")
     from .inbox import add_subcommand as _add_inbox_subcommand
     from .project import add_subcommand as _add_project_subcommand
@@ -463,23 +475,219 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
     print("\n".join(lines))
 
 
-def _run_accounts_action(store: AccountStore, args: argparse.Namespace) -> None:
+def _expiry_iso(expires_at: float) -> str:
+    return datetime.fromtimestamp(expires_at, UTC).isoformat().replace("+00:00", "Z")
+
+
+def _refresh_failure(exc: RuntimeError) -> dict[str, object]:
+    if isinstance(exc.__cause__, AccountCredentialLockTimeoutError):
+        return {"ok": False, "code": "lock_timeout", "retryable": True}
+    code = getattr(exc, "code", "http_error")
+    if code not in {"auth_error", "http_error"}:
+        code = "http_error"
+    return {
+        "ok": False,
+        "code": code,
+        "retryable": (
+            getattr(exc, "retryable", None) if code == "http_error" else None
+        ),
+    }
+
+
+async def _read_safe_account_status(
+    credentials: AccountCredentials,
+) -> tuple[OAuthTokens | None, dict[str, object]]:
+    try:
+        tokens = await asyncio.to_thread(
+            credentials.read, lock_timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+        )
+    except AccountCredentialLockTimeoutError:
+        return None, {
+            "logged_in": None,
+            "access_token_expires_at": None,
+            "error": "lock_timeout",
+            "retryable": True,
+        }
+    except AccountError:
+        return None, {
+            "logged_in": False,
+            "access_token_expires_at": None,
+            "error": "invalid_credentials",
+        }
+    try:
+        expiry = _expiry_iso(tokens.expires_at) if tokens is not None else None
+    except (OSError, OverflowError, ValueError):
+        return None, {
+            "logged_in": False,
+            "access_token_expires_at": None,
+            "error": "invalid_credentials",
+        }
+    return tokens, {
+        "logged_in": tokens is not None,
+        "access_token_expires_at": expiry,
+    }
+
+
+async def _account_status(
+    store: AccountStore,
+    account: AccountId,
+    label: str,
+    default: AccountId | None,
+    *,
+    refresh: bool,
+    client: httpx.AsyncClient,
+) -> tuple[dict[str, object], bool]:
+    credentials = credential_store(
+        "claude" if account.provider == "anthropic" else account.provider,
+        home=store.home,
+        account=account,
+    )
+    assert credentials is not None
+    tokens, safe_status = await _read_safe_account_status(credentials)
+    status: dict[str, object] = {
+        "provider": account.provider,
+        "account": label,
+        "is_default": default == account,
+        **safe_status,
+    }
+    if safe_status.get("error") == "lock_timeout":
+        if refresh:
+            status["refresh"] = {
+                "ok": False,
+                "code": "lock_timeout",
+                "retryable": True,
+            }
+        return status, False
+    if not refresh:
+        return status, tokens is not None
+    if tokens is None:
+        result: dict[str, object] = {
+            "ok": False,
+            "code": "auth_error",
+            "retryable": None,
+        }
+    else:
+        try:
+            await credentials.refresh_existing_token(client)
+        except RuntimeError as exc:
+            result = _refresh_failure(exc)
+        else:
+            result = {"ok": True, "code": None, "retryable": None}
+            _, refreshed_status = await _read_safe_account_status(credentials)
+            status.update(refreshed_status)
+            if refreshed_status["logged_in"] is not True:
+                status["refresh"] = result
+                return status, False
+    status["refresh"] = result
+    return status, bool(result["ok"])
+
+
+async def _account_statuses(
+    store: AccountStore, provider: str | None, *, refresh: bool
+) -> tuple[list[dict[str, object]], bool]:
+    accounts = [
+        item
+        for item in await asyncio.to_thread(store.list_catalog)
+        if provider is None or item.account.provider == provider
+    ]
+    catalog_providers = {item.account.provider for item in accounts}
+    pending_providers = {
+        name
+        for name in ("anthropic", "codex")
+        if (store.home / f"{name}-oauth.json").is_file()
+        and provider in {None, name}
+        and name not in catalog_providers
+    }
+    defaults = {
+        name: await asyncio.to_thread(store.default, name)
+        for name in {item.account.provider for item in accounts}
+    }
+    statuses: list[dict[str, object]] = [
+        {
+            "provider": name,
+            "account": "default",
+            "is_default": defaults.get(name) in {None, AccountId(name, "default")},
+            "logged_in": None,
+            "access_token_expires_at": None,
+            "error": "migration_pending",
+            "retryable": False,
+            **(
+                {
+                    "refresh": {
+                        "ok": False,
+                        "code": "migration_pending",
+                        "retryable": False,
+                    }
+                }
+                if refresh
+                else {}
+            ),
+        }
+        for name in sorted(pending_providers)
+    ]
+    all_ok = bool(accounts) and not pending_providers
+    async with httpx.AsyncClient() as client:
+        for item in accounts:
+            status, ok = await _account_status(
+                store,
+                item.account,
+                item.label,
+                defaults[item.account.provider],
+                refresh=refresh,
+                client=client,
+            )
+            statuses.append(status)
+            all_ok = all_ok and ok
+    return statuses, all_ok
+
+
+def _print_account_statuses(statuses: list[dict[str, object]], *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(statuses))
+        return
+    lines = []
+    for status in statuses:
+        if error := status.get("error"):
+            state = f"login invalid ({error})"
+        else:
+            state = "logged in" if status["logged_in"] else "login missing"
+        default = "  default" if status["is_default"] else ""
+        expiry = status["access_token_expires_at"] or "unknown"
+        line = f"{status['provider']}:{status['account']}  {state}  expires {expiry}{default}"
+        refresh = status.get("refresh")
+        if isinstance(refresh, dict):
+            line += "  refresh ok" if refresh["ok"] else f"  refresh failed ({refresh['code']})"
+        lines.append(line)
+    print("\n".join(lines))
+
+
+def _run_accounts_action(store: AccountStore, args: argparse.Namespace) -> int:
     if args.action == "default":
         if not args.account:
             raise AccountError("default requires provider:name")
         store.set_default(store.resolve_qualified_reference(args.account))
-        return
+        return 0
     if args.action == "refresh":
         asyncio.run(AccountUsage(store).refresh_stale())
         _print_accounts(store, as_json=args.json)
-        return
+        return 0
     if args.action == "rename":
         if not args.account or not args.new_label:
             raise AccountError("rename requires provider:old and a new label")
         account = store.resolve_qualified_reference(args.account)
         print(store.rename(account, args.new_label))
-        return
+        return 0
+    if args.action == "status":
+        provider = args.account
+        if provider not in {None, "anthropic", "codex"}:
+            raise AccountError("status provider must be anthropic or codex")
+        statuses, all_ok = asyncio.run(
+            _account_statuses(store, provider, refresh=args.status_refresh)
+        )
+        _print_account_statuses(statuses, as_json=args.json)
+        return 0 if all_ok else 1
     _print_accounts(store, as_json=args.json)
+    return 0
 
 
 def _handle_accounts(args: argparse.Namespace) -> int:
@@ -496,9 +704,9 @@ def _handle_accounts(args: argparse.Namespace) -> int:
         )
     try:
         store = AccountStore(account_home(env_home()))
-        store.migrate()
-        _run_accounts_action(store, args)
-        return 0
+        if args.action != "status":
+            store.migrate()
+        return _run_accounts_action(store, args)
     except (AccountError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

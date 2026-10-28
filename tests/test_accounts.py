@@ -1758,6 +1758,37 @@ def test_refresh_keeps_email_when_response_has_only_workspace(tmp_path: Path) ->
     )
 
 
+def test_list_display_enriches_list_catalog_without_reparsing_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    named_account_credentials(tmp_path, "codex", "work").save(tokens())
+    named_account_credentials(tmp_path, "anthropic", "team").save(tokens())
+    store = AccountStore(tmp_path)
+    store.rename(AccountId("codex", "work"), "personal")
+    catalog = store.list_catalog()
+    calls = 0
+
+    def checked_list_catalog(self: AccountStore):
+        nonlocal calls
+        assert self is store
+        calls += 1
+        return catalog
+
+    monkeypatch.setattr(AccountStore, "list_catalog", checked_list_catalog)
+    monkeypatch.setattr(
+        store,
+        "_read_registry",
+        lambda _home_fd: pytest.fail("list_display reparsed the registry"),
+    )
+
+    displayed = store.list_display()
+
+    assert calls == 1
+    assert [(item.account, item.label) for item in displayed] == [
+        (item.account, item.label) for item in catalog
+    ]
+
+
 def test_codex_email_from_access_token_profile_claim(tmp_path: Path) -> None:
     access_token = _jwt_token(
         {"https://api.openai.com/profile": {"email": "henry@example.com"}}
