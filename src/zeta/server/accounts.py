@@ -9,6 +9,7 @@ from typing import Any
 
 from ..accounts import AccountId, AccountStore, AccountUsage, account_provider
 from ..accounts.usage import usage_json
+from ..core.session import account_home
 from ..providers.factory import build_backend
 from .protocol import ProtocolError
 from .runtime import ServerRuntime
@@ -34,7 +35,7 @@ async def cancel_owned_switch(owner: Any) -> None:
 
 
 async def migrate(home: Path) -> None:
-    await asyncio.to_thread(AccountStore(home).migrate)
+    await asyncio.to_thread(AccountStore(account_home(home)).migrate)
 
 
 async def list_accounts(runtime: ServerRuntime) -> dict[str, object]:

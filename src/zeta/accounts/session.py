@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..core.session import account_home
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
 from .exhaustion import classify_subscription_limit, recovery_alternatives
 from .store import AccountDisplay, AccountError, AccountId, AccountStore
@@ -92,7 +93,7 @@ class SessionAccountContext:
         }
         context = cls(
             path,
-            AccountStore(path),
+            AccountStore(account_home(path)),
             manager,
             metadata,
             pins,

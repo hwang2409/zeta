@@ -14,7 +14,9 @@ limited to 1 MiB.
 The server accepts one client. A second connection receives a JSON-RPC error
 with code `-32001`, then closes. The server uses a Unix socket by default:
 `$ZETA_HOME/run/serve.sock`. `zeta serve --socket PATH` selects another Unix
-socket. `zeta serve --port N` selects `127.0.0.1:N`.
+socket. `zeta serve --port N` selects `127.0.0.1:N`. set
+`ZETA_ACCOUNT_HOME` to an absolute directory when served sessions must use a
+shared provider account store while all other state remains under `ZETA_HOME`.
 
 ## handshake
 

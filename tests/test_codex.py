@@ -2213,6 +2213,7 @@ async def test_completed_output_text_wins_and_is_persisted(tmp_path: Path) -> No
     assert events[-2].message.content == [TextContent("completed answer")]
     assert store.messages()[-1].content == [TextContent("completed answer")]
     diagnostic = json.loads((tmp_path / "diagnostics.jsonl").read_text())
+    assert diagnostic["provider"] == "codex"
     assert diagnostic["reassembly_mismatches"] == 1
     assert "streamed" not in diagnostic
     assert "completed" not in diagnostic
