@@ -15,7 +15,7 @@ from pathlib import Path
 from ..accounts import AccountCredentials, AccountId, AccountStore
 from ..codex import CodexCredentialDriver
 from ..config.settings import load_settings
-from ..core.session import env_home
+from ..core.session import account_home
 from ..core.slash import budget_for_model, effective_budget_for_model
 from ..models.catalog import provider_for_model
 from ..protocol.types import CompletionBackend
@@ -49,7 +49,7 @@ def credential_store(
 
     if provider not in {"claude", "codex"}:
         return None
-    auth_home = Path(home) if home is not None else env_home()
+    auth_home = account_home(home)
     registry = AccountStore(auth_home)
     canonical = "anthropic" if provider == "claude" else provider
     if account is not None and account.provider != canonical:
@@ -101,7 +101,7 @@ def build_backend(
 ) -> tuple[CompletionBackend, str]:
     """Build a network provider backend and report the model it settled on."""
 
-    auth_home = Path(home) if home is not None else env_home()
+    auth_home = account_home(home)
     stall_kwargs = {
         "stall_seconds": (
             DEFAULT_STREAM_STALL_SECONDS if stall_seconds is None else stall_seconds

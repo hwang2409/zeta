@@ -32,6 +32,7 @@ from ..core.session import (
     SessionManager,
     SessionMetadata,
     SessionPreview,
+    account_home,
     env_home,
     format_relative_age,
     persist_metadata_change,
@@ -258,7 +259,7 @@ def format_picker_row(index: int, preview: SessionPreview) -> str:
 
 def create_app(args: argparse.Namespace) -> TUIApp:
     home = env_home()
-    AccountStore(home).migrate()
+    AccountStore(account_home(home)).migrate()
     ephemeral = bool(getattr(args, "no_session", False))
     ephemeral_root: Path | None = None
     if ephemeral:

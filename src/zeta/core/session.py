@@ -116,6 +116,18 @@ def env_home() -> Path:
     return Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
 
 
+def account_home(home: str | Path | None = None) -> Path:
+    """Return the shared provider-account home, or the supplied zeta home."""
+
+    value = os.environ.get("ZETA_ACCOUNT_HOME")
+    if value is None:
+        return Path(home) if home is not None else env_home()
+    path = Path(value).expanduser()
+    if not value or not path.is_absolute():
+        raise ValueError("ZETA_ACCOUNT_HOME must be an absolute path")
+    return path
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
