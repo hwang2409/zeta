@@ -51,7 +51,6 @@ from .protocol import (
 from .runtime import BackendFactory, ServerRuntime
 from .turn_context import PendingTurnContexts
 
-# Echoed user text stays well inside the 1 MiB frame after JSON escaping.
 USER_MESSAGE_MAX_BYTES = 262_144
 
 class ZetaServer:
