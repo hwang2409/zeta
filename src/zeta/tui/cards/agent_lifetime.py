@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from .agent_shutdown import SHUTDOWN_BUDGET_SECONDS, finish_cleanup_or_handoff
 from .agent_sync import AgentTranscriptSource
 
 
@@ -49,21 +50,27 @@ class AgentTranscriptLifetime:
             raise
         return source
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close_transcript_lifetime())
+            if deadline is None:
+                deadline = asyncio.get_running_loop().time() + SHUTDOWN_BUDGET_SECONDS
+            self._close_task = asyncio.create_task(
+                self._close_transcript_lifetime(deadline)
+            )
         await asyncio.shield(self._close_task)
 
-    async def _close_transcript_lifetime(self) -> None:
+    async def _close_transcript_lifetime(self, deadline: float) -> None:
         self._closed = True
         self._pending_path: Path | None = None
         candidates = self._sync_task, self._replacement_task
         tasks = {task for task in candidates if task is not None and not task.done()}
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
         source, self._source = self._source, None
-        if source is not None:
-            await asyncio.to_thread(source.close)
+        await finish_cleanup_or_handoff(
+            tasks,
+            source.close if source is not None else None,
+            deadline=deadline,
+            label="agent transcript",
+        )
 
 
 __all__ = ["AgentTranscriptLifetime"]

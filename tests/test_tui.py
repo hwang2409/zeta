@@ -10925,7 +10925,6 @@ async def test_tui_close_hands_off_blocked_todo_source(
     await control._task
     source = control._source
     assert source is not None
-    previous = control._snapshot
     entered = threading.Event()
     published = threading.Event()
     original_refresh = source.refresh
@@ -10948,7 +10947,7 @@ async def test_tui_close_hands_off_blocked_todo_source(
 
     await wait_until(lambda: source._closed)
     assert source._store is None
-    assert control._snapshot is previous
+    assert control._snapshot is None
     assert not published.is_set()
     assert _fd_count() <= baseline
 

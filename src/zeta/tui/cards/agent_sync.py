@@ -28,6 +28,7 @@ from ...core.session_files import (
 from ...core.store import ConversationStore
 from ...protocol.types import is_passive_harness_message
 from ..todo import TodoSnapshot
+from .agent_shutdown import SHUTDOWN_BUDGET_SECONDS, finish_cleanup_or_handoff
 
 _REFRESH_LOCK = threading.Lock()
 _REVERSE_READ_BYTES = 64 * 1024
@@ -163,6 +164,8 @@ class AgentTodoControl:
             self._state_seen = False
             if previous is not None:
                 await asyncio.to_thread(previous.close)
+            if self._closed:
+                return False
             self._source = AgentTodoSource(path, cwd=self._cwd)
         try:
             snapshot = await asyncio.to_thread(self._source.refresh)
@@ -181,6 +184,8 @@ class AgentTodoControl:
         else:
             self._refresh_error_logged = False
             self._state_seen = True
+        if self._closed:
+            return False
         changed = snapshot != self._snapshot or path != self._snapshot_path
         self._snapshot = snapshot
         self._snapshot_path = path
@@ -209,7 +214,7 @@ class AgentTodoControl:
                 requested = self._pending_path
                 self._refresh_requested = False
                 changed = await self._refresh(requested) or changed
-            if changed and invalidate is not None:
+            if changed and not self._closed and invalidate is not None:
                 invalidate()
             return changed
 
@@ -221,19 +226,27 @@ class AgentTodoControl:
         self._snapshot_path = None
         self.request(None, invalidate)
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         if self._closed:
             return
         self._closed = True
         self._refresh_requested = False
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + SHUTDOWN_BUDGET_SECONDS
+        tasks = (
+            {self._task}
+            if self._task is not None and not self._task.done()
+            else set()
+        )
         source, self._source = self._source, None
-        if source is not None:
-            await asyncio.to_thread(source.close)
         self._snapshot = None
         self._snapshot_path = None
+        await finish_cleanup_or_handoff(
+            tasks,
+            source.close if source is not None else None,
+            deadline=deadline,
+            label="agent todo",
+        )
 
 
 @dataclass(frozen=True, slots=True)

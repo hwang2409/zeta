@@ -25,6 +25,7 @@ from ..core.session_files import SessionError, open_session_file, session_direct
 from ..core.store import ConversationStore
 from ..protocol.types import Message, ToolCall, is_passive_harness_message
 from . import theme
+from .cards import agent_shutdown
 from .cards.agent import (
     AgentCard,
     AgentRunCommandMixin,
@@ -845,8 +846,18 @@ class AgentNavigation:
         return self._todo_control.snapshot(self.current_path)
 
     async def close(self) -> None:
-        await self.transcript_control.close()
-        await self._todo_control.close()
+        deadline = (
+            asyncio.get_running_loop().time()
+            + agent_shutdown.SHUTDOWN_BUDGET_SECONDS
+        )
+        results = await asyncio.gather(
+            self.transcript_control.close(deadline=deadline),
+            self._todo_control.close(deadline=deadline),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     def child_view_focused(self) -> bool:
         return self._layout is not None and self._layout.has_focus(self.transcript_window)
