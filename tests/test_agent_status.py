@@ -26,6 +26,8 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 
+pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
 
 async def _status(
     loop: AgentLoop,

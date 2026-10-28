@@ -26,6 +26,26 @@ from zeta.tui.app import create_app
 from zeta.tui.render import format_status
 
 
+@pytest.fixture(autouse=True)
+async def close_test_loops(monkeypatch: pytest.MonkeyPatch):
+    loops: list[AgentLoop] = []
+    loop_init = AgentLoop.__init__
+
+    def tracked_init(loop, *args, **kwargs):
+        loop_init(loop, *args, **kwargs)
+        loops.append(loop)
+
+    monkeypatch.setattr(AgentLoop, "__init__", tracked_init)
+    yield
+    for loop in reversed(loops):
+        if not loop._closed:
+            await loop.close()
+        if not loop.tool_registry._closed:
+            await loop.tool_registry.close()
+        if not loop.store._closed:
+            loop.store.close()
+
+
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
     return [event async for event in events]
 

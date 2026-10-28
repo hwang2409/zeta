@@ -613,8 +613,11 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app.stop_decisions_poll = lambda: cleaned.append("poll")
     app._stop_decisions_refresh = lambda: cleaned.append("refresh")
     app._close_finder_workers = fail_finder
+    async def close_navigation() -> None:
+        cleaned.append("navigation close")
+
     app._agent_navigation = SimpleNamespace(
-        close=lambda: cleaned.append("navigation close"),
+        close=close_navigation,
         unbind_layout=lambda: cleaned.append("navigation unbind"),
     )
     app._cancel_mcp_wizard = lambda: async_cleanup("wizard")

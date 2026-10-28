@@ -28,6 +28,8 @@ from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 
+pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
 
 def _init_repo(root: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)

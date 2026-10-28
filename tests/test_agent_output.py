@@ -30,6 +30,8 @@ from zeta.skills import SkillCatalog
 from zeta.tools.agent import agent_result
 from zeta.tui.render import render_event
 
+pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
 
 async def _collect(events):
     return [event async for event in events]

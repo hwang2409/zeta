@@ -76,7 +76,7 @@ class RuntimeCloseMixin:
             close_child_sends = getattr(self, "_close_child_sends", None)
             if close_child_sends is not None:
                 await attempt_async(close_child_sends)
-            attempt(self._agent_navigation.close)
+            await attempt_async(self._agent_navigation.close)
             attempt(self._agent_navigation.unbind_layout)
             await attempt_async(self._cancel_mcp_wizard)
             await attempt_async(self._submissions.close)
