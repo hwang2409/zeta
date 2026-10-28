@@ -584,6 +584,8 @@ class AutoMemoryReconciler:
                             transcript=request.transcript,
                             as_of=today,
                         )
+                    except RequestTooLargeError:
+                        raise
                     except ReconciliationError as first_error:
                         repair_prompt = self._repair_prompt(request.prompt, first_error)
                         raw_text, repair_usage = await self._invoke_request(

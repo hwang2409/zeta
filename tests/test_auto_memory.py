@@ -1341,6 +1341,32 @@ async def test_entry_repair_request_too_large_is_terminal(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_first_call_request_too_large_is_terminal_not_repaired(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> ReconciliationResponse:
+        nonlocal calls
+        calls += 1
+        raise RequestTooLargeError("request too large")
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    assert calls == 1
+    assert runner.last_failure is not None
+    assert runner.last_failure.terminal is True
+
+
+@pytest.mark.asyncio
 async def test_applied_pass_writes_success_diagnostic(tmp_path: Path) -> None:
     async def invoke(prompt: str) -> ReconciliationResponse:
         return ReconciliationResponse(

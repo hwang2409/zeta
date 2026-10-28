@@ -92,8 +92,11 @@ cursor are durable. The row shapes are:
 - `paused`: `timestamp`, `project_id`, `session_id`, `outcome`, `pause_code`,
   and `provider`.
 
-An authoritative commit that changed memory writes exactly one `applied` row
-for its reconciliation key, including after crash recovery. A login-required
+An authoritative commit that changed memory writes at most one `applied` row
+for its reconciliation key, including after crash recovery. Rows are best
+effort: a crash after the cursor commit and before the append, or a failed log
+write, can lose one row. A watchdog should treat a recent row of any outcome
+as evidence that reconciliation runs, not count rows. A login-required
 pause writes one `paused` row per process when it first observes the pause; a
 restart writes a new one. Its fixed pause code is `login_required`. Detailed
 failure text remains only in the session-private `memory-reconcile.json`,
