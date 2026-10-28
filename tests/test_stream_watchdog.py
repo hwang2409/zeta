@@ -614,7 +614,7 @@ async def test_oauth_refresh_network_wait_is_bounded(
         raise AssertionError("unreachable")
 
     async with _mock_client(no_refresh_response) as client:
-        with pytest.raises(store.auth_error_type, match="OAuth token refresh stalled"):
+        with pytest.raises(store.http_error_type, match="OAuth token refresh stalled"):
             await asyncio.wait_for(getattr(store, method_name)(client), timeout=0.5)
         assert json.loads(store.path.read_text())["access_token"] == "expired-access"
 
