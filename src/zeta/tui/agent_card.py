@@ -33,6 +33,7 @@ from .cards.agent import (
     render_agent_progress,
     render_agent_receipt,
 )
+from .cards.agent_lifetime import AgentTranscriptLifetime
 from .cards.agent_list import (
     AGENT_LIST_PAGE_SIZE,
     MAX_AGENT_LIST_ROWS,
@@ -41,8 +42,6 @@ from .cards.agent_list import (
 from .cards.agent_sync import (
     AgentTodoControl,
     AgentTranscriptSnapshot,
-    AgentTranscriptSource,
-    AgentTranscriptTreeSnapshot,
 )
 from .cards.shared import (
     MAX_CARD_COLUMNS,
@@ -503,8 +502,6 @@ def _read_bounded_messages(
     return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
 
 
-
-
 def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list[str]:
     """Read one agent's direct transcript, without nested child sessions."""
 
@@ -519,7 +516,7 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     return result or ["transcript unavailable"]
 
 
-class AgentTranscriptControl(UIControl):
+class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
     """Scrollable child transcript synchronized through a read-only store."""
 
     _RENDER_BATCH_SIZE = 4
@@ -536,15 +533,12 @@ class AgentTranscriptControl(UIControl):
         )
         self._tool_calls: dict[str, ToolCall] = {}
         self._path: Path | None = None
-        self._source: AgentTranscriptSource | None = None
+        self._initialize_transcript_lifetime()
         self._snapshot: AgentTranscriptSnapshot | None = None
         self._entry_units: dict[str, list[Any]] = {}
         self._unit_entries: dict[Any, str] = {}
         self._sync_task: asyncio.Task[bool] | None = None
-        self._replacement_task: asyncio.Task[bool] | None = None
-        self._close_task: asyncio.Task[None] | None = None
         self._pending_path: Path | None = None
-        self._closed = False
 
     @property
     def offset(self) -> int:
@@ -579,17 +573,12 @@ class AgentTranscriptControl(UIControl):
             tree = await asyncio.to_thread(self._source.refresh)
         except (ConversationIntegrityError, OSError, ValueError):
             return False
-        snapshot = self._snapshot_while_open(tree, path)
+        if self._closed:
+            return False
+        snapshot = tree.transcript(path)
         return False if snapshot is None else await self._apply_snapshot(snapshot, path)
 
-    def _snapshot_while_open(
-        self, tree: AgentTranscriptTreeSnapshot, path: Path
-    ) -> AgentTranscriptSnapshot | None:
-        return None if self._closed else tree.transcript(path)
-
-    async def _apply_snapshot(
-        self, snapshot: AgentTranscriptSnapshot, path: Path
-    ) -> bool:
+    async def _apply_snapshot(self, snapshot: AgentTranscriptSnapshot, path: Path) -> bool:
         previous = self._snapshot
         if snapshot == previous:
             return False
@@ -645,61 +634,7 @@ class AgentTranscriptControl(UIControl):
         self._path = path
         self._snapshot = None
 
-    async def _replace_tracked(self, path: Path) -> None:
-        replacement = asyncio.create_task(self._replace(path))
-        self._replacement_task = replacement
-        try:
-            await replacement
-        finally:
-            if self._replacement_task is replacement:
-                self._replacement_task = None
-
-    async def _replace(self, path: Path) -> None:
-        previous, self._source = self._source, None
-        source = await asyncio.to_thread(self._replace_source, path, previous)
-        if self._closed:
-            await asyncio.to_thread(source.close)
-        else:
-            self._source = source
-
-    @staticmethod
-    def _replace_source(
-        path: Path, previous: AgentTranscriptSource | None
-    ) -> AgentTranscriptSource:
-        if previous is not None:
-            previous.close()
-        source = AgentTranscriptSource(path)
-        try:
-            source.refresh()
-        except BaseException:
-            source.close()
-            raise
-        return source
-
-    async def close(self) -> None:
-        """Stop transcript work and close its source away from the event loop."""
-
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close())
-        await asyncio.shield(self._close_task)
-
-    async def _close(self) -> None:
-        self._closed = True
-        self._pending_path = None
-        tasks = {
-            task
-            for task in (self._sync_task, self._replacement_task)
-            if task is not None and not task.done()
-        }
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        source, self._source = self._source, None
-        if source is not None:
-            await asyncio.to_thread(source.close)
-
-    async def _rebuild(
-        self, snapshot: AgentTranscriptSnapshot, path: Path
-    ) -> None:
+    async def _rebuild(self, snapshot: AgentTranscriptSnapshot, path: Path) -> None:
         anchor_id, anchor_unit_index, anchor_offset, follow_tail = self._capture_anchor()
         old_entry_ids = (
             self._snapshot.entry_ids if self._snapshot is not None else ()
