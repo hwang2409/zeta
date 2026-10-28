@@ -514,11 +514,17 @@ async def _read_safe_account_status(
             "access_token_expires_at": None,
             "error": "invalid_credentials",
         }
+    try:
+        expiry = _expiry_iso(tokens.expires_at) if tokens is not None else None
+    except (OSError, OverflowError, ValueError):
+        return None, {
+            "logged_in": False,
+            "access_token_expires_at": None,
+            "error": "invalid_credentials",
+        }
     return tokens, {
         "logged_in": tokens is not None,
-        "access_token_expires_at": (
-            _expiry_iso(tokens.expires_at) if tokens is not None else None
-        ),
+        "access_token_expires_at": expiry,
     }
 
 
@@ -562,7 +568,7 @@ async def _account_status(
         }
     else:
         try:
-            await credentials.refresh_token(client)
+            await credentials.refresh_existing_token(client)
         except RuntimeError as exc:
             result = _refresh_failure(exc)
         else:
@@ -579,21 +585,19 @@ async def _account_status(
 async def _account_statuses(
     store: AccountStore, provider: str | None, *, refresh: bool
 ) -> tuple[list[dict[str, object]], bool]:
+    accounts = [
+        item
+        for item in await asyncio.to_thread(store.list_catalog)
+        if provider is None or item.account.provider == provider
+    ]
+    catalog_providers = {item.account.provider for item in accounts}
     pending_providers = {
         name
         for name in ("anthropic", "codex")
         if (store.home / f"{name}-oauth.json").is_file()
         and provider in {None, name}
+        and name not in catalog_providers
     }
-    accounts = [
-        item
-        for item in await asyncio.to_thread(store.list_catalog)
-        if (provider is None or item.account.provider == provider)
-        and not (
-            item.account.name == "default"
-            and item.account.provider in pending_providers
-        )
-    ]
     defaults = {
         name: await asyncio.to_thread(store.default, name)
         for name in {item.account.provider for item in accounts}

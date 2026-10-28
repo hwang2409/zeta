@@ -633,11 +633,19 @@ class AccountCredentials:
         async with self._async_lock:
             if not await asyncio.to_thread(self.store.contains, self.account):
                 return await self._bootstrap_access_token(client, refresh=True)
-            async with self._async_guard(registry=False) as home_fd:
-                tokens = _read_account_tokens(home_fd, self.account)
-                if tokens is None:
-                    raise self.login_required_error()
-                return await self._refresh_locked(home_fd, tokens, client)
+            return await self._refresh_existing_token(client)
+
+    async def refresh_existing_token(self, client: httpx.AsyncClient) -> str:
+        """Refresh a catalog account without registry lookup or bootstrap."""
+        async with self._async_lock:
+            return await self._refresh_existing_token(client)
+
+    async def _refresh_existing_token(self, client: httpx.AsyncClient) -> str:
+        async with self._async_guard(registry=False) as home_fd:
+            tokens = _read_account_tokens(home_fd, self.account)
+            if tokens is None:
+                raise self.login_required_error()
+            return await self._refresh_locked(home_fd, tokens, client)
 
     async def refresh(
         self, refresh_token: str, client: httpx.AsyncClient

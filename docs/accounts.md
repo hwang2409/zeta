@@ -216,9 +216,10 @@ zeta accounts logout anthropic:work
 
 `status` is a cheap CLI-only credential check for watchdogs. it makes no model
 call and creates no session. for each account it reports the provider, account
-label, default state, login state, and access-token expiry. `--refresh` uses the
-normal locked OAuth refresh path, including token rotation, and adds a safe
-refresh result without printing credentials.
+label, default state, login state, and access-token expiry. `--refresh` uses a
+bounded existing-account OAuth refresh path, including token rotation, and adds
+a safe refresh result without printing credentials. it does not look up or
+bootstrap the account while refreshing.
 
 `status --json` returns an array with one object per selected account. each object
 has this closed schema:
@@ -226,12 +227,13 @@ has this closed schema:
 - `provider`: `"anthropic"` or `"codex"`.
 - `account`: the account label.
 - `is_default`: boolean.
-- `logged_in`: boolean, or `null` when a lock timeout makes the state unknown.
+- `logged_in`: boolean, or `null` when a lock timeout or pending migration makes
+  the state unknown.
 - `access_token_expires_at`: an RFC 3339 UTC string, or `null` when missing or
   unknown.
-- `error`, when present: `"invalid_credentials"`, `"lock_timeout"`, or
-  `"migration_pending"` when a legacy login must be migrated by another account
-  command.
+- `error`, when present: `"invalid_credentials"` for malformed credentials or
+  a non-renderable expiry, `"lock_timeout"`, or `"migration_pending"` when a
+  legacy login must be migrated by another account command.
 - `retryable`, present with `error: "lock_timeout"` or `"migration_pending"`:
   `true` for a lock timeout and `false` for pending migration.
 - `refresh`, present with `--refresh`: an object with boolean `ok`, `code`, and
@@ -246,8 +248,10 @@ The exhaustive safe failure values across `error` and `refresh.code` are
 `invalid_credentials`, `lock_timeout`, `migration_pending`, `auth_error`, and
 `http_error`. no exception message or credential content is included. a lock
 timeout or pending migration leaves `logged_in` unknown instead of claiming
-that the account is logged out. `status` never performs migration or waits on
-migration, registry, or unbounded lifecycle locks.
+that the account is logged out. a legacy file produces `migration_pending` only
+when that provider has no migrated catalog account; migrated accounts remain
+visible. `status` never performs migration or waits on migration, registry, or
+unbounded lifecycle locks.
 
 Exit status `0` means every selected account is logged in and every requested
 refresh succeeded. exit status `1` means there are no selected accounts, a login
