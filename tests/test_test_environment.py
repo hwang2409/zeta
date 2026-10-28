@@ -180,6 +180,66 @@ def test_fd_guard_rejects_cumulative_small_leaks(
         assert "test_probe.py::test_third (+12" in output
 
 
+@pytest.mark.parametrize("close_fds", [False, True])
+def test_fd_guard_propagates_worker_breach_to_xdist_controller(
+    tmp_path: Path, close_fds: bool
+) -> None:
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    for name in ("conftest.py", "sitecustomize.py"):
+        shutil.copyfile(Path(__file__).with_name(name), probe / name)
+    with (probe / "conftest.py").open("a", encoding="utf-8") as conftest:
+        conftest.write("\npytest_plugins = ['retain_fds']\n")
+    (probe / "retain_fds.py").write_text(
+        "import os\n"
+        "import pytest\n"
+        "RETAINED = []\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def retain_fds(request):\n"
+        "    yield\n"
+        "    if request.node.name != 'test_leaker': return\n"
+        "    opened = [os.open('/dev/null', os.O_RDONLY) for _ in range(36)]\n"
+        + (
+            "    for descriptor in opened: os.close(descriptor)\n"
+            if close_fds
+            else "    RETAINED.extend(opened)\n"
+        ),
+        encoding="utf-8",
+    )
+    (probe / "test_probe.py").write_text(
+        "def test_leaker(): pass\n"
+        "def test_other_worker(): pass\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-n",
+            "2",
+            "--confcutdir",
+            str(probe),
+        ],
+        cwd=probe,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode == (0 if close_fds else 1), output
+    if close_fds:
+        assert output.count("breach=[none]") == 2
+    else:
+        assert "fd-breach fd-summary worker=gw" in output
+        assert "worker retained 36 descriptors (budget 32)" in output
+        assert "test_probe.py::test_leaker (+36" in output
+
+
 def test_path_home_follows_home_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -658,3 +718,30 @@ def test_environment_was_sanitized():
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_fd_guard_tolerates_crashed_xdist_worker(tmp_path: Path) -> None:
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    for name in ("conftest.py", "sitecustomize.py"):
+        shutil.copyfile(Path(__file__).with_name(name), probe / name)
+    (probe / "test_probe.py").write_text(
+        "import os\n"
+        "def test_crash(): os._exit(17)\n"
+        "def test_other_worker(): pass\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-n", "2", "--confcutdir", str(probe)],
+        cwd=probe,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+
+    assert "INTERNALERROR" not in output, output
+    assert result.returncode == 1, output
+    assert "test_probe.py::test_crash" in output

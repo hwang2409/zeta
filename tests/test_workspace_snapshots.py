@@ -1147,6 +1147,8 @@ def test_corruption_warning_resolves_only_undo_target(
     # One root lookup and one ref/commit/tree/object resolution, independent
     # of history length. Full history validation belongs only to reset.
     assert len(calls) <= 4
+    reopened.close()
+    store.close()
 
 
 def test_corrupt_undo_advice_names_damaged_target_before_healthy_history(

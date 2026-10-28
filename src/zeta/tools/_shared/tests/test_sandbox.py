@@ -20,13 +20,15 @@ async def test_write_rejects_hard_link_target(tmp_path: Path) -> None:
     sandbox.mkdir()
     os.link(outside, sandbox / "target")
 
-    result = await ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty()).execute(
+    registry = ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty())
+    result = await registry.execute(
         ToolCall("hard-link", "write", {"path": "target", "content": "changed"})
     )
 
     assert result["isError"] is True
     assert "multiple hard links" in result["content"][0]["text"]
     assert outside.read_text(encoding="utf-8") == "outside"
+    await registry.close()
 
 
 @pytest.mark.asyncio
@@ -37,12 +39,14 @@ async def test_read_allows_hard_link_target(tmp_path: Path) -> None:
     sandbox.mkdir()
     os.link(outside, sandbox / "target")
 
-    result = await ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty()).execute(
+    registry = ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty())
+    result = await registry.execute(
         ToolCall("hard-link-read", "read", {"path": "target"})
     )
 
     assert result["isError"] is False
     assert result["content"][0]["text"] == "outside"
+    await registry.close()
 
 
 @pytest.mark.asyncio
@@ -94,6 +98,7 @@ async def test_read_uses_verified_fd_after_rename(
     assert result["structuredContent"]["path"] == str(target)
     monkeypatch.undo()
     assert moved.read_text(encoding="utf-8") == "original"
+    await registry.close()
 
 
 def test_path_from_fd_returns_absolute_path(tmp_path: Path) -> None:
@@ -106,7 +111,8 @@ def test_path_from_fd_returns_absolute_path(tmp_path: Path) -> None:
         os.close(file_descriptor)
 
 
-def test_ancestor_symlink_is_rejected(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_ancestor_symlink_is_rejected(tmp_path: Path) -> None:
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
     outside = tmp_path / "outside"
@@ -114,10 +120,11 @@ def test_ancestor_symlink_is_rejected(tmp_path: Path) -> None:
     (outside / "file").write_text("outside", encoding="utf-8")
     (sandbox / "dir").symlink_to(outside, target_is_directory=True)
 
+    registry = ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty())
     with (
         pytest.raises(ValueError, match="escaped session cwd"),
         sandbox_module.open_target(
-            ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty()),
+            registry,
             "dir/file",
             flags=os.O_RDONLY | os.O_CLOEXEC,
             execution_context=ToolExecutionContext(
@@ -126,6 +133,7 @@ def test_ancestor_symlink_is_rejected(tmp_path: Path) -> None:
         ),
     ):
         pass
+    await registry.close()
 
 
 @pytest.mark.asyncio
@@ -161,6 +169,7 @@ async def test_post_walk_ancestry_check_rejects_rename(
     assert result["isError"] is True
     assert "parent directory does not exist" in result["content"][0]["text"]
     assert (moved / "target").read_text(encoding="utf-8") == "inside"
+    await registry.close()
 
 
 def test_expand_user_path_expands_home() -> None:
@@ -221,6 +230,7 @@ async def test_write_expands_tilde_home_in_target_path(
     assert result["isError"] is False, result["content"][0]["text"]
     assert (home / "hello.txt").read_text(encoding="utf-8") == "hi"
     assert result["structuredContent"]["path"] == str(home / "hello.txt")
+    await registry.close()
 
 
 @pytest.mark.asyncio
@@ -245,6 +255,7 @@ async def test_edit_expands_tilde_home_in_target_path(
 
     assert result["isError"] is False, result["content"][0]["text"]
     assert (home / "note.txt").read_text(encoding="utf-8") == "new"
+    await registry.close()
 
 
 @pytest.mark.asyncio
@@ -265,6 +276,7 @@ async def test_read_expands_tilde_home_in_target_path(
 
     assert result["isError"] is False, result["content"][0]["text"]
     assert result["content"][0]["text"] == "hi"
+    await registry.close()
 
 
 @pytest.mark.asyncio
@@ -285,6 +297,7 @@ async def test_bash_cwd_expands_tilde_home(
     assert result["isError"] is False
     assert result["structuredContent"]["stdout"].strip() == str(home)
     assert result["structuredContent"]["cwd_after"] == str(home)
+    await registry.close()
 
 
 @pytest.mark.asyncio
@@ -310,6 +323,7 @@ async def test_write_cross_root_allow_regression_pin_for_audit(
 
     assert result["isError"] is False, result["content"][0]["text"]
     assert target.read_text(encoding="utf-8") == "<html></html>"
+    await registry.close()
 
 
 @pytest.mark.asyncio
@@ -331,6 +345,7 @@ async def test_write_cross_root_can_create_parents_outside_cwd(
 
     assert result["isError"] is False, result["content"][0]["text"]
     assert target.read_text(encoding="utf-8") == "hi"
+    await registry.close()
 
 
 @pytest.mark.asyncio
@@ -359,6 +374,7 @@ async def test_symlink_escape_error_names_session_cwd(tmp_path: Path) -> None:
     assert str(sandbox) in message
     assert "retry with an absolute path" in message
     assert (outside / "note").read_text(encoding="utf-8") == "outside"
+    await registry.close()
 
 
 @pytest.mark.asyncio
@@ -377,3 +393,4 @@ async def test_read_cross_root_absolute_path_regression_pin(
 
     assert result["isError"] is False
     assert result["content"][0]["text"] == "outside content"
+    await registry.close()
