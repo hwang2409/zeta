@@ -195,17 +195,22 @@ async def test_parent_ownership_survives_lifecycle_start_crash(
     assert store.agent_children()
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     assert child.agent_lifecycle() is None
+    child.close()
 
     monkeypatch.undo()
     resumed = ConversationStore(tmp_path, session_id=store.session_id)
-    await AgentLoop(
+    resumed_loop = AgentLoop(
         FakeBackend([]), resumed, max_turns=1, skill_catalog=SkillCatalog.empty()
-    ).activate()
-    assert not resumed.agent_children()
-    assert (
-        ConversationStore(store.session_dir / "agents", session_id="1").agent_canceled()
-        is not None
     )
+    await resumed_loop.activate()
+    assert not resumed.agent_children()
+    canceled_child = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert canceled_child.agent_canceled() is not None
+    canceled_child.close()
+    await resumed_loop.close()
+    resumed.close()
+    await loop.close()
+    store.close()
 
 
 async def _collect(events):
