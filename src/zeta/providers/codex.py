@@ -297,6 +297,7 @@ class CodexBackend(CompletionBackend):
         StreamDiagnostics.record_retry_exhausted(
             self.diagnostics_path,
             error,
+            provider="codex",
             retries=retries,
         )
 
@@ -411,7 +412,7 @@ async def _decode_response(
         raise CodexStreamError("Codex stream ended before response completion")
     if diagnostics_path is not None and reassembly.mismatches:
         StreamDiagnostics.record_reassembly_mismatches(
-            diagnostics_path, count=reassembly.mismatches
+            diagnostics_path, provider="codex", count=reassembly.mismatches
         )
 
 

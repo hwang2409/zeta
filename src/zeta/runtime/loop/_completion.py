@@ -329,7 +329,9 @@ class ProviderAttemptState:
         event_data: Mapping[str, Any],
     ) -> RetryPlan | None:
         if budget is None:
-            StreamDiagnostics.record_failure_decision(source, will_retry=False)
+            StreamDiagnostics.record_failure_decision(
+                source, provider="codex", will_retry=False
+            )
             return None
         reason = self._retry_block_reason(
             reset_supported=reset_supported,
@@ -339,14 +341,20 @@ class ProviderAttemptState:
             budget.records.append(
                 {"decision": "skipped-after-output", "reason": reason}
             )
-            StreamDiagnostics.record_failure_decision(source, will_retry=False)
+            StreamDiagnostics.record_failure_decision(
+                source, provider="codex", will_retry=False
+            )
             return None
         if not self.can_retry:
-            StreamDiagnostics.record_failure_decision(source, will_retry=False)
+            StreamDiagnostics.record_failure_decision(
+                source, provider="codex", will_retry=False
+            )
             return None
         plan = budget.plan(source, owner="loop", event_data=event_data)
         if plan is None:
-            StreamDiagnostics.record_failure_decision(source, will_retry=False)
+            StreamDiagnostics.record_failure_decision(
+                source, provider="codex", will_retry=False
+            )
         return plan
 
 
@@ -394,10 +402,14 @@ async def wait_for_provider_retry(
 
     if abort_signal is None:
         await asyncio.sleep(delay)
-        StreamDiagnostics.record_failure_decision(source, will_retry=True)
+        StreamDiagnostics.record_failure_decision(
+            source, provider="codex", will_retry=True
+        )
         return True
     if abort_signal.is_set():
-        StreamDiagnostics.record_failure_decision(source, will_retry=False)
+        StreamDiagnostics.record_failure_decision(
+            source, provider="codex", will_retry=False
+        )
         return False
     sleep_task = asyncio.create_task(asyncio.sleep(delay))
     abort_task = asyncio.create_task(abort_signal.wait())
@@ -406,7 +418,9 @@ async def wait_for_provider_retry(
             {sleep_task, abort_task}, return_when=asyncio.FIRST_COMPLETED
         )
         will_retry = sleep_task in done and not abort_signal.is_set()
-        StreamDiagnostics.record_failure_decision(source, will_retry=will_retry)
+        StreamDiagnostics.record_failure_decision(
+            source, provider="codex", will_retry=will_retry
+        )
         return will_retry
     finally:
         for task in (sleep_task, abort_task):

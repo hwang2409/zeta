@@ -559,6 +559,7 @@ class AnthropicBackend(CompletionBackend):
         StreamDiagnostics.record_retry_exhausted(
             self.diagnostics_path,
             error,
+            provider="claude",
             retries=retries,
         )
 
@@ -586,6 +587,7 @@ async def _decode_response(
     diagnostics = (
         StreamDiagnostics(
             diagnostics_path,
+            provider="claude",
             headers=getattr(response, "headers", {}),
             model=model,
             started_at=started_at,
