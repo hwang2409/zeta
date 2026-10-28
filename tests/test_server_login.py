@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
+from tests.support.login import block_loop_until_publication_decision_expires
 from tests.test_server import _close, _connect, _request
 from zeta.accounts import AccountStore
 from zeta.core import login_flow
@@ -261,7 +262,9 @@ async def test_serve_login_decision_expiry_reports_failure_and_releases_locks(
     expected = OAuthTokens("access", "refresh", 4_000_000_000)
     captured = {}
     loop = asyncio.get_running_loop()
-    loop_blocked = threading.Event()
+    block_loop, loop_blocked = block_loop_until_publication_decision_expires(
+        monkeypatch, loop
+    )
 
     def build(state, _challenge, redirect):
         captured.update(state=state, redirect=redirect)
@@ -277,10 +280,6 @@ async def test_serve_login_decision_expiry_reports_failure_and_releases_locks(
         exchange_authorization_code=exchange,
     )
     real_save = provider.credential_store.save
-
-    def block_loop() -> None:
-        loop_blocked.set()
-        threading.Event().wait(0.15)
 
     def observed_save(*args, **kwargs):
         loop.call_soon_threadsafe(block_loop)
