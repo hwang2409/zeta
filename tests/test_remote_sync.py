@@ -571,7 +571,7 @@ def test_opposite_direction_memory_syncs_do_not_deadlock(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
-    "temporary_suffix", ["6034", f"zeta-atomic-{uuid.uuid4().hex}"]
+    "temporary_suffix", ["6034", f"zeta-atomic-{'0' * 32}"]
 )
 def test_project_snapshot_ignores_disappearing_atomic_temporary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, temporary_suffix: str
