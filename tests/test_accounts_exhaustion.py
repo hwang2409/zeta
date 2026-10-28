@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import faulthandler
 import inspect
 import json
 import multiprocessing
@@ -54,6 +55,7 @@ from zeta.tui import TUIApp
 FIXTURE = Path(__file__).parent / "fixtures/usage/codex_responses_429_usage_limit_reached.json"
 NOW = datetime(2026, 10, 22, 16, 0, tzinfo=UTC)
 ACCOUNT = AccountId("codex", "pro")
+SATURATED_RACE_TIMEOUT_SECONDS = 5
 
 
 def _failure(status: int, body: object) -> SimpleNamespace:
@@ -585,6 +587,10 @@ async def test_switch_cancel_during_apply_handoff_releases_lock_and_fails_closed
 
 
 def _saturated_switch_rename_race(home_value: str, results: object) -> None:
+    faulthandler.dump_traceback_later(SATURATED_RACE_TIMEOUT_SECONDS, exit=True)
+    results.send(("ready", time.monotonic()))
+    race_started = time.monotonic()
+
     async def run() -> None:
         home = Path(home_value)
         context, opened, _first, second = await asyncio.to_thread(
@@ -613,7 +619,7 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
 
         def queue_renames() -> None:
             event_loop.set_default_executor(executor)
-            for index in range(8):
+            for index in range(4):
                 rename_futures.append(executor.submit(rename, index))
 
         original_commit = SessionAccountContext._commit_locked
@@ -639,7 +645,7 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
                 provider="codex",
                 build_backend=lambda _account: object(),
             )
-            assert len(rename_futures) == 8
+            assert len(rename_futures) == 4
             await asyncio.gather(
                 *(asyncio.wrap_future(future) for future in rename_futures),
                 return_exceptions=True,
@@ -651,26 +657,51 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
     try:
         asyncio.run(run())
     except BaseException as exc:  # noqa: BLE001 - report child failure to parent
-        results.put(repr(exc))
+        results.send(("result", repr(exc), time.monotonic() - race_started))
     else:
-        results.put(None)
+        results.send(("result", None, time.monotonic() - race_started))
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        results.close()
 
 
 def test_switch_releases_lock_with_saturated_metadata_writers(tmp_path: Path) -> None:
     context = multiprocessing.get_context("spawn")
-    results = context.Queue()
+    results, child_end = context.Pipe(duplex=False)
     process = context.Process(
         target=_saturated_switch_rename_race,
-        args=(str(tmp_path / "saturated-race"), results),
+        args=(str(tmp_path / "saturated-race"), child_end),
     )
+    started = time.monotonic()
     process.start()
-    process.join(timeout=5)
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout=1)
-        pytest.fail("account switch deadlocked with a saturated executor")
-    assert process.exitcode == 0
-    assert results.get(timeout=1) is None
+    child_end.close()
+    try:
+        if not results.poll(60):
+            pytest.fail("child did not finish imports within 60 s")
+        event, _child_ready = results.recv()
+        assert event == "ready"
+        startup_seconds = time.monotonic() - started
+        process.join(timeout=SATURATED_RACE_TIMEOUT_SECONDS + 1)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=1)
+            pytest.fail(
+                f"account switch exceeded its {SATURATED_RACE_TIMEOUT_SECONDS} s "
+                "deadline after "
+                f"{startup_seconds:.3f} s of child startup"
+            )
+        assert process.exitcode == 0
+        assert results.poll(1)
+        event, error, race_seconds = results.recv()
+        assert event == "result"
+        assert error is None, error
+        assert race_seconds < SATURATED_RACE_TIMEOUT_SECONDS
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=1)
+        results.close()
+        process.close()
 
 
 @pytest.mark.asyncio

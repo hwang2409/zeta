@@ -701,6 +701,7 @@ class BlockingThenCaptureBackend:
     def __init__(self) -> None:
         self.calls: list[list[Message]] = []
         self.started = asyncio.Event()
+        self.second_started = asyncio.Event()
 
     async def complete(self, messages, tool_schemas):
         del tool_schemas
@@ -708,6 +709,8 @@ class BlockingThenCaptureBackend:
         if len(self.calls) == 1:
             self.started.set()
             await asyncio.Event().wait()
+        elif len(self.calls) == 2:
+            self.second_started.set()
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
@@ -5994,7 +5997,7 @@ async def test_immediate_foreground_aborts_keep_one_notification_retry(
         await _frames_until_event(reader, "agent_end")
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(backend.second_started.wait(), TIMEOUT)
         assert len(backend.calls) == 2
         assert server.runtime.loop.schedule_notification_turn() is False
     finally:
