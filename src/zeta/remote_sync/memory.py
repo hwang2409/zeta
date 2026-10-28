@@ -544,6 +544,8 @@ def _publish_memory_snapshot(
                     provenance=provenance,
                 )
             for relative, payload in side_file_payloads:
+                if relative.parent == Path("memory") and relative.name in MEMORY_FILES:
+                    continue
                 _atomic_write_file(payload, project / relative)
     except ProjectRegistryError as exc:
         raise RemoteSyncError(f"project memory changed during sync: {exc}") from exc
