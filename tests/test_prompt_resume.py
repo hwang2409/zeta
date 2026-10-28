@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import subprocess
 import sys
 import threading
@@ -456,8 +457,14 @@ opened = manager.open({session_id!r})
 resume_prompt(opened.metadata, manager=manager, store=opened.store, home=home, repo_root=cwd, inbox_enabled=False, context_loader=lambda **kwargs: ProjectContext("child runtime", (), prompt_recipe="default"))
 {close}
 Path({str(ready)!r}).write_text("ready")
-while not Path({str(release)!r}).exists():
-    time.sleep(0.01)
+owner_pid = {os.getpid()}
+deadline = time.monotonic() + 120
+while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
+    try:
+        os.kill(owner_pid, 0)
+    except ProcessLookupError:
+        break
+    time.sleep(0.1)
 '''
     return subprocess.Popen([sys.executable, "-c", script], cwd=cwd)
 

@@ -31,6 +31,7 @@ import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.processes import wait_for_path_command
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
@@ -1731,16 +1732,10 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
     marker = tmp_path / "foreground-finished"
     release = tmp_path / "release-foreground"
     pid_path = tmp_path / "foreground-pid"
-    script = (
-        "import os,pathlib,time\n"
-        f"pid_path = pathlib.Path({str(pid_path)!r})\n"
-        f"release = pathlib.Path({str(release)!r})\n"
-        f"marker = pathlib.Path({str(marker)!r})\n"
-        "pid_path.write_text(str(os.getpid()))\n"
-        "while not release.exists(): time.sleep(0.01)\n"
-        "marker.write_text('done')\n"
+    command = (
+        f"echo $$ > {shlex.quote(str(pid_path))} && "
+        f"{wait_for_path_command(release)} && touch {shlex.quote(str(marker))}"
     )
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
     backend = BackgroundChildAndForegroundToolBackend(command)
     server = ZetaServer(provider="codex",
         home=tmp_path,
