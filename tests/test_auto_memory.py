@@ -11,10 +11,11 @@ from zeta.codex import CodexCredentialDriver
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import EntryReconciliationResult
 from zeta.memory.profiles import memory_profile
-from zeta.memory.reconciler import ReconciliationResponse
+from zeta.memory.reconciler import ReconciliationResponse, RequestTooLargeError
 from zeta.memory.user_authorization import MemoryMutationAuthorization
+from zeta.oauth import ProviderLoginRequiredError
 from zeta.project_memory_commands import run_memory_command
-from zeta.project_registry import ProjectRegistry
+from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 from zeta.providers.anthropic import AnthropicCredentialDriver
 
 SESSION = "a" * 32
@@ -180,6 +181,18 @@ async def test_refresh_invalid_grant_pauses_session_without_retry_or_cursor_adva
         "Reconciliation will retry when this session next starts."
     )
     assert notices == [expected_notice]
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = diagnostics.read_text(encoding="utf-8").splitlines()
+    assert len(records) == 1
+    record = json.loads(records[0])
+    assert record == {
+        "timestamp": record["timestamp"],
+        "project_id": runner.project_id,
+        "session_id": SESSION,
+        "outcome": "paused",
+        "pause_code": "login_required",
+        "provider": provider,
+    }
 
     runner.before_eviction(2, 2)
     await runner.drain()
@@ -187,6 +200,7 @@ async def test_refresh_invalid_grant_pauses_session_without_retry_or_cursor_adva
     assert calls == 1
     assert runner.last_reconciled_seq == 0
     assert len(notices) == 1
+    assert diagnostics.read_text(encoding="utf-8").splitlines() == records
     assert not runner.position_path.exists()
 
 
@@ -486,6 +500,15 @@ async def test_crash_resume_has_no_duplicate_history(tmp_path: Path) -> None:
 
     assert len(registry.memory_log(project_id)) == 1
     assert replacement.last_reconciled_seq == 2
+    diagnostics = registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = [json.loads(line) for line in diagnostics.read_text().splitlines()]
+    assert sum(
+        record["project_id"] == project_id
+        and record["seq_start"] == 1
+        and record["seq_end"] == 2
+        and record["outcome"] == "applied"
+        for record in records
+    ) == 1
 
 
 @pytest.mark.asyncio
@@ -811,7 +834,7 @@ def test_memory_export_import_is_logical_and_preserves_provenance(tmp_path: Path
         expected_digest=before.digest,
     )
 
-    assert result.published is True
+    assert result.changed is True
     assert dict(result.contents) == exported.contents
     round_trip = destination.export_memory(project.project_id)
     assert round_trip.contents == exported.contents
@@ -1249,6 +1272,190 @@ async def test_repair_aggregates_usage_into_committed_provenance(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_entry_repair_login_required_pauses_without_retry(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> ReconciliationResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ReconciliationResponse("not json", {})
+        raise ProviderLoginRequiredError("login required")
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path,
+        invoke,
+        entry_format=True,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = [
+        json.loads(line) for line in diagnostics.read_text(encoding="utf-8").splitlines()
+    ]
+    assert calls == 2
+    assert records == [
+        {
+            "timestamp": records[0]["timestamp"],
+            "project_id": runner.project_id,
+            "session_id": SESSION,
+            "outcome": "paused",
+            "pause_code": "login_required",
+            "provider": runner.config.provider,
+        }
+    ]
+    assert runner.last_failure is None
+    assert not runner.position_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_entry_repair_request_too_large_is_terminal(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> ReconciliationResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ReconciliationResponse("not json", {})
+        raise RequestTooLargeError("request too large")
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path,
+        invoke,
+        entry_format=True,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    assert calls == 2
+    assert runner.last_failure is not None
+    assert runner.last_failure.terminal is True
+    assert len(runner.terminal_receipts()) == 1
+
+
+@pytest.mark.asyncio
+async def test_first_call_request_too_large_is_terminal_not_repaired(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> ReconciliationResponse:
+        nonlocal calls
+        calls += 1
+        raise RequestTooLargeError("request too large")
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    assert calls == 1
+    assert runner.last_failure is not None
+    assert runner.last_failure.terminal is True
+
+
+@pytest.mark.asyncio
+async def test_applied_pass_writes_success_diagnostic(tmp_path: Path) -> None:
+    async def invoke(prompt: str) -> ReconciliationResponse:
+        return ReconciliationResponse(
+            _proposal(prompt), {"input_tokens": 7, "output_tokens": 3}
+        )
+
+    runner, _registry, project_id, _notices = _runner(
+        tmp_path, invoke, transcript_count=1, minimum_interval=0
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = diagnostics.read_text(encoding="utf-8").splitlines()
+    assert len(records) == 1
+    record = json.loads(records[0])
+    assert record == {
+        "timestamp": record["timestamp"],
+        "project_id": project_id,
+        "session_id": SESSION,
+        "seq_start": 1,
+        "seq_end": 1,
+        "outcome": "applied",
+        "entries": 1,
+    }
+    assert "range 1-1" not in records[0]
+    assert "# Decisions" not in records[0]
+
+
+@pytest.mark.asyncio
+async def test_no_change_pass_writes_success_diagnostic(tmp_path: Path) -> None:
+    async def invoke(_prompt: str) -> ReconciliationResponse:
+        return ReconciliationResponse(
+            _no_op_proposal(_prompt), {"input_tokens": 4, "output_tokens": 1}
+        )
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path, invoke, transcript_count=1, minimum_interval=0
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    record = json.loads(diagnostics.read_text(encoding="utf-8"))
+    assert record == {
+        "timestamp": record["timestamp"],
+        "project_id": runner.project_id,
+        "session_id": SESSION,
+        "seq_start": 1,
+        "seq_end": 1,
+        "outcome": "no_change",
+    }
+
+
+@pytest.mark.asyncio
+async def test_commit_failure_writes_no_success_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, registry, project_id, _notices = _runner(
+        tmp_path, transcript_count=1, minimum_interval=0, cas_retries=1
+    )
+
+    def fail_commit(*_args, **_kwargs) -> None:
+        raise ProjectRegistryError("disk write failed")
+
+    monkeypatch.setattr(registry, "compare_and_swap_memory", fail_commit)
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = [
+        json.loads(line) for line in diagnostics.read_text(encoding="utf-8").splitlines()
+    ]
+    assert records == [
+        {
+            "timestamp": records[0]["timestamp"],
+            "project_id": project_id,
+            "session_id": SESSION,
+            "seq_start": 1,
+            "seq_end": 1,
+            "attempt_count": 1,
+            "outcome": "failed",
+        }
+    ]
+    assert runner.last_reconciled_seq == 0
+    assert registry.memory_snapshot(project_id).contents["decisions.md"] == "# Decisions\n"
+
+
+@pytest.mark.asyncio
 async def test_failure_writes_persistent_file_log_without_stderr(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1271,10 +1478,55 @@ async def test_failure_writes_persistent_file_log_without_stderr(
     records = diagnostics.read_text(encoding="utf-8").splitlines()
     assert len(records) == 1
     record = json.loads(records[0])
-    assert record["validation_summary"] == "reconciler output is not valid JSON"
-    assert record["usage"] == {"input_tokens": 4, "output_tokens": 2}
-    assert record["attempt_count"] == 1
+    assert record == {
+        "timestamp": record["timestamp"],
+        "project_id": runner.project_id,
+        "session_id": SESSION,
+        "seq_start": 1,
+        "seq_end": 1,
+        "attempt_count": 1,
+        "outcome": "failed",
+    }
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+async def test_health_log_never_contains_transcript_or_model_text(
+    tmp_path: Path, fails: bool
+) -> None:
+    private_literal = "PRIVATE_HEALTH_LOG_LITERAL_7db92"
+
+    async def invoke(prompt: str) -> ReconciliationResponse:
+        if fails:
+            output = json.dumps({"operations": [{"op": private_literal}]})
+        else:
+            proposal = json.loads(_proposal(prompt))
+            proposal["changes"][0]["content"] = f"# Decisions\n\n{private_literal}\n"
+            output = json.dumps(proposal)
+        return ReconciliationResponse(output, {"input_tokens": 2, "output_tokens": 1})
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+        entry_format=fails,
+    )
+    transcript_path = runner.session_dir / "conversation.jsonl"
+    transcript = transcript_path.read_text(encoding="utf-8").replace(
+        "fact 1", f"remember `{private_literal}`"
+    )
+    transcript_path.write_text(transcript, encoding="utf-8")
+
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    contents = diagnostics.read_text(encoding="utf-8")
+    assert private_literal not in contents
+    assert json.loads(contents)["outcome"] == ("failed" if fails else "applied")
 
 
 @pytest.mark.asyncio
@@ -1551,6 +1803,7 @@ async def test_delivery_only_range_advances_cursor_without_provider(tmp_path: Pa
     assert position["early_trigger_seq"] == 2
     assert position["transcript_bytes"] == path.stat().st_size
     assert position["transcript_tokens"] > 0
+    assert not runner.state.diagnostics_path.exists()
 
     replacement = AutoMemoryReconciler(
         registry=registry,

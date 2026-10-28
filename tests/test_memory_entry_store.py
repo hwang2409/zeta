@@ -285,8 +285,8 @@ def test_reconciliation_key_deduplicates_entry_transaction(tmp_path: Path) -> No
         reconciliation_key=key,
     )
 
-    assert first.published is True
-    assert repeated.published is False
+    assert first.changed is True
+    assert repeated.changed is False
     assert repeated.version == first.version
     assert repeated.state == first.state
     assert len(repeated.state.entries) == 1

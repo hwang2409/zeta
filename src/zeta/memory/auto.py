@@ -29,6 +29,7 @@ from .profiles import early_update_debounce_seconds, early_update_max_wait_secon
 from .reconciler import (
     ReconciliationError,
     ReconciliationResponse,
+    RequestTooLargeError,
     Transcript,
     parse_proposal,
     prepare_request,
@@ -397,6 +398,11 @@ class AutoMemoryReconciler:
                     await self._reconcile_range(item)
                     self._conflict_retries = 0
                 except ProviderLoginRequiredError:
+                    await asyncio.to_thread(
+                        self.state.record_pause,
+                        provider=self.config.provider,
+                        occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                    )
                     self._pause_for_login()
                     return
                 except _ConcurrentMemoryUpdate:
@@ -501,7 +507,7 @@ class AutoMemoryReconciler:
                 continue
             raw_transcript = Transcript(self.session_id, tuple(rows))
             first_seq = int(raw_transcript.rows[0]["seq"])
-            changed: tuple[str, ...] = ()
+            entries = 0
             selected_start = first_seq
             selected_end = first_seq
             failure: Exception | None = None
@@ -534,8 +540,8 @@ class AutoMemoryReconciler:
                         selected_start = entry_result.seq_start
                         selected_end = entry_result.seq_end
                         usage = dict(entry_result.usage)
-                        changed = entry_result.changed_entry_ids
-                        if entry_result.rejected_groups and not changed:
+                        entries = len(entry_result.changed_entry_ids)
+                        if entry_result.rejected_groups and not entries:
                             reasons = Counter(
                                 group.split(": ", 1)[1][:240]
                                 if ": " in group
@@ -578,6 +584,8 @@ class AutoMemoryReconciler:
                             transcript=request.transcript,
                             as_of=today,
                         )
+                    except RequestTooLargeError:
+                        raise
                     except ReconciliationError as first_error:
                         repair_prompt = self._repair_prompt(request.prompt, first_error)
                         raw_text, repair_usage = await self._invoke_request(
@@ -604,13 +612,14 @@ class AutoMemoryReconciler:
                         "usage": usage,
                     }
                     try:
-                        await asyncio.to_thread(
+                        result = await asyncio.to_thread(
                             self.registry.compare_and_swap_memory,
                             self.project_id,
                             expected_digest=proposal.base_digest,
                             updates=updates,
                             provenance=provenance,
                         )
+                        entries = len(updates) if result.changed else 0
                     except ProjectRegistryError as exc:
                         if "digest mismatch" in str(exc):
                             if attempt + 1 < self.config.cas_retries:
@@ -624,10 +633,7 @@ class AutoMemoryReconciler:
                     raise
                 except Exception as unit_error:  # noqa: BLE001 - durable failure receipt
                     failure = unit_error
-                    terminal_failure = (
-                        isinstance(unit_error, ReconciliationError)
-                        and str(unit_error) == "user row exceeds the request limit"
-                    )
+                    terminal_failure = isinstance(unit_error, RequestTooLargeError)
                     break
             else:
                 raise _ConcurrentMemoryUpdate
@@ -672,6 +678,7 @@ class AutoMemoryReconciler:
                             end_offset=end_offset,
                             end_tokens=end_tokens,
                             usage=usage,
+                            entries=entries,
                         )
                     )
                 else:
@@ -682,6 +689,9 @@ class AutoMemoryReconciler:
                         reason=reason,
                         end_offset=end_offset,
                         end_tokens=end_tokens,
+                        usage=usage,
+                        entries=entries,
+                        occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
                     )
             cursor = selected_end + 1
 

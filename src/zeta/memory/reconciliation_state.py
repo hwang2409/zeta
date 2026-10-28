@@ -23,7 +23,6 @@ MAX_SCHEDULED_ATTEMPTS = 3
 _MAX_RECENT_TERMINAL_RECEIPTS = 100
 _MAX_RECEIPT_ARCHIVE_BYTES = 4 * 1024 * 1024
 
-
 @dataclass(frozen=True, slots=True)
 class ReconciliationFailure:
     """The last sanitized reconciliation failure shown in session status."""
@@ -75,6 +74,7 @@ class ReconciliationOutcome:
     end_offset: int
     end_tokens: int
     usage: Mapping[str, int]
+    entries: int | None = None
     validation_summary: str | None = None
     terminal: bool = False
 
@@ -231,7 +231,7 @@ class ReconciliationState:
         )
         self._value["last_failure"] = self._failure_dict(failure)
         self._publish(reason)
-        self._write_diagnostic(failure, key, attempt_count, aggregated_usage)
+        self._write_diagnostic(failure, attempt_count)
         return failure
 
     def record_success(
@@ -242,6 +242,9 @@ class ReconciliationState:
         reason: str,
         end_offset: int,
         end_tokens: int,
+        usage: Mapping[str, int] | None = None,
+        entries: int = 0,
+        occurred_at: str | None = None,
     ) -> None:
         key = self.reconciliation_key(seq_start, seq_end)
 
@@ -269,6 +272,27 @@ class ReconciliationState:
             }
         )
         self._publish(reason)
+        if usage is not None and occurred_at is not None:
+            self._write_success_diagnostic(
+                seq_start=seq_start,
+                seq_end=seq_end,
+                entries=entries,
+                occurred_at=occurred_at,
+            )
+
+    def record_pause(self, *, provider: str, occurred_at: str) -> None:
+        """Publish one content-free login-required pause health row."""
+        write_stream_diagnostic(
+            self.diagnostics_path,
+            {
+                "timestamp": occurred_at,
+                "project_id": self.project_id,
+                "session_id": self.session_id,
+                "outcome": "paused",
+                "pause_code": "login_required",
+                "provider": provider,
+            },
+        )
 
     def record_retry_outcomes(
         self,
@@ -303,7 +327,8 @@ class ReconciliationState:
         self._remove_archived_receipt(key)
 
         failures: list[ReconciliationFailure] = []
-        diagnostics: list[tuple[ReconciliationFailure, str, int, dict[str, int]]] = []
+        diagnostics: list[tuple[ReconciliationFailure, int]] = []
+        successes: list[ReconciliationOutcome] = []
         for outcome in outcomes:
             if outcome.validation_summary is None:
                 self._complete_unit(
@@ -314,6 +339,8 @@ class ReconciliationState:
                         "end_tokens": outcome.end_tokens,
                     }
                 )
+                if outcome.entries is not None:
+                    successes.append(outcome)
                 continue
 
             outcome_key = (
@@ -365,14 +392,13 @@ class ReconciliationState:
                 terminal=terminal,
             )
             failures.append(failure)
-            diagnostics.append((failure, outcome_key, attempt_count, usage))
+            diagnostics.append((failure, attempt_count))
 
         if failures:
             self._value["last_failure"] = self._failure_dict(failures[-1])
         self._archive_old_receipts()
         self._publish(reason)
-        for failure, outcome_key, attempt_count, usage in diagnostics:
-            self._write_diagnostic(failure, outcome_key, attempt_count, usage)
+        self._write_outcome_diagnostics(successes, diagnostics, occurred_at)
         return tuple(failures)
 
     def retry_terminal(self, key: str, *, now: float | None = None) -> bool:
@@ -663,29 +689,59 @@ class ReconciliationState:
         empty["last_failure"] = value.get("last_failure")
         return empty
 
+    def _write_outcome_diagnostics(
+        self,
+        successes: list[ReconciliationOutcome],
+        failures: list[tuple[ReconciliationFailure, int]],
+        occurred_at: str,
+    ) -> None:
+        for outcome in successes:
+            self._write_success_diagnostic(
+                seq_start=outcome.seq_start,
+                seq_end=outcome.seq_end,
+                entries=outcome.entries or 0,
+                occurred_at=occurred_at,
+            )
+        for failure, attempt_count in failures:
+            self._write_diagnostic(failure, attempt_count)
+
     def _write_diagnostic(
         self,
         failure: ReconciliationFailure,
-        key: str,
         attempt_count: int,
-        usage: Mapping[str, int],
     ) -> None:
         write_stream_diagnostic(
             self.diagnostics_path,
             {
                 "timestamp": failure.occurred_at,
-                "cause": "memory_reconciliation_failure",
                 "project_id": self.project_id,
                 "session_id": self.session_id,
-                "reconciliation_key": key,
                 "seq_start": failure.seq_start,
                 "seq_end": failure.seq_end,
                 "attempt_count": attempt_count,
-                "terminal": failure.terminal,
-                "validation_summary": failure.message,
-                "usage": self._valid_usage(usage),
+                "outcome": "failed",
             },
         )
+
+    def _write_success_diagnostic(
+        self,
+        *,
+        seq_start: int,
+        seq_end: int,
+        entries: int,
+        occurred_at: str,
+    ) -> None:
+        record: dict[str, object] = {
+            "timestamp": occurred_at,
+            "project_id": self.project_id,
+            "session_id": self.session_id,
+            "seq_start": seq_start,
+            "seq_end": seq_end,
+            "outcome": "applied" if entries else "no_change",
+        }
+        if entries:
+            record["entries"] = entries
+        write_stream_diagnostic(self.diagnostics_path, record)
 
     @staticmethod
     def _sanitize_summary(message: str) -> str:

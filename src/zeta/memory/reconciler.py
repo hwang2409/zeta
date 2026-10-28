@@ -112,6 +112,10 @@ class ReconciliationError(ValueError):
     """A model proposal or transcript cannot be trusted."""
 
 
+class RequestTooLargeError(ReconciliationError):
+    """A user-authored row cannot fit in one reconciliation request."""
+
+
 @dataclass(frozen=True, slots=True)
 class SourceRange:
     session_id: str
@@ -535,7 +539,7 @@ def prepare_request(
         if type(seq) is not int:
             raise ReconciliationError("oversized transcript row has no sequence")
         if _is_user_authored_row(safe_row):
-            raise ReconciliationError("user row exceeds the request limit")
+            raise RequestTooLargeError("user row exceeds the request limit")
         if not _is_lossy_generated_row(safe_row):
             raise ReconciliationError(
                 "oversized non-generated transcript row requires lossless handling"

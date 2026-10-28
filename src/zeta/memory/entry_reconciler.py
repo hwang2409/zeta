@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from zeta.oauth import ProviderLoginRequiredError
 from zeta.project_errors import ProjectRegistryError
 from zeta.providers.retry_policy import ProviderRetryBudget, use_retry_budget
 
@@ -44,6 +45,7 @@ from .reconciler import (
     PreparedRequest,
     ReconciliationError,
     ReconciliationResponse,
+    RequestTooLargeError,
     Transcript,
     _is_user_authored_row,
     _sanitized,
@@ -778,6 +780,8 @@ async def reconcile_entry_range(
                 if repair_truncated:
                     raise _ProposalError(("response exceeds 32768 bytes",))
                 parsed = _parse(repaired, snapshot.state, request.transcript, now)
+            except (ProviderLoginRequiredError, RequestTooLargeError):
+                raise
             except Exception as exc:
                 raise EntryReconciliationFailure(str(exc), usage) from exc
         operations, rejected = _select_groups(
@@ -809,12 +813,16 @@ async def reconcile_entry_range(
             if "digest mismatch" in str(exc) and attempt + 1 < cas_retries:
                 continue
             raise EntryReconciliationFailure(str(exc), usage) from exc
-        changed = tuple(
-            dict.fromkeys(
-                entry_id
-                for receipt in result.receipts
-                for entry_id in (*receipt.target_ids, *receipt.result_ids)
+        changed = (
+            tuple(
+                dict.fromkeys(
+                    entry_id
+                    for receipt in result.receipts
+                    for entry_id in (*receipt.target_ids, *receipt.result_ids)
+                )
             )
+            if result.changed
+            else ()
         )
         return EntryReconciliationResult(
             changed, rejected, usage, selected_start, selected_end, key

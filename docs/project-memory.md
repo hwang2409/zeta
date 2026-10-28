@@ -81,6 +81,34 @@ idle_minutes = 10
 
 Use `--no-auto-memory` or `--auto-memory` for one session.
 
+Each model-backed pass appends a content-free health record to
+`<ZETA_HOME>/logs/memory-reconciliation.jsonl` after its memory decision and
+cursor are durable. The row shapes are:
+
+- `applied`: `timestamp`, `project_id`, `session_id`, `seq_start`, `seq_end`,
+  `outcome`, and `entries`.
+- `no_change`: the same fields except `entries`.
+- `failed`: the `no_change` fields plus `attempt_count`.
+- `paused`: `timestamp`, `project_id`, `session_id`, `outcome`, `pause_code`,
+  and `provider`.
+
+An authoritative commit that changed memory writes at most one `applied` row
+for its reconciliation key, including after crash recovery. Rows are best
+effort: a crash after the cursor commit and before the append, or a failed log
+write, can lose one row. A watchdog should treat a recent row of any outcome
+as evidence that reconciliation runs, not count rows. A login-required
+pause writes one `paused` row per process when it first observes the pause; a
+restart writes a new one. Its fixed pause code is `login_required`. Detailed
+failure text remains only in the session-private `memory-reconcile.json`,
+`memory-reconcile-errors.jsonl`, and `memory-reconcile-receipts.jsonl` files,
+all with mode `0600`.
+
+The shared diagnostics writer rotates the health file at 1 MiB and keeps one
+previous file. The guaranteed look-back after rotation is about one full file,
+or roughly 2,900-3,000 ordinary rows. A watchdog's "last success within N
+hours" check therefore holds only when the home writes fewer than that many
+rows in N hours. Cursor-only ranges with no model call are not logged.
+
 ## Review and commands
 
 Entry commands use entry IDs, not mirror filenames:

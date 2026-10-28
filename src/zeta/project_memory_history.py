@@ -64,7 +64,7 @@ class MemoryCASResult:
     """The authoritative snapshot and whether this call published it."""
 
     contents: list[tuple[str, str]]
-    published: bool
+    changed: bool
     version: str
 
 
