@@ -39,13 +39,16 @@ _MIRROR_TEMPORARY = re.compile(
 )
 _ATOMIC_TEMPORARY = re.compile(r"^\..+\.zeta-atomic-[0-9a-f]{32}\.tmp$")
 _LEGACY_SYNC_TEMPORARY = re.compile(r"^\..+\.json\.[0-9]+\.tmp$")
-_EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
 _MAX_HISTORY = 128
 _MAX_FORMAT_TWO_STATE_SIZE = 8 * 1024 * 1024
 _MAX_MIGRATED_ENTRY_BYTES = 4 * 1024
-_PROJECT_DIGEST_PREFIX = "tree-v2:"
-_TREE_DIGEST_DOMAIN = b"zeta-project-tree-v2\0"
+_PROJECT_DIGEST_PREFIX = "tree-v3:"
+_TREE_DIGEST_DOMAIN = b"zeta-project-tree-v3\0"
+MAX_SYNC_STATE_SIZE = 512 * 1024
+_MAX_MEMORY_MIRROR_SIZE = project_schema.MAX_MEMORY_FILE_SIZE + 1024
+_MAX_SIDE_FILE_COUNT = 1024
+_MAX_SIDE_FILE_TOTAL_SIZE = project_schema.MAX_RECORD_SIZE
 _SNAPSHOT_PATH_CHARACTERS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
 )
@@ -150,6 +153,7 @@ def publish_local_project(
     """Validate and CAS-publish a staged project without replacing an existing one."""
 
     _validate_snapshot(snapshot, project_id)
+    side_file_payloads = validated_side_file_payloads(snapshot)
     projects = home / "projects"
     projects.mkdir(parents=True, exist_ok=True, mode=0o700)
     project = projects / project_id
@@ -175,7 +179,7 @@ def publish_local_project(
         if not project.is_dir() or project.is_symlink():
             raise ProjectPublicationError(f"project {project_id} was not found")
         publish_version(project, snapshot)
-        _publish_side_files(project, snapshot)
+        _publish_side_files(project, snapshot, side_file_payloads)
 
 
 def publish_version(project: Path, snapshot: Path) -> None:
@@ -311,25 +315,127 @@ def _is_atomic_temporary(root: Path, path: Path) -> bool:
     )
 
 
+def synchronized_payload_paths(root: Path) -> tuple[Path, ...]:
+    """Return the one canonical regular-file payload carried by project sync."""
+
+    for name in ("memory", "memory-versions", "history", "sync"):
+        directory = root / name
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            raise ProjectPublicationError(f"project snapshot member is unsafe: {name}")
+    has_version_store = (root / "memory-current.json").is_file()
+    paths: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        parts = relative.parts
+        if (
+            _is_atomic_temporary(root, path)
+            or not path.is_file()
+            or _is_memory_mirror_temporary(root, path)
+            or not _is_synchronized_payload_path(parts, has_version_store)
+        ):
+            continue
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ProjectPublicationError(
+                f"project snapshot member is unsafe: {relative.as_posix()}"
+            )
+        paths.append(path)
+    return tuple(paths)
+
+
+def _is_synchronized_payload_path(
+    parts: tuple[str, ...], has_version_store: bool
+) -> bool:
+    if parts in {("project.json",), ("memory-current.json",)}:
+        return True
+    if not parts:
+        return False
+    if parts[0] in {"memory-versions", "history"} and len(parts) > 1:
+        return True
+    if parts[0] == "sync" and len(parts) == 2:
+        return parts[1].endswith(".json")
+    if parts[0] != "memory" or len(parts) < 2:
+        return False
+    if parts[1] == "history" and len(parts) > 2:
+        return True
+    if len(parts) != 2:
+        return False
+    name = parts[1]
+    return any(
+        name.startswith(f"{standard}.conflict-") for standard in MEMORY_FILES
+    ) or (not has_version_store and name in MEMORY_FILES)
+
+
+def validated_side_file_payloads(snapshot: Path) -> tuple[tuple[Path, bytes], ...]:
+    """Read bounded conflict and sync payloads before a publication lock is taken."""
+
+    payload_paths = list(synchronized_payload_paths(snapshot))
+    memory = snapshot / "memory"
+    if (snapshot / "memory-current.json").is_file() and memory.is_dir():
+        payload_paths.extend(
+            path for path in sorted(memory.iterdir()) if path.name in MEMORY_FILES
+        )
+    selected: list[tuple[Path, int]] = []
+    total = 0
+    for path in payload_paths:
+        relative = path.relative_to(snapshot)
+        is_memory = relative.parent == Path("memory")
+        is_sync = relative.parent == Path("sync")
+        if not is_memory and not is_sync:
+            continue
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ProjectPublicationError(
+                f"project snapshot member is unsafe: {relative.as_posix()}"
+            )
+        size = info.st_size
+        if is_sync:
+            limit = MAX_SYNC_STATE_SIZE
+        elif relative.name in MEMORY_FILES:
+            limit = _MAX_MEMORY_MIRROR_SIZE
+        else:
+            limit = project_schema.MAX_MEMORY_FILE_SIZE
+        if size > limit:
+            raise ProjectPublicationError(
+                f"project side file is too large: {relative.as_posix()}"
+            )
+        selected.append((relative, limit))
+        total += size
+        if len(selected) > _MAX_SIDE_FILE_COUNT:
+            raise ProjectPublicationError("project snapshot has too many side files")
+        if total > _MAX_SIDE_FILE_TOTAL_SIZE:
+            raise ProjectPublicationError(
+                "project side files exceed the total size limit"
+            )
+    payloads: list[tuple[Path, bytes]] = []
+    actual_total = 0
+    for relative, limit in selected:
+        path = snapshot / relative
+        with path.open("rb") as stream:
+            payload = stream.read(limit + 1)
+        if len(payload) > limit:
+            raise ProjectPublicationError(
+                f"project side file is too large: {relative.as_posix()}"
+            )
+        actual_total += len(payload)
+        if actual_total > _MAX_SIDE_FILE_TOTAL_SIZE:
+            raise ProjectPublicationError(
+                "project side files exceed the total size limit"
+            )
+        payloads.append((relative, payload))
+    return tuple(payloads)
+
+
 def project_digest(root: Path) -> str:
     if not root.exists():
         return _MISSING
-    has_version_store = (root / "memory-current.json").is_file()
-    paths = (
-        path
-        for path in root.rglob("*")
-        if not _is_atomic_temporary(root, path)
-        and path.is_file()
-        and not _is_memory_mirror_temporary(root, path)
-        and not path.is_symlink()
-        and path.name not in _EXCLUDED_NAMES
-        and not (
-            has_version_store
-            and path.parent == root / "memory"
-            and path.name in MEMORY_FILES
-        )
+    return _PROJECT_DIGEST_PREFIX + _tree_digest(
+        root, iter(synchronized_payload_paths(root))
     )
-    return _PROJECT_DIGEST_PREFIX + _tree_digest(root, paths)
 
 
 def normalize_project_digest(reported: str, snapshot: Path) -> str:
@@ -345,6 +451,7 @@ def _validate_snapshot(snapshot: Path, project_id: str) -> None:
         raise ProjectPublicationError(
             "project snapshot path does not match its project ID"
         )
+    synchronized_payload_paths(snapshot)
     try:
         project_schema.validate_project_record(
             _read_record(snapshot / "project.json"), project_id
@@ -496,7 +603,9 @@ def _manifest_payloads(
         scalar = True
     elif isinstance(value, dict) and (
         (memory_format == 2 and set(value) == {"state"})
-        or ((memory_format == 1 or migration_source) and set(value) == set(MEMORY_FILES))
+        or (
+            (memory_format == 1 or migration_source) and set(value) == set(MEMORY_FILES)
+        )
     ):
         values = value
         scalar = False
@@ -563,9 +672,7 @@ def _validate_migration_manifest(
         raise ProjectPublicationError("migration source integrity check failed")
     if source_version is not None:
         source_manifest = _read_manifest(root, source_version)
-        source_payloads, scalar = _manifest_payloads(
-            root, source_manifest, "snapshot"
-        )
+        source_payloads, scalar = _manifest_payloads(root, source_manifest, "snapshot")
         if scalar or source_payloads != before_payloads:
             raise ProjectPublicationError("migration source version does not match")
     try:
@@ -624,29 +731,18 @@ def _copy_file(source: str, destination: str) -> str:
     return destination
 
 
-def _publish_side_files(project: Path, snapshot: Path) -> None:
+def _publish_side_files(
+    project: Path,
+    snapshot: Path,
+    side_file_payloads: tuple[tuple[Path, bytes], ...],
+) -> None:
     atomic_publish_file(
         project, "project.json", (snapshot / "project.json").read_bytes()
     )
-    for directory in ("memory", "sync"):
-        source = snapshot / directory
-        if not source.is_dir():
-            continue
-        destination = project / directory
+    for relative, payload in side_file_payloads:
+        destination = project / relative.parent
         destination.mkdir(mode=0o700, exist_ok=True)
-        for path in sorted(source.iterdir()):
-            if not path.is_file():
-                continue
-            if directory == "sync" and path.suffix != ".json":
-                continue
-            if directory == "memory" and not (
-                path.name in MEMORY_FILES
-                or any(
-                    path.name.startswith(f"{name}.conflict-") for name in MEMORY_FILES
-                )
-            ):
-                continue
-            atomic_publish_file(destination, path.name, path.read_bytes())
+        atomic_publish_file(destination, relative.name, payload)
 
 
 def _prune_versions(root: Path, retained: set[str]) -> None:

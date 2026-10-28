@@ -15,6 +15,7 @@ import sys
 import tarfile
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -540,7 +541,7 @@ def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(
     project, opened = _session(home, repo)
     opened.store.close()
     project_path = home / "projects" / project.project_id
-    (project_path / "sessions.jsonl").unlink()
+    (project_path / "transcript-index.sqlite3").write_bytes(b"derived index\n")
     sync_state = project_path / "sync" / "peer.json"
     sync_state.parent.mkdir()
     sync_state.write_text("old\n", encoding="utf-8")
@@ -552,7 +553,7 @@ def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(
         project_path, project.project_id
     )
     real_project_digest = memory_module.project_digest
-    real_atomic_copy = memory_module._atomic_copy_file
+    real_atomic_write = memory_module._atomic_write_file
     real_flock = fcntl.flock
     main_thread = threading.current_thread()
     sync_copy_ready = threading.Event()
@@ -560,14 +561,14 @@ def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(
     sync_copy_done = threading.Event()
     publication_errors: list[BaseException] = []
 
-    def pause_sync_state_copy(source: Path, destination: Path) -> None:
+    def pause_sync_state_copy(payload: bytes, destination: Path) -> None:
         if destination == sync_state:
             sync_copy_ready.set()
             assert release_sync_copy.wait(timeout=5)
-            real_atomic_copy(source, destination)
+            real_atomic_write(payload, destination)
             sync_copy_done.set()
             return
-        real_atomic_copy(source, destination)
+        real_atomic_write(payload, destination)
 
     def acquire_fetch_lock(file: object, operation: int) -> object:
         if threading.current_thread() is main_thread and operation & fcntl.LOCK_EX:
@@ -594,12 +595,15 @@ def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(
         except Exception as exc:  # noqa: BLE001 - propagate thread failures
             publication_errors.append(exc)
 
-    monkeypatch.setattr(memory_module, "_atomic_copy_file", pause_sync_state_copy)
+    monkeypatch.setattr(memory_module, "_atomic_write_file", pause_sync_state_copy)
     monkeypatch.setattr(fcntl, "flock", acquire_fetch_lock)
     monkeypatch.setattr(memory_module, "project_digest", release_copy_after_digest)
     publication_thread = threading.Thread(target=publish)
     publication_thread.start()
-    assert sync_copy_ready.wait(timeout=5)
+    if not sync_copy_ready.wait(timeout=5):
+        publication_thread.join(timeout=1)
+        assert not publication_errors, repr(publication_errors[0].__cause__)
+        pytest.fail("sync state publication did not start")
     destination = tmp_path / "snapshot"
 
     try:
@@ -617,7 +621,46 @@ def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(
     assert not publication_thread.is_alive()
     assert not publication_errors
     assert reported == real_project_digest(destination)
+    assert not (destination / "sessions.jsonl").exists()
+    assert not (destination / "transcript-index.sqlite3").exists()
     assert sync_state.read_text(encoding="utf-8") == "new\n"
+
+
+def test_oversized_side_file_is_rejected_before_target_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(home, repo)
+    opened.store.close()
+    project_path = home / "projects" / project.project_id
+    publication = tmp_path / "publication" / project.project_id
+    memory_module.copy_project_snapshot(project_path, publication)
+    publication.parent.chmod(0o700)
+    conflict = publication / "memory" / "brief.md.conflict-peer"
+    conflict.parent.mkdir(exist_ok=True)
+    conflict.write_bytes(b"x" * (MAX_MEMORY_FILE_SIZE + 1))
+    original = list(project_path.rglob("*"))
+
+    @contextmanager
+    def target_lock(_registry: ProjectRegistry, *, write: bool):
+        raise AssertionError("target lock was acquired before size validation")
+        yield
+
+    monkeypatch.setattr(ProjectRegistry, "_locked", target_lock)
+
+    with pytest.raises(RemoteSyncError, match="side file is too large"):
+        memory_module._publish_memory_snapshot(
+            project_path,
+            publication,
+            expected_export=memory_module._materialize_memory_export(
+                project_path, project.project_id
+            ),
+            provenance={"source": "test"},
+        )
+
+    assert list(project_path.rglob("*")) == original
 
 
 def test_opposite_direction_memory_syncs_do_not_deadlock(tmp_path: Path) -> None:
@@ -817,7 +860,7 @@ def test_project_digest_ignores_disappearing_memory_mirror_temporary(
         ".people.txt.0123456789abcdef0123456789abcdef.tmp",
     ],
 )
-def test_project_digest_counts_memory_files_that_are_not_mirror_temporaries(
+def test_project_digest_excludes_local_only_memory_files(
     tmp_path: Path, name: str
 ) -> None:
     project = tmp_path / "project"
@@ -826,16 +869,16 @@ def test_project_digest_counts_memory_files_that_are_not_mirror_temporaries(
     (project / "project.json").write_text("record\n", encoding="utf-8")
     before = project_digest(project)
     (memory / name).write_text("user data\n", encoding="utf-8")
-    assert project_digest(project) != before
+    assert project_digest(project) == before
 
 
-def test_project_digest_includes_user_dot_temporary(tmp_path: Path) -> None:
+def test_project_digest_excludes_local_user_file(tmp_path: Path) -> None:
     snapshot, _project_id = _format_two_project_snapshot(tmp_path)
     before = project_digest(snapshot)
 
     (snapshot / ".user-notes.tmp").write_text("keep me\n", encoding="utf-8")
 
-    assert project_digest(snapshot) != before
+    assert project_digest(snapshot) == before
 
 
 def test_project_transfer_includes_user_dot_temporary(tmp_path: Path) -> None:
@@ -853,9 +896,11 @@ def test_project_tree_digests_frame_file_boundaries(tmp_path: Path) -> None:
     second = tmp_path / "second"
     first.mkdir()
     second.mkdir()
-    (first / "x").write_bytes(b"y\0Z")
-    (second / "x").write_bytes(b"")
-    (second / "y").write_bytes(b"Z")
+    (first / "history").mkdir()
+    (second / "history").mkdir()
+    (first / "history" / "x").write_bytes(b"history/y\0Z")
+    (second / "history" / "x").write_bytes(b"")
+    (second / "history" / "y").write_bytes(b"Z")
 
     assert _legacy_project_digest(first) == _legacy_project_digest(second)
     assert transfer_digest(first) != transfer_digest(second)
@@ -869,7 +914,9 @@ def test_project_digest_streams_large_files(
 
     project = tmp_path / "p_test"
     project.mkdir()
-    large = project / "history.jsonl"
+    history = project / "history"
+    history.mkdir()
+    large = history / "events.jsonl"
     large.write_bytes(b"x" * (2 * 1024 * 1024))
     original_read_bytes = Path.read_bytes
 
@@ -880,7 +927,7 @@ def test_project_digest_streams_large_files(
 
     monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
 
-    assert len(project_digest(project).removeprefix("tree-v2:")) == 64
+    assert len(project_digest(project).removeprefix("tree-v3:")) == 64
 
 
 def test_resolve_project_memory_rejects_invalid_accept(tmp_path: Path) -> None:
@@ -1185,8 +1232,7 @@ def test_prepare_project_transfer_rejects_non_ascii_path(
         prepare_project_transfer(snapshot)
     with pytest.raises(ProjectPublicationError, match="snapshot path"):
         transfer_digest(snapshot)
-    with pytest.raises(ProjectPublicationError, match="snapshot path"):
-        memory_module.project_digest(snapshot)
+    assert memory_module.project_digest(snapshot).startswith("tree-v3:")
 
 
 def _add_archive_file(prepared: PreparedTransfer, name: str) -> PreparedTransfer:
@@ -1390,9 +1436,9 @@ def test_legacy_project_digest_is_upgraded_at_sync_entry(tmp_path: Path) -> None
         ) -> None:
             self.published_expected = expected_digest
             if self.race:
-                (self.home / "projects" / project_id / "concurrent").write_text(
-                    "preserve me\n"
-                )
+                concurrent = self.home / "projects" / project_id / "history" / "concurrent"
+                concurrent.parent.mkdir(exist_ok=True)
+                concurrent.write_text("preserve me\n")
             super().publish_project(
                 project_id, snapshot, expected_digest=expected_digest
             )
@@ -1401,13 +1447,13 @@ def test_legacy_project_digest_is_upgraded_at_sync_entry(tmp_path: Path) -> None
     result = push_project_memory(first, transport, project_id=project.project_id)
 
     assert result.conflicts == ()
-    assert transport.published_expected.startswith("tree-v2:")
+    assert transport.published_expected.startswith("tree-v3:")
 
     transport.race = True
     with pytest.raises(RemoteSyncError, match="remote changed during transfer"):
         push_project_memory(first, transport, project_id=project.project_id)
     assert (
-        second / "projects" / project.project_id / "concurrent"
+        second / "projects" / project.project_id / "history" / "concurrent"
     ).read_text() == "preserve me\n"
 
 
