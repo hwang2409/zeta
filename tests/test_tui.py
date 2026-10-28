@@ -10852,6 +10852,136 @@ async def test_tui_close_rejects_inflight_transcript_source(
 
 
 @pytest.mark.asyncio
+async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
+    child.close()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    baseline = _fd_count()
+    navigation = app._agent_navigation
+    navigation.selected_index = 1
+    navigation.open_selected()
+    assert navigation.transcript_control._sync_task is not None
+    await navigation.transcript_control._sync_task
+    source = navigation.transcript_control._source
+    assert source is not None
+    previous = navigation.transcript_control._snapshot
+    entered = threading.Event()
+    published = threading.Event()
+    original_refresh = source.refresh
+
+    def blocked_refresh(*args, **kwargs):
+        entered.set()
+        return original_refresh(*args, **kwargs)
+
+    monkeypatch.setattr(source, "refresh", blocked_refresh)
+    agent_sync._REFRESH_LOCK.acquire()
+    try:
+        navigation.transcript_control.request_sync(source.path, published.set)
+        await wait_until(entered.is_set)
+        started = time.monotonic()
+        await asyncio.wait_for(app.close(), timeout=3)
+        assert time.monotonic() - started < 3
+        assert not source._closed
+    finally:
+        agent_sync._REFRESH_LOCK.release()
+
+    await wait_until(lambda: source._closed)
+    assert source._stores == {}
+    assert navigation.transcript_control._snapshot is previous
+    assert not published.is_set()
+    assert _fd_count() <= baseline
+
+
+@pytest.mark.asyncio
+async def test_tui_close_hands_off_blocked_todo_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
+    )
+    child.close()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    baseline = _fd_count()
+    control = app._agent_navigation._todo_control
+    control.request(child.session_dir)
+    assert control._task is not None
+    await control._task
+    source = control._source
+    assert source is not None
+    previous = control._snapshot
+    entered = threading.Event()
+    published = threading.Event()
+    original_refresh = source.refresh
+
+    def blocked_refresh():
+        entered.set()
+        return original_refresh()
+
+    monkeypatch.setattr(source, "refresh", blocked_refresh)
+    source._lock.acquire()
+    try:
+        control.request(child.session_dir, published.set)
+        await wait_until(entered.is_set)
+        started = time.monotonic()
+        await asyncio.wait_for(app.close(), timeout=3)
+        assert time.monotonic() - started < 3
+        assert not source._closed
+    finally:
+        source._lock.release()
+
+    await wait_until(lambda: source._closed)
+    assert source._store is None
+    assert control._snapshot is previous
+    assert not published.is_set()
+    assert _fd_count() <= baseline
+
+
+@pytest.mark.asyncio
+async def test_tui_close_closes_todo_when_transcript_close_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    todo_closed = False
+
+    async def fail_transcript_close(*args, **kwargs) -> None:
+        raise RuntimeError("transcript close failed")
+
+    async def close_todo(*args, **kwargs) -> None:
+        nonlocal todo_closed
+        todo_closed = True
+
+    monkeypatch.setattr(app._agent_navigation.transcript_control, "close", fail_transcript_close)
+    monkeypatch.setattr(app._agent_navigation._todo_control, "close", close_todo)
+
+    with pytest.raises(RuntimeError, match="transcript close failed"):
+        await app.close()
+
+    assert todo_closed
+
+
+@pytest.mark.asyncio
 async def test_transcript_source_close_runs_off_event_loop() -> None:
     control = AgentTranscriptControl()
     loop_thread = threading.get_ident()
