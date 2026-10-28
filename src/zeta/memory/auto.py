@@ -501,7 +501,7 @@ class AutoMemoryReconciler:
                 continue
             raw_transcript = Transcript(self.session_id, tuple(rows))
             first_seq = int(raw_transcript.rows[0]["seq"])
-            changed: tuple[str, ...] = ()
+            entries = 0
             selected_start = first_seq
             selected_end = first_seq
             failure: Exception | None = None
@@ -534,8 +534,8 @@ class AutoMemoryReconciler:
                         selected_start = entry_result.seq_start
                         selected_end = entry_result.seq_end
                         usage = dict(entry_result.usage)
-                        changed = entry_result.changed_entry_ids
-                        if entry_result.rejected_groups and not changed:
+                        entries = len(entry_result.changed_entry_ids)
+                        if entry_result.rejected_groups and not entries:
                             reasons = Counter(
                                 group.split(": ", 1)[1][:240]
                                 if ": " in group
@@ -596,6 +596,7 @@ class AutoMemoryReconciler:
                     }
                     if not updates:
                         break
+                    entries = len(updates)
                     provenance = {
                         "session_id": self.session_id,
                         "seq_start": selected_start,
@@ -672,6 +673,7 @@ class AutoMemoryReconciler:
                             end_offset=end_offset,
                             end_tokens=end_tokens,
                             usage=usage,
+                            entries=entries,
                         )
                     )
                 else:
@@ -682,6 +684,9 @@ class AutoMemoryReconciler:
                         reason=reason,
                         end_offset=end_offset,
                         end_tokens=end_tokens,
+                        usage=usage,
+                        entries=entries,
+                        occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
                     )
             cursor = selected_end + 1
 

@@ -13,7 +13,7 @@ from zeta.memory.profiles import memory_profile
 from zeta.memory.reconciler import ReconciliationResponse
 from zeta.memory.user_authorization import MemoryMutationAuthorization
 from zeta.project_memory_commands import run_memory_command
-from zeta.project_registry import ProjectRegistry
+from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 
 SESSION = "a" * 32
 
@@ -1234,6 +1234,83 @@ async def test_repair_aggregates_usage_into_committed_provenance(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_applied_pass_writes_success_diagnostic(tmp_path: Path) -> None:
+    async def invoke(prompt: str) -> ReconciliationResponse:
+        return ReconciliationResponse(
+            _proposal(prompt), {"input_tokens": 7, "output_tokens": 3}
+        )
+
+    runner, _registry, project_id, _notices = _runner(
+        tmp_path, invoke, transcript_count=1, minimum_interval=0
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = diagnostics.read_text(encoding="utf-8").splitlines()
+    assert len(records) == 1
+    record = json.loads(records[0])
+    assert record == {
+        "timestamp": record["timestamp"],
+        "project_id": project_id,
+        "session_id": SESSION,
+        "reconciliation_key": runner.state.reconciliation_key(1, 1),
+        "seq_start": 1,
+        "seq_end": 1,
+        "outcome": "applied",
+        "entries": 1,
+        "usage": {"input_tokens": 7, "output_tokens": 3},
+    }
+    assert "range 1-1" not in records[0]
+    assert "# Decisions" not in records[0]
+
+
+@pytest.mark.asyncio
+async def test_no_change_pass_writes_success_diagnostic(tmp_path: Path) -> None:
+    async def invoke(_prompt: str) -> ReconciliationResponse:
+        return ReconciliationResponse(
+            _no_op_proposal(_prompt), {"input_tokens": 4, "output_tokens": 1}
+        )
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path, invoke, transcript_count=1, minimum_interval=0
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    record = json.loads(diagnostics.read_text(encoding="utf-8"))
+    assert record["outcome"] == "no_change"
+    assert record["seq_start"] == 1
+    assert record["seq_end"] == 1
+    assert record["usage"] == {"input_tokens": 4, "output_tokens": 1}
+    assert "entries" not in record
+
+
+@pytest.mark.asyncio
+async def test_commit_failure_writes_no_success_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, registry, project_id, _notices = _runner(
+        tmp_path, transcript_count=1, minimum_interval=0, cas_retries=1
+    )
+
+    def fail_commit(*_args, **_kwargs) -> None:
+        raise ProjectRegistryError("disk write failed")
+
+    monkeypatch.setattr(registry, "compare_and_swap_memory", fail_commit)
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = [json.loads(line) for line in diagnostics.read_text(encoding="utf-8").splitlines()]
+    assert records
+    assert all(record["outcome"] == "failed" for record in records)
+    assert runner.last_reconciled_seq == 0
+    assert registry.memory_snapshot(project_id).contents["decisions.md"] == "# Decisions\n"
+
+
+@pytest.mark.asyncio
 async def test_failure_writes_persistent_file_log_without_stderr(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1257,6 +1334,7 @@ async def test_failure_writes_persistent_file_log_without_stderr(
     assert len(records) == 1
     record = json.loads(records[0])
     assert record["validation_summary"] == "reconciler output is not valid JSON"
+    assert record["outcome"] == "failed"
     assert record["usage"] == {"input_tokens": 4, "output_tokens": 2}
     assert record["attempt_count"] == 1
     assert capsys.readouterr().err == ""
@@ -1536,6 +1614,7 @@ async def test_delivery_only_range_advances_cursor_without_provider(tmp_path: Pa
     assert position["early_trigger_seq"] == 2
     assert position["transcript_bytes"] == path.stat().st_size
     assert position["transcript_tokens"] > 0
+    assert not runner.state.diagnostics_path.exists()
 
     replacement = AutoMemoryReconciler(
         registry=registry,

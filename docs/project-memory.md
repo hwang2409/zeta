@@ -81,6 +81,13 @@ idle_minutes = 10
 
 Use `--no-auto-memory` or `--auto-memory` for one session.
 
+Each model-backed pass appends a content-free health record to
+`<ZETA_HOME>/logs/memory-reconciliation.jsonl` after its memory decision and
+cursor are durable. Records report an `applied`, `no_change`, or `failed`
+outcome and token usage. The shared diagnostics writer rotates the file at 1
+MiB and keeps one previous file. Cursor-only ranges with no model call are not
+logged.
+
 ## Review and commands
 
 Entry commands use entry IDs, not mirror filenames:

@@ -75,6 +75,7 @@ class ReconciliationOutcome:
     end_offset: int
     end_tokens: int
     usage: Mapping[str, int]
+    entries: int | None = None
     validation_summary: str | None = None
     terminal: bool = False
 
@@ -242,6 +243,9 @@ class ReconciliationState:
         reason: str,
         end_offset: int,
         end_tokens: int,
+        usage: Mapping[str, int] | None = None,
+        entries: int = 0,
+        occurred_at: str | None = None,
     ) -> None:
         key = self.reconciliation_key(seq_start, seq_end)
 
@@ -269,6 +273,14 @@ class ReconciliationState:
             }
         )
         self._publish(reason)
+        if usage is not None and occurred_at is not None:
+            self._write_success_diagnostic(
+                seq_start=seq_start,
+                seq_end=seq_end,
+                entries=entries,
+                usage=usage,
+                occurred_at=occurred_at,
+            )
 
     def record_retry_outcomes(
         self,
@@ -304,6 +316,7 @@ class ReconciliationState:
 
         failures: list[ReconciliationFailure] = []
         diagnostics: list[tuple[ReconciliationFailure, str, int, dict[str, int]]] = []
+        successes: list[ReconciliationOutcome] = []
         for outcome in outcomes:
             if outcome.validation_summary is None:
                 self._complete_unit(
@@ -314,6 +327,8 @@ class ReconciliationState:
                         "end_tokens": outcome.end_tokens,
                     }
                 )
+                if outcome.entries is not None:
+                    successes.append(outcome)
                 continue
 
             outcome_key = (
@@ -371,6 +386,14 @@ class ReconciliationState:
             self._value["last_failure"] = self._failure_dict(failures[-1])
         self._archive_old_receipts()
         self._publish(reason)
+        for outcome in successes:
+            self._write_success_diagnostic(
+                seq_start=outcome.seq_start,
+                seq_end=outcome.seq_end,
+                entries=outcome.entries or 0,
+                usage=outcome.usage,
+                occurred_at=occurred_at,
+            )
         for failure, outcome_key, attempt_count, usage in diagnostics:
             self._write_diagnostic(failure, outcome_key, attempt_count, usage)
         return tuple(failures)
@@ -675,6 +698,7 @@ class ReconciliationState:
             {
                 "timestamp": failure.occurred_at,
                 "cause": "memory_reconciliation_failure",
+                "outcome": "failed",
                 "project_id": self.project_id,
                 "session_id": self.session_id,
                 "reconciliation_key": key,
@@ -686,6 +710,29 @@ class ReconciliationState:
                 "usage": self._valid_usage(usage),
             },
         )
+
+    def _write_success_diagnostic(
+        self,
+        *,
+        seq_start: int,
+        seq_end: int,
+        entries: int,
+        usage: Mapping[str, int],
+        occurred_at: str,
+    ) -> None:
+        record: dict[str, object] = {
+            "timestamp": occurred_at,
+            "project_id": self.project_id,
+            "session_id": self.session_id,
+            "reconciliation_key": self.reconciliation_key(seq_start, seq_end),
+            "seq_start": seq_start,
+            "seq_end": seq_end,
+            "outcome": "applied" if entries else "no_change",
+            "usage": self._valid_usage(usage),
+        }
+        if entries:
+            record["entries"] = entries
+        write_stream_diagnostic(self.diagnostics_path, record)
 
     @staticmethod
     def _sanitize_summary(message: str) -> str:
