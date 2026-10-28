@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
+from rich.text import Text
 
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.codex import CodexLoginRequiredError
 from zeta.config.settings import load_settings, resolve
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import OpenedSession, SessionManager
@@ -33,6 +37,7 @@ from zeta.server.server import _Client
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.transcript_search.index import TranscriptIndex
+from zeta.tui.app import TUIApp
 
 
 class _MemoryScriptBackend(CompletionBackend):
@@ -77,6 +82,19 @@ class _MemoryScriptBackend(CompletionBackend):
         )
 
 
+class _LoginRequiredBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(
+        self, messages: Sequence[Message], tools: Sequence[ToolSchema]
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tools
+        self.calls += 1
+        raise CodexLoginRequiredError("no Codex OAuth login found")
+        yield  # pragma: no cover - keep this an async iterator
+
+
 class _UnusedBackend(CompletionBackend):
     async def complete(
         self, messages: Sequence[Message], tools: Sequence[ToolSchema]
@@ -97,6 +115,47 @@ def _resolve(home: Path, *, cli_auto_memory: bool | None = None):
         cli_auto_memory=cli_auto_memory,
     default_provider="codex",
     )
+
+
+async def _login_required_composition(
+    tmp_path: Path, *, memory_notice=None
+) -> tuple[RuntimeComposition, _LoginRequiredBackend]:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    (home / "settings.toml").write_text(
+        '[memory]\nmodel = "gpt-5.6-luna"\n', encoding="utf-8"
+    )
+    config = _resolve(home)
+    manager = SessionManager(home)
+    project = manager.project_registry.create_project("demo", "scope", workspace)
+    manager.project_registry.initialize_memory(project.project_id)
+    memory_backend = _LoginRequiredBackend()
+
+    def backend_builder(provider: str, model: str | None, **kwargs: object):
+        del provider, kwargs
+        if model == config.memory_model:
+            return memory_backend, model
+        return _UnusedBackend(), model or "unused"
+
+    composition = await asyncio.to_thread(
+        compose_runtime,
+        home=home,
+        cwd=workspace,
+        manager=manager,
+        config=config,
+        provider="codex",
+        model="unused-main",
+        project_context=ProjectContext("system", ()),
+        backend_builder=backend_builder,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+        auto_project=False,
+        project_id=project.project_id,
+        memory_notice=memory_notice,
+    )
+    return composition, memory_backend
 
 
 def test_memory_settings_defaults_and_overrides(tmp_path: Path) -> None:
@@ -253,6 +312,84 @@ async def test_composed_runtime_reconciles_real_persisted_trigger_and_notices(
         assert notices == []
     finally:
         await composition.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_login_required_notice_renders_in_tui(tmp_path: Path) -> None:
+    composition, memory_backend = await _login_required_composition(tmp_path)
+    output = StringIO()
+    app = TUIApp(
+        composition.loop,
+        provider="codex",
+        model="unused-main",
+        console=Console(file=output, force_terminal=False),
+    )
+    reconciler = composition.memory_reconciler
+    assert reconciler is not None
+    reconciler.notice = app._print_system
+    try:
+        message = composition.opened.store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("durable fact")]),
+                MessageOrigin.USER,
+            )
+        )
+        reconciler.before_eviction(message.seq, message.seq)
+        await reconciler.drain()
+
+        rendered = " ".join(Text.from_ansi(output.getvalue()).plain.split())
+        assert "automatic project-memory reconciliation paused" in rendered
+        assert "model gpt-5.6-luna uses provider codex" in rendered
+        assert "zeta accounts login codex <name>" in rendered
+        assert "[memory] model" in rendered
+        assert "[memory] auto = false" in rendered
+        assert memory_backend.calls == 1
+    finally:
+        await app.close()
+
+
+@pytest.mark.asyncio
+async def test_login_required_notice_is_delivered_to_serve_client(
+    tmp_path: Path,
+) -> None:
+    composition, memory_backend = await _login_required_composition(tmp_path)
+    client = object.__new__(_Client)
+    client._closed = False
+    client.features = frozenset({"memory_updated"})
+    events: list[tuple[str, str | None, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None = None, **fields: object
+    ) -> None:
+        events.append((event, session_id, fields))
+
+    client._notify = notify
+    reconciler = composition.memory_reconciler
+    assert reconciler is not None
+    reconciler.notice = lambda message: client._publish_memory_notice(
+        composition.opened.metadata.session_id, message
+    )
+    try:
+        message = composition.opened.store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("durable fact")]),
+                MessageOrigin.USER,
+            )
+        )
+        reconciler.before_eviction(message.seq, message.seq)
+        await reconciler.drain()
+        await asyncio.sleep(0)
+
+        assert memory_backend.calls == 1
+        assert len(events) == 1
+        event, session_id, fields = events[0]
+        assert event == "memory_updated"
+        assert session_id == composition.opened.metadata.session_id
+        assert "model gpt-5.6-luna uses provider codex" in fields["message"]
+        assert "zeta accounts login codex <name>" in fields["message"]
+    finally:
+        await composition.loop.close()
+        composition.opened.store.close()
 
 
 async def test_serve_memory_event_requires_negotiated_feature() -> None:

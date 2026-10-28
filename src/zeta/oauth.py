@@ -22,6 +22,11 @@ DEFAULT_STREAM_STALL_SECONDS = 90.0
 
 OAUTH_REFRESH_TIMEOUT_SECONDS = DEFAULT_STREAM_STALL_SECONDS
 
+
+class ProviderLoginRequiredError(RuntimeError):
+    """Raised when a provider cannot run until the operator logs in."""
+
+
 _SENSITIVE_ERROR_NAMES = frozenset(
     {
         "authorization",

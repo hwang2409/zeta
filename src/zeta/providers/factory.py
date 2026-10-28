@@ -164,9 +164,7 @@ def _require_credentials(
         and credential.read() is None
         and credential.bootstrap() is None
     ):
-        raise credential.auth_error_type(
-            f"no {credential.provider_label} OAuth login found; log in first"
-        )
+        raise credential.login_required_error()
 
 
 __all__ = [

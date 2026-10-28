@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta.codex import CodexLoginRequiredError
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import EntryReconciliationResult
 from zeta.memory.profiles import memory_profile
@@ -126,6 +127,78 @@ def _runner(
         **({"retry_clock": retry_clock} if retry_clock is not None else {}),
     )
     return runner, registry, project.project_id, notices
+
+
+@pytest.mark.asyncio
+async def test_login_required_pauses_session_without_retry_or_cursor_advance(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        raise CodexLoginRequiredError("no Codex OAuth login found")
+
+    runner, _registry, _project_id, notices = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=2,
+        model="gpt-5.6-luna",
+        provider="codex",
+        minimum_interval=0,
+        retry_backoff_seconds=0,
+    )
+
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    assert calls == 1
+    assert runner.last_reconciled_seq == 0
+    assert runner.last_failure is None
+    assert not runner.failure_log_path.exists()
+    expected_notice = (
+        "automatic project-memory reconciliation paused: model gpt-5.6-luna "
+        "uses provider codex, but codex is not logged in. Run "
+        "`zeta accounts login codex <name>`, set `[memory] model` in settings.toml "
+        "to a model on a logged-in provider, or set `[memory] auto = false`. "
+        "Reconciliation will retry when this session next starts."
+    )
+    assert notices == [expected_notice]
+
+    runner.before_eviction(2, 2)
+    await runner.drain()
+
+    assert calls == 1
+    assert runner.last_reconciled_seq == 0
+    assert len(notices) == 1
+    assert not runner.position_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_non_login_provider_failure_keeps_retrying(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("provider temporarily unavailable")
+        return _proposal(prompt)
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=1,
+        provider="codex",
+        minimum_interval=0,
+        retry_backoff_seconds=0,
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    assert calls == 2
+    assert runner.last_reconciled_seq == 1
 
 
 @pytest.mark.asyncio
