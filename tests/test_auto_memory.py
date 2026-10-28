@@ -486,6 +486,13 @@ async def test_crash_resume_has_no_duplicate_history(tmp_path: Path) -> None:
 
     assert len(registry.memory_log(project_id)) == 1
     assert replacement.last_reconciled_seq == 2
+    diagnostics = registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = [json.loads(line) for line in diagnostics.read_text().splitlines()]
+    key = replacement.state.reconciliation_key(1, 2)
+    assert sum(
+        record["reconciliation_key"] == key and record["outcome"] == "applied"
+        for record in records
+    ) == 1
 
 
 @pytest.mark.asyncio
@@ -811,7 +818,7 @@ def test_memory_export_import_is_logical_and_preserves_provenance(tmp_path: Path
         expected_digest=before.digest,
     )
 
-    assert result.published is True
+    assert result.changed is True
     assert dict(result.contents) == exported.contents
     round_trip = destination.export_memory(project.project_id)
     assert round_trip.contents == exported.contents
@@ -1159,6 +1166,7 @@ def test_terminal_receipts_move_to_bounded_archive(tmp_path: Path) -> None:
             seq_start=seq,
             seq_end=seq,
             validation_summary="terminal test failure",
+            failure_code="provider_error",
             reason="test",
             usage={},
             retry_backoff_seconds=0,
@@ -1321,6 +1329,7 @@ async def test_commit_failure_writes_no_success_diagnostic(
     records = [json.loads(line) for line in diagnostics.read_text(encoding="utf-8").splitlines()]
     assert records
     assert all(record["outcome"] == "failed" for record in records)
+    assert {record["failure_code"] for record in records} == {"commit_error"}
     assert runner.last_reconciled_seq == 0
     assert registry.memory_snapshot(project_id).contents["decisions.md"] == "# Decisions\n"
 
@@ -1348,11 +1357,50 @@ async def test_failure_writes_persistent_file_log_without_stderr(
     records = diagnostics.read_text(encoding="utf-8").splitlines()
     assert len(records) == 1
     record = json.loads(records[0])
-    assert record["validation_summary"] == "reconciler output is not valid JSON"
+    assert record["failure_code"] == "invalid_response"
+    assert "validation_summary" not in record
     assert record["outcome"] == "failed"
     assert record["usage"] == {"input_tokens": 4, "output_tokens": 2}
     assert record["attempt_count"] == 1
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+async def test_health_log_never_contains_transcript_or_model_text(
+    tmp_path: Path, fails: bool
+) -> None:
+    private_literal = "PRIVATE_HEALTH_LOG_LITERAL_7db92"
+
+    async def invoke(prompt: str) -> ReconciliationResponse:
+        if fails:
+            output = f"not json {private_literal}"
+        else:
+            proposal = json.loads(_proposal(prompt))
+            proposal["changes"][0]["content"] = f"# Decisions\n\n{private_literal}\n"
+            output = json.dumps(proposal)
+        return ReconciliationResponse(output, {"input_tokens": 2, "output_tokens": 1})
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+    )
+    transcript_path = runner.session_dir / "conversation.jsonl"
+    transcript = transcript_path.read_text(encoding="utf-8").replace(
+        "fact 1", private_literal
+    )
+    transcript_path.write_text(transcript, encoding="utf-8")
+
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    contents = diagnostics.read_text(encoding="utf-8")
+    assert private_literal not in contents
+    assert json.loads(contents)["outcome"] == ("failed" if fails else "applied")
 
 
 @pytest.mark.asyncio
@@ -1486,6 +1534,7 @@ async def test_repartitioned_retry_replaces_original_failure(
         seq_start=1,
         seq_end=2,
         validation_summary="initial failure",
+        failure_code="provider_error",
         reason="eviction",
         usage={},
         retry_backoff_seconds=10,
@@ -1541,6 +1590,7 @@ async def test_drain_bounds_attempts_when_retry_key_stays_due(
         seq_start=1,
         seq_end=1,
         validation_summary="initial failure",
+        failure_code="provider_error",
         reason="eviction",
         usage={},
         retry_backoff_seconds=0,

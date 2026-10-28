@@ -355,7 +355,7 @@ def test_entry_mirror_failure_does_not_fail_authoritative_commit(
         operations=(AddOperation("state", "Committed", _source(3)),),
         reconciliation_key="e" * 64,
     )
-    assert updated.published is True
+    assert updated.changed is True
     assert registry._entry_memory_state(project_id).digest == updated.digest
 
 

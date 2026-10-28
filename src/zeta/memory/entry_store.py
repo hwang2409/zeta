@@ -209,7 +209,7 @@ class EntryMemorySnapshot:
 
 @dataclass(frozen=True, slots=True)
 class EntryCASResult(EntryMemorySnapshot):
-    published: bool
+    changed: bool
     receipts: tuple[OperationReceipt, ...]
 
 

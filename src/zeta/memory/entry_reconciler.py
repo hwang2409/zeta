@@ -809,12 +809,16 @@ async def reconcile_entry_range(
             if "digest mismatch" in str(exc) and attempt + 1 < cas_retries:
                 continue
             raise EntryReconciliationFailure(str(exc), usage) from exc
-        changed = tuple(
-            dict.fromkeys(
-                entry_id
-                for receipt in result.receipts
-                for entry_id in (*receipt.target_ids, *receipt.result_ids)
+        changed = (
+            tuple(
+                dict.fromkeys(
+                    entry_id
+                    for receipt in result.receipts
+                    for entry_id in (*receipt.target_ids, *receipt.result_ids)
+                )
             )
+            if result.changed
+            else ()
         )
         return EntryReconciliationResult(
             changed, rejected, usage, selected_start, selected_end, key

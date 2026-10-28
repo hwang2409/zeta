@@ -84,9 +84,16 @@ Use `--no-auto-memory` or `--auto-memory` for one session.
 Each model-backed pass appends a content-free health record to
 `<ZETA_HOME>/logs/memory-reconciliation.jsonl` after its memory decision and
 cursor are durable. Records report an `applied`, `no_change`, or `failed`
-outcome and token usage. The shared diagnostics writer rotates the file at 1
-MiB and keeps one previous file. Cursor-only ranges with no model call are not
-logged.
+outcome and token usage. Failed records use one of four fixed codes:
+`provider_error`, `invalid_response`, `request_too_large`, or `commit_error`.
+Detailed failure text remains only in the session-private
+`memory-reconcile-errors.jsonl` file (mode `0600`).
+
+The shared diagnostics writer rotates the health file at 1 MiB and keeps one
+previous file. The guaranteed look-back after rotation is about one full file,
+or roughly 2,900-3,000 ordinary rows. A watchdog's "last success within N
+hours" check therefore holds only when the home writes fewer than that many
+rows in N hours. Cursor-only ranges with no model call are not logged.
 
 ## Review and commands
 

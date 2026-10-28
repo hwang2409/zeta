@@ -36,6 +36,7 @@ from .reconciler import (
 )
 from .reconciliation_state import (
     MAX_SCHEDULED_ATTEMPTS,
+    FailureCode,
     ReconciliationFailure,
     ReconciliationOutcome,
     ReconciliationState,
@@ -64,6 +65,25 @@ def _failure_summary(error: Exception) -> str:
     if isinstance(error, (ReconciliationError, UnsupportedMemoryFormatError)):
         return str(error)
     return type(error).__name__
+
+
+def _failure_code(error: Exception) -> FailureCode:
+    if str(error) == "user row exceeds the request limit":
+        return "request_too_large"
+    cause = error.__cause__
+    if str(error) == "project memory update failed" or isinstance(
+        cause, ProjectRegistryError
+    ):
+        return "commit_error"
+    if (
+        isinstance(error, EntryReconciliationFailure)
+        and cause is not None
+        and not isinstance(cause, ReconciliationError)
+    ):
+        return "provider_error"
+    if isinstance(error, (ReconciliationError, UnsupportedMemoryFormatError)):
+        return "invalid_response"
+    return "provider_error"
 
 
 class _ConcurrentMemoryUpdate(Exception):
@@ -416,6 +436,7 @@ class AutoMemoryReconciler:
                         seq_start=item.start,
                         seq_end=item.end,
                         validation_summary=_failure_summary(exc),
+                        failure_code=_failure_code(exc),
                         reason="+".join(sorted(item.reasons)),
                         usage={},
                         retry_backoff_seconds=self.config.retry_backoff_seconds,
@@ -596,7 +617,6 @@ class AutoMemoryReconciler:
                     }
                     if not updates:
                         break
-                    entries = len(updates)
                     provenance = {
                         "session_id": self.session_id,
                         "seq_start": selected_start,
@@ -605,13 +625,14 @@ class AutoMemoryReconciler:
                         "usage": usage,
                     }
                     try:
-                        await asyncio.to_thread(
+                        result = await asyncio.to_thread(
                             self.registry.compare_and_swap_memory,
                             self.project_id,
                             expected_digest=proposal.base_digest,
                             updates=updates,
                             provenance=provenance,
                         )
+                        entries = len(updates) if result.changed else 0
                     except ProjectRegistryError as exc:
                         if "digest mismatch" in str(exc):
                             if attempt + 1 < self.config.cas_retries:
@@ -644,6 +665,7 @@ class AutoMemoryReconciler:
                             end_tokens=end_tokens,
                             usage=usage,
                             validation_summary=summary,
+                            failure_code=_failure_code(failure),
                             terminal=terminal_failure,
                         )
                     )
@@ -653,6 +675,7 @@ class AutoMemoryReconciler:
                         seq_start=selected_start,
                         seq_end=selected_end,
                         validation_summary=summary,
+                        failure_code=_failure_code(failure),
                         reason=reason,
                         usage=usage,
                         retry_backoff_seconds=self.config.retry_backoff_seconds,

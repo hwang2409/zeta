@@ -2022,8 +2022,13 @@ async def test_repeated_validation_failure_advances_only_after_terminal_receipt(
 async def test_reconciliation_retry_is_idempotent_after_cursor_crash(
     tmp_path: Path,
 ) -> None:
+    calls = 0
+
     async def invoke(_prompt: str) -> str:
-        return _proposal(_add("brief", "The project uses SQLite."))
+        nonlocal calls
+        calls += 1
+        database = "SQLite" if calls == 1 else "Postgres"
+        return _proposal(_add("brief", f"The project uses {database}."))
 
     runner, registry, project_id = _auto_runner(tmp_path, invoke)
     runner.before_eviction(1, 1)
@@ -2052,6 +2057,14 @@ async def test_reconciliation_retry_is_idempotent_after_cursor_crash(
     assert len(_entries(registry, project_id)) == 1
     assert history_after_retry == history_after_commit
     assert replacement.last_reconciled_seq == 1
+    diagnostics = registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = [json.loads(line) for line in diagnostics.read_text().splitlines()]
+    key = replacement.state.reconciliation_key(1, 1)
+    assert sum(
+        record["reconciliation_key"] == key and record["outcome"] == "applied"
+        for record in records
+    ) == 1
+
 
 @pytest.mark.asyncio
 async def test_stored_correction_rejects_newer_ordinary_user_statement(

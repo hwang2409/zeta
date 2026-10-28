@@ -15,13 +15,21 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..providers.stream_diagnostics import write_stream_diagnostic
 
 MAX_SCHEDULED_ATTEMPTS = 3
 _MAX_RECENT_TERMINAL_RECEIPTS = 100
 _MAX_RECEIPT_ARCHIVE_BYTES = 4 * 1024 * 1024
+
+# Closed, content-free codes written to the home-level health log.
+FailureCode = Literal[
+    "provider_error",
+    "invalid_response",
+    "request_too_large",
+    "commit_error",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +85,7 @@ class ReconciliationOutcome:
     usage: Mapping[str, int]
     entries: int | None = None
     validation_summary: str | None = None
+    failure_code: FailureCode | None = None
     terminal: bool = False
 
 
@@ -162,6 +171,7 @@ class ReconciliationState:
         seq_start: int,
         seq_end: int,
         validation_summary: str,
+        failure_code: FailureCode,
         reason: str,
         usage: Mapping[str, int],
         retry_backoff_seconds: float,
@@ -232,7 +242,9 @@ class ReconciliationState:
         )
         self._value["last_failure"] = self._failure_dict(failure)
         self._publish(reason)
-        self._write_diagnostic(failure, key, attempt_count, aggregated_usage)
+        self._write_diagnostic(
+            failure, failure_code, key, attempt_count, aggregated_usage
+        )
         return failure
 
     def record_success(
@@ -315,7 +327,9 @@ class ReconciliationState:
         self._remove_archived_receipt(key)
 
         failures: list[ReconciliationFailure] = []
-        diagnostics: list[tuple[ReconciliationFailure, str, int, dict[str, int]]] = []
+        diagnostics: list[
+            tuple[ReconciliationFailure, FailureCode, str, int, dict[str, int]]
+        ] = []
         successes: list[ReconciliationOutcome] = []
         for outcome in outcomes:
             if outcome.validation_summary is None:
@@ -331,6 +345,8 @@ class ReconciliationState:
                     successes.append(outcome)
                 continue
 
+            if outcome.failure_code is None:
+                raise ValueError("failed retry outcome requires a failure code")
             outcome_key = (
                 key
                 if (outcome.seq_start, outcome.seq_end)
@@ -380,22 +396,15 @@ class ReconciliationState:
                 terminal=terminal,
             )
             failures.append(failure)
-            diagnostics.append((failure, outcome_key, attempt_count, usage))
+            diagnostics.append(
+                (failure, outcome.failure_code, outcome_key, attempt_count, usage)
+            )
 
         if failures:
             self._value["last_failure"] = self._failure_dict(failures[-1])
         self._archive_old_receipts()
         self._publish(reason)
-        for outcome in successes:
-            self._write_success_diagnostic(
-                seq_start=outcome.seq_start,
-                seq_end=outcome.seq_end,
-                entries=outcome.entries or 0,
-                usage=outcome.usage,
-                occurred_at=occurred_at,
-            )
-        for failure, outcome_key, attempt_count, usage in diagnostics:
-            self._write_diagnostic(failure, outcome_key, attempt_count, usage)
+        self._write_outcome_diagnostics(successes, diagnostics, occurred_at)
         return tuple(failures)
 
     def retry_terminal(self, key: str, *, now: float | None = None) -> bool:
@@ -686,9 +695,31 @@ class ReconciliationState:
         empty["last_failure"] = value.get("last_failure")
         return empty
 
+    def _write_outcome_diagnostics(
+        self,
+        successes: list[ReconciliationOutcome],
+        failures: list[
+            tuple[ReconciliationFailure, FailureCode, str, int, dict[str, int]]
+        ],
+        occurred_at: str,
+    ) -> None:
+        for outcome in successes:
+            self._write_success_diagnostic(
+                seq_start=outcome.seq_start,
+                seq_end=outcome.seq_end,
+                entries=outcome.entries or 0,
+                usage=outcome.usage,
+                occurred_at=occurred_at,
+            )
+        for failure, failure_code, outcome_key, attempt_count, usage in failures:
+            self._write_diagnostic(
+                failure, failure_code, outcome_key, attempt_count, usage
+            )
+
     def _write_diagnostic(
         self,
         failure: ReconciliationFailure,
+        failure_code: FailureCode,
         key: str,
         attempt_count: int,
         usage: Mapping[str, int],
@@ -706,7 +737,7 @@ class ReconciliationState:
                 "seq_end": failure.seq_end,
                 "attempt_count": attempt_count,
                 "terminal": failure.terminal,
-                "validation_summary": failure.message,
+                "failure_code": failure_code,
                 "usage": self._valid_usage(usage),
             },
         )

@@ -259,7 +259,7 @@ def test_imported_entry_can_be_undone(tmp_path: Path) -> None:
 
     result = registry._undo_memory_entry(project_id, imported_id)
 
-    assert result.published
+    assert result.changed
     assert imported_id not in result.state.entries
     assert registry._entry_memory_log(project_id, entry_id=imported_id)[-1]["kind"] == "entry-undo"
 
