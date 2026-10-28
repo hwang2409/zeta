@@ -10,9 +10,11 @@ from pathlib import Path
 import httpx
 import pytest
 
+import zeta.accounts.store as account_store_module
 import zeta.cli.main as cli_main
 from tests.support.credentials import named_account_credentials
 from zeta.accounts import AccountId, AccountStore
+from zeta.core.session_files import SessionFileReplaced
 from zeta.oauth import OAuthTokens
 
 _ACCESS_SECRET = "access-secret-marker"
@@ -167,6 +169,34 @@ def test_accounts_status_missing_login_is_nonzero(
     assert status["access_token_expires_at"] is None
 
 
+def test_accounts_status_retries_registry_replacement_and_keeps_json_valid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _save_account(tmp_path)
+    store = AccountStore(tmp_path)
+    real_open = account_store_module.open_session_file
+    replace_next_read = True
+
+    def replacing_open(directory_fd: int, name: str, flags: int) -> int:
+        nonlocal replace_next_read
+        if name == "accounts.json" and replace_next_read:
+            replace_next_read = False
+            raise SessionFileReplaced("registry replaced during validation")
+        replace_next_read = True
+        return real_open(directory_fd, name, flags)
+
+    monkeypatch.setattr(account_store_module, "open_session_file", replacing_open)
+
+    for _ in range(20):
+        assert [item.account for item in store.list_catalog()] == [
+            AccountId("codex", "default")
+        ]
+        assert _run_json(tmp_path, monkeypatch) == 0
+        assert json.loads(capsys.readouterr().out)[0]["logged_in"] is True
+
+
 def test_accounts_status_lock_timeout_keeps_json_valid_and_reports_other_accounts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -234,6 +264,55 @@ def test_accounts_status_lock_timeout_keeps_json_valid_and_reports_other_account
             "retryable": True,
         },
     ]
+
+
+def test_accounts_status_refresh_lock_timeout_has_refresh_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _save_account(tmp_path, name="locked")
+    ready = tmp_path / "refresh-lock-ready"
+    release = tmp_path / "refresh-lock-release"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys,time; from pathlib import Path; "
+                "from zeta.accounts import AccountId,AccountStore; "
+                "home,ready,release=map(Path,sys.argv[1:]); "
+                "guard=AccountStore(home).lifecycle_guard(AccountId('codex','locked')); "
+                "guard.__enter__(); ready.touch(); "
+                "\nwhile not release.exists(): time.sleep(0.01)\n"
+                "guard.__exit__(None,None,None)"
+            ),
+            str(tmp_path),
+            str(ready),
+            str(release),
+        ]
+    )
+    deadline = time.monotonic() + 10
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists()
+    monkeypatch.setattr(
+        cli_main, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.01, raising=False
+    )
+
+    try:
+        assert _run_json(tmp_path, monkeypatch, "--refresh") == 1
+    finally:
+        release.touch()
+        process.wait(timeout=10)
+
+    assert process.returncode == 0
+    [status] = json.loads(capsys.readouterr().out)
+    assert status["refresh"] == {
+        "ok": False,
+        "code": "lock_timeout",
+        "retryable": True,
+    }
 
 
 def test_accounts_status_corrupt_login_keeps_json_valid_and_reports_other_accounts(

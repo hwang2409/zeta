@@ -26,6 +26,7 @@ from typing import Any, Protocol
 import httpx
 
 from ..core.session_files import (
+    SessionFileReplaced,
     child_directory,
     open_session_file,
     require_off_loop_lock,
@@ -482,7 +483,13 @@ class AccountStore:
 
     def _read_registry(self, home_fd: int) -> dict[str, Any]:
         try:
-            raw = _read_optional(home_fd, "accounts.json")
+            for attempt in range(5):
+                try:
+                    raw = _read_optional(home_fd, "accounts.json")
+                    break
+                except SessionFileReplaced:
+                    if attempt == 4:
+                        raise
             if raw is None:
                 return {"version": 1, "accounts": {}, "defaults": {}, "labels": {}}
             value = json.loads(raw)

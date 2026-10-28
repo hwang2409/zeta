@@ -233,8 +233,9 @@ has this closed schema:
 - `retryable`, present with `error: "lock_timeout"`: `true`.
 - `refresh`, present with `--refresh`: an object with boolean `ok`, `code`, and
   `retryable`. `code` is `null` on success, `"auth_error"` for a rejected or
-  missing login, or `"http_error"` for other HTTP failures. `retryable` is a
-  boolean only for `"http_error"`; otherwise it is `null`.
+  missing login, `"http_error"` for other HTTP failures, or `"lock_timeout"`
+  when the credential lock prevents a refresh attempt. `retryable` is `true`
+  for `"lock_timeout"`, a boolean for `"http_error"`, and `null` otherwise.
 
 The exhaustive safe failure values across `error` and `refresh.code` are
 `invalid_credentials`, `lock_timeout`, `auth_error`, and `http_error`. no

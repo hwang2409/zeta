@@ -15,6 +15,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from ..accounts import (
     AccountCredentialLockTimeoutError,
+    AccountCredentials,
     AccountError,
     AccountId,
     AccountStore,
@@ -26,7 +27,7 @@ from ..core.commands.completion import completion_script
 from ..core.login_flow import LoginPublicationError, run_login
 from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
-from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
+from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
 from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
 from ..tui.app import create_app
@@ -491,6 +492,34 @@ def _refresh_failure(exc: RuntimeError) -> dict[str, object]:
     }
 
 
+async def _read_safe_account_status(
+    credentials: AccountCredentials,
+) -> tuple[OAuthTokens | None, dict[str, object]]:
+    try:
+        tokens = await asyncio.to_thread(
+            credentials.read, lock_timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+        )
+    except AccountCredentialLockTimeoutError:
+        return None, {
+            "logged_in": None,
+            "access_token_expires_at": None,
+            "error": "lock_timeout",
+            "retryable": True,
+        }
+    except AccountError:
+        return None, {
+            "logged_in": False,
+            "access_token_expires_at": None,
+            "error": "invalid_credentials",
+        }
+    return tokens, {
+        "logged_in": tokens is not None,
+        "access_token_expires_at": (
+            _expiry_iso(tokens.expires_at) if tokens is not None else None
+        ),
+    }
+
+
 async def _account_status(
     store: AccountStore,
     account: AccountId,
@@ -506,33 +535,20 @@ async def _account_status(
         account=account,
     )
     assert credentials is not None
-    error = None
-    retryable = None
-    try:
-        tokens = await asyncio.to_thread(
-            credentials.read, lock_timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
-        )
-    except AccountCredentialLockTimeoutError:
-        tokens = None
-        error = "lock_timeout"
-        retryable = True
-    except AccountError:
-        tokens = None
-        error = "invalid_credentials"
+    tokens, safe_status = await _read_safe_account_status(credentials)
     status: dict[str, object] = {
         "provider": account.provider,
         "account": label,
         "is_default": default == account,
-        "logged_in": None if error == "lock_timeout" else tokens is not None,
-        "access_token_expires_at": (
-            _expiry_iso(tokens.expires_at) if tokens is not None else None
-        ),
+        **safe_status,
     }
-    if error is not None:
-        status["error"] = error
-    if retryable is not None:
-        status["retryable"] = retryable
-    if error == "lock_timeout":
+    if safe_status.get("error") == "lock_timeout":
+        if refresh:
+            status["refresh"] = {
+                "ok": False,
+                "code": "lock_timeout",
+                "retryable": True,
+            }
         return status, False
     if not refresh:
         return status, tokens is not None
@@ -549,22 +565,11 @@ async def _account_status(
             result = _refresh_failure(exc)
         else:
             result = {"ok": True, "code": None, "retryable": None}
-            try:
-                refreshed = await asyncio.to_thread(
-                    credentials.read, lock_timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
-                )
-            except AccountCredentialLockTimeoutError:
-                status.update(
-                    logged_in=None,
-                    access_token_expires_at=None,
-                    error="lock_timeout",
-                    retryable=True,
-                )
+            _, refreshed_status = await _read_safe_account_status(credentials)
+            status.update(refreshed_status)
+            if refreshed_status["logged_in"] is not True:
                 status["refresh"] = result
                 return status, False
-            status["access_token_expires_at"] = (
-                _expiry_iso(refreshed.expires_at) if refreshed is not None else None
-            )
     status["refresh"] = result
     return status, bool(result["ok"])
 
