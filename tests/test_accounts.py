@@ -36,7 +36,7 @@ from zeta.core.login_flow import LoginPublicationError
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
-from zeta.oauth import OAuthTokens
+from zeta.oauth import OAuthTokens, ProviderLoginRequiredError
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -46,6 +46,7 @@ from zeta.protocol.types import (
     ThinkingContent,
 )
 from zeta.providers.factory import build_backend, credential_store
+from zeta.providers.retry_policy import retryable_provider_error
 from zeta.server.login import Logins
 from zeta.skills import SkillCatalog
 from zeta.tools import websearch
@@ -238,6 +239,98 @@ def test_provider_driver_refresh_through_account_credentials_keeps_headers_and_r
     persisted = credential.read()
     assert persisted is not None
     assert persisted.refresh_token == "new-refresh"
+
+
+@pytest.mark.parametrize(
+    ("provider", "driver_type"),
+    [
+        ("anthropic", anthropic_module.AnthropicCredentialDriver),
+        ("codex", codex_module.CodexCredentialDriver),
+    ],
+)
+@pytest.mark.parametrize(
+    ("status_code", "body", "expected_code", "login_required"),
+    [
+        (400, {"error": "invalid_grant"}, "auth_error", True),
+        (400, {"error": "invalid_request"}, "http_error", False),
+        (401, {"error": "rejected"}, "auth_error", True),
+        (429, {"error": "rate_limited"}, "http_error", False),
+        (500, {"error": "server_error"}, "http_error", False),
+    ],
+)
+def test_oauth_refresh_response_classifies_auth_rejection_only(
+    provider: str,
+    driver_type: type,
+    status_code: int,
+    body: dict[str, str],
+    expected_code: str,
+    login_required: bool,
+) -> None:
+    driver = driver_type(token_url="https://refresh.test/token")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(status_code, json=body)
+            )
+        ) as client:
+            with pytest.raises(RuntimeError) as raised:
+                await driver.refresh("old-refresh", client)
+        assert raised.value.code == expected_code
+        assert raised.value.status_code == status_code
+        assert isinstance(raised.value, ProviderLoginRequiredError) is login_required
+        assert str(raised.value) == (
+            f"{'Claude' if provider == 'anthropic' else 'Codex'} OAuth token refresh "
+            f"failed with HTTP {status_code}"
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "driver_type",
+    [anthropic_module.AnthropicCredentialDriver, codex_module.CodexCredentialDriver],
+)
+def test_oauth_refresh_network_failure_is_not_auth_error(driver_type: type) -> None:
+    driver = driver_type(token_url="https://refresh.test/token")
+
+    def disconnect(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection failed", request=request)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(disconnect)) as client:
+            with pytest.raises(RuntimeError) as raised:
+                await driver.refresh("old-refresh", client)
+        assert raised.value.code != "auth_error"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "codex"])
+def test_oauth_refresh_deadline_is_transient_http_error(
+    provider: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credential = named_account_credentials(tmp_path, provider)
+    credential.save(OAuthTokens("old-access", "old-refresh", 1.0))
+    monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
+
+    async def blocked_refresh(
+        _refresh_token: str, _client: httpx.AsyncClient
+    ) -> OAuthTokens:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(credential, "refresh", blocked_refresh)
+
+    async def run() -> None:
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(RuntimeError) as raised:
+                await credential.access_token(client)
+        assert raised.value.code == "http_error"
+        assert retryable_provider_error(raised.value)
+        assert isinstance(raised.value.__cause__, TimeoutError)
+
+    asyncio.run(run())
 
 
 def test_anthropic_email_address_captured_on_refresh(tmp_path: Path) -> None:

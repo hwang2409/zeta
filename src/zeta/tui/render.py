@@ -184,7 +184,11 @@ def render_error_card(event: StreamEvent) -> Panel:
         is_json_payload = False
     reason = _truncate(reason, MAX_ERROR_REASON)
     retryable = is_retryable_error(error)
-    title = "provider failure" if retryable else "error"
+    title = (
+        "login required"
+        if code == "auth_error"
+        else "provider failure" if retryable else "error"
+    )
     content: list[RenderableType] = [Text(f"{title} · {code}", style=theme.ERROR)]
     if not is_json_payload:
         content.append(_safe_text(f"reason: {reason}", style=theme.BODY, wrap=True))

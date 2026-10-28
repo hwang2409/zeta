@@ -3561,7 +3561,7 @@ async def test_codex_refresh_keeps_existing_token_when_response_does_not_rotate(
 
 
 @pytest.mark.asyncio
-async def test_http_failure_and_transport_failure_are_typed(
+async def test_auth_failure_and_transport_failure_are_typed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def http_handler(request: httpx.Request) -> httpx.Response:
@@ -3572,7 +3572,7 @@ async def test_http_failure_and_transport_failure_are_typed(
         )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(http_handler))
-    with pytest.raises(CodexHTTPError) as raised:
+    with pytest.raises(CodexAuthError) as raised:
         await anext(
             CodexBackend(client=client, token_store=store_for(tmp_path / "codex.json")).complete([], [])
         )

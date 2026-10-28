@@ -24,7 +24,11 @@ from .anthropic_payload import (
     _validate_thinking_parameters,
     build_messages_payload as _build_messages_payload,
 )
-from ..oauth import ProviderLoginRequiredError
+from ..oauth import (
+    OAuthRefreshFailure,
+    ProviderLoginRequiredError,
+    classify_oauth_refresh_failure,
+)
 from .anthropic_errors import (
     AnthropicAuthError,
     AnthropicBackendError,
@@ -255,13 +259,31 @@ class AnthropicCredentialDriver:
                 headers={"accept": "application/json"},
             )
         except httpx.HTTPError as exc:
-            raise self.auth_error_type(
-                f"{self.provider_label} OAuth token refresh failed"
+            outcome = classify_oauth_refresh_failure(exception=exc)
+            raise self.http_error_type(
+                f"{self.provider_label} OAuth token refresh failed",
+                retryable=outcome is OAuthRefreshFailure.TRANSIENT,
             ) from exc
         if response.status_code >= 400:
-            raise self.http_error_type(
+            try:
+                response_body = response.json()
+            except (TypeError, ValueError, json.JSONDecodeError):
+                response_body = None
+            outcome = classify_oauth_refresh_failure(
+                status_code=response.status_code, response_body=response_body
+            )
+            message = (
                 f"{self.provider_label} OAuth token refresh failed with HTTP "
                 f"{response.status_code}"
+            )
+            if outcome is OAuthRefreshFailure.LOGIN_REQUIRED:
+                raise AnthropicLoginRequiredError(
+                    message, status_code=response.status_code
+                )
+            raise self.http_error_type(
+                message,
+                status_code=response.status_code,
+                retryable=outcome is OAuthRefreshFailure.TRANSIENT,
             )
         try:
             return _tokens_from_response(response.json(), refresh_token)

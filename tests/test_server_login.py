@@ -476,7 +476,9 @@ async def test_login_action_uses_failed_provider_before_model_revert(tmp_path, v
         event = await _event(reader, "error")
         assert event["data"].get("login_provider") == expected
         if expected:
-            assert server.runtime.metadata.provider == "claude"
+            assert server.runtime.metadata.provider == (
+                "codex" if status is None else "claude"
+            )
     finally:
         await _close(server, writer)
 
