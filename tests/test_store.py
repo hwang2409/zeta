@@ -2114,3 +2114,35 @@ def test_later_root_is_rejected_on_load(tmp_path: Path) -> None:
 
     with pytest.raises(ConversationIntegrityError, match="orphaned root"):
         ConversationStore(tmp_path, session_id=store.session_id)
+
+
+def test_all_agent_notifications_copy_only_notification_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # agent_status reads every notification once per child on the event loop;
+    # copying the whole branch there froze a long session for ~34 s.
+    store = ConversationStore(tmp_path)
+    for index in range(50):
+        store.append_message(message(MessageRole.USER, f"message {index}"))
+    store.append_agent_notification(
+        "root:1",
+        child_session_path="/sessions/root/agents/1",
+        description="worker",
+        status="completed",
+        text="done",
+    )
+    copied: list[str] = []
+    snapshot = ConversationStore._snapshot_entry
+
+    def counting_snapshot(entry: ConversationEntry) -> ConversationEntry:
+        copied.append(entry.type)
+        return snapshot(entry)
+
+    monkeypatch.setattr(
+        ConversationStore, "_snapshot_entry", staticmethod(counting_snapshot)
+    )
+
+    notifications = store.agent_notifications(pending_only=False)
+
+    assert [entry.data["child_instance_id"] for entry in notifications] == ["root:1"]
+    assert copied == ["notification"]
