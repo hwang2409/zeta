@@ -435,6 +435,7 @@ def _project_agent_status(
     handle: str,
     child_path: Path,
     *,
+    notifications: Sequence[ConversationEntry],
     requested_handle: str | None = None,
 ) -> dict[str, StructuredContentValue]:
     lifecycle = live_agent_lifecycle(child_path / "agent_lifecycle.json")
@@ -497,9 +498,6 @@ def _project_agent_status(
         idle_since = lifecycle.get("idle_since")
         if type(idle_since) is str:
             item["idle_since"] = idle_since
-    notifications = getattr(store, "agent_notifications", lambda **_kwargs: [])(
-        pending_only=False
-    )
     report_status = next(
         (
             entry.data.get("report_status")
@@ -752,6 +750,10 @@ def _read_agent_status(
     if requested_handle is not None and requested_handle not in active_receipts:
         raise ValueError("unknown child handle")
     children: list[dict[str, StructuredContentValue]] = []
+    # One read for all children: this runs on the event loop.
+    notifications = getattr(store, "agent_notifications", lambda **_kwargs: [])(
+        pending_only=False
+    )
     for handle, child_path in active_receipts.items():
         if requested_handle is not None and handle != requested_handle:
             continue
@@ -760,6 +762,7 @@ def _read_agent_status(
                 store,
                 handle,
                 child_path,
+                notifications=notifications,
                 requested_handle=requested_handle,
             )
         except Exception as exc:  # noqa: BLE001 - every child needs a safe row

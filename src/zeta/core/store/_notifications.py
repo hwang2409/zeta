@@ -472,7 +472,11 @@ class NotificationStateMixin:
         entries = (
             self._active_notifications.values()
             if pending_only
-            else (entry for entry in self.replay() if entry.type == "notification")
+            else (
+                entry
+                for entry in self._active_branch()
+                if entry.type == "notification"
+            )
         )
         return [
             self._snapshot_entry(entry)
