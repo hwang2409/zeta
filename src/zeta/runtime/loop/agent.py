@@ -363,7 +363,10 @@ class AgentLoop(
         """Align compaction and provider-side context budgets."""
         provider = getattr(self.backend, "provider", None)
         model = getattr(self.backend, "model", None)
-        if isinstance(provider, str) and isinstance(model, str):
+        model_window = getattr(self.backend, "model_context_window", None)
+        if provider == "ollama" and type(model_window) is int and model_window > 0:
+            token_budget = min(token_budget, model_window)
+        elif isinstance(provider, str) and isinstance(model, str):
             token_budget = effective_budget_for_model(provider, model, token_budget)
         self.context_assembler.update_token_budget(token_budget)
         if self.step_delivery is not None:

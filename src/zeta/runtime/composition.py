@@ -154,7 +154,12 @@ def compose_runtime(
         backend, selected_model = backend_builder(
             provider, session_model, **backend_kwargs
         )
-        if resuming and (
+        model_window = getattr(backend, "model_context_window", None)
+        if provider == "ollama" and type(model_window) is int and model_window > 0:
+            requested_budget = effective_budget if budget_pinned else model_window
+            effective_budget = min(requested_budget, model_window)
+            backend.set_token_budget(effective_budget)
+        if (
             effective_budget != metadata.compaction_budget
             or budget_pinned != metadata.budget_pinned
         ):

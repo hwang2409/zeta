@@ -21,13 +21,20 @@ allocation from its model-window table:
 | `qwen3:4b-instruct` | 32,768 tokens | Non-thinking instruct model; generally responds much faster and is useful for headless tool calls. |
 
 The `qwen3:4b-instruct` allocation is deliberately below the model's native
-window to bound Ollama memory use. Unknown or locally created Ollama models use
-a conservative 8,192-token default (still larger than Ollama's own default). Zeta resolves one effective
-budget—the smaller of the requested/session budget and the model window—and
-uses it for session metadata, context assembly, child loops, and Ollama's
-`options.num_ctx` on every chat request. Larger `num_ctx` values use more memory
-on the Ollama host; on smaller hardware, set `token_budget` lower in settings or
-with the CLI option. For example:
+window to bound Ollama memory use. For an unknown or locally created model,
+Zeta calls Ollama's `/api/show` once when it builds the backend. It reads the
+architecture's `context_length` and uses a lower `num_ctx` from the model's
+parameters when present. A missing or invalid response, server error, or short
+request timeout falls back to a conservative 8,192-token window.
+
+Zeta resolves one effective budget—the smaller of the requested/session budget
+and the model window—and uses it for session metadata, context assembly, child
+loops, and Ollama's `options.num_ctx` on every chat request. If the model window
+is too small for Zeta's prompt and tools, increase the model's `num_ctx` in
+Ollama up to its architecture limit, or use a model with a larger context
+window. Larger `num_ctx` values use more memory on the Ollama host; on smaller
+hardware, set `token_budget` lower in settings or with the CLI option. For
+example:
 
 ```console
 zeta --provider ollama --model qwen3:4b-instruct --token-budget 32768

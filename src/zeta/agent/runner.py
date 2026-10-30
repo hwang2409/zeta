@@ -427,8 +427,11 @@ async def _build_child_loop(
         child_model = getattr(child_backend, "model", None)
         if type(child_model) is not str or not child_model:
             child_model = model if type(model) is str and model else "unknown"
+        backend_budget = getattr(child_backend, "token_budget", None)
         child_budget = loop.context_assembler.token_budget
-        if isinstance(child_provider, str):
+        if type(backend_budget) is int and backend_budget > 0:
+            child_budget = backend_budget
+        elif isinstance(child_provider, str):
             child_budget = effective_budget_for_model(
                 child_provider, child_model, child_budget
             )

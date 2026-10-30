@@ -19,7 +19,10 @@ def prepare_backend_state(loop: Any, backend: CompletionBackend) -> PreparedBack
     token_budget = loop.context_assembler.token_budget
     provider = getattr(backend, "provider", None)
     model = getattr(backend, "model", None)
-    if isinstance(provider, str) and isinstance(model, str):
+    model_window = getattr(backend, "model_context_window", None)
+    if provider == "ollama" and type(model_window) is int and model_window > 0:
+        token_budget = min(token_budget, model_window)
+    elif isinstance(provider, str) and isinstance(model, str):
         token_budget = effective_budget_for_model(provider, model, token_budget)
     if isinstance(backend, ContextWindowBackend):
         backend.set_token_budget(token_budget)
