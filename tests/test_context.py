@@ -26,7 +26,7 @@ from zeta.core.store import ConversationStore
 from zeta.providers.anthropic import build_messages_payload
 from zeta.providers.codex_errors import CodexStreamError
 from zeta.providers.codex_payload import build_responses_payload
-from zeta.providers.ollama import _messages as build_ollama_messages
+from zeta.providers.ollama import OllamaBackend, _messages as build_ollama_messages
 from zeta.protocol.types import (
     MessageOrigin,
     with_message_origin,
@@ -466,6 +466,36 @@ async def test_system_prompt_over_budget_still_raises(tmp_path: Path) -> None:
 
     with pytest.raises(BudgetExceeded, match="system prompt and retained tail"):
         await assembler.assemble()
+
+
+@pytest.mark.asyncio
+async def test_ollama_model_window_error_names_binding_limit(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(
+        with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER)
+    )
+    backend = OllamaBackend(
+        model="local-model",
+        model_context_window=10,
+        token_budget=10,
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=10,
+        retained_tail=1,
+        system_prompt="system prompt is much too large",
+        token_counter=count,
+        backend=backend,
+    )
+
+    with pytest.raises(BudgetExceeded) as error:
+        await assembler.assemble()
+
+    message = str(error.value)
+    assert "Ollama model 'local-model'" in message
+    assert "context window (10 tokens)" in message
+    assert "increase num_ctx" in message
+    assert "--token-budget" not in message
 
 
 @pytest.mark.asyncio

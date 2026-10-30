@@ -164,6 +164,18 @@ async def tcp_http_server():
         assert httpx.AsyncHTTPTransport is httpx._transports.default.AsyncHTTPTransport
 
 
+def _show_response(payload: dict, *, status: int = 200):
+    async def respond(writer, server) -> None:
+        await _response(
+            writer,
+            server,
+            [json.dumps(payload).encode()],
+            status=status,
+        )
+
+    return respond
+
+
 async def _response(
     writer, server, body_chunks, *, status=200, wait=None, wait_before=None
 ):
@@ -500,6 +512,102 @@ async def test_ollama_instruct_num_ctx_uses_effective_budget(
     assert await _captured_num_ctx(
         OllamaBackend(model="qwen3:4b-instruct", token_budget=effective)
     ) == expected
+
+
+@pytest.mark.asyncio
+async def test_unknown_ollama_model_reads_context_window_once(tcp_http_server) -> None:
+    tcp_http_server.scripts = [
+        _show_response(
+            {
+                "model_info": {
+                    "general.architecture": "qwen2",
+                    "qwen2.context_length": 65_536,
+                },
+                "parameters": "temperature 0.7",
+            }
+        )
+    ]
+
+    backend, _ = await asyncio.to_thread(
+        build_backend,
+        "ollama",
+        "local-model",
+        ollama_base_url=tcp_http_server.url,
+    )
+
+    assert isinstance(backend, OllamaBackend)
+    assert backend.model_context_window == 65_536
+    assert backend.token_budget == 65_536
+    assert tcp_http_server.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"model_info": {}},
+        {"model_info": {"qwen2.context_length": 0}},
+        {"model_info": {"qwen2.context_length": "32768"}},
+    ],
+)
+async def test_unknown_ollama_model_invalid_show_falls_back(
+    tcp_http_server, payload: dict
+) -> None:
+    tcp_http_server.scripts = [_show_response(payload)]
+
+    backend, _ = await asyncio.to_thread(
+        build_backend,
+        "ollama",
+        "local-model",
+        ollama_base_url=tcp_http_server.url,
+        token_budget=32_768,
+    )
+
+    assert isinstance(backend, OllamaBackend)
+    assert backend.model_context_window == 8_192
+    assert backend.token_budget == 8_192
+
+
+@pytest.mark.asyncio
+async def test_unknown_ollama_model_show_error_falls_back(tcp_http_server) -> None:
+    tcp_http_server.scripts = [_show_response({"error": "failed"}, status=500)]
+
+    backend, _ = await asyncio.to_thread(
+        build_backend,
+        "ollama",
+        "local-model",
+        ollama_base_url=tcp_http_server.url,
+        token_budget=32_768,
+    )
+
+    assert isinstance(backend, OllamaBackend)
+    assert backend.model_context_window == 8_192
+    assert backend.token_budget == 8_192
+
+
+@pytest.mark.asyncio
+async def test_unknown_ollama_model_honors_num_ctx_parameter(tcp_http_server) -> None:
+    tcp_http_server.scripts = [
+        _show_response(
+            {
+                "model_info": {"qwen2.context_length": 65_536},
+                "parameters": "temperature 0.7\nnum_ctx 24576\nstop END",
+            }
+        )
+    ]
+
+    backend, _ = await asyncio.to_thread(
+        build_backend,
+        "ollama",
+        "local-model",
+        ollama_base_url=tcp_http_server.url,
+        token_budget=32_768,
+    )
+
+    assert isinstance(backend, OllamaBackend)
+    assert backend.model_context_window == 24_576
+    assert backend.token_budget == 24_576
 
 
 def test_ollama_build_uses_resolved_transport_settings(tmp_path) -> None:
