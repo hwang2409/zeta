@@ -38,6 +38,7 @@ from zeta.skills.agent_catalog import AgentCatalog
 from zeta.skills.catalog import SkillCatalog
 from zeta.tui.bootstrap import build_backend as build_interactive_backend
 
+_ORIGINAL_HTTP_REQUEST = httpx.HTTPTransport.handle_request
 _ORIGINAL_ASYNC_HTTP_REQUEST = httpx.AsyncHTTPTransport.handle_async_request
 _STALL_SECONDS = 0.05
 _CLIENT_DEADLINE_SECONDS = 0.75
@@ -100,6 +101,7 @@ class _TCPHTTPServer:
     def __init__(self) -> None:
         self.scripts: list = []
         self.calls = 0
+        self.request_bodies: list[bytes] = []
         self.first_body_sent = asyncio.Event()
         self.server: asyncio.Server | None = None
         self.tasks: set[asyncio.Task] = set()
@@ -128,8 +130,10 @@ class _TCPHTTPServer:
                 ),
                 0,
             )
-            if content_length:
-                await reader.readexactly(content_length)
+            body = (
+                await reader.readexactly(content_length) if content_length else b""
+            )
+            self.request_bodies.append(body)
             script = self.scripts[min(self.calls, len(self.scripts) - 1)]
             self.calls += 1
             await script(writer, self)
@@ -151,10 +155,18 @@ class _TCPHTTPServer:
 
 
 @pytest.fixture
-async def tcp_http_server():
+async def tcp_http_server(monkeypatch: pytest.MonkeyPatch):
     # The loopback transport captures the real method before conftest's
     # autouse network blocker patches it, without mutating HTTPX module state.
     assert httpx.AsyncHTTPTransport is httpx._transports.default.AsyncHTTPTransport
+
+    def loopback_request(
+        transport: httpx.HTTPTransport, request: httpx.Request
+    ) -> httpx.Response:
+        assert request.url.host in {"127.0.0.1", "localhost", "::1"}
+        return _ORIGINAL_HTTP_REQUEST(transport, request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", loopback_request)
     server = _TCPHTTPServer()
     await server.start()
     try:
@@ -162,6 +174,18 @@ async def tcp_http_server():
     finally:
         await server.close()
         assert httpx.AsyncHTTPTransport is httpx._transports.default.AsyncHTTPTransport
+
+
+def _show_response(payload: dict, *, status: int = 200):
+    async def respond(writer, server) -> None:
+        await _response(
+            writer,
+            server,
+            [json.dumps(payload).encode()],
+            status=status,
+        )
+
+    return respond
 
 
 async def _response(
@@ -500,6 +524,159 @@ async def test_ollama_instruct_num_ctx_uses_effective_budget(
     assert await _captured_num_ctx(
         OllamaBackend(model="qwen3:4b-instruct", token_budget=effective)
     ) == expected
+
+
+@pytest.mark.asyncio
+async def test_unknown_ollama_model_reads_context_window_once(tcp_http_server) -> None:
+    tcp_http_server.scripts = [
+        _show_response(
+            {
+                "model_info": {
+                    "general.architecture": "qwen2",
+                    "qwen2.context_length": 65_536,
+                },
+                "parameters": "temperature 0.7",
+            }
+        )
+    ]
+
+    backend, _ = await asyncio.to_thread(
+        build_backend,
+        "ollama",
+        "local-model",
+        ollama_base_url=tcp_http_server.url,
+    )
+
+    assert isinstance(backend, OllamaBackend)
+    assert backend.model_context_window == 65_536
+    assert backend.token_budget == 65_536
+    assert tcp_http_server.calls == 1
+    assert json.loads(tcp_http_server.request_bodies[0]) == {"model": "local-model"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_budget", "expected_budget"),
+    [(None, 65_536), (32_768, 32_768)],
+)
+async def test_unknown_ollama_window_is_used_by_the_whole_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tcp_http_server,
+    requested_budget: int | None,
+    expected_budget: int,
+) -> None:
+    tcp_http_server.scripts = [
+        _show_response({"model_info": {"qwen2.context_length": 65_536}})
+    ]
+    monkeypatch.setenv("ZETA_OLLAMA_BASE_URL", tcp_http_server.url)
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    config = resolve(
+        load_settings(home=home, project_dir=project / ".zeta").settings,
+        cli_provider="ollama",
+        cli_model="local-model",
+        cli_yolo=None,
+        cli_token_budget=requested_budget,
+        default_provider="codex",
+    )
+    manager = SessionManager(home)
+
+    composition = await asyncio.to_thread(
+        lambda: compose_runtime(
+            home=home,
+            cwd=project,
+            manager=manager,
+            config=config,
+            provider="ollama",
+            model="local-model",
+            project_context=ProjectContext("system", ()),
+            backend_builder=build_interactive_backend,
+            skill_catalog=SkillCatalog.empty(),
+            agent_catalog=AgentCatalog.empty(),
+        )
+    )
+    try:
+        backend = composition.loop.backend
+        persisted = manager.read_metadata(composition.opened.metadata.session_id)
+        assert isinstance(backend, OllamaBackend)
+        assert backend.model_context_window == 65_536
+        assert backend.token_budget == expected_budget
+        assert composition.loop.context_assembler.token_budget == expected_budget
+        assert persisted.compaction_budget == expected_budget
+        assert tcp_http_server.calls == 1
+    finally:
+        await close_session(composition.loop)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"model_info": {}},
+        {"model_info": {"qwen2.context_length": 0}},
+        {"model_info": {"qwen2.context_length": "32768"}},
+    ],
+)
+async def test_unknown_ollama_model_invalid_show_falls_back(
+    tcp_http_server, payload: dict
+) -> None:
+    tcp_http_server.scripts = [_show_response(payload)]
+
+    backend, _ = await asyncio.to_thread(
+        build_backend,
+        "ollama",
+        "local-model",
+        ollama_base_url=tcp_http_server.url,
+        token_budget=32_768,
+    )
+
+    assert isinstance(backend, OllamaBackend)
+    assert backend.model_context_window == 8_192
+    assert backend.token_budget == 8_192
+
+
+@pytest.mark.asyncio
+async def test_unknown_ollama_model_show_error_falls_back(tcp_http_server) -> None:
+    tcp_http_server.scripts = [_show_response({"error": "failed"}, status=500)]
+
+    backend, _ = await asyncio.to_thread(
+        build_backend,
+        "ollama",
+        "local-model",
+        ollama_base_url=tcp_http_server.url,
+        token_budget=32_768,
+    )
+
+    assert isinstance(backend, OllamaBackend)
+    assert backend.model_context_window == 8_192
+    assert backend.token_budget == 8_192
+
+
+@pytest.mark.asyncio
+async def test_unknown_ollama_model_honors_num_ctx_parameter(tcp_http_server) -> None:
+    tcp_http_server.scripts = [
+        _show_response(
+            {
+                "model_info": {"qwen2.context_length": 65_536},
+                "parameters": "temperature 0.7\nnum_ctx 24576\nstop END",
+            }
+        )
+    ]
+
+    backend, _ = await asyncio.to_thread(
+        build_backend,
+        "ollama",
+        "local-model",
+        ollama_base_url=tcp_http_server.url,
+        token_budget=32_768,
+    )
+
+    assert isinstance(backend, OllamaBackend)
+    assert backend.model_context_window == 24_576
+    assert backend.token_budget == 24_576
 
 
 def test_ollama_build_uses_resolved_transport_settings(tmp_path) -> None:
@@ -848,6 +1025,10 @@ async def test_server_provider_switch_resolves_ollama_endpoint_centrally(
     home = tmp_path / "home"
     project = tmp_path / "project"
     expected = _endpoint_sources(home, project / ".zeta", monkeypatch, environment_wins)
+    monkeypatch.setattr(
+        "zeta.providers.factory.model_context_window",
+        lambda _model, _base_url: 8_192,
+    )
     runtime = ServerRuntime(home, cwd=project, provider="codex")
     backend = runtime.backend_for_model("ollama", "locally-created-model")
     assert isinstance(backend, OllamaBackend)

@@ -281,8 +281,9 @@ def budget_for_model(provider: str, model: str) -> int:
 def effective_budget_for_model(provider: str, model: str, budget: int) -> int:
     """Return the one budget used by persistence, compaction, and transport."""
 
-    if provider == "ollama":
-        return min(budget, budget_for_model(provider, model))
+    window = context_window(provider, model)
+    if provider == "ollama" and window is not None:
+        return min(budget, window)
     return budget
 
 

@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from ..core.slash import DEFAULT_OLLAMA_TOKEN_BUDGET
+from ..core.slash import DEFAULT_OLLAMA_TOKEN_BUDGET, context_window
 from ..protocol.tool_batches import without_incomplete_tool_batches
 from ..protocol.types import (
     CompletionBackend,
@@ -43,6 +43,7 @@ from .usage import normalize_usage
 
 OLLAMA_API_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3:4b"
+OLLAMA_SHOW_TIMEOUT_SECONDS = 2.0
 
 
 class OllamaError(RuntimeError):
@@ -133,6 +134,49 @@ def _messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
     return result
 
 
+def model_context_window(model: str, base_url: str) -> int:
+    """Read an unknown model's effective context window from Ollama once."""
+
+    try:
+        with httpx.Client(timeout=OLLAMA_SHOW_TIMEOUT_SECONDS) as client:
+            response = client.post(f"{base_url.rstrip('/')}/api/show", json={"model": model})
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return DEFAULT_OLLAMA_TOKEN_BUDGET
+    if not isinstance(payload, Mapping):
+        return DEFAULT_OLLAMA_TOKEN_BUDGET
+    model_info = payload.get("model_info")
+    if not isinstance(model_info, Mapping):
+        return DEFAULT_OLLAMA_TOKEN_BUDGET
+    windows = [
+        value
+        for key, value in model_info.items()
+        if isinstance(key, str)
+        and key.endswith(".context_length")
+        and type(value) is int
+        and value > 0
+    ]
+    if len(windows) != 1:
+        return DEFAULT_OLLAMA_TOKEN_BUDGET
+    window = windows[0]
+    parameters = payload.get("parameters")
+    if isinstance(parameters, str):
+        for line in parameters.splitlines():
+            parts = line.split()
+            if len(parts) != 2 or parts[0] != "num_ctx":
+                continue
+            try:
+                num_ctx = int(parts[1])
+            except ValueError:
+                return DEFAULT_OLLAMA_TOKEN_BUDGET
+            if num_ctx <= 0:
+                return DEFAULT_OLLAMA_TOKEN_BUDGET
+            window = min(window, num_ctx)
+            break
+    return window
+
+
 def _tools(schemas: Sequence[ToolSchema]) -> list[dict[str, Any]]:
     tools = []
     for schema in schemas:
@@ -168,12 +212,20 @@ class OllamaBackend(CompletionBackend):
         stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
         stall_retries: int = DEFAULT_STREAM_STALL_RETRIES,
         token_budget: int | None = None,
+        model_context_window: int | None = None,
     ) -> None:
         if not base_url or any(ch.isspace() for ch in base_url):
             raise ValueError("Ollama base URL must be a nonempty URL")
         if stall_seconds < 0 or stall_retries < 0:
             raise ValueError("Ollama stall settings must be nonnegative")
+        if model_context_window is None:
+            model_context_window = (
+                context_window("ollama", model) or DEFAULT_OLLAMA_TOKEN_BUDGET
+            )
+        if model_context_window <= 0:
+            raise ValueError("Ollama model context window must be positive")
         self.model, self.base_url, self.client = model, base_url.rstrip("/"), client
+        self.model_context_window = model_context_window
         self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
         self.set_token_budget(token_budget)
         # The shared watchdog owns read-stall timing. Keep HTTPX from racing it.

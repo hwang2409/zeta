@@ -4255,6 +4255,47 @@ skill_catalog=SkillCatalog.empty(),
 
 
 @pytest.mark.asyncio
+async def test_ollama_model_window_error_renders_in_tui(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    backend = OllamaBackend(
+        model="local-model",
+        model_context_window=10,
+        token_budget=10,
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=10,
+        retained_tail=1,
+        system_prompt="system prompt is much too large",
+        token_counter=lambda message: 1 + sum(
+            len(block.text)
+            for block in message.content
+            if isinstance(block, TextContent)
+        ),
+        backend=backend,
+    )
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            store,
+            context_assembler=assembler,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="ollama",
+        model="local-model",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    await app._consume_turn("prompt")
+
+    rendered = Text.from_ansi(app.console.file.getvalue()).plain
+    assert "Ollama model 'local-model' has a context window (10 tokens)" in rendered
+    assert "increase num_ctx" in rendered
+    assert "--token-budget" not in rendered
+    await app.close()
+
+
+@pytest.mark.asyncio
 async def test_retry_reuses_user_message_and_keeps_partial_output(
     tmp_path: Path,
 ) -> None:

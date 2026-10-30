@@ -120,7 +120,7 @@ def test_ollama_context_budgets_are_known_and_capped() -> None:
     )
     assert resolve_session_budget(
         100_000, True, "ollama", "locally-created-model", None
-    ) == (8_192, True)
+    ) == (100_000, True)
 
 
 def test_skill_slash_commands_follow_collision_precedence(tmp_path: Path) -> None:

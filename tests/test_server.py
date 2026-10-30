@@ -54,6 +54,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.providers.ollama import OllamaBackend
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import ApprovalLifecycle
 from zeta.server.event_contract import (
@@ -989,6 +990,42 @@ async def test_oauth_refresh_rejection_reaches_serve_as_auth_error(
                 f"refresh failed with HTTP {status_code}"
             ),
         }
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_ollama_model_window_error_reaches_serve(tmp_path: Path) -> None:
+    backend = OllamaBackend(
+        model="local-model",
+        model_context_window=10,
+        token_budget=10,
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda _provider, model, _home: (
+            backend,
+            model or "local-model",
+        ),
+    )
+    reader, writer = await _ready(server)
+    try:
+        assembler = server.runtime.loop.context_assembler
+        assembler.update_token_budget(10)
+        assembler.system_prompt = Message(
+            MessageRole.SYSTEM,
+            [TextContent("system prompt is much too large")],
+        )
+        await _request(reader, writer, 3, "send", {"text": "prompt"})
+
+        error = await _event(reader, "error")
+
+        message = error["error"]["message"]
+        assert "Ollama model 'local-model' has a context window (10 tokens)" in message
+        assert "increase num_ctx" in message
+        assert "--token-budget" not in message
     finally:
         await _close(server, writer)
 

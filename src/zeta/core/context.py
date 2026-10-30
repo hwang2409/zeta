@@ -26,6 +26,7 @@ from .context_parts.admission import (
     AdmittedSessionRequest,
     RequestBudgetExceeded,
     SessionRequestAdmission,
+    ollama_model_window_guidance,
 )
 from .store import ConversationEntry, ConversationStore
 from .store._client_delivery import without_client_delivery_marker
@@ -231,6 +232,11 @@ class ContextAssembler:
         try:
             return await self._request_admission.admit(messages, tool_schemas)
         except RequestBudgetExceeded as exc:
+            model_limit = ollama_model_window_guidance(
+                self.backend, self.token_budget
+            )
+            if model_limit is not None:
+                raise BudgetExceeded(f"{exc}; {model_limit}") from exc
             raise BudgetExceeded(str(exc)) from exc
 
     def dispatch_admitted_request(
@@ -1004,6 +1010,12 @@ class ContextAssembler:
         self, committed_tokens: int, budget: int | None = None
     ) -> None:
         effective_budget = self.estimator_token_budget if budget is None else budget
+        model_limit = ollama_model_window_guidance(self.backend, self.token_budget)
+        if model_limit is not None:
+            raise BudgetExceeded(
+                "system prompt and retained tail "
+                f"({committed_tokens} tokens) exceed the model limit; {model_limit}"
+            )
         raise BudgetExceeded(
             "system prompt and retained tail "
             f"({committed_tokens} tokens) exceed the token budget "

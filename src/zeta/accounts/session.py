@@ -342,6 +342,19 @@ class SessionAccountContext:
         active_provider: str | None,
     ) -> _PreparedAccountState:
         backend = build_backend(metadata)
+        model_window = getattr(backend, "model_context_window", None)
+        if (
+            metadata.provider == "ollama"
+            and type(model_window) is int
+            and model_window > 0
+        ):
+            requested_budget = (
+                metadata.compaction_budget if metadata.budget_pinned else model_window
+            )
+            metadata = replace(
+                metadata, compaction_budget=min(requested_budget, model_window)
+            )
+            backend.set_token_budget(metadata.compaction_budget)
         backend_state = (
             loop.current_backend_state()
             if backend is None
