@@ -42,7 +42,6 @@ from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
 from ...core.context import BudgetExceeded, ContextAssembler
 from ...core.hooks import HookManager
-from ...core.slash import effective_budget_for_model
 from ...core.store import ConversationStore
 from ...core.store._approval_display import ApprovalAuditRequest
 from ...core.tool_dispatch import dispatch_tool_calls
@@ -90,6 +89,7 @@ from ...tools.registry import (
 from ..backend_state import (
     PreparedBackendState,
     apply_backend_state,
+    effective_backend_budget,
     prepare_backend_state,
 )
 from ._completion import (
@@ -361,13 +361,7 @@ class AgentLoop(
 
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
-        provider = getattr(self.backend, "provider", None)
-        model = getattr(self.backend, "model", None)
-        model_window = getattr(self.backend, "model_context_window", None)
-        if provider == "ollama" and type(model_window) is int and model_window > 0:
-            token_budget = min(token_budget, model_window)
-        elif isinstance(provider, str) and isinstance(model, str):
-            token_budget = effective_budget_for_model(provider, model, token_budget)
+        token_budget = effective_backend_budget(self.backend, token_budget)
         self.context_assembler.update_token_budget(token_budget)
         if self.step_delivery is not None:
             self.step_delivery.capacity_changed()

@@ -26,6 +26,7 @@ from .context_parts.admission import (
     AdmittedSessionRequest,
     RequestBudgetExceeded,
     SessionRequestAdmission,
+    ollama_model_window_guidance,
 )
 from .store import ConversationEntry, ConversationStore
 from .store._client_delivery import without_client_delivery_marker
@@ -231,7 +232,9 @@ class ContextAssembler:
         try:
             return await self._request_admission.admit(messages, tool_schemas)
         except RequestBudgetExceeded as exc:
-            model_limit = self._binding_model_window()
+            model_limit = ollama_model_window_guidance(
+                self.backend, self.token_budget
+            )
             if model_limit is not None:
                 raise BudgetExceeded(f"{exc}; {model_limit}") from exc
             raise BudgetExceeded(str(exc)) from exc
@@ -1003,28 +1006,11 @@ class ContextAssembler:
         )
 
 
-    def _binding_model_window(self) -> str | None:
-        backend = self.backend
-        window = getattr(backend, "model_context_window", None)
-        model = getattr(backend, "model", None)
-        if (
-            getattr(backend, "provider", None) != "ollama"
-            or type(window) is not int
-            or window != self.token_budget
-            or not isinstance(model, str)
-        ):
-            return None
-        return (
-            f"Ollama model {model!r} has a context window ({window} tokens); "
-            "increase num_ctx for this model in Ollama (up to its architecture "
-            "limit), or use a model with a larger context window"
-        )
-
     def _raise_committed_budget(
         self, committed_tokens: int, budget: int | None = None
     ) -> None:
         effective_budget = self.estimator_token_budget if budget is None else budget
-        model_limit = self._binding_model_window()
+        model_limit = ollama_model_window_guidance(self.backend, self.token_budget)
         if model_limit is not None:
             raise BudgetExceeded(
                 "system prompt and retained tail "

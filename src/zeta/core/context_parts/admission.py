@@ -14,6 +14,27 @@ class RequestBudgetExceeded(RuntimeError):
     """The exact provider request exceeds the current session budget."""
 
 
+def ollama_model_window_guidance(
+    backend: CompletionBackend, token_budget: int
+) -> str | None:
+    """Explain an Ollama window that prevents a larger request budget."""
+
+    window = getattr(backend, "model_context_window", None)
+    model = getattr(backend, "model", None)
+    if (
+        getattr(backend, "provider", None) != "ollama"
+        or type(window) is not int
+        or window != token_budget
+        or not isinstance(model, str)
+    ):
+        return None
+    return (
+        f"Ollama model {model!r} has a context window ({window} tokens); "
+        "increase num_ctx for this model in Ollama (up to its architecture "
+        "limit), or use a model with a larger context window"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AdmittedSessionRequest:
     """One immutable, counted provider request ready for dispatch."""
