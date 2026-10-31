@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import select
 import subprocess
 import sys
 import threading
@@ -252,8 +253,10 @@ def test_accounts_status_reports_pending_legacy_migration(
     assert _REFRESH_SECRET not in output
 
 
+@pytest.mark.parametrize("refresh", [False, True])
 def test_accounts_status_is_bounded_while_every_account_lock_is_held(
     tmp_path: Path,
+    refresh: bool,
 ) -> None:
     accounts = [AccountId(provider, "default") for provider in ("anthropic", "codex")]
     for account in accounts:
@@ -281,102 +284,102 @@ def test_accounts_status_is_bounded_while_every_account_lock_is_held(
         "account-locks/codex/login.lock",
     }
 
-    ready = tmp_path / "all-locks-ready"
-    release_lifecycle = tmp_path / "release-lifecycle"
-    lifecycle_released = tmp_path / "lifecycle-released"
-    reacquire_lifecycle = tmp_path / "reacquire-lifecycle"
-    lifecycle_reacquired = tmp_path / "lifecycle-reacquired"
-    done = tmp_path / "all-locks-done"
     holder = subprocess.Popen(
         [
             sys.executable,
             "-c",
             (
-                "import fcntl,sys,time; from pathlib import Path; "
-                "ready,release,released,reacquire,reacquired,done="
-                "map(Path,sys.argv[1:7]); paths=list(map(Path,sys.argv[7:])); "
+                "import fcntl,sys; from pathlib import Path; "
+                "paths=list(map(Path,sys.argv[1:])); "
                 "handles=[path.open('a+') for path in paths]; "
                 "lifecycle=[handle for handle in handles "
                 "if handle.name.endswith('/lifecycle.lock')]; "
                 "[fcntl.flock(handle,fcntl.LOCK_EX) for handle in handles]; "
-                "ready.touch(); "
-                "\nwhile not release.exists(): time.sleep(0.01)\n"
-                "[fcntl.flock(handle,fcntl.LOCK_UN) for handle in lifecycle]; "
-                "released.touch(); "
-                "\nwhile not reacquire.exists(): time.sleep(0.01)\n"
-                "[fcntl.flock(handle,fcntl.LOCK_EX) for handle in lifecycle]; "
-                "reacquired.touch(); "
-                "\nwhile not done.exists(): time.sleep(0.01)\n"
+                "print('held',flush=True); "
+                "\nfor command in sys.stdin:\n"
+                " if command.strip() == 'release':\n"
+                "  [fcntl.flock(handle,fcntl.LOCK_UN) for handle in lifecycle]\n"
+                "  print('released',flush=True)\n"
+                " elif command.strip() == 'reacquire':\n"
+                "  [fcntl.flock(handle,fcntl.LOCK_EX) for handle in lifecycle]\n"
+                "  print('reacquired',flush=True)\n"
+                " elif command.strip() == 'done': break\n"
             ),
-            str(ready),
-            str(release_lifecycle),
-            str(lifecycle_released),
-            str(reacquire_lifecycle),
-            str(lifecycle_reacquired),
-            str(done),
             *(str(path) for path in lock_paths),
-        ]
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
     )
 
-    def wait_for(path: Path) -> None:
-        deadline = time.monotonic() + 10
-        while not path.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert path.exists()
+    def send(process: subprocess.Popen[str], event: str) -> None:
+        assert process.stdin is not None
+        process.stdin.write(event + "\n")
+        process.stdin.flush()
 
-    command = (
-        "import zeta.accounts.store as store, zeta.cli.main as cli; "
-        "store.OAUTH_REFRESH_TIMEOUT_SECONDS=cli.OAUTH_REFRESH_TIMEOUT_SECONDS=0.05; "
-        "raise SystemExit(cli.main(['accounts','status','--json']))"
-    )
-    env = {**os.environ, "ZETA_HOME": str(tmp_path)}
+    def expect(stream, event: str) -> None:
+        readable, _, _ = select.select([stream], [], [], 10)
+        assert readable, f"timed out waiting for {event}"
+        assert stream.readline() == event + "\n"
+
+    status_process: subprocess.Popen[str] | None = None
     try:
-        wait_for(ready)
-        plain = subprocess.run(
-            [sys.executable, "-c", command],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-        assert plain.returncode == 1
-        assert {row["error"] for row in json.loads(plain.stdout)} == {"lock_timeout"}
+        assert holder.stdout is not None
+        expect(holder.stdout, "held")
+        if refresh:
+            send(holder, "release")
+            expect(holder.stdout, "released")
 
-        release_lifecycle.touch()
-        wait_for(lifecycle_released)
-        refresh_command = (
-            "import asyncio; from pathlib import Path; "
-            "import zeta.accounts.store as store, zeta.cli.main as cli; "
+        command = (
+            "import sys; import zeta.accounts.store as store, zeta.cli.main as cli; "
             "store.OAUTH_REFRESH_TIMEOUT_SECONDS=cli.OAUTH_REFRESH_TIMEOUT_SECONDS=0.05; "
-            "real=cli._read_safe_account_status; first=True; "
-            "\nasync def read(credentials):\n"
-            " global first\n result=await real(credentials)\n"
-            " if first:\n  first=False\n  Path(sys.argv[1]).touch()\n"
-            "  while not Path(sys.argv[2]).exists(): await asyncio.sleep(0.01)\n"
-            " return result\n"
-            "\nimport sys; cli._read_safe_account_status=read; "
-            "raise SystemExit(cli.main(['accounts','status','--refresh','--json']))"
+            + (
+                "real=cli._read_safe_account_status; first=True; "
+                "\nasync def read(credentials):\n"
+                " global first\n result=await real(credentials)\n"
+                " if first:\n  first=False\n"
+                "  print('initial-read',file=sys.stderr,flush=True)\n"
+                "  sys.stdin.readline()\n"
+                " return result\n"
+                "\ncli._read_safe_account_status=read; "
+                if refresh
+                else ""
+            )
+            + "print('started',file=sys.stderr,flush=True); sys.stdin.readline(); "
+            "raise SystemExit(cli.main(['accounts','status',"
+            + ("'--refresh'," if refresh else "")
+            + "'--json']))"
         )
-        refreshed = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                refresh_command,
-                str(reacquire_lifecycle),
-                str(lifecycle_reacquired),
-            ],
-            env=env,
-            capture_output=True,
+        status_process = subprocess.Popen(
+            [sys.executable, "-c", command],
+            env={**os.environ, "ZETA_HOME": str(tmp_path)},
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=5,
-            check=False,
         )
-        assert refreshed.returncode == 1
-        refresh_rows = json.loads(refreshed.stdout)
-        assert {row["refresh"]["code"] for row in refresh_rows} == {"lock_timeout"}
+        assert status_process.stderr is not None
+        expect(status_process.stderr, "started")
+        send(status_process, "run")
+        if refresh:
+            expect(status_process.stderr, "initial-read")
+            send(holder, "reacquire")
+            expect(holder.stdout, "reacquired")
+            send(status_process, "continue")
+
+        stdout, stderr = status_process.communicate(timeout=2)
+        assert stderr == ""
+        assert status_process.returncode == 1
+        rows = json.loads(stdout)
+        if refresh:
+            assert {row["refresh"]["code"] for row in rows} == {"lock_timeout"}
+        else:
+            assert {row["error"] for row in rows} == {"lock_timeout"}
     finally:
-        done.touch()
+        if status_process is not None and status_process.poll() is None:
+            status_process.kill()
+            status_process.wait(timeout=10)
+        send(holder, "done")
         holder.wait(timeout=10)
     assert holder.returncode == 0
 
