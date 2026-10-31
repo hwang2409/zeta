@@ -65,6 +65,8 @@ class _DetachedLogState:
     active_approval_requests: dict[str, ConversationEntry]
     active_approval_resolutions: dict[str, str]
     active_tool_results: dict[str, ToolResult]
+    active_agent_call_ids: set[str]
+    active_agent_receipts: list[tuple[str, str]]
     notification_ids: set[str]
     active_notifications: dict[str, ConversationEntry]
     active_completion_notifications: dict[str, ConversationEntry]
@@ -95,6 +97,8 @@ class ConversationLogMixin:
             active_approval_requests=self._active_approval_requests,
             active_approval_resolutions=self._active_approval_resolutions,
             active_tool_results=self._active_tool_results,
+            active_agent_call_ids=self._active_agent_call_ids,
+            active_agent_receipts=self._active_agent_receipts,
             notification_ids=self._notification_ids,
             active_notifications=self._active_notifications,
             active_completion_notifications=self._active_completion_notifications,
@@ -125,6 +129,8 @@ class ConversationLogMixin:
             active_approval_requests=dict(state.active_approval_requests),
             active_approval_resolutions=dict(state.active_approval_resolutions),
             active_tool_results=dict(state.active_tool_results),
+            active_agent_call_ids=set(state.active_agent_call_ids),
+            active_agent_receipts=list(state.active_agent_receipts),
             notification_ids=set(state.notification_ids),
             active_notifications=dict(state.active_notifications),
             active_completion_notifications=dict(
@@ -154,6 +160,8 @@ class ConversationLogMixin:
         self._active_approval_requests = state.active_approval_requests
         self._active_approval_resolutions = state.active_approval_resolutions
         self._active_tool_results = state.active_tool_results
+        self._active_agent_call_ids = state.active_agent_call_ids
+        self._active_agent_receipts = state.active_agent_receipts
         self._notification_ids = state.notification_ids
         self._active_notifications = state.active_notifications
         self._active_completion_notifications = state.active_completion_notifications

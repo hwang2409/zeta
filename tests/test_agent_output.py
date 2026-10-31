@@ -27,7 +27,7 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
-from zeta.tools.agent import agent_result
+from zeta.tools.agent import _active_agent_receipts, agent_result
 from zeta.tui.render import render_event
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
@@ -259,6 +259,54 @@ async def test_agent_output_reads_finished_child_with_roles_and_pages(
     )
     assert "assistant: child answer" in second["content"][0]["text"]
     assert second["structuredContent"]["truncated"] is False
+
+
+def test_active_agent_receipt_discovery_does_not_scan_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="parent")
+    for index in range(50):
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"message {index}")]),
+                MessageOrigin.USER,
+            )
+        )
+    call = ToolCall("agent-call", "agent", {})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent("running")],
+            tool_result=ToolResult(
+                call.id,
+                "running",
+                structured_content={
+                    "child_instance_id": "parent:1",
+                    "child_session_path": str(store.session_dir / "agents" / "1"),
+                },
+            ),
+        )
+    )
+    parsed = 0
+    from_dict = Message.from_dict
+
+    def counting_from_dict(data: dict[str, object]) -> Message:
+        nonlocal parsed
+        parsed += 1
+        return from_dict(data)
+
+    monkeypatch.setattr(Message, "from_dict", staticmethod(counting_from_dict))
+
+    receipts = _active_agent_receipts(store)
+
+    assert receipts == {"parent:1": store.session_dir / "agents" / "1"}
+    assert parsed == 0
+
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+    parsed = 0
+    assert _active_agent_receipts(reopened) == receipts
+    assert parsed == 0
 
 
 @pytest.mark.asyncio

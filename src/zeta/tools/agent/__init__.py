@@ -195,25 +195,10 @@ def _canonical_child_path(session_dir: Path, value: object) -> Path | None:
 
 
 def _active_agent_receipts(store: object) -> dict[str, Path]:
-    replay = getattr(store, "replay", None)
-    if not callable(replay):
-        raise TypeError("agent status is unavailable outside an agent session")
+    receipt_data = getattr(store, "active_agent_receipts", None)
     session_dir = getattr(store, "session_dir", None)
-    if not isinstance(session_dir, Path):
+    if not callable(receipt_data) or not isinstance(session_dir, Path):
         raise TypeError("agent status is unavailable outside an agent session")
-    entries = replay()
-    agent_call_ids: set[str] = set()
-    for entry in entries:
-        if entry.type != "message":
-            continue
-        message = Message.from_dict(entry.data["message"])
-        agent_call_ids.update(
-            block.tool_call.id
-            for block in message.content
-            if isinstance(block, ToolUseContent)
-            and block.tool_call.name.casefold() == "agent"
-        )
-
     receipts: dict[str, Path] = {}
 
     def add_receipt(handle: object, child_path: object) -> None:
@@ -223,24 +208,8 @@ def _active_agent_receipts(store: object) -> dict[str, Path]:
         if canonical_path is not None:
             receipts.setdefault(handle, canonical_path)
 
-    for entry in entries:
-        if entry.type == "message":
-            message = Message.from_dict(entry.data["message"])
-            result = message.tool_result
-            if result is None or result.tool_call_id not in agent_call_ids:
-                continue
-            structured = result.structured_content
-            if structured is not None:
-                add_receipt(
-                    structured.get("child_instance_id"),
-                    structured.get("child_session_path"),
-                )
-        elif entry.type == "notification":
-            data = entry.data
-            add_receipt(
-                data.get("child_instance_id"),
-                data.get("child_session_path"),
-            )
+    for handle, child_path in receipt_data():
+        add_receipt(handle, child_path)
 
     agent_children = getattr(store, "agent_children", None)
     if callable(agent_children):

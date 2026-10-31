@@ -2116,6 +2116,31 @@ def test_later_root_is_rejected_on_load(tmp_path: Path) -> None:
         ConversationStore(tmp_path, session_id=store.session_id)
 
 
+def test_append_message_with_approvals_copies_only_new_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    for index in range(50):
+        store.append_message(message(MessageRole.USER, f"message {index}"))
+    copied: list[str] = []
+    snapshot = ConversationStore._snapshot_entry
+
+    def counting_snapshot(entry: ConversationEntry) -> ConversationEntry:
+        copied.append(entry.type)
+        return snapshot(entry)
+
+    monkeypatch.setattr(
+        ConversationStore, "_snapshot_entry", staticmethod(counting_snapshot)
+    )
+
+    appended = store.append_message_with_approval_requests(
+        message(MessageRole.ASSISTANT, "done")
+    )
+
+    assert appended.data["message"]["content"][0]["text"] == "done"
+    assert copied == ["message"]
+
+
 def test_all_agent_notifications_copy_only_notification_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
