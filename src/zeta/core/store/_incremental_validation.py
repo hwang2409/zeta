@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import time
 
-from ...protocol.types import Message, ToolResult
+from ...protocol.types import Message, ToolResult, ToolUseContent
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
@@ -21,6 +21,8 @@ class IncrementalValidationMixin:
         self._active_approval_requests: dict[str, ConversationEntry] = {}
         self._active_approval_resolutions: dict[str, str] = {}
         self._active_tool_results: dict[str, ToolResult] = {}
+        self._active_agent_call_ids: set[str] = set()
+        self._active_agent_receipts: list[tuple[str, str]] = []
         self._notification_ids: set[str] = set()
         self._active_notifications: dict[str, ConversationEntry] = {}
         self._active_completion_notifications: dict[str, ConversationEntry] = {}
@@ -60,6 +62,8 @@ class IncrementalValidationMixin:
         staged._active_approval_requests = dict(self._active_approval_requests)
         staged._active_approval_resolutions = dict(self._active_approval_resolutions)
         staged._active_tool_results = dict(self._active_tool_results)
+        staged._active_agent_call_ids = set(self._active_agent_call_ids)
+        staged._active_agent_receipts = list(self._active_agent_receipts)
         staged._notification_ids = set(self._notification_ids)
         staged._active_notifications = dict(self._active_notifications)
         staged._active_completion_notifications = dict(
@@ -93,6 +97,8 @@ class IncrementalValidationMixin:
         self._active_approval_requests = staged._active_approval_requests
         self._active_approval_resolutions = staged._active_approval_resolutions
         self._active_tool_results = staged._active_tool_results
+        self._active_agent_call_ids = staged._active_agent_call_ids
+        self._active_agent_receipts = staged._active_agent_receipts
         self._notification_ids = staged._notification_ids
         self._active_notifications = staged._active_notifications
         self._active_completion_notifications = (
@@ -150,6 +156,15 @@ class IncrementalValidationMixin:
                 self._task_notification_ids.add(task_id)
         return True
 
+    def _record_agent_receipt(self, result: ToolResult) -> None:
+        structured = result.structured_content
+        if structured is None:
+            return
+        handle = structured.get("child_instance_id")
+        child_path = structured.get("child_session_path")
+        if type(handle) is str and handle and type(child_path) is str and child_path:
+            self._active_agent_receipts.append((handle, child_path))
+
     def _record_message_entry(self, entry: ConversationEntry) -> None:
         message = Message.from_dict(entry.data["message"])
         self._active_last_message = message
@@ -162,6 +177,20 @@ class IncrementalValidationMixin:
         tool_result = message.tool_result
         if tool_result is not None:
             self._active_tool_results[tool_result.tool_call_id] = tool_result
+        for block in message.content:
+            if (
+                isinstance(block, ToolUseContent)
+                and block.tool_call.name.casefold() == "agent"
+            ):
+                self._active_agent_call_ids.add(block.tool_call.id)
+                prior_result = self._active_tool_results.get(block.tool_call.id)
+                if prior_result is not None:
+                    self._record_agent_receipt(prior_result)
+        if (
+            tool_result is not None
+            and tool_result.tool_call_id in self._active_agent_call_ids
+        ):
+            self._record_agent_receipt(tool_result)
         for request in entry.data.get("approval_requests", []):
             request_id = request.get("request_id")
             if type(request_id) is str and request_id:
@@ -172,6 +201,10 @@ class IncrementalValidationMixin:
                 self._active_approval_requests[request_id] = entry
 
     def _record_notification_entry(self, entry: ConversationEntry) -> None:
+        handle = entry.data.get("child_instance_id")
+        child_path = entry.data.get("child_session_path")
+        if type(handle) is str and handle and type(child_path) is str and child_path:
+            self._active_agent_receipts.append((handle, child_path))
         self._notification_ids.add(entry.id)
         self._active_notifications[entry.id] = entry
         if (

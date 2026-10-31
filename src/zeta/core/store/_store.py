@@ -919,13 +919,17 @@ class ConversationStore(
             data["approval_requests"] = request_data
         with self._append_lock():
             self._load()
-            current_branch = self.replay()
+            current_branch = self._active_branch()
             resolved_parent = (
                 parent_id
                 if parent_id is not None
                 else (current_branch[-1].id if current_branch else None)
             )
-            branch = self._branch_to_parent(resolved_parent)
+            branch = (
+                list(current_branch)
+                if current_branch and resolved_parent == current_branch[-1].id
+                else self._branch_to_parent(resolved_parent)
+            )
             active_child = next(
                 (
                     entry
@@ -1004,7 +1008,7 @@ class ConversationStore(
             seen.add(current.id)
             branch.append(current)
             current = by_id.get(current.parent_id) if current.parent_id else None
-        return [self._snapshot_entry(entry) for entry in reversed(branch)]
+        return list(reversed(branch))
 
     def append_approval_request(
         self,
@@ -1190,6 +1194,11 @@ class ConversationStore(
 
     def replay(self) -> list[ConversationEntry]:
         return self._snapshot_branch(self._active_branch())
+
+    def active_agent_receipts(self) -> tuple[tuple[str, str], ...]:
+        """Return immutable child receipt coordinates from the active branch."""
+
+        return tuple(self._active_agent_receipts)
 
     def active_branch_snapshot(self) -> tuple[ConversationEntry, ...]:
         """Return stable resident entries for read-only planning."""
