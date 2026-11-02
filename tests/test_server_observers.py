@@ -15,7 +15,6 @@ from tests.test_server import (
     TIMEOUT,
     _close,
     _connect,
-    _event,
     _read,
     _request,
     _socket_path,
@@ -67,7 +66,7 @@ async def test_installed_rows_callback_races_observer_churn(tmp_path: Path) -> N
     await _request(controller_reader, controller_writer, 2, "new_session", {"provider": "codex"})
     stable_reader, stable_writer = await _observer(server, 10)
     await _snapshot(stable_reader, stable_writer)
-    churn_reader, churn_writer = await _observer(server, 20)
+    _churn_reader, churn_writer = await _observer(server, 20)
     try:
         callback = server.runtime.opened.store.on_entries_installed
         assert callback is not None
@@ -197,7 +196,7 @@ async def test_mid_turn_observer_snapshot_has_no_duplicate_rows(tmp_path: Path) 
         while True:
             try:
                 frame = await asyncio.wait_for(_read(reader), 0.2)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 break
             if frame.get("params", {}).get("event") == "transcript_row":
                 rows.append(frame["params"]["row"])
@@ -217,7 +216,8 @@ async def test_unix_and_websocket_observers_receive_live_rows(tmp_path: Path) ->
     unix_reader, unix_writer = await _observer(server, 10)
     await _snapshot(unix_reader, unix_writer)
     try:
-        from tests.test_server_websocket import _connect as ws_connect, _read_json, _send_json
+        from tests.test_server_websocket import _connect as ws_connect
+        from tests.test_server_websocket import _read_json, _send_json
         ws_reader, ws_writer, status = await ws_connect(server, token=server._websocket.token)
         assert status == 101
         await _send_json(ws_writer, {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]}})

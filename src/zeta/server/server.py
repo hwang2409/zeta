@@ -29,8 +29,8 @@ from . import (
     slash_commands,
 )
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
-from .connections import OBSERVER_READ_ONLY_CODE, OBSERVER_REQUESTS, ConnectionRegistry
 from .delivery import DeliveryRequests, TurnOutcome
+from .ergonomics import OBSERVER_READ_ONLY_CODE, OBSERVER_REQUESTS, ConnectionRegistry
 from .model_inputs import PendingModelInputs
 from .notification_presentation import NotificationPresentation
 from .project_requests import (
@@ -725,7 +725,6 @@ class _Client:
                 else 0
             ),
         }
-
     async def _run_turn(
         self,
         text: str,
