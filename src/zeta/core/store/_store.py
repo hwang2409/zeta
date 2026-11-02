@@ -82,15 +82,9 @@ from .runtime_lease import (
 
 
 class ConversationStore(
-    AsyncDurableWritesMixin,
-    PendingPromptStoreMixin,
-    ClientDeliveryMixin,
-    ConversationLogMixin,
-    IncrementalValidationMixin,
-    NotificationStateMixin,
-    StoreRuntimeLeaseMixin,
-    AgentStateMixin, CheckpointForkMixin,
-    StepDeliveryStoreMixin, StoreLifecycleMixin, ChildRunStoreMixin,
+    AsyncDurableWritesMixin, PendingPromptStoreMixin, ClientDeliveryMixin, ConversationLogMixin,
+    IncrementalValidationMixin, NotificationStateMixin, StoreRuntimeLeaseMixin, AgentStateMixin,
+    CheckpointForkMixin, StepDeliveryStoreMixin, StoreLifecycleMixin, ChildRunStoreMixin,
 ):
     def __init__(
         self,
@@ -190,7 +184,6 @@ class ConversationStore(
 
     def set_bash_cwd(self, cwd: str | Path) -> None:
         """Persist the shell's current directory outside the append-only log."""
-
         resolved = str(cwd)
         if not resolved:
             raise ValueError("bash cwd must be a nonempty string")
@@ -232,13 +225,11 @@ class ConversationStore(
 
     def todo_items(self) -> list[TodoItem]:
         """Return a detached snapshot of the current session todo list."""
-
         return [dict(item) for item in self._todo_items]
 
     @property
     def todo_dismissed(self) -> bool:
         """Return whether the terminal todo receipt was dismissed."""
-
         return self._todo_dismissed
 
     def dismiss_todo(self) -> None:
