@@ -82,7 +82,11 @@ The first request must be `hello`. `protocol_version` is required and must be
 `client_version: "1.2"` so old servers accept the handshake. A 1.2 server returns
 `1.2` for that request, or the requested version for an explicit `1.1` or `1.2`.
 A legacy hello without the extra field receives `1.0` and only the legacy
-capabilities.
+capabilities. The result can also contain an optional `notices` array of startup
+warnings. Account cleanup warnings name the affected paths and advise checking
+their mode or ownership, then deleting or fixing them; paths are bounded and the
+array never contains file contents. These notices are included in every successful
+handshake while the warning remains current.
 The frontend client gates all extensions on the returned version; it never sends extension
 requests to a 1.0 server. A mismatch returns `-32002` with `requested` and `supported` fields, then closes
 the connection. Clients must not send other requests before `hello`.

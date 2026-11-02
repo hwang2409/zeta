@@ -41,6 +41,7 @@ from ..oauth import (
 )
 
 _PROVIDERS = {"anthropic", "codex"}
+_MAX_SWEEP_WARNING_PATHS, _MAX_SWEEP_WARNING_PATH_LENGTH = 5, 160
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 
@@ -522,10 +523,8 @@ class AccountStore:
                     self._migrate_provider(home_fd, provider)
         return tuple(warnings)
 
-    def _sweep_orphan_directories(self, home_fd: int, warnings: list[str]) -> None:
-        from .logout import remove_account_directory
-
-        registered = set(self._read_registry(home_fd)["accounts"])
+    def _list_orphan_directories(self, home_fd: int, registered: set[str]) -> list[tuple[str, str, str, set[str]]]:
+        orphans: list[tuple[str, str, str, set[str]]] = []
         for root, allowed in (
             ("accounts", {"oauth.json", "usage.json", "publish-pending.json"}),
             ("account-locks", {"lifecycle.lock", "usage.lock"}),
@@ -541,45 +540,59 @@ class AccountStore:
                                 ]
                         except FileNotFoundError:
                             continue
-                        for name, is_directory in names:
-                            if not is_directory:
-                                continue
-                            key = f"{provider}:{name}"
-                            if key in registered:
-                                continue
-                            account = None
-                            try:
-                                account = AccountId(provider, name)
-                            except ValueError:
-                                pass
-                            if root == "accounts" and account is not None:
-                                try:
-                                    with (
-                                        child_directory(home_fd, root) as scan_root_fd,
-                                        child_directory(scan_root_fd, provider) as scan_provider_fd,
-                                        child_directory(scan_provider_fd, name) as account_fd,
-                                    ):
-                                        pending = _read_publication_pending(account_fd)
-                                        credential = _read_optional_bytes(account_fd, "oauth.json")
-                                    if (
-                                        pending is not None
-                                        and credential is not None
-                                        and pending == _publication_record(account, credential)
-                                    ):
-                                        continue
-                                except FileNotFoundError:
-                                    continue
-                            try:
-                                remove_account_directory(
-                                    home_fd, root, (provider, name), allowed=allowed
-                                )
-                            except (AccountError, OSError, ValueError) as exc:
-                                path = self.home / root / provider / name
-                                warnings.append(
-                                    f"could not clean up account directory {path}: {exc}"
-                                )
+                        orphans.extend(
+                            (root, provider, name, allowed)
+                            for name, is_directory in names
+                            if is_directory and f"{provider}:{name}" not in registered
+                        )
             except FileNotFoundError:
                 continue
+        return orphans
+
+    def _orphan_is_pending_publication(self, home_fd: int, root: str, provider: str, name: str) -> bool:
+        if root != "accounts":
+            return False
+        account = AccountId(provider, name)
+        try:
+            with (
+                child_directory(home_fd, root) as root_fd,
+                child_directory(root_fd, provider) as provider_fd,
+                child_directory(provider_fd, name) as account_fd,
+            ):
+                pending = _read_publication_pending(account_fd)
+                credential = _read_optional_bytes(account_fd, "oauth.json")
+        except FileNotFoundError:
+            return True
+        return (
+            pending is not None
+            and credential is not None
+            and pending == _publication_record(account, credential)
+        )
+
+    def _remove_orphan_directory(self, home_fd: int, root: str, provider: str, name: str, allowed: set[str]) -> str | None:
+        from .logout import remove_account_directory
+
+        try:
+            remove_account_directory(home_fd, root, (provider, name), allowed=allowed)
+        except (AccountError, OSError, ValueError):
+            path = str(self.home / root / provider / name)
+            return path[:_MAX_SWEEP_WARNING_PATH_LENGTH]
+        return None
+
+    def _sweep_orphan_directories(self, home_fd: int, warnings: list[str]) -> None:
+        registered, refused = set(self._read_registry(home_fd)["accounts"]), []
+        for root, provider, name, allowed in self._list_orphan_directories(home_fd, registered):
+            try:
+                if self._orphan_is_pending_publication(home_fd, root, provider, name):
+                    continue
+            except ValueError:
+                pass
+            path = self._remove_orphan_directory(home_fd, root, provider, name, allowed)
+            if path is not None:
+                refused.append(path)
+        warnings.extend(f"could not clean up account directory {path}; check its mode or ownership, then delete it or fix it" for path in refused[:_MAX_SWEEP_WARNING_PATHS])
+        if len(refused) > _MAX_SWEEP_WARNING_PATHS:
+            warnings.append(f"and {len(refused) - _MAX_SWEEP_WARNING_PATHS} more account directories could not be cleaned up")
 
     def _migrate_provider(self, home_fd: int, provider: str) -> None:
         account = AccountId(provider, "default")

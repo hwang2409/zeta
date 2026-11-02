@@ -572,6 +572,23 @@ def test_migration_happy_path_anthropic(tmp_path: Path) -> None:
     test_migration_happy_path("anthropic", tmp_path)
 
 
+def test_migration_bounds_refused_directory_warnings(tmp_path: Path) -> None:
+    provider_root = tmp_path / "accounts" / "codex"
+    provider_root.mkdir(parents=True)
+    for index in range(20):
+        directory = provider_root / f"account-{index}"
+        directory.mkdir()
+        (directory / "oauth.json").write_text("secret")
+        os.chmod(directory, 0o755)
+
+    warnings = AccountStore(tmp_path).migrate()
+
+    assert len(warnings) == 6
+    assert all(len(warning) < 300 for warning in warnings)
+    assert "account-0" in " ".join(warnings)
+    assert warnings[-1] == "and 15 more account directories could not be cleaned up"
+
+
 def test_migration_happy_path_codex(tmp_path: Path) -> None:
     test_migration_happy_path("codex", tmp_path)
 

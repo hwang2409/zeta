@@ -2248,6 +2248,30 @@ async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
 
 
 @pytest.mark.asyncio
+async def test_account_warning_waits_for_successful_hello(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    await server.start()
+    server._account_warnings = ("could not clean up account directory /secret",)
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.sleep(0)
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        try:
+            hello = await _request(
+                reader, writer, 1, "hello", {"protocol_version": "1.0"}
+            )
+            assert hello[-1]["result"]["notices"] == [
+                "could not clean up account directory /secret"
+            ]
+        finally:
+            await _close(server, writer)
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
 async def test_rejected_pre_hello_request_closes_connection(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _connect(server)

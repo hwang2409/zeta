@@ -230,6 +230,22 @@ def _force_terminal_env(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
         monkeypatch.setenv(name, env[name])
 
 
+def test_account_startup_warning_uses_warning_render_path(tmp_path: Path) -> None:
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+        startup_warnings=("could not clean up account directory /secret; check its mode or ownership, then delete it or fix it",),
+    )
+
+    app._present_startup_output()
+
+    assert "/secret" in output.getvalue()
+    assert "check its mode or ownership" in output.getvalue()
+
+
 def _agent_list_session(
     tmp_path: Path,
     child_count: int,

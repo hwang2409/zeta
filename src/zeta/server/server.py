@@ -229,8 +229,6 @@ class ZetaServer:
         self.runtime.set_background_event_sink(self._client._publish_background_event)
         self.runtime.set_memory_notice_sink(self._client._publish_memory_notice)
         self.runtime.set_background_wake_sink(self._client._schedule_background_wake)
-        for warning in self._account_warnings: await self._client._notify("account_warning", message=warning)
-        self._account_warnings = ()
         try:
             await self._client.run()
         finally:
@@ -511,11 +509,14 @@ class _Client:
         }
         if extended and requested is not None:
             capabilities["features"] = accepted
-        return {
+        result: dict[str, object] = {
             "protocol_version": self.protocol_version,
             "server": "zeta",
             "capabilities": capabilities,
         }
+        if self.server._account_warnings:
+            result["notices"] = list(self.server._account_warnings)
+        return result
 
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
@@ -1246,5 +1247,4 @@ def _approval_display_fields(request: Any) -> dict[str, object]:
 def _data_text(data: Mapping[str, object]) -> str:
     value = data.get("output", data.get("text", ""))
     return value if isinstance(value, str) else ""
-
 __all__ = ["ZetaServer"]
