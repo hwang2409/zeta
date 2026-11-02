@@ -7,7 +7,6 @@ import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -734,8 +733,9 @@ async def test_async_append_never_loads_transcript_on_event_loop_after_foreign_c
 
 
 @pytest.mark.asyncio
-async def test_async_publish_stays_responsive_during_large_branch_reload(
+async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="large-off-loop-publish")
     notification_data = {
@@ -768,26 +768,95 @@ async def test_async_publish_stays_responsive_during_large_branch_reload(
     foreign.append_fork("large-base")
     foreign.close()
 
-    loop = asyncio.get_running_loop()
-    ticks = [loop.time()]
-    running = True
+    owner_thread = threading.get_ident()
+    heavy_threads: dict[str, list[int]] = {
+        "load": [],
+        "validate": [],
+        "rebuild": [],
+    }
+    active_rows_by_thread: dict[int, int] = {}
+    install_threads: list[int] = []
+    loop_entry_accesses = 0
+    observe_loop_access = True
 
-    async def ticker() -> None:
-        while running:
-            await asyncio.sleep(0.001)
-            ticks.append(loop.time())
+    class ObservedEntries(list[ConversationEntry]):
+        def _record_loop_access(self, rows: int) -> None:
+            nonlocal loop_entry_accesses
+            if observe_loop_access and threading.get_ident() == owner_thread:
+                loop_entry_accesses += rows
 
-    ticker_task = asyncio.create_task(ticker())
-    await asyncio.sleep(0)
-    try:
-        await store.append_message_async(message(MessageRole.ASSISTANT, "kept"))
-    finally:
-        running = False
-        await ticker_task
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self._record_loop_access(len(self))
+            return super().__iter__()
 
-    maximum_gap = max(later - earlier for earlier, later in pairwise(ticks))
-    # shortcut: 500 ms tolerates four-way CI descheduling; use 50 ms on an isolated runner.
-    assert maximum_gap < 0.5, f"maximum ticker gap {maximum_gap:.6f}s"
+        def __reversed__(self):  # type: ignore[no-untyped-def]
+            self._record_loop_access(len(self))
+            return super().__reversed__()
+
+        def __getitem__(self, key):  # type: ignore[no-untyped-def]
+            self._record_loop_access(len(self) if isinstance(key, slice) else 1)
+            return super().__getitem__(key)
+
+    def observe_heavy(name: str):
+        original = getattr(ConversationStore, name)
+
+        def observed(candidate: ConversationStore, *args: object, **kwargs: object):
+            heavy_threads[{"_load_full": "load", "_validate_entries": "validate", "_rebuild_incremental_validation_state": "rebuild"}[name]].append(
+                threading.get_ident()
+            )
+            return original(candidate, *args, **kwargs)
+
+        monkeypatch.setattr(ConversationStore, name, observed)
+
+    for method_name in (
+        "_load_full",
+        "_validate_entries",
+        "_rebuild_incremental_validation_state",
+    ):
+        observe_heavy(method_name)
+
+    original_record_active_entry = ConversationStore._record_active_entry
+
+    def observed_record_active_entry(
+        candidate: ConversationStore, entry: ConversationEntry
+    ) -> None:
+        thread = threading.get_ident()
+        active_rows_by_thread[thread] = active_rows_by_thread.get(thread, 0) + 1
+        original_record_active_entry(candidate, entry)
+
+    monkeypatch.setattr(
+        ConversationStore, "_record_active_entry", observed_record_active_entry
+    )
+    original_detach = ConversationStore._detach_log_state
+
+    def observed_detach(candidate: ConversationStore):
+        state = original_detach(candidate)
+        if threading.get_ident() != owner_thread:
+            state = replace(state, entries=ObservedEntries(state.entries))
+        return state
+
+    monkeypatch.setattr(ConversationStore, "_detach_log_state", observed_detach)
+    original_install = ConversationStore._install_log_state
+
+    def observed_install(candidate: ConversationStore, state: object):
+        install_threads.append(threading.get_ident())
+        return original_install(candidate, state)
+
+    monkeypatch.setattr(ConversationStore, "_install_log_state", observed_install)
+
+    await store.append_message_async(message(MessageRole.ASSISTANT, "kept"))
+    observe_loop_access = False
+
+    assert all(heavy_threads.values())
+    assert all(
+        thread != owner_thread
+        for threads in heavy_threads.values()
+        for thread in threads
+    )
+    assert active_rows_by_thread.get(owner_thread, 0) == 0
+    assert sum(active_rows_by_thread.values()) >= len(rows)
+    assert install_threads == [owner_thread]
+    assert loop_entry_accesses == 0
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store.entries == fresh.entries
     assert store.messages() == fresh.messages()
