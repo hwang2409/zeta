@@ -98,6 +98,7 @@ from ._completion import (
     assistant_reset_event,
     can_retry_context,
     close_completion,
+    complete_delivery,
     ensure_context_reduced,
     observed_completion,
     provider_prompt_tokens,
@@ -899,9 +900,6 @@ class AgentLoop(
                     completion,
                     self.store,
                     steering,
-                    step_delivery.active_publications if has_active_delivery else None,
-                    self._acknowledge_step_delivery if has_active_delivery else None,
-                    self._delivery_publication_events if has_active_delivery else None,
                 )
                 async for event in provider_stream:
                     attempt_state.observe(event)
@@ -952,6 +950,7 @@ class AgentLoop(
                     provider_error = ErrorInfo(
                         "stream_error",
                         "provider stream ended before completion",
+                        retryable=True,
                     )
             except asyncio.CancelledError:
                 await close_completion(completion)
@@ -1027,6 +1026,13 @@ class AgentLoop(
                         assistant_message = None
                         retrying_provider = True
                         continue
+                if plan is None and attempt_state.started and has_active_delivery:
+                    async for publication in complete_delivery(
+                        step_delivery.active_publications,
+                        self._acknowledge_step_delivery,
+                        self._delivery_publication_events,
+                    ):
+                        yield publication
                 if (
                     provider_retry_budget is not None
                     and provider_retry_budget.exhausted
@@ -1050,6 +1056,13 @@ class AgentLoop(
                 return
             retrying_context = False
             retrying_provider = False
+            if attempt_state.started and has_active_delivery:
+                async for publication in complete_delivery(
+                    step_delivery.active_publications,
+                    self._acknowledge_step_delivery,
+                    self._delivery_publication_events,
+                ):
+                    yield publication
             if completion_succeeded and self.on_completion_success is not None:
                 completion_result = self.on_completion_success()
                 if inspect.isawaitable(completion_result):

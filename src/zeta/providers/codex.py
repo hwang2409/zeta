@@ -409,7 +409,9 @@ async def _decode_response(
             raise _stream_inconsistent(
                 "Codex stream ended with an incomplete function call"
             )
-        raise CodexStreamError("Codex stream ended before response completion")
+        raise CodexStreamError(
+            "Codex stream ended before response completion", retryable=True
+        )
     if diagnostics_path is not None and reassembly.mismatches:
         StreamDiagnostics.record_reassembly_mismatches(
             diagnostics_path, provider="codex", count=reassembly.mismatches

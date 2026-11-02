@@ -139,9 +139,9 @@ def test_server_error_code_is_retryable() -> None:
 @pytest.mark.parametrize(
     "error",
     [
-        ErrorInfo("stream_error", "provider stream ended before completion"),
-        AnthropicStreamError("Anthropic stream ended before message completion"),
-        CodexStreamError("Codex stream ended before response completion"),
+        ErrorInfo("stream_error", "loop wording can change", retryable=True),
+        AnthropicStreamError("anthropic wording can change", retryable=True),
+        CodexStreamError("codex wording can change", retryable=True),
     ],
 )
 def test_early_stream_close_is_retryable(error: object) -> None:

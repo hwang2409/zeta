@@ -80,7 +80,7 @@ from zeta.providers.codex import CodexStreamError
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
-from zeta.runtime.loop._completion import observed_completion
+from zeta.runtime.loop._completion import complete_delivery
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog, SkillMeta
 from zeta.skills.agent_catalog import AgentCatalog
@@ -6798,6 +6798,25 @@ async def test_pending_store_lock_rejects_event_loop_thread(tmp_path: Path) -> N
             operation()
 
 
+class EarlyCloseThenAnswerBackend(CompletionBackend):
+    def __init__(self, first_error: BaseException | None = None) -> None:
+        self.calls: list[list[Message]] = []
+        self.first_error = first_error
+
+    async def complete(self, messages, tool_schemas):
+        del tool_schemas
+        self.calls.append(list(messages))
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
+        if len(self.calls) == 1:
+            if self.first_error is not None:
+                raise self.first_error
+            return
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+        )
+
+
 def _task_exit_input(task_id: str) -> pending_delivery_module.NotificationInput:
     return pending_delivery_module.NotificationInput(
         "task_exit",
@@ -7361,6 +7380,209 @@ async def test_provider_error_does_not_ack_staged_prompt(
 
 
 @pytest.mark.asyncio
+async def test_early_close_commits_staged_delivery_only_after_successful_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def retry_now(*_args, **_kwargs) -> bool:
+        return True
+
+    backend = EarlyCloseThenAnswerBackend()
+    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    prompt = await loop.step_delivery.produce(
+        pending_delivery_module.PromptInput(
+            "follow up", MessageOrigin.AGENT_SEND, None
+        )
+    )
+    notification = await loop.step_delivery.produce(_task_exit_input("retry-task"))
+
+    events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    assert len(backend.calls) == 2
+    prompt_id = prompt.entries[0].id
+    assert all(
+        sum(
+            message.metadata.get("zeta.pending_prompt_id") == prompt_id
+            for message in request
+        )
+        == 1
+        for request in backend.calls
+    )
+    assert all(
+        sum(
+            notification.entries[0].id
+            in message.metadata.get("zeta.step_delivery", {}).get(
+                "notification_ids", []
+            )
+            for message in request
+        )
+        == 1
+        for request in backend.calls
+    )
+    delivered = [
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED
+    ]
+    reset = next(
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.ASSISTANT_RESET
+    )
+    delivered_notification = [
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.AGENT_NOTIFICATION
+        and event.data.get("notification_id") == notification.entries[0].id
+    ]
+    assert len(delivered) == 1
+    assert delivered[0] > reset
+    assert len(delivered_notification) == 1
+    assert delivered_notification[0] > reset
+    assert sum(
+        message.metadata.get("zeta.pending_prompt_id") == prompt_id
+        for message in store.messages()
+    ) == 1
+    assert await asyncio.to_thread(store.pending_prompts) == []
+    assert store.agent_notifications() == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_early_close_backoff_keeps_staged_delivery_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backoff_started = asyncio.Event()
+
+    async def wait_for_cancel(*_args, **_kwargs) -> bool:
+        backoff_started.set()
+        await asyncio.Event().wait()
+        return True
+
+    backend = EarlyCloseThenAnswerBackend()
+    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", wait_for_cancel)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    prompt = await loop.step_delivery.produce(
+        pending_delivery_module.PromptInput(
+            "follow up", MessageOrigin.AGENT_SEND, None
+        )
+    )
+    notification = await loop.step_delivery.produce(_task_exit_input("retry-task"))
+    first_events: list[StreamEvent] = []
+
+    async def consume_first_turn() -> None:
+        async for event in loop.run_turn("start", origin=MessageOrigin.USER):
+            first_events.append(event)
+
+    turn = asyncio.create_task(consume_first_turn())
+    await backoff_started.wait()
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert not any(
+        event.type
+        in {
+            StreamEventType.CHILD_MESSAGE_DELIVERED,
+            StreamEventType.AGENT_NOTIFICATION,
+        }
+        for event in first_events
+    )
+    assert [entry.id for entry in await asyncio.to_thread(store.pending_prompts)] == [
+        prompt.entries[0].id
+    ]
+    assert [entry.id for entry in store.agent_notifications()] == [
+        notification.entries[0].id
+    ]
+
+    async def retry_now(*_args, **_kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    retry_events = await _collect(
+        loop.run_turn("resume", origin=MessageOrigin.USER)
+    )
+
+    assert sum(
+        event.type is StreamEventType.CHILD_MESSAGE_DELIVERED
+        for event in retry_events
+    ) == 1
+    assert sum(
+        event.type is StreamEventType.AGENT_NOTIFICATION
+        and event.data.get("notification_id") == notification.entries[0].id
+        for event in retry_events
+    ) == 1
+    assert sum(
+        message.metadata.get("zeta.pending_prompt_id") == prompt.entries[0].id
+        for message in store.messages()
+    ) == 1
+    assert await asyncio.to_thread(store.pending_prompts) == []
+    assert store.agent_notifications() == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_stall_commits_staged_prompt_only_after_successful_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StallError(RuntimeError):
+        retryable = True
+        is_stall = True
+        stall_seconds = 90.0
+        retry_after = 0.0
+
+    async def retry_now(*_args, **_kwargs) -> bool:
+        return True
+
+    backend = EarlyCloseThenAnswerBackend(StallError("provider stalled"))
+    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    await loop.step_delivery.produce(
+        pending_delivery_module.PromptInput(
+            "follow up", MessageOrigin.AGENT_SEND, None
+        )
+    )
+
+    events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    reset = next(
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.ASSISTANT_RESET
+    )
+    delivered = [
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED
+    ]
+    assert len(backend.calls) == 2
+    assert len(delivered) == 1
+    assert delivered[0] > reset
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_provider_error_root_exit_admits_terminal_producer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7395,7 +7617,7 @@ async def test_provider_error_root_exit_admits_terminal_producer(
 
 
 @pytest.mark.asyncio
-async def test_provider_event_publishes_exact_staged_ids_before_acknowledgement(
+async def test_accepted_delivery_publishes_exact_staged_ids_before_acknowledgement(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -7408,13 +7630,6 @@ async def test_provider_event_publishes_exact_staged_ids_before_acknowledgement(
     assert prepared.prompt_id == prompt.entries[0].id
     assert prepared.notification_ids == (notification.entries[0].id,)
     publication_checked = False
-
-    async def provider():
-        yield StreamEvent(StreamEventType.MESSAGE_START)
-        yield StreamEvent(
-            StreamEventType.MESSAGE_END,
-            message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
-        )
 
     def publications(value: object):
         nonlocal publication_checked
@@ -7431,10 +7646,7 @@ async def test_provider_event_publishes_exact_staged_ids_before_acknowledgement(
 
     loop = asyncio.get_running_loop()
     events = await _collect(
-        observed_completion(
-            provider(),
-            store,
-            None,
+        complete_delivery(
             flow.active_publications,
             flow.acknowledge_active,
             publications,
@@ -7442,7 +7654,6 @@ async def test_provider_event_publishes_exact_staged_ids_before_acknowledgement(
     )
     assert publication_checked
     assert events[0].type is StreamEventType.CHILD_MESSAGE_DELIVERED
-    assert events[1].type is StreamEventType.MESSAGE_START
     assert prompt.entries[0].id not in store._active_pending_prompt_entries
     assert notification.entries[0].id not in store._active_notifications
 
@@ -7468,9 +7679,6 @@ async def test_cancel_after_notification_ack_commit_keeps_completion_visible(
 
     monkeypatch.setattr(type(store), "_run_durable_write", pause_after_ack_commit)
 
-    async def provider():
-        yield StreamEvent(StreamEventType.MESSAGE_START)
-
     def publications(value: object):
         assert isinstance(value, pending_delivery_module.DeliveryPublications)
         assert [entry.id for entry in value.notifications] == [
@@ -7478,10 +7686,7 @@ async def test_cancel_after_notification_ack_commit_keeps_completion_visible(
         ]
         return iter((StreamEvent(StreamEventType.AGENT_NOTIFICATION),))
 
-    stream = observed_completion(
-        provider(),
-        store,
-        None,
+    stream = complete_delivery(
         flow.active_publications,
         flow.acknowledge_active,
         publications,
@@ -7511,19 +7716,13 @@ async def test_cancel_after_notification_publication_retries_model_delivery_once
     prepared = await flow.prepare_request("terminal_fallback", [], None)
     assert prepared.notification_ids == (notification.entries[0].id,)
 
-    provider_calls = 0
-
-    async def provider():
-        nonlocal provider_calls
-        provider_calls += 1
-        assert sum(
-            notification.entries[0].id
-            in message.metadata.get("zeta.step_delivery", {}).get(
-                "notification_ids", []
-            )
-            for message in prepared.messages
-        ) == 1
-        yield StreamEvent(StreamEventType.MESSAGE_START)
+    assert sum(
+        notification.entries[0].id
+        in message.metadata.get("zeta.step_delivery", {}).get(
+            "notification_ids", []
+        )
+        for message in prepared.messages
+    ) == 1
 
     def publications(value: object):
         assert isinstance(value, pending_delivery_module.DeliveryPublications)
@@ -7539,10 +7738,7 @@ async def test_cancel_after_notification_publication_retries_model_delivery_once
             )
         )
 
-    first = observed_completion(
-        provider(),
-        store,
-        None,
+    first = complete_delivery(
         flow.active_publications,
         flow.acknowledge_active,
         publications,
@@ -7554,21 +7750,16 @@ async def test_cancel_after_notification_publication_retries_model_delivery_once
         notification.entries[0].id
     ]
 
-    retry = observed_completion(
-        provider(),
-        store,
-        None,
+    retry = complete_delivery(
         flow.active_publications,
         flow.acknowledge_active,
         publications,
     )
     retry_publication = await anext(retry)
     assert retry_publication.data["notification_id"] == notification.entries[0].id
-    assert (await anext(retry)).type is StreamEventType.MESSAGE_START
     with pytest.raises(StopAsyncIteration):
         await anext(retry)
 
-    assert provider_calls == 2
     assert store.agent_notifications() == []
     store.close()
 
