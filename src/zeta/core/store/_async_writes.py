@@ -77,7 +77,6 @@ class AsyncDurableWritesMixin:
         method_name: str,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-        baseline: tuple[int, bytes],
     ) -> Any:
         """Run a write against isolated state; the resident store stays loop-owned."""
         try:
@@ -104,21 +103,12 @@ class AsyncDurableWritesMixin:
                     if persistent
                     else writer._detach_log_state()
                 )
-                if (
-                    writer_baseline == baseline
-                    and writer._full_reload_count == full_reload_count
-                ):
-                    installed_delta = self._owned_installed_delta(
-                        tuple(state.entries[writer_baseline[0] :])
-                    )
-                else:
-                    installed_delta = self._installed_delta_from_baseline(
-                        state.entries, baseline
-                    )
                 return (
                     result,
-                    replace(state, installed_delta=installed_delta),
+                    state,
                     writer.take_persisted_appends(),
+                    writer_baseline,
+                    writer._full_reload_count != full_reload_count,
                 )
             finally:
                 if not persistent:
@@ -178,6 +168,24 @@ class AsyncDurableWritesMixin:
         state = self._load_detached_store_state()
         delta = self._installed_delta_from_baseline(state.log.entries, baseline)
         return replace(state, log=replace(state.log, installed_delta=delta))
+
+    def _run_durable_write_with_delta(
+        self: ConversationStore,
+        method_name: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        baseline: tuple[int, bytes],
+    ) -> tuple[Any, Any, Any]:
+        result, state, receipts, writer_baseline, reloaded = self._run_durable_write(
+            method_name, args, kwargs
+        )
+        if writer_baseline == baseline and not reloaded:
+            delta = self._owned_installed_delta(
+                tuple(state.entries[writer_baseline[0] :])
+            )
+        else:
+            delta = self._installed_delta_from_baseline(state.entries, baseline)
+        return result, replace(state, installed_delta=delta), receipts
 
     def _publication_fence(self: ConversationStore) -> _PublicationFence:
         """Capture every owner field that a recovery refresh may replace."""
@@ -333,7 +341,7 @@ class AsyncDurableWritesMixin:
         try:
             return asyncio.get_running_loop().run_in_executor(
                 None,
-                self._run_durable_write,
+                self._run_durable_write_with_delta,
                 method_name,
                 args,
                 kwargs,
