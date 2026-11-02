@@ -847,6 +847,8 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
         return original_install(candidate, state)
 
     monkeypatch.setattr(ConversationStore, "_install_log_state", observed_install)
+    # Guard the outgoing resident branch too: the loop detaches it during install.
+    store._entries = ObservedEntries(store._entries)
 
     await store.append_message_async(message(MessageRole.ASSISTANT, "kept"))
     observe_loop_access = False
