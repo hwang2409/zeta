@@ -122,9 +122,8 @@ class PendingPromptQueue:
             raise ValueError("pending prompt text must be a nonempty string")
         if len(text) > MAX_PENDING_PROMPT_TEXT:
             raise ValueError("pending prompt text is too long")
+        reload_started = time.monotonic()
         with self._lock(deadline=deadline):
-            reload_started = time.monotonic()
-            self._store._load()
             if (
                 deadline is not None
                 and reload_started < deadline <= time.monotonic()
@@ -142,12 +141,10 @@ class PendingPromptQueue:
 
     def pending(self) -> list[ConversationEntry]:
         with self._lock():
-            self._store._load()
             return self._pending_unlocked()
 
     def acknowledge(self, prompt_id: str) -> None:
         with self._lock():
-            self._store._load()
             branch = self._store.replay()
             prompts = [entry for entry in branch if entry.type == "pending_prompt"]
             if not any(entry.id == prompt_id for entry in prompts):
@@ -164,7 +161,6 @@ class PendingPromptQueue:
 
     def close_if_empty(self) -> list[ConversationEntry]:
         with self._lock():
-            self._store._load()
             pending = self._pending_unlocked()
             if not pending and not self._queue_closed_unlocked():
                 self._store._append_row_unlocked("pending_queue_closed", {})
@@ -172,7 +168,6 @@ class PendingPromptQueue:
 
     def close(self) -> None:
         with self._lock():
-            self._store._load()
             if not self._queue_closed_unlocked():
                 self._store._append_row_unlocked("pending_queue_closed", {})
 
@@ -185,7 +180,6 @@ class PendingPromptQueue:
     ) -> str | None:
         """Atomically close admission and persist one accepted finish report."""
         with self._lock():
-            self._store._load()
             transition = self._terminal_transition_unlocked()
             if transition is not None:
                 return (
@@ -216,7 +210,6 @@ class PendingPromptQueue:
     def cancel_explicit_child(self) -> bool:
         """Close admission unless an accepted finish already owns termination."""
         with self._lock():
-            self._store._load()
             transition = self._terminal_transition_unlocked()
             if transition is not None:
                 return False
@@ -235,7 +228,6 @@ class PendingPromptQueue:
 
     def explicit_finish_report(self) -> dict[str, object] | None:
         with self._lock():
-            self._store._load()
             return self.explicit_finish_report_snapshot()
 
     def explicit_finish_report_snapshot(self) -> dict[str, object] | None:
@@ -252,12 +244,10 @@ class PendingPromptQueue:
     ) -> bool:
         """Atomically reject a nudge when durable input or termination exists."""
         with self._lock():
-            self._store._load()
             return self._idle_nudge_eligible_unlocked(persisted_notification_ids)
 
     def terminal_transition(self) -> str | None:
         with self._lock():
-            self._store._load()
             transition = self._terminal_transition_unlocked()
             return str(transition.data["action"]) if transition is not None else None
 

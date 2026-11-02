@@ -170,7 +170,6 @@ class ClientDeliveryMixin:
         if not ids:
             return 0
         with self._append_lock():
-            self._load()
             ids = [
                 delivery_id
                 for delivery_id in ids
@@ -210,7 +209,6 @@ class ClientDeliveryMixin:
         """Atomically append one acceptance and its optional user message."""
 
         with self._append_lock():
-            self._load()
             if self.client_delivery_outcome(delivery_id) is not None:
                 raise ValueError(f"client delivery already exists: {delivery_id}")
             rows: list[tuple[str, dict[str, object]]] = [
@@ -296,7 +294,6 @@ class ClientDeliveryMixin:
         self: ConversationStore, batch: ClientSteeringBatch
     ) -> None:
         with self._append_lock():
-            self._load()
             rows: list[tuple[str, dict[str, object]]] = []
             for queued in batch._queued:
                 delivery_id = queued.delivery_id
@@ -329,7 +326,6 @@ class ClientDeliveryMixin:
         delivery_ids = [item.delivery_id for item in queued if item.delivery_id is not None]
         if delivery_ids:
             with self._append_lock():
-                self._load()
                 rows = [
                     _transition_row(delivery_id, "dropped", reason)
                     for delivery_id in delivery_ids

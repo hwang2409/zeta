@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import warnings
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -21,6 +22,7 @@ from zeta.core.store import (
     ConversationIntegrityError,
     ConversationStore,
 )
+from zeta.core.store._step_delivery import PromptInput
 from zeta.core.store._validation import (
     NOTIFICATION_KINDS,
     NOTIFICATION_VALIDATORS,
@@ -672,6 +674,496 @@ def test_tui_notification_presentation_is_durable_but_not_consumption(
     assert [entry.id for entry in reopened.agent_notifications()] == [notification.id]
     reopened.acknowledge_agent_notification(notification.id)
     assert reopened.agent_notifications() == []
+
+
+def test_installed_hook_emits_after_durable_resident_single_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-single")
+    write_returned = False
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    original_write_bytes = store._write_bytes
+
+    def tracked_write_bytes(data: bytes) -> None:
+        nonlocal write_returned
+        original_write_bytes(data)
+        write_returned = True
+
+    def installed(delta: tuple[ConversationEntry, ...] | str) -> None:
+        assert write_returned
+        assert delta != "reset"
+        assert delta[-1].id in store._entry_ids
+        assert store._entries[-1].id == delta[-1].id
+        durable = json.loads(store.path.read_bytes().splitlines()[-1])
+        assert (durable["seq"], durable["id"]) == (delta[-1].seq, delta[-1].id)
+        observed.append(delta)
+
+    monkeypatch.setattr(store, "_write_bytes", tracked_write_bytes)
+    store.on_entries_installed = installed
+
+    entry = store.append_message(message(MessageRole.ASSISTANT, "installed"))
+
+    assert [[(row.seq, row.id) for row in delta] for delta in observed] == [
+        [(entry.seq, entry.id)]
+    ]
+
+
+def test_installed_hook_failure_does_not_fail_committed_append(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-failure")
+
+    def fail(_delta: tuple[ConversationEntry, ...] | str) -> None:
+        raise RuntimeError("observer failed")
+
+    store.on_entries_installed = fail
+
+    entry = store.append_message(message(MessageRole.ASSISTANT, "committed"))
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    assert store._entries[-1].id == entry.id
+    assert reopened._entries[-1] == entry
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+    later = store.append_message(message(MessageRole.ASSISTANT, "later"))
+
+    assert observed == [(later,)]
+    assert [record.getMessage() for record in caplog.records].count(
+        "installed-row callback failed"
+    ) == 1
+
+
+def test_installed_hook_receives_owned_delta(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-owned")
+
+    def mutate(delta: tuple[ConversationEntry, ...] | str) -> None:
+        assert delta != "reset"
+        delta[0].data["message"]["content"][0]["text"] = "corrupted"
+
+    store.on_entries_installed = mutate
+
+    entry = store.append_message(message(MessageRole.ASSISTANT, "original"))
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    assert entry.data["message"]["content"][0]["text"] == "original"
+    assert store._entries[-1].data["message"]["content"][0]["text"] == "original"
+    assert reopened._entries[-1].data["message"]["content"][0]["text"] == "original"
+
+
+def test_installed_hook_runs_after_flock_and_can_reenter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-reentrant")
+    gate = threading.Lock()
+    real_flock = __import__("fcntl").flock
+
+    def gated_flock(fd: int, operation: int) -> None:
+        if operation & __import__("fcntl").LOCK_UN:
+            real_flock(fd, operation)
+            gate.release()
+            return
+        assert gate.acquire(blocking=False), "callback re-entered before flock release"
+        real_flock(fd, operation)
+
+    monkeypatch.setattr("zeta.core.store._store.fcntl.flock", gated_flock)
+    observed: list[str] = []
+
+    def reenter(_delta: tuple[ConversationEntry, ...] | str) -> None:
+        store.on_entries_installed = None
+        observed.append(store.append_message(message(MessageRole.ASSISTANT, "inner")).id)
+
+    store.on_entries_installed = reenter
+
+    outer = store.append_message(message(MessageRole.ASSISTANT, "outer"))
+
+    assert outer.id != observed[0]
+    assert [row.data["message"]["content"][0]["text"] for row in store._entries] == [
+        "outer",
+        "inner",
+    ]
+
+
+def test_flock_install_paths_allow_reentrant_callback_append(tmp_path: Path) -> None:
+    def run_reentrant(
+        store: ConversationStore, action: Callable[[], object]
+    ) -> None:
+        observed: list[tuple[ConversationEntry, ...] | str] = []
+
+        def installed(delta: tuple[ConversationEntry, ...] | str) -> None:
+            observed.append(delta)
+            store.on_entries_installed = None
+            store.append_message(message(MessageRole.ASSISTANT, "inner"))
+
+        store.on_entries_installed = installed
+        action()
+        assert len(observed) == 1
+        assert store.messages()[-1].content[0].text == "inner"
+
+    appended = ConversationStore(tmp_path, session_id="installed-path-append")
+    run_reentrant(
+        appended,
+        lambda: appended.append_message(message(MessageRole.ASSISTANT, "outer")),
+    )
+
+    reloaded = ConversationStore(tmp_path, session_id="installed-path-reload")
+    foreign = ConversationStore(tmp_path, session_id=reloaded.session_id)
+    foreign.append_message(message(MessageRole.ASSISTANT, "foreign"))
+    run_reentrant(reloaded, reloaded.refresh)
+
+    forked = ConversationStore(tmp_path, session_id="installed-path-fork")
+    checkpoint = forked.append_checkpoint("base")
+    forked.append_message(message(MessageRole.ASSISTANT, "discarded"))
+    run_reentrant(forked, lambda: forked.append_fork(str(checkpoint.seq)))
+
+    switched = ConversationStore(tmp_path, session_id="installed-path-switch")
+    checkpoint = switched.append_checkpoint("base")
+    switched.append_message(message(MessageRole.ASSISTANT, "discarded"))
+    foreign = ConversationStore(tmp_path, session_id=switched.session_id)
+    foreign.append_fork(str(checkpoint.seq))
+    run_reentrant(switched, switched.refresh)
+
+    repaired = ConversationStore(tmp_path, session_id="installed-path-repair")
+    repaired.append_message(message(MessageRole.ASSISTANT, "kept"))
+    with repaired.path.open("ab") as handle:
+        handle.write(b'{"seq":3,"id":"torn"')
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        run_reentrant(
+            repaired,
+            lambda: repaired.append_message(message(MessageRole.ASSISTANT, "after")),
+        )
+
+
+def test_installed_hook_reentrant_append_emits_in_log_order(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-reentrant-order")
+    observed: list[str] = []
+
+    def reenter(delta: tuple[ConversationEntry, ...] | str) -> None:
+        assert delta != "reset"
+        text = delta[0].data["message"]["content"][0]["text"]
+        if text == "outer":
+            store.append_message(message(MessageRole.ASSISTANT, "inner"))
+        observed.append(text)
+
+    store.on_entries_installed = reenter
+
+    store.append_message(message(MessageRole.ASSISTANT, "outer"))
+
+    durable = [
+        row.data["message"]["content"][0]["text"] for row in store._entries
+    ]
+    assert observed == durable == ["outer", "inner"]
+
+
+def test_installed_hook_serializes_two_threads_in_durable_order(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-two-threads")
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_returned = threading.Event()
+    observed: list[int] = []
+    active_callbacks = 0
+    callbacks_lock = threading.Lock()
+
+    def installed(delta: tuple[ConversationEntry, ...] | str) -> None:
+        nonlocal active_callbacks
+        assert delta != "reset"
+        with callbacks_lock:
+            active_callbacks += 1
+            assert active_callbacks == 1
+            observed.append(delta[0].seq)
+        if delta[0].seq == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+        with callbacks_lock:
+            active_callbacks -= 1
+
+    def append(text: str, returned: threading.Event | None = None) -> None:
+        store.append_message(message(MessageRole.ASSISTANT, text))
+        if returned is not None:
+            returned.set()
+
+    store.on_entries_installed = installed
+    owner = threading.Thread(target=append, args=("one",))
+    owner.start()
+    assert first_entered.wait(timeout=5)
+
+    worker = threading.Thread(target=append, args=("two", second_returned))
+    worker.start()
+    assert second_returned.wait(timeout=5)
+    assert observed == [1]
+
+    release_first.set()
+    owner.join(timeout=5)
+    worker.join(timeout=5)
+
+    assert not owner.is_alive()
+    assert not worker.is_alive()
+    assert observed == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_async_appends_encode_only_new_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-append-cost")
+    store.append_many([("warning", {"message": str(index)}) for index in range(400)])
+    await store._to_thread_durable(store._warm_step_delivery_writer)
+    original_encode = store._encoded_entry_line
+    encoded_rows = 0
+
+    def tracked_encode(entry: ConversationEntry) -> bytes:
+        nonlocal encoded_rows
+        encoded_rows += 1
+        return original_encode(entry)
+
+    monkeypatch.setattr(
+        ConversationStore, "_encoded_entry_line", staticmethod(tracked_encode)
+    )
+    for index in range(25):
+        await store._to_thread_durable(
+            store._commit_delivery_input,
+            PromptInput(f"prompt-{index}", MessageOrigin.AGENT_SEND, None),
+        )
+
+    assert encoded_rows == 25
+
+
+def test_installed_hook_emits_batch_in_log_order(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-batch")
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    entries = store.append_many(
+        [("warning", {"message": "one"}), ("warning", {"message": "two"})]
+    )
+
+    assert observed == [tuple(store._entries)]
+    assert [(row.seq, row.id) for row in observed[0]] == [
+        (row.seq, row.id) for row in entries
+    ]
+    assert type(store._entry_prefix_digest) is bytes
+    assert len(store._entry_prefix_digest) == 32
+
+
+@pytest.mark.asyncio
+async def test_installed_hook_async_failure_keeps_receipt_bookkeeping(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-async-failure")
+    receipts_accepted = False
+    original_accept = store._accept_persisted_appends
+
+    def accept(receipts: object) -> None:
+        nonlocal receipts_accepted
+        original_accept(receipts)
+        receipts_accepted = True
+
+    def fail(_delta: tuple[ConversationEntry, ...] | str) -> None:
+        assert receipts_accepted
+        raise RuntimeError("observer failed")
+
+    monkeypatch.setattr(store, "_accept_persisted_appends", accept)
+    store.on_entries_installed = fail
+
+    entry = await store.append_message_async(message(MessageRole.ASSISTANT, "committed"))
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    assert receipts_accepted
+    assert store._entries[-1].id == entry.id
+    assert reopened._entries[-1] == entry
+    assert [record.getMessage() for record in caplog.records].count(
+        "installed-row callback failed"
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_installed_hook_async_writer_publishes_on_owner_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-async")
+    owner_thread = threading.get_ident()
+    copy_threads: list[int] = []
+    observed: list[tuple[int, tuple[ConversationEntry, ...] | str]] = []
+    original_copy = store._owned_installed_delta
+
+    def tracked_copy(
+        delta: tuple[ConversationEntry, ...] | str,
+    ) -> tuple[ConversationEntry, ...] | str:
+        copy_threads.append(threading.get_ident())
+        return original_copy(delta)
+
+    def installed(delta: tuple[ConversationEntry, ...] | str) -> None:
+        observed.append((threading.get_ident(), delta))
+        assert delta != "reset"
+        delta[0].data["message"]["content"][0]["text"] = "corrupted"
+
+    monkeypatch.setattr(type(store), "_owned_installed_delta", staticmethod(tracked_copy))
+    store.on_entries_installed = installed
+
+    entry = await store.append_message_async(
+        message(MessageRole.ASSISTANT, "worker")
+    )
+
+    assert copy_threads
+    assert owner_thread not in copy_threads
+    assert observed[0][0] == owner_thread
+    assert observed[0][1][0].id == entry.id
+    assert store._entries[-1].data["message"]["content"][0]["text"] == "worker"
+
+
+def test_installed_hook_incremental_reload_emits_foreign_suffix_once(
+    tmp_path: Path,
+) -> None:
+    resident = ConversationStore(tmp_path, session_id="installed-incremental")
+    foreign = ConversationStore(tmp_path, session_id=resident.session_id)
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    resident.on_entries_installed = observed.append
+
+    first = foreign.append_message(message(MessageRole.ASSISTANT, "one"))
+    second = foreign.append_message(message(MessageRole.ASSISTANT, "two"))
+    resident.refresh()
+    resident.refresh()
+
+    assert [[row.id for row in delta] for delta in observed] == [
+        [first.id, second.id]
+    ]
+
+
+def test_installed_hook_full_prefix_reload_emits_only_suffix(tmp_path: Path) -> None:
+    resident = ConversationStore(tmp_path, session_id="installed-full-prefix")
+    resident.append_message(message(MessageRole.ASSISTANT, "old"))
+    foreign = ConversationStore(tmp_path, session_id=resident.session_id)
+    appended = foreign.append_message(message(MessageRole.ASSISTANT, "new"))
+    replacement = resident.path.with_suffix(".replacement")
+    replacement.write_bytes(resident.path.read_bytes())
+    replacement.replace(resident.path)
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    resident.on_entries_installed = observed.append
+
+    resident.refresh()
+
+    assert [[row.id for row in delta] for delta in observed] == [[appended.id]]
+
+
+def test_installed_hook_unchanged_full_reload_emits_nothing(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-unchanged")
+    store.append_message(message(MessageRole.ASSISTANT, "same"))
+    replacement = store.path.with_suffix(".replacement")
+    replacement.write_bytes(store.path.read_bytes())
+    replacement.replace(store.path)
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    store.refresh()
+
+    assert observed == []
+
+
+def test_installed_hook_changed_content_with_same_identity_emits_reset(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-content-reset")
+    original = store.append_message(message(MessageRole.ASSISTANT, "before"))
+    lines = store.path.read_bytes().splitlines(keepends=True)
+    replacement_row = json.loads(lines[1])
+    replacement_row["data"]["message"]["content"][0]["text"] = "after"
+    assert replacement_row["seq"] == original.seq
+    assert replacement_row["id"] == original.id
+    replacement = store.path.with_suffix(".replacement")
+    replacement.write_bytes(
+        lines[0] + json.dumps(replacement_row, separators=(",", ":")).encode() + b"\n"
+    )
+    replacement.replace(store.path)
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    store.refresh()
+
+    assert observed == ["reset"]
+    assert store._entries[0].data["message"]["content"][0]["text"] == "after"
+
+
+def test_installed_hook_non_prefix_reload_emits_reset(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-reset")
+    original = store.append_message(message(MessageRole.ASSISTANT, "old"))
+    final = store.append_message(message(MessageRole.ASSISTANT, "same tip"))
+    rows = store.path.read_text(encoding="utf-8").splitlines()
+    replacement_first = json.loads(rows[1])
+    replacement_final = json.loads(rows[2])
+    replacement_first["id"] = "replacement-id"
+    replacement_final["parent_id"] = "replacement-id"
+    assert replacement_first["id"] != original.id
+    assert replacement_final["id"] == final.id
+    replacement = store.path.with_suffix(".replacement")
+    replacement.write_text(
+        "\n".join(
+            [
+                rows[0],
+                json.dumps(replacement_first, separators=(",", ":")),
+                json.dumps(replacement_final, separators=(",", ":")),
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    replacement.replace(store.path)
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    store.refresh()
+
+    assert observed == ["reset"]
+    assert store._entries[0].id == "replacement-id"
+    assert store._entries[-1].id == final.id
+
+
+def test_installed_hook_fork_keeps_log_order_with_backward_parent(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-fork")
+    checkpoint = store.append_checkpoint("base")
+    store.append_message(message(MessageRole.ASSISTANT, "discarded"))
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    fork = store.append_fork(str(checkpoint.seq))
+
+    assert observed == [(store._entries[-1],)]
+    assert fork.seq > checkpoint.seq
+    assert fork.parent_id == checkpoint.id
+
+
+def test_installed_hook_does_not_access_resident_branch(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-constant-time")
+    entry = store.append_message(message(MessageRole.ASSISTANT, "row"))
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    class BranchAccessGuard(list[ConversationEntry]):
+        def __iter__(self):
+            raise AssertionError("installed hook walked the resident branch")
+
+        def __len__(self):
+            raise AssertionError("installed hook measured the resident branch")
+
+        def __getitem__(self, key: object):
+            raise AssertionError("installed hook indexed the resident branch")
+
+    store._entries = BranchAccessGuard(store._entries)
+    store._publish_entries_installed((entry,))
+
+    assert observed == [(entry,)]
+
+
+def test_close_clears_installed_hook(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-close")
+    store.on_entries_installed = lambda _delta: None
+
+    store.close()
+
+    assert store.on_entries_installed is None
 
 
 @pytest.mark.asyncio
@@ -1955,6 +2447,68 @@ def test_incremental_tail_payload_validation_matches_full_load(
 
     assert incremental_accepted == full_accepted
     assert not incremental_accepted
+
+
+def test_pending_approvals_delivers_foreign_append_after_flock(tmp_path: Path) -> None:
+    script = tmp_path / "pending_approval_reentry.py"
+    script.write_text(
+        '''
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
+
+root = Path(sys.argv[1])
+session_id = "pending-approval-reentry"
+resident = ConversationStore(root, session_id=session_id)
+foreign = """
+from pathlib import Path
+import sys
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import Message, MessageRole, ToolCall, ToolUseContent
+
+store = ConversationStore(Path(sys.argv[1]), session_id=sys.argv[2])
+call = ToolCall("call-1", "echo", {"value": "approved"})
+store.append_message_with_approval_requests(
+    Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
+)
+"""
+subprocess.run([sys.executable, "-c", foreign, str(root), session_id], check=True)
+observed = []
+
+
+def installed(delta):
+    observed.append("reset" if delta == "reset" else [row.id for row in delta])
+    resident.on_entries_installed = None
+    resident.append_message(Message(MessageRole.ASSISTANT, [TextContent("inner")]))
+
+
+resident.on_entries_installed = installed
+pending = resident.pending_approvals()
+print(json.dumps({
+    "observed": observed,
+    "pending": [item[0] for item in pending],
+    "last_text": resident.messages()[-1].content[0].text,
+}))
+'''.strip()
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    result = json.loads(completed.stdout)
+    assert result["pending"] == ["call-1"]
+    assert len(result["observed"]) == 1
+    assert len(result["observed"][0]) == 1
+    assert result["last_text"] == "inner"
 
 
 def test_live_store_tail_syncs_subprocess_append(tmp_path: Path) -> None:

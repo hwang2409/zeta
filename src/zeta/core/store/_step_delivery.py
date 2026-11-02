@@ -132,7 +132,6 @@ def _commit_delivery_input(
     data.setdefault("origin", MessageOrigin.NOTIFICATION.value)
     validate_notification_data(data)
     with store._append_lock(deadline=item.deadline):
-        store._load()
         store.pending_prompt_queue._check_deadline(item.deadline)
         if (
             kind == "child_idle"
@@ -205,7 +204,6 @@ def _commit_notification_mutation(
     store: ConversationStore, kind: DeliveryKind, data: Mapping[str, Any]
 ) -> ProducerResult:
     with store.pending_prompt_queue._lock():
-        store._load()
         if kind == "question_answer_ack":
             entries, rows = _question_answer_ack_rows(store, data)
         else:
@@ -353,7 +351,6 @@ def _stage_delivery_request(
     notification_context: Message | None = None,
 ) -> StagedDelivery:
     with store.pending_prompt_queue._lock():
-        store._load()
         pending_prompts = store.pending_prompt_queue._pending_unlocked()
         pending_notifications = [
             entry
@@ -401,7 +398,6 @@ def _acknowledge_staged_delivery(
     notification_ids: tuple[str, ...],
 ) -> DeliveryPublications:
     with store.pending_prompt_queue._lock():
-        store._load()
         rows: list[tuple[str, dict[str, JSONValue]]] = []
         prompt_entry = store._active_pending_prompt_entries.get(prompt_id or "")
         if prompt_entry is not None:
@@ -433,7 +429,6 @@ def _admit_terminal(
     store: ConversationStore, intent: TerminalIntent
 ) -> tuple[bool, bool]:
     with store.pending_prompt_queue._lock():
-        store._load()
         prompts = store.pending_prompt_queue._pending_unlocked()
         notifications = [
             entry
