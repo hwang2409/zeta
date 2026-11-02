@@ -84,7 +84,7 @@ _zeta() {
                     _arguments '--json[print JSON]' '--refresh[refresh credentials for status]' '--replace[replace existing account]' '1:action:(default login refresh rename status)' '2:account or provider:' '3:new label:'
                     ;;
                 serve)
-                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]' '--auto-memory[enable automatic project memory]' '--no-auto-memory[disable automatic project memory]'
+                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--ws=[WebSocket port]:port:' '*--ws-origin=[allowed browser origin]:URL:' '--provider=[completion provider]:provider:(claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]' '--auto-memory[enable automatic project memory]' '--no-auto-memory[disable automatic project memory]'
                     ;;
                 stalls)
                     _arguments '--top=[top stacks]:count:' '--json[print JSON]'
@@ -155,14 +155,14 @@ def bash_script() -> str:
     while (( index < COMP_CWORD )); do
         token="${COMP_WORDS[index]}"
         case "$token" in
-            --provider|--model|--resume|--token-budget|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
+            --provider|--model|--resume|--token-budget|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--ws|--ws-origin|--cwd|-p|--print)
                 if [[ "${COMP_WORDS[index+1]:-}" == "=" ]]; then
                     (( index += 3 ))
                 else
                     (( index += 2 ))
                 fi
                 ;;
-            --provider=*|--model=*|--resume=*|--token-budget=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
+            --provider=*|--model=*|--resume=*|--token-budget=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--ws=*|--ws-origin=*|--cwd=*|-p*)
                 (( index++ ))
                 ;;
             --)
@@ -206,7 +206,7 @@ def bash_script() -> str:
             COMPREPLY=( $(compgen -W "--json --refresh --replace default login refresh rename status anthropic codex" -- "$cur") )
             ;;
         serve)
-            COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd --tools --disallowed-tools --require-tools --allow-hooks --auto-memory --no-auto-memory" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --port --ws --ws-origin --provider --model --cwd --tools --disallowed-tools --require-tools --allow-hooks --auto-memory --no-auto-memory" -- "$cur") )
             ;;
         stalls)
             COMPREPLY=( $(compgen -W "--top --json" -- "$cur") )

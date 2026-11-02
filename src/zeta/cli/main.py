@@ -343,6 +343,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--port", type=int, help="listen on localhost TCP instead of a Unix socket"
     )
     serve_parser.add_argument(
+        "--ws", dest="ws_port", type=int, help="also listen for WebSocket clients"
+    )
+    serve_parser.add_argument(
+        "--ws-origin",
+        dest="ws_origins",
+        action="append",
+        default=[],
+        metavar="URL",
+        help="allow one exact browser Origin; repeat to allow more",
+    )
+    serve_parser.add_argument(
         "--provider",
         dest="serve_provider",
         type=_provider_name,
@@ -854,6 +865,8 @@ def main(argv: list[str] | None = None) -> int:
                 cwd=args.cwd,
                 socket_path=args.socket_path,
                 port=args.port,
+                ws_port=args.ws_port,
+                ws_origins=tuple(args.ws_origins),
                 provider=args.serve_provider or args.provider,
                 model=args.serve_model or args.model,
                 tools=args.serve_tools if args.serve_tools is not None else args.tools,
