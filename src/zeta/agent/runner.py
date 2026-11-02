@@ -707,6 +707,19 @@ async def run_agent_tool(
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
     try:
+        await loop.store.append_child_run_started_async(
+            child_instance_id,
+            parent_identity if loop.agent_instance_id is not None else None,
+            stored_agent_type,
+            description,
+            _now(),
+        )
+    except BaseException:
+        loop._background_owner.mark_store_finished(child_store)
+        loop._background_owner.release_unused_stores()
+        await loop._background_owner.wait_for_store_closes()
+        raise
+    try:
         child_store.start_agent_lifecycle(
             handle=child_instance_id,
             started_at=_now(),
