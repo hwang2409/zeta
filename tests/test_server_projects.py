@@ -8,6 +8,7 @@ import random
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from zeta.project_registry import ProjectRegistry
 from zeta.server import ZetaServer
 from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
+from zeta.server import slash_commands
 from zeta.server.slash_commands import run_command
 
 
@@ -66,6 +68,15 @@ def _hold_registry_lock(path: Path) -> tuple[threading.Event, threading.Event, t
     thread.start()
     assert acquired.wait(2)
     return acquired, release, thread
+
+
+def _wait_for_path(path: Path, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.01)
+    return path.exists()
 
 
 def _filesystem_snapshot(root: Path) -> dict[str, tuple[int, int, int]]:
@@ -217,8 +228,11 @@ async def test_serve_blocking_git_does_not_block_ping(
     assert real_git is not None
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    git_started = tmp_path / "git-started"
+    git_release = tmp_path / "git-release"
     (fake_bin / "git").write_text(
-        f"#!/bin/sh\nsleep 1\nexec {real_git} \"$@\"\n", encoding="utf-8"
+        f"#!/bin/sh\ntouch {git_started}\nwhile [ ! -e {git_release} ]; do sleep 0.01; done\nexec {real_git} \"$@\"\n",
+        encoding="utf-8",
     )
     (fake_bin / "git").chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
@@ -227,6 +241,20 @@ async def test_serve_blocking_git_does_not_block_ping(
     holder = None
     try:
         await _hello(reader, writer, ["ping"])
+        event_loop_thread = threading.get_ident()
+        if method == "slash_run":
+            registry_started = threading.Event()
+            registry_release = threading.Event()
+            registry_thread: list[int] = []
+            original_build_registry = slash_commands.build_registry
+
+            def blocking_build_registry(runtime):
+                registry_thread.append(threading.get_ident())
+                registry_started.set()
+                registry_release.wait(1)
+                return original_build_registry(runtime)
+
+            monkeypatch.setattr(slash_commands, "build_registry", blocking_build_registry)
         client = server._client
         assert client is not None
         _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
@@ -237,13 +265,20 @@ async def test_serve_blocking_git_does_not_block_ping(
         )
         request_method = {"new_session": "new_session", "resume": "resume", "slash_run": "slash_run"}[method]
         operation = asyncio.create_task(client._dispatch(2, request_method, params))
-        await asyncio.sleep(0.05)
+        git_was_started = await asyncio.to_thread(_wait_for_path, git_started, 1)
+        if method == "slash_run":
+            assert await asyncio.to_thread(registry_started.wait, 1)
         assert not operation.done()
         ping = asyncio.create_task(client._dispatch(3, "ping", {}))
         assert await asyncio.wait_for(ping, 0.25) == {"pong": True}
+        git_release.touch()
+        if method == "slash_run":
+            registry_release.set()
         release.set()
         holder.join(2)
         await asyncio.wait_for(operation, 8)
+        if method == "slash_run":
+            assert registry_thread and registry_thread[0] != event_loop_thread
     finally:
         if release is not None:
             release.set()
