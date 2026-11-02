@@ -29,6 +29,7 @@ from ..core.session_files import (
     SessionFileReplaced,
     child_directory,
     open_session_file,
+    read_session_file,
     require_off_loop_lock,
 )
 from ..oauth import (
@@ -305,6 +306,28 @@ class AccountStore:
                 value["labels"][key] = label
             self._write_registry(home_fd, value)
         return f"renamed {account} to {account.provider}:{label}"
+
+    def logout(self, account: AccountId, *, sessions_root: Path) -> str:
+        """Remove one local account while no live session pins it."""
+
+        with self._home() as home_fd, self._registry_guard(home_fd):
+            value = self._read_registry(home_fd)
+            key = str(account)
+            if key not in value["accounts"]:
+                raise AccountError(f"account {account} does not exist")
+            with self._lifecycle_guard(home_fd, account):
+                if _live_session_pins(sessions_root, account):
+                    raise AccountError(
+                        f"account {account} is pinned by a live session; close it first"
+                    )
+                _remove_account_directory(home_fd, account)
+                cleared_default = value["defaults"].pop(account.provider, None) == key
+                value["accounts"].pop(key)
+                value["labels"].pop(key, None)
+                self._write_registry(home_fd, value)
+            _remove_account_lock_directory(home_fd, account)
+        suffix = f"; cleared {account.provider} default" if cleared_default else ""
+        return f"logged out {account}{suffix}"
 
     def resolve_qualified_reference(self, value: str) -> AccountId:
         try:
@@ -790,6 +813,104 @@ def _bounded_guard(
         yield home_fd
     finally:
         stack.close()
+
+
+def _live_child_pins(session_path: Path, account: AccountId) -> bool:
+    from ..session_liveness import session_is_live
+
+    agents = session_path / "agents"
+    try:
+        agents_info = agents.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(agents_info.st_mode):
+        return False
+    for root, directories, files in os.walk(agents, followlinks=False):
+        directories[:] = [
+            name for name in directories if not (Path(root) / name).is_symlink()
+        ]
+        if "agent_lifecycle.json" not in files or not session_is_live(Path(root)):
+            continue
+        directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            lifecycle = json.loads(read_session_file(directory_fd, "agent_lifecycle.json"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AccountError("could not verify live child account pins") from exc
+        finally:
+            os.close(directory_fd)
+        if not isinstance(lifecycle, Mapping) or not isinstance(
+            lifecycle.get("selected_accounts"), Mapping
+        ):
+            raise AccountError("could not verify live child account pins")
+        if lifecycle["selected_accounts"].get(account.provider) == str(account):
+            return True
+    return False
+
+
+def _live_session_pins(sessions_root: Path, account: AccountId) -> bool:
+    from ..core.session import SessionError, SessionManager
+    from ..session_liveness import session_is_live
+
+    try:
+        entries = list(os.scandir(sessions_root))
+    except FileNotFoundError:
+        return False
+    manager = SessionManager(sessions_root.parent)
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        path = sessions_root / entry.name
+        if session_is_live(path):
+            try:
+                metadata = manager.read_metadata(entry.name)
+            except (OSError, SessionError, ValueError) as exc:
+                raise AccountError("could not verify live session account pins") from exc
+            if metadata.selected_accounts.get(account.provider) == str(account):
+                return True
+        if _live_child_pins(path, account):
+            return True
+    return False
+
+
+def _remove_directory_files(directory_fd: int, allowed: set[str]) -> None:
+    for name in os.listdir(directory_fd):
+        if name not in allowed:
+            raise AccountError("account directory contains an unexpected file")
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise AccountError("account directory contains an unsafe file")
+        os.unlink(name, dir_fd=directory_fd)
+    _fsync_directory(directory_fd)
+
+
+def _remove_account_directory(home_fd: int, account: AccountId) -> None:
+    try:
+        with (
+            child_directory(home_fd, "accounts") as accounts_fd,
+            child_directory(accounts_fd, account.provider) as provider_fd,
+        ):
+            with child_directory(provider_fd, account.name) as account_fd:
+                _remove_directory_files(
+                    account_fd, {"oauth.json", "usage.json", "publish-pending.json"}
+                )
+            os.rmdir(account.name, dir_fd=provider_fd)
+            _fsync_directory(provider_fd)
+    except FileNotFoundError:
+        return
+
+
+def _remove_account_lock_directory(home_fd: int, account: AccountId) -> None:
+    try:
+        with (
+            child_directory(home_fd, "account-locks") as locks_fd,
+            child_directory(locks_fd, account.provider) as provider_fd,
+        ):
+            with child_directory(provider_fd, account.name) as account_fd:
+                _remove_directory_files(account_fd, {"lifecycle.lock", "usage.lock"})
+            os.rmdir(account.name, dir_fd=provider_fd)
+            _fsync_directory(provider_fd)
+    except FileNotFoundError:
+        return
 
 
 @contextmanager

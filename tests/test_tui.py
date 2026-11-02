@@ -13335,7 +13335,6 @@ async def test_tui_accounts_named_login_uses_supplied_label(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
-    account = AccountId("codex", "first")
     await asyncio.to_thread(
         named_account_credentials(home, "codex", "first").save,
         OAuthTokens("access", "refresh", 9_999_999_999),
@@ -13353,7 +13352,7 @@ async def test_tui_accounts_named_login_uses_supplied_label(
     app._presenter.print_unit = lambda _renderable: None
     logins: list[tuple[str, str]] = []
 
-    def login(provider: str, label: str) -> None:
+    def login(_home: Path, provider: str, label: str) -> None:
         with pytest.raises(RuntimeError, match="no running event loop"):
             asyncio.get_running_loop()
         logins.append((provider, label))
@@ -13363,6 +13362,7 @@ async def test_tui_accounts_named_login_uses_supplied_label(
         assert await app.slash_accounts("login codex personal") == "logged in as codex:personal"
         assert logins == [("codex", "personal")]
     finally:
+        await app.close()
         opened.store.close()
 
 
@@ -13390,7 +13390,7 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
     loop.account_context = context
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
     rendered: list[Panel] = []
-    app._presenter.print_unit = rendered.append
+    app._presenter.print_unit = lambda renderable: rendered.append(renderable) or renderable
     app._transcript.replace = lambda _unit, replacement: rendered.append(replacement) or replacement
     logout = AccountStore.logout
     off_loop_calls = 0
@@ -13408,7 +13408,7 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
         app.accounts_picker_move(1)
         assert app.accounts_picker_logout() is None
         confirmation = StringIO()
-        Console(file=confirmation, force_terminal=False, width=80).print(rendered[-1])
+        Console(file=confirmation, force_terminal=False, width=160).print(rendered[-1])
         assert "press x again to log out codex:removed" in Text.from_ansi(
             confirmation.getvalue()
         ).plain
@@ -13418,8 +13418,9 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
         await task
 
         assert off_loop_calls == 1
-        assert not AccountStore(home).contains(removed)
+        assert not await asyncio.to_thread(AccountStore(home).contains, removed)
     finally:
+        await app.close()
         opened.store.close()
 
 

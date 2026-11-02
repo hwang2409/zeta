@@ -1771,6 +1771,36 @@ def test_cli_logout_refuses_account_pinned_by_live_session(
         opened.store.close()
 
 
+def test_logout_refuses_account_pinned_by_live_child(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    pinned = AccountId("codex", "pinned")
+    current = AccountId("codex", "current")
+    for account in (pinned, current):
+        named_account_credentials(home, account.provider, account.name).save(tokens())
+    store = AccountStore(home)
+    store.set_default(current)
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    manager.record_account_selection(opened.metadata, current, boundary=0)
+    child = ConversationStore(opened.store.session_dir / "agents", session_id="1")
+    child.activate_runtime_lease()
+    child.start_agent_lifecycle(
+        handle=f"{opened.metadata.session_id}:1",
+        started_at="2026-01-01T00:00:00Z",
+        depth=1,
+        agent_type="worker",
+        description="pinned child",
+        selected_accounts={"codex": str(pinned)},
+    )
+    try:
+        with pytest.raises(AccountError, match="live session"):
+            store.logout(pinned, sessions_root=home / "sessions")
+        assert store.contains(pinned)
+    finally:
+        child.close()
+        opened.store.close()
+
+
 def test_cli_logout_unknown_account_is_clear_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

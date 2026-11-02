@@ -14,7 +14,7 @@ from ..providers.factory import build_backend
 from .protocol import ProtocolError
 from .runtime import ServerRuntime
 
-REQUEST_METHODS = {"account_list", "account_refresh", "account_switch"}
+REQUEST_METHODS = {"account_list", "account_logout", "account_refresh", "account_switch"}
 
 
 async def run_owned_switch(owner: Any, operation: Awaitable[object]) -> object:
@@ -74,6 +74,16 @@ async def request(
         raise ProtocolError(-32602, "account must be provider:name")
     account = AccountId(*raw.split(":", 1))
     loop = runtime.loop
+    if method == "account_logout":
+        try:
+            message = await asyncio.to_thread(
+                loop.account_context.store.logout,
+                account,
+                sessions_root=runtime.home / "sessions",
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProtocolError(-32005, str(exc)) from exc
+        return {"account": str(account), "message": message}
     context = loop.account_context
     provider = runtime.metadata.provider
     current_provider = account_provider(provider)

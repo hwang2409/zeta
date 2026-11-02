@@ -44,6 +44,7 @@ EXTENSION_REQUESTS = [
     "slash_list",
     "slash_run",
     "account_list",
+    "account_logout",
     "account_refresh",
     "account_switch",
 ]

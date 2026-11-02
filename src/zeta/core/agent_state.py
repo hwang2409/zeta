@@ -394,6 +394,7 @@ class AgentStateMixin:
         agent_type: str,
         description: str,
         cwd: str | None = None,
+        selected_accounts: dict[str, str] | None = None,
     ) -> None:
         """Persist the metadata used by the agent status tool."""
 
@@ -406,6 +407,14 @@ class AgentStateMixin:
             or not description
         ):
             raise ValueError("invalid agent lifecycle metadata")
+        if selected_accounts is not None and (
+            type(selected_accounts) is not dict
+            or any(
+                type(provider) is not str or type(account) is not str
+                for provider, account in selected_accounts.items()
+            )
+        ):
+            raise ValueError("invalid agent account pins")
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -424,6 +433,11 @@ class AgentStateMixin:
                 "agent_type": agent_type,
                 "description": description,
                 "cwd": cwd if cwd else self.cwd,
+                **(
+                    {"selected_accounts": selected_accounts}
+                    if selected_accounts
+                    else {}
+                ),
             }
             self._write_agent_lifecycle()
             publish_live_agent_lifecycle(

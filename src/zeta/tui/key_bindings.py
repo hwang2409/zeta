@@ -361,6 +361,8 @@ def build_key_bindings(
     on_picker_select: Callable[[], None] | None = None,
     on_picker_cancel: Callable[[], None] | None = None,
     on_picker_default: Callable[[], None] | None = None,
+    on_picker_login: Callable[[], None] | None = None,
+    on_picker_logout: Callable[[], None] | None = None,
     on_picker_rename: Callable[[], None] | None = None,
     on_picker_refresh: Callable[[], None] | None = None,
     picker_active: Callable[[], bool] | None = None,
@@ -1185,6 +1187,18 @@ def build_key_bindings(
             def picker_default(event: KeyPressEvent) -> None:
                 del event
                 on_picker_default()
+
+        if on_picker_login is not None:
+            @bindings.add("l", filter=picking & ~panel_mode, eager=True)
+            def picker_login(event: KeyPressEvent) -> None:
+                del event
+                on_picker_login()
+
+        if on_picker_logout is not None:
+            @bindings.add("x", filter=picking & ~panel_mode, eager=True)
+            def picker_logout(event: KeyPressEvent) -> None:
+                del event
+                on_picker_logout()
 
         if on_picker_rename is not None:
             @bindings.add("n", filter=picking & ~panel_mode, eager=True)

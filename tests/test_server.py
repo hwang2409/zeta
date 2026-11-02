@@ -5438,6 +5438,52 @@ async def test_serve_accounts_label_command(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_serve_account_logout_runs_store_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    current = AccountId("codex", "current")
+    removed = AccountId("codex", "removed")
+    for account in (current, removed):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, current)
+    logout = AccountStore.logout
+    off_loop_calls = 0
+
+    def checked_logout(store: AccountStore, account: AccountId, *, sessions_root: Path):
+        nonlocal off_loop_calls
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        off_loop_calls += 1
+        return logout(store, account, sessions_root=sessions_root)
+
+    monkeypatch.setattr(AccountStore, "logout", checked_logout)
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        result = (
+            await _request(
+                reader,
+                writer,
+                "accounts-logout",
+                "account_logout",
+                {"session_id": sid, "account": "codex:removed"},
+            )
+        )[-1]["result"]
+        assert result == {
+            "account": "codex:removed",
+            "message": "logged out codex:removed",
+        }
+        assert off_loop_calls == 1
+        assert not await asyncio.to_thread(AccountStore(home).contains, removed)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -371,6 +371,7 @@ async def _build_child_loop(
     cwd_override: Path | None,
     follow_up_loop: bool,
     description: str,
+    child_account_context: Any,
 ) -> tuple[AgentLoop, ChildApprovalPolicy | None]:
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None
@@ -397,11 +398,8 @@ async def _build_child_loop(
             cwd=cwd_override,
             image_policy=child_image_policy,
         )
-        account_context = getattr(loop, "account_context", None)
-        if account_context is not None:
-            child_registry.account_context = await asyncio.to_thread(
-                account_context.child_snapshot, child_provider
-            )
+        if child_account_context is not None:
+            child_registry.account_context = child_account_context
         loop._background_owner.store_leases.callback(
             child_registry.background_tasks.release_directory
         )
@@ -706,6 +704,14 @@ async def run_agent_tool(
             remove_pending_child_link(loop.root_session_dir, child_instance_id)
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
+    account_context = getattr(loop, "account_context", None)
+    child_account_pins = (
+        await asyncio.to_thread(
+            account_context.child_snapshot, getattr(child_backend, "provider", None)
+        )
+        if account_context is not None
+        else None
+    )
     try:
         child_store.start_agent_lifecycle(
             handle=child_instance_id,
@@ -714,6 +720,12 @@ async def run_agent_tool(
             agent_type=preset.name,
             description=description,
             cwd=child_cwd,
+            selected_accounts={
+                provider: str(account)
+                for provider, account in child_account_pins.snapshot().items()
+            }
+            if child_account_pins is not None
+            else None,
         )
     except BaseException:
         loop._background_owner.mark_store_finished(child_store)
@@ -741,6 +753,7 @@ async def run_agent_tool(
             cwd_override=cwd_override,
             follow_up_loop=follow_up_loop,
             description=description,
+            child_account_context=child_account_pins,
         )
     except asyncio.CancelledError:
         raise
