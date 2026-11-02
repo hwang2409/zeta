@@ -721,6 +721,11 @@ def test_installed_hook_failure_does_not_fail_committed_append(
 
     assert store._entries[-1].id == entry.id
     assert reopened._entries[-1] == entry
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+    later = store.append_message(message(MessageRole.ASSISTANT, "later"))
+
+    assert observed == [(later,)]
     assert [record.getMessage() for record in caplog.records].count(
         "installed-row callback failed"
     ) == 1
@@ -774,6 +779,27 @@ def test_installed_hook_runs_after_flock_and_can_reenter(
         "outer",
         "inner",
     ]
+
+
+def test_installed_hook_reentrant_append_emits_in_log_order(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-reentrant-order")
+    observed: list[str] = []
+
+    def reenter(delta: tuple[ConversationEntry, ...] | str) -> None:
+        assert delta != "reset"
+        text = delta[0].data["message"]["content"][0]["text"]
+        if text == "outer":
+            store.append_message(message(MessageRole.ASSISTANT, "inner"))
+        observed.append(text)
+
+    store.on_entries_installed = reenter
+
+    store.append_message(message(MessageRole.ASSISTANT, "outer"))
+
+    durable = [
+        row.data["message"]["content"][0]["text"] for row in store._entries
+    ]
+    assert observed == durable == ["outer", "inner"]
 
 
 def test_installed_hook_emits_batch_in_log_order(tmp_path: Path) -> None:
@@ -891,6 +917,44 @@ def test_installed_hook_full_prefix_reload_emits_only_suffix(tmp_path: Path) -> 
     resident.refresh()
 
     assert [[row.id for row in delta] for delta in observed] == [[appended.id]]
+
+
+def test_installed_hook_unchanged_full_reload_emits_nothing(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-unchanged")
+    store.append_message(message(MessageRole.ASSISTANT, "same"))
+    replacement = store.path.with_suffix(".replacement")
+    replacement.write_bytes(store.path.read_bytes())
+    replacement.replace(store.path)
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    store.refresh()
+
+    assert observed == []
+
+
+def test_installed_hook_changed_content_with_same_identity_emits_reset(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-content-reset")
+    original = store.append_message(message(MessageRole.ASSISTANT, "before"))
+    lines = store.path.read_bytes().splitlines(keepends=True)
+    replacement_row = json.loads(lines[1])
+    replacement_row["data"]["message"]["content"][0]["text"] = "after"
+    assert replacement_row["seq"] == original.seq
+    assert replacement_row["id"] == original.id
+    replacement = store.path.with_suffix(".replacement")
+    replacement.write_bytes(
+        lines[0] + json.dumps(replacement_row, separators=(",", ":")).encode() + b"\n"
+    )
+    replacement.replace(store.path)
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    store.refresh()
+
+    assert observed == ["reset"]
+    assert store._entries[0].data["message"]["content"][0]["text"] == "after"
 
 
 def test_installed_hook_non_prefix_reload_emits_reset(tmp_path: Path) -> None:
