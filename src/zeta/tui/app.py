@@ -140,6 +140,11 @@ def _tui_slash_commands() -> tuple[SlashCommand, ...]:
         SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]"),
         SlashCommand("accounts", lambda app, args: app.slash_accounts(args), "switch account"),
         SlashCommand(
+            "restart",
+            lambda app, args: app.slash_restart(args),
+            "restart this session from the local checkout (reinstall after pyproject changes)",
+        ),
+        SlashCommand(
             "permissions",
             lambda app, args: app.slash_permissions(args),
             "show rules; revoke a session grant: /permissions revoke <grant>; clear all: /permissions clear",
@@ -376,13 +381,6 @@ class TUIApp(
     @property
     def ephemeral_root(self) -> Path | None:
         return self._ephemeral_root
-    @property
-    def new_session_requested(self) -> bool:
-        return self._new_session_requested
-    def request_new_session(self) -> None:
-        self._new_session_requested = True
-        self.request_exit()
-
     @property
     def _transcript_lines(self) -> list[str]:
         """Expose rendered lines for diagnostics while keeping logical units in the widget."""

@@ -738,7 +738,41 @@ def _print_exit_hint(app: object) -> None:
     print(f"resume with: zeta --resume {app.loop.store.session_id}", file=sys.stderr)
 
 
-async def _run_tui(app: object, args: argparse.Namespace) -> None:
+def _restart_argv(entrypoint: str, argv: list[str], session_id: str) -> list[str]:
+    """Replace the original session selector while preserving all other flags."""
+
+    rewritten: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"--continue", "-c", "--no-session"}:
+            index += 1
+            continue
+        if token.startswith("--resume="):
+            index += 1
+            continue
+        if token == "--resume":
+            index += 1
+            if index < len(argv) and not argv[index].startswith("-"):
+                index += 1
+            continue
+        rewritten.append(token)
+        index += 1
+    return [entrypoint, *rewritten, "--resume", session_id]
+
+
+def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
+    command = _restart_argv(entrypoint, argv, session_id)
+    try:
+        os.execv(entrypoint, command)
+    except OSError as exc:
+        print(f"restart failed: {exc}", file=sys.stderr)
+        print(f"resume manually: zeta --resume {session_id}", file=sys.stderr)
+        return 1
+    return 0
+
+
+async def _run_tui(app: object, args: argparse.Namespace) -> tuple[bool, bool]:
     """Run the main TUI, keeping it live while discussion forks are shown.
 
     Opening an attention discussion suspends the main UI and runs a fork app on
@@ -761,12 +795,14 @@ async def _run_tui(app: object, args: argparse.Namespace) -> None:
     async def build_fork(fork_id: str) -> object:
         return await asyncio.to_thread(_build_fork, fork_id)
 
-    await run_fork_stack(app, build_fork)
+    return await run_fork_stack(app, build_fork)
 
 
 def main(argv: list[str] | None = None) -> int:
+    original_argv = list(sys.argv[1:] if argv is None else argv)
+    entrypoint = sys.argv[0]
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(original_argv)
     if args.command == "login":
         return _handle_login(args)
     if args.command == "accounts":
@@ -917,21 +953,32 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"zeta: {exc}", file=sys.stderr)
             return 1
+        restart_requested = False
+        restart_cancels_work = False
         try:
             with patch_stdout(raw=True):
-                asyncio.run(_run_tui(app, args))
+                restart_requested, restart_cancels_work = asyncio.run(
+                    _run_tui(app, args)
+                )
             if app.new_session_requested:
                 args.continue_session = False
                 args.resume = None
                 continue
-            _print_exit_hint(app)
-            return 0
         except TerminalRenderError as exc:
             print(f"zeta: {exc}", file=sys.stderr)
             _print_exit_hint(app)
             return 1
         finally:
             _cleanup_ephemeral(app)
+        if restart_requested:
+            if restart_cancels_work:
+                print(
+                    "restart · running children or background tasks will be cancelled",
+                    file=sys.stderr,
+                )
+            return _exec_restart(entrypoint, original_argv, app.loop.store.session_id)
+        _print_exit_hint(app)
+        return 0
 
 
 __all__ = ["build_parser", "main"]

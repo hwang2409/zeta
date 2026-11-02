@@ -5015,6 +5015,7 @@ async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path
             )
         )[-1]["result"]
         commands = {entry["name"]: entry for entry in result["commands"]}
+        assert "restart" not in commands  # TUI process lifecycle is not a serve command.
         # Runnable built-ins the server drives directly. `/init` and `/help`
         # live at the scope floor — the menu depends on them appearing here
         # or the ZETA-130 lane loses two anchor commands.
