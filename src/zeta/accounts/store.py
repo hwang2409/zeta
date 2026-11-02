@@ -536,7 +536,7 @@ class AccountStore:
                             with child_directory(root_fd, provider) as provider_fd:
                                 names = [
                                     (name, stat.S_ISDIR(os.stat(name, dir_fd=provider_fd, follow_symlinks=False).st_mode))
-                                    for name in os.listdir(provider_fd)
+                                    for name in sorted(os.listdir(provider_fd))
                                 ]
                         except FileNotFoundError:
                             continue
