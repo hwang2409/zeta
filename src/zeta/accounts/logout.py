@@ -85,3 +85,14 @@ def remove_account_lock_directory(
                 _validate_directory(account_fd, allowed)
     except FileNotFoundError:
         return
+
+
+_MAX_SWEEP_WARNING_PATH_LENGTH = 160
+
+
+def sweep_warning_path(path: object) -> str:
+    """Return a bounded path for a sweep warning, keeping the account-name tail."""
+    text = str(path)
+    if len(text) <= _MAX_SWEEP_WARNING_PATH_LENGTH:
+        return text
+    return "..." + text[-(_MAX_SWEEP_WARNING_PATH_LENGTH - 3):]

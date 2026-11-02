@@ -41,7 +41,7 @@ from ..oauth import (
 )
 
 _PROVIDERS = {"anthropic", "codex"}
-_MAX_SWEEP_WARNING_PATHS, _MAX_SWEEP_WARNING_PATH_LENGTH = 5, 160
+_MAX_SWEEP_WARNING_PATHS = 5
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 
@@ -570,16 +570,12 @@ class AccountStore:
         )
 
     def _remove_orphan_directory(self, home_fd: int, root: str, provider: str, name: str, allowed: set[str]) -> str | None:
-        from .logout import remove_account_directory
+        from .logout import remove_account_directory, sweep_warning_path
 
         try:
             remove_account_directory(home_fd, root, (provider, name), allowed=allowed)
         except (AccountError, OSError, ValueError):
-            path = str(self.home / root / provider / name)
-            if len(path) <= _MAX_SWEEP_WARNING_PATH_LENGTH:
-                return path
-            # keep the tail: the provider and account name identify the directory
-            return "..." + path[-(_MAX_SWEEP_WARNING_PATH_LENGTH - 3):]
+            return sweep_warning_path(self.home / root / provider / name)
         return None
 
     def _sweep_orphan_directories(self, home_fd: int, warnings: list[str]) -> None:
