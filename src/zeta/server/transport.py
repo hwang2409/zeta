@@ -12,6 +12,7 @@ import os
 import secrets
 import signal
 import stat
+import sys
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from http import HTTPStatus
@@ -106,6 +107,12 @@ class WebSocketServer:
             port=self.port,
             token=self.token,
             origins=self.origins,
+        )
+        await asyncio.to_thread(
+            print,
+            "zeta serve: websocket ready: "
+            f"ws://127.0.0.1:{self.port}/?token={self.token}",
+            file=sys.stderr,
         )
 
     def _authorize(

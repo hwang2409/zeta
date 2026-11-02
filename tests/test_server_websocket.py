@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import secrets
 import stat
@@ -291,6 +292,26 @@ async def test_websocket_token_file_lifecycle_and_loopback_bind(tmp_path: Path) 
     finally:
         await _close(server)
     assert not token_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_websocket_prints_connect_url_once_without_logging_token(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    with caplog.at_level(logging.DEBUG):
+        await server.start()
+        assert server._websocket is not None
+        token = server._websocket.token
+        port = server._websocket.port
+        await _close(server)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        f"zeta serve: websocket ready: ws://127.0.0.1:{port}/?token={token}\n"
+    )
+    assert token is not None
+    assert all(token not in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio

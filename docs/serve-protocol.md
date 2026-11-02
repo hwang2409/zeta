@@ -31,8 +31,9 @@ negotiate extensions. Binary messages close with code `1003`, and messages over
 1 MiB close with code `1009`.
 
 Every serve start creates a new random bearer token. A WebSocket upgrade must
-supply it as the `token` URL query parameter. Zeta does not print the token or
-write it to logs. It atomically writes this discovery file with mode `0600` and
+supply it as the `token` URL query parameter. After startup, Zeta prints the
+exact connect URL once to stderr; it does not print it to stdout or write the
+token to logs. It atomically writes this discovery file with mode `0600` and
 removes it on clean shutdown:
 
 ```text
