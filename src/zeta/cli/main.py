@@ -491,7 +491,9 @@ def _expiry_iso(expires_at: float) -> str:
 
 
 def _refresh_failure(exc: RuntimeError) -> dict[str, object]:
-    if isinstance(exc.__cause__, AccountCredentialLockTimeoutError):
+    if isinstance(exc, AccountCredentialLockTimeoutError) or isinstance(
+        exc.__cause__, AccountCredentialLockTimeoutError
+    ):
         return {"ok": False, "code": "lock_timeout", "retryable": True}
     code = getattr(exc, "code", "http_error")
     if code not in {"auth_error", "http_error"}:

@@ -4133,6 +4133,25 @@ def test_render_event_error_is_visible() -> None:
     assert "reason: provider stopped" in renderable_plain(rendered)
 
 
+def test_account_lock_timeout_renders_as_retryable_error() -> None:
+    message = (
+        "cannot access codex:work: another process holds the account lock; "
+        "retry the turn"
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.ERROR,
+            error=ErrorInfo("account_lock_timeout", message),
+        )
+    )
+
+    assert isinstance(rendered, Panel)
+    plain = renderable_plain(rendered)
+    assert "account busy · account_lock_timeout" in plain
+    assert f"reason: {message}" in plain
+    assert "retry: ctrl+y" in plain
+
+
 def test_render_error_card_bounds_and_labels_json_payload() -> None:
     rendered = render_event(
         StreamEvent(
