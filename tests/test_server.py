@@ -842,7 +842,7 @@ class BackgroundChildAndForegroundToolBackend:
         )
 
 
-class MidstreamRetryBackend:
+class EarlyCloseRetryBackend:
     def __init__(self) -> None:
         self.calls = 0
 
@@ -851,7 +851,7 @@ class MidstreamRetryBackend:
         self.calls += 1
         if self.calls == 1:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
-            raise ConnectionError("provider connection dropped")
+            return
         yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="keep me")
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
@@ -861,8 +861,8 @@ class MidstreamRetryBackend:
 
 async def _provider_retry_frames(
     tmp_path: Path, *, features: list[str] | None
-) -> tuple[MidstreamRetryBackend, dict[str, Any], list[dict[str, Any]]]:
-    backend = MidstreamRetryBackend()
+) -> tuple[EarlyCloseRetryBackend, dict[str, Any], list[dict[str, Any]]]:
+    backend = EarlyCloseRetryBackend()
     server = ZetaServer(
         home=tmp_path,
         socket_path=_socket_path(tmp_path),

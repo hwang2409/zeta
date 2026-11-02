@@ -2779,29 +2779,126 @@ async def test_provider_error_event_persists_partial_state_and_ends_turn(
 
 
 @pytest.mark.asyncio
-async def test_clean_stream_exit_becomes_provider_failure(tmp_path: Path) -> None:
+async def test_clean_stream_exit_retries_without_duplicate_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(retry_policy_module, "retry_wait_seconds", lambda *_args: 0.0)
+
     class IncompleteBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
         async def complete(
             self,
             messages: Sequence[Message],
             tool_schemas: Sequence[ToolSchema],
         ) -> AsyncIterator[StreamEvent]:
             del messages, tool_schemas
+            self.calls += 1
             yield StreamEvent(
                 StreamEventType.MESSAGE_UPDATE,
-                content=TextContent("partial"),
+                content=TextContent("discard me"),
+            )
+            if self.calls == 1:
+                return
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("keep me")]),
             )
 
+    backend = IncompleteBackend()
     store = ConversationStore(tmp_path)
-    events = await collect(AgentLoop(IncompleteBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn(
+            "start", origin=MessageOrigin.USER
+        )
+    )
 
-    assert events[-2].type is StreamEventType.ERROR
+    assert backend.calls == 2
+    retry = next(event for event in events if event.type is StreamEventType.RETRY)
+    assert retry.data["kind"] == "provider_retry"
+    assert retry.data["reason"] == "stream_error"
+    assert any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
+    assert [message.content for message in store.messages()] == [
+        [TextContent("start")],
+        [TextContent("keep me")],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clean_stream_exit_after_completed_tool_call_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    class CompletedToolBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            self.calls += 1
+            yield StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                tool_call=ToolCall("echo-1", "echo", {"value": "once"}),
+                data={"tool_call_completed": True},
+            )
+
+    backend = CompletedToolBackend()
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn(
+            "start", origin=MessageOrigin.USER
+        )
+    )
+
+    assert backend.calls == 1
+    assert not any(event.type is StreamEventType.RETRY for event in events)
     assert events[-2].error == ErrorInfo(
         "stream_error", "provider stream ended before completion"
     )
-    assert StreamEventType.TURN_END not in [event.type for event in events]
-    assert store.turn_in_flight() is False
-    assert store.messages()[-1].metadata["turn_failed"] is True
+    assert store.messages()[-1].metadata["provider_retries"] == [
+        {"decision": "skipped-after-output", "reason": "tool_call_completed"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clean_stream_exit_exhausts_normal_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(retry_policy_module, "retry_wait_seconds", lambda *_args: 0.0)
+
+    class IncompleteBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            self.calls += 1
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+
+    backend = IncompleteBackend()
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn(
+            "start", origin=MessageOrigin.USER
+        )
+    )
+
+    assert backend.calls == 5
+    assert sum(event.type is StreamEventType.RETRY for event in events) == 4
+    assert events[-2].error == ErrorInfo(
+        "stream_error", "provider stream ended before completion"
+    )
+    assert store.messages()[-1].metadata["turn_error"]["message"] == (
+        "provider stream ended before completion"
+    )
 
 
 @pytest.mark.asyncio

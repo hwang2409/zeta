@@ -38,6 +38,11 @@ _TERMINAL_ERROR_CODES = {
     "permission_denied",
     "permission_error",
 }
+_EARLY_STREAM_CLOSE_MESSAGES = {
+    "provider stream ended before completion",
+    "Anthropic stream ended before message completion",
+    "Codex stream ended before response completion",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +209,12 @@ def retryable_provider_error(
     ):
         return False
     if code == "server_error":
+        return True
+    message = getattr(error, "message", None)
+    if not isinstance(message, str):
+        args = getattr(error, "args", ())
+        message = args[0] if len(args) == 1 and isinstance(args[0], str) else None
+    if code == "stream_error" and message in _EARLY_STREAM_CLOSE_MESSAGES:
         return True
     if status_code in _RETRYABLE_STATUS_CODES:
         return True
