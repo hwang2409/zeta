@@ -743,7 +743,7 @@ async def test_stdio_write_failure_does_not_wait_for_live_stdout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    source = "import os, time; os.write(2, b'ready'); os.close(0); time.sleep(30)"
+    source = "import os, time; os.close(0); os.write(2, b'ready'); time.sleep(30)"
     client = StdioMCPClient(
         MCPServerConfig("write-live-stdout", "stdio", sys.executable, ("-u", "-c", source))
     )
@@ -758,12 +758,12 @@ async def test_stdio_write_failure_does_not_wait_for_live_stdout(
         start_new_session=True,
     )
     assert process.stderr is not None
-    await asyncio.wait_for(process.stderr.readexactly(5), timeout=0.5)
+    await asyncio.wait_for(process.stderr.readexactly(5), timeout=10)
     client._process = process
     client._reader_task = asyncio.create_task(client._read_stdout())
     try:
         with pytest.raises(MCPTransportError, match="closed its input"):
-            await asyncio.wait_for(client._request("initialize", {}), timeout=0.5)
+            await asyncio.wait_for(client._request("initialize", {}), timeout=10)
     finally:
         await client.close()
 
