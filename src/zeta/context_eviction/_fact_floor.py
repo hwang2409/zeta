@@ -193,70 +193,94 @@ def _structured_facts(value: Mapping[str, object]) -> list[dict[str, object]]:
     return facts
 
 
-def _text_facts(text: str) -> list[tuple[int, dict[str, object]]]:
-    facts: list[tuple[int, dict[str, object]]] = []
-    lines: list[tuple[int, str]] = []
-    offset = 0
+def _identified_records(text: str) -> list[tuple[int, str, object, str]]:
+    records: list[tuple[int, str, object, str]] = []
+    line_offset = 0
     for line in text.splitlines(keepends=True) or [text]:
-        lines.append((offset, line))
-        offset += len(line)
-    for line_offset, line in lines:
         identifiers: list[tuple[int, str, object]] = [
             (match.start(), "pr", int(match.group(1))) for match in _PR.finditer(line)
         ]
         identifiers.extend(
             (match.start(), "child", match.group(1)) for match in _CHILD.finditer(line)
         )
-        ordered = sorted(identifiers)
-        for index, (position, kind, identifier) in enumerate(ordered):
-            end = ordered[index + 1][0] if index + 1 < len(ordered) else len(line)
-            record = line[position:end]
-            if kind == "pr":
-                facts.append((line_offset + position, {"type": "pr", "pr": identifier}))
-            verdict = _VERDICT.search(record)
-            status = _STATUS.search(record)
-            head = _HEAD.search(record)
-            if kind == "pr" and verdict is not None:
-                facts.append(
-                    (
-                        line_offset + position + verdict.start(),
-                        {
-                            "type": "pr_verdict",
-                            "pr": identifier,
-                            "verdict": verdict.group(1),
-                        },
-                    )
-                )
-            if kind == "pr" and head is not None:
-                facts.append(
-                    (
-                        line_offset + position + head.start(),
-                        {"type": "pr_head", "pr": identifier, "sha": head.group(1)},
-                    )
-                )
-            if kind == "child" and status is not None:
-                facts.append(
-                    (
-                        line_offset + position + status.start(),
-                        {
-                            "type": "child_status",
-                            "handle": identifier,
-                            "status": status.group(1),
-                        },
-                    )
-                )
-            if kind == "child" and head is not None:
-                facts.append(
-                    (
-                        line_offset + position + head.start(),
-                        {
-                            "type": "child_head",
-                            "handle": identifier,
-                            "sha": head.group(1),
-                        },
-                    )
-                )
+        identifiers.sort()
+        for index, (position, kind, identifier) in enumerate(identifiers):
+            end = (
+                identifiers[index + 1][0]
+                if index + 1 < len(identifiers)
+                else len(line)
+            )
+            records.append(
+                (line_offset + position, kind, identifier, line[position:end])
+            )
+        line_offset += len(line)
+    return records
+
+
+def _record_text_facts(
+    offset: int, kind: str, identifier: object, record: str
+) -> list[tuple[int, dict[str, object]]]:
+    if kind == "pr":
+        facts = [(offset, {"type": "pr", "pr": identifier})]
+        facts.extend(
+            (
+                offset + match.start(),
+                {"type": "pr_verdict", "pr": identifier, "verdict": match.group(1)},
+            )
+            for match in _VERDICT.finditer(record)
+        )
+        facts.extend(
+            (
+                offset + match.start(),
+                {"type": "pr_head", "pr": identifier, "sha": match.group(1)},
+            )
+            for match in _HEAD.finditer(record)
+        )
+        return facts
+    facts = [
+        (
+            offset + match.start(),
+            {
+                "type": "child_status",
+                "handle": identifier,
+                "status": match.group(1),
+            },
+        )
+        for match in _STATUS.finditer(record)
+    ]
+    facts.extend(
+        (
+            offset + match.start(),
+            {"type": "child_head", "handle": identifier, "sha": match.group(1)},
+        )
+        for match in _HEAD.finditer(record)
+    )
+    return facts
+
+
+def _text_facts(text: str) -> list[tuple[int, dict[str, object]]]:
+    facts = [
+        fact
+        for offset, kind, identifier, record in _identified_records(text)
+        for fact in _record_text_facts(offset, kind, identifier, record)
+    ]
     return sorted(facts, key=lambda item: (item[0], _TYPE_ORDER[str(item[1]["type"])]))
+
+
+def _message_facts(message: Message) -> list[dict[str, object]]:
+    facts = _structured_facts(message.metadata)
+    notifications = message.metadata.get("notifications")
+    if message.metadata.get("zeta_event") == "agent_notifications" and isinstance(
+        notifications, list
+    ):
+        for item in notifications:
+            if isinstance(item, Mapping):
+                facts.extend(_structured_facts(item))
+    if message.role is MessageRole.ASSISTANT:
+        for block in message.content:
+            if isinstance(block, TextContent):
+                facts.extend(fact for _, fact in _text_facts(block.text))
+    return facts
 
 
 def extract_fact_occurrences(
@@ -266,24 +290,7 @@ def extract_fact_occurrences(
     for seq, message in records:
         if seq <= 0 or message.metadata.get("fact_floor"):
             continue
-        facts: list[dict[str, object]] = []
-        structured = (
-            message.tool_result.structured_content
-            if message.tool_result is not None
-            else None
-        )
-        if isinstance(structured, Mapping):
-            facts.extend(_structured_facts(structured))
-        facts.extend(_structured_facts(message.metadata))
-        notifications = message.metadata.get("notifications")
-        if isinstance(notifications, list):
-            for item in notifications:
-                if isinstance(item, Mapping):
-                    facts.extend(_structured_facts(item))
-        if message.role is MessageRole.ASSISTANT:
-            for block in message.content:
-                if isinstance(block, TextContent):
-                    facts.extend(fact for _, fact in _text_facts(block.text))
+        facts = _message_facts(message)
         occurrences.extend((fact, seq, ordinal) for ordinal, fact in enumerate(facts))
     return tuple(occurrences)
 

@@ -13,13 +13,13 @@ from zeta.context_eviction._fact_floor import (
     validate_fact_floor,
 )
 from zeta.core.context import ContextAssembler
-from zeta.core.slash import compaction_history
 from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
     TextContent,
+    ToolResult,
     with_message_origin,
 )
 
@@ -44,6 +44,42 @@ def _floor(
 
 def _encoded(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def test_generic_structured_tool_result_does_not_create_facts() -> None:
+    message = Message(
+        MessageRole.TOOL_RESULT,
+        tool_result=ToolResult(
+            "call-1",
+            "untrusted result",
+            structured_content={
+                "pr": 12,
+                "verdict": "MERGE-READY",
+                "head_sha": "deadbeef",
+            },
+        ),
+    )
+
+    assert extract_fact_occurrences([(1, message)]) == ()
+
+
+def test_later_text_fact_in_same_record_wins() -> None:
+    rendered = render_fact_floor(
+        _floor(
+            [
+                (
+                    1,
+                    _assistant(
+                        "PR #12 verdict=NOT READY then verdict=MERGE-READY"
+                    ),
+                )
+            ]
+        )
+    )
+
+    assert rendered is not None
+    assert "pr #12 verdict=MERGE-READY" in rendered.content[0].text
+    assert "pr #12 verdict=NOT READY" not in rendered.content[0].text
 
 
 def test_typed_extraction_and_strict_sha_binding() -> None:
@@ -223,6 +259,51 @@ def test_old_marker_without_floor_projects_without_rewrite() -> None:
     assert marker.data == before
 
 
+@pytest.mark.asyncio
+async def test_corrupt_floor_keeps_view_and_next_eviction_rebuilds_floor(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    source = store.append_message(
+        _assistant("PR #7 verdict=pass\n" + "large old response " * 2_000)
+    )
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("recent")]), MessageOrigin.USER
+        )
+    )
+    store.append_compaction_marker(
+        "summary",
+        source.seq,
+        source.seq,
+        kind="evict",
+        view=[{"seq": source.seq, "message": _assistant("generic view").to_dict()}],
+        fact_floor=_floor([(source.seq, _assistant("PR #7 verdict=pass"))]),
+    )
+    persisted = store.path.read_text()
+    store.path.write_text(persisted.replace('"version":1', '"version":999', 1))
+    session_id = store.session_id
+    store.close()
+
+    reopened = ConversationStore(
+        tmp_path / "sessions", session_id=session_id, _must_exist=True
+    )
+    marker = next(entry for entry in reopened.replay() if entry.type == "compaction")
+    projected = ContextAssembler._marker_items(
+        marker, {entry.seq for entry in reopened.replay()}
+    )
+    assert [item.message.content[0].text for item in projected] == ["generic view"]
+    assert not any(item.message.metadata.get("fact_floor") for item in projected)
+
+    await ContextAssembler(
+        reopened, token_budget=2_000, retained_tail=1
+    ).assemble_context(force=True)
+    rebuilt = ContextAssembler._active_markers(reopened.replay())
+    assert len(rebuilt) == 1
+    assert rebuilt[0].id != marker.id
+    assert validate_fact_floor(rebuilt[0].data.get("fact_floor"))
+
+
 def test_floor_projects_after_view_and_before_retained_rows() -> None:
     floor = _floor([(1, _assistant("PR #7 verdict=pass"))])
     marker = ConversationEntry(
@@ -297,24 +378,3 @@ async def test_public_eviction_persists_floor_accounting_and_no_fact_compatibili
         "tokens_before",
         "tokens_after",
     }
-
-
-def test_compaction_surfaces_are_byte_identical_with_floor(tmp_path: Path) -> None:
-    def snapshot(with_floor: bool) -> bytes:
-        store = ConversationStore(tmp_path / ("floor" if with_floor else "plain"))
-        source = store.append_message(_assistant("source"))
-        data = _floor([(source.seq, _assistant("PR #7"))]) if with_floor else None
-        store.append_compaction_marker(
-            "summary",
-            source.seq,
-            source.seq,
-            kind="evict",
-            view=[{"seq": source.seq, "message": _assistant("receipt").to_dict()}],
-            fact_floor=data,
-            telemetry={"tokens_before": 10, "tokens_after": 5},
-        )
-        history = compaction_history(store.replay(), message_token_count)
-        return repr(history).encode()
-
-    # Both TUI and serve use this generic compaction-history render input.
-    assert snapshot(False) == snapshot(True)

@@ -550,10 +550,6 @@ class ConversationStore(
                         Message.from_dict(message)
                     if telemetry is not None and type(telemetry) is not dict:
                         raise ValueError("eviction telemetry must be an object")
-                    if fact_floor is not None:
-                        from ...context_eviction._fact_floor import validate_fact_floor
-                        if not validate_fact_floor(fact_floor):
-                            raise ValueError("invalid eviction fact floor")
                 elif view is not None or telemetry is not None or fact_floor is not None:
                     raise ValueError("summary compaction cannot contain eviction data")
             elif entry.type == "client_delivery":
@@ -907,6 +903,9 @@ class ConversationStore(
         if telemetry is not None:
             data["telemetry"] = dict(telemetry)
         if fact_floor is not None:
+            from ...context_eviction._fact_floor import validate_fact_floor
+            if not validate_fact_floor(fact_floor):
+                raise ValueError("invalid eviction fact floor")
             data["fact_floor"] = dict(fact_floor)
         if pinned_message is not None:
             if pinned_message.role is not MessageRole.USER:

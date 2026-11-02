@@ -5143,6 +5143,62 @@ def test_memory_command_parity_tui_and_serve() -> None:
     assert tui_registry.calls == runtime.manager.project_registry.calls
 
 
+@pytest.mark.parametrize("with_fact_floor", [False, True])
+async def test_slash_status_maps_compaction_with_or_without_fact_floor(
+    tmp_path: Path, with_fact_floor: bool
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        assert server.runtime.loop is not None
+        store = server.runtime.loop.store
+        source = store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("source")])
+        )
+        aggregate = {
+            "fact": {"type": "pr", "pr": 7},
+            "first_seq": source.seq,
+            "last_seq": source.seq,
+            "value_rank": [source.seq, 0],
+        }
+        store.append_compaction_marker(
+            "summary",
+            source.seq,
+            source.seq,
+            kind="evict",
+            view=[
+                {
+                    "seq": source.seq,
+                    "message": Message(
+                        MessageRole.ASSISTANT, [TextContent("receipt")]
+                    ).to_dict(),
+                }
+            ],
+            fact_floor=(
+                {"version": 1, "oldest": [aggregate], "newest": [aggregate]}
+                if with_fact_floor
+                else None
+            ),
+        )
+
+        result = (
+            await _request(
+                reader,
+                writer,
+                "status",
+                "slash_run",
+                {"session_id": sid, "text": "/status"},
+            )
+        )[-1]["result"]
+
+        assert result["kind"] == "output"
+        assert "compaction_history:\n  turn 1: 1 entries" in result["text"]
+        assert "retained typed facts" not in result["text"]
+    finally:
+        await _close(server, writer)
+
+
 async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
