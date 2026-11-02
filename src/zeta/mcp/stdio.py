@@ -91,6 +91,7 @@ class StdioMCPClient(MCPClient):
     async def connect(self) -> None:
         if self._process is not None:
             return
+        self._reader_error = None
         log_path = mcp_log_path(self.config.name)
         log_root = log_path.parent
         log_root.mkdir(parents=True, exist_ok=True)
@@ -234,20 +235,7 @@ class StdioMCPClient(MCPClient):
             "params": dict(params),
         }
         try:
-            try:
-                async with self._write_lock:
-                    process.stdin.write(
-                        (json.dumps(request, separators=(",", ":")) + "\n").encode()
-                    )
-                    await process.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError):
-                if self._reader_task is not None and not self._reader_task.done():
-                    await self._reader_task
-                if not response.done():
-                    response.set_exception(
-                        self._reader_error
-                        or MCPTransportError("MCP stdio server closed")
-                    )
+            await self._write_request(process, request, response)
             if abort_signal is None:
                 raw_response = await response
             else:
@@ -291,6 +279,29 @@ class StdioMCPClient(MCPClient):
             raise
         finally:
             self._pending.pop(request_id, None)
+
+    async def _write_request(
+        self,
+        process: asyncio.subprocess.Process,
+        request: Mapping[str, object],
+        response: asyncio.Future[dict[str, object]],
+    ) -> None:
+        try:
+            async with self._write_lock:
+                if process.stdin is None:
+                    raise MCPTransportError("MCP stdio server closed its input")
+                process.stdin.write(
+                    (json.dumps(request, separators=(",", ":")) + "\n").encode()
+                )
+                await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            reader_error = self._reader_error
+            await self._terminate_process(report_failure=True)
+            if response.done():
+                response.exception()
+            raise reader_error or MCPTransportError(
+                "MCP stdio server closed its input"
+            ) from exc
 
     async def _notify(self, method: str, params: Mapping[str, object]) -> None:
         process = self._process
