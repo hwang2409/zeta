@@ -6,6 +6,7 @@ import pytest
 
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.context_accounting import message_token_count
+from zeta.context_eviction import valid_eviction_view
 from zeta.context_eviction._fact_floor import (
     FACT_FLOOR_TOKEN_CAP,
     extract_fact_occurrences,
@@ -401,6 +402,69 @@ async def test_corrupt_floor_keeps_view_and_next_eviction_rebuilds_floor(
     assert len(rebuilt) == 1
     assert rebuilt[0].id != marker.id
     assert validate_fact_floor(rebuilt[0].data.get("fact_floor"))
+
+
+@pytest.mark.asyncio
+async def test_repeated_real_eviction_keeps_floor_out_of_generic_view(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER
+        )
+    )
+    assembler = ContextAssembler(store, token_budget=4_000, retained_tail=1)
+
+    for cycle in range(3):
+        for index in range(6):
+            store.append_message(
+                _assistant(
+                    f"PR #{cycle * 6 + index} verdict=pass sha: abcdef{index}\n"
+                    + "large real-shaped response " * 600
+                )
+            )
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"continue {cycle}-{index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+
+        planned = await assembler.assemble_context(force=True)
+        branch = store.replay()
+        marker = ContextAssembler._active_markers(branch)[0]
+        active_source_seqs = {
+            entry.seq for entry in branch if entry.type in {"message", "compaction"}
+        }
+        view = marker.data["view"]
+        view_seqs = [item["seq"] for item in view]
+
+        assert validate_fact_floor(marker.data.get("fact_floor"))
+        assert view_seqs == sorted(set(view_seqs)), view_seqs
+        assert valid_eviction_view(marker, active_source_seqs)
+        assert not any(
+            item["message"].get("metadata", {}).get("fact_floor") for item in view
+        )
+        assert sum(
+            bool(message.metadata.get("fact_floor")) for message in planned.messages
+        ) == 1
+        assert planned.token_count == marker.data["telemetry"]["tokens_after"]
+
+        marker_count = sum(entry.type == "compaction" for entry in branch)
+        readback = await assembler.assemble_context()
+        assert readback.token_count == planned.token_count
+        assert sum(entry.type == "compaction" for entry in store.replay()) == marker_count
+
+        store.append_message(_assistant("short follow-up"))
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("continue")]), MessageOrigin.USER
+            )
+        )
+        assembled = await assembler.assemble_context()
+        assert abs(assembled.token_count - planned.token_count) < 100
+        assert sum(entry.type == "compaction" for entry in store.replay()) == marker_count
 
 
 def test_floor_projects_after_view_and_before_retained_rows() -> None:

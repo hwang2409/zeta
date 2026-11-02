@@ -502,6 +502,8 @@ def prepare_records(
     materialized: list[tuple[int, Message]] = []
     occurrences: list[Occurrence] = []
     for record in records:
+        if record[1].metadata.get("fact_floor"):
+            continue
         materialized.append(record)
         occurrences.extend(extract_fact_occurrences((record,)))
     for record in floor_rebuild_records:
