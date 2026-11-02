@@ -15,9 +15,11 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import warnings
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -94,6 +96,14 @@ class _DetachedLogState:
 
 class ConversationLogMixin:
     """Load a log once, then synchronize only bytes appended by other writers."""
+
+    def _initialize_entries_installed(self: ConversationStore) -> None:
+        self.on_entries_installed: Callable[[InstalledEntriesDelta], None] | None = None
+        self._installed_callback_lock = threading.Lock()
+        self._installed_callback_pending: deque[InstalledEntriesDelta] = deque()
+        self._installed_callback_draining = False
+        self._installed_callback_local = threading.local()
+        self._full_reload_count = 0
 
     def _detach_log_state(self: ConversationStore) -> _DetachedLogState:
         """Return the worker-owned validated state for an atomic loop install."""
@@ -190,30 +200,48 @@ class ConversationLogMixin:
             _LOGGER.exception("installed-row callback failed")
 
     def _start_entries_installed(self: ConversationStore) -> None:
-        if not hasattr(self._installed_callback_local, "pending"):
-            self._installed_callback_local.pending = []
+        self._installed_callback_local.defer = True
 
     def _finish_entries_installed(self: ConversationStore) -> None:
-        if getattr(self._installed_callback_local, "draining", False):
-            return
-        pending = self._installed_callback_local.pending
-        self._installed_callback_local.draining = True
-        try:
-            for delta in pending:
+        self._installed_callback_local.defer = False
+        if getattr(self._installed_callback_local, "drain_after_unlock", False):
+            del self._installed_callback_local.drain_after_unlock
+            self._drain_entries_installed()
+
+    def _drain_entries_installed(self: ConversationStore) -> None:
+        failure: BaseException | None = None
+        while True:
+            with self._installed_callback_lock:
+                if not self._installed_callback_pending:
+                    self._installed_callback_draining = False
+                    break
+                delta = self._installed_callback_pending.popleft()
+            try:
                 self._deliver_entries_installed(delta)
-        finally:
-            del self._installed_callback_local.pending
-            del self._installed_callback_local.draining
+            except BaseException as exc:  # noqa: BLE001 - propagate after FIFO cleanup
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
 
     def _publish_prepared_entries_installed(
         self: ConversationStore, delta: InstalledEntriesDelta
     ) -> None:
-        """Publish an owned delta, deferring it while the session flock is held."""
-        pending = getattr(self._installed_callback_local, "pending", None)
-        if pending is None:
-            self._deliver_entries_installed(delta)
-        elif delta:
-            pending.append(delta)
+        """Enqueue one owned delta and let one store-wide drainer deliver it."""
+        if not delta or self.on_entries_installed is None:
+            return
+        should_drain = False
+        with self._installed_callback_lock:
+            self._installed_callback_pending.append(delta)
+            if not self._installed_callback_draining:
+                self._installed_callback_draining = True
+                should_drain = True
+        if not should_drain:
+            return
+        if getattr(self._installed_callback_local, "defer", False):
+            self._installed_callback_local.drain_after_unlock = True
+        else:
+            self._drain_entries_installed()
 
     def _publish_entries_installed(
         self: ConversationStore, delta: InstalledEntriesDelta
@@ -451,6 +479,7 @@ class ConversationLogMixin:
         self._publish_entries_installed(tuple(entries))
 
     def _load_full(self: ConversationStore) -> None:
+        self._full_reload_count += 1
         baseline = (len(self._entries), self._entry_prefix_digest)
         raw = read_session_file(self.directory_fd, "conversation.jsonl")
         lines = raw.splitlines(keepends=True)

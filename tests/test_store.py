@@ -21,6 +21,7 @@ from zeta.core.store import (
     ConversationIntegrityError,
     ConversationStore,
 )
+from zeta.core.store._step_delivery import PromptInput
 from zeta.core.store._validation import (
     NOTIFICATION_KINDS,
     NOTIFICATION_VALIDATORS,
@@ -800,6 +801,81 @@ def test_installed_hook_reentrant_append_emits_in_log_order(tmp_path: Path) -> N
         row.data["message"]["content"][0]["text"] for row in store._entries
     ]
     assert observed == durable == ["outer", "inner"]
+
+
+def test_installed_hook_serializes_two_threads_in_durable_order(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-two-threads")
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_returned = threading.Event()
+    observed: list[int] = []
+    active_callbacks = 0
+    callbacks_lock = threading.Lock()
+
+    def installed(delta: tuple[ConversationEntry, ...] | str) -> None:
+        nonlocal active_callbacks
+        assert delta != "reset"
+        with callbacks_lock:
+            active_callbacks += 1
+            assert active_callbacks == 1
+            observed.append(delta[0].seq)
+        if delta[0].seq == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+        with callbacks_lock:
+            active_callbacks -= 1
+
+    def append(text: str, returned: threading.Event | None = None) -> None:
+        store.append_message(message(MessageRole.ASSISTANT, text))
+        if returned is not None:
+            returned.set()
+
+    store.on_entries_installed = installed
+    owner = threading.Thread(target=append, args=("one",))
+    owner.start()
+    assert first_entered.wait(timeout=5)
+
+    worker = threading.Thread(target=append, args=("two", second_returned))
+    worker.start()
+    assert second_returned.wait(timeout=5)
+    assert observed == [1]
+
+    release_first.set()
+    owner.join(timeout=5)
+    worker.join(timeout=5)
+
+    assert not owner.is_alive()
+    assert not worker.is_alive()
+    assert observed == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_async_appends_encode_only_new_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-append-cost")
+    store.append_many([("warning", {"message": str(index)}) for index in range(400)])
+    await store._to_thread_durable(store._warm_step_delivery_writer)
+    original_encode = store._encoded_entry_line
+    encoded_rows = 0
+
+    def tracked_encode(entry: ConversationEntry) -> bytes:
+        nonlocal encoded_rows
+        encoded_rows += 1
+        return original_encode(entry)
+
+    monkeypatch.setattr(
+        ConversationStore, "_encoded_entry_line", staticmethod(tracked_encode)
+    )
+    for index in range(25):
+        await store._to_thread_durable(
+            store._commit_delivery_input,
+            PromptInput(f"prompt-{index}", MessageOrigin.AGENT_SEND, None),
+        )
+
+    assert encoded_rows == 25
 
 
 def test_installed_hook_emits_batch_in_log_order(tmp_path: Path) -> None:

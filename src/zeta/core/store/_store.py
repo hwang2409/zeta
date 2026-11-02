@@ -7,7 +7,6 @@ import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
 import math  # noqa: F401 - re-exported by the compatibility store facade
 import os
-import threading
 import time
 import uuid
 import warnings  # noqa: F401 - re-exported by the compatibility store facade
@@ -52,7 +51,7 @@ from ._async_writes import AsyncDurableWritesMixin
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
 from ._incremental_validation import IncrementalValidationMixin
 from ._lifecycle import StoreLifecycleMixin
-from ._log import ConversationLogMixin, InstalledEntriesDelta, PersistedAppend
+from ._log import ConversationLogMixin, PersistedAppend
 from ._notifications import NotificationStateMixin
 from ._pending_prompts import (
     MAX_PENDING_PROMPT_TEXT,
@@ -106,8 +105,7 @@ class ConversationStore(
         self.root_dir = Path(session_dir or default_home / "sessions")
         self.session_id = uuid.uuid4().hex if session_id is None else session_id
         self.on_persisted_activity: Callable[[int], None] | None = None
-        self.on_entries_installed: Callable[[InstalledEntriesDelta], None] | None = None
-        self._installed_callback_local = threading.local()
+        self._initialize_entries_installed()
         session_path = Path(self.session_id)
         if (
             not self.session_id
