@@ -31,6 +31,19 @@ MAX_NUMERIC_ID_DIGITS = 128
 TOOL_OUTPUT_MAX_BYTES = 8_000
 
 
+def hello_result(
+    protocol_version: str, capabilities: dict[str, object], warning: str | None
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "protocol_version": protocol_version,
+        "server": "zeta",
+        "capabilities": capabilities,
+    }
+    if warning is not None:
+        result["notices"] = [warning]
+    return result
+
+
 class _OversizedInteger:
     def __init__(self, digits: int) -> None:
         self.digits = digits

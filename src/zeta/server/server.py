@@ -45,6 +45,7 @@ from .protocol import (
     ProtocolError,
     bounded,
     finish_frame_write,
+    hello_result,
     negotiate_protocol_version,
 )
 from .runtime import BackendFactory, ServerRuntime
@@ -475,8 +476,7 @@ class _Client:
             raise ProtocolError(-32602, "features must be an array of strings")
         extended = self.protocol_version != "1.0"
         accepted = [item for item in FEATURES if item in (requested or ())] if extended else []
-        if self.server.runtime.manager.project_registry is None:
-            accepted = [item for item in accepted if not item.startswith("projects")]
+        accepted = self.server.runtime.available_project_features(accepted)
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
         self.features = frozenset(accepted)
@@ -513,15 +513,7 @@ class _Client:
         }
         if extended and requested is not None:
             capabilities["features"] = accepted
-        result: dict[str, object] = {
-            "protocol_version": self.protocol_version,
-            "server": "zeta",
-            "capabilities": capabilities,
-        }
-        unavailable = self.server.runtime.manager.project_registry_unavailable
-        if unavailable is not None:
-            result["notices"] = [unavailable.warning]
-        return result
+        return hello_result(self.protocol_version, capabilities, self.server.runtime.project_registry_warning)
 
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:

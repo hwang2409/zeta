@@ -280,6 +280,16 @@ class ServerRuntime:
     def list_sessions_read_only(self) -> list[SessionMetadata]:
         return self.manager.list_sessions_read_only()
 
+    def available_project_features(self, features: list[str]) -> list[str]:
+        if self.manager.project_registry is not None:
+            return features
+        return [item for item in features if not item.startswith("projects")]
+
+    @property
+    def project_registry_warning(self) -> str | None:
+        unavailable = self.manager.project_registry_unavailable
+        return unavailable.warning if unavailable is not None else None
+
     def set_post_stream_provider_retry(self, enabled: bool) -> None:
         """Apply the serve client's negotiated retry display capability."""
 
