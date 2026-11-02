@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import errno
 import os
-import signal
 import socket
 import stat
 from collections.abc import Mapping
@@ -50,8 +49,10 @@ from .protocol import (
 )
 from .runtime import BackendFactory, ServerRuntime
 from .turn_context import PendingTurnContexts
+from .websocket import WebSocketServer
 
 USER_MESSAGE_MAX_BYTES = 262_144
+
 
 class ZetaServer:
     """Serve one local client over a Unix socket or localhost TCP."""
@@ -63,6 +64,8 @@ class ZetaServer:
         cwd: str | Path | None = None,
         socket_path: str | Path | None = None,
         port: int | None = None,
+        ws_port: int | None = None,
+        ws_origins: tuple[str, ...] = (),
         provider: str | None = None,
         model: str | None = None,
         tools: str | None = None,
@@ -78,6 +81,8 @@ class ZetaServer:
             raise ValueError("choose socket_path or port, not both")
         if port is not None and not 0 <= port <= 65535:
             raise ValueError("port must be between 0 and 65535")
+        if ws_port is None and ws_origins:
+            raise ValueError("ws_origins requires ws_port")
         self.home = Path(home).expanduser().resolve() if home is not None else _home()
         self.socket_path = (
             Path(socket_path).expanduser().resolve()
@@ -100,6 +105,16 @@ class ZetaServer:
             backend_factory=backend_factory,
         )
         self._server: asyncio.AbstractServer | None = None
+        self._websocket = (
+            WebSocketServer(
+                port=ws_port,
+                origins=ws_origins,
+                path=self.home / "run" / "serve.ws.json",
+                accept=self._accept,
+            )
+            if ws_port is not None
+            else None
+        )
         self._client_active = False
         self._client: _Client | None = None
         self._socket_created = False
@@ -128,6 +143,12 @@ class ZetaServer:
             bound = self._server.sockets
             if bound:
                 self.port = int(bound[0].getsockname()[1])
+        if self._websocket is not None:
+            try:
+                await self._websocket.start()
+            except BaseException:
+                await self.close()
+                raise
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -144,6 +165,8 @@ class ZetaServer:
             self._client = None
             self._client_active = False
             try:
+                if self._websocket is not None:
+                    await self._websocket.close()
                 if self._server is not None:
                     self._server.close()
                     await self._server.wait_closed()
@@ -1224,27 +1247,4 @@ def _data_text(data: Mapping[str, object]) -> str:
     value = data.get("output", data.get("text", ""))
     return value if isinstance(value, str) else ""
 
-
-async def run_server(server: ZetaServer) -> None:
-    loop = asyncio.get_running_loop()
-    stopped = asyncio.Event()
-    installed: list[signal.Signals] = []
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(signum, stopped.set)
-        except (NotImplementedError, RuntimeError):
-            continue
-        installed.append(signum)
-    await server.start()
-    serving = asyncio.create_task(server.serve_forever())
-    try:
-        await stopped.wait()
-    finally:
-        await server.close()
-        serving.cancel()
-        await asyncio.gather(serving, return_exceptions=True)
-        for signum in installed:
-            loop.remove_signal_handler(signum)
-
-
-__all__ = ["ZetaServer", "run_server"]
+__all__ = ["ZetaServer"]

@@ -12,6 +12,7 @@ dependencies = [
     "pyvips[binary]>=3.2.0",
     "pyyaml>=6.0",
     "rich>=13.9",
+    "websockets>=15,<16",
 ]
 
 [dependency-groups]

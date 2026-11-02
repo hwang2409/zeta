@@ -1,9 +1,10 @@
 # zeta serve protocol
 
 This document defines protocol version `1.2` (with `1.0` and `1.1`
-compatibility). It is the contract for native clients. The transport is
-newline-delimited UTF-8 JSON. Each line is one JSON-RPC 2.0 object. Frames are
-limited to 1 MiB.
+compatibility). It is the contract for frontend clients. Unix socket and TCP
+transports use newline-delimited UTF-8 JSON, with one JSON-RPC 2.0 object per
+line. WebSocket transport uses one JSON-RPC object per text message, without a
+newline. Messages are limited to 1 MiB on every transport.
 
 ## version history
 
@@ -12,11 +13,65 @@ limited to 1 MiB.
 - `1.0` is the legacy base protocol.
 
 The server accepts one client. A second connection receives a JSON-RPC error
-with code `-32001`, then closes. The server uses a Unix socket by default:
-`$ZETA_HOME/run/serve.sock`. `zeta serve --socket PATH` selects another Unix
-socket. `zeta serve --port N` selects `127.0.0.1:N`. set
-`ZETA_ACCOUNT_HOME` to an absolute directory when served sessions must use a
-shared provider account store while all other state remains under `ZETA_HOME`.
+with code `-32001`, then closes. The limit is shared by all enabled transports.
+The server uses a Unix socket by default: `$ZETA_HOME/run/serve.sock`.
+`zeta serve --socket PATH` selects another Unix socket. `zeta serve --port N`
+selects `127.0.0.1:N`. Set `ZETA_ACCOUNT_HOME` to an absolute directory when
+served sessions must use a shared provider account store while all other state
+remains under `ZETA_HOME`.
+
+### WebSocket transport
+
+`zeta serve --ws PORT` adds an RFC 6455 WebSocket listener on
+`127.0.0.1:PORT`; it does not replace the Unix socket or TCP listener. The bind
+address is fixed and cannot be configured. The transport supports text
+messages, fragmentation, ping, pong, and the close handshake. It does not
+negotiate extensions. Binary messages close with code `1003`, and messages over
+1 MiB close with code `1009`.
+
+Every serve start creates a new random bearer token. A WebSocket upgrade must
+supply it as the `token` URL query parameter. Zeta does not print the token or
+write it to logs. It atomically writes this discovery file with mode `0600` and
+removes it on clean shutdown:
+
+```text
+$ZETA_HOME/run/serve.ws.json
+```
+
+```json
+{"port":8765,"token":"<random bearer token>","pid":12345,"origins":["http://127.0.0.1:5173"]}
+```
+
+A native launcher can read this file and deliver the connection details to its
+trusted frontend. Treat the token as a secret.
+
+Browser upgrades also require an exact allowed `Origin`. Add each origin with a
+repeatable `--ws-origin scheme://host:port` flag. Wildcards, omitted ports,
+paths, and partial matches are not accepted. With no `--ws-origin`, all browser
+origins are rejected. A non-browser client can omit `Origin`, but it must still
+supply the token. Token or origin failures are rejected during the HTTP upgrade,
+before any serve protocol message is read.
+
+Minimal browser connection, where the launcher supplied `connection` from the
+discovery file:
+
+```js
+const socket = new WebSocket(
+  `ws://127.0.0.1:${connection.port}/?token=${encodeURIComponent(connection.token)}`,
+);
+socket.addEventListener("open", () => {
+  socket.send(JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "hello",
+    params: {protocol_version: "1.0", client_version: "1.2"},
+  }));
+});
+socket.addEventListener("message", ({data}) => {
+  const message = JSON.parse(data);
+  console.log(message);
+});
+```
 
 ## handshake
 
