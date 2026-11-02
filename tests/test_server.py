@@ -4446,8 +4446,10 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
 
 
 @pytest.mark.asyncio
-async def test_account_lock_timeout_reaches_serve_with_retryable_code(tmp_path: Path) -> None:
-    from zeta.protocol.types import ErrorInfo
+async def test_account_lock_timeout_reaches_serve_with_retryable_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.accounts import AccountCredentialLockTimeoutError
 
     server = ZetaServer(
         home=tmp_path,
@@ -4463,22 +4465,33 @@ async def test_account_lock_timeout_reaches_serve_with_retryable_code(tmp_path: 
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        message = (
-            "cannot access codex:work: another process holds the account lock; "
-            "retry the turn"
-        )
-        await server._client._event(
-            StreamEvent(
-                StreamEventType.ERROR,
-                error=ErrorInfo("account_lock_timeout", message, provider_error=True),
-            ),
-            session_id=server.runtime.session_id,
-        )
 
-        event = await _event(reader, "error")
-        assert event["error"] == {
-            "code": "account_lock_timeout",
-            "message": message,
+        async def locked(*_args, **_kwargs):
+            raise AccountCredentialLockTimeoutError(AccountId("codex", "work"))
+
+        monkeypatch.setattr(
+            account_session_module.SessionAccountContext, "switch_model", locked
+        )
+        response = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "set_settings",
+                {
+                    "session_id": server.runtime.session_id,
+                    "model": "gpt-5.4",
+                    "approval_mode": "ask",
+                },
+            )
+        )[-1]
+        assert response["error"] == {
+            "code": -32008,
+            "message": (
+                "cannot access codex:work: another process holds the account lock; "
+                "retry the turn"
+            ),
+            "data": {"code": "account_lock_timeout", "retryable": True},
         }
     finally:
         await _close(server, writer)
