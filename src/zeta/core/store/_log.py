@@ -17,7 +17,7 @@ import time
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ...agent.receipt import encode_json
 from ..checkpoints import (
@@ -53,6 +53,7 @@ class PersistedAppend:
 SCHEMA = "zeta.conversation.v1"
 PREFIX_FINGERPRINT_BYTES = 64 * 1024
 MAX_PENDING_APPEND_RECEIPTS = 256
+type InstalledEntriesDelta = tuple[ConversationEntry, ...] | Literal["reset"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +63,7 @@ class _DetachedLogState:
     cwd: str
     entries: list[ConversationEntry]
     entry_ids: set[str]
+    entry_prefix_digests: list[bytes]
     active_approval_requests: dict[str, ConversationEntry]
     active_approval_resolutions: dict[str, str]
     active_tool_results: dict[str, ToolResult]
@@ -94,6 +96,7 @@ class ConversationLogMixin:
             cwd=self.cwd,
             entries=self._entries,
             entry_ids=self._entry_ids,
+            entry_prefix_digests=self._entry_prefix_digests,
             active_approval_requests=self._active_approval_requests,
             active_approval_resolutions=self._active_approval_resolutions,
             active_tool_results=self._active_tool_results,
@@ -126,6 +129,7 @@ class ConversationLogMixin:
             state,
             entries=list(state.entries),
             entry_ids=set(state.entry_ids),
+            entry_prefix_digests=list(state.entry_prefix_digests),
             active_approval_requests=dict(state.active_approval_requests),
             active_approval_resolutions=dict(state.active_approval_resolutions),
             active_tool_results=dict(state.active_tool_results),
@@ -149,14 +153,43 @@ class ConversationLogMixin:
             client_delivery_outcomes=dict(state.client_delivery_outcomes),
         )
 
+    @staticmethod
+    def _next_entry_prefix_digest(
+        previous: bytes, entry: ConversationEntry
+    ) -> bytes:
+        entry_id = entry.id.encode("utf-8")
+        identity = (
+            entry.seq.to_bytes(8, "big")
+            + len(entry_id).to_bytes(8, "big")
+            + entry_id
+        )
+        return hashlib.sha256(previous + identity).digest()
+
+    @staticmethod
+    def _installed_delta_from_baseline(
+        entries: list[ConversationEntry],
+        prefix_digests: list[bytes],
+        baseline: tuple[int, bytes],
+    ) -> InstalledEntriesDelta:
+        """Prepare the exact suffix, or reset when the old log is not a prefix."""
+        count, digest = baseline
+        if count == 0:
+            return tuple(entries)
+        if count <= len(entries) and prefix_digests[count - 1] == digest:
+            return tuple(entries[count:])
+        return "reset"
+
     def _install_log_state(
-        self: ConversationStore, state: _DetachedLogState
+        self: ConversationStore,
+        state: _DetachedLogState,
+        delta: InstalledEntriesDelta,
     ) -> _DetachedLogState:
         """Install validated state on the owner thread using pointer swaps only."""
         previous = self._detach_log_state()
         self._before_incremental_state_install()
         self.cwd = state.cwd
         self._entry_ids = state.entry_ids
+        self._entry_prefix_digests = state.entry_prefix_digests
         self._active_approval_requests = state.active_approval_requests
         self._active_approval_resolutions = state.active_approval_resolutions
         self._active_tool_results = state.active_tool_results
@@ -183,6 +216,7 @@ class ConversationLogMixin:
         # Publish entries last so readers never see rows without matching indexes.
         self._entries = state.entries
         self._transcript_generation += 1
+        self._publish_entries_installed(delta)
         return previous
 
     def enable_persisted_append_tracking(self: ConversationStore) -> None:
@@ -272,6 +306,7 @@ class ConversationLogMixin:
         Replacements, truncations, and non-linear tails fall back to a complete
         parse; ordinary external appends read and validate only the new bytes.
         """
+        had_entries = bool(self._entries)
         try:
             fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         except FileNotFoundError:
@@ -280,6 +315,7 @@ class ConversationLogMixin:
                     f"conversation file is missing: {self.path}"
                 )
             self._entries = []
+            self._entry_prefix_digests = []
             self._reset_incremental_validation_state()
             self._rebuild_client_deliveries(self._entries)
             header = {
@@ -289,6 +325,8 @@ class ConversationLogMixin:
                 "created_at": _now(),
             }
             self._write_line({"type": "header", "data": header})
+            if had_entries:
+                self._publish_entries_installed("reset")
             return
 
         try:
@@ -337,6 +375,7 @@ class ConversationLogMixin:
                 self._load_full()
                 return
             self._log_offset = known_offset + torn_at
+            self._publish_entries_installed(tuple(entries))
             self._append_torn_warning()
             return
 
@@ -349,8 +388,13 @@ class ConversationLogMixin:
             self._write_bytes(b"\n")
         else:
             self._set_log_stat(stat)
+        self._publish_entries_installed(tuple(entries))
 
     def _load_full(self: ConversationStore) -> None:
+        baseline = (
+            len(self._entries),
+            self._entry_prefix_digests[-1] if self._entry_prefix_digests else b"",
+        )
         raw = read_session_file(self.directory_fd, "conversation.jsonl")
         lines = raw.splitlines(keepends=True)
         valid_rows: list[dict[str, Any]] = []
@@ -399,6 +443,16 @@ class ConversationLogMixin:
                 f"invalid conversation entry: {self.path}"
             ) from exc
         self._validate_entries()
+        self._entry_prefix_digests = []
+        for entry in self._entries:
+            previous = (
+                self._entry_prefix_digests[-1]
+                if self._entry_prefix_digests
+                else b""
+            )
+            self._entry_prefix_digests.append(
+                self._next_entry_prefix_digest(previous, entry)
+            )
         self._task_notification_ids = set()
         for index, entry in enumerate(self._entries):
             if index and index % 64 == 0:
@@ -413,18 +467,24 @@ class ConversationLogMixin:
         self._rebuild_incremental_validation_state()
         self._rebuild_client_deliveries(self._entries)
 
+        delta = self._installed_delta_from_baseline(
+            self._entries, self._entry_prefix_digests, baseline
+        )
         if torn_offset is not None:
             self._repair_torn_tail(torn_offset)
             self._log_offset = torn_offset
+            self._publish_entries_installed(delta)
             self._append_torn_warning()
         elif not self._read_only and not raw.endswith(b"\n"):
             self._write_bytes(b"\n")
+            self._publish_entries_installed(delta)
         else:
             fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
             try:
                 self._set_log_stat(os.fstat(fd))
             finally:
                 os.close(fd)
+            self._publish_entries_installed(delta)
 
     def _validate_header(self: ConversationStore, header: dict[str, Any]) -> None:
         header_data = header.get("data")

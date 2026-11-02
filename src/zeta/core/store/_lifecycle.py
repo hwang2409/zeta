@@ -13,6 +13,7 @@ class StoreLifecycleMixin:
 
     def close(self) -> None:
         """Drain durable writers, then release this store's activity leases."""
+        self.on_entries_installed = None
         if self._drain_durable_writes_for_close():
             if self._runtime_lease is not None:
                 self._runtime_lease.close()

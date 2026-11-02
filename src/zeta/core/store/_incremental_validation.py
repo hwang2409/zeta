@@ -59,6 +59,7 @@ class IncrementalValidationMixin:
         staged = copy.copy(self)
         staged._entries = list(self._entries)
         staged._entry_ids = set(self._entry_ids)
+        staged._entry_prefix_digests = list(self._entry_prefix_digests)
         staged._active_approval_requests = dict(self._active_approval_requests)
         staged._active_approval_resolutions = dict(self._active_approval_resolutions)
         staged._active_tool_results = dict(self._active_tool_results)
@@ -94,6 +95,7 @@ class IncrementalValidationMixin:
 
         self._before_incremental_state_install()
         self._entry_ids = staged._entry_ids
+        self._entry_prefix_digests = staged._entry_prefix_digests
         self._active_approval_requests = staged._active_approval_requests
         self._active_approval_resolutions = staged._active_approval_resolutions
         self._active_tool_results = staged._active_tool_results
@@ -149,6 +151,14 @@ class IncrementalValidationMixin:
             self._validate_fork_entry(entry)
         self._record_active_entry(entry)
         self._entries.append(entry)
+        previous_digest = (
+            self._entry_prefix_digests[-1]
+            if self._entry_prefix_digests
+            else b""
+        )
+        self._entry_prefix_digests.append(
+            self._next_entry_prefix_digest(previous_digest, entry)
+        )
         self._entry_ids.add(entry.id)
         if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
             task_id = entry.data.get("task_id")

@@ -778,13 +778,24 @@ def test_installed_hook_full_prefix_reload_emits_only_suffix(tmp_path: Path) -> 
 def test_installed_hook_non_prefix_reload_emits_reset(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="installed-reset")
     original = store.append_message(message(MessageRole.ASSISTANT, "old"))
+    final = store.append_message(message(MessageRole.ASSISTANT, "same tip"))
     rows = store.path.read_text(encoding="utf-8").splitlines()
-    replacement_row = json.loads(rows[1])
-    replacement_row["id"] = "replacement-id"
-    assert replacement_row["id"] != original.id
+    replacement_first = json.loads(rows[1])
+    replacement_final = json.loads(rows[2])
+    replacement_first["id"] = "replacement-id"
+    replacement_final["parent_id"] = "replacement-id"
+    assert replacement_first["id"] != original.id
+    assert replacement_final["id"] == final.id
     replacement = store.path.with_suffix(".replacement")
     replacement.write_text(
-        rows[0] + "\n" + json.dumps(replacement_row, separators=(",", ":")) + "\n",
+        "\n".join(
+            [
+                rows[0],
+                json.dumps(replacement_first, separators=(",", ":")),
+                json.dumps(replacement_final, separators=(",", ":")),
+                "",
+            ]
+        ),
         encoding="utf-8",
     )
     replacement.replace(store.path)
@@ -794,7 +805,8 @@ def test_installed_hook_non_prefix_reload_emits_reset(tmp_path: Path) -> None:
     store.refresh()
 
     assert observed == ["reset"]
-    assert store._entries[-1].id == "replacement-id"
+    assert store._entries[0].id == "replacement-id"
+    assert store._entries[-1].id == final.id
 
 
 def test_installed_hook_fork_keeps_log_order_with_backward_parent(

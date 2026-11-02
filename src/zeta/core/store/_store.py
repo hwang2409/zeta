@@ -51,7 +51,7 @@ from ._async_writes import AsyncDurableWritesMixin
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
 from ._incremental_validation import IncrementalValidationMixin
 from ._lifecycle import StoreLifecycleMixin
-from ._log import ConversationLogMixin, PersistedAppend
+from ._log import ConversationLogMixin, InstalledEntriesDelta, PersistedAppend
 from ._notifications import NotificationStateMixin
 from ._pending_prompts import (
     MAX_PENDING_PROMPT_TEXT,
@@ -105,6 +105,7 @@ class ConversationStore(
         self.root_dir = Path(session_dir or default_home / "sessions")
         self.session_id = uuid.uuid4().hex if session_id is None else session_id
         self.on_persisted_activity: Callable[[int], None] | None = None
+        self.on_entries_installed: Callable[[InstalledEntriesDelta], None] | None = None
         session_path = Path(self.session_id)
         if (
             not self.session_id
@@ -148,6 +149,7 @@ class ConversationStore(
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
+        self._entry_prefix_digests: list[bytes] = []
         self._initialize_client_delivery_lifecycle()
         self._collect_persisted_appends = _collect_persisted_appends
         self._persisted_appends: list[PersistedAppend] = []
@@ -638,6 +640,11 @@ class ConversationStore(
         if kind not in NOTIFICATION_KINDS:
             raise ValueError(f"unknown notification kind: {kind!r}")
 
+    def _publish_entries_installed(self, delta: InstalledEntriesDelta) -> None:
+        """Publish one prepared resident-install delta without inspecting state."""
+        if delta and self.on_entries_installed is not None:
+            self.on_entries_installed(delta)
+
     def _append_row(
         self,
         entry_type: str,
@@ -705,6 +712,14 @@ class ConversationStore(
         self._write_bytes(encoded)
         for entry in entries:
             self._entries.append(entry)
+            previous_digest = (
+                self._entry_prefix_digests[-1]
+                if self._entry_prefix_digests
+                else b""
+            )
+            self._entry_prefix_digests.append(
+                self._next_entry_prefix_digest(previous_digest, entry)
+            )
             self._entry_ids.add(entry.id)
             self._record_active_entry(entry)
             if (
@@ -717,6 +732,7 @@ class ConversationStore(
         self._record_client_delivery_entries(entries)
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entries[-1].seq)
+        self._publish_entries_installed(tuple(entries))
         return entries
 
     def _append_row_unlocked(
@@ -759,6 +775,14 @@ class ConversationStore(
             self._write_deadline = previous_deadline
         linear = not self._entries or entry.parent_id == self._entries[-1].id
         self._entries.append(entry)
+        previous_digest = (
+            self._entry_prefix_digests[-1]
+            if self._entry_prefix_digests
+            else b""
+        )
+        self._entry_prefix_digests.append(
+            self._next_entry_prefix_digest(previous_digest, entry)
+        )
         self._entry_ids.add(entry.id)
         if linear:
             self._record_active_entry(entry)
@@ -775,6 +799,7 @@ class ConversationStore(
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:
                 self._task_notification_ids.add(task_id)
+        self._publish_entries_installed((entry,))
         return entry
 
     def append_message(
