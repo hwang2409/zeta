@@ -10,7 +10,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..accounts import AccountCredentialLockTimeoutError
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
 from ..protocol.types import (
@@ -302,15 +301,6 @@ class _Client:
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
                     code, message, data = project_request_error(exc)
                     await self._write(self.codec.error_response(request_id, code, message, data))
-                except AccountCredentialLockTimeoutError as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            request_id,
-                            -32008,
-                            str(exc),
-                            {"code": exc.code, "retryable": exc.retryable},
-                        )
-                    )
                 except (SessionError, ValueError) as exc:
                     await self._write(
                         self.codec.error_response(request_id, -32602, str(exc))
@@ -587,7 +577,7 @@ class _Client:
             mode = _required_string(params, "approval_mode")
             if model not in ergonomics.catalog(runtime)["models"] or mode not in {"ask", "allow", "deny"}:
                 raise ProtocolError(-32602, "invalid model or approval mode")
-            await model_selection.apply(runtime, model, mode)
+            await model_selection.apply_rpc(runtime, model, mode)
             return ergonomics.settings(runtime)
         if method == "set_compaction":
             _required_string(params, "mode")

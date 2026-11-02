@@ -5,12 +5,18 @@ Keep a durable fallback until the selected model completes its first response.
 This uses the existing protocol 1.1 settings RPC and ordinary error events.
 """
 
-from ..accounts import AccountId, account_provider, api_key_mode
+from ..accounts import (
+    AccountCredentialLockTimeoutError,
+    AccountId,
+    account_provider,
+    api_key_mode,
+)
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionMetadata, persist_metadata_change
 from ..core.slash import resolve_session_budget
 from ..models.catalog import provider_for_model
 from ..protocol.types import ErrorInfo
+from .protocol import ProtocolError
 from .runtime import ServerRuntime
 
 
@@ -99,6 +105,17 @@ async def apply(
         raise OSError("session settings were not persisted")
     approval_mode = authoritative.approval_mode or mode
     runtime.policy.default = ApprovalDecision(approval_mode)
+
+async def apply_rpc(runtime: ServerRuntime, model: str, mode: str) -> None:
+    try:
+        await apply(runtime, model, mode)
+    except AccountCredentialLockTimeoutError as exc:
+        raise ProtocolError(
+            -32008,
+            str(exc),
+            {"code": exc.code, "retryable": exc.retryable},
+        ) from exc
+
 
 async def confirm(runtime: ServerRuntime) -> None:
     metadata = runtime.metadata
