@@ -120,15 +120,14 @@ class ZetaServer:
         self._socket_created = False
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
-
+        self._account_warnings: tuple[str, ...] = ()
     @property
     def address(self) -> str:
         if self.port is not None:
             return f"127.0.0.1:{self.port}"
         return str(self.socket_path)
-
     async def start(self) -> None:
-        await accounts.migrate(self.home)
+        self._account_warnings = await accounts.migrate(self.home)
         if self.port is None:
             self._prepare_socket_path()
             self._server = await asyncio.start_unix_server(
@@ -149,7 +148,6 @@ class ZetaServer:
             except BaseException:
                 await self.close()
                 raise
-
     async def serve_forever(self) -> None:
         if self._server is None:
             await self.start()
@@ -231,6 +229,8 @@ class ZetaServer:
         self.runtime.set_background_event_sink(self._client._publish_background_event)
         self.runtime.set_memory_notice_sink(self._client._publish_memory_notice)
         self.runtime.set_background_wake_sink(self._client._schedule_background_wake)
+        for warning in self._account_warnings: await self._client._notify("account_warning", message=warning)
+        self._account_warnings = ()
         try:
             await self._client.run()
         finally:

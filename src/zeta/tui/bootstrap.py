@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import threading
 import time
+from collections.abc import Sequence
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -259,7 +260,7 @@ def format_picker_row(index: int, preview: SessionPreview) -> str:
 
 def create_app(args: argparse.Namespace) -> TUIApp:
     home = env_home()
-    AccountStore(account_home(home)).migrate()
+    account_warnings = AccountStore(account_home(home)).migrate()
     ephemeral = bool(getattr(args, "no_session", False))
     ephemeral_root: Path | None = None
     if ephemeral:
@@ -268,7 +269,9 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         ephemeral_root = Path(tempfile.mkdtemp(prefix="zeta-ephemeral-"))
     try:
         with ExitStack() as cleanup:
-            app = _create_app_with_root(args, home, ephemeral_root, cleanup)
+            app = _create_app_with_root(
+                args, home, ephemeral_root, cleanup, account_warnings
+            )
             cleanup.pop_all()
             return app
     except BaseException:
@@ -284,6 +287,7 @@ def _create_app_with_root(
     home: Path,
     ephemeral_root: Path | None,
     cleanup: ExitStack,
+    account_warnings: Sequence[str] = (),
 ) -> TUIApp:
     # Resolve monkey-patch surface at call time so tests that patch
     # ``zeta.tui.app.<name>`` continue to intercept these lookups.
@@ -594,7 +598,9 @@ def _create_app_with_root(
         + external_tools.notices
         + theme_notices
     )
-    startup_warnings = tuple(loaded_settings.warnings) + external_tools.warnings
+    startup_warnings = (
+        tuple(loaded_settings.warnings) + external_tools.warnings + account_warnings
+    )
     if ephemeral:
         startup_warnings = (
             "ephemeral session: nothing will be persisted",

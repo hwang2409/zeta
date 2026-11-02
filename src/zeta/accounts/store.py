@@ -501,7 +501,8 @@ class AccountStore:
         value["defaults"].setdefault(account.provider, key)
         self._write_registry(home_fd, value)
 
-    def migrate(self) -> None:
+    def migrate(self) -> tuple[str, ...]:
+        warnings: list[str] = []
         with self._home() as home_fd:
             if not any(
                 _exists(home_fd, name)
@@ -513,14 +514,15 @@ class AccountStore:
                     "account-locks",
                 )
             ):
-                return
+                return ()
             with self._lock_at(home_fd, ".accounts-migration.lock"):
                 with self._registry_guard(home_fd):
-                    self._sweep_orphan_directories(home_fd)
+                    self._sweep_orphan_directories(home_fd, warnings)
                 for provider in ("anthropic", "codex"):
                     self._migrate_provider(home_fd, provider)
+        return tuple(warnings)
 
-    def _sweep_orphan_directories(self, home_fd: int) -> None:
+    def _sweep_orphan_directories(self, home_fd: int, warnings: list[str]) -> None:
         from .logout import remove_account_directory
 
         registered = set(self._read_registry(home_fd)["accounts"])
@@ -567,9 +569,15 @@ class AccountStore:
                                         continue
                                 except FileNotFoundError:
                                     continue
-                            remove_account_directory(
-                                home_fd, root, (provider, name), allowed=allowed
-                            )
+                            try:
+                                remove_account_directory(
+                                    home_fd, root, (provider, name), allowed=allowed
+                                )
+                            except (AccountError, OSError, ValueError) as exc:
+                                path = self.home / root / provider / name
+                                warnings.append(
+                                    f"could not clean up account directory {path}: {exc}"
+                                )
             except FileNotFoundError:
                 continue
 

@@ -34,8 +34,8 @@ async def cancel_owned_switch(owner: Any) -> None:
     owner._account_switch_task = None
 
 
-async def migrate(home: Path) -> None:
-    await asyncio.to_thread(AccountStore(account_home(home)).migrate)
+async def migrate(home: Path) -> tuple[str, ...]:
+    return await asyncio.to_thread(AccountStore(account_home(home)).migrate)
 
 
 async def list_accounts(runtime: ServerRuntime) -> dict[str, object]:

@@ -13,7 +13,9 @@ def _fsync_directory(directory_fd: int) -> None:
     os.fsync(directory_fd)
 
 
-def _validate_directory_files(directory_fd: int, allowed: set[str]) -> None:
+def _validate_directory(directory_fd: int, allowed: set[str]) -> None:
+    if stat.S_IMODE(os.fstat(directory_fd).st_mode) != 0o700:
+        raise AccountError("account directory has unsafe permissions")
     for name in os.listdir(directory_fd):
         if name not in allowed:
             raise AccountError("account directory contains an unexpected file")
@@ -23,10 +25,8 @@ def _validate_directory_files(directory_fd: int, allowed: set[str]) -> None:
 
 
 def _remove_directory_files(directory_fd: int, allowed: set[str]) -> None:
-    if stat.S_IMODE(os.fstat(directory_fd).st_mode) != 0o700:
-        raise AccountError("account directory has unsafe permissions")
+    _validate_directory(directory_fd, allowed)
     names = os.listdir(directory_fd)
-    _validate_directory_files(directory_fd, allowed)
     for name in names:
         os.unlink(name, dir_fd=directory_fd)
     _fsync_directory(directory_fd)
@@ -41,7 +41,7 @@ def validate_account_directory(
             child_directory(root_fd, account.provider) as provider_fd,
             child_directory(provider_fd, account.name) as account_fd,
         ):
-            _validate_directory_files(account_fd, allowed)
+            _validate_directory(account_fd, allowed)
     except FileNotFoundError:
         return
 
@@ -82,6 +82,6 @@ def remove_account_lock_directory(
                 os.rmdir(account.name, dir_fd=provider_fd)
                 _fsync_directory(provider_fd)
             else:
-                _validate_directory_files(account_fd, allowed)
+                _validate_directory(account_fd, allowed)
     except FileNotFoundError:
         return

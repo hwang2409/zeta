@@ -27,6 +27,7 @@ import zeta.codex as codex_module
 import zeta.oauth as oauth_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.server.login as server_login
+from tests.support.account_processes import crash_logout, hold_account_credential_lock
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import (
@@ -80,41 +81,6 @@ def _hold_registry_lock(
 ) -> None:
     store = AccountStore(home)
     with store._home() as home_fd, store._registry_guard(home_fd):
-        ready.set()
-        release.wait()
-
-
-def _crash_logout(home: str, account: AccountId, point: str) -> None:
-    store = AccountStore(home)
-    if point in {"before-commit", "after-commit"}:
-        original = AccountStore._write_registry
-
-        def crash(self: AccountStore, home_fd: int, value: dict[str, object]) -> None:
-            if point == "after-commit":
-                original(self, home_fd, value)
-            os.kill(os.getpid(), signal.SIGKILL)
-
-        AccountStore._write_registry = crash
-    elif point == "partway-cleanup":
-        import zeta.accounts.logout as logout_module
-
-        def crash(directory_fd: int, allowed: set[str]) -> None:
-            if "oauth.json" in allowed:
-                os.unlink("oauth.json", dir_fd=directory_fd)
-                os.kill(os.getpid(), signal.SIGKILL)
-            logout_module._remove_directory_files(directory_fd, allowed)
-
-        logout_module._remove_directory_files = crash
-    store.logout(account, sessions_root=store.home / "sessions")
-
-
-def _hold_account_credential_lock(
-    home: str,
-    account: AccountId,
-    ready: multiprocessing.synchronize.Event,
-    release: multiprocessing.synchronize.Event,
-) -> None:
-    with AccountStore(home).credential_guard(account):
         ready.set()
         release.wait()
 
@@ -1774,8 +1740,8 @@ def _registered_account(home: Path, account: AccountId) -> None:
 
 
 def _run_killed_logout(home: Path, account: AccountId, point: str) -> None:
-    context = multiprocessing.get_context("fork")
-    process = context.Process(target=_crash_logout, args=(str(home), account, point))
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=crash_logout, args=(str(home), account, point))
     process.start()
     process.join(timeout=5)
     if process.is_alive():
@@ -1863,11 +1829,11 @@ def test_migrate_never_sweeps_registered_account_during_login(tmp_path: Path) ->
     credential = named_account_credentials(tmp_path, account.provider, account.name)
     credential.save(tokens())
     _registered_account(tmp_path, account)
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("spawn")
     ready = context.Event()
     release = context.Event()
     holder = context.Process(
-        target=_hold_account_credential_lock,
+        target=hold_account_credential_lock,
         args=(str(tmp_path), account, ready, release),
     )
     holder.start()
@@ -2045,6 +2011,23 @@ def test_logout_refusal_does_not_delete_valid_credentials(tmp_path: Path) -> Non
 
     assert credential.path.exists()
     assert unexpected.exists()
+    assert store.contains(account)
+
+
+def test_logout_refusal_preserves_account_when_credential_directory_has_unsafe_mode(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(home, account.provider, account.name)
+    credential.save(tokens())
+    os.chmod(credential.path.parent, 0o755)
+    store = AccountStore(home)
+
+    with pytest.raises(AccountError, match="unsafe permissions"):
+        store.logout(account, sessions_root=home / "sessions")
+
+    assert credential.path.exists()
     assert store.contains(account)
 
 
