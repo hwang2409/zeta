@@ -186,6 +186,8 @@ def render_error_card(event: StreamEvent) -> Panel:
     retryable = is_retryable_error(error)
     if code == "account_lock_timeout":
         title = "account busy"
+    elif code == "project_registry_busy":
+        title = "project registry busy"
     elif code == "auth_error":
         title = "login required"
     else:
@@ -222,6 +224,7 @@ def is_retryable_error(error: ErrorInfo | None) -> bool:
 
     return error is not None and error.code in {
         "account_lock_timeout",
+        "project_registry_busy",
         "auth_error",
         "backend_error",
         "http_error",

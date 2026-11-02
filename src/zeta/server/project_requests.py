@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..project_errors import (
     ProjectNotFoundError,
+    ProjectRegistryBusyError,
     ProjectRegistryError,
     UnsupportedMemoryFormatError,
 )
@@ -592,6 +593,8 @@ def project_request_error(
         )
     if isinstance(error, RequestValidationError):
         return -32602, str(error), None
+    if isinstance(error, ProjectRegistryBusyError):
+        return -32000, str(error), {"code": error.code, "retryable": error.retryable}
     if isinstance(error, UnsupportedMemoryFormatError):
         return -32000, str(error), None
     return -32000, "project storage is invalid or unavailable", None

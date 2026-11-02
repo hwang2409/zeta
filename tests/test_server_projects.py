@@ -116,6 +116,66 @@ async def test_session_project_preparation_does_not_block_ping(
 
 
 @pytest.mark.asyncio
+async def test_resume_cancel_closes_store_after_preparation_finishes(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    ProjectRegistry(server.home / "projects").create_project("launch", "repo")
+    first = await server.runtime.create_session()
+    await server.runtime.create_session()
+    opened: list[object] = []
+    preparation_started = threading.Event()
+    preparation_done = threading.Event()
+    closed_before_prepare = False
+    original_open = server.runtime.manager.open
+
+    def tracked_open(session_id: str):
+        nonlocal closed_before_prepare
+        result = original_open(session_id)
+        original_close = result.store.close
+
+        def tracked_close():
+            nonlocal closed_before_prepare
+            closed_before_prepare = not preparation_done.is_set()
+            return original_close()
+
+        result.store.close = tracked_close
+        opened.append(result.store)
+        return result
+
+    server.runtime.manager.open = tracked_open
+    preparation_release = threading.Event()
+    original_prepare = server.runtime._prepare_resumed_session
+
+    def tracked_prepare(opened_session, session_cwd):
+        preparation_started.set()
+        preparation_release.wait(1)
+        try:
+            return original_prepare(opened_session, session_cwd)
+        finally:
+            preparation_done.set()
+
+    server.runtime._prepare_resumed_session = tracked_prepare
+    _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
+    operation = asyncio.create_task(server.runtime.resume_session(first.session_id))
+    try:
+        assert await asyncio.to_thread(preparation_started.wait, 1)
+        threading.Timer(0.2, preparation_release.set).start()
+        operation.cancel()
+        await asyncio.sleep(0)
+        assert not operation.done() or preparation_done.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        preparation_release.set()
+        assert await asyncio.to_thread(preparation_done.wait, 2)
+        assert opened and opened[0]._closed
+        assert not closed_before_prepare
+    finally:
+        preparation_release.set()
+        release.set()
+        holder.join(2)
+        await server.close()
+
+
+@pytest.mark.asyncio
 async def test_serve_project_instructions_does_not_block_loop_tick(tmp_path: Path) -> None:
     server = _server(tmp_path)
     root = server.runtime.cwd
@@ -178,6 +238,7 @@ async def test_serve_blocking_git_does_not_block_ping(
         request_method = {"new_session": "new_session", "resume": "resume", "slash_run": "slash_run"}[method]
         operation = asyncio.create_task(client._dispatch(2, request_method, params))
         await asyncio.sleep(0.05)
+        assert not operation.done()
         ping = asyncio.create_task(client._dispatch(3, "ping", {}))
         assert await asyncio.wait_for(ping, 0.25) == {"pong": True}
         release.set()
@@ -189,6 +250,24 @@ async def test_serve_blocking_git_does_not_block_ping(
         if holder is not None:
             holder.join(2)
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_shutdown_with_registry_reader_held_exits_bounded(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    ProjectRegistry(server.home / "projects").create_project("launch", "repo")
+    reader, writer = await _connect(server)
+    await _hello(reader, writer, ["projects"])
+    _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
+    request = asyncio.create_task(_request(reader, writer, 2, "list_projects"))
+    try:
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(server.close(), 2)
+        assert holder.is_alive()
+    finally:
+        release.set()
+        holder.join(2)
+        await asyncio.gather(request, return_exceptions=True)
 
 
 @pytest.mark.asyncio

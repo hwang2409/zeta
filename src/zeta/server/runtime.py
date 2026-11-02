@@ -441,12 +441,21 @@ class ServerRuntime:
             raise ValueError(
                 f"session working directory no longer exists: {metadata.cwd}"
             )
-        opened = await asyncio.to_thread(self.manager.open, session_id)
-        preparation = asyncio.create_task(
-            asyncio.to_thread(self._prepare_resumed_session, opened, session_cwd)
-        )
+        async def open_and_prepare() -> tuple[OpenedSession, tuple[object, object]]:
+            opened = await asyncio.to_thread(self.manager.open, session_id)
+            try:
+                prepared = await asyncio.to_thread(
+                    self._prepare_resumed_session, opened, session_cwd
+                )
+            except BaseException:
+                await asyncio.to_thread(opened.store.close)
+                raise
+            return opened, prepared
+
+        preparation = asyncio.create_task(open_and_prepare())
+        opened: OpenedSession | None = None
         try:
-            prepared = await preparation
+            opened, prepared = await asyncio.shield(preparation)
             config, resumed_prompt = prepared
             context = resumed_prompt.context
             skill_catalog = resumed_prompt.skill_catalog
@@ -465,11 +474,16 @@ class ServerRuntime:
                 max_turns=self._max_turns,
             )
         except asyncio.CancelledError:
-            await asyncio.shield(preparation)
-            await asyncio.to_thread(opened.store.close)
+            try:
+                opened, _prepared = await asyncio.shield(preparation)
+            except BaseException as preparation_error:  # noqa: BLE001
+                _ = preparation_error
+            else:
+                await asyncio.to_thread(opened.store.close)
             raise
         except BaseException:
-            await preparation
+            if opened is None:
+                opened, _prepared = await preparation
             await asyncio.to_thread(opened.store.close)
             raise
         await self._replace(composition)

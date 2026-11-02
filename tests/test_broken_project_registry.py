@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
 import shutil
 import stat
 import subprocess
+import time
 from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
@@ -17,6 +19,7 @@ from rich.text import Text
 
 from zeta.cli.main import build_parser
 from zeta.core.session import SessionManager
+from zeta.project_errors import ProjectRegistryBusyError
 from zeta.project_registry import ProjectRegistry
 from zeta.runtime.project_registry_state import (
     ProjectRegistryUnavailable,
@@ -55,6 +58,24 @@ _CORRUPTIONS: tuple[tuple[str, Callable[[Path, Path, Path], None]], ...] = (
     ("dangling-symlink", _dangling_symlink),
 )
 _CASE_IDS = [case for case, _corrupt in _CORRUPTIONS]
+
+
+def test_registry_lock_wait_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "projects"
+    registry = ProjectRegistry(root)
+    registry.create_project("one", "repo")
+    lock = root / ".lock"
+    fd = os.open(lock, os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    monkeypatch.setattr("zeta.project_registry._PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS", 0.05)
+    started = time.monotonic()
+    try:
+        with pytest.raises(ProjectRegistryBusyError):
+            registry.list_projects()
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    assert time.monotonic() - started < 0.5
 
 
 def _make_registry(home: Path) -> tuple[Path, Path]:

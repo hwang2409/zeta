@@ -12,6 +12,7 @@ from typing import Any
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
+from ..project_errors import ProjectRegistryBusyError
 from ..protocol.types import (
     Message,
     MessageOrigin,
@@ -302,6 +303,15 @@ class _Client:
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
                     code, message, data = project_request_error(exc)
                     await self._write(self.codec.error_response(request_id, code, message, data))
+                except ProjectRegistryBusyError as exc:
+                    await self._write(
+                        self.codec.error_response(
+                            request_id,
+                            -32000,
+                            str(exc),
+                            {"code": exc.code, "retryable": exc.retryable},
+                        )
+                    )
                 except (SessionError, ValueError) as exc:
                     await self._write(
                         self.codec.error_response(request_id, -32602, str(exc))
