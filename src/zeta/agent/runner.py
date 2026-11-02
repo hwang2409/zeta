@@ -718,9 +718,15 @@ async def run_agent_tool(
     )
 
     def publish_child_lifecycle() -> None:
+        account_store = getattr(account_context, "store", None)
+        protected_accounts = {
+            provider: account
+            for provider, account in selected_accounts.items()
+            if account_store is not None and account_store.contains(account)
+        }
         guard = (
-            account_context.store.pin_guard(selected_accounts)
-            if account_context is not None
+            account_store.pin_guard(protected_accounts)
+            if protected_accounts
             else nullcontext()
         )
         with guard:
