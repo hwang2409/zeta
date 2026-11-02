@@ -797,6 +797,10 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
             self._record_loop_access(len(self) if isinstance(key, slice) else 1)
             return super().__getitem__(key)
 
+        def copy(self):  # type: ignore[no-untyped-def]
+            self._record_loop_access(len(self))
+            return super().copy()
+
     def observe_heavy(name: str):
         original = getattr(ConversationStore, name)
 
