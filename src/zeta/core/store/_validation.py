@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from ...agent.receipt import valid_killed_task_fields
+from ...protocol.types import Message, MessageRole
 
 MAX_AGENT_NOTIFICATION_TEXT = 10_000
 AGENT_COMPLETION_NOTIFICATION_KIND = "agent_completion"
@@ -141,7 +142,8 @@ def validate_project_inbox_notification_data(data: Mapping[str, Any]) -> None:
 def validate_child_question_notification_data(data: Mapping[str, Any]) -> None:
     if (
         data.get("origin") != "notification"
-        or data.get("kind") not in {
+        or data.get("kind")
+        not in {
             CHILD_QUESTION_NOTIFICATION_KIND,
             CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND,
         }
@@ -180,7 +182,8 @@ def validate_agent_notification_data(data: Mapping[str, Any]) -> None:
     """Apply the shared append/load contract for an agent notification."""
 
     if (
-        data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND) != AGENT_COMPLETION_NOTIFICATION_KIND
+        data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
+        != AGENT_COMPLETION_NOTIFICATION_KIND
         or type(data.get("child_instance_id")) is not str
         or not data["child_instance_id"]
         or type(data.get("child_session_path")) is not str
@@ -226,3 +229,52 @@ def validate_notification_data(data: Mapping[str, Any]) -> None:
     if "origin" not in data:
         data = {**data, "origin": "notification"}
     validator(data)
+
+
+def validate_compaction_data(data: Mapping[str, Any]) -> None:
+    summary = data.get("summary")
+    source_start = data.get("source_seq_start")
+    source_end = data.get("source_seq_end")
+    replaces = data.get("replaces", [])
+    pinned_message = data.get("pinned_message")
+    kind = data.get("kind", "summary")
+    view = data.get("view")
+    telemetry = data.get("telemetry")
+    fact_floor = data.get("fact_floor")
+    if type(summary) is not str or not summary.strip():
+        raise ValueError("compaction summary must be a nonempty string")
+    if (
+        type(source_start) is not int
+        or type(source_end) is not int
+        or source_start <= 0
+        or source_end < source_start
+    ):
+        raise ValueError("compaction source sequence must be integers")
+    if (
+        type(replaces) is not list
+        or any(type(entry_id) is not str or not entry_id for entry_id in replaces)
+        or len(replaces) != len(set(replaces))
+    ):
+        raise ValueError("compaction replaces must be unique string IDs")
+    if pinned_message is not None:
+        if type(pinned_message) is not dict:
+            raise ValueError("compaction pinned message must be an object")
+        pinned = Message.from_dict(pinned_message)
+        if pinned.role is not MessageRole.USER:
+            raise ValueError("compaction pinned message must be a user message")
+    if kind not in {"summary", "evict"}:
+        raise ValueError("unknown compaction kind")
+    if kind == "evict":
+        if type(view) is not list or not view:
+            raise ValueError("eviction view must be a nonempty array")
+        for item in view:
+            if type(item) is not dict or type(item.get("seq")) is not int:
+                raise ValueError("invalid eviction view item")
+            message = item.get("message")
+            if type(message) is not dict:
+                raise ValueError("invalid eviction view message")
+            Message.from_dict(message)
+        if telemetry is not None and type(telemetry) is not dict:
+            raise ValueError("eviction telemetry must be an object")
+    elif view is not None or telemetry is not None or fact_floor is not None:
+        raise ValueError("summary compaction cannot contain eviction data")
