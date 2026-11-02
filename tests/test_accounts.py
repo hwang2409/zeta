@@ -25,6 +25,7 @@ import zeta.server.login as server_login
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import (
+    AccountCredentialLockTimeoutError,
     AccountError,
     AccountId,
     AccountLoopThreadLockError,
@@ -55,6 +56,70 @@ from zeta.tui import bootstrap as tui_bootstrap
 from zeta.tui import models as tui_models
 
 _SENTINEL = "token-text-must-not-escape"
+
+
+def _hold_lifecycle_lock(
+    home: str, account: AccountId, ready: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+) -> None:
+    with AccountStore(home).lifecycle_guard(account):
+        ready.set()
+        release.wait()
+
+
+def _read_turn_credentials(
+    home: str, account: AccountId, result: multiprocessing.queues.Queue,
+) -> None:
+    account_store.OAUTH_REFRESH_TIMEOUT_SECONDS = 0.05
+    credential = credential_store(account.provider, home=home, account=account)
+    assert credential is not None
+    try:
+        credential.read()
+    except AccountCredentialLockTimeoutError as exc:
+        result.put((exc.code, exc.retryable, str(exc)))
+    else:
+        result.put(None)
+
+
+def test_turn_credential_read_times_out_when_another_process_holds_lock(
+    tmp_path: Path,
+) -> None:
+    account = AccountId("codex", "work")
+    named_account_credentials(tmp_path, account.provider, account.name).save(tokens())
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    result = context.Queue()
+    holder = context.Process(
+        target=_hold_lifecycle_lock,
+        args=(str(tmp_path), account, ready, release),
+    )
+    reader = context.Process(
+        target=_read_turn_credentials,
+        args=(str(tmp_path), account, result),
+    )
+    holder.start()
+    try:
+        assert ready.wait(timeout=5)
+        reader.start()
+        reader.join(timeout=1)
+        assert not reader.is_alive(), "turn credential read did not honor the lock timeout"
+        assert reader.exitcode == 0
+        assert result.get(timeout=1) == (
+            "account_lock_timeout",
+            True,
+            "cannot access codex:work: another process holds the account lock; retry the turn",
+        )
+    finally:
+        if reader.is_alive():
+            reader.kill()
+        reader.join(timeout=5)
+        release.set()
+        holder.join(timeout=5)
+        if holder.is_alive():
+            holder.kill()
+            holder.join(timeout=5)
+        result.close()
 
 
 @pytest.mark.asyncio
