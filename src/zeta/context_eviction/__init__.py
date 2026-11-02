@@ -20,6 +20,7 @@ from ..protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from ._fact_floor import validate_fact_floor
 from .receipt_constructors import (
     RECEIPT_KIND_METADATA as RECEIPT_KIND_METADATA,
 )
@@ -495,6 +496,9 @@ def valid_eviction_view(
     if not isinstance(view, list) or not all(
         isinstance(item, Mapping) for item in view
     ):
+        return False
+    floor = entry.data.get("fact_floor")
+    if floor is not None and not validate_fact_floor(floor):
         return False
     seqs = [item.get("seq") for item in view]
     return (

@@ -15,7 +15,13 @@ from zeta.context_eviction._fact_floor import (
 from zeta.core.context import ContextAssembler
 from zeta.core.slash import compaction_history
 from zeta.core.store import ConversationEntry, ConversationStore
-from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
 
 
 def _assistant(value: str) -> Message:
@@ -30,7 +36,9 @@ def _notification(**fields: object) -> Message:
     )
 
 
-def _floor(records: list[tuple[int, Message]], previous: object = None) -> dict[str, object]:
+def _floor(
+    records: list[tuple[int, Message]], previous: object = None
+) -> dict[str, object]:
     return select_fact_floor(previous, extract_fact_occurrences(records))
 
 
@@ -83,7 +91,11 @@ def test_typed_extraction_and_strict_sha_binding() -> None:
             "version": 1,
             "oldest": [
                 {
-                    "fact": {"type": "child_status", "handle": "h", "status": "running"},
+                    "fact": {
+                        "type": "child_status",
+                        "handle": "h",
+                        "status": "running",
+                    },
                     "first_seq": 1,
                     "last_seq": 1,
                     "value_rank": [1, 0],
@@ -111,20 +123,22 @@ def test_malformed_persisted_floor_is_rejected(value: object) -> None:
 
 def test_floor_is_bounded_and_max_receipt_fits_production_token_cap() -> None:
     records = [
-        (index, _assistant(f"child {'h' * 78}{index % 10}: status=failed head: {'a' * 40}"))
+        (index, _assistant(f"child {'h' * 78}{index:02d} head: {'a' * 40}"))
         for index in range(1, 41)
     ]
     floor = _floor(records)
     rendered = render_fact_floor(floor)
 
-    assert len(floor["oldest"]) <= 8
-    assert len(floor["newest"]) <= 16
+    assert len(floor["oldest"]) == 8
+    assert len(floor["newest"]) == 16
     assert rendered is not None
     assert len(rendered.content[0].text) <= 4096
     assert message_token_count(rendered) <= FACT_FLOOR_TOKEN_CAP
 
 
-def _partitioned(records: list[tuple[int, Message]], cuts: list[int]) -> dict[str, object]:
+def _partitioned(
+    records: list[tuple[int, Message]], cuts: list[int]
+) -> dict[str, object]:
     floor: object = None
     start = 0
     for end in [*cuts, len(records)]:
@@ -148,7 +162,10 @@ def _partitioned(records: list[tuple[int, Message]], cuts: list[int]) -> dict[st
             [29],
         ),
         (
-            [(1, _assistant("PR #1 verdict=fail")), (2, _assistant("PR #1 verdict=pass"))],
+            [
+                (1, _assistant("PR #1 verdict=fail")),
+                (2, _assistant("PR #1 verdict=pass")),
+            ],
             [1],
         ),
         (
@@ -165,11 +182,16 @@ def test_repeated_selection_matches_one_shot_for_associativity_fixtures(
 
     assert _encoded(repeated["oldest"]) == _encoded(one_shot["oldest"])
     assert _encoded(repeated["newest"]) == _encoded(one_shot["newest"])
-    assert render_fact_floor(repeated).to_dict() == render_fact_floor(one_shot).to_dict()
+    assert (
+        render_fact_floor(repeated).to_dict() == render_fact_floor(one_shot).to_dict()
+    )
 
 
 def test_ten_replacements_equal_one_shot_and_stay_bounded() -> None:
-    records = [(i, _assistant(f"PR #{i} verdict={'pass' if i % 2 else 'fail'}")) for i in range(1, 81)]
+    records = [
+        (i, _assistant(f"PR #{i} verdict={'pass' if i % 2 else 'fail'}"))
+        for i in range(1, 81)
+    ]
     repeated = _partitioned(records, list(range(8, 80, 8)))
     one_shot = _floor(records)
 
@@ -224,6 +246,57 @@ def test_floor_projects_after_view_and_before_retained_rows() -> None:
         "view receipt",
         "[retained typed facts]\npr #7\npr #7 verdict=pass",
     ]
+
+
+@pytest.mark.asyncio
+async def test_public_eviction_persists_floor_accounting_and_no_fact_compatibility(
+    tmp_path: Path,
+) -> None:
+    async def compact(
+        name: str, old_text: str
+    ) -> tuple[dict[str, object], list[Message]]:
+        store = ConversationStore(tmp_path / name)
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER
+            )
+        )
+        store.append_message(_assistant(old_text))
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("recent")]), MessageOrigin.USER
+            )
+        )
+        context = await ContextAssembler(
+            store, token_budget=2_000, retained_tail=1
+        ).assemble_context(force=True)
+        marker = next(
+            entry for entry in reversed(store.replay()) if entry.type == "compaction"
+        )
+        return marker.data, context.messages
+
+    floor_marker, messages = await compact(
+        "facts", "PR #7 verdict=pass sha: abcdef1\n" + "large old response " * 2_000
+    )
+    telemetry = floor_marker["telemetry"]
+    floor_message = next(
+        message for message in messages if message.metadata.get("fact_floor")
+    )
+    assert telemetry["reached_target"] is True
+    assert telemetry["fact_floor_chars"] == len(floor_message.content[0].text)
+    assert telemetry["fact_floor_tokens"] == message_token_count(floor_message)
+    assert telemetry["fact_floor_tokens"] <= FACT_FLOOR_TOKEN_CAP
+    assert messages.index(floor_message) < len(messages) - 1
+
+    plain_marker, _ = await compact("plain", "large old response " * 2_000)
+    assert "fact_floor" not in plain_marker
+    assert set(plain_marker["telemetry"]) == {
+        "kind",
+        "eviction_count",
+        "items_evicted",
+        "tokens_before",
+        "tokens_after",
+    }
 
 
 def test_compaction_surfaces_are_byte_identical_with_floor(tmp_path: Path) -> None:

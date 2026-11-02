@@ -509,6 +509,7 @@ class ConversationStore(
                 kind = entry.data.get("kind", "summary")
                 view = entry.data.get("view")
                 telemetry = entry.data.get("telemetry")
+                fact_floor = entry.data.get("fact_floor")
                 if type(summary) is not str or not summary.strip():
                     raise ValueError("compaction summary must be a nonempty string")
                 if (
@@ -549,10 +550,12 @@ class ConversationStore(
                         Message.from_dict(message)
                     if telemetry is not None and type(telemetry) is not dict:
                         raise ValueError("eviction telemetry must be an object")
-                elif view is not None or telemetry is not None:
-                    raise ValueError(
-                        "summary compaction cannot contain an eviction view"
-                    )
+                    if fact_floor is not None:
+                        from ...context_eviction._fact_floor import validate_fact_floor
+                        if not validate_fact_floor(fact_floor):
+                            raise ValueError("invalid eviction fact floor")
+                elif view is not None or telemetry is not None or fact_floor is not None:
+                    raise ValueError("summary compaction cannot contain eviction data")
             elif entry.type == "client_delivery":
                 validate_client_delivery_data(entry.data, self.session_id)
             elif entry.type == "warning":
@@ -812,6 +815,7 @@ class ConversationStore(
         kind: str = "summary",
         view: list[dict[str, Any]] | None = None,
         telemetry: Mapping[str, Any] | None = None,
+        fact_floor: Mapping[str, Any] | None = None,
     ) -> ConversationEntry:
         data = self._compaction_marker_data(
             summary,
@@ -822,6 +826,7 @@ class ConversationStore(
             kind=kind,
             view=view,
             telemetry=telemetry,
+            fact_floor=fact_floor,
         )
         if expected_parent_id is None:
             return self._append_row("compaction", data, parent_id)
@@ -851,6 +856,7 @@ class ConversationStore(
         kind: str = "summary",
         view: list[dict[str, Any]] | None = None,
         telemetry: Mapping[str, Any] | None = None,
+        fact_floor: Mapping[str, Any] | None = None,
     ) -> None:
         """Commit an unshared marker without copying its large payload."""
 
@@ -863,6 +869,7 @@ class ConversationStore(
             kind=kind,
             view=view,
             telemetry=telemetry,
+            fact_floor=fact_floor,
         )
         with self._append_lock():
             self._load()
@@ -885,6 +892,7 @@ class ConversationStore(
         kind: str,
         view: list[dict[str, Any]] | None,
         telemetry: Mapping[str, Any] | None,
+        fact_floor: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         data: dict[str, Any] = {
             "summary": summary,
@@ -898,6 +906,8 @@ class ConversationStore(
             data["view"] = view
         if telemetry is not None:
             data["telemetry"] = dict(telemetry)
+        if fact_floor is not None:
+            data["fact_floor"] = dict(fact_floor)
         if pinned_message is not None:
             if pinned_message.role is not MessageRole.USER:
                 raise ValueError("compaction pinned message must be a user message")
