@@ -573,7 +573,9 @@ def test_migration_happy_path_anthropic(tmp_path: Path) -> None:
 
 
 def test_migration_bounds_refused_directory_warnings(tmp_path: Path) -> None:
-    provider_root = tmp_path / "accounts" / "codex"
+    # a long home path (as on CI runners) must not hide the account name
+    home = tmp_path / ("h" * 150)
+    provider_root = home / "accounts" / "codex"
     provider_root.mkdir(parents=True)
     for index in range(20):
         directory = provider_root / f"account-{index}"
@@ -581,7 +583,7 @@ def test_migration_bounds_refused_directory_warnings(tmp_path: Path) -> None:
         (directory / "oauth.json").write_text("secret")
         os.chmod(directory, 0o755)
 
-    warnings = AccountStore(tmp_path).migrate()
+    warnings = AccountStore(home).migrate()
 
     assert len(warnings) == 6
     assert all(len(warning) < 300 for warning in warnings)

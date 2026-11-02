@@ -576,7 +576,10 @@ class AccountStore:
             remove_account_directory(home_fd, root, (provider, name), allowed=allowed)
         except (AccountError, OSError, ValueError):
             path = str(self.home / root / provider / name)
-            return path[:_MAX_SWEEP_WARNING_PATH_LENGTH]
+            if len(path) <= _MAX_SWEEP_WARNING_PATH_LENGTH:
+                return path
+            # keep the tail: the provider and account name identify the directory
+            return "..." + path[-(_MAX_SWEEP_WARNING_PATH_LENGTH - 3):]
         return None
 
     def _sweep_orphan_directories(self, home_fd: int, warnings: list[str]) -> None:
