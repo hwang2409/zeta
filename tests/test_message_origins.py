@@ -523,8 +523,12 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
         elif path == "serve steer":
             assert isinstance(backend, SteerToolBackend)
             async with asyncio.timeout(30):
-                await _request(reader, writer, 3, "send", {"text": "start"})
-                await backend.turn1_streaming.wait()
+                send = await _request(reader, writer, 3, "send", {"text": "start"})
+                if not any(
+                    frame.get("params", {}).get("event") == "agent_start"
+                    for frame in send
+                ):
+                    await _frames_until_event(reader, "agent_start")
                 steer = await _request(
                     reader, writer, 4, "steer", {"text": "serve steer input"}
                 )
