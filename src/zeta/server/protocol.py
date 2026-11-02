@@ -24,6 +24,8 @@ FEATURES = (
     "abort_scope",
     "turn_context",
     "delivery_id",
+    "serve_observers",
+    "child_run_events",
 )
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128

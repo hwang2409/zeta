@@ -1109,3 +1109,11 @@ session. It contains a bounded, control-stripped, single-line preview of the
 first user message. It does not change the persisted session name. Older clients
 ignore it; newer clients fall back when an older server omits it. Provider-mode
 filtering and response-size limits apply before the response is sent.
+
+## read-only observers
+
+protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
+
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, `delivery_status`, and `session_snapshot`. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`.
+
+serve owns connection output. controller writes remain direct and awaited. observer output is bounded; an observer that exceeds the queue limit is closed with `-32011`. observer feature negotiation is per connection, so feature-gated live events are sent only to observers that negotiated the feature. requests are read and dispatched sequentially.

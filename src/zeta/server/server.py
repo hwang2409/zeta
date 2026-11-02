@@ -29,6 +29,7 @@ from . import (
     slash_commands,
 )
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
+from .connections import OBSERVER_READ_ONLY_CODE, OBSERVER_REQUESTS, ConnectionRegistry
 from .delivery import DeliveryRequests, TurnOutcome
 from .model_inputs import PendingModelInputs
 from .notification_presentation import NotificationPresentation
@@ -117,6 +118,7 @@ class ZetaServer:
         )
         self._client_active = False
         self._client: _Client | None = None
+        self.connections: ConnectionRegistry | None = None
         self._socket_created = False
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
@@ -129,6 +131,7 @@ class ZetaServer:
 
     async def start(self) -> None:
         await accounts.migrate(self.home)
+        self.connections = ConnectionRegistry(asyncio.get_running_loop())
         if self.port is None:
             self._prepare_socket_path()
             self._server = await asyncio.start_unix_server(
@@ -164,6 +167,9 @@ class ZetaServer:
         finally:
             self._client = None
             self._client_active = False
+            if self.connections is not None:
+                self.connections.close()
+                self.connections = None
             try:
                 if self._websocket is not None:
                     await self._websocket.close()
@@ -215,30 +221,20 @@ class ZetaServer:
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        if self._client_active:
-            codec = FrameCodec()
-            await codec.write(
-                writer,
-                codec.error_response(
-                    None, -32001, "another client is already connected"
-                ),
-            )
-            writer.close()
-            await writer.wait_closed()
-            return
-        self._client_active = True
-        self._client = _Client(self, reader, writer)
-        self.runtime.set_background_event_sink(self._client._publish_background_event)
-        self.runtime.set_memory_notice_sink(self._client._publish_memory_notice)
-        self.runtime.set_background_wake_sink(self._client._schedule_background_wake)
+        registry = self.connections
+        assert registry is not None
+        client = _Client(self, reader, writer)
+        registry.register(client)
         try:
-            await self._client.run()
+            await client.run()
         finally:
-            self.runtime.set_background_event_sink(None)
-            self.runtime.set_memory_notice_sink(None)
-            self.runtime.set_background_wake_sink(None)
-            self._client = None
-            self._client_active = False
+            registry.release(client)
+            if self._client is client:
+                self.runtime.set_background_event_sink(None)
+                self.runtime.set_memory_notice_sink(None)
+                self.runtime.set_background_wake_sink(None)
+                self._client = None
+                self._client_active = False
 
 
 class _Client:
@@ -253,6 +249,7 @@ class _Client:
         self.writer = writer
         self.logins = login.Logins(server.home)
         self.handshaken = False
+        self.role: str | None = None
         self.protocol_version = "1.0"
         self.features: frozenset[str] = frozenset()
         self._write_lock = asyncio.Lock()
@@ -381,10 +378,22 @@ class _Client:
     ) -> object:
         if method == "hello":
             result = self._hello(params)
-            await self._attach_pending_notifications()
+            if self.role == "controller":
+                self.server._client_active = True
+                self.server._client = self
+                self.server.runtime.set_background_event_sink(self._publish_background_event)
+                self.server.runtime.set_memory_notice_sink(self._publish_memory_notice)
+                self.server.runtime.set_background_wake_sink(self._schedule_background_wake)
+                await self._attach_pending_notifications()
             return result
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
+        if self.role == "observer" and method not in OBSERVER_REQUESTS:
+            raise ProtocolError(
+                -32008,
+                "method is unavailable to read-only observers",
+                {"code": OBSERVER_READ_ONLY_CODE, "method": method},
+            )
         if method in login.REQUESTS:
             if self.protocol_version == "1.0":
                 raise ProtocolError(-32601, "login is unavailable on this server")
@@ -409,6 +418,12 @@ class _Client:
                 request_id, method, params, features=self.features
             )
         if method == "list_sessions":
+            if self.role == "observer" and "project_id" in params:
+                raise ProtocolError(
+                    -32008,
+                    "method is unavailable to read-only observers",
+                    {"code": OBSERVER_READ_ONLY_CODE, "method": method},
+                )
             return self._list_sessions(request_id, params)
         if method == "new_session":
             await self._require_idle()
@@ -466,6 +481,9 @@ class _Client:
             raise ProtocolError(-32600, "hello may only be sent once")
         version = params.get("protocol_version")
         client_version = params.get("client_version")
+        role = params.get("role", "controller")
+        if role not in {"controller", "observer"}:
+            raise ProtocolError(-32602, "role must be 'controller' or 'observer'")
         self.protocol_version = negotiate_protocol_version(version, client_version)
         requested = params.get("features")
         if requested is not None and (
@@ -478,9 +496,20 @@ class _Client:
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
         self.features = frozenset(accepted)
-        self.server.runtime.set_post_stream_provider_retry(
-            "assistant_reset" in self.features
-        )
+        if role == "observer" and (
+            self.protocol_version == "1.0" or "serve_observers" not in self.features
+        ):
+            raise ProtocolError(-32602, "observer requires protocol 1.1 and serve_observers")
+        assert self.server.connections is not None
+        try:
+            self.server.connections.claim(self, role, self.features)
+        except RuntimeError as exc:
+            raise ProtocolError(-32001, "another client is already connected") from exc
+        self.role = role
+        if role == "controller":
+            self.server.runtime.set_post_stream_provider_retry(
+                "assistant_reset" in self.features
+            )
         self.handshaken = True
         requests = [
             "list_sessions",
@@ -505,6 +534,8 @@ class _Client:
                 requests.append("clear_steering")
             if "delivery_id" in self.features:
                 requests.append("delivery_status")
+        if role == "observer":
+            requests = sorted(OBSERVER_REQUESTS)
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],
@@ -688,7 +719,7 @@ class _Client:
         runtime = self.server.runtime
         session = self._session_snapshot()
         pending = []
-        if runtime.policy is not None:
+        if self.role != "observer" and runtime.policy is not None:
             pending = [
                 {
                     **self._approvals.observe(item),
@@ -1149,6 +1180,10 @@ class _Client:
             )
 
     async def _write(self, payload: bytes) -> bool:
+        assert self.server.connections is not None
+        return await self.server.connections.send(self, payload)
+
+    async def _write_physical(self, payload: bytes) -> bool:
         async with self._write_lock:
             return await finish_frame_write(self.codec, self.writer, payload)
 
