@@ -11952,7 +11952,10 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
         await app._run_full_screen(session)
 
     assert any("background failed" in line for line in app._transcript_lines)
-    assert "jsonl" in "\n".join(app._transcript_lines)
+    # The log path wraps inside the card on long tmp paths (macOS); compare
+    # the text without ANSI codes, card borders, and line breaks.
+    flat = re.sub(r"\x1b\[[0-9;]*m|[│\s]", "", "".join(app._transcript_lines))
+    assert "tui-errors.jsonl" in flat
     assert terminal_calls == []
     log_path = tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl"
     deadline = time.monotonic() + 1
