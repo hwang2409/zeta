@@ -98,7 +98,6 @@ from ._completion import (
     assistant_reset_event,
     can_retry_context,
     close_completion,
-    complete_delivery,
     ensure_context_reduced,
     observed_completion,
     provider_prompt_tokens,
@@ -1027,11 +1026,7 @@ class AgentLoop(
                         retrying_provider = True
                         continue
                 if plan is None and attempt_state.started and has_active_delivery:
-                    async for publication in complete_delivery(
-                        step_delivery.active_publications,
-                        self._acknowledge_step_delivery,
-                        self._delivery_publication_events,
-                    ):
+                    async for publication in self._accepted_delivery_events(step_delivery):
                         yield publication
                 if (
                     provider_retry_budget is not None
@@ -1057,11 +1052,7 @@ class AgentLoop(
             retrying_context = False
             retrying_provider = False
             if attempt_state.started and has_active_delivery:
-                async for publication in complete_delivery(
-                    step_delivery.active_publications,
-                    self._acknowledge_step_delivery,
-                    self._delivery_publication_events,
-                ):
+                async for publication in self._accepted_delivery_events(step_delivery):
                     yield publication
             if completion_succeeded and self.on_completion_success is not None:
                 completion_result = self.on_completion_success()

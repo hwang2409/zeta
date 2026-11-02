@@ -80,7 +80,6 @@ from zeta.providers.codex import CodexStreamError
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
-from zeta.runtime.loop._completion import complete_delivery
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog, SkillMeta
 from zeta.skills.agent_catalog import AgentCatalog
@@ -7646,7 +7645,7 @@ async def test_accepted_delivery_publishes_exact_staged_ids_before_acknowledgeme
 
     loop = asyncio.get_running_loop()
     events = await _collect(
-        complete_delivery(
+        pending_delivery_module.complete_delivery(
             flow.active_publications,
             flow.acknowledge_active,
             publications,
@@ -7686,7 +7685,7 @@ async def test_cancel_after_notification_ack_commit_keeps_completion_visible(
         ]
         return iter((StreamEvent(StreamEventType.AGENT_NOTIFICATION),))
 
-    stream = complete_delivery(
+    stream = pending_delivery_module.complete_delivery(
         flow.active_publications,
         flow.acknowledge_active,
         publications,
@@ -7738,7 +7737,7 @@ async def test_cancel_after_notification_publication_retries_model_delivery_once
             )
         )
 
-    first = complete_delivery(
+    first = pending_delivery_module.complete_delivery(
         flow.active_publications,
         flow.acknowledge_active,
         publications,
@@ -7750,7 +7749,7 @@ async def test_cancel_after_notification_publication_retries_model_delivery_once
         notification.entries[0].id
     ]
 
-    retry = complete_delivery(
+    retry = pending_delivery_module.complete_delivery(
         flow.active_publications,
         flow.acknowledge_active,
         publications,
@@ -13541,7 +13540,7 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
 
 
 @pytest.mark.asyncio
-async def test_finish_accepted_after_follow_up_read_mid_turn(
+async def test_finish_accepted_after_follow_up_attempt_is_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = FollowUpFinishBackend()
@@ -13559,10 +13558,10 @@ async def test_finish_accepted_after_follow_up_read_mid_turn(
     backend.release_child.set()
     await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
-    await _wait_for_pending_prompt_count(child_store, 0)
+    assert len(await asyncio.to_thread(child_store.pending_prompts)) == 1
     backend.release_finish.set()
-    await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
     await _wait_for_notification(store, "completed")
+    await _wait_for_pending_prompt_count(child_store, 0)
 
     assert backend.finish_attempts == 1
     assert backend.child_prompts.count("first follow-up") == 1
@@ -13600,7 +13599,7 @@ async def test_unread_follow_up_still_blocks_finish(
     backend.release_child.set()
     await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
-    await _wait_for_pending_prompt_count(child_store, 0)
+    assert len(await asyncio.to_thread(child_store.pending_prompts)) == 1
     await _send_follow_up(loop, handle, "second follow-up")
     backend.release_finish.set()
     await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
@@ -14520,7 +14519,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
             self.prompt_attempts = 0
             self.blocked = asyncio.Event()
             self.priority_after_retry: str | None = None
-            self.priority_after_evidence: str | None = "not-observed"
+            self.priority_before_acceptance: str | None = "not-observed"
 
         async def complete(
             self,
@@ -14564,7 +14563,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
             if call_number == 1:
                 assembler.update_token_budget(1_000_000)
             if contains_prompt:
-                self.priority_after_evidence = loop.step_delivery.prompt_priority
+                self.priority_before_acceptance = loop.step_delivery.prompt_priority
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
                 message=reply,
@@ -14626,12 +14625,12 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
         with pytest.raises(asyncio.CancelledError):
             await task
         assert loop.step_delivery.prompt_priority == priority
-        await run_once()
+        await run_once(stop_at_evidence=False)
     else:
-        await run_once()
+        await run_once(stop_at_evidence=False)
         if prompt_outcome == "failure":
             assert loop.step_delivery.prompt_priority == priority
-            await run_once()
+            await run_once(stop_at_evidence=False)
 
     prompt_calls = [
         messages
@@ -14645,7 +14644,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
     )
     if prompt_outcome == "retry":
         assert backend.priority_after_retry == priority
-    assert backend.priority_after_evidence is None
+    assert backend.priority_before_acceptance == priority
     assert loop.step_delivery.prompt_priority is None
 
     for _ in range(10):

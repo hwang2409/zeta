@@ -37,16 +37,6 @@ if TYPE_CHECKING:
     from ...core.store._client_delivery import ClientSteeringBatch
 
 MAX_ERROR_MESSAGE = 400
-async def complete_delivery(
-    publications: object | None,
-    acknowledge_delivery: Callable[[], Awaitable[object]] | None,
-    publication_events: Callable[[object], Iterator[StreamEvent]] | None,
-) -> AsyncIterator[StreamEvent]:
-    if publications is not None and publication_events is not None:
-        for publication in publication_events(publications):
-            yield publication
-    if acknowledge_delivery is not None:
-        await acknowledge_delivery()
 
 
 async def provider_events(
