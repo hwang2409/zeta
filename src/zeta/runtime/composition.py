@@ -206,10 +206,12 @@ def compose_runtime(
         if attention_fork is not None:
             tool_policy = tool_policy.narrowed_by(ATTENTION_FORK_POLICY)
         hooks_restricted = tool_policy.restricted
+        project_registry = manager.project_registry
         memory_enabled = (
             attention_fork is None
             and config.memory_auto
             and metadata.project_id is not None
+            and project_registry is not None
         )
         memory_account = None
         if memory_enabled:
@@ -246,8 +248,8 @@ def compose_runtime(
             skill_catalog=skill_catalog,
             agent_catalog=agent_catalog,
             project_id=metadata.project_id,
-            project_registry=manager.project_registry,
-            inbox_enabled=config.inbox_enabled,
+            project_registry=project_registry,
+            inbox_enabled=config.inbox_enabled and project_registry is not None,
             command_niceness=config.command_niceness,
             tool_allow=tool_policy.allow,
             tool_deny=tool_policy.deny,
@@ -263,6 +265,9 @@ def compose_runtime(
                 )
             ),
         )
+        if project_registry is None:
+            registry.unregister("project")
+            registry.unregister("inbox")
         if attention_fork is not None:
             from ..tools.resolve_attention import register_fork
 
@@ -276,7 +281,7 @@ def compose_runtime(
             skill_catalog=skill_catalog,
             root_project_id=metadata.project_id,
             parent_session_id=metadata.parent_session_id,
-            project_registry=manager.project_registry,
+            project_registry=project_registry,
             **loop_kwargs,
         )
         loop.explicit_finish = config.agents_explicit_finish
@@ -308,8 +313,9 @@ def compose_runtime(
                             )
                 return await complete_reconciliation(memory_backend, prompt)
 
+            assert project_registry is not None
             memory_reconciler = AutoMemoryReconciler(
-                registry=manager.project_registry,
+                registry=project_registry,
                 project_id=metadata.project_id,
                 session_id=metadata.session_id,
                 session_dir=opened.store.session_dir,

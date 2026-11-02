@@ -475,6 +475,8 @@ class _Client:
             raise ProtocolError(-32602, "features must be an array of strings")
         extended = self.protocol_version != "1.0"
         accepted = [item for item in FEATURES if item in (requested or ())] if extended else []
+        if self.server.runtime.manager.project_registry is None:
+            accepted = [item for item in accepted if not item.startswith("projects")]
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
         self.features = frozenset(accepted)
@@ -511,11 +513,15 @@ class _Client:
         }
         if extended and requested is not None:
             capabilities["features"] = accepted
-        return {
+        result: dict[str, object] = {
             "protocol_version": self.protocol_version,
             "server": "zeta",
             "capabilities": capabilities,
         }
+        unavailable = self.server.runtime.manager.project_registry_unavailable
+        if unavailable is not None:
+            result["notices"] = [unavailable.warning]
+        return result
 
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:

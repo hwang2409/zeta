@@ -56,6 +56,25 @@ _T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
+class ProjectRegistryUnavailable:
+    path: Path
+    reason: str
+
+    @property
+    def warning(self) -> str:
+        return (
+            f"warning: project registry unavailable at {self.path}: {self.reason}; "
+            "project features are disabled"
+        )
+
+
+@dataclass(frozen=True)
+class ProjectRegistryState:
+    registry: ProjectRegistry | None
+    unavailable: ProjectRegistryUnavailable | None = None
+
+
+@dataclass(frozen=True)
 class Project:
     project_id: str
     name: str
@@ -211,6 +230,33 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
             if root is not None
             else Path.home() / ".zeta" / "projects"
         )
+
+    @classmethod
+    def load(cls, root: Path | str | None = None) -> ProjectRegistryState:
+        """Probe an existing registry without creating or repairing it."""
+
+        registry = cls(root)
+        try:
+            registry.root.lstat()
+        except FileNotFoundError:
+            return ProjectRegistryState(registry)
+        except OSError as exc:
+            return ProjectRegistryState(
+                None, ProjectRegistryUnavailable(registry.root, str(exc))
+            )
+        try:
+            projects = registry.list_projects()
+            for project in projects:
+                linked = project.canonical_integration_root
+                if linked is not None and not Path(linked).is_dir():
+                    raise ProjectRegistryError(
+                        f"project directory does not exist: {linked}"
+                    )
+        except (OSError, ProjectRegistryError) as exc:
+            return ProjectRegistryState(
+                None, ProjectRegistryUnavailable(registry.root, str(exc))
+            )
+        return ProjectRegistryState(registry)
 
     def _open_root(self) -> tuple[int, os.stat_result]:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW

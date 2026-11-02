@@ -269,6 +269,8 @@ class ServerSlashSession:
         if project_id is None:
             return "memory: no associated project"
         registry = runtime.manager.project_registry
+        if registry is None:
+            return "memory: project registry unavailable"
         loop = getattr(runtime, "loop", None)
         reconciler = loop.memory_reconciler if loop is not None else None
         return run_memory_command(

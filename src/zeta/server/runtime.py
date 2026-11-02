@@ -327,11 +327,16 @@ class ServerRuntime:
         config = self._config(provider, model, project_root=repo_root)
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
-        associated = associate_project_discovery(
-            discovery, self.manager.project_registry, create=False
+        registry = self.manager.project_registry
+        associated = (
+            associate_project_discovery(discovery, registry, create=False)
+            if registry is not None
+            else discovery
         )
-        session_project = associated.project
-        cwd_project = resolve_project_context(discovery, self.manager.project_registry)
+        session_project = associated.project if registry is not None else None
+        cwd_project = (
+            resolve_project_context(discovery, registry) if registry is not None else None
+        )
         context = load_project_context(
             cwd=session_cwd,
             repo_root=repo_root,
@@ -376,16 +381,17 @@ class ServerRuntime:
                 opened.metadata.model,
                 project_root=repo_root,
             )
+            registry = self.manager.project_registry
             session_project = None
-            if opened.metadata.project_id is not None:
+            if opened.metadata.project_id is not None and registry is not None:
                 try:
-                    session_project = self.manager.project_registry.show_project(
-                        opened.metadata.project_id
-                    )
+                    session_project = registry.show_project(opened.metadata.project_id)
                 except (OSError, ValueError):
                     pass
-            cwd_project = resolve_project_context(
-                discovery, self.manager.project_registry
+            cwd_project = (
+                resolve_project_context(discovery, registry)
+                if registry is not None
+                else None
             )
             resumed_prompt = await asyncio.to_thread(
                 resume_prompt,
@@ -397,6 +403,7 @@ class ServerRuntime:
                 inbox_enabled=config.inbox_enabled,
                 session_project=session_project,
                 cwd_project=cwd_project,
+                project_features_enabled=registry is not None,
             )
             context = resumed_prompt.context
             skill_catalog = resumed_prompt.skill_catalog
