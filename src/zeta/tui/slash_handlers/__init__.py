@@ -637,6 +637,32 @@ class SlashHandlerMixin:
         names = sorted({tool.module_stem for tool in trusted})
         return f"tools: trusted {len(names)} project tool(s): {', '.join(names)}"
 
+    @property
+    def new_session_requested(self) -> bool:
+        return self._new_session_requested
+
+    def request_new_session(self) -> None:
+        self._new_session_requested = True
+        self.request_exit()
+
+    @property
+    def restart_has_running_work(self) -> bool:
+        return (
+            self.loop.background_children_running
+            or self.loop.tool_registry.background_tasks.running_count > 0
+        )
+
+    def slash_restart(self, args: str) -> str:
+        if args.strip():
+            return "restart unchanged: /restart does not accept arguments"
+        if self._ephemeral_root is not None:
+            return "restart unavailable: this session is not persistent"
+        if self._fork_controller is None:
+            return "restart unavailable: no TUI session controller"
+        self._fork_controller.request_restart()
+        self.request_exit()
+        return "restarting from the local checkout..."
+
     def slash_new(self, args: str) -> str:
         """Signal the CLI wrapper to start a fresh session in this window."""
 
