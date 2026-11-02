@@ -497,9 +497,6 @@ def valid_eviction_view(
         isinstance(item, Mapping) for item in view
     ):
         return False
-    floor = entry.data.get("fact_floor")
-    if floor is not None and not validate_fact_floor(floor):
-        return False
     seqs = [item.get("seq") for item in view]
     return (
         all(type(seq) is int for seq in seqs)
@@ -511,6 +508,27 @@ def valid_eviction_view(
             for seq in seqs
         )
     )
+
+
+def invalid_eviction_markers(
+    markers: Sequence[ConversationEntry], active_source_seqs: Collection[int]
+) -> tuple[list[ConversationEntry], list[ConversationEntry]]:
+    """Separate invalid views from valid views with invalid fact floors."""
+
+    invalid_floors = [
+        marker
+        for marker in markers
+        if valid_eviction_view(marker, active_source_seqs)
+        and marker.data.get("fact_floor") is not None
+        and not validate_fact_floor(marker.data["fact_floor"])
+    ]
+    invalid = [
+        marker
+        for marker in markers
+        if not valid_eviction_view(marker, active_source_seqs)
+        or marker in invalid_floors
+    ]
+    return invalid, invalid_floors
 
 
 def eviction_view(

@@ -268,10 +268,12 @@ def _text_facts(text: str) -> list[tuple[int, dict[str, object]]]:
 
 
 def _message_facts(message: Message) -> list[dict[str, object]]:
-    facts = _structured_facts(message.metadata)
+    facts: list[dict[str, object]] = []
     notifications = message.metadata.get("notifications")
-    if message.metadata.get("zeta_event") == "agent_notifications" and isinstance(
-        notifications, list
+    if (
+        message.role is MessageRole.SYSTEM
+        and message.metadata.get("zeta_event") == "agent_notifications"
+        and isinstance(notifications, list)
     ):
         for item in notifications:
             if isinstance(item, Mapping):
@@ -477,14 +479,32 @@ def previous_fact_floor(
     )
 
 
+def floor_rebuild_records(
+    markers: Sequence[_Marker], source_messages: Mapping[int, Message]
+) -> list[tuple[int, Message]]:
+    return [
+        (seq, message)
+        for seq, message in sorted(source_messages.items())
+        if any(
+            marker.data["source_seq_start"] <= seq <= marker.data["source_seq_end"]
+            for marker in markers
+        )
+    ]
+
+
 def prepare_records(
-    records: Iterable[tuple[int, Message]], previous: object
+    records: Iterable[tuple[int, Message]],
+    previous: object,
+    *,
+    floor_rebuild_records: Iterable[tuple[int, Message]] = (),
 ) -> tuple[list[tuple[int, Message]], FactFloorPlan]:
     """Materialize records and extract their facts in the same worker-side walk."""
     materialized: list[tuple[int, Message]] = []
     occurrences: list[Occurrence] = []
     for record in records:
         materialized.append(record)
+        occurrences.extend(extract_fact_occurrences((record,)))
+    for record in floor_rebuild_records:
         occurrences.extend(extract_fact_occurrences((record,)))
     floor = select_fact_floor(previous, occurrences)
     message = render_fact_floor(floor)
@@ -496,5 +516,7 @@ def prepare_records(
 
 
 def projected_fact_floor(value: object) -> list[Message]:
+    if value is not None and not validate_fact_floor(value):
+        return []
     message = render_fact_floor(value)
     return [] if message is None else [message]
