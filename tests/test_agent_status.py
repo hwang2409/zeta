@@ -1,7 +1,9 @@
 import asyncio
+import gc
 import json
 import os
 import random
+import weakref
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +29,18 @@ from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
+
+def test_runtime_owner_fixture_retains_store_until_teardown(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    reference = weakref.ref(store)
+
+    del store
+    gc.collect()
+
+    retained = reference()
+    assert retained is not None
+    retained.close()
 
 
 async def _status(
