@@ -17,10 +17,9 @@ from tests.support.fake_backend import FakeBackend
 from tests.test_server import _close, _connect, _request
 from zeta.project_inbox import ProjectInbox, ProjectInboxScanner
 from zeta.project_registry import ProjectRegistry
-from zeta.server import ZetaServer
+from zeta.server import ZetaServer, slash_commands
 from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
-from zeta.server import slash_commands
 from zeta.server.slash_commands import run_command
 
 
@@ -265,7 +264,7 @@ async def test_serve_blocking_git_does_not_block_ping(
         )
         request_method = {"new_session": "new_session", "resume": "resume", "slash_run": "slash_run"}[method]
         operation = asyncio.create_task(client._dispatch(2, request_method, params))
-        git_was_started = await asyncio.to_thread(_wait_for_path, git_started, 1)
+        await asyncio.to_thread(_wait_for_path, git_started, 1)
         if method == "slash_run":
             assert await asyncio.to_thread(registry_started.wait, 1)
         assert not operation.done()
