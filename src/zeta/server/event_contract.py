@@ -1,8 +1,10 @@
 """Exhaustive runtime-to-wire event ownership for zeta serve."""
 
+from collections.abc import Mapping
 from enum import Enum, auto
 
-from ..protocol.types import StreamEventType
+from ..protocol.types import StreamEvent, StreamEventType
+from .protocol import bounded
 
 LEGACY_NOTIFICATION_WIRE_EVENT = "sub_agent_receipt"
 NOTIFICATION_WIRE_EVENTS = {
@@ -38,6 +40,43 @@ AUXILIARY_WIRE_EVENTS = {
 }
 
 # Custom projections in server.py use this exhaustive contract.
+def _tool_call(event: StreamEvent) -> dict[str, object] | None:
+    return event.tool_call.to_dict() if event.tool_call is not None else None
+
+
+def _data_text(data: Mapping[str, object]) -> str:
+    value = data.get("output", data.get("text", ""))
+    return value if isinstance(value, str) else ""
+
+
+def assistant_message(event: StreamEvent) -> dict[str, object]:
+    if event.message is None:
+        return {}
+    message = event.message.to_dict()
+    message.pop("metadata", None)
+    return {"message": message}
+
+
+def tool_start(event: StreamEvent) -> dict[str, object]:
+    return {"tool_call": _tool_call(event), "data": dict(event.data)}
+
+
+def tool_output(event: StreamEvent) -> dict[str, object]:
+    return {
+        "tool_call": _tool_call(event),
+        "output": bounded(event.delta or _data_text(event.data)),
+        "data": dict(event.data),
+    }
+
+
+def tool_end(event: StreamEvent) -> dict[str, object]:
+    return {
+        "tool_call": _tool_call(event),
+        "tool_result": event.tool_result.to_dict() if event.tool_result else None,
+        "data": dict(event.data),
+    }
+
+
 STREAM_EVENT_WIRE_EVENTS = {
     StreamEventType.AGENT_START: "agent_start",
     StreamEventType.TURN_START: "turn_start",
