@@ -629,7 +629,7 @@ class ConversationStore(
                         time.sleep(max(0, min(0.01, deadline - time.monotonic())))
                     else:
                         break
-            self._installed_callback_local.pending = []
+            self._start_entries_installed()
             try:
                 yield
             finally:

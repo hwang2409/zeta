@@ -158,20 +158,16 @@ class ConversationLogMixin:
         )
 
     @staticmethod
-    def _next_entry_prefix_digest(
-        previous: bytes, entry: ConversationEntry
-    ) -> bytes:
-        entry_id = entry.id.encode("utf-8")
-        identity = (
-            entry.seq.to_bytes(8, "big")
-            + len(entry_id).to_bytes(8, "big")
-            + entry_id
-        )
-        return hashlib.sha256(previous + identity).digest()
+    def _encoded_entry_line(entry: ConversationEntry) -> bytes:
+        return encode_json(entry.to_dict()) + b"\n"
+
+    @staticmethod
+    def _next_entry_prefix_digest(previous: bytes, encoded_line: bytes) -> bytes:
+        return hashlib.sha256(previous + encoded_line).digest()
 
     def _record_entry_prefix(self: ConversationStore, entry: ConversationEntry) -> None:
         self._entry_prefix_digest = self._next_entry_prefix_digest(
-            self._entry_prefix_digest, entry
+            self._entry_prefix_digest, self._encoded_entry_line(entry)
         )
 
     @staticmethod
@@ -193,11 +189,21 @@ class ConversationLogMixin:
         except Exception:
             _LOGGER.exception("installed-row callback failed")
 
+    def _start_entries_installed(self: ConversationStore) -> None:
+        if not hasattr(self._installed_callback_local, "pending"):
+            self._installed_callback_local.pending = []
+
     def _finish_entries_installed(self: ConversationStore) -> None:
+        if getattr(self._installed_callback_local, "draining", False):
+            return
         pending = self._installed_callback_local.pending
-        del self._installed_callback_local.pending
-        for delta in pending:
-            self._deliver_entries_installed(delta)
+        self._installed_callback_local.draining = True
+        try:
+            for delta in pending:
+                self._deliver_entries_installed(delta)
+        finally:
+            del self._installed_callback_local.pending
+            del self._installed_callback_local.draining
 
     def _publish_prepared_entries_installed(
         self: ConversationStore, delta: InstalledEntriesDelta
@@ -229,7 +235,9 @@ class ConversationLogMixin:
             return "reset"
         digest = b""
         for index in range(count):
-            digest = cls._next_entry_prefix_digest(digest, entries[index])
+            digest = cls._next_entry_prefix_digest(
+                digest, cls._encoded_entry_line(entries[index])
+            )
         if digest != expected_digest:
             return "reset"
         return cls._owned_installed_delta(tuple(entries[count:]))
