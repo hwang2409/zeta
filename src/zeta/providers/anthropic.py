@@ -768,7 +768,9 @@ async def _decode_response(
         if message_state == "not-started":
             raise AnthropicStreamError("Anthropic stream ended before message_start")
         yield salvage("clean-eof")
-        raise AnthropicStreamError("Anthropic stream ended before message completion")
+        raise AnthropicStreamError(
+            "Anthropic stream ended before message completion", retryable=True
+        )
 
 
 def _translate_event(

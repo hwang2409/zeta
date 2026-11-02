@@ -6482,37 +6482,34 @@ def test_retry_notice_is_dim() -> None:
 
 
 @pytest.mark.asyncio
-async def test_discard_retry_drops_inline_partial_from_scrollback(
+async def test_early_close_retry_drops_inline_partial_from_scrollback(
     tmp_path: Path,
 ) -> None:
     """A discarded assistant partial must not leak into inline scrollback."""
 
-    class StallRetryBackend(CompletionBackend):
+    class EarlyCloseRetryBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
         async def complete(
             self,
             messages: Sequence[Message],
             tool_schemas: Sequence[ToolSchema],
         ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            self.calls += 1
             yield StreamEvent(StreamEventType.MESSAGE_START)
-            yield StreamEvent(
-                StreamEventType.MESSAGE_UPDATE,
-                content=TextContent("pre-stall partial"),
-            )
-            yield StreamEvent(
-                StreamEventType.MESSAGE_UPDATE,
-                tool_call=ToolCall("partial-call", "read", {"path": "discard-me"}),
-                data={"tool_call_delta": '{"path":"discard-me'},
-            )
-            yield StreamEvent(
-                StreamEventType.RETRY,
-                data={
-                    "text": "network error, retrying in 0s (attempt 2/5)",
-                    "retry": 1,
-                    "delay": 0.0,
-                },
-            )
-            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
-            yield StreamEvent(StreamEventType.MESSAGE_START)
+            if self.calls == 1:
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    content=TextContent("pre-close partial"),
+                )
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    tool_call=ToolCall("partial-call", "read", {"path": "discard-me"}),
+                    data={"tool_call_delta": '{"path":"discard-me'},
+                )
+                return
             yield StreamEvent(
                 StreamEventType.MESSAGE_UPDATE,
                 content=TextContent("post-retry reply"),
@@ -6527,7 +6524,7 @@ async def test_discard_retry_drops_inline_partial_from_scrollback(
     output = StringIO()
     app = TUIApp(
         AgentLoop(
-            StallRetryBackend(),
+            EarlyCloseRetryBackend(),
             ConversationStore(tmp_path / "sessions"),
             tool_schemas=[],
 skill_catalog=SkillCatalog.empty(),
@@ -6540,25 +6537,42 @@ skill_catalog=SkillCatalog.empty(),
     await app._consume_turn("hi")
 
     plain = Text.from_ansi(output.getvalue()).plain
-    assert "network error, retrying" in plain
+    assert "provider error (stream_error), retry scheduled" in plain
     assert "post-retry reply" in plain
-    assert "pre-stall partial" not in plain
+    assert "pre-close partial" not in plain
     assert "discard-me" not in plain
 
 
 @pytest.mark.asyncio
-async def test_truncated_response_notice_is_printed_once(tmp_path: Path) -> None:
+async def test_truncated_response_notice_is_printed_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+    )
+
     class TruncatedBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
         async def complete(
             self,
             messages: Sequence[Message],
             tool_schemas: Sequence[ToolSchema],
         ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            self.calls += 1
             yield StreamEvent(StreamEventType.MESSAGE_START)
+            if self.calls == 1:
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT),
+                    data={"truncated": True},
+                )
+                return
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
-                message=Message(MessageRole.ASSISTANT),
-                data={"truncated": True},
+                message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
             )
 
     output = StringIO()

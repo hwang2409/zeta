@@ -38,8 +38,6 @@ _TERMINAL_ERROR_CODES = {
     "permission_denied",
     "permission_error",
 }
-
-
 @dataclass(frozen=True, slots=True)
 class RetryPlan:
     """One scheduled retry within a shared turn budget."""

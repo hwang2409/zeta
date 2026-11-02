@@ -809,6 +809,7 @@ class ErrorInfo:
     # Internal provider context; the server projects versioned wire errors.
     status_code: int | None = None
     provider_error: bool = False
+    retryable: bool = field(default=False, compare=False, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {"code": self.code, "message": self.message}

@@ -1114,6 +1114,50 @@ async def test_midstream_disconnect_without_tool_call_discards_partial_and_retri
 
 
 @pytest.mark.asyncio
+async def test_clean_eof_without_tool_call_discards_partial_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = message_stream()[:4] if len(requests) == 1 else message_stream()
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(stream),
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(
+        CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+        ),
+        store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    events = [
+        event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)
+    ]
+
+    assert len(requests) == 2
+    assert any(event.type is StreamEventType.RETRY for event in events)
+    assert any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
+    assert [message.content for message in store.messages()] == [
+        [TextContent("hello")],
+        [TextContent("hello")],
+    ]
+    await loop.close()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_tool_argument_mismatch_retries_without_executing_bad_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

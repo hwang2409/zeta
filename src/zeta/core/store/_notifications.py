@@ -119,7 +119,6 @@ class NotificationStateMixin:
         if not task_id or not command or type(exit_code) not in {int, type(None)}:
             raise ValueError("invalid task notification")
         with self._append_lock():
-            self._load()
             # Confirm id-set hits against the branch, preserving old scan behavior.
             if task_id in self._task_notification_ids:
                 existing = next(
@@ -174,7 +173,6 @@ class NotificationStateMixin:
             ),
         }
         with self._append_lock():
-            self._load()
             pending = next(
                 (
                     entry
@@ -258,7 +256,6 @@ class NotificationStateMixin:
         if not child_instance_id or reason not in {"finished", "canceled"}:
             raise ValueError("invalid child question closure")
         with self._append_lock():
-            self._load()
             questions = [
                 entry
                 for entry in self._active_notifications.values()
@@ -315,7 +312,6 @@ class NotificationStateMixin:
             data["display_only"] = True
         validate_child_idle_notification_data(data)
         with self._append_lock():
-            self._load()
             if child_instance_id in self._active_completion_notifications:
                 return None
             return self._snapshot_entry(self._append_row_unlocked("notification", data))
@@ -383,7 +379,6 @@ class NotificationStateMixin:
             report=report,
         )
         with self._append_lock():
-            self._load()
             existing = self._active_completion_notifications.get(child_instance_id)
             if existing is not None:
                 return self._snapshot_entry(existing), False
@@ -404,7 +399,6 @@ class NotificationStateMixin:
     ) -> ConversationEntry | None:
         """Incrementally sync the log tail and return one active notification."""
         with self._append_lock():
-            self._load()
             entry = self._active_completion_notifications.get(child_instance_id)
             return self._snapshot_entry(entry) if entry is not None else None
 
@@ -507,7 +501,6 @@ class NotificationStateMixin:
         if not presented and not acknowledged:
             return
         with self._append_lock():
-            self._load()
             branch = self.replay()
             if not any(
                 entry.type == "notification" and entry.id == notification_id
@@ -556,7 +549,6 @@ class NotificationStateMixin:
         if not ordered_ids:
             return
         with self._append_lock():
-            self._load()
             branch = self._active_branch()
             notifications = {
                 entry.id for entry in branch if entry.type == "notification"
@@ -604,7 +596,6 @@ class NotificationStateMixin:
         if not ordered_ids:
             return
         with self._append_lock():
-            self._load()
             branch = self._active_branch()
             notifications = {
                 entry.id for entry in branch if entry.type == "notification"

@@ -983,16 +983,21 @@ async def run_agent_tool(
             return
         child_loop.tool_registry.abort()
         child_loop.store.drop_client_steering("abort")
+        loop._background_owner.cancel_subtree(child_instance_id)
+        await loop._background_owner.wait_for_descendant_watchers(child_instance_id)
         if not child_task.done():
             child_task.cancel()
-        loop._background_owner.cancel_subtree(child_instance_id)
         await asyncio.gather(child_task, return_exceptions=True)
         child_store.mark_agent_canceled(tool_call.id)
 
     def request_child_cancel() -> CancellationRequest:
-        """Start durable cancellation and separately owned cleanup."""
-        confirmation = loop._create_task(confirm_child_cancel())
-        cleanup = loop._create_task(cleanup_canceled_child(confirmation))
+        """Start durable cancellation and tree-owned cleanup."""
+        confirmation = loop._background_owner.create_cancellation_task(
+            confirm_child_cancel()
+        )
+        cleanup = loop._background_owner.create_cancellation_task(
+            cleanup_canceled_child(confirmation)
+        )
         return CancellationRequest(confirmation, cleanup)
 
     async def cancel_child() -> None:

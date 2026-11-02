@@ -17,7 +17,12 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
-from .pending_delivery import DeliveryPublications, StepDeliveryFlow, delivery_preview
+from .pending_delivery import (
+    DeliveryPublications,
+    StepDeliveryFlow,
+    complete_delivery,
+    delivery_preview,
+)
 
 WakeState = Literal["idle", "scheduled", "running"]
 
@@ -56,6 +61,15 @@ class AgentNotificationMixin:
             self.agent_instance_id, flow
         )
         self.step_delivery = flow
+
+    def _accepted_delivery_events(
+        self, flow: StepDeliveryFlow
+    ) -> AsyncIterator[StreamEvent]:
+        return complete_delivery(
+            flow.active_publications,
+            self._acknowledge_step_delivery,
+            self._delivery_publication_events,
+        )
 
     def _delivery_publication_events(
         self, publications: object

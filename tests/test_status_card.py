@@ -13,6 +13,7 @@ from rich.text import Text
 from tests.support.fake_backend import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
+from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.overlay import OverlayControl
@@ -95,6 +96,66 @@ async def _render_status(session, width: int, height: int) -> Screen:
         )
         screen.draw_all_floats()
     return screen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_fact_floor", [False, True])
+async def test_status_card_renders_compaction_with_or_without_fact_floor(
+    tmp_path, with_fact_floor: bool
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    source = store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("source")])
+    )
+    aggregate = {
+        "fact": {"type": "pr", "pr": 7},
+        "first_seq": source.seq,
+        "last_seq": source.seq,
+        "value_rank": [source.seq, 0],
+    }
+    store.append_compaction_marker(
+        "summary",
+        source.seq,
+        source.seq,
+        kind="evict",
+        view=[
+            {
+                "seq": source.seq,
+                "message": Message(
+                    MessageRole.ASSISTANT, [TextContent("receipt")]
+                ).to_dict(),
+            }
+        ],
+        fact_floor=(
+            {"version": 1, "oldest": [aggregate], "newest": [aggregate]}
+            if with_fact_floor
+            else None
+        ),
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    try:
+        session = app._make_session()
+        app._active_session = session
+        app._install_full_screen_layout(session)
+        app.open_status_card()
+
+        await _render_status(session, 100, 30)
+        app._status_card.bottom()
+        screen = await _render_status(session, 100, 30)
+        text = "\n".join(
+            "".join(screen.data_buffer[y][x].char for x in range(100))
+            for y in range(30)
+        )
+        assert "compaction_history:" in text
+        assert "turn 1: 1 entries" in text
+        assert "retained typed facts" not in text
+    finally:
+        await app.close()
 
 
 @pytest.mark.asyncio

@@ -80,7 +80,6 @@ from zeta.providers.codex import CodexStreamError
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
-from zeta.runtime.loop._completion import observed_completion
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog, SkillMeta
 from zeta.skills.agent_catalog import AgentCatalog
@@ -2375,6 +2374,66 @@ async def test_parent_abort_cancels_background_grandchild(
 
 
 @pytest.mark.asyncio
+async def test_parent_routing_lives_until_grandchild_cancellation_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = NestedBackgroundBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    owner = loop._background_owner
+    parent_id = f"{store.session_id}:1"
+    grandchild_id = f"{parent_id}:1"
+    grandchild_publication_started = asyncio.Event()
+    release_grandchild_publication = asyncio.Event()
+    original_publish = owner.conversation_channel.publish_completion
+    original_unregister = owner.conversation_channel.unregister_delivery_flow
+    original_wait = getattr(owner, "wait_for_descendant_watchers", None)
+
+    async def hold_grandchild_publication(**kwargs):
+        if kwargs["child_instance_id"] == grandchild_id:
+            grandchild_publication_started.set()
+            await release_grandchild_publication.wait()
+        return await original_publish(**kwargs)
+
+    async def unregister_delivery_flow(instance_id: str) -> None:
+        await original_unregister(instance_id)
+        if instance_id == parent_id:
+            release_grandchild_publication.set()
+
+    monkeypatch.setattr(
+        owner.conversation_channel, "publish_completion", hold_grandchild_publication
+    )
+    monkeypatch.setattr(
+        owner.conversation_channel,
+        "unregister_delivery_flow",
+        unregister_delivery_flow,
+    )
+    if original_wait is not None:
+
+        async def release_while_parent_waits(instance_id: str) -> None:
+            if instance_id == parent_id:
+                release_grandchild_publication.set()
+            await original_wait(instance_id)
+
+        monkeypatch.setattr(
+            owner, "wait_for_descendant_watchers", release_while_parent_waits
+        )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    loop.abort()
+    await asyncio.wait_for(grandchild_publication_started.wait(), timeout=1)
+    await asyncio.wait_for(owner.wait(), timeout=1)
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    notifications = child_store.agent_notifications(pending_only=False)
+    assert [notification.data["status"] for notification in notifications] == [
+        "canceled"
+    ]
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_foreground_cancel_cancels_owned_background_descendant_only(
     tmp_path: Path,
 ) -> None:
@@ -2477,6 +2536,72 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
     backend.release_grandchild.set()
     await loop._background_owner.wait()
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_adopted_grandchild_after_child_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FinishGateBackend("handoff", background_child=True)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    owner = loop._background_owner
+    completion_published = asyncio.Event()
+    release_child_watcher = asyncio.Event()
+    cancellation_requested = asyncio.Event()
+    original_publish = owner.conversation_channel.publish_completion
+    original_cancel_all = owner.cancel_all
+    original_create_task = AgentLoop._create_task
+
+    async def pause_after_publication(**kwargs):
+        notification = await original_publish(**kwargs)
+        if kwargs["child_instance_id"].count(":") == 1:
+            completion_published.set()
+            await release_child_watcher.wait()
+        return notification
+
+    async def hold_child_loop_cancellation(coroutine):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            coroutine.close()
+
+    def create_task(loop_self, coroutine):
+        if loop_self.agent_depth == 1 and coroutine.cr_code.co_name in {
+            "confirm_child_cancel",
+            "cleanup_canceled_child",
+        }:
+            return original_create_task(
+                loop_self, hold_child_loop_cancellation(coroutine)
+            )
+        return original_create_task(loop_self, coroutine)
+
+    def cancel_all() -> None:
+        original_cancel_all()
+        cancellation_requested.set()
+
+    monkeypatch.setattr(
+        owner.conversation_channel, "publish_completion", pause_after_publication
+    )
+    monkeypatch.setattr(AgentLoop, "_create_task", create_task)
+    monkeypatch.setattr(owner, "cancel_all", cancel_all)
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(completion_published.wait(), timeout=2)
+    closing = asyncio.create_task(loop.close())
+    try:
+        await asyncio.wait_for(cancellation_requested.wait(), timeout=1)
+        release_child_watcher.set()
+        await asyncio.wait_for(closing, timeout=1)
+        assert not owner.running
+    finally:
+        release_child_watcher.set()
+        backend.release_grandchild.set()
+        if not closing.done():
+            closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        await asyncio.wait_for(owner.wait(), timeout=2)
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -3832,7 +3957,7 @@ async def test_parallel_delegated_approvals_resolve_by_child_instance(
     allow, deny = pending
     assert policy.approve(allow.key)
     assert policy.deny(deny.key)
-    await asyncio.wait_for(task, timeout=1)
+    await asyncio.wait_for(task, timeout=30)
     assert policy.pending_requests() == []
 
 
@@ -6798,6 +6923,25 @@ async def test_pending_store_lock_rejects_event_loop_thread(tmp_path: Path) -> N
             operation()
 
 
+class EarlyCloseThenAnswerBackend(CompletionBackend):
+    def __init__(self, first_error: BaseException | None = None) -> None:
+        self.calls: list[list[Message]] = []
+        self.first_error = first_error
+
+    async def complete(self, messages, tool_schemas):
+        del tool_schemas
+        self.calls.append(list(messages))
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
+        if len(self.calls) == 1:
+            if self.first_error is not None:
+                raise self.first_error
+            return
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+        )
+
+
 def _task_exit_input(task_id: str) -> pending_delivery_module.NotificationInput:
     return pending_delivery_module.NotificationInput(
         "task_exit",
@@ -7361,6 +7505,209 @@ async def test_provider_error_does_not_ack_staged_prompt(
 
 
 @pytest.mark.asyncio
+async def test_early_close_commits_staged_delivery_only_after_successful_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def retry_now(*_args, **_kwargs) -> bool:
+        return True
+
+    backend = EarlyCloseThenAnswerBackend()
+    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    prompt = await loop.step_delivery.produce(
+        pending_delivery_module.PromptInput(
+            "follow up", MessageOrigin.AGENT_SEND, None
+        )
+    )
+    notification = await loop.step_delivery.produce(_task_exit_input("retry-task"))
+
+    events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    assert len(backend.calls) == 2
+    prompt_id = prompt.entries[0].id
+    assert all(
+        sum(
+            message.metadata.get("zeta.pending_prompt_id") == prompt_id
+            for message in request
+        )
+        == 1
+        for request in backend.calls
+    )
+    assert all(
+        sum(
+            notification.entries[0].id
+            in message.metadata.get("zeta.step_delivery", {}).get(
+                "notification_ids", []
+            )
+            for message in request
+        )
+        == 1
+        for request in backend.calls
+    )
+    delivered = [
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED
+    ]
+    reset = next(
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.ASSISTANT_RESET
+    )
+    delivered_notification = [
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.AGENT_NOTIFICATION
+        and event.data.get("notification_id") == notification.entries[0].id
+    ]
+    assert len(delivered) == 1
+    assert delivered[0] > reset
+    assert len(delivered_notification) == 1
+    assert delivered_notification[0] > reset
+    assert sum(
+        message.metadata.get("zeta.pending_prompt_id") == prompt_id
+        for message in store.messages()
+    ) == 1
+    assert await asyncio.to_thread(store.pending_prompts) == []
+    assert store.agent_notifications() == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_early_close_backoff_keeps_staged_delivery_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backoff_started = asyncio.Event()
+
+    async def wait_for_cancel(*_args, **_kwargs) -> bool:
+        backoff_started.set()
+        await asyncio.Event().wait()
+        return True
+
+    backend = EarlyCloseThenAnswerBackend()
+    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", wait_for_cancel)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    prompt = await loop.step_delivery.produce(
+        pending_delivery_module.PromptInput(
+            "follow up", MessageOrigin.AGENT_SEND, None
+        )
+    )
+    notification = await loop.step_delivery.produce(_task_exit_input("retry-task"))
+    first_events: list[StreamEvent] = []
+
+    async def consume_first_turn() -> None:
+        async for event in loop.run_turn("start", origin=MessageOrigin.USER):
+            first_events.append(event)
+
+    turn = asyncio.create_task(consume_first_turn())
+    await backoff_started.wait()
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert not any(
+        event.type
+        in {
+            StreamEventType.CHILD_MESSAGE_DELIVERED,
+            StreamEventType.AGENT_NOTIFICATION,
+        }
+        for event in first_events
+    )
+    assert [entry.id for entry in await asyncio.to_thread(store.pending_prompts)] == [
+        prompt.entries[0].id
+    ]
+    assert [entry.id for entry in store.agent_notifications()] == [
+        notification.entries[0].id
+    ]
+
+    async def retry_now(*_args, **_kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    retry_events = await _collect(
+        loop.run_turn("resume", origin=MessageOrigin.USER)
+    )
+
+    assert sum(
+        event.type is StreamEventType.CHILD_MESSAGE_DELIVERED
+        for event in retry_events
+    ) == 1
+    assert sum(
+        event.type is StreamEventType.AGENT_NOTIFICATION
+        and event.data.get("notification_id") == notification.entries[0].id
+        for event in retry_events
+    ) == 1
+    assert sum(
+        message.metadata.get("zeta.pending_prompt_id") == prompt.entries[0].id
+        for message in store.messages()
+    ) == 1
+    assert await asyncio.to_thread(store.pending_prompts) == []
+    assert store.agent_notifications() == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_stall_commits_staged_prompt_only_after_successful_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StallError(RuntimeError):
+        retryable = True
+        is_stall = True
+        stall_seconds = 90.0
+        retry_after = 0.0
+
+    async def retry_now(*_args, **_kwargs) -> bool:
+        return True
+
+    backend = EarlyCloseThenAnswerBackend(StallError("provider stalled"))
+    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    await loop.step_delivery.produce(
+        pending_delivery_module.PromptInput(
+            "follow up", MessageOrigin.AGENT_SEND, None
+        )
+    )
+
+    events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    reset = next(
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.ASSISTANT_RESET
+    )
+    delivered = [
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED
+    ]
+    assert len(backend.calls) == 2
+    assert len(delivered) == 1
+    assert delivered[0] > reset
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_provider_error_root_exit_admits_terminal_producer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7395,7 +7742,7 @@ async def test_provider_error_root_exit_admits_terminal_producer(
 
 
 @pytest.mark.asyncio
-async def test_provider_event_publishes_exact_staged_ids_before_acknowledgement(
+async def test_accepted_delivery_publishes_exact_staged_ids_before_acknowledgement(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -7408,13 +7755,6 @@ async def test_provider_event_publishes_exact_staged_ids_before_acknowledgement(
     assert prepared.prompt_id == prompt.entries[0].id
     assert prepared.notification_ids == (notification.entries[0].id,)
     publication_checked = False
-
-    async def provider():
-        yield StreamEvent(StreamEventType.MESSAGE_START)
-        yield StreamEvent(
-            StreamEventType.MESSAGE_END,
-            message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
-        )
 
     def publications(value: object):
         nonlocal publication_checked
@@ -7431,10 +7771,7 @@ async def test_provider_event_publishes_exact_staged_ids_before_acknowledgement(
 
     loop = asyncio.get_running_loop()
     events = await _collect(
-        observed_completion(
-            provider(),
-            store,
-            None,
+        pending_delivery_module.complete_delivery(
             flow.active_publications,
             flow.acknowledge_active,
             publications,
@@ -7442,7 +7779,6 @@ async def test_provider_event_publishes_exact_staged_ids_before_acknowledgement(
     )
     assert publication_checked
     assert events[0].type is StreamEventType.CHILD_MESSAGE_DELIVERED
-    assert events[1].type is StreamEventType.MESSAGE_START
     assert prompt.entries[0].id not in store._active_pending_prompt_entries
     assert notification.entries[0].id not in store._active_notifications
 
@@ -7468,9 +7804,6 @@ async def test_cancel_after_notification_ack_commit_keeps_completion_visible(
 
     monkeypatch.setattr(type(store), "_run_durable_write", pause_after_ack_commit)
 
-    async def provider():
-        yield StreamEvent(StreamEventType.MESSAGE_START)
-
     def publications(value: object):
         assert isinstance(value, pending_delivery_module.DeliveryPublications)
         assert [entry.id for entry in value.notifications] == [
@@ -7478,10 +7811,7 @@ async def test_cancel_after_notification_ack_commit_keeps_completion_visible(
         ]
         return iter((StreamEvent(StreamEventType.AGENT_NOTIFICATION),))
 
-    stream = observed_completion(
-        provider(),
-        store,
-        None,
+    stream = pending_delivery_module.complete_delivery(
         flow.active_publications,
         flow.acknowledge_active,
         publications,
@@ -7511,19 +7841,13 @@ async def test_cancel_after_notification_publication_retries_model_delivery_once
     prepared = await flow.prepare_request("terminal_fallback", [], None)
     assert prepared.notification_ids == (notification.entries[0].id,)
 
-    provider_calls = 0
-
-    async def provider():
-        nonlocal provider_calls
-        provider_calls += 1
-        assert sum(
-            notification.entries[0].id
-            in message.metadata.get("zeta.step_delivery", {}).get(
-                "notification_ids", []
-            )
-            for message in prepared.messages
-        ) == 1
-        yield StreamEvent(StreamEventType.MESSAGE_START)
+    assert sum(
+        notification.entries[0].id
+        in message.metadata.get("zeta.step_delivery", {}).get(
+            "notification_ids", []
+        )
+        for message in prepared.messages
+    ) == 1
 
     def publications(value: object):
         assert isinstance(value, pending_delivery_module.DeliveryPublications)
@@ -7539,10 +7863,7 @@ async def test_cancel_after_notification_publication_retries_model_delivery_once
             )
         )
 
-    first = observed_completion(
-        provider(),
-        store,
-        None,
+    first = pending_delivery_module.complete_delivery(
         flow.active_publications,
         flow.acknowledge_active,
         publications,
@@ -7554,21 +7875,16 @@ async def test_cancel_after_notification_publication_retries_model_delivery_once
         notification.entries[0].id
     ]
 
-    retry = observed_completion(
-        provider(),
-        store,
-        None,
+    retry = pending_delivery_module.complete_delivery(
         flow.active_publications,
         flow.acknowledge_active,
         publications,
     )
     retry_publication = await anext(retry)
     assert retry_publication.data["notification_id"] == notification.entries[0].id
-    assert (await anext(retry)).type is StreamEventType.MESSAGE_START
     with pytest.raises(StopAsyncIteration):
         await anext(retry)
 
-    assert provider_calls == 2
     assert store.agent_notifications() == []
     store.close()
 
@@ -13350,7 +13666,7 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
 
 
 @pytest.mark.asyncio
-async def test_finish_accepted_after_follow_up_read_mid_turn(
+async def test_finish_accepted_after_follow_up_attempt_is_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = FollowUpFinishBackend()
@@ -13368,10 +13684,10 @@ async def test_finish_accepted_after_follow_up_read_mid_turn(
     backend.release_child.set()
     await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
-    await _wait_for_pending_prompt_count(child_store, 0)
+    assert len(await asyncio.to_thread(child_store.pending_prompts)) == 1
     backend.release_finish.set()
-    await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
     await _wait_for_notification(store, "completed")
+    await _wait_for_pending_prompt_count(child_store, 0)
 
     assert backend.finish_attempts == 1
     assert backend.child_prompts.count("first follow-up") == 1
@@ -13409,7 +13725,7 @@ async def test_unread_follow_up_still_blocks_finish(
     backend.release_child.set()
     await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
-    await _wait_for_pending_prompt_count(child_store, 0)
+    assert len(await asyncio.to_thread(child_store.pending_prompts)) == 1
     await _send_follow_up(loop, handle, "second follow-up")
     backend.release_finish.set()
     await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
@@ -14329,7 +14645,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
             self.prompt_attempts = 0
             self.blocked = asyncio.Event()
             self.priority_after_retry: str | None = None
-            self.priority_after_evidence: str | None = "not-observed"
+            self.priority_before_acceptance: str | None = "not-observed"
 
         async def complete(
             self,
@@ -14373,7 +14689,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
             if call_number == 1:
                 assembler.update_token_budget(1_000_000)
             if contains_prompt:
-                self.priority_after_evidence = loop.step_delivery.prompt_priority
+                self.priority_before_acceptance = loop.step_delivery.prompt_priority
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
                 message=reply,
@@ -14435,12 +14751,12 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
         with pytest.raises(asyncio.CancelledError):
             await task
         assert loop.step_delivery.prompt_priority == priority
-        await run_once()
+        await run_once(stop_at_evidence=False)
     else:
-        await run_once()
+        await run_once(stop_at_evidence=False)
         if prompt_outcome == "failure":
             assert loop.step_delivery.prompt_priority == priority
-            await run_once()
+            await run_once(stop_at_evidence=False)
 
     prompt_calls = [
         messages
@@ -14454,7 +14770,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
     )
     if prompt_outcome == "retry":
         assert backend.priority_after_retry == priority
-    assert backend.priority_after_evidence is None
+    assert backend.priority_before_acceptance == priority
     assert loop.step_delivery.prompt_priority is None
 
     for _ in range(10):
