@@ -310,6 +310,13 @@ class AccountStore:
     def logout(self, account: AccountId, *, sessions_root: Path) -> str:
         """Remove one local account while no live session pins it."""
 
+        from .logout import (
+            _quarantine_account_directory,
+            remove_account_lock_directory,
+            remove_account_tombstone,
+            restore_account_directory,
+        )
+
         with self._home() as home_fd, self._registry_guard(home_fd):
             value = self._read_registry(home_fd)
             key = str(account)
@@ -320,7 +327,7 @@ class AccountStore:
                     raise AccountError(
                         f"account {account} is pinned by a live session; close it first"
                     )
-                _validate_account_lock_directory(home_fd, account)
+                remove_account_lock_directory(home_fd, account, remove=False)
                 tombstone = _quarantine_account_directory(home_fd, account)
                 try:
                     cleared_default = value["defaults"].pop(account.provider, None) == key
@@ -329,11 +336,11 @@ class AccountStore:
                     self._write_registry(home_fd, value)
                 except BaseException:
                     if tombstone is not None:
-                        _restore_account_directory(home_fd, account, tombstone)
+                        restore_account_directory(home_fd, account, tombstone)
                     raise
                 if tombstone is not None:
-                    _remove_account_tombstone(home_fd, account, tombstone)
-                _remove_account_lock_directory(home_fd, account)
+                    remove_account_tombstone(home_fd, account, tombstone)
+                remove_account_lock_directory(home_fd, account, remove=True)
         suffix = f"; cleared {account.provider} default" if cleared_default else ""
         return f"logged out {account}{suffix}"
 
@@ -896,115 +903,6 @@ def _live_session_pins(sessions_root: Path, account: AccountId) -> bool:
         if _live_child_pins(path, account):
             return True
     return False
-
-
-def _validate_directory_files(directory_fd: int, allowed: set[str]) -> None:
-    for name in os.listdir(directory_fd):
-        if name not in allowed:
-            raise AccountError("account directory contains an unexpected file")
-        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise AccountError("account directory contains an unsafe file")
-
-
-def _remove_directory_files(directory_fd: int, allowed: set[str]) -> None:
-    names = os.listdir(directory_fd)
-    _validate_directory_files(directory_fd, allowed)
-    for name in names:
-        os.unlink(name, dir_fd=directory_fd)
-    _fsync_directory(directory_fd)
-
-
-def _validate_account_lock_directory(home_fd: int, account: AccountId) -> None:
-    try:
-        with (
-            child_directory(home_fd, "account-locks") as locks_fd,
-            child_directory(locks_fd, account.provider) as provider_fd,
-            child_directory(provider_fd, account.name) as account_fd,
-        ):
-            _validate_directory_files(account_fd, {"lifecycle.lock", "usage.lock"})
-    except FileNotFoundError:
-        return
-
-
-def _quarantine_account_directory(
-    home_fd: int, account: AccountId
-) -> str | None:
-    try:
-        with (
-            child_directory(home_fd, "accounts") as accounts_fd,
-            child_directory(accounts_fd, account.provider) as provider_fd,
-            child_directory(provider_fd, account.name) as account_fd,
-        ):
-            _validate_directory_files(
-                account_fd, {"oauth.json", "usage.json", "publish-pending.json"}
-            )
-            tombstone = f".logout-{uuid.uuid4().hex}"
-            os.rename(account.name, tombstone, src_dir_fd=provider_fd, dst_dir_fd=provider_fd)
-            _fsync_directory(provider_fd)
-            try:
-                with child_directory(provider_fd, tombstone) as tombstone_fd:
-                    _validate_directory_files(
-                        tombstone_fd,
-                        {"oauth.json", "usage.json", "publish-pending.json"},
-                    )
-            except BaseException:
-                os.rename(
-                    tombstone,
-                    account.name,
-                    src_dir_fd=provider_fd,
-                    dst_dir_fd=provider_fd,
-                )
-                _fsync_directory(provider_fd)
-                raise
-            return tombstone
-    except FileNotFoundError:
-        return None
-
-
-def _restore_account_directory(
-    home_fd: int, account: AccountId, tombstone: str
-) -> None:
-    with (
-        child_directory(home_fd, "accounts") as accounts_fd,
-        child_directory(accounts_fd, account.provider) as provider_fd,
-    ):
-        os.rename(
-            tombstone,
-            account.name,
-            src_dir_fd=provider_fd,
-            dst_dir_fd=provider_fd,
-        )
-        _fsync_directory(provider_fd)
-
-
-def _remove_account_tombstone(
-    home_fd: int, account: AccountId, tombstone: str
-) -> None:
-    with (
-        child_directory(home_fd, "accounts") as accounts_fd,
-        child_directory(accounts_fd, account.provider) as provider_fd,
-        child_directory(provider_fd, tombstone) as account_fd,
-    ):
-        _remove_directory_files(
-            account_fd, {"oauth.json", "usage.json", "publish-pending.json"}
-        )
-        os.rmdir(tombstone, dir_fd=provider_fd)
-        _fsync_directory(provider_fd)
-
-
-def _remove_account_lock_directory(home_fd: int, account: AccountId) -> None:
-    try:
-        with (
-            child_directory(home_fd, "account-locks") as locks_fd,
-            child_directory(locks_fd, account.provider) as provider_fd,
-        ):
-            with child_directory(provider_fd, account.name) as account_fd:
-                _remove_directory_files(account_fd, {"lifecycle.lock", "usage.lock"})
-            os.rmdir(account.name, dir_fd=provider_fd)
-            _fsync_directory(provider_fd)
-    except FileNotFoundError:
-        return
 
 
 @contextmanager
