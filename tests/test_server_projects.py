@@ -162,19 +162,24 @@ async def test_serve_blocking_git_does_not_block_ping(
     )
     (fake_bin / "git").chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    reader, writer = await _connect(server)
     release = None
     holder = None
     try:
+        await _hello(reader, writer, ["ping"])
+        client = server._client
+        assert client is not None
         _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
-        operation = asyncio.create_task(
-            server.runtime.create_session() if method == "new_session" else
-            server.runtime.resume_session(first.session_id) if method == "resume" else
-            run_command(server.runtime, "/project-instructions")
+        params = (
+            {} if method == "new_session" else
+            {"session_id": first.session_id} if method == "resume" else
+            {"text": "/project-instructions", "session_id": first.session_id}
         )
+        request_method = {"new_session": "new_session", "resume": "resume", "slash_run": "slash_run"}[method]
+        operation = asyncio.create_task(client._dispatch(2, request_method, params))
         await asyncio.sleep(0.05)
-        progress = asyncio.create_task(asyncio.sleep(0))
-        await progress
-        assert not operation.done()
+        ping = asyncio.create_task(client._dispatch(3, "ping", {}))
+        assert await asyncio.wait_for(ping, 0.25) == {"pong": True}
         release.set()
         holder.join(2)
         await asyncio.wait_for(operation, 8)
@@ -183,7 +188,7 @@ async def test_serve_blocking_git_does_not_block_ping(
             release.set()
         if holder is not None:
             holder.join(2)
-        await server.close()
+        await _close(server, writer)
 
 
 @pytest.mark.asyncio
