@@ -70,6 +70,7 @@ from ._validation import (
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
     NOTIFICATION_KINDS,
     TASK_EXITED_NOTIFICATION_KIND,
+    validate_compaction_data,
     validate_notification_data,
     validate_terminal_transition_data,
 )
@@ -503,57 +504,7 @@ class ConversationStore(
                             "approval request must match an anchored tool call"
                         )
             elif entry.type == "compaction":
-                summary = entry.data.get("summary")
-                source_start = entry.data.get("source_seq_start")
-                source_end = entry.data.get("source_seq_end")
-                replaces = entry.data.get("replaces", [])
-                pinned_message = entry.data.get("pinned_message")
-                kind = entry.data.get("kind", "summary")
-                view = entry.data.get("view")
-                telemetry = entry.data.get("telemetry")
-                fact_floor = entry.data.get("fact_floor")
-                if type(summary) is not str or not summary.strip():
-                    raise ValueError("compaction summary must be a nonempty string")
-                if (
-                    type(source_start) is not int
-                    or type(source_end) is not int
-                    or source_start <= 0
-                    or source_end < source_start
-                ):
-                    raise ValueError("compaction source sequence must be integers")
-                if (
-                    type(replaces) is not list
-                    or any(
-                        type(entry_id) is not str or not entry_id
-                        for entry_id in replaces
-                    )
-                    or len(replaces) != len(set(replaces))
-                ):
-                    raise ValueError("compaction replaces must be unique string IDs")
-                if pinned_message is not None:
-                    if type(pinned_message) is not dict:
-                        raise ValueError("compaction pinned message must be an object")
-                    pinned = Message.from_dict(pinned_message)
-                    if pinned.role is not MessageRole.USER:
-                        raise ValueError(
-                            "compaction pinned message must be a user message"
-                        )
-                if kind not in {"summary", "evict"}:
-                    raise ValueError("unknown compaction kind")
-                if kind == "evict":
-                    if type(view) is not list or not view:
-                        raise ValueError("eviction view must be a nonempty array")
-                    for item in view:
-                        if type(item) is not dict or type(item.get("seq")) is not int:
-                            raise ValueError("invalid eviction view item")
-                        message = item.get("message")
-                        if type(message) is not dict:
-                            raise ValueError("invalid eviction view message")
-                        Message.from_dict(message)
-                    if telemetry is not None and type(telemetry) is not dict:
-                        raise ValueError("eviction telemetry must be an object")
-                elif view is not None or telemetry is not None or fact_floor is not None:
-                    raise ValueError("summary compaction cannot contain eviction data")
+                validate_compaction_data(entry.data)
             elif entry.type == "client_delivery":
                 validate_client_delivery_data(entry.data, self.session_id)
             elif entry.type == "warning":
