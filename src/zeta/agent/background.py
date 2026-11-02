@@ -97,6 +97,7 @@ class BackgroundAgentOwner:
         self._stores: list[ConversationStore] = []
         self._pending_stores: set[ConversationStore] = set()
         self._store_close_tasks: set[asyncio.Task[Any]] = set()
+        self._cancellation_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
             str, Callable[[], CancellationRequest | asyncio.Task[None] | None]
         ] = {}
@@ -125,6 +126,16 @@ class BackgroundAgentOwner:
     def notify_wake(self) -> None:
         """Wake the frontend after a durable completion notification."""
         self._notify_frontend()
+
+    def create_cancellation_task[TaskResult](
+        self, awaitable: Awaitable[TaskResult]
+    ) -> asyncio.Task[TaskResult]:
+        """Keep cancellation work alive for the lifetime of the agent tree."""
+
+        task = asyncio.create_task(awaitable)
+        self._cancellation_tasks.add(task)
+        task.add_done_callback(self._cancellation_tasks.discard)
+        return task
 
     def cancel(self, instance_id: str) -> bool:
         """Request cancellation of one child and its owned descendants."""
