@@ -1,5 +1,4 @@
 """Small input-time slash-command dispatcher."""
-
 from __future__ import annotations
 
 import asyncio
@@ -44,24 +43,21 @@ from .commands.custom_commands import (
 )
 from .project_context import (
     discover_project_root,
+    project_instructions_command,
     project_instructions_path,
-    project_instructions_path_async,
 )
 from .store import ConversationEntry
 
 
 class UsageCounterSource(Protocol):
     """Cumulative usage counters exposed by the context assembler."""
-
     uncached_input_tokens_this_session: int
     output_tokens_this_session: int
     cache_read_input_tokens_this_session: int
     cache_creation_input_tokens_this_session: int
-
 @dataclass(frozen=True, slots=True)
 class UsageSnapshot:
     """One completed turn's token usage."""
-
     turn: int
     input_tokens: int = 0
     output_tokens: int = 0
@@ -69,7 +65,6 @@ class UsageSnapshot:
     cache_creation_input_tokens: int = 0
     model: str | None = None
     estimated_cost_usd: float | None = None
-
     @property
     def cache_total(self) -> int:
         return (
@@ -77,17 +72,13 @@ class UsageSnapshot:
             + self.cache_read_input_tokens
             + self.cache_creation_input_tokens
         )
-
     @property
     def cache_hit_rate(self) -> float | None:
         if self.cache_total == 0:
             return None
         return self.cache_read_input_tokens / self.cache_total * 100
-
-
 class UsageTracker:
     """Keep bounded usage deltas at real turn boundaries."""
-
     def __init__(self, source: UsageCounterSource, provider: str | None = None) -> None:
         self.source = source
         self.provider = provider
@@ -96,15 +87,12 @@ class UsageTracker:
         self._history: deque[UsageSnapshot] = deque(maxlen=8)
         self._cost_by_model: dict[str, UsageSnapshot] = {}
         self._completed_turns = 0
-
     @property
     def history(self) -> tuple[UsageSnapshot, ...]:
         return tuple(self._history)
-
     @property
     def cost_by_model(self) -> tuple[UsageSnapshot, ...]:
         return tuple(self._cost_by_model.values())
-
     def record(self, event_type: StreamEventType, model: str) -> None:
         current = self._counters()
         self._record_cost_delta(current, model)
@@ -115,14 +103,11 @@ class UsageTracker:
             snapshot = usage_delta(current, self._baseline, self._completed_turns, model)
             self._history.append(snapshot)
             self._baseline = current
-
     def record_compaction(self, model: str) -> None:
         """Record direct compaction usage without adding a trend snapshot."""
-
         current = self._counters()
         self._record_cost_delta(current, model)
         self._baseline = current
-
     def _record_cost_delta(self, current: Mapping[str, int], model: str) -> None:
         snapshot = usage_delta(current, self._cost_baseline, 0, model)
         self._cost_baseline = dict(current)
@@ -1176,25 +1161,22 @@ def create_slash_registry(
     registry.register(
         SlashCommand("implement", _run_implement, "implement the proposed plan")
     )
+    if async_project_instructions:
+        instruction_handler = lambda session, args: project_instructions_command(
+            session, args, private_project_root,
+            Path(effective_home).expanduser().resolve() if effective_home else None,
+            project_registry_state,
+        )
+    else:
+        instruction_handler = lambda session, args: project_instructions_path(
+            args,
+            private_project_root,
+            Path(effective_home).expanduser().resolve() if effective_home else None,
+            getattr(session, "open_project_instructions_editor", None),
+            project_registry_state,
+        )
     registry.register(SlashCommand(
-        "project-instructions",
-        lambda session, args: (
-            project_instructions_path_async(
-                args,
-                private_project_root,
-                Path(effective_home).expanduser().resolve() if effective_home else None,
-                getattr(session, "open_project_instructions_editor", None),
-                project_registry_state,
-            )
-            if async_project_instructions
-            else project_instructions_path(
-                args,
-                private_project_root,
-                Path(effective_home).expanduser().resolve() if effective_home else None,
-                getattr(session, "open_project_instructions_editor", None),
-                project_registry_state,
-            )
-        ),
+        "project-instructions", instruction_handler,
         "open or create private project instructions in your editor",
     ))
     registry.register(

@@ -630,6 +630,19 @@ def project_instructions_path(
     return editor(path)
 
 
+def project_instructions_command(
+    session: object,
+    args: str,
+    project_root: Path,
+    zeta_home: Path | None,
+    registry_state: ProjectRegistryState | None,
+) -> str | Awaitable[str]:
+    editor = getattr(session, "open_project_instructions_editor", None)
+    return project_instructions_path_async(
+        args, project_root, zeta_home, editor, registry_state
+    )
+
+
 async def project_instructions_path_async(
     args: str,
     project_root: Path | None,

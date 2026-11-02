@@ -1,5 +1,4 @@
 """Composition root for the full-screen zeta terminal UI."""
-
 from __future__ import annotations
 
 import asyncio
