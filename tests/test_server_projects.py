@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import random
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -56,7 +57,7 @@ def _hold_registry_lock(path: Path) -> tuple[threading.Event, threading.Event, t
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             acquired.set()
-            release.wait()
+            release.wait(2)
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -101,7 +102,9 @@ async def test_session_project_preparation_does_not_block_ping(
             server.runtime.create_session() if method == "new_session"
             else server.runtime.resume_session(request["session_id"])
         )
-        await asyncio.sleep(0)
+        progress = asyncio.create_task(asyncio.sleep(0))
+        await progress
+        assert not operation.done()
         release.set()
         holder.join(2)
         await operation
@@ -123,7 +126,9 @@ async def test_serve_project_instructions_does_not_block_loop_tick(tmp_path: Pat
     try:
         _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
         operation = asyncio.create_task(run_command(server.runtime, "/project-instructions"))
-        await asyncio.sleep(0)
+        progress = asyncio.create_task(asyncio.sleep(0))
+        await progress
+        assert not operation.done()
         release.set()
         holder.join(2)
         result = await operation
@@ -131,6 +136,52 @@ async def test_serve_project_instructions_does_not_block_loop_tick(tmp_path: Pat
     finally:
         if "release" in locals():
             release.set()
+            holder.join(2)
+        await server.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["new_session", "resume", "slash_run"])
+async def test_serve_blocking_git_does_not_block_ping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    server = _server(tmp_path)
+    root = server.runtime.cwd
+    await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=root, check=True)
+    registry = ProjectRegistry(server.home / "projects")
+    registry.create_project("launch", "git", root)
+    first = await server.runtime.create_session()
+    if method == "resume":
+        await server.runtime.create_session()
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "git").write_text(
+        f"#!/bin/sh\nsleep 1\nexec {real_git} \"$@\"\n", encoding="utf-8"
+    )
+    (fake_bin / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    release = None
+    holder = None
+    try:
+        _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
+        operation = asyncio.create_task(
+            server.runtime.create_session() if method == "new_session" else
+            server.runtime.resume_session(first.session_id) if method == "resume" else
+            run_command(server.runtime, "/project-instructions")
+        )
+        await asyncio.sleep(0.05)
+        progress = asyncio.create_task(asyncio.sleep(0))
+        await progress
+        assert not operation.done()
+        release.set()
+        holder.join(2)
+        await asyncio.wait_for(operation, 8)
+    finally:
+        if release is not None:
+            release.set()
+        if holder is not None:
             holder.join(2)
         await server.close()
 

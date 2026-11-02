@@ -84,7 +84,7 @@ def _hold_registry_lock(path: Path) -> tuple[threading.Event, threading.Event, t
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             acquired.set()
-            release.wait()
+            release.wait(2)
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -515,6 +515,9 @@ async def test_project_instructions_does_not_block_status_on_registry_lock(
         )
         status = await app._slash_commands.dispatch_async(app, "/status")
         assert status
+        progress = asyncio.create_task(asyncio.sleep(0))
+        await progress
+        assert not operation.done()
         release.set()
         holder.join(2)
         result = await operation

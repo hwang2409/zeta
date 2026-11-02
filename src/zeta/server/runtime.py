@@ -437,15 +437,16 @@ class ServerRuntime:
         if metadata.provider == "fake":
             raise ValueError(REMOVED_PROVIDER_ERROR)
         session_cwd = Path(metadata.cwd)
-        if not session_cwd.is_dir():
+        if not await asyncio.to_thread(session_cwd.is_dir):
             raise ValueError(
                 f"session working directory no longer exists: {metadata.cwd}"
             )
         opened = await asyncio.to_thread(self.manager.open, session_id)
+        preparation = asyncio.create_task(
+            asyncio.to_thread(self._prepare_resumed_session, opened, session_cwd)
+        )
         try:
-            prepared = await asyncio.to_thread(
-                self._prepare_resumed_session, opened, session_cwd
-            )
+            prepared = await preparation
             config, resumed_prompt = prepared
             context = resumed_prompt.context
             skill_catalog = resumed_prompt.skill_catalog
@@ -463,7 +464,12 @@ class ServerRuntime:
                 project_id=opened.metadata.project_id,
                 max_turns=self._max_turns,
             )
+        except asyncio.CancelledError:
+            await asyncio.shield(preparation)
+            await asyncio.to_thread(opened.store.close)
+            raise
         except BaseException:
+            await preparation
             await asyncio.to_thread(opened.store.close)
             raise
         await self._replace(composition)

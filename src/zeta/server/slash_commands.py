@@ -391,7 +391,7 @@ async def list_commands(runtime: ServerRuntime) -> dict[str, object]:
 
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
-    registry = build_registry(runtime)
+    registry = await asyncio.to_thread(build_registry, runtime)
     entries = _entries_from_registry(registry)
     return {
         "commands": [entry.to_dict() for entry in entries],
@@ -435,7 +435,7 @@ async def run_command(
         return {"kind": "client_only", "name": name}
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
-    registry = build_registry(runtime)
+    registry = await asyncio.to_thread(build_registry, runtime)
     if name in CLIENT_ONLY_BUILTINS:
         return {"kind": "client_only", "name": name}
     # Prompt macros expand to user input rather than dispatch through a handler.
