@@ -915,14 +915,14 @@ class _Client:
                 await self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.USAGE], session_id, usage=dict(usage))
             if event.message is not None:
                 await self._notify(
-                    wire_event, session_id, **ergonomics.assistant_message(event)
+                    wire_event, session_id, **event_contract.assistant_message(event)
                 )
             return
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
             await self._notify(
                 wire_event,
                 session_id,
-                **ergonomics.tool_output(event),
+                **event_contract.tool_output(event),
             )
             return
         if kind is StreamEventType.TOOL_EXECUTION_START:
@@ -931,7 +931,7 @@ class _Client:
             await self._notify(
                 wire_event,
                 session_id,
-                **ergonomics.tool_start(event),
+                **event_contract.tool_start(event),
             )
             return
         if kind is StreamEventType.TOOL_EXECUTION_END:
@@ -940,7 +940,7 @@ class _Client:
             await self._notify(
                 wire_event,
                 session_id,
-                **ergonomics.tool_end(event),
+                **event_contract.tool_end(event),
             )
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
