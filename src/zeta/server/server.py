@@ -576,7 +576,7 @@ class _Client:
             mode = _required_string(params, "approval_mode")
             if model not in ergonomics.catalog(runtime)["models"] or mode not in {"ask", "allow", "deny"}:
                 raise ProtocolError(-32602, "invalid model or approval mode")
-            await model_selection.apply(runtime, model, mode)
+            await model_selection.apply_rpc(runtime, model, mode)
             return ergonomics.settings(runtime)
         if method == "set_compaction":
             _required_string(params, "mode")
@@ -913,21 +913,15 @@ class _Client:
                 state.usage.update(usage)
                 await self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.USAGE], session_id, usage=dict(usage))
             if event.message is not None:
-                wire_message = event.message.to_dict()
-                # Codex keeps encrypted replay items in assistant metadata.
-                # They are server-only and may contain raw reasoning text.
-                wire_message.pop("metadata", None)
                 await self._notify(
-                    wire_event, session_id, message=wire_message
+                    wire_event, session_id, **event_contract.assistant_message(event)
                 )
             return
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
             await self._notify(
                 wire_event,
                 session_id,
-                tool_call=_tool_call(event),
-                output=bounded(event.delta or _data_text(event.data)),
-                data=dict(event.data),
+                **event_contract.tool_output(event),
             )
             return
         if kind is StreamEventType.TOOL_EXECUTION_START:
@@ -936,8 +930,7 @@ class _Client:
             await self._notify(
                 wire_event,
                 session_id,
-                tool_call=_tool_call(event),
-                data=dict(event.data),
+                **event_contract.tool_start(event),
             )
             return
         if kind is StreamEventType.TOOL_EXECUTION_END:
@@ -946,11 +939,7 @@ class _Client:
             await self._notify(
                 wire_event,
                 session_id,
-                tool_call=_tool_call(event),
-                tool_result=(
-                    event.tool_result.to_dict() if event.tool_result else None
-                ),
-                data=dict(event.data),
+                **event_contract.tool_end(event),
             )
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
@@ -1215,10 +1204,6 @@ def _optional_string(params: dict[str, Any], name: str) -> str | None:
     return value
 
 
-def _tool_call(event: StreamEvent) -> dict[str, object] | None:
-    return event.tool_call.to_dict() if event.tool_call is not None else None
-
-
 def _approval_key(event: StreamEvent) -> ApprovalKey:
     raw_request_id = event.tool_call.id if event.tool_call is not None else ""
     child_id = event.data.get("agent_instance_id")
@@ -1242,9 +1227,5 @@ def _approval_display_fields(request: Any) -> dict[str, object]:
         fields["approval_display"] = display
     return fields
 
-
-def _data_text(data: Mapping[str, object]) -> str:
-    value = data.get("output", data.get("text", ""))
-    return value if isinstance(value, str) else ""
 
 __all__ = ["ZetaServer"]

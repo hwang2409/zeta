@@ -5,7 +5,6 @@ import os
 import stat
 import sys
 import uuid
-import weakref
 from collections import Counter
 from collections.abc import Generator
 from contextlib import ExitStack
@@ -613,8 +612,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     from zeta.core.store import ConversationStore
     from zeta.tools import ToolRegistry
 
-    stores: list[weakref.ReferenceType[ConversationStore]] = []
-    registries: list[weakref.ReferenceType[ToolRegistry]] = []
+    stores: list[ConversationStore] = []
+    registries: list[ToolRegistry] = []
     store_init = ConversationStore.__init__
     registry_init = ToolRegistry.__init__
     store_close = ConversationStore.close
@@ -625,25 +624,23 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         store_init(store, *args, **kwargs)
         caller = Path(sys._getframe(1).f_code.co_filename).resolve()
         if _is_repository_test_path(caller):
-            stores.append(weakref.ref(store))
+            stores.append(store)
 
     @wraps(registry_init)
     def tracked_registry_init(registry, *args, **kwargs):
         registry_init(registry, *args, **kwargs)
         caller = Path(sys._getframe(1).f_code.co_filename).resolve()
         if _is_repository_test_path(caller):
-            registries.append(weakref.ref(registry))
+            registries.append(registry)
 
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
     yield
-    for reference in reversed(registries):
-        registry = reference()
-        if registry is not None and not registry._closed:
+    for registry in reversed(registries):
+        if not registry._closed:
             await registry_close(registry)
-    for reference in reversed(stores):
-        store = reference()
-        if store is not None and not store._closed:
+    for store in reversed(stores):
+        if not store._closed:
             store_close(store)
 
 

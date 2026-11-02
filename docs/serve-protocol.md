@@ -724,6 +724,7 @@ Error responses use standard JSON-RPC codes where applicable:
 | `-32005` | no turn is running for steering |
 | `-32006` | approval request is missing or already resolved |
 | `-32007` | outbound frame exceeds the size limit |
+| `-32008` | the selected account lock is held by another process |
 | `-32010` | delivery ID was accepted but its full details were evicted |
 
 Error objects have `code` and `message`, and may have a method-specific
@@ -1010,7 +1011,9 @@ error code and message. Provider status and origin remain internal.
   compaction backends while retaining the session, history, usage, and approval
   rules. Pinned budgets stay fixed; unpinned budgets track the target model.
   Running turns reject changes with `-32004`. Missing target-provider logins
-  return `-32000` with a login message; failed swaps retain the previous settings.
+  return `-32000` with a login message. Account lock timeouts return `-32008`
+  with `data.code = "account_lock_timeout"` and `data.retryable = true`. Failed
+  swaps retain the previous settings.
   The response contains the applied settings.
 - `set_compaction` is retained only to give old clients a clear migration
   error. All modes, including `summary`, return `-32602` with

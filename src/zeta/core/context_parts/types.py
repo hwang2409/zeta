@@ -52,3 +52,4 @@ class _EvictionPlan:
     pinned_message: Message | None = None
     view: tuple[Mapping[str, Any], ...] = ()
     telemetry: Mapping[str, Any] | None = None
+    fact_floor: Mapping[str, Any] | None = None

@@ -12,7 +12,11 @@ import uuid
 import warnings  # noqa: F401 - re-exported by the compatibility store facade
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import (  # noqa: F401 - re-exported by the store facade
+    ExitStack,
+    contextmanager,
+    nullcontext,
+)
 from pathlib import Path
 from typing import Any, Self  # noqa: F401 - re-exported by the store facade
 
@@ -66,6 +70,7 @@ from ._validation import (
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
     NOTIFICATION_KINDS,
     TASK_EXITED_NOTIFICATION_KIND,
+    validate_compaction_data,
     validate_notification_data,
     validate_terminal_transition_data,
 )
@@ -105,6 +110,7 @@ class ConversationStore(
         self.root_dir = Path(session_dir or default_home / "sessions")
         self.session_id = uuid.uuid4().hex if session_id is None else session_id
         self.on_persisted_activity: Callable[[int], None] | None = None
+        self._initialize_entries_installed()
         session_path = Path(self.session_id)
         if (
             not self.session_id
@@ -148,6 +154,7 @@ class ConversationStore(
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
+        self._entry_prefix_digest = b""
         self._initialize_client_delivery_lifecycle()
         self._collect_persisted_appends = _collect_persisted_appends
         self._persisted_appends: list[PersistedAppend] = []
@@ -168,13 +175,12 @@ class ConversationStore(
             _, self.directory_fd = lease.enter_context(
                 session_directory(self.root_dir, self.session_id)
             )
-            with (
-                nullcontext()
-                if _read_only
-                else self._append_lock(deadline=_lock_deadline)
-            ):
+            if _read_only:
                 self._load()
                 self._load_session_state()
+            else:
+                with self._append_lock(deadline=_lock_deadline):
+                    self._load_session_state()
             if not _read_only:
                 self._runtime_lease = SessionRuntimeLease(self.directory_fd)
             self._release_lease = weakref.finalize(
@@ -191,7 +197,6 @@ class ConversationStore(
         if not resolved:
             raise ValueError("bash cwd must be a nonempty string")
         with self._append_lock():
-            self._load()
             self._write_session_state(resolved, self._todo_items)
             self.bash_cwd = resolved
 
@@ -242,7 +247,6 @@ class ConversationStore(
         """Persist dismissal of the terminal todo receipt."""
 
         with self._append_lock():
-            self._load()
             self._todo_dismissed = True
             self._write_session_state(self.bash_cwd, self._todo_items)
 
@@ -251,7 +255,6 @@ class ConversationStore(
 
         normalized = parse_todo_items(items)
         with self._append_lock():
-            self._load()
             self._todo_items = [dict(item) for item in normalized]
             self._todo_dismissed = False
             self._write_session_state(self.bash_cwd, normalized)
@@ -501,58 +504,7 @@ class ConversationStore(
                             "approval request must match an anchored tool call"
                         )
             elif entry.type == "compaction":
-                summary = entry.data.get("summary")
-                source_start = entry.data.get("source_seq_start")
-                source_end = entry.data.get("source_seq_end")
-                replaces = entry.data.get("replaces", [])
-                pinned_message = entry.data.get("pinned_message")
-                kind = entry.data.get("kind", "summary")
-                view = entry.data.get("view")
-                telemetry = entry.data.get("telemetry")
-                if type(summary) is not str or not summary.strip():
-                    raise ValueError("compaction summary must be a nonempty string")
-                if (
-                    type(source_start) is not int
-                    or type(source_end) is not int
-                    or source_start <= 0
-                    or source_end < source_start
-                ):
-                    raise ValueError("compaction source sequence must be integers")
-                if (
-                    type(replaces) is not list
-                    or any(
-                        type(entry_id) is not str or not entry_id
-                        for entry_id in replaces
-                    )
-                    or len(replaces) != len(set(replaces))
-                ):
-                    raise ValueError("compaction replaces must be unique string IDs")
-                if pinned_message is not None:
-                    if type(pinned_message) is not dict:
-                        raise ValueError("compaction pinned message must be an object")
-                    pinned = Message.from_dict(pinned_message)
-                    if pinned.role is not MessageRole.USER:
-                        raise ValueError(
-                            "compaction pinned message must be a user message"
-                        )
-                if kind not in {"summary", "evict"}:
-                    raise ValueError("unknown compaction kind")
-                if kind == "evict":
-                    if type(view) is not list or not view:
-                        raise ValueError("eviction view must be a nonempty array")
-                    for item in view:
-                        if type(item) is not dict or type(item.get("seq")) is not int:
-                            raise ValueError("invalid eviction view item")
-                        message = item.get("message")
-                        if type(message) is not dict:
-                            raise ValueError("invalid eviction view message")
-                        Message.from_dict(message)
-                    if telemetry is not None and type(telemetry) is not dict:
-                        raise ValueError("eviction telemetry must be an object")
-                elif view is not None or telemetry is not None:
-                    raise ValueError(
-                        "summary compaction cannot contain an eviction view"
-                    )
+                validate_compaction_data(entry.data)
             elif entry.type == "client_delivery":
                 validate_client_delivery_data(entry.data, self.session_id)
             elif entry.type == "warning":
@@ -605,14 +557,24 @@ class ConversationStore(
             ) from exc
 
     @contextmanager
-    def _append_lock(self, *, deadline: float | None = None) -> Iterator[None]:
+    def _append_lock(
+        self, *, deadline: float | None = None, wait: bool = True
+    ) -> Iterator[bool]:
+        """Lock and synchronize the log before exposing resident state."""
         if self._closed:
             raise ValueError("session store is closed")
         with os.fdopen(
             open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
         ) as handle:
             if deadline is None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    fcntl.flock(
+                        handle.fileno(),
+                        fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError:
+                    yield False
+                    return
             else:
                 while True:
                     if time.monotonic() >= deadline:
@@ -625,10 +587,13 @@ class ConversationStore(
                         time.sleep(max(0, min(0.01, deadline - time.monotonic())))
                     else:
                         break
+            self._start_entries_installed()
             try:
-                yield
+                self._load()
+                yield True
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                self._finish_entries_installed()
 
     @staticmethod
     def _validate_notification_write(entry_type: str, data: Mapping[str, Any]) -> None:
@@ -645,7 +610,6 @@ class ConversationStore(
         parent_id: str | None = None,
     ) -> ConversationEntry:
         with self._append_lock():
-            self._load()
             entry = self._append_row_unlocked(entry_type, data, parent_id)
             return self._snapshot_entry(entry)
 
@@ -661,7 +625,6 @@ class ConversationStore(
         if not materialized:
             return []
         with self._append_lock():
-            self._load()
             return [
                 self._snapshot_entry(entry)
                 for entry in self._append_many_unlocked(materialized)
@@ -705,6 +668,7 @@ class ConversationStore(
         self._write_bytes(encoded)
         for entry in entries:
             self._entries.append(entry)
+            self._record_entry_prefix(entry)
             self._entry_ids.add(entry.id)
             self._record_active_entry(entry)
             if (
@@ -717,6 +681,7 @@ class ConversationStore(
         self._record_client_delivery_entries(entries)
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entries[-1].seq)
+        self._publish_entries_installed(tuple(entries))
         return entries
 
     def _append_row_unlocked(
@@ -759,6 +724,7 @@ class ConversationStore(
             self._write_deadline = previous_deadline
         linear = not self._entries or entry.parent_id == self._entries[-1].id
         self._entries.append(entry)
+        self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
         if linear:
             self._record_active_entry(entry)
@@ -775,6 +741,7 @@ class ConversationStore(
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:
                 self._task_notification_ids.add(task_id)
+        self._publish_entries_installed((entry,))
         return entry
 
     def append_message(
@@ -812,6 +779,7 @@ class ConversationStore(
         kind: str = "summary",
         view: list[dict[str, Any]] | None = None,
         telemetry: Mapping[str, Any] | None = None,
+        fact_floor: Mapping[str, Any] | None = None,
     ) -> ConversationEntry:
         data = self._compaction_marker_data(
             summary,
@@ -822,11 +790,11 @@ class ConversationStore(
             kind=kind,
             view=view,
             telemetry=telemetry,
+            fact_floor=fact_floor,
         )
         if expected_parent_id is None:
             return self._append_row("compaction", data, parent_id)
         with self._append_lock():
-            self._load()
             current_parent_id = self.active_branch_head_id()
             if current_parent_id != expected_parent_id:
                 raise ConversationIntegrityError(
@@ -851,6 +819,7 @@ class ConversationStore(
         kind: str = "summary",
         view: list[dict[str, Any]] | None = None,
         telemetry: Mapping[str, Any] | None = None,
+        fact_floor: Mapping[str, Any] | None = None,
     ) -> None:
         """Commit an unshared marker without copying its large payload."""
 
@@ -863,9 +832,9 @@ class ConversationStore(
             kind=kind,
             view=view,
             telemetry=telemetry,
+            fact_floor=fact_floor,
         )
         with self._append_lock():
-            self._load()
             if self.active_branch_head_id() != expected_parent_id:
                 raise ConversationIntegrityError(
                     "active branch changed while appending compaction"
@@ -885,6 +854,7 @@ class ConversationStore(
         kind: str,
         view: list[dict[str, Any]] | None,
         telemetry: Mapping[str, Any] | None,
+        fact_floor: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         data: dict[str, Any] = {
             "summary": summary,
@@ -898,6 +868,11 @@ class ConversationStore(
             data["view"] = view
         if telemetry is not None:
             data["telemetry"] = dict(telemetry)
+        if fact_floor is not None:
+            from ...context_eviction._fact_floor import validate_fact_floor
+            if not validate_fact_floor(fact_floor):
+                raise ValueError("invalid eviction fact floor")
+            data["fact_floor"] = dict(fact_floor)
         if pinned_message is not None:
             if pinned_message.role is not MessageRole.USER:
                 raise ValueError("compaction pinned message must be a user message")
@@ -918,7 +893,6 @@ class ConversationStore(
         if request_data:
             data["approval_requests"] = request_data
         with self._append_lock():
-            self._load()
             current_branch = self._active_branch()
             resolved_parent = (
                 parent_id
@@ -1039,7 +1013,6 @@ class ConversationStore(
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
         with self._append_lock():
-            self._load()
             entry = self._resolve_approval_unlocked(
                 request_id,
                 decision,
@@ -1062,7 +1035,6 @@ class ConversationStore(
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
         with self._append_lock():
-            self._load()
             return self._resolve_approval_unlocked(request_id, decision) is not None
 
     def _resolve_approval_unlocked(
@@ -1103,7 +1075,6 @@ class ConversationStore(
     def approval_states(self) -> dict[str, tuple[ToolCall, str | None]]:
         """Return strict approval state after waiting for concurrent writers."""
         with self._append_lock():
-            self._load()
             return self._approval_states_from_indexes()
 
     def _approval_states_from_indexes(self) -> dict[str, tuple[ToolCall, str | None]]:
@@ -1232,7 +1203,6 @@ class ConversationStore(
     def tool_result(self, tool_call_id: str) -> ToolResult | None:
         """Return a strict tool result after waiting for concurrent writers."""
         with self._append_lock():
-            self._load()
             return self._active_tool_results.get(tool_call_id)
 
     @property

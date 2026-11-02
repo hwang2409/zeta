@@ -9,15 +9,18 @@ store. Reopen the session to force a full load after unsupported external edits.
 
 from __future__ import annotations
 
-import fcntl
+import copy
 import hashlib
 import json
+import logging
 import os
+import threading
 import time
 import warnings
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ...agent.receipt import encode_json
 from ..checkpoints import (
@@ -53,6 +56,9 @@ class PersistedAppend:
 SCHEMA = "zeta.conversation.v1"
 PREFIX_FINGERPRINT_BYTES = 64 * 1024
 MAX_PENDING_APPEND_RECEIPTS = 256
+type InstalledEntriesDelta = tuple[ConversationEntry, ...] | Literal["reset"]
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +68,7 @@ class _DetachedLogState:
     cwd: str
     entries: list[ConversationEntry]
     entry_ids: set[str]
+    entry_prefix_digest: bytes
     active_approval_requests: dict[str, ConversationEntry]
     active_approval_resolutions: dict[str, str]
     active_tool_results: dict[str, ToolResult]
@@ -83,10 +90,19 @@ class _DetachedLogState:
     log_offset: int
     log_mtime_ns: int
     log_prefix_fingerprint: bytes
+    installed_delta: InstalledEntriesDelta = ()
 
 
 class ConversationLogMixin:
     """Load a log once, then synchronize only bytes appended by other writers."""
+
+    def _initialize_entries_installed(self: ConversationStore) -> None:
+        self.on_entries_installed: Callable[[InstalledEntriesDelta], None] | None = None
+        self._installed_callback_lock = threading.Lock()
+        self._installed_callback_pending: deque[InstalledEntriesDelta] = deque()
+        self._installed_callback_draining = False
+        self._installed_callback_local = threading.local()
+        self._full_reload_count = 0
 
     def _detach_log_state(self: ConversationStore) -> _DetachedLogState:
         """Return the worker-owned validated state for an atomic loop install."""
@@ -94,6 +110,7 @@ class ConversationLogMixin:
             cwd=self.cwd,
             entries=self._entries,
             entry_ids=self._entry_ids,
+            entry_prefix_digest=self._entry_prefix_digest,
             active_approval_requests=self._active_approval_requests,
             active_approval_resolutions=self._active_approval_resolutions,
             active_tool_results=self._active_tool_results,
@@ -149,6 +166,112 @@ class ConversationLogMixin:
             client_delivery_outcomes=dict(state.client_delivery_outcomes),
         )
 
+    @staticmethod
+    def _encoded_entry_line(entry: ConversationEntry) -> bytes:
+        return encode_json(entry.to_dict()) + b"\n"
+
+    @staticmethod
+    def _next_entry_prefix_digest(previous: bytes, encoded_line: bytes) -> bytes:
+        return hashlib.sha256(previous + encoded_line).digest()
+
+    def _record_entry_prefix(self: ConversationStore, entry: ConversationEntry) -> None:
+        self._entry_prefix_digest = self._next_entry_prefix_digest(
+            self._entry_prefix_digest, self._encoded_entry_line(entry)
+        )
+
+    @staticmethod
+    def _owned_installed_delta(
+        delta: InstalledEntriesDelta,
+    ) -> InstalledEntriesDelta:
+        if delta == "reset":
+            return delta
+        return copy.deepcopy(delta)
+
+    def _deliver_entries_installed(
+        self: ConversationStore, delta: InstalledEntriesDelta
+    ) -> None:
+        assert not getattr(self._installed_callback_local, "flock_held", False)
+        callback = self.on_entries_installed
+        if not delta or callback is None:
+            return
+        try:
+            callback(delta)
+        except Exception:
+            _LOGGER.exception("installed-row callback failed")
+
+    def _start_entries_installed(self: ConversationStore) -> None:
+        self._installed_callback_local.defer = True
+        self._installed_callback_local.flock_held = True
+
+    def _finish_entries_installed(self: ConversationStore) -> None:
+        self._installed_callback_local.defer = False
+        self._installed_callback_local.flock_held = False
+        if getattr(self._installed_callback_local, "drain_after_unlock", False):
+            del self._installed_callback_local.drain_after_unlock
+            self._drain_entries_installed()
+
+    def _drain_entries_installed(self: ConversationStore) -> None:
+        failure: BaseException | None = None
+        while True:
+            with self._installed_callback_lock:
+                if not self._installed_callback_pending:
+                    self._installed_callback_draining = False
+                    break
+                delta = self._installed_callback_pending.popleft()
+            try:
+                self._deliver_entries_installed(delta)
+            except BaseException as exc:  # noqa: BLE001 - propagate after FIFO cleanup
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
+
+    def _publish_prepared_entries_installed(
+        self: ConversationStore, delta: InstalledEntriesDelta
+    ) -> None:
+        """Enqueue one owned delta and let one store-wide drainer deliver it."""
+        if not delta or self.on_entries_installed is None:
+            return
+        should_drain = False
+        with self._installed_callback_lock:
+            self._installed_callback_pending.append(delta)
+            if not self._installed_callback_draining:
+                self._installed_callback_draining = True
+                should_drain = True
+        if not should_drain:
+            return
+        if getattr(self._installed_callback_local, "defer", False):
+            self._installed_callback_local.drain_after_unlock = True
+        else:
+            self._drain_entries_installed()
+
+    def _publish_entries_installed(
+        self: ConversationStore, delta: InstalledEntriesDelta
+    ) -> None:
+        """Copy and publish only newly installed rows."""
+        if not delta or self.on_entries_installed is None:
+            return
+        self._publish_prepared_entries_installed(self._owned_installed_delta(delta))
+
+    @classmethod
+    def _installed_delta_from_baseline(
+        cls,
+        entries: list[ConversationEntry],
+        baseline: tuple[int, bytes],
+    ) -> InstalledEntriesDelta:
+        """Prepare an owned suffix, or reset when the old log is not a prefix."""
+        count, expected_digest = baseline
+        if count > len(entries):
+            return "reset"
+        digest = b""
+        for index in range(count):
+            digest = cls._next_entry_prefix_digest(
+                digest, cls._encoded_entry_line(entries[index])
+            )
+        if digest != expected_digest:
+            return "reset"
+        return cls._owned_installed_delta(tuple(entries[count:]))
+
     def _install_log_state(
         self: ConversationStore, state: _DetachedLogState
     ) -> _DetachedLogState:
@@ -157,6 +280,7 @@ class ConversationLogMixin:
         self._before_incremental_state_install()
         self.cwd = state.cwd
         self._entry_ids = state.entry_ids
+        self._entry_prefix_digest = state.entry_prefix_digest
         self._active_approval_requests = state.active_approval_requests
         self._active_approval_resolutions = state.active_approval_resolutions
         self._active_tool_results = state.active_tool_results
@@ -251,19 +375,11 @@ class ConversationLogMixin:
         """Synchronize changed log metadata unless another writer owns it."""
         if self._log_metadata_matches():
             return
-        with os.fdopen(
-            open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
-        ) as handle:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+        with self._append_lock(wait=False) as acquired:
+            if not acquired:
                 # A writer can expose a new size before releasing the lock. A
                 # later query synchronizes the append after the writer exits.
                 return
-            try:
-                self._load()
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _load(self: ConversationStore) -> None:
         """Synchronize in-memory state with the durable log.
@@ -272,6 +388,7 @@ class ConversationLogMixin:
         Replacements, truncations, and non-linear tails fall back to a complete
         parse; ordinary external appends read and validate only the new bytes.
         """
+        had_entries = bool(self._entries)
         try:
             fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         except FileNotFoundError:
@@ -280,6 +397,7 @@ class ConversationLogMixin:
                     f"conversation file is missing: {self.path}"
                 )
             self._entries = []
+            self._entry_prefix_digest = b""
             self._reset_incremental_validation_state()
             self._rebuild_client_deliveries(self._entries)
             header = {
@@ -289,6 +407,8 @@ class ConversationLogMixin:
                 "created_at": _now(),
             }
             self._write_line({"type": "header", "data": header})
+            if had_entries:
+                self._publish_entries_installed("reset")
             return
 
         try:
@@ -337,6 +457,7 @@ class ConversationLogMixin:
                 self._load_full()
                 return
             self._log_offset = known_offset + torn_at
+            self._publish_entries_installed(tuple(entries))
             self._append_torn_warning()
             return
 
@@ -349,8 +470,11 @@ class ConversationLogMixin:
             self._write_bytes(b"\n")
         else:
             self._set_log_stat(stat)
+        self._publish_entries_installed(tuple(entries))
 
     def _load_full(self: ConversationStore) -> None:
+        self._full_reload_count += 1
+        baseline = (len(self._entries), self._entry_prefix_digest)
         raw = read_session_file(self.directory_fd, "conversation.jsonl")
         lines = raw.splitlines(keepends=True)
         valid_rows: list[dict[str, Any]] = []
@@ -399,6 +523,9 @@ class ConversationLogMixin:
                 f"invalid conversation entry: {self.path}"
             ) from exc
         self._validate_entries()
+        self._entry_prefix_digest = b""
+        for entry in self._entries:
+            self._record_entry_prefix(entry)
         self._task_notification_ids = set()
         for index, entry in enumerate(self._entries):
             if index and index % 64 == 0:
@@ -413,18 +540,26 @@ class ConversationLogMixin:
         self._rebuild_incremental_validation_state()
         self._rebuild_client_deliveries(self._entries)
 
+        delta = (
+            self._installed_delta_from_baseline(self._entries, baseline)
+            if self.on_entries_installed is not None
+            else ()
+        )
         if torn_offset is not None:
             self._repair_torn_tail(torn_offset)
             self._log_offset = torn_offset
+            self._publish_entries_installed(delta)
             self._append_torn_warning()
         elif not self._read_only and not raw.endswith(b"\n"):
             self._write_bytes(b"\n")
+            self._publish_entries_installed(delta)
         else:
             fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
             try:
                 self._set_log_stat(os.fstat(fd))
             finally:
                 os.close(fd)
+            self._publish_entries_installed(delta)
 
     def _validate_header(self: ConversationStore, header: dict[str, Any]) -> None:
         header_data = header.get("data")

@@ -40,7 +40,6 @@ def _append_approval_while_holding_lock(
     writer = ConversationStore(root, session_id="shared")
     request = ToolCall("mid-append", "read", {"path": "README.md"})
     with writer._append_lock():
-        writer._load()
         writer._append_row_unlocked(
             "message",
             {
@@ -130,12 +129,13 @@ def test_pending_approvals_does_not_block_on_writer_mid_append(
     process.start()
     try:
         assert ready.wait(timeout=2)
-        reader._append_lock = _unexpected_history_scan  # type: ignore[method-assign]
+        reader._load = _unexpected_history_scan  # type: ignore[method-assign]
         assert reader.pending_approvals() == []
     finally:
         release.set()
         process.join(timeout=2)
     assert process.exitcode == 0
+    del reader._load
     request = ToolCall("mid-append", "read", {"path": "README.md"})
     assert reader.pending_approvals() == [(request.id, request)]
 

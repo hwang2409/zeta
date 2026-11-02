@@ -56,18 +56,28 @@ pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
 
 @pytest.fixture(autouse=True)
-async def close_direct_transcript_controls(monkeypatch: pytest.MonkeyPatch):
+async def close_direct_agent_navigation_owners(monkeypatch: pytest.MonkeyPatch):
+    navigations: list[AgentNavigation] = []
     controls: list[AgentTranscriptControl] = []
+    navigation_init = AgentNavigation.__init__
     control_init = AgentTranscriptControl.__init__
 
-    def tracked_init(control, *args, **kwargs):
+    def tracked_navigation_init(navigation, *args, **kwargs):
+        navigation_init(navigation, *args, **kwargs)
+        navigations.append(navigation)
+
+    def tracked_control_init(control, *args, **kwargs):
         control_init(control, *args, **kwargs)
         controls.append(control)
 
-    monkeypatch.setattr(AgentTranscriptControl, "__init__", tracked_init)
+    monkeypatch.setattr(AgentNavigation, "__init__", tracked_navigation_init)
+    monkeypatch.setattr(AgentTranscriptControl, "__init__", tracked_control_init)
     yield
+    for navigation in reversed(navigations):
+        await navigation.close()
     for control in reversed(controls):
-        await control.close()
+        if not control._closed:
+            await control.close()
 
 
 def _child(

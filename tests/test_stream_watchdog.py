@@ -632,7 +632,13 @@ async def test_oauth_credential_lock_wait_is_bounded(
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
     async with _mock_client(lambda _request: httpx.Response(500)) as client:
         async with store._async_guard(registry=False):
-            with pytest.raises(store.auth_error_type, match="OAuth credential lock stalled"):
+            with pytest.raises(
+                account_store.AccountCredentialLockTimeoutError,
+                match=(
+                    "cannot access codex:default: another process holds the account "
+                    "lock; retry the turn"
+                ),
+            ):
                 await asyncio.wait_for(store.access_token(client), timeout=0.5)
         assert await asyncio.wait_for(store.access_token(client), timeout=0.5) == (
             _codex_access_token()

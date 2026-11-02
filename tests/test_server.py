@@ -71,6 +71,19 @@ from zeta.skills.agent_catalog import AgentCatalog
 TIMEOUT = 3
 
 
+def _hold_registry_lock_after_start(
+    home: str,
+    start: multiprocessing.synchronize.Event,
+    ready: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+) -> None:
+    assert start.wait(timeout=5)
+    store = AccountStore(home)
+    with store._home() as home_fd, store._registry_guard(home_fd):
+        ready.set()
+        release.wait()
+
+
 def test_every_durable_notification_kind_has_an_explicit_wire_event() -> None:
     assert NOTIFICATION_KINDS
     assert set(NOTIFICATION_WIRE_EVENTS) == set(NOTIFICATION_KINDS)
@@ -842,7 +855,7 @@ class BackgroundChildAndForegroundToolBackend:
         )
 
 
-class MidstreamRetryBackend:
+class EarlyCloseRetryBackend:
     def __init__(self) -> None:
         self.calls = 0
 
@@ -851,7 +864,7 @@ class MidstreamRetryBackend:
         self.calls += 1
         if self.calls == 1:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
-            raise ConnectionError("provider connection dropped")
+            return
         yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="keep me")
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
@@ -861,8 +874,8 @@ class MidstreamRetryBackend:
 
 async def _provider_retry_frames(
     tmp_path: Path, *, features: list[str] | None
-) -> tuple[MidstreamRetryBackend, dict[str, Any], list[dict[str, Any]]]:
-    backend = MidstreamRetryBackend()
+) -> tuple[EarlyCloseRetryBackend, dict[str, Any], list[dict[str, Any]]]:
+    backend = EarlyCloseRetryBackend()
     server = ZetaServer(
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
@@ -4446,6 +4459,85 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
 
 
 @pytest.mark.asyncio
+async def test_account_lock_timeout_reaches_serve_with_retryable_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.accounts.store as account_store
+
+    account = AccountId("codex", "work")
+    await asyncio.to_thread(
+        named_account_credentials(tmp_path, "codex", "work").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
+    )
+    await asyncio.to_thread(AccountStore(tmp_path).set_default, account)
+    monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="claude",
+        model="claude-sonnet-4-6",
+        backend_factory=lambda _provider, model, _home: (
+            FakeBackend([]),
+            model or "claude-sonnet-4-6",
+        ),
+    )
+    reader, writer = await _connect(server)
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_registry_lock_after_start,
+        args=(str(tmp_path), start, ready, release),
+    )
+    holder.start()
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        original_resolve = AccountStore.resolve_account
+
+        def resolve_then_lock(store, provider, selected=None):
+            resolved = original_resolve(store, provider, selected)
+            start.set()
+            assert ready.wait(timeout=5)
+            return resolved
+
+        monkeypatch.setattr(AccountStore, "resolve_account", resolve_then_lock)
+        response = (
+            await asyncio.wait_for(
+                _request(
+                    reader,
+                    writer,
+                    3,
+                    "set_settings",
+                    {
+                        "session_id": server.runtime.session_id,
+                        "model": "gpt-5.4",
+                        "approval_mode": "ask",
+                    },
+                ),
+                timeout=1,
+            )
+        )[-1]
+        assert response["error"] == {
+            "code": -32008,
+            "message": (
+                "cannot access codex:work: another process holds the account lock; "
+                "retry the turn"
+            ),
+            "data": {"code": "account_lock_timeout", "retryable": True},
+        }
+    finally:
+        release.set()
+        holder.join(timeout=5)
+        if holder.is_alive():
+            holder.kill()
+            holder.join(timeout=5)
+        holder.close()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("version", ["1.0", "1.1"])
 async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, version):
     from zeta.protocol.types import ErrorInfo, StreamEvent, StreamEventType
@@ -5015,6 +5107,7 @@ async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path
             )
         )[-1]["result"]
         commands = {entry["name"]: entry for entry in result["commands"]}
+        assert "restart" not in commands  # TUI process lifecycle is not a serve command.
         # Runnable built-ins the server drives directly. `/init` and `/help`
         # live at the scope floor — the menu depends on them appearing here
         # or the ZETA-130 lane loses two anchor commands.
@@ -5141,6 +5234,62 @@ def test_memory_command_parity_tui_and_serve() -> None:
     serve_outputs = [ServerSlashSession(runtime).slash_memory(command) for command in ("log", "undo", "accept state.md")]
     assert tui_outputs == serve_outputs
     assert tui_registry.calls == runtime.manager.project_registry.calls
+
+
+@pytest.mark.parametrize("with_fact_floor", [False, True])
+async def test_slash_status_maps_compaction_with_or_without_fact_floor(
+    tmp_path: Path, with_fact_floor: bool
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        assert server.runtime.loop is not None
+        store = server.runtime.loop.store
+        source = store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("source")])
+        )
+        aggregate = {
+            "fact": {"type": "pr", "pr": 7},
+            "first_seq": source.seq,
+            "last_seq": source.seq,
+            "value_rank": [source.seq, 0],
+        }
+        store.append_compaction_marker(
+            "summary",
+            source.seq,
+            source.seq,
+            kind="evict",
+            view=[
+                {
+                    "seq": source.seq,
+                    "message": Message(
+                        MessageRole.ASSISTANT, [TextContent("receipt")]
+                    ).to_dict(),
+                }
+            ],
+            fact_floor=(
+                {"version": 1, "oldest": [aggregate], "newest": [aggregate]}
+                if with_fact_floor
+                else None
+            ),
+        )
+
+        result = (
+            await _request(
+                reader,
+                writer,
+                "status",
+                "slash_run",
+                {"session_id": sid, "text": "/status"},
+            )
+        )[-1]["result"]
+
+        assert result["kind"] == "output"
+        assert "compaction_history:\n  turn 1: 1 entries" in result["text"]
+        assert "retained typed facts" not in result["text"]
+    finally:
+        await _close(server, writer)
 
 
 async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
@@ -6596,15 +6745,15 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
     holder = threading.Thread(target=hold_registry_lock)
     holder.start()
     assert await asyncio.to_thread(locked.wait, 1)
-    original_registry_guard = AccountStore._registry_guard
+    original_credential_guard = AccountStore.credential_guard
 
     @contextmanager
-    def observed_registry_guard(store, home_fd):
+    def observed_credential_guard(store, account, **kwargs):
         waiting.set()
-        with original_registry_guard(store, home_fd):
-            yield
+        with original_credential_guard(store, account, **kwargs) as home_fd:
+            yield home_fd
 
-    monkeypatch.setattr(AccountStore, "_registry_guard", observed_registry_guard)
+    monkeypatch.setattr(AccountStore, "credential_guard", observed_credential_guard)
     ticks = 0
     stop = asyncio.Event()
 

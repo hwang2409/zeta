@@ -184,11 +184,12 @@ def render_error_card(event: StreamEvent) -> Panel:
         is_json_payload = False
     reason = _truncate(reason, MAX_ERROR_REASON)
     retryable = is_retryable_error(error)
-    title = (
-        "login required"
-        if code == "auth_error"
-        else "provider failure" if retryable else "error"
-    )
+    if code == "account_lock_timeout":
+        title = "account busy"
+    elif code == "auth_error":
+        title = "login required"
+    else:
+        title = "provider failure" if retryable else "error"
     content: list[RenderableType] = [Text(f"{title} · {code}", style=theme.ERROR)]
     if not is_json_payload:
         content.append(_safe_text(f"reason: {reason}", style=theme.BODY, wrap=True))
@@ -220,6 +221,7 @@ def is_retryable_error(error: ErrorInfo | None) -> bool:
     """Return whether an error can succeed when the provider is retried."""
 
     return error is not None and error.code in {
+        "account_lock_timeout",
         "auth_error",
         "backend_error",
         "http_error",

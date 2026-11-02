@@ -8,6 +8,7 @@ import pytest
 
 import zeta.providers.retry_policy as retry_policy_module
 from zeta.protocol.types import (
+    ErrorInfo,
     Message,
     MessageRole,
     StreamEvent,
@@ -17,7 +18,7 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.providers.anthropic_errors import AnthropicStreamError
-from zeta.providers.codex_errors import CodexHTTPError
+from zeta.providers.codex_errors import CodexHTTPError, CodexStreamError
 from zeta.providers.ollama import OllamaError
 from zeta.providers.retry_policy import ProviderRetryBudget, retryable_provider_error
 from zeta.providers.transport import (
@@ -133,6 +134,24 @@ def test_server_error_code_is_retryable() -> None:
     error.code = "server_error"
 
     assert retryable_provider_error(error)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ErrorInfo("stream_error", "loop wording can change", retryable=True),
+        AnthropicStreamError("anthropic wording can change", retryable=True),
+        CodexStreamError("codex wording can change", retryable=True),
+    ],
+)
+def test_early_stream_close_is_retryable(error: object) -> None:
+    assert retryable_provider_error(error)
+
+
+def test_other_stream_errors_are_not_retryable() -> None:
+    assert not retryable_provider_error(
+        ErrorInfo("stream_error", "provider disconnected")
+    )
 
 
 def test_server_error_with_permanent_4xx_status_is_not_retried() -> None:
