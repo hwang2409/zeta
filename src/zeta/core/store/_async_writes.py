@@ -6,11 +6,11 @@ import asyncio
 import copy
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from ._log import InstalledEntriesDelta, _DetachedLogState
+    from ._log import _DetachedLogState
     from ._store import ConversationStore
 
 
@@ -142,19 +142,23 @@ class AsyncDurableWritesMixin:
 
     def _load_detached_log_state_with_delta(
         self: ConversationStore, baseline: tuple[int, bytes]
-    ) -> tuple[_DetachedLogState, InstalledEntriesDelta]:
+    ) -> _DetachedLogState:
         state = self._load_detached_log_state()
-        return state, self._installed_delta_from_baseline(
-            state.entries, state.entry_prefix_digests, baseline
+        return replace(
+            state,
+            installed_delta=self._installed_delta_from_baseline(
+                state.entries, state.entry_prefix_digests, baseline
+            ),
         )
 
     def _load_detached_store_state_with_delta(
         self: ConversationStore, baseline: tuple[int, bytes]
-    ) -> tuple[_DetachedConversationState, InstalledEntriesDelta]:
+    ) -> _DetachedConversationState:
         state = self._load_detached_store_state()
-        return state, self._installed_delta_from_baseline(
+        delta = self._installed_delta_from_baseline(
             state.log.entries, state.log.entry_prefix_digests, baseline
         )
+        return replace(state, log=replace(state.log, installed_delta=delta))
 
     def _run_durable_write_with_delta(
         self: ConversationStore,
@@ -162,12 +166,12 @@ class AsyncDurableWritesMixin:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         baseline: tuple[int, bytes],
-    ) -> tuple[Any, Any, Any, InstalledEntriesDelta]:
+    ) -> tuple[Any, Any, Any]:
         result, state, receipts = self._run_durable_write(method_name, args, kwargs)
         delta = self._installed_delta_from_baseline(
             state.entries, state.entry_prefix_digests, baseline
         )
-        return result, state, receipts, delta
+        return result, replace(state, installed_delta=delta), receipts
 
     def _publication_fence(self: ConversationStore) -> _PublicationFence:
         """Capture every owner field that a recovery refresh may replace."""
@@ -226,11 +230,10 @@ class AsyncDurableWritesMixin:
         self: ConversationStore,
         state: _DetachedConversationState,
         fence: _PublicationFence,
-        delta: InstalledEntriesDelta,
     ) -> _DetachedLogState:
         """Publish unchanged recovery fields and preserve newer owner mutations."""
         if self._transcript_generation == fence.transcript_generation:
-            released_log = self._install_log_state(state.log, delta)
+            released_log = self._install_log_state(state.log)
         else:
             released_log = state.log
 
@@ -242,7 +245,6 @@ class AsyncDurableWritesMixin:
         state: _DetachedLogState,
         generation: int,
         receipts: Any,
-        delta: InstalledEntriesDelta,
     ) -> _DetachedLogState:
         """Publish one durable write unless a newer owner snapshot is authoritative."""
         released_log = state
@@ -250,7 +252,7 @@ class AsyncDurableWritesMixin:
             if self._closing or self._closed:
                 return released_log
             if self._transcript_generation == generation:
-                released_log = self._install_log_state(state, delta)
+                released_log = self._install_log_state(state)
             self._accept_persisted_appends(receipts)
         return released_log
 
@@ -288,14 +290,14 @@ class AsyncDurableWritesMixin:
                 if self._entry_prefix_digests
                 else b"",
             )
-            state, delta = await loop.run_in_executor(
+            state = await loop.run_in_executor(
                 None, self._load_detached_store_state_with_delta, baseline
             )
             with self._durable_write_condition:
                 if self._closing or self._closed:
                     released_log = state.log
                 else:
-                    released_log = self._install_store_state(state, fence, delta)
+                    released_log = self._install_store_state(state, fence)
             cancelled = await self._release_log_state_off_loop(released_log)
             if cancelled:
                 raise asyncio.CancelledError
@@ -358,11 +360,9 @@ class AsyncDurableWritesMixin:
             )
             worker = self._start_durable_write(method_name, args, kwargs, baseline)
             outcome, cancelled = await self._await_started_worker(worker)
-            result, state, receipts, delta = outcome
+            result, state, receipts = outcome
             if self._transcript_generation == generation:
-                released_log = self._publish_log_state(
-                    state, generation, receipts, delta
-                )
+                released_log = self._publish_log_state(state, generation, receipts)
                 cancelled |= await self._release_log_state_off_loop(released_log)
             else:
                 reload_generation = self._transcript_generation
@@ -377,19 +377,16 @@ class AsyncDurableWritesMixin:
                     self._load_detached_log_state_with_delta,
                     reload_baseline,
                 )
-                reload_outcome, reload_cancelled = await self._await_started_worker(
+                reloaded, reload_cancelled = await self._await_started_worker(
                     reload_worker
                 )
-                reloaded, reload_delta = reload_outcome
                 cancelled |= reload_cancelled
                 with self._durable_write_condition:
                     if self._closing or self._closed:
                         released_reload = reloaded
                     else:
                         if self._transcript_generation == reload_generation:
-                            released_reload = self._install_log_state(
-                                reloaded, reload_delta
-                            )
+                            released_reload = self._install_log_state(reloaded)
                         else:
                             # A later owner write synchronized this completed commit.
                             released_reload = reloaded

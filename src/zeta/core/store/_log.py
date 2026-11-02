@@ -85,6 +85,7 @@ class _DetachedLogState:
     log_offset: int
     log_mtime_ns: int
     log_prefix_fingerprint: bytes
+    installed_delta: InstalledEntriesDelta = ()
 
 
 class ConversationLogMixin:
@@ -193,9 +194,7 @@ class ConversationLogMixin:
         return "reset"
 
     def _install_log_state(
-        self: ConversationStore,
-        state: _DetachedLogState,
-        delta: InstalledEntriesDelta,
+        self: ConversationStore, state: _DetachedLogState
     ) -> _DetachedLogState:
         """Install validated state on the owner thread using pointer swaps only."""
         previous = self._detach_log_state()
@@ -229,7 +228,7 @@ class ConversationLogMixin:
         # Publish entries last so readers never see rows without matching indexes.
         self._entries = state.entries
         self._transcript_generation += 1
-        self._publish_entries_installed(delta)
+        self._publish_entries_installed(state.installed_delta)
         return previous
 
     def enable_persisted_append_tracking(self: ConversationStore) -> None:
