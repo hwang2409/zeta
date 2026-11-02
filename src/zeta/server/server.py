@@ -53,11 +53,8 @@ from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
 USER_MESSAGE_MAX_BYTES = 262_144
-
-
 class ZetaServer:
     """Serve one local client over a Unix socket or localhost TCP."""
-
     def __init__(
         self,
         *,
@@ -122,16 +119,16 @@ class ZetaServer:
         self._socket_created = False
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
-
+        self._bound_store: Any = None
     @property
     def address(self) -> str:
         if self.port is not None:
             return f"127.0.0.1:{self.port}"
         return str(self.socket_path)
-
     async def start(self) -> None:
         await accounts.migrate(self.home)
         self.connections = ConnectionRegistry(asyncio.get_running_loop())
+        ergonomics.bind_observer_store(self)
         if self.port is None:
             self._prepare_socket_path()
             self._server = await asyncio.start_unix_server(
@@ -152,14 +149,12 @@ class ZetaServer:
             except BaseException:
                 await self.close()
                 raise
-
     async def serve_forever(self) -> None:
         if self._server is None:
             await self.start()
         assert self._server is not None
         async with self._server:
             await self._server.serve_forever()
-
     async def close(self) -> None:
         try:
             if self._client is not None:
@@ -167,6 +162,9 @@ class ZetaServer:
         finally:
             self._client = None
             self._client_active = False
+            if self._bound_store is not None:
+                self._bound_store.on_entries_installed = None
+                self._bound_store = None
             if self.connections is not None:
                 self.connections.close()
                 self.connections = None
@@ -186,7 +184,6 @@ class ZetaServer:
                             if stat.S_ISSOCK(self.socket_path.stat().st_mode):
                                 self.socket_path.unlink()
                         self._socket_created = False
-
     def _prepare_socket_path(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -217,7 +214,6 @@ class ZetaServer:
         finally:
             probe.close()
         self.socket_path.unlink()
-
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -235,8 +231,6 @@ class ZetaServer:
                 self.runtime.set_background_wake_sink(None)
                 self._client = None
                 self._client_active = False
-
-
 class _Client:
     def __init__(
         self,
@@ -263,7 +257,6 @@ class _Client:
         self.projects = ProjectRequests(home=server.home, runtime=server.runtime, codec=self.codec)
         self.deliveries = DeliveryRequests(self)
         self._approvals = ApprovalLifecycle()
-
     async def run(self) -> None:
         try:
             while True:
@@ -312,10 +305,8 @@ class _Client:
                     break
         finally:
             await self.close()
-
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
-
         while True:
             newline = self._read_buffer.find(b"\n")
             if newline >= 0:
@@ -339,10 +330,8 @@ class _Client:
                 self._read_buffer.clear()
                 return line
             self._read_buffer.extend(chunk)
-
     async def _discard_oversized_frame(self, prefix: bytes) -> bytes:
         """Discard an oversized line and preserve any complete later frames."""
-
         while True:
             chunk = await self.reader.read(65_536)
             if not chunk:
@@ -352,7 +341,6 @@ class _Client:
                 continue
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
-
     async def close(self) -> None:
         async with self._close_lock:
             if self._closed:
@@ -417,6 +405,9 @@ class _Client:
             return self.projects.dispatch(
                 request_id, method, params, features=self.features
             )
+        if method == "session_snapshot":
+            assert self.server.connections is not None
+            return await ergonomics.observer_snapshot(self.server.runtime, self.server.connections, self, params)
         if method == "list_sessions":
             if self.role == "observer" and "project_id" in params:
                 raise ProtocolError(
@@ -438,6 +429,7 @@ class _Client:
                 cwd=cwd,
             )
             self._approvals.clear()
+            ergonomics.bind_observer_store(self.server)
             await self._attach_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "resume":
@@ -453,6 +445,7 @@ class _Client:
                     {"code": "session_not_found", "session_id": session_id},
                 ) from exc
             self._approvals.clear()
+            ergonomics.bind_observer_store(self.server)
             await self._attach_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "send":
@@ -475,7 +468,6 @@ class _Client:
         if method == "status":
             return self._status()
         raise ProtocolError(-32601, f"method not found: {method}")
-
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:
             raise ProtocolError(-32600, "hello may only be sent once")
@@ -547,18 +539,15 @@ class _Client:
             "server": "zeta",
             "capabilities": capabilities,
         }
-
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
             raise ProtocolError(
                 -32602, f"{param} requires the negotiated {feature} feature"
             )
-
     async def _user_message(
         self, text: str, mode: str, attachments: list[dict[str, object]] | None = None
     ) -> None:
         """Echo an accepted user message so observers can rebuild the transcript."""
-
         if "user_message_event" in self.features:
             await self._notify(
                 event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.USER_MESSAGE],
@@ -567,7 +556,6 @@ class _Client:
                 mode=mode,
                 attachments=attachments or [],
             )
-
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
         runtime = self.server.runtime
         if method in {"rename_session", "delete_session"}:
@@ -624,7 +612,6 @@ class _Client:
             if not current or current[-1].id != head:
                 store.switch_to_branch(head)
         return ergonomics.tree(runtime)
-
     async def _approval(
         self, method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
@@ -681,7 +668,6 @@ class _Client:
         if scope != "once":
             result["scope"] = scope
         return result
-
     async def _abort(self, scope: abort_scope.AbortScope = "session") -> dict[str, object]:
         session_id = self.server.runtime.session_id
         outcome = (
@@ -690,11 +676,9 @@ class _Client:
             else TurnOutcome.SESSION_CANCELED
         )
         turn_task = self._turn_task
-
         def mark_canceled() -> None:
             if turn_task is not None and not turn_task.done():
                 self._turn_cancel_outcome = outcome
-
         aborted = await abort_scope.abort_active_turn(
             turn_task,
             scope=scope,
@@ -705,7 +689,6 @@ class _Client:
         if aborted:
             await self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.TURN_ABORTED], session_id)
         return {"aborted": aborted}
-
     def _session_snapshot(self) -> dict[str, object] | None:
         runtime = self.server.runtime
         if runtime.opened is None:
@@ -714,7 +697,6 @@ class _Client:
         if runtime.policy is not None:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
-
     def _status(self) -> dict[str, object]:
         runtime = self.server.runtime
         session = self._session_snapshot()
@@ -1095,7 +1077,11 @@ class _Client:
             self._require_feature("projects", "project_id")
             available = self.projects.project_sessions(params["project_id"])
         else:
-            available = self.server.runtime.list_sessions()
+            available = (
+                self.server.runtime.list_sessions_read_only()
+                if self.role == "observer"
+                else self.server.runtime.list_sessions()
+            )
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
             item.session_id: item.preview
@@ -1221,7 +1207,6 @@ def _integer(
         raise ProtocolError(-32602, f"{name} must be an integer of at least {minimum}")
     return value
 
-
 def _directory(params: dict[str, Any], name: str) -> Path:
     value = params.get(name)
     if not isinstance(value, str) or not value or not os.path.isabs(value):
@@ -1230,7 +1215,6 @@ def _directory(params: dict[str, Any], name: str) -> Path:
     if not path.is_dir():
         raise ProtocolError(-32602, f"{name} is not an existing directory: {value}")
     return path
-
 
 def _optional_string(params: dict[str, Any], name: str) -> str | None:
     value = params.get(name)

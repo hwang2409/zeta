@@ -10,6 +10,7 @@ import shutil
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from ..core.session_files import child_directory, write_session_file
@@ -26,6 +27,7 @@ from ..protocol.types import (
     is_passive_harness_message,
     with_message_origin,
 )
+from .connections import ConnectionRegistry
 from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
 from .runtime import ServerRuntime
 
@@ -82,6 +84,41 @@ async def mutate_session(
     if runtime.opened is not None and session_id == runtime.session_id:
         runtime.manager._copy_metadata(runtime.metadata, metadata)
     return {"session": metadata.to_dict()}
+
+
+def bind_observer_store(server: Any) -> None:
+    if server._bound_store is not None:
+        server._bound_store.on_entries_installed = None
+        server._bound_store = None
+    state = server.runtime.state
+    if state is None or server.connections is None:
+        return
+    store = state.opened.store
+    session_id = state.session_id
+    store.on_entries_installed = lambda delta: server.connections.offer_installed_rows(session_id, delta)
+    server._bound_store = store
+
+
+async def observer_snapshot(runtime: ServerRuntime, registry: ConnectionRegistry, observer: Any, params: dict) -> dict[str, object]:
+    limit = params.get("limit", 128)
+    if type(limit) is not int or not 1 <= limit <= 128:
+        raise ProtocolError(-32602, "limit must be an integer from 1 to 128")
+    if runtime.opened is None:
+        raise ProtocolError(-32003, "session is not active")
+    session_id = runtime.session_id
+    registry.begin_snapshot(observer, session_id)
+
+    def read_page() -> tuple[list[Any], bool]:
+        entries = list(runtime.opened.store.replay())
+        return entries[-limit:], len(entries) > limit
+
+    entries, has_more = await asyncio.to_thread(read_page)
+    rows = [ConnectionRegistry._row_projection(entry) for entry in entries]
+    anchor = {"seq": entries[-1].seq, "entry_id": entries[-1].id} if entries else {"seq": -1, "entry_id": None}
+    result: dict[str, object] = {"session_id": session_id, "rows": rows, "anchor": anchor, "has_more_before": has_more, "partial_output_available": False}
+    if not registry.activate_snapshot(observer, session_id, result):
+        raise ProtocolError(-32009, "snapshot is stale", {"code": "stale_snapshot"})
+    return result
 
 
 def active(runtime: ServerRuntime, params: dict):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -20,6 +21,9 @@ class _Connection:
     features: frozenset[str] = frozenset()
     queue: asyncio.Queue[tuple[bytes, asyncio.Future[bool]]] | None = None
     writer_task: asyncio.Task[None] | None = None
+    snapshot_required: bool = True
+    snapshot_session_id: str | None = None
+    snapshot_seq: int = -1
 
 class ConnectionRegistry:
     """Owns serve connection claims and the single output fan-out seam."""
@@ -58,6 +62,8 @@ class ConnectionRegistry:
             raise ValueError("invalid role")
         state.role = role
         state.features = features
+        if role == "observer":
+            state.snapshot_required = True
 
     def release(self, connection: Any) -> None:
         state = self._connections.pop(connection, None)
@@ -121,7 +127,66 @@ class ConnectionRegistry:
     async def _overflow(self, state: _Connection) -> None:
         if state.connection not in self._connections:
             return
+        # A full queue cannot safely accept another frame. Closing is the
+        # fail-closed signal; the next connection must take a new snapshot.
         await state.connection.close()
+
+    def begin_snapshot(self, observer: Any, session_id: str) -> None:
+        state = self._connections.get(observer)
+        if state is None or state.role != "observer":
+            raise RuntimeError("observer is not connected")
+        state.snapshot_required = True
+        state.snapshot_session_id = session_id
+
+    def activate_snapshot(
+        self, observer: Any, session_id: str, page: dict[str, Any]
+    ) -> bool:
+        state = self._connections.get(observer)
+        if state is None or state.role != "observer":
+            return False
+        if state.snapshot_session_id != session_id:
+            return False
+        anchor = page.get("anchor")
+        state.snapshot_seq = anchor.get("seq", -1) if isinstance(anchor, dict) else -1
+        state.snapshot_required = False
+        return True
+
+    @staticmethod
+    def _row_projection(entry: Any) -> dict[str, Any]:
+        data = getattr(entry, "data", {})
+        display = None
+        if getattr(entry, "type", None) == "message":
+            message = data.get("message", {}) if isinstance(data, dict) else {}
+            content = []
+            for block in message.get("content", []):
+                if not isinstance(block, dict):
+                    continue
+                kind = block.get("type")
+                if kind == "text":
+                    content.append({"type": "text", "text": str(block.get("text", ""))[:8000]})
+                elif kind == "thinking":
+                    content.append({"type": "thinking", "text": ""})
+                elif kind == "image":
+                    content.append({"type": "attachment", "name": str(block.get("path", "image")).split("/")[-1], "size": block.get("size", 0) or 0})
+                elif kind == "tool_use":
+                    call = block.get("tool_call", {})
+                    content.append({"type": "tool_use", "tool_call": {"id": call.get("id", ""), "name": call.get("name", ""), "arguments": {}}})
+            display = {"role": message.get("role"), "content": content, "tool_result": None}
+        elif getattr(entry, "type", None) == "notification":
+            display = {"role": "system", "content": [{"type": "text", "text": str(data.get("text", "background agent notification"))[:8000]}], "tool_result": None}
+        return {"seq": entry.seq, "entry_id": entry.id, "parent_entry_id": entry.parent_id, "lane": entry.lane, "type": entry.type, "display": display}
+
+    def _enqueue_projection(self, session_id: str, entry: Any) -> None:
+        for state in tuple(self._observers):
+            if state.snapshot_required or state.snapshot_session_id not in {None, session_id}:
+                continue
+            if entry.seq <= state.snapshot_seq:
+                continue
+            payload = json.dumps({"jsonrpc": "2.0", "method": "event", "params": {"event": "transcript_row", "session_id": session_id, "row": self._row_projection(entry)}}, separators=(",", ":")).encode()
+            if state.queue is None or state.queue.full():
+                asyncio.create_task(self._overflow(state))
+                continue
+            state.queue.put_nowait((payload, self.loop.create_future()))
 
     def offer_installed_rows(self, session_id: str, owned_delta: Any) -> None:
         try:
@@ -155,9 +220,15 @@ class ConnectionRegistry:
         if overflow:
             for state in tuple(self._observers):
                 asyncio.create_task(self._overflow(state))
-        # durable projection is attached by the session owner in a later slice;
-        # consuming here keeps callback state loop-owned and bounded.
-        del items
+            items.clear()
+        for session_id, delta in items:
+            if delta == "reset":
+                for state in tuple(self._observers):
+                    if state.snapshot_session_id == session_id:
+                        state.snapshot_required = True
+                continue
+            for entry in delta:
+                self._enqueue_projection(session_id, entry)
 
     def close(self) -> None:
         self._closed = True
