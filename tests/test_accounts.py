@@ -1730,6 +1730,56 @@ def test_api_key_mode_skips_named_accounts(
     opened.store.close()
 
 
+def test_cli_logout_removes_credentials_registry_default_and_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, "codex", "work").save(tokens())
+    store = AccountStore(home)
+    store.set_default(account)
+    with store.lifecycle_guard(account):
+        pass
+    monkeypatch.setattr(cli_main, "env_home", lambda: home)
+
+    assert cli_main.main(["accounts", "logout", "codex:work"]) == 0
+
+    assert capsys.readouterr().out == "logged out codex:work; cleared codex default\n"
+    assert store.list() == []
+    assert store.default("codex") is None
+    assert not store.credential_path(account).parent.exists()
+    assert not (home / "account-locks" / "codex" / "work").exists()
+
+
+def test_cli_logout_refuses_account_pinned_by_live_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, "codex", "work").save(tokens())
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    manager.record_account_selection(opened.metadata, account, boundary=0)
+    opened.store.activate_runtime_lease()
+    monkeypatch.setattr(cli_main, "env_home", lambda: home)
+    try:
+        assert cli_main.main(["accounts", "logout", "codex:work"]) == 1
+        assert "live session" in capsys.readouterr().err
+        assert AccountStore(home).contains(account)
+        assert named_account_credentials(home, "codex", "work").read() == tokens()
+    finally:
+        opened.store.close()
+
+
+def test_cli_logout_unknown_account_is_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
+
+    assert cli_main.main(["accounts", "logout", "codex:missing"]) == 1
+    assert capsys.readouterr().err == "account codex:missing does not exist\n"
+
+
 def test_label_is_display_only_and_id_stays_stable(tmp_path: Path) -> None:
     home = tmp_path / "home"
     account = AccountId("codex", "work")
