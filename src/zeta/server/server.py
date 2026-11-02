@@ -407,8 +407,8 @@ class _Client:
                     -32601, f"{method} requires the negotiated projects feature"
                 )
             assert self.projects is not None
-            return self.projects.dispatch(
-                request_id, method, params, features=self.features
+            return await asyncio.to_thread(
+                self.projects.dispatch, request_id, method, params, features=self.features
             )
         if method == "list_sessions":
             return self._list_sessions(request_id, params)

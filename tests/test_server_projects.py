@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import threading
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,51 @@ def _filesystem_snapshot(root: Path) -> dict[str, tuple[int, int, int]]:
         )
         for path in paths
     }
+
+
+@pytest.mark.asyncio
+async def test_project_requests_run_registry_reads_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = _server(tmp_path)
+    registry = ProjectRegistry(server.home / "projects")
+    project = registry.create_project("alpha", "repo")
+    registry.update_memory(project.project_id, {"brief.md": "content\n"})
+    calls: list[tuple[str, int]] = []
+    original_list = ProjectRegistry.list_projects
+    original_memory_log = ProjectRegistry.memory_log
+    original_read = ProjectInbox.read
+
+    def list_projects(self: ProjectRegistry):
+        calls.append(("list", threading.get_ident()))
+        return original_list(self)
+
+    def memory_log(self: ProjectRegistry, project_id: str, **kwargs: object):
+        calls.append(("memory", threading.get_ident()))
+        return original_memory_log(self, project_id, **kwargs)
+
+    def read(self: ProjectInbox, project_id: str):
+        calls.append(("inbox", threading.get_ident()))
+        return original_read(self, project_id)
+
+    monkeypatch.setattr(ProjectRegistry, "list_projects", list_projects)
+    monkeypatch.setattr(ProjectRegistry, "memory_log", memory_log)
+    monkeypatch.setattr(ProjectInbox, "read", read)
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects"])
+        event_loop_thread = threading.get_ident()
+        await _request(reader, writer, 2, "list_projects")
+        await _request(
+            reader, writer, 3, "project_memory_log", {"project_id": project.project_id}
+        )
+        await _request(
+            reader, writer, 4, "project_inbox", {"project_id": project.project_id}
+        )
+    finally:
+        await _close(server, writer)
+    assert {kind for kind, _thread in calls} >= {"list", "memory", "inbox"}
+    assert all(thread != event_loop_thread for _kind, thread in calls)
 
 
 @pytest.mark.asyncio
