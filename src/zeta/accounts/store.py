@@ -82,7 +82,17 @@ class AccountError(RuntimeError):
 
 
 class AccountCredentialLockTimeoutError(AccountError):
-    """Credential publication could not acquire its lifecycle lock in time."""
+    """An account operation could not acquire its lifecycle lock in time."""
+
+    code = "account_lock_timeout"
+    retryable = True
+
+    def __init__(self, account: AccountId | None = None) -> None:
+        self.account = account
+        message = "another process holds the account lock"
+        if account is not None:
+            message = f"cannot access {account}: {message}; retry the turn"
+        super().__init__(message)
 
 
 class AccountLoopThreadLockError(AccountError):
@@ -350,10 +360,13 @@ class AccountStore:
         """Hold one account's stable lifecycle lock."""
 
         if timeout is not None:
-            with _bounded_guard(
-                lambda: self.lifecycle_guard(account, wait=False), timeout
-            ) as home_fd:
-                yield home_fd
+            try:
+                with _bounded_guard(
+                    lambda: self.lifecycle_guard(account, wait=False), timeout
+                ) as home_fd:
+                    yield home_fd
+            except AccountCredentialLockTimeoutError as exc:
+                raise AccountCredentialLockTimeoutError(account) from exc
             return
         with (
             self._home() as home_fd,
@@ -372,10 +385,13 @@ class AccountStore:
         """Hold registry then lifecycle locks for account publication."""
 
         if timeout is not None:
-            with _bounded_guard(
-                lambda: self.credential_guard(account, wait=False), timeout
-            ) as home_fd:
-                yield home_fd
+            try:
+                with _bounded_guard(
+                    lambda: self.credential_guard(account, wait=False), timeout
+                ) as home_fd:
+                    yield home_fd
+            except AccountCredentialLockTimeoutError as exc:
+                raise AccountCredentialLockTimeoutError(account) from exc
             return
         with (
             self._home() as home_fd,
@@ -580,7 +596,8 @@ class AccountCredentials:
 
     def read(self, *, lock_timeout: float | None = None) -> OAuthTokens | None:
         with self.store.lifecycle_guard(
-            self.account, timeout=lock_timeout
+            self.account,
+            timeout=OAUTH_REFRESH_TIMEOUT_SECONDS if lock_timeout is None else lock_timeout,
         ) as home_fd:
             return _read_account_tokens(home_fd, self.account)
 
@@ -598,7 +615,9 @@ class AccountCredentials:
                 self._publish(home_fd, tokens)
 
     def bootstrap(self) -> OAuthTokens | None:
-        with self.store.credential_guard(self.account) as home_fd:
+        with self.store.credential_guard(
+            self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+        ) as home_fd:
             tokens = self.store._recover_account(home_fd, self.account)
             if tokens is not None:
                 return tokens
@@ -740,12 +759,7 @@ class AccountCredentials:
                 self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
             )
         )
-        try:
-            home_fd = await asyncio.to_thread(stack.enter_context, guard)
-        except AccountCredentialLockTimeoutError as exc:
-            raise self.auth_error_type(
-                f"{self.provider_label} OAuth credential lock stalled"
-            ) from exc
+        home_fd = await asyncio.to_thread(stack.enter_context, guard)
         try:
             yield home_fd
         finally:
@@ -766,9 +780,7 @@ def _bounded_guard(
             stack.close()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise AccountCredentialLockTimeoutError(
-                    "OAuth credential lock acquisition timed out"
-                ) from exc
+                raise AccountCredentialLockTimeoutError() from exc
             time.sleep(min(0.05, remaining))
         else:
             break

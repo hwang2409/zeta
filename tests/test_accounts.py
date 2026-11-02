@@ -67,22 +67,26 @@ def _hold_lifecycle_lock(
         release.wait()
 
 
-def _read_turn_credentials(
-    home: str, account: AccountId, result: multiprocessing.queues.Queue,
+def _access_turn_credentials(
+    home: str,
+    account: AccountId,
+    method: str,
+    result: multiprocessing.queues.Queue,
 ) -> None:
     account_store.OAUTH_REFRESH_TIMEOUT_SECONDS = 0.05
     credential = credential_store(account.provider, home=home, account=account)
     assert credential is not None
     try:
-        credential.read()
+        getattr(credential, method)()
     except AccountCredentialLockTimeoutError as exc:
         result.put((exc.code, exc.retryable, str(exc)))
     else:
         result.put(None)
 
 
-def test_turn_credential_read_times_out_when_another_process_holds_lock(
-    tmp_path: Path,
+@pytest.mark.parametrize("method", ["read", "bootstrap"])
+def test_turn_credential_access_times_out_when_another_process_holds_lock(
+    tmp_path: Path, method: str
 ) -> None:
     account = AccountId("codex", "work")
     named_account_credentials(tmp_path, account.provider, account.name).save(tokens())
@@ -95,15 +99,15 @@ def test_turn_credential_read_times_out_when_another_process_holds_lock(
         args=(str(tmp_path), account, ready, release),
     )
     reader = context.Process(
-        target=_read_turn_credentials,
-        args=(str(tmp_path), account, result),
+        target=_access_turn_credentials,
+        args=(str(tmp_path), account, method, result),
     )
     holder.start()
     try:
         assert ready.wait(timeout=5)
         reader.start()
-        reader.join(timeout=1)
-        assert not reader.is_alive(), "turn credential read did not honor the lock timeout"
+        reader.join(timeout=5)
+        assert not reader.is_alive(), "turn credential access ignored the lock timeout"
         assert reader.exitcode == 0
         assert result.get(timeout=1) == (
             "account_lock_timeout",
@@ -119,7 +123,10 @@ def test_turn_credential_read_times_out_when_another_process_holds_lock(
         if holder.is_alive():
             holder.kill()
             holder.join(timeout=5)
+        reader.close()
+        holder.close()
         result.close()
+        result.join_thread()
 
 
 @pytest.mark.asyncio

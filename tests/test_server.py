@@ -4446,6 +4446,45 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
 
 
 @pytest.mark.asyncio
+async def test_account_lock_timeout_reaches_serve_with_retryable_code(tmp_path: Path) -> None:
+    from zeta.protocol.types import ErrorInfo
+
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="codex",
+        model="gpt-5.6-luna",
+        backend_factory=lambda _provider, model, _home: (
+            FakeBackend([]),
+            model or "gpt-5.6-luna",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        message = (
+            "cannot access codex:work: another process holds the account lock; "
+            "retry the turn"
+        )
+        await server._client._event(
+            StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo("account_lock_timeout", message, provider_error=True),
+            ),
+            session_id=server.runtime.session_id,
+        )
+
+        event = await _event(reader, "error")
+        assert event["error"] == {
+            "code": "account_lock_timeout",
+            "message": message,
+        }
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("version", ["1.0", "1.1"])
 async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, version):
     from zeta.protocol.types import ErrorInfo, StreamEvent, StreamEventType
