@@ -2375,6 +2375,66 @@ async def test_parent_abort_cancels_background_grandchild(
 
 
 @pytest.mark.asyncio
+async def test_parent_routing_lives_until_grandchild_cancellation_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = NestedBackgroundBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    owner = loop._background_owner
+    parent_id = f"{store.session_id}:1"
+    grandchild_id = f"{parent_id}:1"
+    grandchild_publication_started = asyncio.Event()
+    release_grandchild_publication = asyncio.Event()
+    original_publish = owner.conversation_channel.publish_completion
+    original_unregister = owner.conversation_channel.unregister_delivery_flow
+    original_wait = getattr(owner, "wait_for_descendant_watchers", None)
+
+    async def hold_grandchild_publication(**kwargs):
+        if kwargs["child_instance_id"] == grandchild_id:
+            grandchild_publication_started.set()
+            await release_grandchild_publication.wait()
+        return await original_publish(**kwargs)
+
+    async def unregister_delivery_flow(instance_id: str) -> None:
+        await original_unregister(instance_id)
+        if instance_id == parent_id:
+            release_grandchild_publication.set()
+
+    monkeypatch.setattr(
+        owner.conversation_channel, "publish_completion", hold_grandchild_publication
+    )
+    monkeypatch.setattr(
+        owner.conversation_channel,
+        "unregister_delivery_flow",
+        unregister_delivery_flow,
+    )
+    if original_wait is not None:
+
+        async def release_while_parent_waits(instance_id: str) -> None:
+            if instance_id == parent_id:
+                release_grandchild_publication.set()
+            await original_wait(instance_id)
+
+        monkeypatch.setattr(
+            owner, "wait_for_descendant_watchers", release_while_parent_waits
+        )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    loop.abort()
+    await asyncio.wait_for(grandchild_publication_started.wait(), timeout=1)
+    await asyncio.wait_for(owner.wait(), timeout=1)
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    notifications = child_store.agent_notifications(pending_only=False)
+    assert [notification.data["status"] for notification in notifications] == [
+        "canceled"
+    ]
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_foreground_cancel_cancels_owned_background_descendant_only(
     tmp_path: Path,
 ) -> None:
@@ -2477,6 +2537,72 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
     backend.release_grandchild.set()
     await loop._background_owner.wait()
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_adopted_grandchild_after_child_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FinishGateBackend("handoff", background_child=True)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    owner = loop._background_owner
+    completion_published = asyncio.Event()
+    release_child_watcher = asyncio.Event()
+    cancellation_requested = asyncio.Event()
+    original_publish = owner.conversation_channel.publish_completion
+    original_cancel_all = owner.cancel_all
+    original_create_task = AgentLoop._create_task
+
+    async def pause_after_publication(**kwargs):
+        notification = await original_publish(**kwargs)
+        if kwargs["child_instance_id"].count(":") == 1:
+            completion_published.set()
+            await release_child_watcher.wait()
+        return notification
+
+    async def hold_child_loop_cancellation(coroutine):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            coroutine.close()
+
+    def create_task(loop_self, coroutine):
+        if loop_self.agent_depth == 1 and coroutine.cr_code.co_name in {
+            "confirm_child_cancel",
+            "cleanup_canceled_child",
+        }:
+            return original_create_task(
+                loop_self, hold_child_loop_cancellation(coroutine)
+            )
+        return original_create_task(loop_self, coroutine)
+
+    def cancel_all() -> None:
+        original_cancel_all()
+        cancellation_requested.set()
+
+    monkeypatch.setattr(
+        owner.conversation_channel, "publish_completion", pause_after_publication
+    )
+    monkeypatch.setattr(AgentLoop, "_create_task", create_task)
+    monkeypatch.setattr(owner, "cancel_all", cancel_all)
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await asyncio.wait_for(completion_published.wait(), timeout=2)
+    closing = asyncio.create_task(loop.close())
+    try:
+        await asyncio.wait_for(cancellation_requested.wait(), timeout=1)
+        release_child_watcher.set()
+        await asyncio.wait_for(closing, timeout=1)
+        assert not owner.running
+    finally:
+        release_child_watcher.set()
+        backend.release_grandchild.set()
+        if not closing.done():
+            closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        await asyncio.wait_for(owner.wait(), timeout=2)
+        store.close()
 
 
 @pytest.mark.asyncio
