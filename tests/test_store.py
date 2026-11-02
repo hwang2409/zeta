@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import warnings
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -780,6 +781,57 @@ def test_installed_hook_runs_after_flock_and_can_reenter(
         "outer",
         "inner",
     ]
+
+
+def test_flock_install_paths_allow_reentrant_callback_append(tmp_path: Path) -> None:
+    def run_reentrant(
+        store: ConversationStore, action: Callable[[], object]
+    ) -> None:
+        observed: list[tuple[ConversationEntry, ...] | str] = []
+
+        def installed(delta: tuple[ConversationEntry, ...] | str) -> None:
+            observed.append(delta)
+            store.on_entries_installed = None
+            store.append_message(message(MessageRole.ASSISTANT, "inner"))
+
+        store.on_entries_installed = installed
+        action()
+        assert len(observed) == 1
+        assert store.messages()[-1].content[0].text == "inner"
+
+    appended = ConversationStore(tmp_path, session_id="installed-path-append")
+    run_reentrant(
+        appended,
+        lambda: appended.append_message(message(MessageRole.ASSISTANT, "outer")),
+    )
+
+    reloaded = ConversationStore(tmp_path, session_id="installed-path-reload")
+    foreign = ConversationStore(tmp_path, session_id=reloaded.session_id)
+    foreign.append_message(message(MessageRole.ASSISTANT, "foreign"))
+    run_reentrant(reloaded, reloaded.refresh)
+
+    forked = ConversationStore(tmp_path, session_id="installed-path-fork")
+    checkpoint = forked.append_checkpoint("base")
+    forked.append_message(message(MessageRole.ASSISTANT, "discarded"))
+    run_reentrant(forked, lambda: forked.append_fork(str(checkpoint.seq)))
+
+    switched = ConversationStore(tmp_path, session_id="installed-path-switch")
+    checkpoint = switched.append_checkpoint("base")
+    switched.append_message(message(MessageRole.ASSISTANT, "discarded"))
+    foreign = ConversationStore(tmp_path, session_id=switched.session_id)
+    foreign.append_fork(str(checkpoint.seq))
+    run_reentrant(switched, switched.refresh)
+
+    repaired = ConversationStore(tmp_path, session_id="installed-path-repair")
+    repaired.append_message(message(MessageRole.ASSISTANT, "kept"))
+    with repaired.path.open("ab") as handle:
+        handle.write(b'{"seq":3,"id":"torn"')
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        run_reentrant(
+            repaired,
+            lambda: repaired.append_message(message(MessageRole.ASSISTANT, "after")),
+        )
 
 
 def test_installed_hook_reentrant_append_emits_in_log_order(tmp_path: Path) -> None:
@@ -2395,6 +2447,68 @@ def test_incremental_tail_payload_validation_matches_full_load(
 
     assert incremental_accepted == full_accepted
     assert not incremental_accepted
+
+
+def test_pending_approvals_delivers_foreign_append_after_flock(tmp_path: Path) -> None:
+    script = tmp_path / "pending_approval_reentry.py"
+    script.write_text(
+        '''
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
+
+root = Path(sys.argv[1])
+session_id = "pending-approval-reentry"
+resident = ConversationStore(root, session_id=session_id)
+foreign = """
+from pathlib import Path
+import sys
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import Message, MessageRole, ToolCall, ToolUseContent
+
+store = ConversationStore(Path(sys.argv[1]), session_id=sys.argv[2])
+call = ToolCall("call-1", "echo", {"value": "approved"})
+store.append_message_with_approval_requests(
+    Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
+)
+"""
+subprocess.run([sys.executable, "-c", foreign, str(root), session_id], check=True)
+observed = []
+
+
+def installed(delta):
+    observed.append("reset" if delta == "reset" else [row.id for row in delta])
+    resident.on_entries_installed = None
+    resident.append_message(Message(MessageRole.ASSISTANT, [TextContent("inner")]))
+
+
+resident.on_entries_installed = installed
+pending = resident.pending_approvals()
+print(json.dumps({
+    "observed": observed,
+    "pending": [item[0] for item in pending],
+    "last_text": resident.messages()[-1].content[0].text,
+}))
+'''.strip()
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    result = json.loads(completed.stdout)
+    assert result["pending"] == ["call-1"]
+    assert len(result["observed"]) == 1
+    assert len(result["observed"][0]) == 1
+    assert result["last_text"] == "inner"
 
 
 def test_live_store_tail_syncs_subprocess_append(tmp_path: Path) -> None:

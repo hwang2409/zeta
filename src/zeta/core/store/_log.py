@@ -10,7 +10,6 @@ store. Reopen the session to force a full load after unsupported external edits.
 from __future__ import annotations
 
 import copy
-import fcntl
 import hashlib
 import json
 import logging
@@ -191,6 +190,7 @@ class ConversationLogMixin:
     def _deliver_entries_installed(
         self: ConversationStore, delta: InstalledEntriesDelta
     ) -> None:
+        assert not getattr(self._installed_callback_local, "flock_held", False)
         callback = self.on_entries_installed
         if not delta or callback is None:
             return
@@ -201,9 +201,11 @@ class ConversationLogMixin:
 
     def _start_entries_installed(self: ConversationStore) -> None:
         self._installed_callback_local.defer = True
+        self._installed_callback_local.flock_held = True
 
     def _finish_entries_installed(self: ConversationStore) -> None:
         self._installed_callback_local.defer = False
+        self._installed_callback_local.flock_held = False
         if getattr(self._installed_callback_local, "drain_after_unlock", False):
             del self._installed_callback_local.drain_after_unlock
             self._drain_entries_installed()
@@ -373,19 +375,11 @@ class ConversationLogMixin:
         """Synchronize changed log metadata unless another writer owns it."""
         if self._log_metadata_matches():
             return
-        with os.fdopen(
-            open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
-        ) as handle:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+        with self._append_lock(wait=False) as acquired:
+            if not acquired:
                 # A writer can expose a new size before releasing the lock. A
                 # later query synchronizes the append after the writer exits.
                 return
-            try:
-                self._load()
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _load(self: ConversationStore) -> None:
         """Synchronize in-memory state with the durable log.

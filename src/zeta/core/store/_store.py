@@ -12,7 +12,11 @@ import uuid
 import warnings  # noqa: F401 - re-exported by the compatibility store facade
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import (  # noqa: F401 - re-exported by the store facade
+    ExitStack,
+    contextmanager,
+    nullcontext,
+)
 from pathlib import Path
 from typing import Any, Self  # noqa: F401 - re-exported by the store facade
 
@@ -170,13 +174,12 @@ class ConversationStore(
             _, self.directory_fd = lease.enter_context(
                 session_directory(self.root_dir, self.session_id)
             )
-            with (
-                nullcontext()
-                if _read_only
-                else self._append_lock(deadline=_lock_deadline)
-            ):
+            if _read_only:
                 self._load()
                 self._load_session_state()
+            else:
+                with self._append_lock(deadline=_lock_deadline):
+                    self._load_session_state()
             if not _read_only:
                 self._runtime_lease = SessionRuntimeLease(self.directory_fd)
             self._release_lease = weakref.finalize(
@@ -193,7 +196,6 @@ class ConversationStore(
         if not resolved:
             raise ValueError("bash cwd must be a nonempty string")
         with self._append_lock():
-            self._load()
             self._write_session_state(resolved, self._todo_items)
             self.bash_cwd = resolved
 
@@ -244,7 +246,6 @@ class ConversationStore(
         """Persist dismissal of the terminal todo receipt."""
 
         with self._append_lock():
-            self._load()
             self._todo_dismissed = True
             self._write_session_state(self.bash_cwd, self._todo_items)
 
@@ -253,7 +254,6 @@ class ConversationStore(
 
         normalized = parse_todo_items(items)
         with self._append_lock():
-            self._load()
             self._todo_items = [dict(item) for item in normalized]
             self._todo_dismissed = False
             self._write_session_state(self.bash_cwd, normalized)
@@ -607,14 +607,24 @@ class ConversationStore(
             ) from exc
 
     @contextmanager
-    def _append_lock(self, *, deadline: float | None = None) -> Iterator[None]:
+    def _append_lock(
+        self, *, deadline: float | None = None, wait: bool = True
+    ) -> Iterator[bool]:
+        """Lock and synchronize the log before exposing resident state."""
         if self._closed:
             raise ValueError("session store is closed")
         with os.fdopen(
             open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
         ) as handle:
             if deadline is None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    fcntl.flock(
+                        handle.fileno(),
+                        fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError:
+                    yield False
+                    return
             else:
                 while True:
                     if time.monotonic() >= deadline:
@@ -629,7 +639,8 @@ class ConversationStore(
                         break
             self._start_entries_installed()
             try:
-                yield
+                self._load()
+                yield True
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 self._finish_entries_installed()
@@ -649,7 +660,6 @@ class ConversationStore(
         parent_id: str | None = None,
     ) -> ConversationEntry:
         with self._append_lock():
-            self._load()
             entry = self._append_row_unlocked(entry_type, data, parent_id)
             return self._snapshot_entry(entry)
 
@@ -665,7 +675,6 @@ class ConversationStore(
         if not materialized:
             return []
         with self._append_lock():
-            self._load()
             return [
                 self._snapshot_entry(entry)
                 for entry in self._append_many_unlocked(materialized)
@@ -834,7 +843,6 @@ class ConversationStore(
         if expected_parent_id is None:
             return self._append_row("compaction", data, parent_id)
         with self._append_lock():
-            self._load()
             current_parent_id = self.active_branch_head_id()
             if current_parent_id != expected_parent_id:
                 raise ConversationIntegrityError(
@@ -873,7 +881,6 @@ class ConversationStore(
             telemetry=telemetry,
         )
         with self._append_lock():
-            self._load()
             if self.active_branch_head_id() != expected_parent_id:
                 raise ConversationIntegrityError(
                     "active branch changed while appending compaction"
@@ -926,7 +933,6 @@ class ConversationStore(
         if request_data:
             data["approval_requests"] = request_data
         with self._append_lock():
-            self._load()
             current_branch = self._active_branch()
             resolved_parent = (
                 parent_id
@@ -1047,7 +1053,6 @@ class ConversationStore(
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
         with self._append_lock():
-            self._load()
             entry = self._resolve_approval_unlocked(
                 request_id,
                 decision,
@@ -1070,7 +1075,6 @@ class ConversationStore(
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
         with self._append_lock():
-            self._load()
             return self._resolve_approval_unlocked(request_id, decision) is not None
 
     def _resolve_approval_unlocked(
@@ -1111,7 +1115,6 @@ class ConversationStore(
     def approval_states(self) -> dict[str, tuple[ToolCall, str | None]]:
         """Return strict approval state after waiting for concurrent writers."""
         with self._append_lock():
-            self._load()
             return self._approval_states_from_indexes()
 
     def _approval_states_from_indexes(self) -> dict[str, tuple[ToolCall, str | None]]:
@@ -1240,7 +1243,6 @@ class ConversationStore(
     def tool_result(self, tool_call_id: str) -> ToolResult | None:
         """Return a strict tool result after waiting for concurrent writers."""
         with self._append_lock():
-            self._load()
             return self._active_tool_results.get(tool_call_id)
 
     @property

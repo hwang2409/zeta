@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from typing import Self
 
 from ..checkpoints import ConversationIntegrityError
@@ -24,9 +23,12 @@ class StoreLifecycleMixin:
         """Reload durable state without acquiring ownership of the session."""
         if self._closed:
             raise ConversationIntegrityError("conversation store is closed")
-        with nullcontext() if self._read_only else self._append_lock():
+        if self._read_only:
             self._load()
             self._load_session_state()
+        else:
+            with self._append_lock():
+                self._load_session_state()
 
     def __enter__(self) -> Self:
         return self
