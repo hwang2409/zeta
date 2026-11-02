@@ -1166,7 +1166,8 @@ class _Client:
             )
 
     async def _write(self, payload: bytes) -> bool:
-        assert self.server.connections is not None
+        if self.server.connections is None:
+            return await self._write_physical(payload)
         return await self.server.connections.send(self, payload)
 
     async def _write_physical(self, payload: bytes) -> bool:
