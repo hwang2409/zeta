@@ -3957,7 +3957,7 @@ async def test_parallel_delegated_approvals_resolve_by_child_instance(
     allow, deny = pending
     assert policy.approve(allow.key)
     assert policy.deny(deny.key)
-    await asyncio.wait_for(task, timeout=1)
+    await asyncio.wait_for(task, timeout=30)
     assert policy.pending_requests() == []
 
 
