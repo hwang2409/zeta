@@ -6508,18 +6508,35 @@ skill_catalog=SkillCatalog.empty(),
 
 
 @pytest.mark.asyncio
-async def test_truncated_response_notice_is_printed_once(tmp_path: Path) -> None:
+async def test_truncated_response_notice_is_printed_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+    )
+
     class TruncatedBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
         async def complete(
             self,
             messages: Sequence[Message],
             tool_schemas: Sequence[ToolSchema],
         ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            self.calls += 1
             yield StreamEvent(StreamEventType.MESSAGE_START)
+            if self.calls == 1:
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT),
+                    data={"truncated": True},
+                )
+                return
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
-                message=Message(MessageRole.ASSISTANT),
-                data={"truncated": True},
+                message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
             )
 
     output = StringIO()
