@@ -48,8 +48,8 @@ from .protocol import (
     negotiate_protocol_version,
 )
 from .runtime import BackendFactory, ServerRuntime
+from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
-from .websocket import WebSocketServer
 
 USER_MESSAGE_MAX_BYTES = 262_144
 

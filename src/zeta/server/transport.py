@@ -9,10 +9,12 @@ import json
 import logging
 import os
 import secrets
+import signal
 import stat
 from collections.abc import Awaitable, Callable, Sequence
 from http import HTTPStatus
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
 
 from websockets.asyncio.server import Server, ServerConnection, serve
@@ -21,6 +23,9 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
 from .protocol import MAX_FRAME_BYTES
+
+if TYPE_CHECKING:
+    from .server import ZetaServer
 
 _UPGRADE_TIMEOUT = 5
 _LOGGER = logging.getLogger("zeta.server.websocket")
@@ -172,6 +177,28 @@ class WebSocketConnection:
         await self._connection.wait_closed()
 
 
+async def run_server(server: ZetaServer) -> None:
+    loop = asyncio.get_running_loop()
+    stopped = asyncio.Event()
+    installed: list[signal.Signals] = []
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, stopped.set)
+        except (NotImplementedError, RuntimeError):
+            continue
+        installed.append(signum)
+    await server.start()
+    serving = asyncio.create_task(server.serve_forever())
+    try:
+        await stopped.wait()
+    finally:
+        await server.close()
+        serving.cancel()
+        await asyncio.gather(serving, return_exceptions=True)
+        for signum in installed:
+            loop.remove_signal_handler(signum)
+
+
 def write_connection_file(
     path: Path, *, port: int, token: str, origins: tuple[str, ...]
 ) -> None:
@@ -227,4 +254,4 @@ def remove_connection_file(path: Path, *, token: str) -> None:
             os.close(fd)
 
 
-__all__ = ["WebSocketServer"]
+__all__ = ["WebSocketServer", "run_server"]
