@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -71,21 +70,13 @@ async def test_installed_rows_callback_races_observer_churn(tmp_path: Path) -> N
     try:
         callback = server.runtime.opened.store.on_entries_installed
         assert callback is not None
-        done = threading.Event()
-
-        def publish() -> None:
-            callback((_entry(10), _entry(11)))
-            done.set()
-
-        thread = threading.Thread(target=publish)
-        thread.start()
-        thread.join(TIMEOUT)
-        assert done.is_set()
+        publish = asyncio.create_task(asyncio.to_thread(callback, (_entry(10), _entry(11))))
+        churn_writer.close()
+        await asyncio.wait_for(churn_writer.wait_closed(), TIMEOUT)
+        await asyncio.wait_for(publish, TIMEOUT)
         row1 = await _read(stable_reader)
         row2 = await _read(stable_reader)
         assert [row1["params"]["row"]["seq"], row2["params"]["row"]["seq"]] == [10, 11]
-        churn_writer.close()
-        await asyncio.wait_for(churn_writer.wait_closed(), TIMEOUT)
         await _request(controller_reader, controller_writer, 3, "status")
     finally:
         await _close(server, controller_writer)
