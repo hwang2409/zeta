@@ -1233,13 +1233,7 @@ class TUIApp(
 
 from .bootstrap import create_app, format_picker_row
 
-__all__ = [
-    "TUIApp",
-    "build_backend",
-    "create_app",
-    "format_picker_row",
-    "main",
-]
+__all__ = ["TUIApp", "build_backend", "create_app", "format_picker_row", "main"]
 
 
 def __getattr__(name: str) -> object:

@@ -1182,34 +1182,18 @@ def build_key_bindings(
             del event
             on_picker_cancel()
 
-        if on_picker_default is not None:
-            @bindings.add("d", filter=picking & ~panel_mode, eager=True)
-            def picker_default(event: KeyPressEvent) -> None:
-                del event
-                on_picker_default()
-
-        if on_picker_login is not None:
-            @bindings.add("l", filter=picking & ~panel_mode, eager=True)
-            def picker_login(event: KeyPressEvent) -> None:
-                del event
-                on_picker_login()
-
-        if on_picker_logout is not None:
-            @bindings.add("x", filter=picking & ~panel_mode, eager=True)
-            def picker_logout(event: KeyPressEvent) -> None:
-                del event
-                on_picker_logout()
-
-        if on_picker_rename is not None:
-            @bindings.add("n", filter=picking & ~panel_mode, eager=True)
-            def picker_rename(event: KeyPressEvent) -> None:
-                del event
-                on_picker_rename()
-
-        if on_picker_refresh is not None:
-            @bindings.add("r", filter=picking & ~panel_mode, eager=True)
-            def picker_refresh(_event: KeyPressEvent) -> None:
-                on_picker_refresh()
+        picker_actions = (
+            ("d", on_picker_default),
+            ("l", on_picker_login),
+            ("x", on_picker_logout),
+            ("n", on_picker_rename),
+            ("r", on_picker_refresh),
+        )
+        for key, action in picker_actions:
+            if action is not None:
+                bindings.add(key, filter=picking & ~panel_mode, eager=True)(
+                    lambda _event, callback=action: callback()
+                )
 
     @bindings.add(*resolved_keys["open-editor"], filter=interactions_enabled & ~panel_mode, eager=True)
     def open_external_editor(event: KeyPressEvent) -> None:
