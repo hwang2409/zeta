@@ -140,6 +140,11 @@ def _tui_slash_commands() -> tuple[SlashCommand, ...]:
         SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]"),
         SlashCommand("accounts", lambda app, args: app.slash_accounts(args), "switch account"),
         SlashCommand(
+            "restart",
+            lambda app, args: app.slash_restart(args),
+            "restart this session from the local checkout (reinstall after pyproject changes)",
+        ),
+        SlashCommand(
             "permissions",
             lambda app, args: app.slash_permissions(args),
             "show rules; revoke a session grant: /permissions revoke <grant>; clear all: /permissions clear",
@@ -382,6 +387,24 @@ class TUIApp(
     def request_new_session(self) -> None:
         self._new_session_requested = True
         self.request_exit()
+
+    @property
+    def restart_has_running_work(self) -> bool:
+        return (
+            self.loop.background_children_running
+            or self.loop.tool_registry.background_tasks.running_count > 0
+        )
+
+    def slash_restart(self, args: str) -> str:
+        if args.strip():
+            return "restart unchanged: /restart does not accept arguments"
+        if self._ephemeral_root is not None:
+            return "restart unavailable: this session is not persistent"
+        if self._fork_controller is None:
+            return "restart unavailable: no TUI session controller"
+        self._fork_controller.request_restart()
+        self.request_exit()
+        return "restarting from the local checkout..."
 
     @property
     def _transcript_lines(self) -> list[str]:

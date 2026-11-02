@@ -49,6 +49,9 @@ class ForkHost(Protocol):
 
     def notification_count(self) -> int: ...
 
+    @property
+    def restart_has_running_work(self) -> bool: ...
+
 
 @dataclass(frozen=True, slots=True)
 class OwnedApproval:
@@ -164,6 +167,8 @@ class ForkStackController:
             tuple[int, object], tuple[ApprovalRequest, str]
         ] = {}
         self._approval_handle_counter = 0
+        self.restart_requested = False
+        self.restart_cancels_work = False
         main_app.set_fork_controller(self)
 
     @property
@@ -172,6 +177,12 @@ class ForkStackController:
 
     def is_visible(self, runtime: ForkHost) -> bool:
         return self.visible is runtime
+
+    def request_restart(self) -> None:
+        self.restart_requested = True
+        self.restart_cancels_work = any(
+            runtime.restart_has_running_work for runtime in self._stack
+        )
 
     @property
     def pending_approvals(self) -> tuple[OwnedApproval, ...]:
@@ -315,10 +326,12 @@ class ForkStackController:
 async def run_fork_stack(
     main_app: ForkHost,
     build_fork: Callable[[str], Awaitable[ForkHost]],
-) -> None:
+) -> tuple[bool, bool]:
     """Run one main runtime and any discussion runtimes opened above it."""
 
-    await ForkStackController(main_app, build_fork).run()
+    controller = ForkStackController(main_app, build_fork)
+    await controller.run()
+    return controller.restart_requested, controller.restart_cancels_work
 
 
 __all__ = [
