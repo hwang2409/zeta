@@ -265,6 +265,7 @@ def compose_runtime(
                 )
             ),
         )
+        registry.project_registry_state = manager.project_registry_state
         if project_registry is None:
             registry.unregister("project")
             registry.unregister("inbox")

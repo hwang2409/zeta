@@ -92,6 +92,7 @@ from ._validation import (
 )
 
 if TYPE_CHECKING:
+    from ..runtime.project_registry_state import ProjectRegistryState
     from ..skills.agent_catalog import AgentCatalog
 
 AbortSignal = ToolAbortSignal
@@ -259,6 +260,7 @@ class ToolRegistry:
         # Concrete capability captured at composition time; tools must never
         # rediscover it through ambient ZETA_HOME.
         self.project_registry = project_registry
+        self.project_registry_state: ProjectRegistryState | None = None
         self.inbox_enabled = inbox_enabled
         self.inbox_target_ids: frozenset[str] | None = None
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
@@ -725,6 +727,7 @@ class ToolRegistry:
         clone.project_id = self.project_id
         clone.inbox_target_ids = self.inbox_target_ids
         clone.project_registry = self.project_registry
+        clone.project_registry_state = self.project_registry_state
         return clone
 
     def abort(self) -> None:

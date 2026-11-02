@@ -43,6 +43,7 @@ from ..project_registry import ProjectRegistryError
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
+from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import (
     discover_session_skills,
@@ -290,7 +291,10 @@ def _create_app_with_root(
     from . import app as _app
 
     ephemeral = ephemeral_root is not None
-    manager = SessionManager(ephemeral_root if ephemeral else home)
+    runtime_home = ephemeral_root if ephemeral else home
+    assert runtime_home is not None
+    registry_state = load_project_registry(runtime_home / "projects")
+    manager = SessionManager(runtime_home, project_registry_state=registry_state)
     opened = None
     try:
         system_prompt_override = resolve_prompt_argument(

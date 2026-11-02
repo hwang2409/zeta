@@ -23,6 +23,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..runtime.project_registry_state import ProjectRegistryState
 from ..skills import (
     SkillCatalog,
     SkillMeta,
@@ -571,7 +572,7 @@ class SlashSession(Protocol):
 
     def slash_tasks(self, args: str) -> str: ...
 
-    def slash_decisions(self, args: str) -> str: ...
+    def slash_decisions(self, args: str) -> str | Awaitable[str]: ...
 
     def slash_send(self, args: str) -> str | Awaitable[str]: ...
 
@@ -1069,7 +1070,7 @@ def _run_tasks(session: SlashSession, args: str) -> str:
     return session.slash_tasks(args)
 
 
-def _run_decisions(session: SlashSession, args: str) -> str:
+def _run_decisions(session: SlashSession, args: str) -> str | Awaitable[str]:
     return session.slash_decisions(args)
 
 
@@ -1136,6 +1137,7 @@ def create_slash_registry(
     project_dir: str | Path | None = None,
     project_eligible: bool | None = None,
     skill_catalog: SkillCatalog,
+    project_registry_state: ProjectRegistryState | None = None,
     extra_commands: Sequence[SlashCommand] = (),
 ) -> SlashCommandRegistry:
     """Register built-ins and frontend commands before custom commands and skills."""
@@ -1163,7 +1165,13 @@ def create_slash_registry(
     )
     registry.register(SlashCommand(
         "project-instructions",
-        lambda session, args: project_instructions_path(args, private_project_root, Path(effective_home).expanduser().resolve() if effective_home else None, getattr(session, "open_project_instructions_editor", None)),
+        lambda session, args: project_instructions_path(
+            args,
+            private_project_root,
+            Path(effective_home).expanduser().resolve() if effective_home else None,
+            getattr(session, "open_project_instructions_editor", None),
+            project_registry_state,
+        ),
         "open or create private project instructions in your editor",
     ))
     registry.register(

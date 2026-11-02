@@ -302,7 +302,7 @@ class TUIApp(
             zeta_home=self._zeta_home,
             project_dir=repo_root,
             project_eligible=project_eligible,
-            skill_catalog=skill_catalog,
+            skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
             extra_commands=_tui_slash_commands(),
         )
         self.loop.add_skill_catalog_listener(self._slash_commands.register_skills)

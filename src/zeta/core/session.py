@@ -40,10 +40,10 @@ from .session_files import (
     child_directory,
     write_session_json,
 )
-from ..project_registry import (
-    ProjectRegistry,
-    ProjectRegistryError,
-    ProjectRegistryUnavailable,
+from ..project_registry import ProjectRegistryError
+from ..runtime.project_registry_state import (
+    ProjectRegistryState,
+    available_project_registry,
 )
 from .store.session_preferences import SessionPreferenceMixin
 from ..config.tool_policy import validate_tool_patterns
@@ -505,15 +505,14 @@ class OpenedSession:
 
 class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     """Create, validate, open, and discover zeta sessions."""
-    def __init__(self, home: str | Path | None = None, *, user_home: str | Path | None = None) -> None:
+    def __init__(self, home: str | Path | None = None, *, user_home: str | Path | None = None, project_registry_state: ProjectRegistryState | None = None) -> None:
         self.home = Path(home) if home is not None else env_home()
         self.user_home = (Path(user_home) if user_home is not None else Path.home()).expanduser().resolve()
         self.sessions_dir = self.home / "sessions"
-        registry_state = ProjectRegistry.load(self.home / "projects")
-        self.project_registry = registry_state.registry
-        self.project_registry_unavailable: ProjectRegistryUnavailable | None = (
-            registry_state.unavailable
-        )
+        state = project_registry_state or available_project_registry(self.home / "projects")
+        self.project_registry_state = state
+        self.project_registry = state.registry
+        self.project_registry_unavailable = state.unavailable
 
     def create(
         self,

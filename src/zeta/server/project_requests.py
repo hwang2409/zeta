@@ -82,10 +82,26 @@ _KNOWN_OPTIONAL_MESSAGE_FIELDS = frozenset(
 class ProjectRequests:
     """Build bounded project views without changing project or session state."""
 
+    @classmethod
+    def for_runtime(
+        cls, *, home: Path, runtime: ServerRuntime, codec: FrameCodec
+    ) -> ProjectRequests | None:
+        registry = runtime.manager.project_registry
+        return (
+            cls(home=home, runtime=runtime, codec=codec, registry=registry)
+            if registry is not None
+            else None
+        )
+
     def __init__(
-        self, *, home: Path, runtime: ServerRuntime, codec: FrameCodec
+        self,
+        *,
+        home: Path,
+        runtime: ServerRuntime,
+        codec: FrameCodec,
+        registry: ProjectRegistry,
     ) -> None:
-        self.registry = ProjectRegistry(home / "projects")
+        self.registry = registry
         self.inbox = ProjectInbox(self.registry, sessions_root=home / "sessions")
         self.runtime = runtime
         self.codec = codec

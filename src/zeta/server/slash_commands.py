@@ -361,6 +361,7 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
         zeta_home=runtime.home,
         project_dir=project_dir,
         skill_catalog=catalog,
+        project_registry_state=runtime.manager.project_registry_state,
         extra_commands=(
             SlashCommand("accounts", lambda session, args: session.slash_accounts(args), "list or label accounts"),
         ),

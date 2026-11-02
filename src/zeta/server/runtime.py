@@ -33,6 +33,7 @@ from ..protocol.types import (
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
+from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import discover_session_skills
 from ..skills.agent_catalog import discover_session_agents
@@ -190,6 +191,7 @@ class ServerRuntime:
         self._test_scripted_provider = os.environ.get(TEST_SCRIPTED_PROVIDER_ENV) == "1"
         self.backend_factory = backend_factory
         self.manager = SessionManager(self.home)
+        self._project_registry_probed = False
         self._state: SessionState | None = None
         self._background_event_sink: SessionEventSink | None = None
         self._background_wake_sink: SessionWakeSink | None = None
@@ -273,6 +275,17 @@ class ServerRuntime:
     @property
     def session_id(self) -> str:
         return self.metadata.session_id
+
+    async def initialize_project_registry(self) -> None:
+        """Probe registry availability once outside the event loop."""
+
+        if self._project_registry_probed:
+            return
+        state = await asyncio.to_thread(load_project_registry, self.home / "projects")
+        self.manager.project_registry_state = state
+        self.manager.project_registry = state.registry
+        self.manager.project_registry_unavailable = state.unavailable
+        self._project_registry_probed = True
 
     def list_sessions(self) -> list[SessionMetadata]:
         return self.manager.list_sessions()

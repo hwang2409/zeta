@@ -17,7 +17,11 @@ from rich.text import Text
 
 from zeta.cli.main import build_parser
 from zeta.core.session import SessionManager
-from zeta.project_registry import ProjectRegistry, ProjectRegistryUnavailable
+from zeta.project_registry import ProjectRegistry
+from zeta.runtime.project_registry_state import (
+    ProjectRegistryUnavailable,
+    load_project_registry,
+)
 from zeta.server.server import ZetaServer
 from zeta.tui.app import create_app
 
@@ -44,16 +48,11 @@ def _dangling_symlink(home: Path, _linked: Path, _record: Path) -> None:
     projects.symlink_to(home / "missing-projects")
 
 
-def _missing_directory(_home: Path, linked: Path, _record: Path) -> None:
-    linked.rmdir()
-
-
 _CORRUPTIONS: tuple[tuple[str, Callable[[Path, Path, Path], None]], ...] = (
     ("invalid-json", _invalid_json),
     ("wrong-schema-version", _wrong_schema),
     ("unreadable-permissions", _unreadable),
     ("dangling-symlink", _dangling_symlink),
-    ("missing-project-directory", _missing_directory),
 )
 _CASE_IDS = [case for case, _corrupt in _CORRUPTIONS]
 
@@ -158,7 +157,7 @@ def test_broken_registry_tui_start_and_resume_without_repair(
     corrupt(home, linked, record)
     projects = home / "projects"
     before = _registry_snapshot(projects)
-    state = ProjectRegistry.load(projects)
+    state = load_project_registry(projects)
     assert state.registry is None
     assert isinstance(state.unavailable, ProjectRegistryUnavailable)
     monkeypatch.setenv("ZETA_HOME", str(home))
@@ -220,3 +219,141 @@ def test_missing_registry_remains_available(tmp_path: Path) -> None:
 
     assert manager.project_registry is not None
     assert manager.project_registry_unavailable is None
+
+
+def test_stale_project_roots_do_not_disable_registry(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    registry = ProjectRegistry(home / "projects")
+    roots = [tmp_path / f"repository-{index}" for index in range(11)]
+    projects = []
+    for index, root in enumerate(roots):
+        root.mkdir()
+        projects.append(registry.create_project(f"project-{index}", "git", root))
+    roots[2].rmdir()
+    roots[7].rmdir()
+
+    state = load_project_registry(home / "projects")
+
+    assert state.unavailable is None
+    assert state.registry is not None
+    assert len(state.registry.list_projects()) == 11
+    assert state.registry.find_for_directory(roots[5]) == projects[5]
+
+
+def test_session_manager_construction_does_not_open_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry_root = tmp_path / "home" / "projects"
+    registry_root.mkdir(parents=True)
+    opened: list[object] = []
+    original_open = os.open
+
+    def count_open(path: object, *args: object, **kwargs: object) -> int:
+        if path == registry_root or kwargs.get("dir_fd") is not None:
+            opened.append(path)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", count_open)
+
+    SessionManager(tmp_path / "home")
+
+    assert opened == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_attention_does_not_open_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from zeta.runtime.project_registry_state import available_project_registry
+    from zeta.tools import resolve_attention
+
+    home = tmp_path / "home"
+    session_dir = home / "sessions" / ("a" * 32)
+    session_dir.mkdir(parents=True)
+    state = available_project_registry(home / "projects")
+    opened: list[object] = []
+    original_open = os.open
+
+    def count_open(path: object, *args: object, **kwargs: object) -> int:
+        if path == home / "projects":
+            opened.append(path)
+        return original_open(path, *args, **kwargs)
+
+    record = SimpleNamespace(decision="yes")
+    monkeypatch.setattr(os, "open", count_open)
+    monkeypatch.setattr(
+        resolve_attention,
+        "validate_attention_fork",
+        lambda **_kwargs: SimpleNamespace(record=record),
+    )
+    monkeypatch.setattr(
+        resolve_attention,
+        "deliver_attention_decision",
+        lambda *_args, **_kwargs: ("message-id", record, False),
+    )
+    registry = SimpleNamespace(
+        session_store=SimpleNamespace(
+            session_dir=session_dir,
+            session_id=session_dir.name,
+            directory_fd=-1,
+        ),
+        project_registry=state.registry,
+        project_registry_state=state,
+        project_id="p_" + "b" * 32,
+    )
+
+    await resolve_attention._resolve_attention(registry, {"decision": "yes"})
+
+    assert opened == []
+
+
+def test_malformed_registry_decisions_use_startup_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    _corrupt_registry(home, _invalid_json)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(repository)
+
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    try:
+        warning = app.loop.manager.project_registry_unavailable
+        assert warning is not None
+        assert app._startup_warnings.count(warning.warning) == 1
+        asyncio.run(app._decisions_tick())
+        assert asyncio.run(app.slash_decisions("")) == "no open decisions"
+    finally:
+        asyncio.run(app.close())
+
+
+def test_project_instructions_refuses_unavailable_registry(tmp_path: Path) -> None:
+    from zeta.core.project_context import project_instructions_path
+
+    home = tmp_path / "home"
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    record = _corrupt_registry(home, _invalid_json)
+    state = load_project_registry(home / "projects")
+    assert state.unavailable is not None
+
+    result = project_instructions_path("", repository, home, registry_state=state)
+
+    assert result == f"project instructions unavailable: {state.unavailable.reason}"
+    assert not (record.parent / "AGENTS.md").exists()
+
+
+def test_only_registry_state_constructs_project_registry() -> None:
+    source_root = Path(__file__).parents[1] / "src" / "zeta"
+    offenders = []
+    for path in source_root.rglob("*.py"):
+        if path.name in {"project_registry.py", "project_registry_state.py"}:
+            continue
+        if "ProjectRegistry(" in path.read_text(encoding="utf-8"):
+            offenders.append(path.relative_to(source_root))
+
+    assert offenders == []

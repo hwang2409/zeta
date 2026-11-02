@@ -48,6 +48,11 @@ from ..memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memo
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import load_identity, load_packaged_identity, load_runtime_guidance
+from ..runtime.project_registry_state import (
+    ProjectRegistryState,
+    available_project_registry,
+    project_registry,
+)
 from ..skills import SkillCatalog
 from .process_env import subprocess_env
 
@@ -582,6 +587,7 @@ def project_instructions_path(
     project_root: Path | None,
     zeta_home: Path | None,
     editor: Callable[[Path], str | Awaitable[str]] | None = None,
+    registry_state: ProjectRegistryState | None = None,
 ) -> str | Awaitable[str]:
     """Create the private project instructions file and optionally open it."""
     if args.strip():
@@ -591,8 +597,12 @@ def project_instructions_path(
             "project instructions: this folder is not a zeta project. run `git init` "
             "here and restart zeta, or start zeta inside a registered project."
         )
+    state = registry_state or available_project_registry(zeta_home / "projects")
+    if state.registry is None:
+        assert state.unavailable is not None
+        return f"project instructions unavailable: {state.unavailable.reason}"
     try:
-        registry = ProjectRegistry(zeta_home / "projects")
+        registry = state.registry
         discovery = discover_project(project_root, user_home=zeta_home.parent)
         project = resolve_project_context(discovery, registry)
     except ProjectRegistryError as exc:
@@ -755,7 +765,7 @@ def load_project_context(
         # A malformed or unsafe optional registry must not prevent a session from
         # starting; surface it as a startup notice instead.
         try:
-            registry = ProjectRegistry(home / "projects")
+            registry = project_registry(home / "projects")
             project = session_project
             if project is not None:
                 manual_memory_sections: list[str] = []
@@ -935,7 +945,7 @@ def refresh_project_memory(
     if _owned_block_digest(owned) != memory_digest:
         return system_prompt
     try:
-        registry = ProjectRegistry(home / "projects")
+        registry = project_registry(home / "projects")
         project = registry.show_project(project_id)
         if project is None:
             return system_prompt

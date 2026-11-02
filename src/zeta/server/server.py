@@ -129,6 +129,7 @@ class ZetaServer:
         return str(self.socket_path)
 
     async def start(self) -> None:
+        await self.runtime.initialize_project_registry()
         await accounts.migrate(self.home)
         if self.port is None:
             self._prepare_socket_path()
@@ -241,7 +242,6 @@ class ZetaServer:
             self._client = None
             self._client_active = False
 
-
 class _Client:
     def __init__(
         self,
@@ -264,7 +264,7 @@ class _Client:
         self._read_buffer = bytearray()
         self._model_inputs = PendingModelInputs()
         self.codec = FrameCodec()
-        self.projects = ProjectRequests(home=server.home, runtime=server.runtime, codec=self.codec)
+        self.projects = ProjectRequests.for_runtime(home=server.home, runtime=server.runtime, codec=self.codec)
         self.deliveries = DeliveryRequests(self)
         self._approvals = ApprovalLifecycle()
 
@@ -406,6 +406,7 @@ class _Client:
                 raise ProtocolError(
                     -32601, f"{method} requires the negotiated projects feature"
                 )
+            assert self.projects is not None
             return self.projects.dispatch(
                 request_id, method, params, features=self.features
             )
@@ -1071,6 +1072,7 @@ class _Client:
         limit = _integer(params, "limit", None, minimum=1)
         if "project_id" in params:
             self._require_feature("projects", "project_id")
+            assert self.projects is not None
             available = self.projects.project_sessions(params["project_id"])
         else:
             available = self.server.runtime.list_sessions()
