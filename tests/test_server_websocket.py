@@ -293,6 +293,53 @@ async def test_websocket_token_file_lifecycle_and_loopback_bind(tmp_path: Path) 
     assert not token_path.exists()
 
 
+@pytest.mark.asyncio
+async def test_websocket_discovery_file_has_one_owner(tmp_path: Path) -> None:
+    token_path = tmp_path / "run" / "serve.ws.json"
+    first = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    second = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    await first.start()
+    first_value = token_path.read_bytes()
+    assert stat.S_IMODE((tmp_path / "run" / "serve.ws.lock").stat().st_mode) == 0o600
+    try:
+        with pytest.raises(
+            ValueError,
+            match=rf"WebSocket server.*pid {os.getpid()}.*stop it",
+        ):
+            await second.start()
+        assert second._websocket.server is None
+        assert token_path.read_bytes() == first_value
+    finally:
+        await _close(second)
+        await _close(first)
+    assert not token_path.exists()
+
+    replacement = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    await replacement.start()
+    try:
+        assert token_path.exists()
+        assert token_path.read_bytes() != first_value
+    finally:
+        await _close(replacement)
+
+
+@pytest.mark.asyncio
+async def test_websocket_replaces_stale_discovery_file(tmp_path: Path) -> None:
+    token_path = tmp_path / "run" / "serve.ws.json"
+    token_path.parent.mkdir(parents=True)
+    token_path.write_text('{"stale":true}')
+    (token_path.parent / "serve.ws.lock").write_text("999999")
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    await server.start()
+    try:
+        value = json.loads(token_path.read_text())
+        assert value["token"] == server._websocket.token
+        assert value["pid"] == os.getpid()
+        assert (token_path.parent / "serve.ws.lock").read_text() == str(os.getpid())
+    finally:
+        await _close(server)
+
+
 def test_serve_websocket_cli_flags() -> None:
     args = build_parser().parse_args(
         [

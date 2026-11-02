@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import hmac
 import json
 import logging
@@ -11,6 +12,7 @@ import os
 import secrets
 import signal
 import stat
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from http import HTTPStatus
 from pathlib import Path
@@ -78,8 +80,12 @@ class WebSocketServer:
         self.accept = accept
         self.token: str | None = None
         self.server: Server | None = None
+        self._lock_fd: int | None = None
 
     async def start(self) -> None:
+        self._lock_fd = await asyncio.to_thread(
+            acquire_connection_lock, self.path.with_name("serve.ws.lock")
+        )
         self.token = secrets.token_urlsafe(32)
         self.server = await serve(
             self._handle,
@@ -131,8 +137,14 @@ class WebSocketServer:
             self.server.close()
             await self.server.wait_closed()
             self.server = None
-        if self.token is not None:
-            await asyncio.to_thread(remove_connection_file, self.path, token=self.token)
+        if self._lock_fd is not None:
+            await asyncio.to_thread(
+                release_connection_lock,
+                self.path,
+                token=self.token,
+                lock_fd=self._lock_fd,
+            )
+            self._lock_fd = None
             self.token = None
 
 
@@ -197,6 +209,55 @@ async def run_server(server: ZetaServer) -> None:
         await asyncio.gather(serving, return_exceptions=True)
         for signum in installed:
             loop.remove_signal_handler(signum)
+
+
+def acquire_connection_lock(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fd = -1
+    try:
+        os.fchmod(parent_fd, 0o700)
+        fd = os.open(
+            path.name,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError(f"refusing unsafe WebSocket lock file: {path}")
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            pid = ""
+            for _ in range(10):
+                pid = os.pread(fd, 64, 0).decode(errors="replace").strip()
+                if pid:
+                    break
+                time.sleep(0.01)
+            raise ValueError(
+                "WebSocket server already running for this ZETA_HOME "
+                f"(pid {pid or 'unknown'}); stop it before starting another"
+            ) from exc
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        os.fsync(fd)
+        result, fd = fd, -1
+        return result
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
+
+
+def release_connection_lock(path: Path, *, token: str | None, lock_fd: int) -> None:
+    try:
+        if token is not None:
+            remove_connection_file(path, token=token)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def write_connection_file(

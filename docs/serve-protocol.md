@@ -23,8 +23,9 @@ remains under `ZETA_HOME`.
 ### WebSocket transport
 
 `zeta serve --ws PORT` adds an RFC 6455 WebSocket listener on
-`127.0.0.1:PORT`; it does not replace the Unix socket or TCP listener. The bind
-address is fixed and cannot be configured. The transport supports text
+`127.0.0.1:PORT`; it does not replace the Unix socket or TCP listener. Only one
+`--ws` server can run per `ZETA_HOME`. The bind address is fixed and cannot be
+configured. The transport supports text
 messages, fragmentation, ping, pong, and the close handshake. It does not
 negotiate extensions. Binary messages close with code `1003`, and messages over
 1 MiB close with code `1009`.
