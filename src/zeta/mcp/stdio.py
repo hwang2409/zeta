@@ -68,6 +68,7 @@ class StdioMCPClient(MCPClient):
         self._write_lock = asyncio.Lock()
         self._next_id = 0
         self._pending: dict[int, asyncio.Future[dict[str, object]]] = {}
+        self._reader_error: BaseException | None = None
         self._closed = False
         self._suppress_failure = False
         self._failure_sink: Callable[[str], None] | None = None
@@ -233,11 +234,20 @@ class StdioMCPClient(MCPClient):
             "params": dict(params),
         }
         try:
-            async with self._write_lock:
-                process.stdin.write(
-                    (json.dumps(request, separators=(",", ":")) + "\n").encode()
-                )
-                await process.stdin.drain()
+            try:
+                async with self._write_lock:
+                    process.stdin.write(
+                        (json.dumps(request, separators=(",", ":")) + "\n").encode()
+                    )
+                    await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                if self._reader_task is not None and not self._reader_task.done():
+                    await self._reader_task
+                if not response.done():
+                    response.set_exception(
+                        self._reader_error
+                        or MCPTransportError("MCP stdio server closed")
+                    )
             if abort_signal is None:
                 raw_response = await response
             else:
@@ -287,11 +297,14 @@ class StdioMCPClient(MCPClient):
         if process is None or process.stdin is None or self._closed:
             return
         message = {"jsonrpc": "2.0", "method": method, "params": dict(params)}
-        async with self._write_lock:
-            process.stdin.write(
-                (json.dumps(message, separators=(",", ":")) + "\n").encode()
-            )
-            await process.stdin.drain()
+        try:
+            async with self._write_lock:
+                process.stdin.write(
+                    (json.dumps(message, separators=(",", ":")) + "\n").encode()
+                )
+                await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     async def _terminate_process(self, *, report_failure: bool = False) -> None:
         process = self._process
@@ -425,6 +438,8 @@ class StdioMCPClient(MCPClient):
                     self._failure_sink(str(error))
 
     def _fail_pending(self, error: BaseException) -> None:
+        if self._reader_error is None:
+            self._reader_error = error
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(error)

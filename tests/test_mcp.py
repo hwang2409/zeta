@@ -707,6 +707,38 @@ async def test_mcp_stdio_oversized_line_memory_is_bounded(
 
 
 @pytest.mark.asyncio
+async def test_stdio_write_after_server_exit_preserves_protocol_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.mcp.stdio as stdio_module
+
+    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    source = "import sys; sys.stdout.write('x' * 2048); sys.stdout.flush()"
+    client = StdioMCPClient(
+        MCPServerConfig("write-after-exit", "stdio", sys.executable, ("-u", "-c", source))
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-u",
+        "-c",
+        source,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        limit=stdio_module.MCP_STDIO_LINE_LIMIT,
+    )
+    client._process = process
+    client._reader_task = asyncio.create_task(client._read_stdout())
+    try:
+        await process.wait()
+        await client._reader_task
+        with pytest.raises(MCPProtocolError, match="invalid MCP JSON"):
+            await client._request("initialize", {})
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_stdio_rejects_unterminated_line_beyond_named_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
