@@ -203,6 +203,15 @@ async def test_websocket_and_unix_socket_share_single_client_limit(
         )
         await _read_json(ws_reader)
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        writer.write(
+            (json.dumps({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "hello",
+                "params": {"protocol_version": "1.0"},
+            }) + "\n").encode()
+        )
+        await writer.drain()
         error = json.loads(await asyncio.wait_for(reader.readline(), TIMEOUT))
         assert error["error"]["code"] == -32001
         writer.close()
