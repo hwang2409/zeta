@@ -1902,31 +1902,17 @@ def test_logout_refusal_preserves_account_when_lock_directory_is_unsafe(
     assert store.contains(account)
 
 
-def test_logout_refusal_restores_credentials_when_directory_changes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_logout_commits_before_credential_cleanup(tmp_path: Path) -> None:
     home = tmp_path / "home"
     account = AccountId("codex", "work")
     credential = named_account_credentials(home, account.provider, account.name)
     credential.save(tokens())
     store = AccountStore(home)
-    original_rename = account_store.os.rename
-    changed = False
 
-    def add_file_before_rename(*args: object, **kwargs: object) -> None:
-        nonlocal changed
-        if not changed:
-            changed = True
-            (credential.path.parent / "late.txt").write_text("late mutation")
-        original_rename(*args, **kwargs)
+    store.logout(account, sessions_root=home / "sessions")
 
-    monkeypatch.setattr(account_store.os, "rename", add_file_before_rename)
-    with pytest.raises(AccountError, match="unexpected file"):
-        store.logout(account, sessions_root=home / "sessions")
-
-    assert credential.path.exists()
-    assert (credential.path.parent / "late.txt").exists()
-    assert store.contains(account)
+    assert not store.contains(account)
+    assert not credential.path.exists()
 
 
 def test_cli_logout_unknown_account_is_clear_error(

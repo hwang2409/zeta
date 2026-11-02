@@ -311,10 +311,9 @@ class AccountStore:
         """Remove one local account while no live session pins it."""
 
         from .logout import (
-            _quarantine_account_directory,
+            remove_account_directory,
             remove_account_lock_directory,
-            remove_account_tombstone,
-            restore_account_directory,
+            validate_account_directory,
         )
 
         with self._home() as home_fd, self._registry_guard(home_fd):
@@ -328,18 +327,22 @@ class AccountStore:
                         f"account {account} is pinned by a live session; close it first"
                     )
                 remove_account_lock_directory(home_fd, account, remove=False)
-                tombstone = _quarantine_account_directory(home_fd, account)
-                try:
-                    cleared_default = value["defaults"].pop(account.provider, None) == key
-                    value["accounts"].pop(key)
-                    value["labels"].pop(key, None)
-                    self._write_registry(home_fd, value)
-                except BaseException:
-                    if tombstone is not None:
-                        restore_account_directory(home_fd, account, tombstone)
-                    raise
-                if tombstone is not None:
-                    remove_account_tombstone(home_fd, account, tombstone)
+                validate_account_directory(
+                    home_fd,
+                    "accounts",
+                    account,
+                    allowed={"oauth.json", "usage.json", "publish-pending.json"},
+                )
+                cleared_default = value["defaults"].pop(account.provider, None) == key
+                value["accounts"].pop(key)
+                value["labels"].pop(key, None)
+                self._write_registry(home_fd, value)
+                remove_account_directory(
+                    home_fd,
+                    "accounts",
+                    account,
+                    allowed={"oauth.json", "usage.json", "publish-pending.json"},
+                )
                 remove_account_lock_directory(home_fd, account, remove=True)
         suffix = f"; cleared {account.provider} default" if cleared_default else ""
         return f"logged out {account}{suffix}"
@@ -507,12 +510,68 @@ class AccountStore:
                     "codex-oauth.json",
                     "accounts.json",
                     "accounts",
+                    "account-locks",
                 )
             ):
                 return
             with self._lock_at(home_fd, ".accounts-migration.lock"):
+                with self._registry_guard(home_fd):
+                    self._sweep_orphan_directories(home_fd)
                 for provider in ("anthropic", "codex"):
                     self._migrate_provider(home_fd, provider)
+
+    def _sweep_orphan_directories(self, home_fd: int) -> None:
+        from .logout import remove_account_directory
+
+        registered = set(self._read_registry(home_fd)["accounts"])
+        for root, allowed in (
+            ("accounts", {"oauth.json", "usage.json", "publish-pending.json"}),
+            ("account-locks", {"lifecycle.lock", "usage.lock"}),
+        ):
+            try:
+                with child_directory(home_fd, root) as root_fd:
+                    for provider in _PROVIDERS:
+                        try:
+                            with child_directory(root_fd, provider) as provider_fd:
+                                names = [
+                                    (name, stat.S_ISDIR(os.stat(name, dir_fd=provider_fd, follow_symlinks=False).st_mode))
+                                    for name in os.listdir(provider_fd)
+                                ]
+                        except FileNotFoundError:
+                            continue
+                        for name, is_directory in names:
+                            if not is_directory:
+                                continue
+                            key = f"{provider}:{name}"
+                            if key in registered:
+                                continue
+                            account = None
+                            try:
+                                account = AccountId(provider, name)
+                            except ValueError:
+                                pass
+                            if root == "accounts" and account is not None:
+                                try:
+                                    with (
+                                        child_directory(home_fd, root) as scan_root_fd,
+                                        child_directory(scan_root_fd, provider) as scan_provider_fd,
+                                        child_directory(scan_provider_fd, name) as account_fd,
+                                    ):
+                                        pending = _read_publication_pending(account_fd)
+                                        credential = _read_optional_bytes(account_fd, "oauth.json")
+                                    if (
+                                        pending is not None
+                                        and credential is not None
+                                        and pending == _publication_record(account, credential)
+                                    ):
+                                        continue
+                                except FileNotFoundError:
+                                    continue
+                            remove_account_directory(
+                                home_fd, root, (provider, name), allowed=allowed
+                            )
+            except FileNotFoundError:
+                continue
 
     def _migrate_provider(self, home_fd: int, provider: str) -> None:
         account = AccountId(provider, "default")

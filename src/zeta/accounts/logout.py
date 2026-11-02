@@ -4,14 +4,9 @@ from __future__ import annotations
 
 import os
 import stat
-import uuid
-from typing import TYPE_CHECKING
 
 from ..core.session_files import child_directory
-from .store import AccountError
-
-if TYPE_CHECKING:
-    from .store import AccountId
+from .store import AccountError, AccountId
 
 
 def _fsync_directory(directory_fd: int) -> None:
@@ -28,6 +23,8 @@ def _validate_directory_files(directory_fd: int, allowed: set[str]) -> None:
 
 
 def _remove_directory_files(directory_fd: int, allowed: set[str]) -> None:
+    if stat.S_IMODE(os.fstat(directory_fd).st_mode) != 0o700:
+        raise AccountError("account directory has unsafe permissions")
     names = os.listdir(directory_fd)
     _validate_directory_files(directory_fd, allowed)
     for name in names:
@@ -35,56 +32,39 @@ def _remove_directory_files(directory_fd: int, allowed: set[str]) -> None:
     _fsync_directory(directory_fd)
 
 
-def _quarantine_account_directory(
-    home_fd: int, account: AccountId
-) -> str | None:
+def validate_account_directory(
+    home_fd: int, root: str, account: AccountId, *, allowed: set[str]
+) -> None:
     try:
         with (
-            child_directory(home_fd, "accounts") as accounts_fd,
-            child_directory(accounts_fd, account.provider) as provider_fd,
+            child_directory(home_fd, root) as root_fd,
+            child_directory(root_fd, account.provider) as provider_fd,
             child_directory(provider_fd, account.name) as account_fd,
         ):
-            allowed = {"oauth.json", "usage.json", "publish-pending.json"}
             _validate_directory_files(account_fd, allowed)
-            tombstone = f".logout-{uuid.uuid4().hex}"
-            os.rename(account.name, tombstone, src_dir_fd=provider_fd, dst_dir_fd=provider_fd)
-            _fsync_directory(provider_fd)
-            try:
-                with child_directory(provider_fd, tombstone) as tombstone_fd:
-                    _validate_directory_files(tombstone_fd, allowed)
-            except BaseException:
-                os.rename(tombstone, account.name, src_dir_fd=provider_fd, dst_dir_fd=provider_fd)
-                _fsync_directory(provider_fd)
-                raise
-            return tombstone
     except FileNotFoundError:
-        return None
+        return
 
 
-def restore_account_directory(
-    home_fd: int, account: AccountId, tombstone: str
+def remove_account_directory(
+    home_fd: int, root: str, account: AccountId | tuple[str, str], *, allowed: set[str]
 ) -> None:
-    with (
-        child_directory(home_fd, "accounts") as accounts_fd,
-        child_directory(accounts_fd, account.provider) as provider_fd,
-    ):
-        os.rename(tombstone, account.name, src_dir_fd=provider_fd, dst_dir_fd=provider_fd)
-        _fsync_directory(provider_fd)
-
-
-def remove_account_tombstone(
-    home_fd: int, account: AccountId, tombstone: str
-) -> None:
-    with (
-        child_directory(home_fd, "accounts") as accounts_fd,
-        child_directory(accounts_fd, account.provider) as provider_fd,
-        child_directory(provider_fd, tombstone) as account_fd,
-    ):
-        _remove_directory_files(
-            account_fd, {"oauth.json", "usage.json", "publish-pending.json"}
-        )
-        os.rmdir(tombstone, dir_fd=provider_fd)
-        _fsync_directory(provider_fd)
+    provider, name = (
+        (account.provider, account.name)
+        if isinstance(account, AccountId)
+        else account
+    )
+    try:
+        with (
+            child_directory(home_fd, root) as root_fd,
+            child_directory(root_fd, provider) as provider_fd,
+            child_directory(provider_fd, name) as account_fd,
+        ):
+            _remove_directory_files(account_fd, allowed)
+            os.rmdir(name, dir_fd=provider_fd)
+            _fsync_directory(provider_fd)
+    except FileNotFoundError:
+        return
 
 
 def remove_account_lock_directory(
@@ -99,10 +79,9 @@ def remove_account_lock_directory(
             allowed = {"lifecycle.lock", "usage.lock"}
             if remove:
                 _remove_directory_files(account_fd, allowed)
-            else:
-                _validate_directory_files(account_fd, allowed)
-            if remove:
                 os.rmdir(account.name, dir_fd=provider_fd)
                 _fsync_directory(provider_fd)
+            else:
+                _validate_directory_files(account_fd, allowed)
     except FileNotFoundError:
         return
