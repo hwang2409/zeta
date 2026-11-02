@@ -606,7 +606,10 @@ def test_project_inbox_omits_too_deep_unknown_field(tmp_path: Path) -> None:
     record["future_metadata"] = nested
 
     requests = ProjectRequests(
-        home=server.home, runtime=server.runtime, codec=FrameCodec()
+        home=server.home,
+        runtime=server.runtime,
+        codec=FrameCodec(),
+        registry=registry,
     )
     projected = requests._bounded_message("request", record)
 
