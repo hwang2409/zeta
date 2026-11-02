@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import json
 import os
 import shutil
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from ..core.session_files import child_directory, write_session_file
@@ -22,6 +24,7 @@ from ..protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
+    StreamEvent,
     TextContent,
     is_passive_harness_message,
     with_message_origin,
@@ -354,3 +357,128 @@ def attachment_summary(message: Message) -> list[dict[str, object]]:
         for block in message.content
         if isinstance(block, ImageContent)
     ]
+def tool_call(event: StreamEvent) -> dict[str, object] | None:
+    return event.tool_call.to_dict() if event.tool_call is not None else None
+
+
+def data_text(data: Mapping[str, object]) -> str:
+    value = data.get("output", data.get("text", ""))
+    return value if isinstance(value, str) else ""
+
+
+def assistant_message(event: StreamEvent) -> dict[str, object]:
+    if event.message is None:
+        return {}
+    message = event.message.to_dict()
+    message.pop("metadata", None)
+    return {"message": message}
+
+
+def tool_start(event: StreamEvent) -> dict[str, object]:
+    return {"tool_call": tool_call(event), "data": dict(event.data)}
+
+
+def tool_output(event: StreamEvent) -> dict[str, object]:
+    return {
+        "tool_call": tool_call(event),
+        "output": bounded(event.delta or data_text(event.data)),
+        "data": dict(event.data),
+    }
+
+
+def tool_end(event: StreamEvent) -> dict[str, object]:
+    return {
+        "tool_call": tool_call(event),
+        "tool_result": event.tool_result.to_dict() if event.tool_result else None,
+        "data": dict(event.data),
+    }
+
+
+def transcript_row(entry: Any, fields: str = "full") -> dict[str, object] | None:
+    """Project one durable entry; unsupported harness rows are not transcript rows."""
+    if entry.type not in {"message", "notification"}:
+        return None
+    data = entry.data
+    if entry.type == "notification":
+        kind = data.get("kind", "agent_completion")
+        if kind == "task_exited":
+            text = (
+                f"background task {data.get('task_id', '?')} exited "
+                f"({data.get('exit_code')}); {data.get('headline', '')}"
+            )
+        else:
+            text = data.get("text", "background agent notification")
+        display: dict[str, object] = {
+            "role": "system",
+            "content": [{"type": "text", "text": bounded(text, 8000)}],
+            "tool_result": None,
+            "notification": dict(data),
+        }
+    else:
+        message = data["message"]
+        display = {
+            "role": message["role"],
+            "content": _content(message.get("content", [])),
+            "tool_result": _tool_result(message.get("tool_result")),
+        }
+    row: dict[str, object] = {
+        "seq": entry.seq,
+        "entry_id": entry.id,
+        "parent_entry_id": entry.parent_id,
+        "lane": entry.lane,
+        "type": entry.type,
+        "at": None,
+    }
+    if fields == "outline":
+        return row
+    encoded = json.dumps(display, separators=(",", ":"), ensure_ascii=False).encode()
+    if len(encoded) > 4096:
+        row.update({
+            "display": None,
+            "truncated": True,
+            "original_bytes": base64.b64encode(encoded).decode("ascii"),
+            "recall_history": "use recall_history to retrieve the complete row",
+        })
+    else:
+        row["display"] = display
+    return row
+
+
+def _content(blocks: list[Mapping[str, object]]) -> list[dict[str, object]]:
+    content: list[dict[str, object]] = []
+    for block in blocks:
+        kind = block.get("type")
+        if kind == "image":
+            content.append({
+                "type": "attachment",
+                "name": str(block.get("path") or "image").rsplit("/", 1)[-1],
+                "size": block.get("size") or 0,
+            })
+        elif kind == "text":
+            content.append({"type": "text", "text": bounded(block["text"], 8000)})
+        elif kind == "tool_use":
+            call = block["tool_call"]
+            content.append({
+                "type": "tool_use",
+                "tool_call": {"id": call["id"], "name": call["name"], "arguments": {}},
+            })
+        elif kind == "thinking":
+            body = block.get("body")
+            if isinstance(body, str) and body:
+                body = bounded(body, 8000)
+                content.append({"type": "thinking", "text": body, "body": body})
+            else:
+                content.append({"type": "thinking", "text": ""})
+    return content
+
+
+def _tool_result(result: object) -> dict[str, object] | None:
+    if not result:
+        return None
+    value = dict(result)  # type: ignore[arg-type]
+    value.update({
+        "content": bounded(value.get("content", ""), 8000),
+        "content_blocks": [],
+        "structured_content": None,
+    })
+    return value
