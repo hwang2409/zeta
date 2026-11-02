@@ -675,6 +675,175 @@ def test_tui_notification_presentation_is_durable_but_not_consumption(
     assert reopened.agent_notifications() == []
 
 
+def test_installed_hook_emits_after_durable_resident_single_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-single")
+    write_returned = False
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    original_write_bytes = store._write_bytes
+
+    def tracked_write_bytes(data: bytes) -> None:
+        nonlocal write_returned
+        original_write_bytes(data)
+        write_returned = True
+
+    def installed(delta: tuple[ConversationEntry, ...] | str) -> None:
+        assert write_returned
+        assert delta != "reset"
+        assert delta[-1].id in store._entry_ids
+        assert store._entries[-1].id == delta[-1].id
+        durable = json.loads(store.path.read_bytes().splitlines()[-1])
+        assert (durable["seq"], durable["id"]) == (delta[-1].seq, delta[-1].id)
+        observed.append(delta)
+
+    monkeypatch.setattr(store, "_write_bytes", tracked_write_bytes)
+    store.on_entries_installed = installed
+
+    entry = store.append_message(message(MessageRole.ASSISTANT, "installed"))
+
+    assert [[(row.seq, row.id) for row in delta] for delta in observed] == [
+        [(entry.seq, entry.id)]
+    ]
+
+
+def test_installed_hook_emits_batch_in_log_order(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-batch")
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    entries = store.append_many(
+        [("warning", {"message": "one"}), ("warning", {"message": "two"})]
+    )
+
+    assert observed == [tuple(store._entries)]
+    assert [(row.seq, row.id) for row in observed[0]] == [
+        (row.seq, row.id) for row in entries
+    ]
+
+
+@pytest.mark.asyncio
+async def test_installed_hook_async_writer_publishes_on_owner_thread(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-async")
+    owner_thread = threading.get_ident()
+    observed: list[tuple[int, tuple[ConversationEntry, ...] | str]] = []
+    store.on_entries_installed = lambda delta: observed.append(
+        (threading.get_ident(), delta)
+    )
+
+    entry = await store.append_message_async(
+        message(MessageRole.ASSISTANT, "worker")
+    )
+
+    assert observed == [(owner_thread, (store._entries[-1],))]
+    assert observed[0][1][0].id == entry.id
+
+
+def test_installed_hook_incremental_reload_emits_foreign_suffix_once(
+    tmp_path: Path,
+) -> None:
+    resident = ConversationStore(tmp_path, session_id="installed-incremental")
+    foreign = ConversationStore(tmp_path, session_id=resident.session_id)
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    resident.on_entries_installed = observed.append
+
+    first = foreign.append_message(message(MessageRole.ASSISTANT, "one"))
+    second = foreign.append_message(message(MessageRole.ASSISTANT, "two"))
+    resident.refresh()
+    resident.refresh()
+
+    assert [[row.id for row in delta] for delta in observed] == [
+        [first.id, second.id]
+    ]
+
+
+def test_installed_hook_full_prefix_reload_emits_only_suffix(tmp_path: Path) -> None:
+    resident = ConversationStore(tmp_path, session_id="installed-full-prefix")
+    resident.append_message(message(MessageRole.ASSISTANT, "old"))
+    foreign = ConversationStore(tmp_path, session_id=resident.session_id)
+    appended = foreign.append_message(message(MessageRole.ASSISTANT, "new"))
+    replacement = resident.path.with_suffix(".replacement")
+    replacement.write_bytes(resident.path.read_bytes())
+    replacement.replace(resident.path)
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    resident.on_entries_installed = observed.append
+
+    resident.refresh()
+
+    assert [[row.id for row in delta] for delta in observed] == [[appended.id]]
+
+
+def test_installed_hook_non_prefix_reload_emits_reset(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-reset")
+    original = store.append_message(message(MessageRole.ASSISTANT, "old"))
+    rows = store.path.read_text(encoding="utf-8").splitlines()
+    replacement_row = json.loads(rows[1])
+    replacement_row["id"] = "replacement-id"
+    assert replacement_row["id"] != original.id
+    replacement = store.path.with_suffix(".replacement")
+    replacement.write_text(
+        rows[0] + "\n" + json.dumps(replacement_row, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    replacement.replace(store.path)
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    store.refresh()
+
+    assert observed == ["reset"]
+    assert store._entries[-1].id == "replacement-id"
+
+
+def test_installed_hook_fork_keeps_log_order_with_backward_parent(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-fork")
+    checkpoint = store.append_checkpoint("base")
+    store.append_message(message(MessageRole.ASSISTANT, "discarded"))
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    fork = store.append_fork(str(checkpoint.seq))
+
+    assert observed == [(store._entries[-1],)]
+    assert fork.seq > checkpoint.seq
+    assert fork.parent_id == checkpoint.id
+
+
+def test_installed_hook_does_not_access_resident_branch(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-constant-time")
+    entry = store.append_message(message(MessageRole.ASSISTANT, "row"))
+    observed: list[tuple[ConversationEntry, ...] | str] = []
+    store.on_entries_installed = observed.append
+
+    class BranchAccessGuard(list[ConversationEntry]):
+        def __iter__(self):
+            raise AssertionError("installed hook walked the resident branch")
+
+        def __len__(self):
+            raise AssertionError("installed hook measured the resident branch")
+
+        def __getitem__(self, key: object):
+            raise AssertionError("installed hook indexed the resident branch")
+
+    store._entries = BranchAccessGuard(store._entries)
+    store._publish_entries_installed((entry,))
+
+    assert observed == [(entry,)]
+
+
+def test_close_clears_installed_hook(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-close")
+    store.on_entries_installed = lambda _delta: None
+
+    store.close()
+
+    assert store.on_entries_installed is None
+
+
 @pytest.mark.asyncio
 async def test_async_append_runs_off_loop_and_is_durable_on_return(
     tmp_path: Path,
