@@ -9,9 +9,11 @@ store. Reopen the session to force a full load after unsupported external edits.
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import time
 import warnings
@@ -55,6 +57,8 @@ PREFIX_FINGERPRINT_BYTES = 64 * 1024
 MAX_PENDING_APPEND_RECEIPTS = 256
 type InstalledEntriesDelta = tuple[ConversationEntry, ...] | Literal["reset"]
 
+_LOGGER = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class _DetachedLogState:
@@ -63,7 +67,7 @@ class _DetachedLogState:
     cwd: str
     entries: list[ConversationEntry]
     entry_ids: set[str]
-    entry_prefix_digests: list[bytes]
+    entry_prefix_digest: bytes
     active_approval_requests: dict[str, ConversationEntry]
     active_approval_resolutions: dict[str, str]
     active_tool_results: dict[str, ToolResult]
@@ -97,7 +101,7 @@ class ConversationLogMixin:
             cwd=self.cwd,
             entries=self._entries,
             entry_ids=self._entry_ids,
-            entry_prefix_digests=self._entry_prefix_digests,
+            entry_prefix_digest=self._entry_prefix_digest,
             active_approval_requests=self._active_approval_requests,
             active_approval_resolutions=self._active_approval_resolutions,
             active_tool_results=self._active_tool_results,
@@ -130,7 +134,6 @@ class ConversationLogMixin:
             state,
             entries=list(state.entries),
             entry_ids=set(state.entry_ids),
-            entry_prefix_digests=list(state.entry_prefix_digests),
             active_approval_requests=dict(state.active_approval_requests),
             active_approval_resolutions=dict(state.active_approval_resolutions),
             active_tool_results=dict(state.active_tool_results),
@@ -167,31 +170,69 @@ class ConversationLogMixin:
         return hashlib.sha256(previous + identity).digest()
 
     def _record_entry_prefix(self: ConversationStore, entry: ConversationEntry) -> None:
-        previous = self._entry_prefix_digests[-1] if self._entry_prefix_digests else b""
-        self._entry_prefix_digests.append(
-            self._next_entry_prefix_digest(previous, entry)
+        self._entry_prefix_digest = self._next_entry_prefix_digest(
+            self._entry_prefix_digest, entry
         )
+
+    @staticmethod
+    def _owned_installed_delta(
+        delta: InstalledEntriesDelta,
+    ) -> InstalledEntriesDelta:
+        if delta == "reset":
+            return delta
+        return copy.deepcopy(delta)
+
+    def _deliver_entries_installed(
+        self: ConversationStore, delta: InstalledEntriesDelta
+    ) -> None:
+        callback = self.on_entries_installed
+        if not delta or callback is None:
+            return
+        try:
+            callback(delta)
+        except Exception:
+            _LOGGER.exception("installed-row callback failed")
+
+    def _finish_entries_installed(self: ConversationStore) -> None:
+        pending = self._installed_callback_local.pending
+        del self._installed_callback_local.pending
+        for delta in pending:
+            self._deliver_entries_installed(delta)
+
+    def _publish_prepared_entries_installed(
+        self: ConversationStore, delta: InstalledEntriesDelta
+    ) -> None:
+        """Publish an owned delta, deferring it while the session flock is held."""
+        pending = getattr(self._installed_callback_local, "pending", None)
+        if pending is None:
+            self._deliver_entries_installed(delta)
+        elif delta:
+            pending.append(delta)
 
     def _publish_entries_installed(
         self: ConversationStore, delta: InstalledEntriesDelta
     ) -> None:
-        """Publish one prepared resident-install delta without inspecting state."""
-        if delta and self.on_entries_installed is not None:
-            self.on_entries_installed(delta)
+        """Copy and publish only newly installed rows."""
+        if not delta or self.on_entries_installed is None:
+            return
+        self._publish_prepared_entries_installed(self._owned_installed_delta(delta))
 
-    @staticmethod
+    @classmethod
     def _installed_delta_from_baseline(
+        cls,
         entries: list[ConversationEntry],
-        prefix_digests: list[bytes],
         baseline: tuple[int, bytes],
     ) -> InstalledEntriesDelta:
-        """Prepare the exact suffix, or reset when the old log is not a prefix."""
-        count, digest = baseline
-        if count == 0:
-            return tuple(entries)
-        if count <= len(entries) and prefix_digests[count - 1] == digest:
-            return tuple(entries[count:])
-        return "reset"
+        """Prepare an owned suffix, or reset when the old log is not a prefix."""
+        count, expected_digest = baseline
+        if count > len(entries):
+            return "reset"
+        digest = b""
+        for index in range(count):
+            digest = cls._next_entry_prefix_digest(digest, entries[index])
+        if digest != expected_digest:
+            return "reset"
+        return cls._owned_installed_delta(tuple(entries[count:]))
 
     def _install_log_state(
         self: ConversationStore, state: _DetachedLogState
@@ -201,7 +242,7 @@ class ConversationLogMixin:
         self._before_incremental_state_install()
         self.cwd = state.cwd
         self._entry_ids = state.entry_ids
-        self._entry_prefix_digests = state.entry_prefix_digests
+        self._entry_prefix_digest = state.entry_prefix_digest
         self._active_approval_requests = state.active_approval_requests
         self._active_approval_resolutions = state.active_approval_resolutions
         self._active_tool_results = state.active_tool_results
@@ -228,7 +269,6 @@ class ConversationLogMixin:
         # Publish entries last so readers never see rows without matching indexes.
         self._entries = state.entries
         self._transcript_generation += 1
-        self._publish_entries_installed(state.installed_delta)
         return previous
 
     def enable_persisted_append_tracking(self: ConversationStore) -> None:
@@ -327,7 +367,7 @@ class ConversationLogMixin:
                     f"conversation file is missing: {self.path}"
                 )
             self._entries = []
-            self._entry_prefix_digests = []
+            self._entry_prefix_digest = b""
             self._reset_incremental_validation_state()
             self._rebuild_client_deliveries(self._entries)
             header = {
@@ -403,10 +443,7 @@ class ConversationLogMixin:
         self._publish_entries_installed(tuple(entries))
 
     def _load_full(self: ConversationStore) -> None:
-        baseline = (
-            len(self._entries),
-            self._entry_prefix_digests[-1] if self._entry_prefix_digests else b"",
-        )
+        baseline = (len(self._entries), self._entry_prefix_digest)
         raw = read_session_file(self.directory_fd, "conversation.jsonl")
         lines = raw.splitlines(keepends=True)
         valid_rows: list[dict[str, Any]] = []
@@ -455,16 +492,9 @@ class ConversationLogMixin:
                 f"invalid conversation entry: {self.path}"
             ) from exc
         self._validate_entries()
-        self._entry_prefix_digests = []
+        self._entry_prefix_digest = b""
         for entry in self._entries:
-            previous = (
-                self._entry_prefix_digests[-1]
-                if self._entry_prefix_digests
-                else b""
-            )
-            self._entry_prefix_digests.append(
-                self._next_entry_prefix_digest(previous, entry)
-            )
+            self._record_entry_prefix(entry)
         self._task_notification_ids = set()
         for index, entry in enumerate(self._entries):
             if index and index % 64 == 0:
@@ -479,8 +509,10 @@ class ConversationLogMixin:
         self._rebuild_incremental_validation_state()
         self._rebuild_client_deliveries(self._entries)
 
-        delta = self._installed_delta_from_baseline(
-            self._entries, self._entry_prefix_digests, baseline
+        delta = (
+            self._installed_delta_from_baseline(self._entries, baseline)
+            if self.on_entries_installed is not None
+            else ()
         )
         if torn_offset is not None:
             self._repair_torn_tail(torn_offset)

@@ -59,7 +59,7 @@ class IncrementalValidationMixin:
         staged = copy.copy(self)
         staged._entries = list(self._entries)
         staged._entry_ids = set(self._entry_ids)
-        staged._entry_prefix_digests = list(self._entry_prefix_digests)
+        staged._entry_prefix_digest = self._entry_prefix_digest
         staged._active_approval_requests = dict(self._active_approval_requests)
         staged._active_approval_resolutions = dict(self._active_approval_resolutions)
         staged._active_tool_results = dict(self._active_tool_results)
@@ -95,7 +95,7 @@ class IncrementalValidationMixin:
 
         self._before_incremental_state_install()
         self._entry_ids = staged._entry_ids
-        self._entry_prefix_digests = staged._entry_prefix_digests
+        self._entry_prefix_digest = staged._entry_prefix_digest
         self._active_approval_requests = staged._active_approval_requests
         self._active_approval_resolutions = staged._active_approval_resolutions
         self._active_tool_results = staged._active_tool_results

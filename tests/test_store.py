@@ -706,6 +706,76 @@ def test_installed_hook_emits_after_durable_resident_single_append(
     ]
 
 
+def test_installed_hook_failure_does_not_fail_committed_append(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-failure")
+
+    def fail(_delta: tuple[ConversationEntry, ...] | str) -> None:
+        raise RuntimeError("observer failed")
+
+    store.on_entries_installed = fail
+
+    entry = store.append_message(message(MessageRole.ASSISTANT, "committed"))
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    assert store._entries[-1].id == entry.id
+    assert reopened._entries[-1] == entry
+    assert [record.getMessage() for record in caplog.records].count(
+        "installed-row callback failed"
+    ) == 1
+
+
+def test_installed_hook_receives_owned_delta(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-owned")
+
+    def mutate(delta: tuple[ConversationEntry, ...] | str) -> None:
+        assert delta != "reset"
+        delta[0].data["message"]["content"][0]["text"] = "corrupted"
+
+    store.on_entries_installed = mutate
+
+    entry = store.append_message(message(MessageRole.ASSISTANT, "original"))
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    assert entry.data["message"]["content"][0]["text"] == "original"
+    assert store._entries[-1].data["message"]["content"][0]["text"] == "original"
+    assert reopened._entries[-1].data["message"]["content"][0]["text"] == "original"
+
+
+def test_installed_hook_runs_after_flock_and_can_reenter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-reentrant")
+    gate = threading.Lock()
+    real_flock = __import__("fcntl").flock
+
+    def gated_flock(fd: int, operation: int) -> None:
+        if operation & __import__("fcntl").LOCK_UN:
+            real_flock(fd, operation)
+            gate.release()
+            return
+        assert gate.acquire(blocking=False), "callback re-entered before flock release"
+        real_flock(fd, operation)
+
+    monkeypatch.setattr("zeta.core.store._store.fcntl.flock", gated_flock)
+    observed: list[str] = []
+
+    def reenter(_delta: tuple[ConversationEntry, ...] | str) -> None:
+        store.on_entries_installed = None
+        observed.append(store.append_message(message(MessageRole.ASSISTANT, "inner")).id)
+
+    store.on_entries_installed = reenter
+
+    outer = store.append_message(message(MessageRole.ASSISTANT, "outer"))
+
+    assert outer.id != observed[0]
+    assert [row.data["message"]["content"][0]["text"] for row in store._entries] == [
+        "outer",
+        "inner",
+    ]
+
+
 def test_installed_hook_emits_batch_in_log_order(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="installed-batch")
     observed: list[tuple[ConversationEntry, ...] | str] = []
@@ -719,25 +789,74 @@ def test_installed_hook_emits_batch_in_log_order(tmp_path: Path) -> None:
     assert [(row.seq, row.id) for row in observed[0]] == [
         (row.seq, row.id) for row in entries
     ]
+    assert type(store._entry_prefix_digest) is bytes
+    assert len(store._entry_prefix_digest) == 32
+
+
+@pytest.mark.asyncio
+async def test_installed_hook_async_failure_keeps_receipt_bookkeeping(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-async-failure")
+    receipts_accepted = False
+    original_accept = store._accept_persisted_appends
+
+    def accept(receipts: object) -> None:
+        nonlocal receipts_accepted
+        original_accept(receipts)
+        receipts_accepted = True
+
+    def fail(_delta: tuple[ConversationEntry, ...] | str) -> None:
+        assert receipts_accepted
+        raise RuntimeError("observer failed")
+
+    monkeypatch.setattr(store, "_accept_persisted_appends", accept)
+    store.on_entries_installed = fail
+
+    entry = await store.append_message_async(message(MessageRole.ASSISTANT, "committed"))
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    assert receipts_accepted
+    assert store._entries[-1].id == entry.id
+    assert reopened._entries[-1] == entry
+    assert [record.getMessage() for record in caplog.records].count(
+        "installed-row callback failed"
+    ) == 1
 
 
 @pytest.mark.asyncio
 async def test_installed_hook_async_writer_publishes_on_owner_thread(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path, session_id="installed-async")
     owner_thread = threading.get_ident()
+    copy_threads: list[int] = []
     observed: list[tuple[int, tuple[ConversationEntry, ...] | str]] = []
-    store.on_entries_installed = lambda delta: observed.append(
-        (threading.get_ident(), delta)
-    )
+    original_copy = store._owned_installed_delta
+
+    def tracked_copy(
+        delta: tuple[ConversationEntry, ...] | str,
+    ) -> tuple[ConversationEntry, ...] | str:
+        copy_threads.append(threading.get_ident())
+        return original_copy(delta)
+
+    def installed(delta: tuple[ConversationEntry, ...] | str) -> None:
+        observed.append((threading.get_ident(), delta))
+        assert delta != "reset"
+        delta[0].data["message"]["content"][0]["text"] = "corrupted"
+
+    monkeypatch.setattr(type(store), "_owned_installed_delta", staticmethod(tracked_copy))
+    store.on_entries_installed = installed
 
     entry = await store.append_message_async(
         message(MessageRole.ASSISTANT, "worker")
     )
 
-    assert observed == [(owner_thread, (store._entries[-1],))]
+    assert copy_threads
+    assert owner_thread not in copy_threads
+    assert observed[0][0] == owner_thread
     assert observed[0][1][0].id == entry.id
+    assert store._entries[-1].data["message"]["content"][0]["text"] == "worker"
 
 
 def test_installed_hook_incremental_reload_emits_foreign_suffix_once(

@@ -7,6 +7,7 @@ import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
 import math  # noqa: F401 - re-exported by the compatibility store facade
 import os
+import threading
 import time
 import uuid
 import warnings  # noqa: F401 - re-exported by the compatibility store facade
@@ -106,6 +107,7 @@ class ConversationStore(
         self.session_id = uuid.uuid4().hex if session_id is None else session_id
         self.on_persisted_activity: Callable[[int], None] | None = None
         self.on_entries_installed: Callable[[InstalledEntriesDelta], None] | None = None
+        self._installed_callback_local = threading.local()
         session_path = Path(self.session_id)
         if (
             not self.session_id
@@ -149,7 +151,7 @@ class ConversationStore(
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
-        self._entry_prefix_digests: list[bytes] = []
+        self._entry_prefix_digest = b""
         self._initialize_client_delivery_lifecycle()
         self._collect_persisted_appends = _collect_persisted_appends
         self._persisted_appends: list[PersistedAppend] = []
@@ -627,10 +629,12 @@ class ConversationStore(
                         time.sleep(max(0, min(0.01, deadline - time.monotonic())))
                     else:
                         break
+            self._installed_callback_local.pending = []
             try:
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                self._finish_entries_installed()
 
     @staticmethod
     def _validate_notification_write(entry_type: str, data: Mapping[str, Any]) -> None:
