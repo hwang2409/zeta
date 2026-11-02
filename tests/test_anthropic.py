@@ -2945,7 +2945,12 @@ async def test_eof_message_delta_is_typed(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_two_turn_replay_omits_empty_salvaged_text_block(tmp_path: Path) -> None:
+async def test_early_eof_retry_omits_empty_salvaged_text_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+    )
     truncated = (
         'data: {"type":"message_start","message":{}}\n\n'
         'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n'
@@ -2974,15 +2979,18 @@ async def test_two_turn_replay_omits_empty_salvaged_text_block(tmp_path: Path) -
 skill_catalog=SkillCatalog.empty(),
     )
 
-    [event async for event in loop.run_turn("first", origin=MessageOrigin.USER)]
-    [event async for event in loop.run_turn("second", origin=MessageOrigin.USER)]
+    events = [
+        event async for event in loop.run_turn("first", origin=MessageOrigin.USER)
+    ]
 
     assert len(requests) == 2
+    assert any(event.type is StreamEventType.RETRY for event in events)
+    assert any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
     assert all(
         message != {"role": "assistant", "content": []}
         for message in requests[1]["messages"]
     )
-    assert requests[1]["messages"][-1]["content"][-1]["text"] == "second"
+    assert requests[1]["messages"][-1]["content"][-1]["text"] == "first"
     await client.aclose()
 
 

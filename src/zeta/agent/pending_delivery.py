@@ -6,7 +6,14 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -31,12 +38,25 @@ from ..core.store._step_delivery import (
     TerminalIntent,
     validate_delivery_input,
 )
-from ..protocol.types import ErrorInfo, Message, MessageOrigin
+from ..protocol.types import ErrorInfo, Message, MessageOrigin, StreamEvent
 from ._delivery_notifications import (
     _message_notification_ids,
     _select_notification_delivery,
 )
 from .conversation_channel import ConversationChannel, has_follow_up_loop
+
+
+async def complete_delivery(
+    publications: object | None,
+    acknowledge: Callable[[], Awaitable[object]] | None,
+    publication_events: Callable[[object], Iterator[StreamEvent]] | None,
+) -> AsyncIterator[StreamEvent]:
+    if publications is not None and publication_events is not None:
+        for event in publication_events(publications):
+            yield event
+    if acknowledge is not None:
+        await acknowledge()
+
 
 if TYPE_CHECKING:
     from ..core.context import ContextAssembler

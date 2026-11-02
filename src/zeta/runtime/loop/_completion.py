@@ -37,31 +37,11 @@ if TYPE_CHECKING:
     from ...core.store._client_delivery import ClientSteeringBatch
 
 MAX_ERROR_MESSAGE = 400
-_PROVIDER_EVIDENCE_EVENTS = {
-    StreamEventType.MESSAGE_START,
-    StreamEventType.MESSAGE_UPDATE,
-    StreamEventType.MESSAGE_END,
-}
-
-
-async def _complete_delivery(
-    publications: object | None,
-    acknowledge_delivery: Callable[[], Awaitable[object]] | None,
-    publication_events: Callable[[object], Iterator[StreamEvent]] | None,
-) -> AsyncIterator[StreamEvent]:
-    if publications is not None and publication_events is not None:
-        for publication in publication_events(publications):
-            yield publication
-    if acknowledge_delivery is not None:
-        await acknowledge_delivery()
 
 
 async def provider_events(
     completion: AsyncIterator[StreamEvent],
     on_started: Callable[[], Awaitable[None]] | None = None,
-    delivery_publications: object | None = None,
-    acknowledge_delivery: Callable[[], Awaitable[object]] | None = None,
-    publication_events: Callable[[object], Iterator[StreamEvent]] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """Preserve stream ordering while exposing the provider-start seam."""
 
@@ -91,17 +71,8 @@ async def provider_events(
                 raise error
         if on_started is not None:
             await on_started()
-        first_provider_event = True
         while (event := await events.get()) is not finished:
             assert isinstance(event, StreamEvent)
-            if first_provider_event and event.type in _PROVIDER_EVIDENCE_EVENTS:
-                first_provider_event = False
-                async for publication in _complete_delivery(
-                    delivery_publications,
-                    acknowledge_delivery,
-                    publication_events,
-                ):
-                    yield publication
             try:
                 yield event
             finally:
@@ -117,29 +88,15 @@ def observed_completion(
     completion: AsyncIterator[StreamEvent],
     store: ConversationStore,
     steering: ClientSteeringBatch | None,
-    delivery_publications: object | None,
-    acknowledge_delivery: Callable[[], Awaitable[object]] | None,
-    publication_events: Callable[[object], Iterator[StreamEvent]] | None = None,
 ) -> AsyncIterator[StreamEvent]:
-    """Attach steering delivery and pending-prompt acknowledgement to a stream.
+    """Publish steering when the provider starts without changing event order."""
 
-    Steering is published when the provider starts. A pending prompt is
-    acknowledged only after the first provider event, so retries and cancels
-    before that point leave it pending.
-    """
-
-    if steering is None and acknowledge_delivery is None:
+    if steering is None:
         return completion
     on_started = (
         partial(store.deliver_client_steering, steering) if steering is not None else None
     )
-    return provider_events(
-        completion,
-        on_started,
-        delivery_publications,
-        acknowledge_delivery,
-        publication_events,
-    )
+    return provider_events(completion, on_started)
 
 
 def _is_permission_error(error: BaseException) -> bool:
