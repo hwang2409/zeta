@@ -5,6 +5,7 @@ import json
 import random
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +16,7 @@ from zeta.project_registry import ProjectRegistry
 from zeta.server import ZetaServer
 from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
+from zeta.server.server import _Client
 
 
 def _server(tmp_path: Path) -> ZetaServer:
@@ -98,6 +100,32 @@ async def test_project_requests_run_registry_reads_off_event_loop(
         await _close(server, writer)
     assert {kind for kind, _thread in calls} >= {"list", "memory", "inbox"}
     assert all(thread != event_loop_thread for _kind, thread in calls)
+
+
+@pytest.mark.asyncio
+async def test_project_dispatch_does_not_block_other_requests() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_dispatch(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        entered.set()
+        release.wait(1)
+        return {}
+
+    client = object.__new__(_Client)
+    client.handshaken = True
+    client.features = frozenset({"projects", "ping"})
+    client.projects = SimpleNamespace(dispatch=blocked_dispatch)
+    project_read = asyncio.create_task(client._dispatch(1, "list_projects", {}))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert await asyncio.wait_for(client._dispatch(2, "ping", {}), timeout=0.5) == {
+            "pong": True
+        }
+    finally:
+        release.set()
+        await project_read
 
 
 @pytest.mark.asyncio
