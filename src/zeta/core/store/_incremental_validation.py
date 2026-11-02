@@ -151,14 +151,7 @@ class IncrementalValidationMixin:
             self._validate_fork_entry(entry)
         self._record_active_entry(entry)
         self._entries.append(entry)
-        previous_digest = (
-            self._entry_prefix_digests[-1]
-            if self._entry_prefix_digests
-            else b""
-        )
-        self._entry_prefix_digests.append(
-            self._next_entry_prefix_digest(previous_digest, entry)
-        )
+        self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
         if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
             task_id = entry.data.get("task_id")

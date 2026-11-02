@@ -640,11 +640,6 @@ class ConversationStore(
         if kind not in NOTIFICATION_KINDS:
             raise ValueError(f"unknown notification kind: {kind!r}")
 
-    def _publish_entries_installed(self, delta: InstalledEntriesDelta) -> None:
-        """Publish one prepared resident-install delta without inspecting state."""
-        if delta and self.on_entries_installed is not None:
-            self.on_entries_installed(delta)
-
     def _append_row(
         self,
         entry_type: str,
@@ -712,14 +707,7 @@ class ConversationStore(
         self._write_bytes(encoded)
         for entry in entries:
             self._entries.append(entry)
-            previous_digest = (
-                self._entry_prefix_digests[-1]
-                if self._entry_prefix_digests
-                else b""
-            )
-            self._entry_prefix_digests.append(
-                self._next_entry_prefix_digest(previous_digest, entry)
-            )
+            self._record_entry_prefix(entry)
             self._entry_ids.add(entry.id)
             self._record_active_entry(entry)
             if (
@@ -775,14 +763,7 @@ class ConversationStore(
             self._write_deadline = previous_deadline
         linear = not self._entries or entry.parent_id == self._entries[-1].id
         self._entries.append(entry)
-        previous_digest = (
-            self._entry_prefix_digests[-1]
-            if self._entry_prefix_digests
-            else b""
-        )
-        self._entry_prefix_digests.append(
-            self._next_entry_prefix_digest(previous_digest, entry)
-        )
+        self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
         if linear:
             self._record_active_entry(entry)

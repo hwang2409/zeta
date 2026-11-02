@@ -165,6 +165,19 @@ class ConversationLogMixin:
         )
         return hashlib.sha256(previous + identity).digest()
 
+    def _record_entry_prefix(self: ConversationStore, entry: ConversationEntry) -> None:
+        previous = self._entry_prefix_digests[-1] if self._entry_prefix_digests else b""
+        self._entry_prefix_digests.append(
+            self._next_entry_prefix_digest(previous, entry)
+        )
+
+    def _publish_entries_installed(
+        self: ConversationStore, delta: InstalledEntriesDelta
+    ) -> None:
+        """Publish one prepared resident-install delta without inspecting state."""
+        if delta and self.on_entries_installed is not None:
+            self.on_entries_installed(delta)
+
     @staticmethod
     def _installed_delta_from_baseline(
         entries: list[ConversationEntry],
