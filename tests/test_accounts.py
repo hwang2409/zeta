@@ -9,12 +9,15 @@ import multiprocessing
 import os
 import stat
 import threading
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import httpx
 import pytest
+from rich.console import Console
+from rich.text import Text
 
 import zeta.accounts.store as account_store
 import zeta.cli.main as cli_main
@@ -54,6 +57,7 @@ from zeta.tools import websearch
 from zeta.tools.websearch import codex as websearch_codex
 from zeta.tui import bootstrap as tui_bootstrap
 from zeta.tui import models as tui_models
+from zeta.tui.app import TUIApp
 
 _SENTINEL = "token-text-must-not-escape"
 
@@ -63,6 +67,17 @@ def _hold_lifecycle_lock(
     release: multiprocessing.synchronize.Event,
 ) -> None:
     with AccountStore(home).lifecycle_guard(account):
+        ready.set()
+        release.wait()
+
+
+def _hold_registry_lock(
+    home: str,
+    ready: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+) -> None:
+    store = AccountStore(home)
+    with store._home() as home_fd, store._registry_guard(home_fd):
         ready.set()
         release.wait()
 
@@ -127,6 +142,89 @@ def test_turn_credential_access_times_out_when_another_process_holds_lock(
         holder.close()
         result.close()
         result.join_thread()
+
+
+@pytest.mark.asyncio
+async def test_access_token_times_out_when_another_process_holds_registry_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    await asyncio.to_thread(credential.save, tokens())
+    monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_registry_lock,
+        args=(str(tmp_path), ready, release),
+    )
+    holder.start()
+    try:
+        assert ready.wait(timeout=5)
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(AccountCredentialLockTimeoutError):
+                await asyncio.wait_for(credential.access_token(client), timeout=1)
+    finally:
+        release.set()
+        holder.join(timeout=5)
+        if holder.is_alive():
+            holder.kill()
+            holder.join(timeout=5)
+        holder.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_lock_timeout_reaches_tui_turn_error_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    await asyncio.to_thread(credential.save, tokens())
+    monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
+
+    class TurnSetupBackend:
+        async def complete(self, _messages, _tool_schemas):
+            async with httpx.AsyncClient() as client:
+                await credential.access_token(client)
+            if False:
+                yield
+
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(TurnSetupBackend(), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="gpt-5.4",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered: list[object] = []
+    app._print = rendered.append
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_registry_lock,
+        args=(str(tmp_path), ready, release),
+    )
+    holder.start()
+    try:
+        assert ready.wait(timeout=5)
+        await asyncio.wait_for(app._consume_turn("hello"), timeout=1)
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=100)
+        for item in rendered:
+            console.print(item)
+        plain = Text.from_ansi(output.getvalue()).plain
+        assert "account busy · account_lock_timeout" in plain
+        assert "retry: ctrl+y" in plain
+    finally:
+        release.set()
+        holder.join(timeout=5)
+        if holder.is_alive():
+            holder.kill()
+            holder.join(timeout=5)
+        holder.close()
+        store.close()
 
 
 @pytest.mark.asyncio

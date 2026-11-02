@@ -276,7 +276,9 @@ class AccountStore:
             return AccountId(*value.split(":", 1)) if value else None
 
     def contains(self, account: AccountId) -> bool:
-        with self._home() as home_fd, self._registry_guard(home_fd):
+        with self.credential_guard(
+            account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+        ) as home_fd:
             return str(account) in self._read_registry(home_fd)["accounts"]
 
     def set_default(self, account: AccountId) -> None:

@@ -71,6 +71,19 @@ from zeta.skills.agent_catalog import AgentCatalog
 TIMEOUT = 3
 
 
+def _hold_registry_lock_after_start(
+    home: str,
+    start: multiprocessing.synchronize.Event,
+    ready: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+) -> None:
+    assert start.wait(timeout=5)
+    store = AccountStore(home)
+    with store._home() as home_fd, store._registry_guard(home_fd):
+        ready.set()
+        release.wait()
+
+
 def test_every_durable_notification_kind_has_an_explicit_wire_event() -> None:
     assert NOTIFICATION_KINDS
     assert set(NOTIFICATION_WIRE_EVENTS) == set(NOTIFICATION_KINDS)
@@ -4449,40 +4462,61 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
 async def test_account_lock_timeout_reaches_serve_with_retryable_code(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zeta.accounts import AccountCredentialLockTimeoutError
+    import zeta.accounts.store as account_store
 
+    account = AccountId("codex", "work")
+    await asyncio.to_thread(
+        named_account_credentials(tmp_path, "codex", "work").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
+    )
+    await asyncio.to_thread(AccountStore(tmp_path).set_default, account)
+    monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
     server = ZetaServer(
         home=tmp_path,
         port=0,
-        provider="codex",
-        model="gpt-5.6-luna",
+        provider="claude",
+        model="claude-sonnet-4-6",
         backend_factory=lambda _provider, model, _home: (
             FakeBackend([]),
-            model or "gpt-5.6-luna",
+            model or "claude-sonnet-4-6",
         ),
     )
     reader, writer = await _connect(server)
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_registry_lock_after_start,
+        args=(str(tmp_path), start, ready, release),
+    )
+    holder.start()
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
+        original_resolve = AccountStore.resolve_account
 
-        async def locked(*_args, **_kwargs):
-            raise AccountCredentialLockTimeoutError(AccountId("codex", "work"))
+        def resolve_then_lock(store, provider, selected=None):
+            resolved = original_resolve(store, provider, selected)
+            start.set()
+            assert ready.wait(timeout=5)
+            return resolved
 
-        monkeypatch.setattr(
-            account_session_module.SessionAccountContext, "switch_model", locked
-        )
+        monkeypatch.setattr(AccountStore, "resolve_account", resolve_then_lock)
         response = (
-            await _request(
-                reader,
-                writer,
-                3,
-                "set_settings",
-                {
-                    "session_id": server.runtime.session_id,
-                    "model": "gpt-5.4",
-                    "approval_mode": "ask",
-                },
+            await asyncio.wait_for(
+                _request(
+                    reader,
+                    writer,
+                    3,
+                    "set_settings",
+                    {
+                        "session_id": server.runtime.session_id,
+                        "model": "gpt-5.4",
+                        "approval_mode": "ask",
+                    },
+                ),
+                timeout=1,
             )
         )[-1]
         assert response["error"] == {
@@ -4494,6 +4528,12 @@ async def test_account_lock_timeout_reaches_serve_with_retryable_code(
             "data": {"code": "account_lock_timeout", "retryable": True},
         }
     finally:
+        release.set()
+        holder.join(timeout=5)
+        if holder.is_alive():
+            holder.kill()
+            holder.join(timeout=5)
+        holder.close()
         await _close(server, writer)
 
 
@@ -6649,15 +6689,15 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
     holder = threading.Thread(target=hold_registry_lock)
     holder.start()
     assert await asyncio.to_thread(locked.wait, 1)
-    original_registry_guard = AccountStore._registry_guard
+    original_credential_guard = AccountStore.credential_guard
 
     @contextmanager
-    def observed_registry_guard(store, home_fd):
+    def observed_credential_guard(store, account, **kwargs):
         waiting.set()
-        with original_registry_guard(store, home_fd):
-            yield
+        with original_credential_guard(store, account, **kwargs) as home_fd:
+            yield home_fd
 
-    monkeypatch.setattr(AccountStore, "_registry_guard", observed_registry_guard)
+    monkeypatch.setattr(AccountStore, "credential_guard", observed_credential_guard)
     ticks = 0
     stop = asyncio.Event()
 
