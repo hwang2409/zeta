@@ -744,8 +744,8 @@ async def test_vips_path_converts_display_p3_to_srgb_and_preserves_untagged(
 
     tagged = await read(tagged_path)
     untagged = await read(untagged_path)
-    assert all(abs(actual - wanted) <= 8 for actual, wanted in zip(tagged.getpixel((100, 50)), expected))
-    assert all(abs(actual - wanted) <= 8 for actual, wanted in zip(untagged.getpixel((100, 50)), (220, 80, 20)))
+    assert all(abs(actual - wanted) <= 8 for actual, wanted in zip(tagged.getpixel((tagged.width // 2, tagged.height // 2)), expected))
+    assert all(abs(actual - wanted) <= 8 for actual, wanted in zip(untagged.getpixel((untagged.width // 2, untagged.height // 2)), (220, 80, 20)))
 
 
 @pytest.mark.asyncio
@@ -787,8 +787,8 @@ async def test_read_large_image_downscales_not_errors(tmp_path: Path) -> None:
         "format": "jpeg",
     }
     assert details["sent"]["bytes"] <= ANTHROPIC_IMAGE_POLICY.max_raw_bytes("image/jpeg")
-    assert details["sent"]["width"] <= 8000
-    assert details["sent"]["height"] <= 8000
+    assert details["sent"]["width"] <= ANTHROPIC_IMAGE_POLICY.max_dimension
+    assert details["sent"]["height"] <= ANTHROPIC_IMAGE_POLICY.max_dimension
     assert details["original_path"] == str(path)
     assert details["original_unchanged"] is True
     assert path.read_bytes() == original
@@ -797,7 +797,7 @@ async def test_read_large_image_downscales_not_errors(tmp_path: Path) -> None:
 def test_image_limits_match_provider_documentation() -> None:
     assert ANTHROPIC_IMAGE_POLICY.max_wire_size == 10_000_000
     assert ANTHROPIC_IMAGE_POLICY.wire_limit_unit is WireLimitUnit.BASE64_CHARACTERS
-    assert ANTHROPIC_IMAGE_POLICY.max_dimension == 8000
+    assert ANTHROPIC_IMAGE_POLICY.max_dimension == 2000
     assert CODEX_IMAGE_POLICY.max_wire_size == OPENAI_IMAGE_URL_MAX_LENGTH
     assert CODEX_IMAGE_POLICY.wire_limit_unit is WireLimitUnit.DATA_URL_CHARACTERS
     assert CODEX_IMAGE_POLICY.max_dimension is None
@@ -876,7 +876,7 @@ async def test_read_transparent_png_large(tmp_path: Path) -> None:
     with Image.open(io.BytesIO(sent)) as normalized:
         assert normalized.mode == "RGBA"
         assert "A" in normalized.getbands()
-        assert max(normalized.size) <= 8000
+        assert max(normalized.size) <= ANTHROPIC_IMAGE_POLICY.max_dimension
     assert path.read_bytes() == original
 
 
@@ -896,7 +896,7 @@ async def test_read_huge_dimension_image_bounded_memory(tmp_path: Path) -> None:
     assert max(
         result["structuredContent"]["sent"]["width"],
         result["structuredContent"]["sent"]["height"],
-    ) <= 8000
+    ) <= ANTHROPIC_IMAGE_POLICY.max_dimension
 
 
 @pytest.mark.asyncio
@@ -1182,8 +1182,10 @@ async def test_exif_orientation_is_applied_before_sizing(tmp_path: Path) -> None
     )
 
     assert result["isError"] is False
-    assert result["structuredContent"]["sent"]["height"] == 8000
-    assert result["structuredContent"]["sent"]["width"] < 100
+    sent = result["structuredContent"]["sent"]
+    # Rotated to portrait before sizing: the long side is the height.
+    assert 0.9 * ANTHROPIC_IMAGE_POLICY.max_dimension <= sent["height"] <= ANTHROPIC_IMAGE_POLICY.max_dimension
+    assert sent["width"] < 100
 
 
 @pytest.mark.asyncio

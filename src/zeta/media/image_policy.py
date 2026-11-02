@@ -57,13 +57,16 @@ class ImagePolicy:
 
 _FORMATS = frozenset({"jpeg", "png", "gif", "webp"})
 
-# The direct Claude API accepts 10 MB of base64 text per image and dimensions
-# up to 8000x8000. Bedrock and Vertex use a separate 5 MB policy; Zeta's
+# The direct Claude API accepts 10 MB of base64 text per image. Sides may be
+# up to 8000 px for one image, but a request with many images rejects any
+# side above the many-image limit (documented as 2000 px), and a long session
+# always has many images. Claude downscales above ~1568 px anyway, so 2000 px
+# loses nothing. Bedrock and Vertex use a separate 5 MB policy; Zeta's
 # Anthropic adapter calls api.anthropic.com directly.
 ANTHROPIC_IMAGE_POLICY = ImagePolicy(
     10_000_000,
     WireLimitUnit.BASE64_CHARACTERS,
-    8_000,
+    2_000,
     _FORMATS,
     AnimationPolicy.FIRST_FRAME,
 )
