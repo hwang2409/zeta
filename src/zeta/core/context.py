@@ -36,9 +36,11 @@ from ..context_eviction import (
     TARGET_RATIO,
     evict_messages,
     eviction_view,
+    invalid_eviction_markers,
     normalize_evicted_tool_result,
     valid_eviction_view,
 )
+from ..context_eviction import _fact_floor
 from ..compaction import (
     CompactionPolicy,
     SUMMARY_SOURCE_TOKEN_LIMIT,
@@ -684,6 +686,7 @@ class ContextAssembler:
                         kind=EVICTION_KIND,
                         view=list(plan.view),
                         telemetry=dict(plan.telemetry or {}),
+                        fact_floor=plan.fact_floor,
                     )
                 except ValueError:
                     stale = True
@@ -740,11 +743,7 @@ class ContextAssembler:
         eviction_markers = [
             m for m in active_markers if m.data.get("kind") == EVICTION_KIND
         ]
-        invalid_markers = [
-            marker
-            for marker in eviction_markers
-            if not valid_eviction_view(marker, active_source_seqs)
-        ]
+        invalid_markers, invalid_floor_markers = invalid_eviction_markers(eviction_markers, active_source_seqs)
         if invalid_markers:
             bypass_hysteresis = True
         previous_ends = [m.data["source_seq_end"] for m in eviction_markers]
@@ -792,16 +791,22 @@ class ContextAssembler:
                 ]
             )
         )
-        records = [
-            (int(i.message.metadata.get("source_seq", i.entry.seq)), i.message)
-            for i in candidates
-            if i.entry is not None
-        ]
+        previous_floor = _fact_floor.previous_fact_floor(eviction_markers, invalid_markers)
+        record_rows = (
+            (int(item.message.metadata.get("source_seq", item.entry.seq)), item.message)
+            for item in candidates if item.entry is not None
+        )
         source_messages = {
             entry.seq: Message.from_dict(entry.data["message"])
             for entry in branch
             if entry.type == "message"
         }
+        floor_rebuild = _fact_floor.floor_rebuild_records(
+            invalid_floor_markers, source_messages
+        )
+        records, floor_plan = _fact_floor.prepare_records(
+            record_rows, previous_floor, floor_rebuild_records=floor_rebuild
+        )
         latest_assistant_seq = self._latest_persisted_assistant_entry_seq(items)
         unconsumed = {
             int(i.message.metadata.get("source_seq", i.entry.seq))
@@ -821,17 +826,19 @@ class ContextAssembler:
         result = evict_messages(
             records,
             fixed_tokens=self._count(fixed),
-            target_tokens=min(
-                assembly_budget,
-                self._request_budget.target_budget(
-                    emergency=target_ratio == EMERGENCY_TARGET_RATIO
-                ),
+            target_tokens=floor_plan.target(
+                min(
+                    assembly_budget,
+                    self._request_budget.target_budget(
+                        emergency=target_ratio == EMERGENCY_TARGET_RATIO
+                    ),
+                )
             ),
             token_counter=self.token_counter,
             unconsumed_source_seqs=unconsumed,
             source_messages=source_messages,
         )
-        if not result.items_evicted:
+        if not result.items_evicted and not invalid_floor_markers:
             return (
                 self._plan_reuse_eviction(branch, system_messages, assembly_budget)
                 if eviction_markers
@@ -839,11 +846,11 @@ class ContextAssembler:
             )
         view = eviction_view(records, result)
         view_messages = self._eviction_view_messages(view)
-        proposed = [
-            *system_messages,
-            *view_messages,
-            *([] if latest_user_item is None else [latest_user_item.message]),
-        ]
+        proposed = floor_plan.proposed_messages(
+            system_messages,
+            view_messages,
+            None if latest_user_item is None else latest_user_item.message,
+        )
         result_seqs = {
             id(m): int(m.metadata["source_seq"])
             for m in view_messages
@@ -853,13 +860,7 @@ class ContextAssembler:
         if truncated is None:
             return _EvictionPlan("none-fallback")
         context = self._context(truncated, True)
-        telemetry = {
-            "kind": EVICTION_KIND,
-            "eviction_count": 1,
-            "items_evicted": result.items_evicted,
-            "tokens_before": result.tokens_before,
-            "tokens_after": context.token_count,
-        }
+        telemetry = floor_plan.telemetry(result, context.token_count, self.token_counter)
         return _EvictionPlan(
             "marker",
             context,
@@ -869,6 +870,7 @@ class ContextAssembler:
             None if latest_user_item is None else latest_user_item.message,
             tuple(view),
             telemetry,
+            floor_plan.floor,
         )
 
     def _plan_reuse_eviction(
@@ -1133,6 +1135,7 @@ class ContextAssembler:
             valid = valid_eviction_view(entry, active_source_seqs)
             if valid:
                 messages = ContextAssembler._eviction_view_messages(view)
+                messages.extend(_fact_floor.projected_fact_floor(entry.data.get("fact_floor")))
             else:
                 messages = [
                     normalize_evicted_tool_result(

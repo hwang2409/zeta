@@ -20,6 +20,7 @@ from ..protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from ._fact_floor import validate_fact_floor
 from .receipt_constructors import (
     RECEIPT_KIND_METADATA as RECEIPT_KIND_METADATA,
 )
@@ -507,6 +508,27 @@ def valid_eviction_view(
             for seq in seqs
         )
     )
+
+
+def invalid_eviction_markers(
+    markers: Sequence[ConversationEntry], active_source_seqs: Collection[int]
+) -> tuple[list[ConversationEntry], list[ConversationEntry]]:
+    """Separate invalid views from valid views with invalid fact floors."""
+
+    invalid_floors = [
+        marker
+        for marker in markers
+        if valid_eviction_view(marker, active_source_seqs)
+        and marker.data.get("fact_floor") is not None
+        and not validate_fact_floor(marker.data["fact_floor"])
+    ]
+    invalid = [
+        marker
+        for marker in markers
+        if not valid_eviction_view(marker, active_source_seqs)
+        or marker in invalid_floors
+    ]
+    return invalid, invalid_floors
 
 
 def eviction_view(
