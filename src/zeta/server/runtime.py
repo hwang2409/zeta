@@ -345,6 +345,32 @@ class ServerRuntime:
         """
 
         session_cwd = cwd if cwd is not None else self.cwd
+        prepared = await asyncio.to_thread(
+            self._prepare_new_session, session_cwd, provider, model
+        )
+        config = prepared[0]
+        skill_catalog = prepared[1]
+        agent_catalog = prepared[2]
+        context = prepared[3]
+        session_project = prepared[4]
+        composition = await asyncio.to_thread(
+            self._compose,
+            cwd=session_cwd,
+            config=config,
+            provider=config.provider,
+            model=config.model,
+            project_context=context,
+            skill_catalog=skill_catalog,
+            agent_catalog=agent_catalog,
+            project_id=session_project.project_id if session_project is not None else None,
+            max_turns=self._max_turns,
+        )
+        await self._replace(composition)
+        return self.metadata
+
+    def _prepare_new_session(
+        self, session_cwd: Path, provider: str | None, model: str | None
+    ) -> tuple[object, object, object, object, object]:
         discovery = discover_project(session_cwd, user_home=self.home.parent)
         repo_root = discovery.primary_root or discovery.cwd
         config = self._config(provider, model, project_root=repo_root)
@@ -369,20 +395,40 @@ class ServerRuntime:
             cwd_project=cwd_project,
             inbox_enabled=config.inbox_enabled,
         )
-        composition = await asyncio.to_thread(
-            self._compose,
-            cwd=session_cwd,
-            config=config,
-            provider=config.provider,
-            model=config.model,
-            project_context=context,
-            skill_catalog=skill_catalog,
-            agent_catalog=agent_catalog,
-            project_id=session_project.project_id if session_project is not None else None,
-            max_turns=self._max_turns,
+        return config, skill_catalog, agent_catalog, context, session_project
+
+    def _prepare_resumed_session(
+        self, opened: OpenedSession, session_cwd: Path
+    ) -> tuple[object, object]:
+        discovery = discover_project(session_cwd, user_home=self.home.parent)
+        repo_root = discovery.primary_root or discovery.cwd
+        config = self._config(
+            opened.metadata.provider,
+            opened.metadata.model,
+            project_root=repo_root,
         )
-        await self._replace(composition)
-        return self.metadata
+        registry = self.manager.project_registry
+        session_project = None
+        if opened.metadata.project_id is not None and registry is not None:
+            try:
+                session_project = registry.show_project(opened.metadata.project_id)
+            except (OSError, ValueError):
+                pass
+        cwd_project = (
+            resolve_project_context(discovery, registry) if registry is not None else None
+        )
+        resumed_prompt = resume_prompt(
+            opened.metadata,
+            manager=self.manager,
+            store=opened.store,
+            home=self.home,
+            repo_root=repo_root,
+            inbox_enabled=config.inbox_enabled,
+            session_project=session_project,
+            cwd_project=cwd_project,
+            project_features_enabled=registry is not None,
+        )
+        return config, resumed_prompt
 
     async def resume_session(self, session_id: str) -> SessionMetadata:
         if self._state is not None and self._state.session_id == session_id:
@@ -397,37 +443,10 @@ class ServerRuntime:
             )
         opened = await asyncio.to_thread(self.manager.open, session_id)
         try:
-            discovery = discover_project(session_cwd, user_home=self.home.parent)
-            repo_root = discovery.primary_root or discovery.cwd
-            config = self._config(
-                opened.metadata.provider,
-                opened.metadata.model,
-                project_root=repo_root,
+            prepared = await asyncio.to_thread(
+                self._prepare_resumed_session, opened, session_cwd
             )
-            registry = self.manager.project_registry
-            session_project = None
-            if opened.metadata.project_id is not None and registry is not None:
-                try:
-                    session_project = registry.show_project(opened.metadata.project_id)
-                except (OSError, ValueError):
-                    pass
-            cwd_project = (
-                resolve_project_context(discovery, registry)
-                if registry is not None
-                else None
-            )
-            resumed_prompt = await asyncio.to_thread(
-                resume_prompt,
-                opened.metadata,
-                manager=self.manager,
-                store=opened.store,
-                home=self.home,
-                repo_root=repo_root,
-                inbox_enabled=config.inbox_enabled,
-                session_project=session_project,
-                cwd_project=cwd_project,
-                project_features_enabled=registry is not None,
-            )
+            config, resumed_prompt = prepared
             context = resumed_prompt.context
             skill_catalog = resumed_prompt.skill_catalog
             agent_catalog = resumed_prompt.agent_catalog

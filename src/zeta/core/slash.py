@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import os
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -40,7 +42,11 @@ from .commands.custom_commands import (
     render_custom_input,
     resolve_custom_input,
 )
-from .project_context import discover_project_root, project_instructions_path
+from .project_context import (
+    discover_project_root,
+    project_instructions_path,
+    project_instructions_path_async,
+)
 from .store import ConversationEntry
 
 
@@ -794,7 +800,13 @@ class SlashCommandRegistry:
     def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command, returning an awaitable for async commands."""
 
-        return self._dispatch(session, value)
+        result = self._dispatch(session, value)
+        if result is not None and inspect.isawaitable(result):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(result)
+        return result
 
     async def dispatch_async(
         self, session: SlashSession, value: str
@@ -1139,6 +1151,7 @@ def create_slash_registry(
     skill_catalog: SkillCatalog,
     project_registry_state: ProjectRegistryState | None = None,
     extra_commands: Sequence[SlashCommand] = (),
+    async_project_instructions: bool = False,
 ) -> SlashCommandRegistry:
     """Register built-ins and frontend commands before custom commands and skills."""
 
@@ -1165,12 +1178,22 @@ def create_slash_registry(
     )
     registry.register(SlashCommand(
         "project-instructions",
-        lambda session, args: project_instructions_path(
-            args,
-            private_project_root,
-            Path(effective_home).expanduser().resolve() if effective_home else None,
-            getattr(session, "open_project_instructions_editor", None),
-            project_registry_state,
+        lambda session, args: (
+            project_instructions_path_async(
+                args,
+                private_project_root,
+                Path(effective_home).expanduser().resolve() if effective_home else None,
+                getattr(session, "open_project_instructions_editor", None),
+                project_registry_state,
+            )
+            if async_project_instructions
+            else project_instructions_path(
+                args,
+                private_project_root,
+                Path(effective_home).expanduser().resolve() if effective_home else None,
+                getattr(session, "open_project_instructions_editor", None),
+                project_registry_state,
+            )
         ),
         "open or create private project instructions in your editor",
     ))

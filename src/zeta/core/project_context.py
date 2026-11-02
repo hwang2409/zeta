@@ -31,7 +31,9 @@ from __future__ import annotations
 
 SUPPORTED_MEMORY_FORMATS = frozenset({1, 2})
 
+import asyncio
 import hashlib
+import inspect
 import logging
 import os
 import shlex
@@ -626,6 +628,31 @@ def project_instructions_path(
     if editor is None:
         return f"project instructions: {path}"
     return editor(path)
+
+
+async def project_instructions_path_async(
+    args: str,
+    project_root: Path | None,
+    zeta_home: Path | None,
+    editor: Callable[[Path], str | Awaitable[str]] | None = None,
+    registry_state: ProjectRegistryState | None = None,
+) -> str:
+    """Resolve project instructions off the event loop, then run the editor."""
+    result = await asyncio.to_thread(
+        project_instructions_path,
+        args,
+        project_root,
+        zeta_home,
+        None,
+        registry_state,
+    )
+    if editor is None or not result.startswith("project instructions: "):
+        return result
+    candidate = result.removeprefix("project instructions: ")
+    if not Path(candidate).is_absolute():
+        return result
+    opened = editor(Path(candidate))
+    return await opened if inspect.isawaitable(opened) else opened
 
 
 def project_instructions_editor_command(path: Path) -> tuple[str, ...]:

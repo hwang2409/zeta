@@ -365,6 +365,7 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
         extra_commands=(
             SlashCommand("accounts", lambda session, args: session.slash_accounts(args), "list or label accounts"),
         ),
+        async_project_instructions=True,
     )
 
 
