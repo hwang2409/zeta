@@ -1140,12 +1140,14 @@ async def test_child_send_finishing_after_its_session_left_does_not_touch_ui(
     # session stays the rendering context during a fork suspension.
     app._release_ui_ownership()
     notices_before = list(notices)
+    send_tasks = tuple(task for task, _, _ in app._child_send_tasks.values())
+    assert len(send_tasks) == 1
     release.set()
-    for _ in range(100):
-        if await asyncio.to_thread(child.pending_prompts) and not app._child_send_tasks:
-            break
-        await asyncio.sleep(0.01)
-    assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == ["during exit"]
+    await asyncio.wait_for(asyncio.gather(*send_tasks), 2)
+    assert not app._child_send_tasks
+    assert [
+        entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)
+    ] == ["during exit"]
     assert session.default_buffer.text == "during exit"
     assert notices == notices_before
     assert store.messages() == []
