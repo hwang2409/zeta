@@ -202,23 +202,27 @@ class SlashHandlerMixin:
         self._invalidate_prompt()
         return ""
 
+    async def _login_account(self, requested: list[str]) -> str:
+        context = getattr(self.loop, "account_context", None)
+        if context is None:
+            return "accounts unavailable for this session"
+        if len(requested) != 3 or requested[1] not in {"anthropic", "codex"}:
+            return "usage: /accounts login <anthropic|codex> <label>"
+        try:
+            await asyncio.to_thread(
+                login_named_account, context.home, requested[1], requested[2]
+            )
+        except (AccountError, OSError, RuntimeError, ValueError):
+            return "account login failed"
+        return f"logged in as {requested[1]}:{requested[2].lower()}"
+
     async def slash_accounts(self, args: str) -> str:
         """List named accounts and open the current-session switcher."""
 
         context = getattr(self.loop, "account_context", None)
         requested = args.split()
         if requested and requested[0] == "login":
-            if context is None:
-                return "accounts unavailable for this session"
-            if len(requested) != 3 or requested[1] not in {"anthropic", "codex"}:
-                return "usage: /accounts login <anthropic|codex> <label>"
-            try:
-                await asyncio.to_thread(
-                    login_named_account, context.home, requested[1], requested[2]
-                )
-            except (AccountError, OSError, RuntimeError, ValueError):
-                return "account login failed"
-            return f"logged in as {requested[1]}:{requested[2].lower()}"
+            return await self._login_account(requested)
         if requested:
             if context is None:
                 return "accounts unavailable for this session"

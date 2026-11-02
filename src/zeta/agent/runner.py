@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -712,21 +713,33 @@ async def run_agent_tool(
         if account_context is not None
         else None
     )
-    try:
-        child_store.start_agent_lifecycle(
-            handle=child_instance_id,
-            started_at=_now(),
-            depth=child_depth,
-            agent_type=preset.name,
-            description=description,
-            cwd=child_cwd,
-            selected_accounts={
-                provider: str(account)
-                for provider, account in child_account_pins.snapshot().items()
-            }
-            if child_account_pins is not None
-            else None,
+    selected_accounts = (
+        child_account_pins.snapshot() if child_account_pins is not None else {}
+    )
+
+    def publish_child_lifecycle() -> None:
+        guard = (
+            account_context.store.pin_guard(selected_accounts)
+            if account_context is not None
+            else nullcontext()
         )
+        with guard:
+            child_store.start_agent_lifecycle(
+                handle=child_instance_id,
+                started_at=_now(),
+                depth=child_depth,
+                agent_type=preset.name,
+                description=description,
+                cwd=child_cwd,
+                selected_accounts={
+                    provider: str(account)
+                    for provider, account in selected_accounts.items()
+                }
+                or None,
+            )
+
+    try:
+        await asyncio.to_thread(publish_child_lifecycle)
     except BaseException:
         loop._background_owner.mark_store_finished(child_store)
         loop._background_owner.release_unused_stores()

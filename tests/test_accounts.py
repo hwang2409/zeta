@@ -1801,6 +1801,87 @@ def test_logout_refuses_account_pinned_by_live_child(tmp_path: Path) -> None:
         opened.store.close()
 
 
+def test_logout_cannot_race_live_child_pin_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, account.provider, account.name).save(tokens())
+    store = AccountStore(home)
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    child = ConversationStore(opened.store.session_dir / "agents", session_id="1")
+    child.activate_runtime_lease()
+    scan_finished = threading.Event()
+    publish_finished = threading.Event()
+    original_scan = account_store._live_session_pins
+
+    def gated_scan(sessions_root: Path, selected: AccountId) -> bool:
+        result = original_scan(sessions_root, selected)
+        scan_finished.set()
+        publish_finished.wait(timeout=1)
+        return result
+
+    monkeypatch.setattr(account_store, "_live_session_pins", gated_scan)
+    publish_error: list[BaseException] = []
+
+    def publish_pin() -> None:
+        scan_finished.wait(timeout=5)
+        try:
+            with store.pin_guard({"codex": account}):
+                child.start_agent_lifecycle(
+                    handle=f"{opened.metadata.session_id}:1",
+                    started_at="2026-01-01T00:00:00Z",
+                    depth=1,
+                    agent_type="worker",
+                    description="racing child",
+                    selected_accounts={"codex": str(account)},
+                )
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            publish_error.append(exc)
+        finally:
+            publish_finished.set()
+
+    publisher = threading.Thread(target=publish_pin)
+    publisher.start()
+    try:
+        try:
+            store.logout(account, sessions_root=home / "sessions")
+        except AccountError:
+            pass
+        publisher.join(timeout=5)
+        assert not publisher.is_alive()
+        live_pin = child.agent_lifecycle()
+        account_exists = store.contains(account)
+        has_live_pin = bool(
+            live_pin
+            and live_pin.get("selected_accounts", {}).get("codex") == str(account)
+        )
+        assert account_exists or not has_live_pin
+        if not account_exists:
+            assert publish_error
+    finally:
+        child.close()
+        opened.store.close()
+
+
+def test_logout_refusal_does_not_delete_valid_credentials(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(home, account.provider, account.name)
+    credential.save(tokens())
+    unexpected = credential.path.parent / "unexpected.txt"
+    unexpected.write_text("keep the account unchanged")
+    store = AccountStore(home)
+
+    with pytest.raises(AccountError, match="unexpected file"):
+        store.logout(account, sessions_root=home / "sessions")
+
+    assert credential.path.exists()
+    assert unexpected.exists()
+    assert store.contains(account)
+
+
 def test_cli_logout_unknown_account_is_clear_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -400,6 +400,19 @@ class AccountStore:
             yield home_fd
 
     @contextmanager
+    def pin_guard(self, accounts: Mapping[str, AccountId]) -> Iterator[None]:
+        """Hold registry then account locks while durable pins are published."""
+
+        ordered = sorted(set(accounts.values()), key=lambda item: (item.provider, item.name))
+        with self._home() as home_fd, self._registry_guard(home_fd), ExitStack() as stack:
+            for account in ordered:
+                stack.enter_context(self._lifecycle_guard(home_fd, account))
+            registered = self._read_registry(home_fd)["accounts"]
+            if any(str(account) not in registered for account in ordered):
+                raise AccountError("account no longer exists; use /accounts")
+            yield
+
+    @contextmanager
     def credential_guard(
         self,
         account: AccountId,
@@ -815,6 +828,21 @@ def _bounded_guard(
         stack.close()
 
 
+def _read_child_account_pins(path: Path) -> Mapping[str, Any]:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        lifecycle = json.loads(read_session_file(directory_fd, "agent_lifecycle.json"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AccountError("could not verify live child account pins") from exc
+    finally:
+        os.close(directory_fd)
+    if not isinstance(lifecycle, Mapping) or not isinstance(
+        lifecycle.get("selected_accounts"), Mapping
+    ):
+        raise AccountError("could not verify live child account pins")
+    return lifecycle["selected_accounts"]
+
+
 def _live_child_pins(session_path: Path, account: AccountId) -> bool:
     from ..session_liveness import session_is_live
 
@@ -831,18 +859,8 @@ def _live_child_pins(session_path: Path, account: AccountId) -> bool:
         ]
         if "agent_lifecycle.json" not in files or not session_is_live(Path(root)):
             continue
-        directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            lifecycle = json.loads(read_session_file(directory_fd, "agent_lifecycle.json"))
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise AccountError("could not verify live child account pins") from exc
-        finally:
-            os.close(directory_fd)
-        if not isinstance(lifecycle, Mapping) or not isinstance(
-            lifecycle.get("selected_accounts"), Mapping
-        ):
-            raise AccountError("could not verify live child account pins")
-        if lifecycle["selected_accounts"].get(account.provider) == str(account):
+        pins = _read_child_account_pins(Path(root))
+        if pins.get(account.provider) == str(account):
             return True
     return False
 
@@ -873,12 +891,14 @@ def _live_session_pins(sessions_root: Path, account: AccountId) -> bool:
 
 
 def _remove_directory_files(directory_fd: int, allowed: set[str]) -> None:
-    for name in os.listdir(directory_fd):
+    names = os.listdir(directory_fd)
+    for name in names:
         if name not in allowed:
             raise AccountError("account directory contains an unexpected file")
         info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise AccountError("account directory contains an unsafe file")
+    for name in names:
         os.unlink(name, dir_fd=directory_fd)
     _fsync_directory(directory_fd)
 

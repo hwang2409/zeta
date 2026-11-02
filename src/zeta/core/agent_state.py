@@ -23,6 +23,34 @@ from .session_files import child_directory, write_session_json
 _AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
 
 
+def _validate_lifecycle_start(
+    *,
+    handle: str,
+    started_at: str,
+    depth: int,
+    agent_type: str,
+    description: str,
+    selected_accounts: dict[str, str] | None,
+) -> None:
+    if (
+        not handle
+        or not started_at
+        or type(depth) is not int
+        or depth < 1
+        or not agent_type
+        or not description
+    ):
+        raise ValueError("invalid agent lifecycle metadata")
+    if selected_accounts is not None and (
+        type(selected_accounts) is not dict
+        or any(
+            type(provider) is not str or type(account) is not str
+            for provider, account in selected_accounts.items()
+        )
+    ):
+        raise ValueError("invalid agent account pins")
+
+
 def _lifecycle_elapsed(
     lifecycle: dict[str, Any], *, finished_at: str | None = None
 ) -> float:
@@ -398,23 +426,14 @@ class AgentStateMixin:
     ) -> None:
         """Persist the metadata used by the agent status tool."""
 
-        if (
-            not handle
-            or not started_at
-            or type(depth) is not int
-            or depth < 1
-            or not agent_type
-            or not description
-        ):
-            raise ValueError("invalid agent lifecycle metadata")
-        if selected_accounts is not None and (
-            type(selected_accounts) is not dict
-            or any(
-                type(provider) is not str or type(account) is not str
-                for provider, account in selected_accounts.items()
-            )
-        ):
-            raise ValueError("invalid agent account pins")
+        _validate_lifecycle_start(
+            handle=handle,
+            started_at=started_at,
+            depth=depth,
+            agent_type=agent_type,
+            description=description,
+            selected_accounts=selected_accounts,
+        )
         with self._append_lock():
             self._load()
             self._load_session_state()

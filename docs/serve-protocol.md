@@ -986,6 +986,13 @@ error code and message. Provider status and origin remain internal.
   null `snapshot` or the normalized `version`, `captured_at`, `source`, and
   `windows` fields documented in `accounts.md`. This request is lock-free and
   never calls a provider endpoint.
+- `account_logout`: takes `session_id` and `account` (`provider:name`) and
+  requires an idle session. It removes only Zeta's local credentials and catalog
+  entry; it does not revoke the provider subscription or token. The response
+  contains the removed `account` and a safe `message`. A pinned live session or
+  child, an unknown account, or unsafe account files return `-32005`. The disk
+  operation runs off the server event loop; after cancellation, `account_list`
+  reports its final persisted result.
 - `account_refresh`: takes `session_id`, requires an idle session, and performs
   the same explicit refresh as `r` in `/accounts`: all stale accounts,
   sequentially, with the persisted 60-second per-account cooldown. Provider
