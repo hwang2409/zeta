@@ -37,7 +37,6 @@ from ..checkpoints import (
     active_branch,
     load_session_json,
 )
-from ..child_runs import validate_child_run_started_data
 from ..session_files import (
     child_directory,
     open_session_file,
@@ -53,6 +52,7 @@ from ._approval_display import (
     validated_approval_display,
 )
 from ._async_writes import AsyncDurableWritesMixin
+from ._child_runs import ChildRunStoreMixin, validate_child_run_started_data
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
 from ._incremental_validation import IncrementalValidationMixin
 from ._lifecycle import StoreLifecycleMixin
@@ -89,10 +89,8 @@ class ConversationStore(
     IncrementalValidationMixin,
     NotificationStateMixin,
     StoreRuntimeLeaseMixin,
-    AgentStateMixin,
-    CheckpointForkMixin,
-    StepDeliveryStoreMixin,
-    StoreLifecycleMixin,
+    AgentStateMixin, CheckpointForkMixin,
+    StepDeliveryStoreMixin, StoreLifecycleMixin, ChildRunStoreMixin,
 ):
     def __init__(
         self,
@@ -503,8 +501,7 @@ class ConversationStore(
                         raise ValueError(
                             "approval request must match an anchored tool call"
                         )
-            elif entry.type == "child_run_started":
-                validate_child_run_started_data(entry.data)
+            elif entry.type == "child_run_started": validate_child_run_started_data(entry.data)
             elif entry.type == "compaction":
                 summary = entry.data.get("summary")
                 source_start = entry.data.get("source_seq_start")
@@ -804,45 +801,6 @@ class ConversationStore(
             "message",
             {"message": require_new_message_origin(message).to_dict()},
             parent_id,
-        )
-
-    def append_child_run_started(
-        self,
-        run_id: str,
-        parent_run_id: str | None,
-        name: str | None,
-        task: str,
-        started_at: str,
-    ) -> ConversationEntry:
-        data: dict[str, Any] = {
-            "run_id": run_id,
-            "parent_run_id": parent_run_id,
-            "task": task,
-            "started_at": started_at,
-        }
-        if name is not None:
-            data["name"] = name
-        return self._append_row("child_run_started", data)
-
-    async def append_child_run_started_async(
-        self,
-        run_id: str,
-        parent_run_id: str | None,
-        name: str | None,
-        task: str,
-        started_at: str,
-        *,
-        on_persisted: Callable[[], None] | None = None,
-    ) -> ConversationEntry:
-        """Append the spawn row off-loop and publish it before returning."""
-        return await self._to_thread_durable(
-            self.append_child_run_started,
-            run_id,
-            parent_run_id,
-            name,
-            task,
-            started_at,
-            _on_persisted=on_persisted,
         )
 
     async def append_message_async(

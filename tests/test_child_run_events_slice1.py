@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from zeta.core.child_runs import parse_child_run_id
 from zeta.core.store import ConversationStore
+from zeta.core.store._child_runs import parse_child_run_id
 
 
 def test_nested_ids_resolve_lineage() -> None:
