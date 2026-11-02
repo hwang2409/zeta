@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import os
 import random
+import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,13 +13,14 @@ from types import SimpleNamespace
 import pytest
 
 from tests.support.fake_backend import FakeBackend
-from tests.test_server import _close, _connect, _request, _socket_path
+from tests.test_server import _close, _connect, _request
 from zeta.project_inbox import ProjectInbox, ProjectInboxScanner
 from zeta.project_registry import ProjectRegistry
 from zeta.server import ZetaServer
 from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
 from zeta.server.server import _Client
+from zeta.server.slash_commands import run_command
 
 
 def _server(tmp_path: Path) -> ZetaServer:
@@ -26,7 +30,7 @@ def _server(tmp_path: Path) -> ZetaServer:
         home=tmp_path / "home",
         cwd=cwd,
         provider="codex",
-        socket_path=_socket_path(tmp_path),
+        port=0,
         backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
     )
 
@@ -45,6 +49,26 @@ def _mtimes(root: Path) -> dict[str, int]:
     }
 
 
+def _hold_registry_lock(path: Path) -> tuple[threading.Event, threading.Event, threading.Thread]:
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        fd = os.open(path, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            acquired.set()
+            release.wait()
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert acquired.wait(2)
+    return acquired, release, thread
+
+
 def _filesystem_snapshot(root: Path) -> dict[str, tuple[int, int, int]]:
     paths = [root, *root.rglob("*")] if root.exists() else []
     return {
@@ -55,6 +79,62 @@ def _filesystem_snapshot(root: Path) -> dict[str, tuple[int, int, int]]:
         )
         for path in paths
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["new_session", "resume"])
+async def test_session_project_preparation_does_not_block_ping(
+    tmp_path: Path, method: str
+) -> None:
+    server = _server(tmp_path)
+    root = server.runtime.cwd
+    await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=root, check=True)
+    registry = ProjectRegistry(server.home / "projects")
+    registry.create_project("launch", "git", root)
+    try:
+        if method == "resume":
+            first = await server.runtime.create_session()
+            await server.runtime.create_session()
+            request = {"session_id": first.session_id}
+        else:
+            request = {}
+        _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
+        operation = asyncio.create_task(
+            server.runtime.create_session() if method == "new_session"
+            else server.runtime.resume_session(request["session_id"])
+        )
+        await asyncio.sleep(0)
+        release.set()
+        holder.join(2)
+        await operation
+    finally:
+        if "release" in locals():
+            release.set()
+            holder.join(2)
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_serve_project_instructions_does_not_block_loop_tick(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    root = server.runtime.cwd
+    await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=root, check=True)
+    registry = ProjectRegistry(server.home / "projects")
+    registry.create_project("launch", "git", root)
+    await server.runtime.create_session()
+    try:
+        _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
+        operation = asyncio.create_task(run_command(server.runtime, "/project-instructions"))
+        await asyncio.sleep(0)
+        release.set()
+        holder.join(2)
+        result = await operation
+        assert result["kind"] == "output"
+    finally:
+        if "release" in locals():
+            release.set()
+            holder.join(2)
+        await server.close()
 
 
 @pytest.mark.asyncio

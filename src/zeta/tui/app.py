@@ -303,7 +303,6 @@ class TUIApp(
             project_eligible=project_eligible,
             skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
             extra_commands=_tui_slash_commands(),
-            async_project_instructions=True,
         )
         self.loop.add_skill_catalog_listener(self._slash_commands.register_skills)
         self.loop.set_mcp_prompt_refresh(

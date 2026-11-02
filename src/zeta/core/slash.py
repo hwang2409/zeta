@@ -44,7 +44,6 @@ from .commands.custom_commands import (
 from .project_context import (
     discover_project_root,
     project_instructions_command,
-    project_instructions_path,
 )
 from .store import ConversationEntry
 
@@ -1136,7 +1135,6 @@ def create_slash_registry(
     skill_catalog: SkillCatalog,
     project_registry_state: ProjectRegistryState | None = None,
     extra_commands: Sequence[SlashCommand] = (),
-    async_project_instructions: bool = False,
 ) -> SlashCommandRegistry:
     """Register built-ins and frontend commands before custom commands and skills."""
 
@@ -1161,20 +1159,11 @@ def create_slash_registry(
     registry.register(
         SlashCommand("implement", _run_implement, "implement the proposed plan")
     )
-    if async_project_instructions:
-        instruction_handler = lambda session, args: project_instructions_command(
-            session, args, private_project_root,
-            Path(effective_home).expanduser().resolve() if effective_home else None,
-            project_registry_state,
-        )
-    else:
-        instruction_handler = lambda session, args: project_instructions_path(
-            args,
-            private_project_root,
-            Path(effective_home).expanduser().resolve() if effective_home else None,
-            getattr(session, "open_project_instructions_editor", None),
-            project_registry_state,
-        )
+    instruction_handler = lambda session, args: project_instructions_command(
+        session, args, private_project_root,
+        Path(effective_home).expanduser().resolve() if effective_home else None,
+        project_registry_state,
+    )
     registry.register(SlashCommand(
         "project-instructions", instruction_handler,
         "open or create private project instructions in your editor",
