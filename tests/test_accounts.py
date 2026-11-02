@@ -7,8 +7,10 @@ import inspect
 import json
 import multiprocessing
 import os
+import signal
 import stat
 import threading
+import time
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -78,6 +80,41 @@ def _hold_registry_lock(
 ) -> None:
     store = AccountStore(home)
     with store._home() as home_fd, store._registry_guard(home_fd):
+        ready.set()
+        release.wait()
+
+
+def _crash_logout(home: str, account: AccountId, point: str) -> None:
+    store = AccountStore(home)
+    if point in {"before-commit", "after-commit"}:
+        original = AccountStore._write_registry
+
+        def crash(self: AccountStore, home_fd: int, value: dict[str, object]) -> None:
+            if point == "after-commit":
+                original(self, home_fd, value)
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        AccountStore._write_registry = crash
+    elif point == "partway-cleanup":
+        import zeta.accounts.logout as logout_module
+
+        def crash(directory_fd: int, allowed: set[str]) -> None:
+            if "oauth.json" in allowed:
+                os.unlink("oauth.json", dir_fd=directory_fd)
+                os.kill(os.getpid(), signal.SIGKILL)
+            logout_module._remove_directory_files(directory_fd, allowed)
+
+        logout_module._remove_directory_files = crash
+    store.logout(account, sessions_root=store.home / "sessions")
+
+
+def _hold_account_credential_lock(
+    home: str,
+    account: AccountId,
+    ready: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+) -> None:
+    with AccountStore(home).credential_guard(account):
         ready.set()
         release.wait()
 
@@ -1728,6 +1765,135 @@ def test_api_key_mode_skips_named_accounts(
         "system · this session uses an API key; account switching is unavailable"
     )
     opened.store.close()
+
+
+def _registered_account(home: Path, account: AccountId) -> None:
+    store = AccountStore(home)
+    with store._home() as home_fd:
+        store._register_account(home_fd, account)
+
+
+def _run_killed_logout(home: Path, account: AccountId, point: str) -> None:
+    context = multiprocessing.get_context("fork")
+    process = context.Process(target=_crash_logout, args=(str(home), account, point))
+    process.start()
+    process.join(timeout=5)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=5)
+    assert process.exitcode == -signal.SIGKILL
+    process.close()
+
+
+def test_logout_crash_before_registry_commit_preserves_account(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    credential.save(tokens())
+    _registered_account(tmp_path, account)
+
+    _run_killed_logout(tmp_path, account, "before-commit")
+
+    restarted = AccountStore(tmp_path)
+    assert restarted.contains(account)
+    assert credential.path.exists()
+    assert credential.read() == tokens()
+
+
+def test_logout_crash_after_registry_commit_is_swept(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    credential.save(tokens())
+    _registered_account(tmp_path, account)
+
+    _run_killed_logout(tmp_path, account, "after-commit")
+    restarted = AccountStore(tmp_path)
+    restarted.migrate()
+
+    assert restarted.list() == []
+    assert not credential.path.parent.exists()
+    assert not (tmp_path / "account-locks" / account.provider / account.name).exists()
+
+
+def test_logout_crash_partway_through_cleanup_is_swept(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    credential.save(tokens())
+    (credential.path.parent / "usage.json").write_text("usage")
+    _registered_account(tmp_path, account)
+
+    _run_killed_logout(tmp_path, account, "partway-cleanup")
+    restarted = AccountStore(tmp_path)
+    restarted.migrate()
+
+    assert restarted.list() == []
+    assert not credential.path.parent.exists()
+    assert not (tmp_path / "account-locks" / account.provider / account.name).exists()
+
+
+def test_migrate_sweeps_round_three_logout_tombstone(tmp_path: Path) -> None:
+    path = tmp_path / "accounts" / "codex" / ".logout-deadbeef" / "oauth.json"
+    path.parent.mkdir(parents=True)
+    os.chmod(path.parent, 0o700)
+    path.write_text("secret")
+
+    AccountStore(tmp_path).migrate()
+
+    assert not path.parent.exists()
+
+
+def test_migrate_preserves_pending_login_and_completes_it(tmp_path: Path) -> None:
+    account = AccountId("codex", "pending")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    credential.save(tokens())
+    pending = credential.path.with_name("publish-pending.json")
+    pending.write_text(json.dumps({
+        "provider": account.provider,
+        "name": account.name,
+        "sha256": hashlib.sha256(credential.path.read_bytes()).hexdigest(),
+    }) + "\n")
+
+    AccountStore(tmp_path).migrate()
+    assert pending.exists()
+    assert AccountStore(tmp_path).resolve_account(account.provider, account) == account
+    assert AccountStore(tmp_path).contains(account)
+
+
+def test_migrate_never_sweeps_registered_account_during_login(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    credential.save(tokens())
+    _registered_account(tmp_path, account)
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_account_credential_lock,
+        args=(str(tmp_path), account, ready, release),
+    )
+    holder.start()
+    migration_done = threading.Event()
+
+    def migrate() -> None:
+        AccountStore(tmp_path).migrate()
+        migration_done.set()
+
+    thread = threading.Thread(target=migrate)
+    thread.start()
+    try:
+        assert ready.wait(timeout=5)
+        time.sleep(0.05)
+        release.set()
+        assert migration_done.wait(timeout=5)
+        assert credential.path.exists()
+        assert AccountStore(tmp_path).contains(account)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+        holder.join(timeout=5)
+        if holder.is_alive():
+            holder.kill()
+            holder.join(timeout=5)
+        holder.close()
 
 
 def test_cli_logout_removes_credentials_registry_default_and_locks(
