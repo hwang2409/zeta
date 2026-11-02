@@ -10,6 +10,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -84,6 +85,7 @@ from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 from zeta.tools._shared.process import BackgroundTaskShutdownNotice
+from zeta.tui import loop_errors as loop_errors_module
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
     AgentCard,
@@ -395,12 +397,16 @@ async def _background_event_transcript_count(
     )
     if app_sink is not None:
         app_sink(app)
+    blocked_command = (
+        f"{shlex.quote(sys.executable)} -c "
+        "'import threading; threading.Event().wait()'"
+    )
     command = {
-        "start": "sleep 30",
+        "start": blocked_command,
         "natural_exit_success": "exit 0",
         "natural_exit_failure": "exit 7",
-        "task_kill": "sleep 30",
-        "session_shutdown": "sleep 30",
+        "task_kill": blocked_command,
+        "session_shutdown": blocked_command,
         "failed_process_creation": "printf unreachable",
     }[event]
     cwd = tmp_path / "missing" if event == "failed_process_creation" else None
@@ -420,8 +426,16 @@ async def _background_event_transcript_count(
             ),
             multiline=True,
         )
+        input_ready = asyncio.Event()
+        run_full_screen = app._run_full_screen
+
+        async def run_full_screen_after_ready(*args: object) -> None:
+            input_ready.set()
+            await run_full_screen(*args)
+
+        app._run_full_screen = run_full_screen_after_ready  # type: ignore[method-assign]
         running = asyncio.create_task(app.run(session))
-        await wait_until(lambda: app._input_loop_active)
+        await input_ready.wait()
         if owner == "run_background":
             app._handle_tool_event(
                 StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=launch)
@@ -11854,32 +11868,42 @@ async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
     fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
     monkeypatch.setenv("ZETA_HOME", str(zeta_home))
 
+    write_started = threading.Event()
+    write_finished = threading.Event()
+    write_diagnostic = loop_errors_module.write_tui_diagnostic
+
+    def gated_write(path: Path, record: dict[str, object]) -> None:
+        write_started.set()
+        try:
+            write_diagnostic(path, record)
+        finally:
+            write_finished.set()
+
+    monkeypatch.setattr(loop_errors_module, "write_tui_diagnostic", gated_write)
+
     async def run_async(**_kwargs: object) -> None:
         async def fail() -> None:
             raise RuntimeError("background failed")
 
         asyncio.create_task(fail())
         await asyncio.sleep(0)
+        await asyncio.to_thread(write_started.wait)
 
     monkeypatch.setattr(session.app, "run_async", run_async)
     try:
-        started = time.monotonic()
         with patch_stdout(raw=True):
             await app._run_full_screen(session)
-        elapsed = time.monotonic() - started
-        assert elapsed < 0.1
         assert any("background failed" in line for line in app._transcript_lines)
         assert not log_path.exists()
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
 
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and not log_path.exists():
-        await asyncio.sleep(0.01)
+    await asyncio.to_thread(write_finished.wait)
     records = log_path.read_text().splitlines()
     assert len(records) == 1
     assert "background failed" in json.loads(records[0])["traceback"]
+    await app.close()
 
 
 @pytest.mark.asyncio
