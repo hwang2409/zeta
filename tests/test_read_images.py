@@ -797,7 +797,7 @@ async def test_read_large_image_downscales_not_errors(tmp_path: Path) -> None:
 def test_image_limits_match_provider_documentation() -> None:
     assert ANTHROPIC_IMAGE_POLICY.max_wire_size == 10_000_000
     assert ANTHROPIC_IMAGE_POLICY.wire_limit_unit is WireLimitUnit.BASE64_CHARACTERS
-    assert ANTHROPIC_IMAGE_POLICY.max_dimension == 2000
+    assert ANTHROPIC_IMAGE_POLICY.max_dimension == 3000
     assert CODEX_IMAGE_POLICY.max_wire_size == OPENAI_IMAGE_URL_MAX_LENGTH
     assert CODEX_IMAGE_POLICY.wire_limit_unit is WireLimitUnit.DATA_URL_CHARACTERS
     assert CODEX_IMAGE_POLICY.max_dimension is None

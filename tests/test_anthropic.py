@@ -206,7 +206,7 @@ def test_anthropic_falls_back_for_oversized_image_dimensions() -> None:
         "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
         "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
     ))
-    data[16:20] = (2001).to_bytes(4, "big")
+    data[16:20] = (8001).to_bytes(4, "big")
     block = png_block(data=bytes(data))
     payload = build_messages_payload(
         [Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("call-1", "stale", content_blocks=[block]))],
@@ -218,8 +218,8 @@ def test_anthropic_falls_back_for_oversized_image_dimensions() -> None:
 
     content = payload["messages"][0]["content"][0]["content"]
     assert isinstance(content, str)
-    assert "dimensions are 2001x1" in content
-    assert "limit is 2000x2000" in content
+    assert "dimensions are 8001x1" in content
+    assert "limit is 3000x3000" in content
 
 
 def test_anthropic_sends_supported_tool_images_as_native_blocks() -> None:
@@ -3891,4 +3891,4 @@ def test_anthropic_falls_back_for_images_over_many_image_limit() -> None:
     content = payload["messages"][0]["content"][0]["content"]
     assert isinstance(content, str)
     assert "dimensions are 3001x1" in content
-    assert "limit is 2000x2000" in content
+    assert "limit is 3000x3000" in content
