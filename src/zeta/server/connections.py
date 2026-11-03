@@ -36,6 +36,7 @@ class _Connection:
     queue: asyncio.Queue[tuple[bytes, asyncio.Future[bool]]] | None = None
     writer_task: asyncio.Task[None] | None = None
     queued_bytes: int = 0
+    ready: bool = False
 
 
 class ConnectionRegistry:
@@ -110,9 +111,15 @@ class ConnectionRegistry:
         state.protocol_version = protocol_version
         state.features = features
 
+    def controller_ready(self, connection: Any) -> None:
+        state = self._connections.get(connection)
+        if state is not self._controller:
+            raise RuntimeError("connection does not own the controller claim")
+        state.ready = True
+
     def current_controller(self) -> ControllerMetadata | None:
         state = self._controller
-        if state is None:
+        if state is None or not state.ready:
             return None
         return ControllerMetadata(state.connection, state.protocol_version, state.features)
 
