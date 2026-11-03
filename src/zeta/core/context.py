@@ -138,7 +138,7 @@ class ContextAssembler:
         self.last_context: AssembledContext | None = None
         self.last_usage: dict[str, Any] = {}
         self._request_budget = ContextRequestBudget(
-            self.store.replay(),
+            self.store.context_calibration_records(),
             provider_limit=self.token_budget,
             safety_margin=self.safety_margin,
             normal_target_ratio=TARGET_RATIO,

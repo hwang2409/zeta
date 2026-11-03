@@ -43,6 +43,78 @@ def _projects(tmp_path: Path):
     return home, registry, project_a, project_b
 
 
+def _sent_status_message(
+    message_id: str,
+    status: str = "done",
+    *,
+    origin: MessageOrigin = MessageOrigin.HARNESS_NUDGE,
+) -> Message:
+    return Message(
+        MessageRole.USER,
+        [TextContent("status")],
+        metadata={
+            "zeta_event": "project_inbox_sent_status",
+            "zeta.origin": origin.value,
+            "sent_statuses": [{"message_id": message_id, "status": status}],
+        },
+    )
+
+
+def test_inbox_receipt_index_includes_abandoned_branches(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    root = store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("root")],
+            metadata={"zeta.origin": MessageOrigin.USER.value},
+        )
+    )
+    store.append_message(_sent_status_message("a" * 32))
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("other branch")],
+            metadata={"zeta.origin": MessageOrigin.USER.value},
+        ),
+        parent_id=root.id,
+    )
+    session_id = store.session_id
+    store.close()
+    reopened = ConversationStore(tmp_path, session_id=session_id)
+
+    assert reopened.sent_message_receipts() == (("a" * 32, "done"),)
+
+
+def test_inbox_receipt_index_ignores_lookalikes(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(_sent_status_message("not-an-id"))
+    store.append_message(_sent_status_message("b" * 32, "unknown"))
+    store.append_message(
+        _sent_status_message("c" * 32, origin=MessageOrigin.USER)
+    )
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("non-passive")],
+            metadata={
+                "zeta.origin": MessageOrigin.USER.value,
+                "zeta_event": "project_inbox_sent_status",
+                "sent_statuses": [{"message_id": "d" * 32, "status": "done"}],
+            },
+        )
+    )
+
+    assert store.sent_message_receipts() == ()
+
+
+def test_inbox_receipt_index_updates_on_append(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+
+    assert store.sent_message_receipts() == ()
+    store.append_message(_sent_status_message("e" * 32, "claimed"))
+    assert store.sent_message_receipts() == (("e" * 32, "claimed"),)
+
+
 def test_send_is_idempotent_and_large_body_spills(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")

@@ -19,7 +19,6 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
-from .core.checkpoints import ConversationEntry
 from .core.session_files import (
     SessionError,
     atomic_publish_file,
@@ -31,7 +30,6 @@ from .core.session_files import (
 )
 from .project_errors import ProjectNotFoundError
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
-from .protocol.types import Message, is_passive_harness_message
 from .session_liveness import session_is_live
 
 SCHEMA_VERSION = 1
@@ -196,36 +194,9 @@ class SentMessageTracker:
             if changed:
                 self._persist()
 
-    def reconcile(self, entries: Iterable[ConversationEntry]) -> None:
-        """Recover receipts from all physical passive-note transcript entries."""
-        statuses: list[tuple[str, str]] = []
-        for entry in entries:
-            if entry.type != "message":
-                continue
-            raw = entry.data.get("message")
-            if not isinstance(raw, dict) or not is_passive_harness_message(raw):
-                continue
-            try:
-                message = Message.from_dict(raw)
-            except (KeyError, TypeError, ValueError):
-                continue
-            if message.metadata.get("zeta_event") != SENT_STATUS_EVENT:
-                continue
-            raw_statuses = message.metadata.get("sent_statuses")
-            if not isinstance(raw_statuses, list):
-                continue
-            for item in raw_statuses:
-                if not isinstance(item, dict):
-                    continue
-                message_id = item.get("message_id")
-                status = item.get("status")
-                if (
-                    isinstance(message_id, str)
-                    and _ID.fullmatch(message_id)
-                    and status in {"claimed", "done"}
-                ):
-                    statuses.append((message_id, status))
-        self.mark_reported(statuses)
+    def reconcile(self, receipts: Iterable[tuple[str, str]]) -> None:
+        """Recover reported statuses from the store's validated receipt index."""
+        self.mark_reported(receipts)
 
     @staticmethod
     def _chronology(record: dict[str, Any]) -> tuple[str, str]:
