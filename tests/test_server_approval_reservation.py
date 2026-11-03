@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import json
@@ -36,6 +37,23 @@ from zeta.server import ZetaServer
 from zeta.server.protocol import ProtocolError
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.tools.agent.approval import ChildApprovalPolicy
+
+
+def test_approval_record_state_has_one_writer() -> None:
+    root = Path(__file__).parents[1] / "src"
+    violations: list[str] = []
+    for path in root.rglob("*.py"):
+        if path.name != "control.py":
+            continue
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            targets: list[ast.expr] = []
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute) and target.attr in {"state", "disposition"}:
+                    violations.append(f"{path}:{target.lineno}: {target.attr}")
+    assert not violations, "approval record writes outside lifecycle: " + ", ".join(violations)
 
 
 class _AbortEvent:

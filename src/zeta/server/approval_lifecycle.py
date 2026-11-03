@@ -82,9 +82,44 @@ class ApprovalLifecycle:
     def state(self) -> ApprovalMachineState:
         return self._state
 
-    async def transition(self, event: str, **data: object) -> ApprovalMachineState:
+    def transition(self, event: str, **data: object) -> ApprovalMachineState:
         """Apply one guarded lifecycle event and publish one immutable state."""
-        if event == "fail":
+        if event in {
+            "reserve",
+            "reserve_starting",
+            "mark_pending",
+            "externalize",
+            "health_abort",
+        }:
+            record = data.get("record")
+            if record is None:
+                raise TypeError(f"{event} requires an approval record")
+            state = record.state
+            disposition = data.get("disposition")
+            if not isinstance(disposition, str):
+                raise TypeError(f"{event} requires a disposition")
+            if event == "mark_pending":
+                if state != "starting" or record.disposition != "active":
+                    raise ValueError(f"cannot mark approval {state} as pending")
+                record.state = "pending"
+            elif event == "externalize":
+                if state != "starting" or record.disposition != "active":
+                    raise ValueError(f"cannot externalize approval {state}")
+                record.disposition = "external"
+            elif event == "health_abort":
+                if state != "reserved":
+                    raise ValueError(f"cannot update health abort from {state}")
+                record.disposition = disposition
+            elif event == "reserve_starting":
+                if state != "starting" or record.disposition != "active":
+                    raise ValueError(f"cannot reserve approval {state}")
+                record.disposition = disposition
+            elif state in {"starting", "pending"}:
+                record.state = "reserved"
+                record.disposition = disposition
+            else:
+                raise ValueError(f"cannot reserve approval {state}")
+        elif event == "fail":
             health = data.get("health")
             if not isinstance(health, SessionHealth):
                 raise TypeError("fail requires SessionHealth")

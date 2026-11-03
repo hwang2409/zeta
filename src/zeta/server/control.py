@@ -245,7 +245,7 @@ class ServeControl:
     def session_replaced(self) -> None:
         self._approval_generation += 1
         self.clear_approvals()
-        asyncio.create_task(self._approvals.transition("replace"))
+        self._approvals.transition("replace")
 
     async def wait_for_approval_settlement(self) -> None:
         while tasks := [
@@ -301,6 +301,9 @@ class ServeControl:
             raise RuntimeError("serve control worker is unavailable")
         return await registry.run_blocking(job)
 
+    def _approval_transition(self, event: str, record: _ApprovalRecord, disposition: str) -> None:
+        self._approvals.transition(event, record=record, disposition=disposition)
+
     def _new_record(self, target: _ApprovalTarget) -> _ApprovalRecord:
         self._approval_token += 1
         record = _ApprovalRecord(
@@ -350,7 +353,7 @@ class ServeControl:
             reason = (
                 "turn_canceled" if record.disposition == "abort" else record.disposition
             )
-            record.state = "reserved"
+            self._approval_transition("reserve", record, reason)
             record.settlement = asyncio.create_task(
                 self._settle_record(record, "abort", reason)
             )
@@ -377,14 +380,13 @@ class ServeControl:
         if record.state == "starting":
             if record.disposition != "active":
                 return False
-            record.disposition = decision
+            self._approval_transition("reserve_starting", record, decision)
             return True
         if record.state != "pending":
             return False
         self._approval_token += 1
         record.token = self._approval_token
-        record.state = "reserved"
-        record.disposition = decision
+        self._approval_transition("reserve", record, decision)
         return True
 
     async def resolve_approval(
@@ -474,11 +476,11 @@ class ServeControl:
             self._approval_records.pop(core_key, None)
             return None
         if record.disposition != "active":
-            record.state = "reserved"
+            self._approval_transition("reserve", record, record.disposition)
             await self._settle_record(record, "abort", record.disposition)
             return None
         record.request = policy.request_from_store(core_key, state[0])
-        record.state = "pending"
+        self._approval_transition("mark_pending", record, "active")
         record.published = True
         self._approvals.observe(record.request)
         return record
@@ -538,7 +540,7 @@ class ServeControl:
         )
         if resolution is None:
             if owns_record:
-                await self._approvals.transition(
+                self._approvals.transition(
                     "fail",
                     health=SessionHealth(
                         "approval_persistence_failed",
@@ -558,8 +560,7 @@ class ServeControl:
                         data={"request_id": record.wire_id},
                     )
                 self.request_turn_failure()
-                record.state = "reserved"
-                record.disposition = reason or "turn_canceled"
+                self._approval_transition("health_abort", record, reason or "turn_canceled")
                 record.settlement = None
             raise OSError("approval decision could not be persisted")
         if not owns_record:
@@ -596,7 +597,7 @@ class ServeControl:
             and self._approvals.state.health is not None
             and (record.settlement is None or record.settlement.done())
         ):
-            record.disposition = reason
+            self._approval_transition("health_abort", record, reason)
         elif not self._reserve(record, reason):
             settlement = record.settlement
             if settlement is not None and settlement is not asyncio.current_task():
@@ -1000,7 +1001,6 @@ class ServeControl:
         generation = record.generation
         record.settlement = asyncio.current_task()
         target = record.target
-
         def lookup() -> tuple[ToolCall, str | None] | None:
             return target.store.approval_states().get(target.store_request_id)
 
@@ -1071,13 +1071,14 @@ class ServeControl:
                 self._approval_records.pop(target.key, None)
             return
         if record.disposition != "active":
-            record.state = "reserved"
+            self._approval_transition("reserve", record, record.disposition)
             record.settlement = asyncio.create_task(
                 self._settle_record(record, "abort", record.disposition)
             )
             await record.settlement
             return
-        record.state, record.settlement, record.published = "pending", None, True
+        self._approval_transition("mark_pending", record, "active")
+        record.settlement, record.published = None, True
         await self._notify(wire_event, session_id, **payload)
 
     async def _write_approval_start_history(
@@ -1104,7 +1105,7 @@ class ServeControl:
             if record.disposition not in {"active", "external"}
             else "turn_canceled"
         )
-        record.state = "reserved"
+        self._approval_transition("reserve", record, reason)
         record.settlement = asyncio.create_task(
             self._settle_record(record, "abort", reason)
         )
@@ -1170,7 +1171,7 @@ class ServeControl:
             return
         if record.state == "starting":
             if record.disposition == "active":
-                record.disposition = "external"
+                self._approval_transition("externalize", record, "external")
             return
         if record.state != "pending":
             return
@@ -1240,7 +1241,6 @@ class ServeControl:
             self._settle_record(record, "abort", reason)
         )
         return record.settlement
-
 
 def _approval_key(event: StreamEvent) -> ApprovalKey:
     raw_request_id = event.tool_call.id if event.tool_call is not None else ""
