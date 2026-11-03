@@ -10,6 +10,7 @@ import pytest
 
 from tests.test_server import TIMEOUT, _close, _connect, _request, _socket_path
 from zeta.server import ZetaServer
+from zeta.server.connections import ConnectionRegistry
 
 
 async def _observer(server: ZetaServer, number: int = 1, features: list[str] | None = None):
@@ -81,6 +82,50 @@ async def test_controller_frames_are_byte_identical_with_observer(tmp_path: Path
             await _close(server, writer)
     assert await hello(tmp_path / "base", False) == await hello(tmp_path / "observer", True)
 
+
+
+
+@pytest.mark.asyncio
+async def test_controller_only_raw_frames_match_origin_main(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        for request in (
+            {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2", "features": ["ping"]}},
+            {"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}},
+            {"jsonrpc": "2.0", "id": 3, "method": "missing", "params": {}},
+        ):
+            writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            await writer.drain()
+        assert [await reader.readline() for _ in range(3)] == [
+            b'{"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.2","server":"zeta","capabilities":{"requests":["list_sessions","new_session","resume","send","steer","approve","deny","abort","status","rename_session","delete_session","session_tree","session_history","switch_branch","fork_message","model_catalog","session_settings","set_settings","set_compaction","send_images","slash_list","slash_run","account_list","account_logout","account_refresh","account_switch","login_start","login_status","login_cancel","login_providers","ping"],"notifications":["event"],"features":["ping"]}}}\n',
+            b'{"jsonrpc":"2.0","id":2,"result":{"pong":true}}\n',
+            b'{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"method not found: missing"}}\n',
+        ]
+    finally:
+        writer.close(); await writer.wait_closed(); await server.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_release_follows_flush_and_blocks_late_output() -> None:
+    events: list[str] = []
+    class FakeConnection:
+        async def _write_physical(self, frame: bytes) -> bool:
+            events.append(f"write:{frame!r}")
+            return True
+        async def close(self) -> None:
+            events.append("close")
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = FakeConnection()
+    registry.register(connection)
+    registry.claim(connection, "controller", frozenset())
+    assert await registry.send(connection, b"frame") is True
+    registry.release(connection)
+    assert events == ["write:b'frame'"]
+    assert await registry.send(connection, b"late") is False
+    assert events == ["write:b'frame'"]
+    await registry.aclose()
 
 @pytest.mark.asyncio
 async def test_controller_slot_releases_after_cleanup_only(tmp_path: Path) -> None:

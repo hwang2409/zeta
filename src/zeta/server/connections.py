@@ -83,7 +83,9 @@ class ConnectionRegistry:
 
     async def send(self, connection: Any, frame: bytes) -> bool:
         state = self._connections.get(connection)
-        if state is None or state.role != "observer":
+        if state is None:
+            return False
+        if state.role != "observer":
             return await connection._write_physical(frame)
         assert state.queue is not None
         if state.queued_bytes + len(frame) > 4 * 1024 * 1024 or state.queue.full():
