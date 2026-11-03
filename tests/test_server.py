@@ -1195,15 +1195,16 @@ async def test_session_history_records_controller_disconnect_approval_abort(
     writer.close()
     await writer.wait_closed()
     try:
-        for _ in range(100):
-            if (
-                server.runtime.policy is not None
-                and not server.runtime.policy.pending_requests()
-            ):
+        # The approval aborts first; the old controller releases only after
+        # its turn is canceled. Reconnect after the release, as a client must.
+        for _ in range(500):
+            if not server._client_active:
                 break
             await asyncio.sleep(0.01)
         else:
-            pytest.fail("approval was not aborted after controller disconnect")
+            pytest.fail("controller was not released after disconnect")
+        assert server.runtime.policy is not None
+        assert not server.runtime.policy.pending_requests()
 
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         hello = await _request(
