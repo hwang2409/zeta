@@ -350,9 +350,8 @@ class _Client:
                         and self.role == "controller"
                     ):
                         self.connections.controller_ready(self)
-                        await self.server.control.controller_ready(
-                            reconnect="approval_reconnect" in self.features
-                        )
+                        if "approval_reconnect" in self.features:
+                            await self.server.control.controller_ready(reconnect=True)
                 if not self.handshaken:
                     break
         finally:
@@ -400,7 +399,7 @@ class _Client:
         async with self._close_lock:
             if self._closed:
                 return
-            if self.role == "controller":
+            if self.role == "controller" and self.connections.is_controller(self):
                 await self.server.control.controller_released(
                     reconnect="approval_reconnect" in self.features
                 )
@@ -421,6 +420,8 @@ class _Client:
                 self.server._client = self
                 reconnect = "approval_reconnect" in self.features
                 await self.server.control.controller_claimed(reconnect=reconnect)
+                if not reconnect:
+                    await self.server.control.controller_ready()
             return True, result
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")

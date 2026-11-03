@@ -191,6 +191,7 @@ async def _replace_registry_controller(
         replacement.features,
     )
     replacement.handshaken = True
+    server.connections.controller_ready(replacement)
     return replacement, writer
 
 

@@ -111,11 +111,14 @@ class ConnectionRegistry:
         state.protocol_version = protocol_version
         state.features = features
 
-    def controller_ready(self, connection: Any) -> None:
+    def is_controller(self, connection: Any) -> bool:
         state = self._connections.get(connection)
-        if state is not self._controller:
+        return state is not None and state is self._controller
+
+    def controller_ready(self, connection: Any) -> None:
+        if not self.is_controller(connection):
             raise RuntimeError("connection does not own the controller claim")
-        state.ready = True
+        self._connections[connection].ready = True
 
     def current_controller(self) -> ControllerMetadata | None:
         state = self._controller
