@@ -1977,6 +1977,97 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
 
 
 @pytest.mark.asyncio
+async def test_approval_reconnect_legacy_claim_during_grace_gets_hello_first_and_no_end_event(
+    tmp_path: Path,
+) -> None:
+    server, _reader, writer, call = await _approval_server(
+        tmp_path, protocol_version="1.2", features=["approval_reconnect"]
+    )
+    replacement: asyncio.StreamWriter | None = None
+    try:
+        await server.control._event(_start_event(call))
+        writer.close()
+        await writer.wait_closed()
+        await _wait_controller_release(server)
+
+        replacement_reader, replacement = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        hello_request = {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "hello",
+            "params": {"protocol_version": "1.2"},
+        }
+        replacement.write((json.dumps(hello_request) + "\n").encode())
+        await replacement.drain()
+        hello = await _read_raw(replacement_reader)
+        assert json.loads(hello)["id"] == 10
+
+        status_request = {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "status",
+            "params": {},
+        }
+        replacement.write((json.dumps(status_request) + "\n").encode())
+        await replacement.drain()
+        status = json.loads(await _read_raw(replacement_reader))
+        assert status["id"] == 11
+    finally:
+        await _close(server, replacement or writer)
+
+
+@pytest.mark.asyncio
+async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, call = await _approval_server(
+        tmp_path, protocol_version="1.2", features=["approval_reconnect"]
+    )
+    replacement: asyncio.StreamWriter | None = None
+    gate = _StoreGate(server.runtime.opened.store, "resolve_approval")
+    try:
+        await server.control._event(_start_event(call))
+        writer.close()
+        await writer.wait_closed()
+        await _wait_controller_release(server)
+
+        grace = server.control._grace_task
+        assert grace is not None
+        grace.cancel()
+        await asyncio.gather(grace, return_exceptions=True)
+        server.approval_reconnect_grace = 0
+        monkeypatch.setattr(
+            server.runtime.opened.store, gate.method, gate.call
+        )
+        server.control._grace_task = asyncio.create_task(server.control._expire_grace())
+        await _wait_thread_gate(gate)
+
+        replacement_reader, replacement = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        hello_request = {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "hello",
+            "params": {
+                "protocol_version": "1.2",
+                "features": ["approval_reconnect"],
+            },
+        }
+        replacement.write((json.dumps(hello_request) + "\n").encode())
+        await replacement.drain()
+        gate.release.set()
+
+        hello = json.loads(await _read_raw(replacement_reader))
+        assert hello["id"] == 10
+    finally:
+        gate.release.set()
+        await _close(server, replacement or writer)
+
+
+@pytest.mark.asyncio
 async def test_approval_reconnect_starting_claim_before_lookup_completion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
