@@ -201,10 +201,34 @@ async def test_websocket_and_unix_socket_share_single_client_limit(
                 "params": {"protocol_version": "1.0"},
             },
         )
-        await _read_json(ws_reader)
+        hello = await _read_json(ws_reader)
+        assert hello["id"] == 1
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
-        error = json.loads(await asyncio.wait_for(reader.readline(), TIMEOUT))
+        writer.write(
+            (json.dumps({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "hello",
+                "params": {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]},
+            }) + "\n").encode()
+        )
+        await writer.drain()
+        observer_hello = json.loads(await asyncio.wait_for(reader.readline(), TIMEOUT))
+        assert observer_hello["id"] == 2
+        occupied_reader, occupied_writer = await asyncio.open_unix_connection(str(server.socket_path))
+        occupied_writer.write(
+            (json.dumps({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "hello",
+                "params": {"protocol_version": "1.0"},
+            }) + "\n").encode()
+        )
+        await occupied_writer.drain()
+        error = json.loads(await asyncio.wait_for(occupied_reader.readline(), TIMEOUT))
         assert error["error"]["code"] == -32001
+        occupied_writer.close()
+        await occupied_writer.wait_closed()
         writer.close()
         await writer.wait_closed()
     finally:
