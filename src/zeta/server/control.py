@@ -214,6 +214,9 @@ class ServeControl:
         await self._attach_pending_notifications()
 
     async def controller_released(self, *, reconnect: bool = False) -> None:
+        if reconnect and self._grace_task is not None:
+            await asyncio.shield(self._grace_task)
+            return
         if reconnect and self._approvals.has_pending_approvals():
             await self._approvals.transition(BeginGrace())
             self._grace_task = asyncio.create_task(self._expire_grace())
