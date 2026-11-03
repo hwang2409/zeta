@@ -34,9 +34,10 @@ Every serve start creates a new random bearer token. New clients should supply
 it in `Sec-WebSocket-Protocol` as `zeta.bearer.<token>`, alongside
 `zeta.v1`. The server echoes only `zeta.v1`. The legacy `token` URL query
 parameter remains supported for existing clients, but is deprecated and will be
-removed after Gamma and Fulcrum switch to the subprotocol. After startup, Zeta
-prints the WebSocket URL without credentials once to stderr; it does not print
-the token to logs. It atomically writes this discovery file with mode `0600` and
+removed after Gamma and Fulcrum switch to the subprotocol. Until then, the
+startup WebSocket URL still includes the query token for existing manual
+connect clients. Zeta does not print the token to logs. It atomically writes this
+discovery file with mode `0600` and
 removes it on clean shutdown:
 
 ```text

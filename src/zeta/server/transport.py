@@ -62,6 +62,18 @@ def validate_origins(origins: Sequence[str]) -> tuple[str, ...]:
     return tuple(validated)
 
 
+def _parse_subprotocol_auth(
+    fields: Sequence[str],
+) -> tuple[str, str | None]:
+    protocols = [item.strip() for field in fields for item in field.split(",")]
+    bearers = [item[12:] for item in protocols if item.startswith("zeta.bearer.")]
+    if not bearers:
+        return ("none", None)
+    if len(bearers) != 1 or "zeta.v1" not in protocols or not bearers[0]:
+        return ("invalid", None)
+    return ("bearer", bearers[0])
+
+
 class WebSocketServer:
     """Own the secure loopback listener and its connection-discovery file."""
 
@@ -115,27 +127,25 @@ class WebSocketServer:
         await asyncio.to_thread(
             print,
             "zeta serve: websocket ready: "
-            f"ws://127.0.0.1:{self.port}/ (auth: subprotocol, query)",
+            f"ws://127.0.0.1:{self.port}/?token={self.token}",
             file=sys.stderr,
         )
 
     def _authorize(
         self, connection: ServerConnection, request: Request
     ) -> Response | None:
-        try:
-            protocols = [
-                item.strip()
-                for item in request.headers.get("Sec-WebSocket-Protocol", "").split(",")
-            ]
-        except MultipleValuesError:
-            protocols = []
-        bearer = [item[12:] for item in protocols if item.startswith("zeta.bearer.")]
-        if bearer:
-            supplied = bearer if len(bearer) == 1 else []
-        else:
-            supplied = parse_qs(urlsplit(request.path).query, keep_blank_values=True).get(
+        auth_kind, bearer = _parse_subprotocol_auth(
+            request.headers.get_all("Sec-WebSocket-Protocol")
+        )
+        if auth_kind == "invalid":
+            return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
+        supplied = (
+            [bearer]
+            if auth_kind == "bearer"
+            else parse_qs(urlsplit(request.path).query, keep_blank_values=True).get(
                 "token", []
             )
+        )
         if (
             self.token is None
             or len(supplied) != 1
