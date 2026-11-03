@@ -713,10 +713,11 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         request_id: str | tuple[str, str],
         *,
         child_instance_id: str | None = None,
+        reason: str = "turn_canceled",
     ) -> bool:
         delegated = self._delegated_entry(request_id, child_instance_id)
         if delegated is not None:
-            return delegated[1].resolve_approval(delegated[0].request_id, "abort")
+            return delegated[1].resolve_approval(delegated[0].request_id, "abort", reason=reason)
         if isinstance(request_id, tuple):
             return False
         ephemeral = self._ephemeral.get(request_id)
@@ -724,7 +725,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             self._ephemeral[request_id] = (ephemeral[0], "abort")
             return True
         store = self._require_store()
-        return store.resolve_approval(request_id, "abort")
+        return store.resolve_approval(request_id, "abort", reason=reason)
 
     def abort_or_winner(
         self,

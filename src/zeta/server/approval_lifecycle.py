@@ -36,6 +36,7 @@ class _TrackedApproval:
             "request_id": self.request_id,
             "tool_call": self.tool_call,
             "data": data,
+            **({"reason": data["reason"]} if "reason" in data else {}),
         }
 
 

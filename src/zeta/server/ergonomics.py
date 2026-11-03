@@ -26,6 +26,7 @@ from ..protocol.types import (
     is_passive_harness_message,
     with_message_origin,
 )
+from . import event_contract
 from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
 from .runtime import ServerRuntime
 
@@ -160,18 +161,36 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
     entries = [
         entry
         for entry in runtime.opened.store.replay()
-        if entry.type in {"message", "notification"}
+        if entry.type in {"message", "notification", "approval_resolution"}
         and not (
             entry.type == "message"
             and is_passive_harness_message(entry.data["message"])
         )
     ]
+    approval_calls = {
+        request["request_id"]: request["tool_call"]
+        for entry in entries
+        if entry.type == "message"
+        for request in entry.data.get("approval_requests", [])
+    }
     rows = []
     codec = FrameCodec()
     # Reserve the largest legal JSON-escaped request id, including the envelope.
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
     for entry in entries[offset : offset + 8]:
-        if entry.type == "notification":
+        if entry.type == "approval_resolution":
+            payload = event_contract.approval_end({
+                "request_id": entry.data["request_id"],
+                "tool_call": approval_calls.get(entry.data["request_id"]),
+                "data": {
+                    "decision": entry.data["decision"],
+                    **({"reason": entry.data["reason"]} if "reason" in entry.data else {}),
+                },
+                "decision": entry.data["decision"],
+                **({"reason": entry.data["reason"]} if "reason" in entry.data else {}),
+            })
+            row = {"id": entry.id, "role": "system", "event": "approval_end", **payload}
+        elif entry.type == "notification":
             data = entry.data
             kind = data.get("kind", "agent_completion")
             if kind == "task_exited":
@@ -190,6 +209,13 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
             }
         else:
             message = entry.data["message"]
+            for approval in entry.data.get("approval_requests", []):
+                rows.append({
+                    "id": entry.id,
+                    "role": "system",
+                    "event": "approval_request",
+                    **event_contract.approval_request(approval),
+                })
             content = []
             for block in message.get("content", []):
                 if block.get("type") == "image":

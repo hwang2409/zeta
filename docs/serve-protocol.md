@@ -635,7 +635,9 @@ on the wire.
 `approval_request` carries `request_id` and `tool_call`. It also carries
 `delegated: true` and `agent_instance_id` for delegated approvals. `approval_end`
 carries the same `request_id` as its matching `approval_request`, the tool call,
-and empty or loop-provided `data`. For delegated approvals, the request ID is an
+and empty or loop-provided `data`. When an approval is aborted, `reason` may be
+present with one of `controller_disconnected`, `turn_canceled`, `timeout`,
+`shutdown`, or `child_cleanup`; `grace_expired` is reserved for reconnect work. For delegated approvals, the request ID is an
 opaque server-issued key, even when the parent and child use the same raw tool
 call ID.
 
@@ -983,7 +985,10 @@ error code and message. Provider status and origin remain internal.
   return `-32602`. Fork and switch affect conversation state, not workspace files.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end), eight messages per page. Each
-  message has `id`, `role`, `content`, and optional `tool_result`. Text and tool
+  message has `id`, `role`, `content`, and optional `tool_result`. Durable
+  approval lifecycle rows use `event: approval_request` and `event:
+  approval_end` with the same fields as the live events, at the transcript
+  position of the anchored request and resolution. Text and tool
   output previews are bounded to 8,000 bytes. Image content becomes
   `{"type":"attachment","name":"shot.png","size":123}`; base64 stays off this
   response. Tool-use content retains the existing `tool_call` shape.

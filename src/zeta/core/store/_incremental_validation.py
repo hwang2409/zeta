@@ -234,6 +234,20 @@ class IncrementalValidationMixin:
                 raise ConversationIntegrityError(
                     f"approval resolution is not linked to request: {request_id}"
                 )
+            reason = entry.data.get("reason")
+            if reason is not None and (
+                type(reason) is not str
+                or entry.data.get("decision") != "abort"
+                or reason not in {
+                    "controller_disconnected",
+                    "turn_canceled",
+                    "timeout",
+                    "shutdown",
+                    "child_cleanup",
+                    "grace_expired",
+                }
+            ):
+                raise ConversationIntegrityError("invalid approval resolution reason")
             if request_id in self._active_approval_resolutions:
                 raise ConversationIntegrityError(
                     f"duplicate approval resolution: {request_id}"

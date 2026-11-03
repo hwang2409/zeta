@@ -1106,6 +1106,14 @@ class _Client:
         data: dict[str, object] | None = None,
         suppress_write_errors: bool = False,
     ) -> None:
+        data = dict(data or {})
+        policy = self.server.runtime.policy
+        if policy is not None and isinstance(key, str):
+            state = policy.durable_decision(key)
+            if state is not None:
+                data.setdefault("decision", state)
+                if state == "abort" and "reason" not in data:
+                    data["reason"] = "turn_canceled"
         payload = self._approvals.end(key, data=data)
         if payload is None:
             return
@@ -1139,13 +1147,14 @@ class _Client:
                 if foreground_only and request.child_instance_id is not None:
                     continue
                 with contextlib.suppress(ValueError, RuntimeError):
-                    policy.abort(request.key)
+                    policy.abort(request.key, reason="controller_disconnected")
         for key in self._approvals.active_keys():
             if foreground_only and not isinstance(key, str):
                 continue
             await self._end_approval(
                 key,
                 self.server.runtime.session_id if self.server.runtime.opened else None,
+                data={"reason": "controller_disconnected"},
                 suppress_write_errors=suppress_write_errors,
             )
 

@@ -80,6 +80,24 @@ from .runtime_lease import (
     close_store_leases,
 )
 
+APPROVAL_RESOLUTION_REASONS = {
+    "controller_disconnected",
+    "turn_canceled",
+    "timeout",
+    "shutdown",
+    "child_cleanup",
+    "grace_expired",
+}
+
+
+def _validate_approval_reason(decision: str, reason: str | None) -> None:
+    if reason is not None and (
+        type(reason) is not str
+        or decision != "abort"
+        or reason not in APPROVAL_RESOLUTION_REASONS
+    ):
+        raise ValueError("invalid approval resolution reason")
+
 
 class ConversationStore(
     AsyncDurableWritesMixin,
@@ -519,6 +537,7 @@ class ConversationStore(
                     raise ValueError("approval resolution id must be a nonempty string")
                 if decision not in {"allow", "deny", "abort"}:
                     raise ValueError("invalid approval resolution")
+                _validate_approval_reason(decision, entry.data.get("reason"))
             elif entry.type == "notification":
                 kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
                 if kind in NOTIFICATION_KINDS:
@@ -1006,17 +1025,20 @@ class ConversationStore(
         request_id: str,
         decision: str,
         *,
+        reason: str | None = None,
         parent_id: str | None = None,
     ) -> ConversationEntry:
         if type(request_id) is not str or not request_id:
             raise ValueError("approval resolution id must be a nonempty string")
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
+        _validate_approval_reason(decision, reason)
         with self._append_lock():
             entry = self._resolve_approval_unlocked(
                 request_id,
                 decision,
                 parent_id,
+                reason,
             )
             if entry is None:
                 raise ConversationIntegrityError(
@@ -1024,7 +1046,9 @@ class ConversationStore(
                 )
             return self._snapshot_entry(entry)
 
-    def resolve_approval(self, request_id: str, decision: str) -> bool:
+    def resolve_approval(
+        self, request_id: str, decision: str, *, reason: str | None = None
+    ) -> bool:
         """Resolve one pending request atomically.
 
         The state check and resolution append share one file lock.
@@ -1034,14 +1058,16 @@ class ConversationStore(
             raise ValueError("approval resolution id must be a nonempty string")
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
+        _validate_approval_reason(decision, reason)
         with self._append_lock():
-            return self._resolve_approval_unlocked(request_id, decision) is not None
+            return self._resolve_approval_unlocked(request_id, decision, reason=reason) is not None
 
     def _resolve_approval_unlocked(
         self,
         request_id: str,
         decision: str,
         parent_id: str | None = None,
+        reason: str | None = None,
     ) -> ConversationEntry | None:
         branch = self.replay()
         states = self._approval_states_from_branch(branch)
@@ -1066,11 +1092,10 @@ class ConversationStore(
             raise ConversationIntegrityError(
                 f"approval resolution parent is not descended from request: {request_id}"
             )
-        return self._append_row_unlocked(
-            "approval_resolution",
-            {"request_id": request_id, "decision": decision},
-            parent_id,
-        )
+        data = {"request_id": request_id, "decision": decision}
+        if reason is not None:
+            data["reason"] = reason
+        return self._append_row_unlocked("approval_resolution", data, parent_id)
 
     def approval_states(self) -> dict[str, tuple[ToolCall, str | None]]:
         """Return strict approval state after waiting for concurrent writers."""

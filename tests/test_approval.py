@@ -383,6 +383,24 @@ def test_resolution_rejects_a_parent_outside_the_request_ancestry(
     )
 
 
+def test_approval_resolution_reason_is_bounded_and_abort_only(approval_root: Path) -> None:
+    store = ConversationStore(approval_root, session_id="reason")
+    call = ToolCall("reason-call", "echo", {})
+    store.append_approval_request(call.id, call)
+    store.append_approval_resolution(call.id, "abort", reason="controller_disconnected")
+    assert store.entries[-1].data["reason"] == "controller_disconnected"
+    with pytest.raises(ValueError):
+        store.append_approval_resolution(call.id, "allow", reason="shutdown")
+
+
+def test_unknown_approval_resolution_reason_is_rejected(approval_root: Path) -> None:
+    store = ConversationStore(approval_root, session_id="unknown-reason")
+    call = ToolCall("unknown-reason-call", "echo", {})
+    store.append_approval_request(call.id, call)
+    with pytest.raises(ValueError):
+        store.append_approval_resolution(call.id, "abort", reason="not-a-reason")
+
+
 def test_two_stores_do_not_abort_a_request_before_atomic_anchor_append(
     approval_root: Path,
 ) -> None:
