@@ -497,11 +497,13 @@ server executes the pending tool through the existing loop seam.
 
 Approval decisions are acknowledged only after their durable row is confirmed.
 If the write fails and an authoritative read finds no terminal row, the server
-fails closed: it returns `-32000`, emits one `server_error`, cancels the affected
-turn, and does not emit a false `approval_end`. The request remains a terminal
-in-memory tombstone for the session, so later decisions return `-32006`. If the
-authoritative read finds that the requested decision was durable despite the
-write error, the server completes it once as a normal success.
+fails closed: it returns `-32000`, emits one `server_error`, and cancels the
+affected turn. Cancellation makes one final durable abort attempt. Whether that
+attempt succeeds or fails, the server emits one terminal `approval_end` and
+removes the live approval record. If terminal persistence still fails, the
+loaded session remains unhealthy and rejects later mutations with `-32000`. If
+an authoritative read finds that the requested decision was durable despite
+the write error, the server completes it once as a normal success.
 
 ### `abort`
 

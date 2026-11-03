@@ -1036,6 +1036,78 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
 
 
 @pytest.mark.asyncio
+async def test_persistent_failure_removes_many_live_child_approvals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, _call = await _approval_server(tmp_path)
+    stores: list[ConversationStore] = []
+    events: list[str] = []
+    original_notify = server.control._notify
+
+    async def record_notify(event: str, *args: object, **kwargs: object) -> bool:
+        events.append(event)
+        return await original_notify(event, *args, **kwargs)
+
+    monkeypatch.setattr(server.control, "_notify", record_notify)
+    assert server.runtime.loop is not None
+    monkeypatch.setattr(server.runtime.loop, "abort", lambda **kwargs: None)
+    policy = server.runtime.policy
+    assert policy is not None
+    try:
+        for index in range(4):
+            child_id = f"child-{index}"
+            call = ToolCall(f"child-call-{index}", "read", {"path": "input"})
+            store = ConversationStore(tmp_path / child_id)
+            stores.append(store)
+            store.append_message_with_approval_requests(
+                Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+                [(call.id, call)],
+            )
+            request = ApprovalRequest(call.id, call, child_instance_id=child_id)
+            policy.register_delegated(request, store, child_instance_id=child_id)
+            await server.control._event(
+                StreamEvent(
+                    StreamEventType.TOOL_APPROVAL_START,
+                    tool_call=call,
+                    data={"agent_instance_id": child_id},
+                ),
+                session_id="parent",
+                background=True,
+            )
+            monkeypatch.setattr(
+                store,
+                "resolve_approval",
+                lambda *args, **kwargs: (_ for _ in ()).throw(
+                    OSError("disk failed")
+                ),
+            )
+
+        first_key = ("child-0", "child-call-0")
+        with pytest.raises(ProtocolError) as error:
+            await server.control.resolve_approval(
+                "approve", server.control._approvals.wire_id(first_key)
+            )
+        assert error.value.code == -32000
+
+        for index in range(4):
+            await server.control.request_approval_abort(
+                f"child-call-{index}",
+                child_instance_id=f"child-{index}",
+                reason="child_cleanup",
+            )
+        await server.control.wait_for_approval_settlement()
+
+        assert events.count("error") == 1
+        assert events.count("approval_end") == 4
+        assert not server.control.has_pending_approvals()
+        assert server.control._approvals.state.records == {}
+    finally:
+        await _close(server, writer)
+        for store in stores:
+            store.close()
+
+
+@pytest.mark.asyncio
 async def test_legacy_status_bytes_match_main_off_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -538,6 +538,18 @@ class ServeControl:
             and token == record.token
         )
         if resolution is None:
+            if (
+                owns_record
+                and decision == "abort"
+                and self._approvals.state.health is not None
+            ):
+                synthetic = {
+                    "request_id": target.store_request_id,
+                    "decision": "abort",
+                    "reason": reason or "turn_canceled",
+                }
+                await self._finish_record(record, synthetic)
+                return synthetic
             if owns_record:
                 self._approvals.transition(
                     "fail",
