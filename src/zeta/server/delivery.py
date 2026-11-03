@@ -62,7 +62,9 @@ class DeliveryRequests:
             params,
             enabled="model_input_ids" in features,
         )
-        await control.user_message(value.display_text, "send", features)
+        await control.user_message(
+            value.display_text, "send", features, delivery_id=delivery_id
+        )
         if delivery_id is None:
             control.start_turn(
                 value.text,
@@ -120,7 +122,7 @@ class DeliveryRequests:
         message = with_message_origin(
             Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
         )
-        await control.user_message(text, "steer", features)
+        await control.user_message(text, "steer", features, delivery_id=delivery_id)
         if delivery_id is None:
             loop.steer(message)
             return {"accepted": True}

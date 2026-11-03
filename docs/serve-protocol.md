@@ -707,10 +707,15 @@ It carries `text` (the user text, bounded to 262,144 UTF-8 bytes), `mode`
 (`"send"` or `"steer"`; `send_images` uses `"send"`), and `attachments`, an
 array of `{name, mime_type, size}` objects (empty for text-only messages; no
 image data). Observers and reconnecting clients use it to rebuild the
-transcript.
+transcript. When `user_message_delivery_id`, `delivery_id`, and
+`user_message_event` are all negotiated, an accepted `send` or `steer` that
+carried a delivery ID also has `delivery_id`. The field is omitted for requests
+without an ID. The same opt-in field appears on matching user rows from
+`session_history` and survives restart. The echo is emitted at request
+acceptance; applying queued steering does not emit it again.
 
 ```json
-{"jsonrpc":"2.0","method":"event","params":{"event":"user_message","session_id":"abc123","text":"hello","mode":"send","attachments":[]}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"user_message","session_id":"abc123","text":"hello","mode":"send","attachments":[],"delivery_id":"send-7"}}
 ```
 
 `error` is a loud structured event. It carries `error` with `code` and
@@ -865,7 +870,7 @@ Event fields are:
 | `child_message_delivered` | `event`, `data: object` | `session_id` |
 | `retry` | `event`, `data: object` | `session_id` |
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
-| `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id` |
+| `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
 and `is_stall: boolean`. It is an informational notice that a retry is
@@ -1126,6 +1131,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | --- | --- |
 | `session_cwd` | `new_session` accepts `cwd` |
 | `user_message_event` | `send`, `steer`, and `send_images` emit `user_message` |
+| `user_message_delivery_id` | with `user_message_event` and `delivery_id`, adds `delivery_id` to matching `user_message` events and `session_history` user rows |
 | `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
 | `memory_updated` | automatic reconciliation emits `memory_updated` with a short `message` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
