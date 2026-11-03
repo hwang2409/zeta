@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -98,22 +98,18 @@ class DeliveryRequests:
                 raise
             canceled_after_commit = True
 
-        async def effects() -> None:
-            try:
-                await control.user_message(
-                    value.display_text, "send", features, delivery_id=delivery_id
-                )
-            finally:
-                control.start_turn(
-                    value.text,
-                    origin=value.origin,
-                    user_message=message,
-                    persist_user_message=False,
-                )
-
-        await _run_delivery_effects(effects)
-        if canceled_after_commit:
-            raise asyncio.CancelledError
+        await _deliver_after_commit(
+            lambda: control.user_message(
+                value.display_text, "send", features, delivery_id=delivery_id
+            ),
+            lambda: control.start_turn(
+                value.text,
+                origin=value.origin,
+                user_message=message,
+                persist_user_message=False,
+            ),
+            canceled=canceled_after_commit,
+        )
         return outcome
 
     async def steer(
@@ -154,17 +150,13 @@ class DeliveryRequests:
                 raise
             canceled_after_commit = True
 
-        async def effects() -> None:
-            try:
-                await control.user_message(
-                    text, "steer", features, delivery_id=delivery_id
-                )
-            finally:
-                loop.steer(tagged)
-
-        await _run_delivery_effects(effects)
-        if canceled_after_commit:
-            raise asyncio.CancelledError
+        await _deliver_after_commit(
+            lambda: control.user_message(
+                text, "steer", features, delivery_id=delivery_id
+            ),
+            lambda: loop.steer(tagged),
+            canceled=canceled_after_commit,
+        )
         return outcome
 
     def finalize_turn(
@@ -250,26 +242,39 @@ class DeliveryRequests:
         return None
 
 
-async def _run_delivery_effects(operation: Callable[[], Any]) -> None:
-    """Finish post-commit effects before reporting caller cancellation."""
-    task = asyncio.create_task(operation())
-    canceled = False
-    cancel_sent = False
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            canceled = True
-            if not cancel_sent:
-                task.cancel()
-                cancel_sent = True
+async def _deliver_after_commit(
+    echo: Callable[[], Coroutine[Any, Any, None]],
+    work: Callable[[], object],
+    *,
+    canceled: bool,
+) -> None:
+    """Run the best-effort echo, then the committed work exactly once.
+
+    The work runs in this frame's ``finally``, never inside the echo task, so no
+    cancel or echo failure can skip it. A caller already canceled at commit gets
+    no echo. The first cancel during the echo reaches the echo task once, so the
+    bounded frame-write abort runs; later cancels wait for it. A caller cancel is
+    re-raised after the work; otherwise an echo error is.
+    """
+    error: BaseException | None = None
     try:
-        task.result()
-    except BaseException:
         if not canceled:
-            raise
+            task = asyncio.create_task(echo())
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if not canceled:
+                        canceled = True
+                        task.cancel()
+            if not task.cancelled():
+                error = task.exception()
+    finally:
+        work()
     if canceled:
         raise asyncio.CancelledError
+    if error is not None:
+        raise error
 
 
 def _require_feature(

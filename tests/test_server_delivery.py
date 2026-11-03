@@ -189,12 +189,13 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
         await request_task
 
     assert store.client_delivery("cancel-1") is not None
-    assert effects == (["echo", "start"] if method == "send" else ["echo", "steer"])
+    # canceled at commit: no echo, the work still runs once
+    assert effects == (["start"] if method == "send" else ["steer"])
     duplicate = await getattr(
         requests, method
     )({"text": "hello", "delivery_id": "cancel-1"}, features)
     assert duplicate["duplicate"] is True
-    assert effects == (["echo", "start"] if method == "send" else ["echo", "steer"])
+    assert effects == (["start"] if method == "send" else ["steer"])
     store.close()
 
 
@@ -1302,3 +1303,32 @@ async def test_cancel_cleans_up_echo_and_runs_committed_work(method: str) -> Non
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(request, 1)
     assert control.start_calls + control.steer_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["send", "steer"])
+async def test_cancel_during_commit_runs_work_without_waiting_for_echo(method: str) -> None:
+    control = _Control(steer=method == "steer")
+    control.echo_stalls = True
+    requests = DeliveryRequests(control)
+    request: asyncio.Task[dict[str, object]] | None = None
+    commit = control.store.append_client_delivery_async
+
+    async def append_then_cancel(*args, **kwargs) -> None:
+        await commit(*args, **kwargs)
+        assert request is not None
+        request.cancel()  # the first cancel lands after the row is durable
+        await asyncio.sleep(0)
+
+    control.store.append_client_delivery_async = append_then_cancel
+    request = asyncio.create_task(
+        getattr(requests, method)(
+            {"text": "hello", "delivery_id": f"{method}-commit-cancel"},
+            frozenset({"delivery_id", "user_message_event"}),
+        )
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(request), 1)
+    assert control.start_calls + control.steer_calls == 1
+    assert not control.echo_started.is_set()

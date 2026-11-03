@@ -373,7 +373,8 @@ the item is added to the running loop's queue. A failed durable append therefore
 does not start a turn or add steering. After a committed append, the user-message
 echo is attempted before the turn's events can reach the client, but it is best
 effort: the start or queue effect runs exactly once even if the echo fails, stalls,
-or is canceled. Cancellation before a commit produces no row or effect.
+or is canceled. A request already canceled when its append commits gets no
+echo, only the effect. Cancellation before a commit produces no row or effect.
 
 Repeating a retained queued or delivered ID returns the original result with
 `duplicate: true`. It does not validate changed text against the first request,
