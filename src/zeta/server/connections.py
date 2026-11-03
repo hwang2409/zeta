@@ -53,7 +53,31 @@ class ConnectionRegistry:
             raise RuntimeError("connection limit reached")
         self._connections[connection] = _Connection(connection)
 
-    def claim(self, connection: Any, role: str, features: frozenset[str]) -> None:
+    def negotiate_role(
+        self,
+        connection: Any,
+        requested_role: object,
+        protocol_version: str,
+        features: frozenset[str],
+    ) -> str:
+        if requested_role not in {"controller", "observer"}:
+            raise ProtocolError(-32602, "role must be 'controller' or 'observer'")
+        role = str(requested_role)
+        if role == "observer" and (
+            protocol_version == "1.0" or "serve_observers" not in features
+        ):
+            raise ProtocolError(
+                -32602, "observer requires protocol 1.1 and serve_observers"
+            )
+        try:
+            self._claim(connection, role, features)
+        except RuntimeError as exc:
+            if role == "observer":
+                raise ProtocolError(-32004, "observer limit reached") from exc
+            raise ProtocolError(-32001, "another client is already connected") from exc
+        return role
+
+    def _claim(self, connection: Any, role: str, features: frozenset[str]) -> None:
         state = self._connections[connection]
         if state.role is not None:
             raise ValueError("connection already claimed")
@@ -61,14 +85,12 @@ class ConnectionRegistry:
             if self._controller is not None:
                 raise RuntimeError("controller occupied")
             self._controller = state
-        elif role == "observer":
+        else:
             if len(self._observers) >= 8:
                 raise RuntimeError("observer limit reached")
             state.queue = asyncio.Queue(maxsize=256)
             state.writer_task = asyncio.create_task(self._observer_writer(state))
             self._observers.append(state)
-        else:
-            raise ValueError("invalid role")
         state.role = role
         state.features = features
 
@@ -177,11 +199,36 @@ class ConnectionRegistry:
         else:
             future.set_exception(error)
 
-    def allows(self, connection: Any, method: str, params: dict[str, Any]) -> bool:
+    async def route_request(
+        self, connection: Any, method: str, params: dict[str, Any]
+    ) -> tuple[bool, object]:
         state = self._connections.get(connection)
         if state is None or state.role != "observer":
-            return True
-        return method in OBSERVER_REQUESTS and not (method == "list_sessions" and "project_id" in params)
+            return False, None
+        if method not in OBSERVER_REQUESTS or (
+            method == "list_sessions" and "project_id" in params
+        ):
+            raise ProtocolError(
+                -32008,
+                "method is unavailable to read-only observers",
+                {"code": OBSERVER_READ_ONLY_CODE, "method": method},
+            )
+        if method not in {
+            "list_sessions",
+            "status",
+            "session_tree",
+            "session_history",
+            "model_catalog",
+            "session_settings",
+        }:
+            return False, None
+        target = capture_observer_read(connection, method, params)
+        result = await self.run_observer_read(
+            connection, lambda: read_observer(method, target, params)
+        )
+        if target[0] is not None and connection.server.runtime.session_id != target[0]:
+            raise ProtocolError(-32003, "session is not active")
+        return True, result
 
     async def aclose(self) -> None:
         self._closed = True

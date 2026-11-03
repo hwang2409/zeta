@@ -29,13 +29,7 @@ from . import (
     slash_commands,
 )
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
-from .connections import (
-    OBSERVER_READ_ONLY_CODE,
-    OBSERVER_REQUESTS,
-    ConnectionRegistry,
-    capture_observer_read,
-    read_observer,
-)
+from .connections import OBSERVER_REQUESTS, ConnectionRegistry
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .notification_presentation import NotificationPresentation
 from .project_requests import (
@@ -390,18 +384,12 @@ class _Client:
             return result
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
-        if self.role == "observer":
-            assert self.server.connections is not None
-            if not self.server.connections.allows(self, method, params):
-                raise ProtocolError(-32008, "method is unavailable to read-only observers", {"code": OBSERVER_READ_ONLY_CODE, "method": method})
-            if method in {"list_sessions", "status", "session_tree", "session_history", "model_catalog", "session_settings"}:
-                target = capture_observer_read(self, method, params)
-                result = await self.server.connections.run_observer_read(
-                    self, lambda: read_observer(method, target, params)
-                )
-                if target[0] is not None and self.server.runtime.session_id != target[0]:
-                    raise ProtocolError(-32003, "session is not active")
-                return result
+        assert self.server.connections is not None
+        handled, result = await self.server.connections.route_request(
+            self, method, params
+        )
+        if handled:
+            return result
         if method in login.REQUESTS:
             if self.protocol_version == "1.0":
                 raise ProtocolError(-32601, "login is unavailable on this server")
@@ -484,9 +472,6 @@ class _Client:
             raise ProtocolError(-32600, "hello may only be sent once")
         version = params.get("protocol_version")
         client_version = params.get("client_version")
-        role = params.get("role", "controller")
-        if role not in {"controller", "observer"}:
-            raise ProtocolError(-32602, "role must be 'controller' or 'observer'")
         self.protocol_version = negotiate_protocol_version(version, client_version)
         requested = params.get("features")
         if requested is not None and (
@@ -499,17 +484,13 @@ class _Client:
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
         self.features = frozenset(accepted)
-        if role == "observer" and (
-            self.protocol_version == "1.0" or "serve_observers" not in self.features
-        ):
-            raise ProtocolError(-32602, "observer requires protocol 1.1 and serve_observers")
         assert self.server.connections is not None
-        try:
-            self.server.connections.claim(self, role, self.features)
-        except RuntimeError as exc:
-            if role == "observer":
-                raise ProtocolError(-32004, "observer limit reached") from exc
-            raise ProtocolError(-32001, "another client is already connected") from exc
+        role = self.server.connections.negotiate_role(
+            self,
+            params.get("role", "controller"),
+            self.protocol_version,
+            self.features,
+        )
         self.role = role
         if role == "controller":
             self.server.runtime.set_post_stream_provider_retry(
