@@ -1504,12 +1504,25 @@ async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
         "import time; time.sleep(0.3)\n" + tool_spawn_module._LAUNCHER,
     )
     pid_file = tmp_path / "timeout-grandchild.pid"
-    child = "import time; time.sleep(30)"
-    parent = (
-        "import os,pathlib,subprocess,sys,time; "
-        f"child = subprocess.Popen([sys.executable, '-c', {child!r}]); "
+    child = (
+        "import os,pathlib,time; "
         f"pathlib.Path({str(pid_file)!r}).write_text("
-        "f'{child.pid} {os.getpgid(child.pid)}'); time.sleep(30)"
+        "f'{os.getpid()} {os.getpgid(0)}'); time.sleep(30)"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+    )
+    original_spawn = bash_module.create_tool_subprocess_shell
+
+    async def spawn_after_grandchild_started(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        while not pid_file.exists():
+            await asyncio.sleep(0.01)
+        return process
+
+    monkeypatch.setattr(
+        bash_module, "create_tool_subprocess_shell", spawn_after_grandchild_started
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     result = await asyncio.wait_for(
