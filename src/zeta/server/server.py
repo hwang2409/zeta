@@ -245,6 +245,7 @@ class _Client:
         if server.connections is None:
             server.connections = ConnectionRegistry(asyncio.get_running_loop())
             server.connections.register(self)
+        self.connections = server.connections
         self.logins = login.Logins(server.home)
         self.handshaken = False
         self.role: str | None = None
@@ -1159,8 +1160,7 @@ class _Client:
             )
 
     async def _write(self, payload: bytes) -> bool:
-        assert self.server.connections is not None
-        return await self.server.connections.send(self, payload)
+        return await self.connections.send(self, payload)
 
     async def _write_physical(self, payload: bytes) -> bool:
         async with self._write_lock:
