@@ -3,6 +3,7 @@ import gc
 import json
 import os
 import random
+import threading
 import weakref
 from datetime import datetime
 from pathlib import Path
@@ -313,6 +314,80 @@ def _new_live_child(
     child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
     remove_live_agent_lifecycle(child.agent_lifecycle_path)
     return child, handle
+
+
+@pytest.mark.asyncio
+async def test_malformed_durable_lifecycle_keeps_valid_live_projection(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    child, handle = _new_live_child(store, 1)
+    _persist_finished_receipt(store, child, "agent-1", handle)
+    live = child.agent_lifecycle()
+    assert live is not None
+    live.update(tool_calls=3, current_step="valid live work")
+    publish_live_agent_lifecycle(child.agent_lifecycle_path, live)
+    child.agent_lifecycle_path.write_text("{", encoding="utf-8")
+
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop, handle)
+    item = status["structuredContent"]["children"][0]
+    assert item["state"] == "running"
+    assert item["tool_calls"] == 3
+    assert item["current_step"] == "valid live work"
+
+    call = ToolCall(
+        "agent-1", "agent", {"prompt": "inspect", "description": "child 1"}
+    )
+    rendered = AgentCard.render_receipt(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "still running",
+                structured_content={
+                    "child_session_path": str(child.session_dir),
+                    "status": "running",
+                    "turns_used": 0,
+                },
+            ),
+        )
+    )
+    assert rendered is not None
+    assert "3 tool calls" in rendered.plain
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_status_does_not_read_lifecycle_files_on_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    for index in range(1, 9):
+        child, handle = _new_live_child(store, index)
+        _persist_finished_receipt(store, child, f"agent-{index}", handle)
+
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+    original = agent_tools._read_child_file
+
+    def tracked_read(*args: object, **kwargs: object) -> bytes:
+        read_threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(agent_tools, "_read_child_file", tracked_read)
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop)
+
+    assert len(status["structuredContent"]["children"]) == 8
+    assert len(read_threads) == 8
+    assert loop_thread not in read_threads
+    await loop.close()
 
 
 @pytest.mark.asyncio
