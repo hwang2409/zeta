@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -62,8 +62,8 @@ class DeliveryRequests:
             params,
             enabled="model_input_ids" in features,
         )
-        await control.user_message(value.display_text, "send", features)
         if delivery_id is None:
+            await control.user_message(value.display_text, "send", features)
             control.start_turn(
                 value.text,
                 origin=value.origin,
@@ -84,21 +84,31 @@ class DeliveryRequests:
             "session_id": runtime.session_id,
         }
 
-        def start_turn() -> None:
-            control.start_turn(
+        canceled_after_commit = False
+        try:
+            await runtime.opened.store.append_client_delivery_async(
+                delivery_id,
+                "send",
+                "delivered",
+                outcome,
+                message=message,
+            )
+        except asyncio.CancelledError:
+            if runtime.opened.store.client_delivery(delivery_id) is None:
+                raise
+            canceled_after_commit = True
+
+        await _deliver_after_commit(
+            lambda: control.user_message(
+                value.display_text, "send", features, delivery_id=delivery_id
+            ),
+            lambda: control.start_turn(
                 value.text,
                 origin=value.origin,
                 user_message=message,
                 persist_user_message=False,
-            )
-
-        await runtime.opened.store.append_client_delivery_async(
-            delivery_id,
-            "send",
-            "delivered",
-            outcome,
-            message=message,
-            on_persisted=start_turn,
+            ),
+            canceled=canceled_after_commit,
         )
         return outcome
 
@@ -120,19 +130,32 @@ class DeliveryRequests:
         message = with_message_origin(
             Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
         )
-        await control.user_message(text, "steer", features)
         if delivery_id is None:
+            await control.user_message(text, "steer", features)
             loop.steer(message)
             return {"accepted": True}
 
         outcome: dict[str, object] = {"accepted": True}
         tagged = tag_client_delivery(message, delivery_id)
-        await runtime.opened.store.append_client_delivery_async(
-            delivery_id,
-            "steer",
-            "queued",
-            outcome,
-            on_persisted=lambda: loop.steer(tagged),
+        canceled_after_commit = False
+        try:
+            await runtime.opened.store.append_client_delivery_async(
+                delivery_id,
+                "steer",
+                "queued",
+                outcome,
+            )
+        except asyncio.CancelledError:
+            if runtime.opened.store.client_delivery(delivery_id) is None:
+                raise
+            canceled_after_commit = True
+
+        await _deliver_after_commit(
+            lambda: control.user_message(
+                text, "steer", features, delivery_id=delivery_id
+            ),
+            lambda: loop.steer(tagged),
+            canceled=canceled_after_commit,
         )
         return outcome
 
@@ -217,6 +240,41 @@ class DeliveryRequests:
                 {"outcome": outcome},
             )
         return None
+
+
+async def _deliver_after_commit(
+    echo: Callable[[], Coroutine[Any, Any, None]],
+    work: Callable[[], object],
+    *,
+    canceled: bool,
+) -> None:
+    """Run the best-effort echo, then the committed work exactly once.
+
+    The work runs in this frame's ``finally``, never inside the echo task, so no
+    cancel or echo failure can skip it. A caller already canceled at commit gets
+    no echo. The first cancel during the echo reaches the echo task once, so the
+    bounded frame-write abort runs; later cancels wait for it. A caller cancel is
+    re-raised after the work; otherwise an echo error is.
+    """
+    error: BaseException | None = None
+    try:
+        if not canceled:
+            task = asyncio.create_task(echo())
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if not canceled:
+                        canceled = True
+                        task.cancel()
+            if not task.cancelled():
+                error = task.exception()
+    finally:
+        work()
+    if canceled:
+        raise asyncio.CancelledError
+    if error is not None:
+        raise error
 
 
 def _require_feature(

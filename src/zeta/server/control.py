@@ -151,17 +151,26 @@ class ServeControl:
         mode: str,
         features: frozenset[str],
         attachments: list[dict[str, object]] | None = None,
+        delivery_id: str | None = None,
     ) -> None:
         """Echo an accepted user message so observers can rebuild the transcript."""
         if "user_message_event" in features:
+            fields: dict[str, object] = {
+                "text": bounded(text, USER_MESSAGE_MAX_BYTES),
+                "mode": mode,
+                "attachments": attachments or [],
+            }
+            if delivery_id is not None and {
+                "delivery_id",
+                "user_message_delivery_id",
+            } <= features:
+                fields["delivery_id"] = delivery_id
             await self._notify(
                 event_contract.AUXILIARY_WIRE_EVENTS[
                     event_contract.AuxiliaryEvent.USER_MESSAGE
                 ],
                 self.server.runtime.session_id,
-                text=bounded(text, USER_MESSAGE_MAX_BYTES),
-                mode=mode,
-                attachments=attachments or [],
+                **fields,
             )
 
     async def resolve_approval(

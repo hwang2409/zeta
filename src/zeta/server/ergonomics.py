@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from ..core.checkpoints import list_branches_from_entries
 from ..core.session_files import child_directory, write_session_file
+from ..core.store._client_delivery import CLIENT_DELIVERY_METADATA
 from ..media.images import image_signature_matches
 from ..models.catalog import PROVIDER_MODELS, known_model_names
 from ..protocol.types import (
@@ -159,7 +160,10 @@ HISTORY_PAGE_ENTRIES = 8
 
 
 def _history_entry_rows(
-    entry: object, approval_calls: Mapping[str, object]
+    entry: object,
+    approval_calls: Mapping[str, object],
+    *,
+    include_delivery_id: bool = False,
 ) -> list[dict[str, object]]:
     """Project one durable entry to one atomic group of history rows."""
 
@@ -249,6 +253,14 @@ def _history_entry_rows(
     failed_turn = _failed_turn_history(message)
     if failed_turn is not None:
         row["failed_turn"] = failed_turn
+    metadata = message.get("metadata")
+    if (
+        include_delivery_id
+        and message["role"] == "user"
+        and isinstance(metadata, dict)
+        and isinstance(metadata.get(CLIENT_DELIVERY_METADATA), str)
+    ):
+        row["delivery_id"] = metadata[CLIENT_DELIVERY_METADATA]
     rows = [row]
     for approval in entry.data.get("approval_requests", []):
         payload = {
@@ -272,7 +284,9 @@ def _history_entry_rows(
     return rows
 
 
-def history(runtime: ServerRuntime, params: dict) -> dict:
+def history(
+    runtime: ServerRuntime, params: dict, *, include_delivery_id: bool = False
+) -> dict:
     offset = params.get("offset", 0)
     if type(offset) is not int or offset < 0:
         raise ProtocolError(-32602, "offset must be a nonnegative integer")
@@ -312,7 +326,9 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
         group = [
             row
             for entry in groups[group_index]
-            for row in _history_entry_rows(entry, approval_calls)
+            for row in _history_entry_rows(
+                entry, approval_calls, include_delivery_id=include_delivery_id
+            )
         ]
         candidate_offset = min(group_index + 1, entry_count)
         candidate = {
