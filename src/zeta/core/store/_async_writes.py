@@ -230,9 +230,12 @@ class AsyncDurableWritesMixin:
             )
         else:
             delta = self._installed_delta_from_baseline(state.entries, baseline)
-        if delta != "reset" and not self._linear_suffix(
-            state.entries, baseline[0]
+        if delta != "reset" and (
+            len(delta) > 64
+            or not self._linear_suffix(state.entries, baseline[0])
         ):
+            # Keep owner publication bounded; large or nonlinear suffixes use
+            # one worker-owned state copy and an owner-thread pointer swap.
             delta = "reset"
         state = replace(state, installed_delta=delta)
         if delta == "reset":
@@ -327,8 +330,10 @@ class AsyncDurableWritesMixin:
                 else:
                     entries = list(installed_delta)
                     if entries:
-                        accepted = self._accept_incremental_entries(entries)
-                        assert accepted
+                        for entry in entries:
+                            accepted = self._accept_incremental_entry(entry)
+                            assert accepted
+                        self._record_client_delivery_entries(entries)
                         self._transcript_generation += 1
                     self._log_identity = state.log_identity
                     self._log_offset = state.log_offset
