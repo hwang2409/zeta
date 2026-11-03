@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
@@ -43,6 +44,8 @@ SessionEventSink = Callable[[str, StreamEvent], None]
 SessionWakeSink = Callable[[str], None]
 MemoryNoticeSink = Callable[[str, str], None]
 TEST_SCRIPTED_PROVIDER_ENV = "ZETA_TEST_SCRIPTED_PROVIDER"
+_SETUP_CANCEL_GRACE_SECONDS = 1.0
+logger = logging.getLogger(__name__)
 
 
 class _TestScriptedBackend(CompletionBackend):
@@ -197,6 +200,7 @@ class ServerRuntime:
         self._background_wake_sink: SessionWakeSink | None = None
         self._memory_notice_sink: MemoryNoticeSink | None = None
         self._post_stream_provider_retry = False
+        self._setup_reapers: set[asyncio.Task[None]] = set()
 
     def backend_for_model(
         self,
@@ -345,25 +349,10 @@ class ServerRuntime:
         """
 
         session_cwd = cwd if cwd is not None else self.cwd
-        prepared = await asyncio.to_thread(
-            self._prepare_new_session, session_cwd, provider, model
-        )
-        config = prepared[0]
-        skill_catalog = prepared[1]
-        agent_catalog = prepared[2]
-        context = prepared[3]
-        session_project = prepared[4]
-        composition = await asyncio.to_thread(
-            self._compose,
-            cwd=session_cwd,
-            config=config,
-            provider=config.provider,
-            model=config.model,
-            project_context=context,
-            skill_catalog=skill_catalog,
-            agent_catalog=agent_catalog,
-            project_id=session_project.project_id if session_project is not None else None,
-            max_turns=self._max_turns,
+        composition = await self._run_setup(
+            session_cwd,
+            provider=provider,
+            model=model,
         )
         await self._replace(composition)
         return self.metadata
@@ -442,41 +431,7 @@ class ServerRuntime:
                 f"session working directory no longer exists: {metadata.cwd}"
             )
 
-        async def setup() -> RuntimeComposition:
-            opened = await asyncio.to_thread(self.manager.open, session_id)
-            try:
-                prepared = await asyncio.to_thread(
-                    self._prepare_resumed_session, opened, session_cwd
-                )
-                config, resumed_prompt = prepared
-                return await asyncio.to_thread(
-                    self._compose,
-                    cwd=session_cwd,
-                    config=config,
-                    provider=opened.metadata.provider,
-                    model=opened.metadata.model,
-                    project_context=resumed_prompt.context,
-                    skill_catalog=resumed_prompt.skill_catalog,
-                    agent_catalog=resumed_prompt.agent_catalog,
-                    opened=opened,
-                    project_id=opened.metadata.project_id,
-                    max_turns=self._max_turns,
-                )
-            except BaseException:
-                await asyncio.to_thread(opened.store.close)
-                raise
-
-        setup_task = asyncio.create_task(setup())
-        try:
-            composition = await asyncio.shield(setup_task)
-        except asyncio.CancelledError:
-            try:
-                composition = await asyncio.shield(setup_task)
-            except BaseException as setup_error:  # noqa: BLE001
-                _ = setup_error
-            else:
-                await self._close_state(SessionState.from_composition(composition))
-            raise
+        composition = await self._run_setup(session_cwd, session_id=session_id)
         await self._replace(composition)
         return self.metadata
 
@@ -484,10 +439,108 @@ class ServerRuntime:
     async def _close_state(state: SessionState) -> None:
         await close_session(state.loop)
 
+    async def _run_setup(
+        self,
+        session_cwd: Path,
+        *,
+        session_id: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> RuntimeComposition:
+        async def setup() -> RuntimeComposition:
+            opened = None
+            try:
+                if session_id is not None:
+                    opened = await asyncio.to_thread(self.manager.open, session_id)
+                    prepared = await asyncio.to_thread(
+                        self._prepare_resumed_session, opened, session_cwd
+                    )
+                    config, resumed_prompt = prepared
+                    kwargs = {
+                        "config": config,
+                        "provider": opened.metadata.provider,
+                        "model": opened.metadata.model,
+                        "project_context": resumed_prompt.context,
+                        "skill_catalog": resumed_prompt.skill_catalog,
+                        "agent_catalog": resumed_prompt.agent_catalog,
+                        "opened": opened,
+                        "project_id": opened.metadata.project_id,
+                    }
+                else:
+                    prepared = await asyncio.to_thread(
+                        self._prepare_new_session, session_cwd, provider, model
+                    )
+                    config, skill_catalog, agent_catalog, context, session_project = prepared
+                    kwargs = {
+                        "config": config,
+                        "provider": config.provider,
+                        "model": config.model,
+                        "project_context": context,
+                        "skill_catalog": skill_catalog,
+                        "agent_catalog": agent_catalog,
+                        "project_id": (
+                            session_project.project_id
+                            if session_project is not None
+                            else None
+                        ),
+                    }
+                return await asyncio.to_thread(
+                    self._compose,
+                    cwd=session_cwd,
+                    max_turns=self._max_turns,
+                    **kwargs,
+                )
+            except BaseException:
+                if opened is not None:
+                    await asyncio.to_thread(opened.store.close)
+                raise
+
+        setup_task = asyncio.create_task(setup())
+        try:
+            return await asyncio.shield(setup_task)
+        except asyncio.CancelledError:
+            try:
+                composition = await asyncio.wait_for(
+                    asyncio.shield(setup_task), _SETUP_CANCEL_GRACE_SECONDS
+                )
+            except TimeoutError:
+                reaper = asyncio.create_task(self._reap_setup(setup_task))
+                self._setup_reapers.add(reaper)
+                reaper.add_done_callback(self._setup_reapers.discard)
+            except BaseException as setup_error:  # noqa: BLE001
+                logger.debug("canceled session setup ended: %s", setup_error)
+            else:
+                await self._close_state(SessionState.from_composition(composition))
+            raise
+
+    async def _reap_setup(self, setup_task: asyncio.Task[RuntimeComposition]) -> None:
+        try:
+            composition = await setup_task
+        except BaseException as exc:  # noqa: BLE001
+            logger.warning("abandoned session setup failed: %s", exc)
+        else:
+            try:
+                await self._close_state(SessionState.from_composition(composition))
+            except BaseException:
+                logger.exception("abandoned session setup cleanup failed")
+            else:
+                logger.warning("abandoned session setup was cleaned up")
+
     async def close(self) -> None:
         state, self._state = self._state, None
         if state is not None:
             await self._close_state(state)
+        if self._setup_reapers:
+            pending = asyncio.gather(*self._setup_reapers)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(pending), _SETUP_CANCEL_GRACE_SECONDS
+                )
+            except TimeoutError:
+                logger.error(
+                    "%d abandoned session setup task(s) still running at shutdown",
+                    len(self._setup_reapers),
+                )
 
     async def _replace(self, composition: RuntimeComposition) -> None:
         state = SessionState.from_composition(composition)
