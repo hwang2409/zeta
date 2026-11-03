@@ -429,11 +429,7 @@ class _Client:
                 features=self.features,
             )
         if method == "list_sessions":
-            assert self.server.connections is not None
-            return await self.server.connections.run_read(
-                self,
-                lambda: self._list_sessions(request_id, params),
-            )
+            return await asyncio.to_thread(self._list_sessions, request_id, params)
         if method == "new_session":
             await self.server.control.require_idle()
             cwd = None

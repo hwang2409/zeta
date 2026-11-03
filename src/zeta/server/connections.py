@@ -303,6 +303,8 @@ class ConnectionRegistry:
         if method in {"session_tree", "session_history"}:
             return True, await self.read_session(connection, method, params)
         target = capture_read(connection, method, params)
+        if method == "list_sessions":
+            return True, await asyncio.to_thread(perform_read, method, target, params)
         result = await self.run_read(
             connection,
             lambda: perform_read(method, target, params),

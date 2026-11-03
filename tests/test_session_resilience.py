@@ -5,7 +5,13 @@ import pytest
 
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.store import ConversationIntegrityError, ConversationStore
-from zeta.protocol.types import MessageOrigin, with_message_origin
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
 
 
 @pytest.mark.parametrize("damage", ["missing", "json", "encoding", "directory"])
@@ -37,9 +43,12 @@ def test_previews_skip_unreadable_sessions(tmp_path: Path, damage: str) -> None:
     else:
         bad.store.path.write_text("broken\n")
 
-    assert [item.session_id for item in manager.list_session_previews()] == [
-        good.metadata.session_id
-    ]
+    previews = manager.list_session_previews()
+    expected = [good.metadata.session_id]
+    if damage != "metadata":
+        expected.insert(0, bad.metadata.session_id)
+        assert previews[0].preview == ""
+    assert [item.session_id for item in previews] == expected
 
 
 @pytest.mark.parametrize("fail_write", [False, True])
@@ -91,17 +100,17 @@ def test_listing_skips_deeply_nested_metadata(tmp_path: Path) -> None:
     assert manager.list_sessions() == [good.metadata]
 
 
-def test_preview_limit_counts_healthy_sessions(tmp_path: Path) -> None:
+def test_preview_limit_counts_catalog_rows(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="codex", model="offline")
+    manager.create(provider="codex", model="offline")
     bad = manager.create(provider="codex", model="offline")
     bad.metadata.updated_at = "2099-01-01T00:00:00+00:00"
     manager._write(bad.metadata)
     bad.store.path.write_text("broken\n")
 
-    assert [item.session_id for item in manager.list_session_previews(limit=1)] == [
-        good.metadata.session_id
-    ]
+    previews = manager.list_session_previews(limit=1)
+    assert [item.session_id for item in previews] == [bad.metadata.session_id]
+    assert previews[0].preview == ""
     assert manager.list_session_previews(limit=0) == []
 
 
@@ -145,7 +154,7 @@ def test_create_preserves_empty_directory_created_during_staging(
 
 
 @pytest.mark.parametrize("filename", ["session_state.json", "agent_lifecycle.json"])
-def test_previews_skip_deeply_nested_state(tmp_path: Path, filename: str) -> None:
+def test_previews_do_not_load_deeply_nested_state(tmp_path: Path, filename: str) -> None:
     manager = SessionManager(tmp_path)
     good = manager.create(provider="codex", model="offline")
     bad = manager.create(provider="codex", model="offline")
@@ -155,9 +164,9 @@ def test_previews_skip_deeply_nested_state(tmp_path: Path, filename: str) -> Non
         ConversationStore(manager.sessions_dir, session_id=bad.metadata.session_id)
     with pytest.raises(SessionError, match="could not be opened"):
         manager.open(bad.metadata.session_id)
-    assert [item.session_id for item in manager.list_session_previews()] == [
-        good.metadata.session_id
-    ]
+    assert {
+        item.session_id for item in manager.list_session_previews()
+    } == {good.metadata.session_id, bad.metadata.session_id}
 
 
 def test_create_preserves_directory_created_at_publication(
@@ -336,26 +345,41 @@ def test_mixed_store_listings_validate_without_mutating(tmp_path: Path) -> None:
     } == before
 
 
-def test_preview_boundary_includes_replay(
+def test_list_sessions_reads_only_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="codex", model="offline")
-    bad = manager.create(provider="codex", model="offline")
-    snapshot = ConversationStore.active_branch_snapshot
+    opened = manager.create(provider="codex", model="offline")
 
-    def fail_snapshot(self):
-        if self.session_id == bad.metadata.session_id:
-            raise ConversationIntegrityError("damaged preview")
-        return snapshot(self)
+    def fail(*args, **kwargs):
+        raise AssertionError("conversation store opened")
 
-    monkeypatch.setattr(ConversationStore, "active_branch_snapshot", fail_snapshot)
-    assert [
-        p.session_id
-        for p in manager.list_session_previews(
-            limit=1, sessions=[bad.metadata, good.metadata]
-        )
-    ] == [good.metadata.session_id]
+    monkeypatch.setattr("zeta.core.session.ConversationStore", fail)
+    assert manager.list_sessions_read_only() == [opened.metadata]
+
+
+def test_preview_reads_bounded_prefix(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="codex", model="offline")
+    store = opened.store
+    store.append_checkpoint("root")
+    store.append_message(with_message_origin(
+        Message(MessageRole.USER, [TextContent("first log message")]),
+        MessageOrigin.USER,
+    ))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
+    store.append_fork("root")
+    store.append_message(with_message_origin(
+        Message(MessageRole.USER, [TextContent("active branch message")]),
+        MessageOrigin.USER,
+    ))
+    assert store.messages()[0].content[0].text == "active branch message"
+    with store.path.open("ab") as conversation:
+        conversation.write(b"not json\n" * 5_000)
+
+    previews = manager.list_session_previews(sessions=[opened.metadata])
+
+    assert [item.preview for item in previews] == ["first log message"]
 
 
 @pytest.mark.parametrize("surface", ["tool", "card"])
@@ -372,24 +396,18 @@ def test_child_lifecycle_readers_reject_decoder_surviving_depth(
 
 
 @pytest.mark.parametrize("fault", [RecursionError, OSError, KeyError])
-@pytest.mark.parametrize("surface", ["listing", "preview"])
 def test_listing_boundaries_propagate_programming_faults(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault, surface: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault
 ) -> None:
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="codex", model="offline")
+    manager.create(provider="codex", model="offline")
 
     def fail(*args, **kwargs):
         raise fault("programming fault")
 
-    if surface == "listing":
-        monkeypatch.setattr(manager, "read_metadata", fail)
-        reader = manager.list_sessions_read_only
-    else:
-        monkeypatch.setattr(ConversationStore, "active_branch_snapshot", fail)
-        reader = lambda: manager.list_session_previews(sessions=[opened.metadata])
+    monkeypatch.setattr(manager, "read_metadata", fail)
     with pytest.raises(fault, match="programming fault"):
-        reader()
+        manager.list_sessions_read_only()
 
 
 @pytest.mark.parametrize(
