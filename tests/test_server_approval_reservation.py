@@ -1012,8 +1012,21 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
         with pytest.raises(ProtocolError) as error:
             await server.control.resolve_approval("approve", call.id)
         assert error.value.code == -32000
-        assert events == [("error", "server_error")]
         assert aborted == [True]
+
+        await server.control.request_approval_abort(
+            call.id,
+            reason="turn_canceled",
+        )
+        await server.control.wait_for_approval_settlement()
+
+        assert events == [
+            ("error", "server_error"),
+            ("approval_end", None),
+        ]
+        assert server.control.pending_approvals_now() == []
+        assert not server.control.has_pending_approvals()
+        assert server.control._approvals.state.records == {}
         with pytest.raises(ProtocolError) as later:
             await server.control.resolve_approval("approve", call.id)
         assert later.value.code == -32000
