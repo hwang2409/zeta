@@ -737,3 +737,216 @@ async def test_slash_and_ergonomics_read_serve_control_not_store(
         assert error.value.code == -32004
     finally:
         await _close(server, writer)
+
+
+_APPROVAL_SETTLEMENT_CASES = [
+    *(
+        pytest.param(
+            requested,
+            "none",
+            write,
+            "foreground",
+            id=f"foreground-{requested}-none-{write}",
+        )
+        for requested in ("allow", "always_tool", "deny")
+        for write in ("ok", "raise")
+    ),
+    *(
+        pytest.param(
+            requested,
+            "cancel",
+            write,
+            "foreground",
+            id=f"foreground-{requested}-cancel-{write}",
+        )
+        for requested in ("allow", "always_tool", "deny")
+        for write in ("ok", "raise")
+    ),
+    pytest.param(
+        "allow", "disconnect", "ok", "foreground", id="foreground-allow-disconnect-ok"
+    ),
+    pytest.param("deny", "expiry", "ok", "foreground", id="foreground-deny-expiry-ok"),
+    pytest.param(
+        "always_tool",
+        "shutdown",
+        "ok",
+        "foreground",
+        id="foreground-always_tool-shutdown-ok",
+    ),
+    *(
+        pytest.param(
+            requested, event, "ok", "delegated", id=f"delegated-{requested}-{event}-ok"
+        )
+        for requested in ("allow", "deny")
+        for event in ("none", "child_cleanup")
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested, competing_event, write_result, path", _APPROVAL_SETTLEMENT_CASES
+)
+async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested: str,
+    competing_event: str,
+    write_result: str,
+    path: str,
+) -> None:
+    """Cover feasible ownership races; always_tool is foreground-only, and child cleanup is delegated-only."""
+    server, reader, writer, foreground_call = await _approval_server(tmp_path)
+    child: ConversationStore | None = None
+    release = threading.Event()
+    try:
+        policy = server.runtime.policy
+        assert policy is not None
+        if path == "foreground":
+            call = foreground_call
+            store = server.runtime.opened.store
+            await server.control._event(_start_event(call))
+            request_id = call.id
+        else:
+            child = ConversationStore(tmp_path / "matrix-child")
+            call = ToolCall("matrix-child-call", "read", {"path": "input"})
+            child.append_message_with_approval_requests(
+                Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+                [(call.id, call)],
+            )
+            request = ApprovalRequest(call.id, call, child_instance_id="child")
+            policy.register_delegated(request, child, child_instance_id="child")
+            await server.control._event(
+                StreamEvent(
+                    StreamEventType.TOOL_APPROVAL_START,
+                    tool_call=call,
+                    data={"agent_instance_id": "child"},
+                ),
+                session_id="parent",
+                background=True,
+            )
+            store = child
+            request_id = server.control._approvals.wire_id(request.key)
+
+        original_resolve = store.resolve_approval
+        entered = threading.Event()
+        calls = 0
+
+        def gated_resolve(*args: object, **kwargs: object) -> bool:
+            nonlocal calls
+            calls += 1
+            entered.set()
+            assert release.wait(timeout=1)
+            if write_result == "raise" and calls == 1:
+                raise OSError("matrix write failed")
+            return original_resolve(*args, **kwargs)
+
+        monkeypatch.setattr(store, "resolve_approval", gated_resolve)
+        method = "deny" if requested == "deny" else "approve"
+        params = {"request_id": request_id}
+        if requested == "always_tool":
+            params["scope"] = "always_tool"
+        rpc = asyncio.create_task(_request(reader, writer, 40, method, params))
+        assert await asyncio.to_thread(entered.wait, TIMEOUT)
+
+        reasons = {
+            "cancel": "turn_canceled",
+            "disconnect": "controller_disconnected",
+            "child_cleanup": "child_cleanup",
+            "expiry": "grace_expired",
+            "shutdown": "controller_disconnected",
+        }
+        if competing_event != "none":
+            original_resolve(call.id, "abort", reason=reasons[competing_event])
+        release.set()
+        frames = await rpc
+        await server.control.wait_for_approval_settlement()
+
+        resolution = store.approval_resolution_data(call.id)
+        assert resolution is not None
+        response = frames[-1]
+        assert "error" not in response
+        expected_rpc = (
+            "approve" if resolution["decision"] == "allow" else resolution["decision"]
+        )
+        assert response["result"]["decision"] == expected_rpc
+        granted = policy.session_allow != frozenset()
+        assert granted is (
+            requested == "always_tool" and resolution["decision"] == "allow"
+        )
+        key = call.id if path == "foreground" else ("child", call.id)
+        assert key not in server.control._approval_records
+        if path == "delegated":
+            history = [
+                entry.data
+                for entry in server.runtime.opened.store.entries
+                if entry.type == "approval_history"
+            ]
+            assert [row["event"] for row in history] == [
+                "approval_request",
+                "approval_end",
+            ]
+    finally:
+        release.set()
+        await _close(server, writer)
+        if child is not None:
+            child.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_delegated_request_write_settles_cleanup_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, _foreground = await _approval_server(tmp_path)
+    child = ConversationStore(tmp_path / "failed-start-child")
+    call = ToolCall("failed-start-call", "read", {"path": "input"})
+    child.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
+    )
+    policy = server.runtime.policy
+    assert policy is not None
+    request = ApprovalRequest(call.id, call, child_instance_id="child")
+    parent = server.runtime.opened.store
+    gate = _StoreGate(parent, "append_approval_history")
+
+    def fail_after_gate(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        gate.entered.set()
+        assert gate.release.wait(timeout=1)
+        raise OSError("request history failed")
+
+    monkeypatch.setattr(parent, gate.method, fail_after_gate)
+    try:
+        policy.register_delegated(request, child, child_instance_id="child")
+        start = asyncio.create_task(
+            server.control._event(
+                StreamEvent(
+                    StreamEventType.TOOL_APPROVAL_START,
+                    tool_call=call,
+                    data={"agent_instance_id": "child"},
+                ),
+                session_id="parent",
+                background=True,
+            )
+        )
+        await _wait_thread_gate(gate)
+        cleanup = policy.cleanup_delegated("child")
+        assert cleanup is not None
+        cleanup_task = asyncio.ensure_future(cleanup)
+        gate.release.set()
+        await asyncio.gather(start, cleanup_task)
+
+        assert child.approval_resolution_data(call.id) == {
+            "request_id": call.id,
+            "decision": "abort",
+            "reason": "child_cleanup",
+        }
+        assert ("child", call.id) not in server.control._approval_records
+        history = [
+            entry.data for entry in parent.entries if entry.type == "approval_history"
+        ]
+        assert history == []
+    finally:
+        gate.release.set()
+        await _close(server, writer)
+        child.close()
