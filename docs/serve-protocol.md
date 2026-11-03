@@ -497,6 +497,16 @@ server executes the pending tool through the existing loop seam.
 {"jsonrpc":"2.0","id":8,"result":{"accepted":true,"request_id":"tool-call-2","decision":"approve","scope":"always_tool"}}
 ```
 
+Approval decisions are acknowledged only after their durable row is confirmed.
+If the write fails and an authoritative read finds no terminal row, the server
+fails closed: it returns `-32000`, emits one `server_error`, and cancels the
+affected turn. Cancellation makes one final durable abort attempt. Whether that
+attempt succeeds or fails, the server emits one terminal `approval_end` and
+removes the live approval record. If terminal persistence still fails, the
+loaded session remains unhealthy and rejects later mutations with `-32000`. If
+an authoritative read finds that the requested decision was durable despite
+the write error, the server completes it once as a normal success.
+
 ### `abort`
 
 Params: optional `scope` with the `abort_scope` feature. It is `"session"`
@@ -1012,6 +1022,8 @@ error code and message. Provider status and origin remain internal.
   `approval_request`; a resolution emits its `approval_end`. These lifecycle
   rows use the same fields as the live events. The parent history includes only
   lifecycle data stored in the parent session, including delegated identity.
+  If delegated cleanup wins while its request row is being stored, history keeps
+  the request row followed by its `child_cleanup` end row and emits neither live event.
   Child-session transcript rows are not copied into parent history; they belong
   to the planned `child_run_events` protocol. Each ordinary message has `id`,
   `role`, `content`, and optional `tool_result`. Text and tool

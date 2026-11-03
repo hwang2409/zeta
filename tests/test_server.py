@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import weakref
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -57,7 +58,12 @@ from zeta.protocol.types import (
 )
 from zeta.providers.ollama import OllamaBackend
 from zeta.server import ZetaServer
-from zeta.server.approval_lifecycle import ApprovalLifecycle, approval_display_fields
+from zeta.server.approval_lifecycle import (
+    ApprovalLifecycle,
+    Cancel,
+    Start,
+    approval_display_fields,
+)
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
@@ -1889,9 +1895,7 @@ async def test_lifecycle_prunes_ended_approvals(tmp_path: Path) -> None:
             await _event(reader, "agent_end")
 
         assert server._client is not None
-        assert len(server.control._approvals._by_key) == 0
-        assert len(server.control._approvals._wires_by_key) == 0
-        assert len(server.control._approvals._keys_by_wire) == 0
+        assert server.control._approvals.state.records == {}
     finally:
         await _close(server, writer)
 
@@ -2242,10 +2246,8 @@ async def test_foreground_abort_only_ends_foreground_approval(
             foreground["request_id"]
         ]
         assert delegated_request.key in server.control._approvals.active_keys()
-        assert any(
-            request.key == delegated_request.key
-            for request in server.runtime.policy.pending_requests()
-        )
+        assert delegated_request.key in server.control._approvals.state.records
+        assert server.runtime.policy._delegated == {}
         assert not child_task.done()
     finally:
         await _close(server, writer)
@@ -2887,27 +2889,62 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
     await server.close()
 
 
-def test_delegated_approval_wire_keys_are_unique() -> None:
-    approvals = ApprovalLifecycle()
-    first = approvals.wire_id(("child-a", "same"))
-    second = approvals.wire_id(("child-b", "same"))
-    assert first != second
-    assert approvals.core_key(first) == ("child-a", "same")
-    assert approvals.core_key(second) == ("child-b", "same")
+def _bare_approval_lifecycle(tmp_path: Path) -> ApprovalLifecycle:
+    async def publish(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
 
+    async def offload(job: Callable[[], object]) -> object:
+        return job()
 
-def test_reused_core_key_gets_fresh_wire_id_after_end() -> None:
-    approvals = ApprovalLifecycle()
-    request = ApprovalRequest(
-        "same", ToolCall("same", "read", {"path": "input"}), child_instance_id="child"
+    policy = ApprovalPolicy(store=ConversationStore(tmp_path / "parent"))
+    return ApprovalLifecycle(
+        publish=publish,
+        request_turn_failure=lambda: None,
+        policy=lambda: policy,
+        session_id=lambda: "session",
+        parent_store=lambda: None,
+        offload=offload,
+        is_closing=lambda: False,
     )
 
-    first = approvals.observe(request)["request_id"]
-    assert approvals.end(request.key) is not None
-    approvals.prune_ended()
-    second = approvals.observe(request)["request_id"]
 
-    assert first != second
+def test_delegated_approval_wire_keys_are_unique(tmp_path: Path) -> None:
+    approvals = _bare_approval_lifecycle(tmp_path)
+    tool_call = ToolCall("same", "read", {"path": "x"})
+    first = ApprovalRequest("same", tool_call, child_instance_id="child-a")
+    second = ApprovalRequest("same", tool_call, child_instance_id="child-b")
+    approvals.register_delegated(first, ConversationStore(tmp_path / "a"), "child-a")
+    approvals.register_delegated(second, ConversationStore(tmp_path / "b"), "child-b")
+    assert approvals.wire_id(first.key) != approvals.wire_id(second.key)
+
+
+@pytest.mark.asyncio
+async def test_reused_core_key_gets_fresh_wire_id_after_end(tmp_path: Path) -> None:
+    approvals = _bare_approval_lifecycle(tmp_path)
+    store = ConversationStore(tmp_path / "child")
+    tool_call = ToolCall("same", "read", {"path": "x"})
+    request = ApprovalRequest("same", tool_call, child_instance_id="child")
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
+        [(tool_call.id, tool_call)],
+    )
+    approvals.register_delegated(request, store, "child")
+    first = approvals.wire_id(request.key)
+    await approvals.transition(
+        Start(
+            StreamEvent(
+                StreamEventType.TOOL_APPROVAL_START,
+                tool_call=tool_call,
+                data={"agent_instance_id": "child"},
+            ),
+            "session",
+            "approval_request",
+        )
+    )
+    await approvals.transition(Cancel(tool_call.id, "child", "turn_canceled"))
+    approvals.register_delegated(request, store, "child")
+    assert approvals.wire_id(request.key) != first
 
 
 @pytest.mark.asyncio
@@ -3003,10 +3040,14 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
     tmp_path: Path,
 ) -> None:
     policy = ApprovalPolicy(store=ConversationStore(tmp_path))
-    client = object.__new__(ServeControl)
-    client.server = SimpleNamespace(
-        runtime=SimpleNamespace(policy=policy, state=None)
+    client = ServeControl(
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
     )
+
+    async def run_blocking(job: Callable[[], object]) -> object:
+        return job()
+
+    client._run_blocking = run_blocking
     notifications: list[tuple[str, dict[str, object]]] = []
 
     async def notify(

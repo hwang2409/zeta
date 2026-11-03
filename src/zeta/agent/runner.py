@@ -1029,10 +1029,10 @@ async def run_agent_tool(
                 child_instance_id
             )
             loop._background_owner.unregister(child_instance_id)
+            if child_policy is not None:
+                await child_policy.cleanup()
             loop._background_owner.mark_store_finished(child_store)
             loop._background_owner.release_unused_stores()
-            if child_policy is not None:
-                child_policy.cleanup()
 
         async def close_background_child() -> tuple[str, ...]:
             return tuple(await child_loop.close(cancel_background=False))
@@ -1149,7 +1149,7 @@ async def run_agent_tool(
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
         loop._background_owner.unregister(child_instance_id)
         if child_policy is not None:
-            child_policy.cleanup()
+            await child_policy.cleanup()
         if not abort_task.done():
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)

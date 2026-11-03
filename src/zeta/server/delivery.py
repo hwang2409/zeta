@@ -55,6 +55,7 @@ class DeliveryRequests:
         duplicate = self._duplicate(delivery_id)
         if duplicate is not None:
             return duplicate
+        control._reject_if_unhealthy()
         if control.turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
         value = control._model_inputs.resolve(
@@ -124,6 +125,7 @@ class DeliveryRequests:
         duplicate = self._duplicate(delivery_id)
         if duplicate is not None:
             return duplicate
+        control._reject_if_unhealthy()
         if not control.turn_busy():
             raise ProtocolError(-32005, "no turn is running")
         text = _required_string(params, "text")

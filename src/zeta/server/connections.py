@@ -192,6 +192,16 @@ class ConnectionRegistry:
             await state.connection._write_physical(error)
         await state.connection.close()
 
+    async def run_blocking(self, callable: Callable[[], Any]) -> Any:
+        """Run one store or observer read away from the event loop."""
+        future = self.loop.create_future()
+        with self._read_condition:
+            if self._read_stopping:
+                raise RuntimeError("reads are closed")
+            self._read_jobs.append((callable, future))
+            self._read_condition.notify()
+        return await future
+
     async def run_read(
         self,
         connection: Any,
@@ -201,13 +211,7 @@ class ConnectionRegistry:
     ) -> Any:
         if connection not in self._connections:
             raise RuntimeError("connection is not connected")
-        future = self.loop.create_future()
-        with self._read_condition:
-            if self._read_stopping:
-                raise RuntimeError("reads are closed")
-            self._read_jobs.append((callable, future))
-            self._read_condition.notify()
-        result = await future
+        result = await self.run_blocking(callable)
         if (
             session_id is not None
             and connection.server.runtime.session_id != session_id
@@ -244,6 +248,12 @@ class ConnectionRegistry:
             lambda: project_status(status),
             session_id=session_id,
         )
+
+    async def run_observer_read(self, connection: Any, callable: Callable[[], Any]) -> Any:
+        state = self._connections.get(connection)
+        if state is None or state.role != "observer":
+            raise RuntimeError("observer is not connected")
+        return await self.run_blocking(callable)
 
     def _read_worker(self) -> None:
         while True:
@@ -336,7 +346,11 @@ def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str 
             return None, {"session": None, "state": "idle", "explicit_finish": False, "pending_approvals": [], "usage": {}, "compaction_markers": 0}
         return runtime.session_id, {
             "session": client._session_snapshot(),
-            "state": runtime.state.status if runtime.state is not None else "idle",
+            "state": (
+                "idle"
+                if client.server.control.unhealthy() or runtime.state is None
+                else runtime.state.status
+            ),
             "explicit_finish": runtime.loop.explicit_finish if runtime.loop is not None else runtime._config(None, None).agents_explicit_finish,
             "pending_approvals": [], "usage": dict(runtime.usage), "store": runtime.opened.store,
         }

@@ -25,7 +25,11 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.server import ZetaServer
-from zeta.server.delivery import DeliveryRequests, ResolvedModelInput
+from zeta.server.delivery import (
+    DeliveryRequests,
+    ResolvedModelInput,
+    _deliver_after_commit,
+)
 
 TIMEOUT = 3
 
@@ -171,6 +175,7 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
         )
     })()
     control.turn_busy = lambda: method == "steer"
+    control._reject_if_unhealthy = lambda: None
 
     async def user_message(*args: Any, **kwargs: Any) -> None:
         effects.append("echo")
@@ -226,6 +231,7 @@ async def test_delivery_id_cancel_before_append_commits_does_nothing(
         )
     })()
     control.turn_busy = lambda: method == "steer"
+    control._reject_if_unhealthy = lambda: None
     effects: list[str] = []
 
     async def user_message(*args: Any, **kwargs: Any) -> None:
@@ -1251,6 +1257,9 @@ class _Control:
     def turn_busy(self) -> bool:
         return self._steer
 
+    def _reject_if_unhealthy(self) -> None:
+        pass
+
     async def user_message(self, *args, **kwargs) -> None:
         del args, kwargs
         self.echo_started.set()
@@ -1283,6 +1292,43 @@ async def test_committed_delivery_runs_work_when_echo_fails(method: str) -> None
     retry = await getattr(requests, method)(params, frozenset({"delivery_id"}))
     assert retry["duplicate"] is True
     assert control.start_calls + control.steer_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_repeat_cancel_does_not_interrupt_echo_cancellation_cleanup() -> None:
+    echo_started = asyncio.Event()
+    cancel_started = asyncio.Event()
+    release_cancel = asyncio.Event()
+    cleanup_interrupted = False
+    effects: list[str] = []
+
+    async def echo() -> None:
+        nonlocal cleanup_interrupted
+        echo_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancel_started.set()
+            try:
+                await release_cancel.wait()
+            except asyncio.CancelledError:
+                cleanup_interrupted = True
+
+    request = asyncio.create_task(
+        _deliver_after_commit(echo, lambda: effects.append("work"), canceled=False)
+    )
+    await echo_started.wait()
+    request.cancel()
+    await cancel_started.wait()
+    await asyncio.sleep(0)
+    request.cancel()
+    await asyncio.sleep(0)
+    release_cancel.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert not cleanup_interrupted
+    assert effects == ["work"]
 
 
 @pytest.mark.asyncio

@@ -275,6 +275,27 @@ class ApprovalAbortPolicy(Protocol):
     ) -> ApprovalDecision | None: ...
 
 
+class _ServeApprovalControl(Protocol):
+    def request_approval_abort(
+        self,
+        request_id: str,
+        *,
+        child_instance_id: str | None = None,
+        reason: str = "turn_canceled",
+    ) -> Awaitable[dict[str, str] | None]: ...
+
+    def register_delegated(
+        self,
+        request: ApprovalRequest,
+        store: ConversationStore,
+        child_instance_id: str,
+    ) -> None: ...
+
+    def cleanup_delegated(
+        self, child_instance_id: str
+    ) -> Awaitable[object] | None: ...
+
+
 class ApprovalPolicy(ApprovalAbortPolicy):
     """Choose, persist, and resolve decisions for tool calls."""
 
@@ -302,9 +323,48 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self._delegated_resolutions: dict[tuple[str, str], dict[str, str]] = {}
         self._ephemeral: dict[str, tuple[ApprovalRequest, str | None]] = {}
         self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
+        self._serve_control: _ServeApprovalControl | None = None
 
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
+
+    def bind_serve_control(self, control: _ServeApprovalControl) -> None:
+        """Permanently route this serve policy's delegated lifetime to control."""
+        if self._serve_control is not None and self._serve_control is not control:
+            raise RuntimeError("approval policy is already bound to serve control")
+        self._serve_control = control
+
+    def _request_serve_abort(
+        self,
+        request_id: str,
+        *,
+        child_instance_id: str | None = None,
+        reason: str = "turn_canceled",
+    ) -> Awaitable[dict[str, str] | None] | None:
+        if self._serve_control is None:
+            return None
+        return self._serve_control.request_approval_abort(
+            request_id,
+            child_instance_id=child_instance_id,
+            reason=reason,
+        )
+
+    @property
+    def store(self) -> ConversationStore:
+        """Return the exact foreground target store for serve capture."""
+        return self._require_store()
+
+    def request_from_store(self, request_id: str, tool_call: ToolCall) -> ApprovalRequest:
+        """Resolve trusted display facts on the loop after a strict store read."""
+        action = None
+        resolved = self._capability_resolver is None
+        if self._capability_resolver is not None:
+            try:
+                action = self._capability_resolver(tool_call).action
+                resolved = True
+            except (KeyError, TypeError, ValueError):
+                resolved = False
+        return ApprovalRequest(request_id, tool_call, action=action, capability_resolved=resolved)
 
     def bind_capability_resolver(
         self, resolver: Callable[[ToolCall], ApprovalCapability]
@@ -659,6 +719,9 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         """Expose a child request without writing it into this store."""
 
         child_id = child_instance_id or request.child_instance_id or store.session_id
+        if self._serve_control is not None:
+            self._serve_control.register_delegated(request, store, child_id)
+            return
         key = (child_id, request.request_id)
         if key in self._delegated:
             return
@@ -676,9 +739,13 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             store,
         )
 
-    def cleanup_delegated(self, child_instance_id: str) -> None:
+    def cleanup_delegated(
+        self, child_instance_id: str
+    ) -> Awaitable[object] | None:
         """Resolve and remove all delegated requests owned by one child."""
 
+        if self._serve_control is not None:
+            return self._serve_control.cleanup_delegated(child_instance_id)
         for key, (request, store) in list(self._delegated.items()):
             if key[0] != child_instance_id:
                 continue
@@ -691,6 +758,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 if resolution is not None:
                     self._delegated_resolutions[key] = resolution
                 self._delegated.pop(key, None)
+        return None
 
     def approve(
         self,
@@ -743,6 +811,8 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
         del execution_token, capability
+        if self._request_serve_abort(request_id) is not None:
+            return None
         delegated = self._delegated_entry(request_id, None)
         if delegated is not None:
             delegated[1].resolve_approval(delegated[0].request_id, "abort")
@@ -921,7 +991,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                     return ApprovalDecision.DENY
                 return None
             if abort_signal.is_set():
-                return self._resolve_abort_or_winner(
+                return await self._resolve_abort_or_winner(
                     tool_call.id, capability=capability
                 )
             abort_task = asyncio.create_task(abort_signal.wait())
@@ -940,7 +1010,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
             if abort_task in done:
-                return self._resolve_abort_or_winner(
+                return await self._resolve_abort_or_winner(
                     tool_call.id, capability=capability
                 )
 
@@ -949,13 +1019,19 @@ class ApprovalPolicy(ApprovalAbortPolicy):
 
         self._ephemeral.pop(request_id, None)
 
-    def _resolve_abort_or_winner(
+    async def _resolve_abort_or_winner(
         self,
         request_id: str,
         *,
         capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
-        return self.abort_or_winner(request_id, capability=capability)
+        settlement = self._request_serve_abort(request_id)
+        if settlement is None:
+            return self.abort_or_winner(request_id, capability=capability)
+        resolution = await settlement
+        return _resolved_decision(
+            resolution["decision"] if resolution is not None else None
+        )
 
     def _require_store(self) -> ConversationStore:
         if self._store is None:

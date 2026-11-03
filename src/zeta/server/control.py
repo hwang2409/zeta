@@ -7,7 +7,8 @@ import functools
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING
 
-from ..core.approval import ApprovalDecision
+from ..core.approval import ApprovalPolicy, ApprovalRequest
+from ..core.store import ConversationStore
 from ..protocol.types import (
     Message,
     MessageOrigin,
@@ -16,8 +17,15 @@ from ..protocol.types import (
     TextContent,
 )
 from . import abort_scope, event_contract, model_selection
-from . import approval_lifecycle as approvals
-from .approval_lifecycle import ApprovalKey, ApprovalLifecycle, approval_display_fields
+from .approval_lifecycle import (
+    ApprovalKey,
+    ApprovalLifecycle,
+    Cancel,
+    Decide,
+    ExternalEnd,
+    Start,
+    Terminate,
+)
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .protocol import FrameWriteCancelled, ProtocolError, bounded
 
@@ -78,8 +86,24 @@ class ServeControl:
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
-        self._approvals = ApprovalLifecycle()
         self.closing = False
+        self._approvals = ApprovalLifecycle(
+            publish=lambda *args, **kwargs: self._notify(*args, **kwargs),
+            request_turn_failure=self.request_turn_failure,
+            policy=lambda: self.server.runtime.policy,
+            session_id=lambda: (
+                self.server.runtime.session_id
+                if self.server.runtime.opened is not None
+                else None
+            ),
+            parent_store=lambda: (
+                self.server.runtime.opened.store
+                if self.server.runtime.opened is not None
+                else None
+            ),
+            offload=lambda job: self._run_blocking(job),
+            is_closing=lambda: self.closing,
+        )
 
     def start_turn(
         self,
@@ -98,6 +122,21 @@ class ServeControl:
             )
         )
 
+    def unhealthy(self) -> bool:
+        return self._approvals.state.health is not None
+
+    def _reject_if_unhealthy(self) -> None:
+        self._approvals.reject_if_unhealthy()
+
+    def request_turn_failure(self) -> None:
+        """Request whole-session cancellation without joining teardown."""
+        loop = self.server.runtime.loop
+        if loop is not None:
+            loop.abort(steering_drop_reason=None)
+        task = self._turn_task
+        if task is not None and not task.done():
+            self._turn_cancel_outcome = TurnOutcome.SESSION_CANCELED
+
     def turn_busy(self) -> bool:
         loop = self.server.runtime.loop
         return (self._turn_task is not None and not self._turn_task.done()) or (
@@ -114,17 +153,31 @@ class ServeControl:
             enabled="model_input_ids" in features,
         )
 
-    def pending_approvals(self) -> list[dict[str, object]]:
-        policy = self.server.runtime.policy
-        if policy is None:
-            return []
-        return [
-            {**self._approvals.observe(item), **approval_display_fields(item)}
-            for item in policy.pending_requests()
-        ]
+    def bind_policy(self, policy: ApprovalPolicy) -> None:
+        """Bind one serve policy to this control for its complete lifetime."""
+
+        policy.bind_serve_control(self)
+
+    def pending_approvals_now(self) -> list[dict[str, object]]:
+        return self._approvals.pending_approvals_now()
+
+    def pending_approval_labels(self) -> tuple[str, ...]:
+        return self._approvals.pending_approval_labels()
+
+    def has_pending_approvals(self) -> bool:
+        return self._approvals.has_pending_approvals()
+
+    async def pending_approvals(self) -> list[dict[str, object]]:
+        return await self._approvals.pending_approvals()
 
     def clear_approvals(self) -> None:
-        self._approvals.clear()
+        self._approvals.clear_approvals()
+
+    def session_replaced(self) -> None:
+        self._approvals.session_replaced()
+
+    async def wait_for_approval_settlement(self) -> None:
+        await self._approvals.wait_for_approval_settlement()
 
     async def controller_claimed(self) -> None:
         await self._attach_pending_notifications()
@@ -139,7 +192,7 @@ class ServeControl:
             self._turn_task.cancel()
             await asyncio.gather(self._turn_task, return_exceptions=True)
         self._turn_task = None
-        self._approvals.clear()
+        self._approvals.prune_ended()
 
     async def close(self) -> None:
         self.closing = True
@@ -160,10 +213,10 @@ class ServeControl:
                 "mode": mode,
                 "attachments": attachments or [],
             }
-            if delivery_id is not None and {
-                "delivery_id",
-                "user_message_delivery_id",
-            } <= features:
+            if (
+                delivery_id is not None
+                and {"delivery_id", "user_message_delivery_id"} <= features
+            ):
                 fields["delivery_id"] = delivery_id
             await self._notify(
                 event_contract.AUXILIARY_WIRE_EVENTS[
@@ -173,62 +226,52 @@ class ServeControl:
                 **fields,
             )
 
+    async def _run_blocking(self, job: Callable[[], object]) -> object:
+        if self.closing:
+            return await asyncio.to_thread(job)
+        registry = self.server.connections
+        if registry is None:
+            raise RuntimeError("serve control worker is unavailable")
+        return await registry.run_blocking(job)
+
+    def register_delegated(
+        self, request: ApprovalRequest, store: ConversationStore, child_instance_id: str
+    ) -> None:
+        self._approvals.register_delegated(request, store, child_instance_id)
+
+    def cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
+        return self._approvals.cleanup_delegated(child_instance_id)
+
     async def resolve_approval(
         self, method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
-        policy = self.server.runtime.policy
         loop = self.server.runtime.loop
-        if policy is None or loop is None:
+        if loop is None:
             raise ProtocolError(-32003, "no active session")
-        core_key = self._approvals.core_key(request_id)
-        pending = next(
-            (item for item in policy.pending_requests() if item.key == core_key),
-            None,
+        result, core_key = await self._approvals.transition(
+            Decide(method, request_id, scope)
         )
+        assert isinstance(result, dict)
         if (
-            scope == "always_tool"
-            and pending is not None
-            and pending.child_instance_id is not None
-        ):
-            raise ProtocolError(
-                -32602, "scope 'always_tool' is unavailable for delegated approvals"
-            )
-        if scope == "always_tool" and pending is not None:
-            try:
-                policy.remember_allow(pending)
-            except ValueError as exc:
-                raise ProtocolError(
-                    -32602, f"cannot always allow approval request: {exc}"
-                ) from exc
-        resolved = policy.resolve(
-            core_key,
-            ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY,
-        )
-        if not resolved:
-            raise ProtocolError(
-                -32006, f"approval request not found or already resolved: {request_id}"
-            )
-        if pending is not None:
-            self._approvals.observe(pending)
-        await self._end_approval(core_key, self.server.runtime.session_id)
-        active = self.turn_busy()
-        if (
-            not active
+            not self.turn_busy()
             and isinstance(core_key, str)
             and loop.prepare_resume_pending_tool(core_key)
         ):
             if self.server.runtime.state is not None:
                 self.server.runtime.state.tool_started()
-            task = asyncio.create_task(self._resume_tool(core_key))
-            self._turn_task = task
-        result: dict[str, object] = {
-            "accepted": True,
-            "request_id": request_id,
-            "decision": method,
-        }
-        if scope != "once":
-            result["scope"] = scope
+            self._turn_task = asyncio.create_task(self._resume_tool(core_key))
         return result
+
+    def request_approval_abort(
+        self,
+        request_id: str,
+        *,
+        child_instance_id: str | None = None,
+        reason: str = "turn_canceled",
+    ) -> Awaitable[object]:
+        return asyncio.create_task(
+            self._approvals.transition(Cancel(request_id, child_instance_id, reason))
+        )
 
     async def abort(
         self, scope: abort_scope.AbortScope = "session"
@@ -505,51 +548,7 @@ class ServeControl:
         if kind is StreamEventType.TOOL_APPROVAL_START:
             if foreground:
                 state.tool_started()
-            raw_request_id = event.tool_call.id if event.tool_call else ""
-            child_id = event.data.get("agent_instance_id")
-            core_key: str | tuple[str, str] = (
-                (child_id, raw_request_id)
-                if isinstance(child_id, str) and raw_request_id
-                else raw_request_id
-            )
-            policy = self.server.runtime.policy
-            request = (
-                next(
-                    (
-                        item
-                        for item in policy.pending_requests()
-                        if item.key == core_key
-                    ),
-                    None,
-                )
-                if policy is not None
-                else None
-            )
-            if request is None:
-                if policy is not None:
-                    policy.deny(core_key)
-                # A live approval without its exact pending request has lost the
-                # harness-owned execution facts.  Never offer an approval based
-                # only on the provider-controlled ToolCall.
-                await self._notify(
-                    event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
-                    session_id,
-                    error={
-                        "code": "approval_context_missing",
-                        "message": "approval request is unavailable; denying live approval",
-                    },
-                    data={"request_id": raw_request_id},
-                )
-                return
-            await self._notify(
-                wire_event,
-                session_id,
-                **self._approvals.observe(
-                    request,
-                    store=self.server.runtime.opened.store,
-                    fields=approval_display_fields(request),
-                ),
-            )
+            await self._start_approval(event, session_id, wire_event)
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
             await self.server.notification_presentations.publish(
@@ -594,6 +593,11 @@ class ServeControl:
         if foreground and kind is StreamEventType.AGENT_END:
             state.turn_finished()
         await self._notify(wire_event, session_id, data=dict(event.data))
+
+    async def _start_approval(
+        self, event: StreamEvent, session_id: str | None, wire_event: str
+    ) -> None:
+        await self._approvals.transition(Start(event, session_id, wire_event))
 
     def _protocol_version(self) -> str:
         connections = self.server.connections
@@ -646,37 +650,15 @@ class ServeControl:
         key: ApprovalKey,
         session_id: str | None,
         *,
-        data: dict[str, object] | None = None,
+        data: dict[str, object],
         suppress_write_errors: bool = False,
     ) -> None:
-        payload = approvals.end_durably(
-            self._approvals,
-            self.server.runtime.policy,
-            key,
-            self.server.runtime.opened.store if self.server.runtime.opened else None,
-            data,
+        await self._approvals.transition(
+            ExternalEnd(key, session_id, data, suppress_write_errors)
         )
-        if payload is None:
-            return
-        try:
-            event = event_contract.STREAM_EVENT_WIRE_EVENTS[
-                StreamEventType.TOOL_APPROVAL_END
-            ]
-            await self._notify(event, session_id, **payload)
-        except (ConnectionError, OSError):
-            if not suppress_write_errors:
-                raise
 
     async def _end_stale_approvals(self, session_id: str | None) -> None:
-        policy = self.server.runtime.policy
-        pending_keys = (
-            {request.key for request in policy.pending_requests()}
-            if policy is not None
-            else set()
-        )
-        for key in self._approvals.active_keys():
-            if key not in pending_keys:
-                await self._end_approval(key, session_id)
+        await self._approvals._end_stale_approvals(session_id)
 
     async def _terminate_pending_approvals(
         self,
@@ -685,16 +667,9 @@ class ServeControl:
         suppress_write_errors: bool = False,
         reason: str = "controller_disconnected",
     ) -> None:
-        approvals.abort_pending(self.server.runtime.policy, foreground_only, reason)
-        for key in self._approvals.active_keys():
-            if foreground_only and not isinstance(key, str):
-                continue
-            await self._end_approval(
-                key,
-                self.server.runtime.session_id if self.server.runtime.opened else None,
-                data={"reason": reason},
-                suppress_write_errors=suppress_write_errors,
-            )
+        await self._approvals.transition(
+            Terminate(foreground_only, suppress_write_errors, reason)
+        )
 
 
 def _approval_key(event: StreamEvent) -> ApprovalKey:

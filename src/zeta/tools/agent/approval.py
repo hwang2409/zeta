@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -75,8 +75,10 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
             child_instance_id=child_instance_id,
         )
 
-    def cleanup_delegated(self, child_instance_id: str) -> None:
-        self.parent.cleanup_delegated(child_instance_id)
+    def cleanup_delegated(
+        self, child_instance_id: str
+    ) -> Awaitable[object] | None:
+        return self.parent.cleanup_delegated(child_instance_id)
 
     def bind_rule_resolver(self, resolver: Any) -> None:
         self.parent.bind_rule_resolver(resolver)
@@ -321,7 +323,7 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
                     return None
                 return ApprovalDecision.DENY
             if abort_signal.is_set():
-                return self.abort_or_winner(
+                return await self._resolve_abort_or_winner(
                     tool_call.id,
                     execution_token=execution_token,
                     capability=capability,
@@ -342,7 +344,7 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
             if abort_task in done:
-                return self.abort_or_winner(
+                return await self._resolve_abort_or_winner(
                     tool_call.id,
                     execution_token=execution_token,
                     capability=capability,
@@ -373,6 +375,15 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         self._pending_bindings.pop(request_id, None)
         return self.child_store.resolve_approval(request_id, "abort", reason="child_cleanup")
 
+    def _request_serve_abort(
+        self, request_id: str
+    ) -> Awaitable[dict[str, str] | None] | None:
+        return self.parent._request_serve_abort(
+            request_id,
+            child_instance_id=self.child_instance_id,
+            reason="child_cleanup",
+        )
+
     def abort_or_winner(
         self,
         request_id: str,
@@ -382,6 +393,9 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
     ) -> ApprovalDecision | None:
         # Resolve first.  If ALLOW won concurrently, the pending binding still
         # belongs to that approval and must be transferred to this execution.
+        if self._request_serve_abort(request_id) is not None:
+            self._pending_bindings.pop(request_id, None)
+            return None
         self.child_store.resolve_approval(
             request_id, "abort", reason="child_cleanup"
         )
@@ -396,11 +410,39 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         self._pending_bindings.pop(request_id, None)
         return decision
 
-    def cleanup(self) -> None:
+    async def _resolve_abort_or_winner(
+        self,
+        request_id: str,
+        *,
+        execution_token: str | None,
+        capability: ApprovalCapability,
+    ) -> ApprovalDecision | None:
+        settlement = self._request_serve_abort(request_id)
+        if settlement is None:
+            return self.abort_or_winner(
+                request_id,
+                execution_token=execution_token,
+                capability=capability,
+            )
+        resolution = await settlement
+        state = self.child_store.approval_states().get(request_id)
+        decision = _approval_decision(
+            resolution["decision"] if resolution is not None else None
+        )
+        if decision is ApprovalDecision.ALLOW and state is not None:
+            if execution_token is None:
+                return decision
+            return self._consume_allow_binding(state[0], execution_token, capability)
+        self._pending_bindings.pop(request_id, None)
+        return decision
+
+    async def cleanup(self) -> None:
         self._execution_bindings.clear()
         self._pending_bindings.clear()
         self._denial_reasons.clear()
-        self.parent.cleanup_delegated(self.child_instance_id)
+        cleanup = self.parent.cleanup_delegated(self.child_instance_id)
+        if cleanup is not None:
+            await cleanup
 
 
 def _approval_decision(value: str | None) -> ApprovalDecision | None:

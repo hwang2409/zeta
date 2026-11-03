@@ -43,6 +43,7 @@ BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]
 SessionEventSink = Callable[[str, StreamEvent], None]
 SessionWakeSink = Callable[[str], None]
 MemoryNoticeSink = Callable[[str, str], None]
+ApprovalControlBinder = Callable[[ApprovalPolicy], None]
 TEST_SCRIPTED_PROVIDER_ENV = "ZETA_TEST_SCRIPTED_PROVIDER"
 _SETUP_SHUTDOWN_WAIT_SECONDS = 1.0
 logger = logging.getLogger(__name__)
@@ -198,6 +199,7 @@ class ServerRuntime:
         self._state: SessionState | None = None
         self._background_event_sink: SessionEventSink | None = None
         self._background_wake_sink: SessionWakeSink | None = None
+        self._approval_control_binder: ApprovalControlBinder | None = None
         self._memory_notice_sink: MemoryNoticeSink | None = None
         self._post_stream_provider_retry = False
         self._setup_reapers: set[asyncio.Task[None]] = set()
@@ -314,6 +316,9 @@ class ServerRuntime:
         if self._state is not None:
             self._state.loop.post_stream_provider_retry = enabled
 
+    def set_approval_control_binder(self, binder: ApprovalControlBinder) -> None:
+        self._approval_control_binder = binder
+
     def set_background_event_sink(self, sink: SessionEventSink | None) -> None:
         """Attach the current frontend to child-agent progress events."""
 
@@ -419,9 +424,13 @@ class ServerRuntime:
         )
         return config, resumed_prompt
 
-    async def resume_session(self, session_id: str) -> SessionMetadata:
+    async def resume_session(
+        self, session_id: str, *, force: bool = False
+    ) -> SessionMetadata:
         if self._state is not None and self._state.session_id == session_id:
-            return self.metadata
+            if not force:
+                return self.metadata
+            await self.close()
         metadata = await asyncio.to_thread(self.manager.read_metadata, session_id)
         if metadata.provider == "fake":
             raise ValueError(REMOVED_PROVIDER_ERROR)
@@ -520,9 +529,18 @@ class ServerRuntime:
                 logger.info("canceled session setup was cleaned up")
 
     async def close(self) -> None:
-        state, self._state = self._state, None
+        state = self._state
         if state is not None:
-            await self._close_state(state)
+            close_task = asyncio.create_task(self._close_state(state))
+            try:
+                try:
+                    await asyncio.shield(close_task)
+                except asyncio.CancelledError:
+                    await close_task
+                    raise
+            finally:
+                if close_task.done() and self._state is state:
+                    self._state = None
         if self._setup_reapers:
             pending = asyncio.gather(*self._setup_reapers)
             try:
@@ -540,6 +558,8 @@ class ServerRuntime:
         try:
             await self.close()
             self._state = state
+            if self._approval_control_binder is not None:
+                self._approval_control_binder(state.policy)
             self._bind_background_event_sink(state)
             await state.loop.activate()
             if self._require_tools:
