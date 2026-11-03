@@ -390,8 +390,11 @@ class SessionAccountContext:
         current = self.manager._read(session_id, directory_fd=directory_fd)
         if not self._metadata_equal(current, state.previous_metadata):
             return current
+        # Recency refreshes write ``updated_at`` without touching this copy;
+        # keep the newer disk value so the switch never moves recency back.
+        target = replace(state.metadata, updated_at=current.updated_at)
         try:
-            self.manager._write_unlocked(state.metadata, directory_fd=directory_fd)
+            self.manager._write_unlocked(target, directory_fd=directory_fd)
         except BaseException as exc:  # noqa: BLE001 - authoritative reread decides
             logger.debug("session transition write reported failure: %s", exc)
         try:
@@ -495,7 +498,13 @@ class SessionAccountContext:
 
     @staticmethod
     def _metadata_equal(left: SessionMetadata, right: SessionMetadata) -> bool:
-        return left.to_storage_dict() == right.to_storage_dict()
+        # ``updated_at`` is recency only. ``refresh_recency`` changes it on disk
+        # during turns, so it must not make a switch look like a conflict.
+        left_data = left.to_storage_dict()
+        right_data = right.to_storage_dict()
+        left_data.pop("updated_at", None)
+        right_data.pop("updated_at", None)
+        return left_data == right_data
 
     @staticmethod
     def _state_from_metadata(

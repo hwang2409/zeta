@@ -1495,21 +1495,76 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
+async def test_bash_timeout_starts_after_launcher_is_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    launcher_ready = tmp_path / "launcher-ready"
     monkeypatch.setattr(
         tool_spawn_module,
         "_LAUNCHER",
-        "import time; time.sleep(0.3)\n" + tool_spawn_module._LAUNCHER,
+        "import pathlib,time; time.sleep(1.0); "
+        f"pathlib.Path({str(launcher_ready)!r}).touch()\n"
+        + tool_spawn_module._LAUNCHER,
     )
+    command_started = tmp_path / "timeout-command-started"
+    command_finished = tmp_path / "timeout-command-finished"
+    command = (
+        "import pathlib,time; "
+        f"pathlib.Path({str(command_started)!r}).touch(); time.sleep(1.5); "
+        f"pathlib.Path({str(command_finished)!r}).touch()"
+    )
+    original_spawn = bash_module.create_tool_subprocess_shell
+
+    async def spawn_after_command_started(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        assert launcher_ready.exists()
+        while not command_started.exists():
+            await asyncio.sleep(0.01)
+        return process
+
+    monkeypatch.setattr(
+        bash_module, "create_tool_subprocess_shell", spawn_after_command_started
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+
+    result = await registry.execute(
+        ToolCall(
+            "bash-launcher-timeout",
+            "bash",
+            {"command": _python_command(command), "timeout": 2.0},
+        )
+    )
+
+    assert launcher_ready.exists()
+    assert command_finished.exists()
+    assert result["isError"] is False
+    assert "timed_out" not in result["structuredContent"]
+
+
+@pytest.mark.asyncio
+async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pid_file = tmp_path / "timeout-grandchild.pid"
-    child = "import time; time.sleep(30)"
-    parent = (
-        "import os,pathlib,subprocess,sys,time; "
-        f"child = subprocess.Popen([sys.executable, '-c', {child!r}]); "
+    child = (
+        "import os,pathlib,time; "
         f"pathlib.Path({str(pid_file)!r}).write_text("
-        "f'{child.pid} {os.getpgid(child.pid)}'); time.sleep(30)"
+        "f'{os.getpid()} {os.getpgid(0)}'); time.sleep(30)"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+    )
+    original_spawn = bash_module.create_tool_subprocess_shell
+
+    async def spawn_after_grandchild_started(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        while not pid_file.exists():
+            await asyncio.sleep(0.01)
+        return process
+
+    monkeypatch.setattr(
+        bash_module, "create_tool_subprocess_shell", spawn_after_grandchild_started
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     result = await asyncio.wait_for(
