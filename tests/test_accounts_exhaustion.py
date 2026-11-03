@@ -1109,3 +1109,31 @@ async def test_limit_recovery_does_not_block_event_loop_while_usage_lock_held(
     finally:
         release.set()
         opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_switch_after_recency_refresh_applies(tmp_path: Path) -> None:
+    """A live session refreshes recency on disk during turns; a later switch must still work."""
+    context, opened, _first, second = await asyncio.to_thread(
+        _account_context, tmp_path
+    )
+    first_backend = object()
+    second_backend = object()
+    loop = _switch_loop(first_backend)
+    assert context.manager is not None
+    await asyncio.sleep(0.01)
+    assert await asyncio.to_thread(
+        context.manager.refresh_recency, context.metadata.session_id
+    )
+
+    await context.switch_active(
+        loop,
+        second,
+        boundary=4,
+        provider="codex",
+        build_backend=lambda _account: second_backend,
+    )
+
+    assert not context.account_state_unknown
+    _assert_switch_state(context, second, second_backend, loop, sequence=1, boundary=4)
+    opened.store.close()
