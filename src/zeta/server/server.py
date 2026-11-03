@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import asyncio
 import contextlib
 import errno
@@ -8,6 +9,7 @@ import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
 from ..protocol.types import (
@@ -27,13 +29,7 @@ from . import (
     slash_commands,
 )
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
-from .connections import (
-    OBSERVER_READ_ONLY_CODE,
-    OBSERVER_REQUESTS,
-    ConnectionRegistry,
-    capture_observer_read,
-    read_observer,
-)
+from .connections import OBSERVER_READ_ONLY_CODE, OBSERVER_REQUESTS, ConnectionRegistry, capture_observer_read, read_observer
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .notification_presentation import NotificationPresentation
 from .project_requests import (
@@ -54,6 +50,7 @@ from .protocol import (
 from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
+
 USER_MESSAGE_MAX_BYTES = 262_144
 class ZetaServer:
     """Serve one local client over a Unix socket or localhost TCP."""
