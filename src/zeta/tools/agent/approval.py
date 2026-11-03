@@ -75,8 +75,10 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
             child_instance_id=child_instance_id,
         )
 
-    def cleanup_delegated(self, child_instance_id: str) -> None:
-        self.parent.cleanup_delegated(child_instance_id)
+    def cleanup_delegated(
+        self, child_instance_id: str
+    ) -> Awaitable[object] | None:
+        return self.parent.cleanup_delegated(child_instance_id)
 
     def bind_rule_resolver(self, resolver: Any) -> None:
         self.parent.bind_rule_resolver(resolver)

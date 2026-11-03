@@ -61,6 +61,35 @@ async def _wait_thread_gate(gate: _StoreGate) -> None:
     assert await asyncio.to_thread(gate.entered.wait, TIMEOUT)
 
 
+def _reservation_gate(
+    server: ZetaServer, monkeypatch: pytest.MonkeyPatch
+) -> asyncio.Event:
+    entered = asyncio.Event()
+    original = server.control._reserve
+
+    def reserve(*args: object, **kwargs: object) -> bool:
+        result = original(*args, **kwargs)
+        entered.set()
+        return result
+
+    monkeypatch.setattr(server.control, "_reserve", reserve)
+    return entered
+
+
+def _terminal_gate(
+    server: ZetaServer, monkeypatch: pytest.MonkeyPatch
+) -> asyncio.Event:
+    entered = asyncio.Event()
+    original = server.control._end_approval
+
+    async def finish(*args: object, **kwargs: object) -> None:
+        await original(*args, **kwargs)
+        entered.set()
+
+    monkeypatch.setattr(server.control, "_end_approval", finish)
+    return entered
+
+
 async def _approval_server(
     tmp_path: Path,
     approval_count: int = 1,
@@ -119,8 +148,9 @@ async def test_approval_start_disconnect_while_lookup_gated(
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
         start, gate = await _gated_start(server, call, monkeypatch)
+        reserved = _reservation_gate(server, monkeypatch)
         released = asyncio.create_task(server.control.controller_released())
-        await asyncio.sleep(0)
+        await asyncio.wait_for(reserved.wait(), TIMEOUT)
         assert not released.done()
         gate.release.set()
         await asyncio.wait_for(asyncio.gather(start, released), TIMEOUT)
@@ -147,8 +177,9 @@ async def test_approval_start_terminal_event_while_lookup_gated(
     monkeypatch.setattr(server.control, "_notify", record)
     try:
         start, gate = await _gated_start(server, call, monkeypatch)
+        terminal_entered = _terminal_gate(server, monkeypatch)
         terminal = asyncio.create_task(server.control._event(_end_event(call)))
-        await asyncio.sleep(0)
+        await asyncio.wait_for(terminal_entered.wait(), TIMEOUT)
         gate.release.set()
         await asyncio.wait_for(asyncio.gather(start, terminal), TIMEOUT)
         assert "approval_request" not in notifications
@@ -165,10 +196,11 @@ async def test_approval_start_expiry_while_lookup_gated(
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
         start, gate = await _gated_start(server, call, monkeypatch)
+        reserved = _reservation_gate(server, monkeypatch)
         expiry = asyncio.create_task(
             server.control._terminate_pending_approvals(reason="grace_expired")
         )
-        await asyncio.sleep(0)
+        await asyncio.wait_for(reserved.wait(), TIMEOUT)
         gate.release.set()
         await asyncio.wait_for(asyncio.gather(start, expiry), TIMEOUT)
         resolution = server.runtime.opened.store.approval_resolution_data(call.id)
@@ -188,8 +220,9 @@ async def test_approval_start_shutdown_while_lookup_gated(
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
     start, gate = await _gated_start(server, call, monkeypatch)
+    reserved = _reservation_gate(server, monkeypatch)
     closing = asyncio.create_task(server.control.close())
-    await asyncio.sleep(0)
+    await asyncio.wait_for(reserved.wait(), TIMEOUT)
     assert not closing.done()
     gate.release.set()
     await asyncio.wait_for(asyncio.gather(start, closing), TIMEOUT)
@@ -228,10 +261,14 @@ async def test_approval_start_disconnect_then_terminal_while_lookup_gated(
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
         start, gate = await _gated_start(server, call, monkeypatch)
+        reserved = _reservation_gate(server, monkeypatch)
+        terminal_entered = _terminal_gate(server, monkeypatch)
         terminal = asyncio.create_task(server.control._event(_end_event(call)))
         disconnect = asyncio.create_task(server.control.controller_released())
         ordered = (terminal, disconnect) if terminal_first else (disconnect, terminal)
-        await asyncio.sleep(0)
+        await asyncio.wait_for(
+            asyncio.gather(reserved.wait(), terminal_entered.wait()), TIMEOUT
+        )
         gate.release.set()
         await asyncio.wait_for(asyncio.gather(start, *ordered), TIMEOUT)
         rows = [
@@ -288,7 +325,6 @@ async def test_same_tick_approval_reservation_winner(
         )
         await _wait_thread_gate(gate)
         abort = asyncio.create_task(server.control._terminate_pending_approvals())
-        await asyncio.sleep(0)
         gate.release.set()
         results = await asyncio.gather(approve, abort, return_exceptions=True)
         assert gate.thread_ids != [threading.get_ident()]
