@@ -441,12 +441,12 @@ class _Client:
                 self._require_feature("session_cwd", "cwd")
                 cwd = _directory(params, "cwd")
             await self.server.control._terminate_pending_approvals()
-            self.server.control.session_replaced()
             await self.server.runtime.create_session(
                 provider=_optional_string(params, "provider"),
                 model=_optional_string(params, "model"),
                 cwd=cwd,
             )
+            self.server.control.session_replaced()
             self.server.control.clear_approvals()
             await self.server.control.controller_claimed()
             return {"session": self._session_snapshot()}
@@ -469,9 +469,7 @@ class _Client:
                     ) from exc
                 except Exception as exc:
                     raise ProtocolError(-32000, "approval persistence failed") from exc
-                self.server.control.session_replaced()
             else:
-                self.server.control.session_replaced()
                 try:
                     await self.server.runtime.resume_session(session_id)
                 except SessionNotFoundError as exc:
@@ -480,6 +478,7 @@ class _Client:
                         str(exc),
                         {"code": "session_not_found", "session_id": session_id},
                     ) from exc
+            self.server.control.session_replaced()
             self.server.control.clear_approvals()
             await self.server.control.controller_claimed()
             return {"session": self._session_snapshot()}

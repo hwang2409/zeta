@@ -997,6 +997,46 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["new_session", "missing_resume", "failed_resume"])
+async def test_failed_recovery_keeps_session_unhealthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovery: str
+) -> None:
+    server, reader, writer, call = await _approval_server(tmp_path)
+    try:
+        await _make_unhealthy(server, call, monkeypatch)
+        old_state = server.runtime.state
+        method = "new_session" if recovery == "new_session" else "resume"
+        params: dict[str, str] = {"provider": "codex"}
+        if recovery == "missing_resume":
+            params = {"session_id": "missing-session"}
+        elif recovery == "failed_resume":
+            opened = await asyncio.to_thread(
+                server.runtime.manager.create,
+                provider="codex",
+                model="offline",
+                cwd=tmp_path,
+            )
+            params = {"session_id": opened.metadata.session_id}
+            await asyncio.to_thread(opened.store.close)
+        if recovery != "missing_resume":
+
+            async def fail_setup(*args: object, **kwargs: object) -> None:
+                del args, kwargs
+                raise OSError("setup failed")
+
+            monkeypatch.setattr(server.runtime, "_run_setup", fail_setup)
+
+        response = (await _request(reader, writer, 9, method, params))[-1]
+        assert "error" in response
+        assert server.runtime.state is old_state
+        assert server.control.unhealthy()
+        mutation = (await _request(reader, writer, 10, "send", {"text": "blocked"}))[-1]
+        assert mutation["error"]["code"] == -32000
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_unhealthy_same_session_resume_reopens_and_clears_after_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
