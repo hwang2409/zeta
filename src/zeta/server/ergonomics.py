@@ -290,17 +290,19 @@ def history(
     offset = params.get("offset", 0)
     if type(offset) is not int or offset < 0:
         raise ProtocolError(-32602, "offset must be a nonnegative integer")
-    replay = runtime.opened.store.replay()
-    approval_calls = {
-        request["request_id"]: request["tool_call"]
-        for entry in replay
-        if entry.type == "message"
-        for request in entry.data.get("approval_requests", [])
-    }
+    branch = runtime.opened.store.active_branch_snapshot()
+    approval_calls: dict[str, object] = {}
     # Cursor-bearing entries are exactly origin/main's message/notification set.
     # New lifecycle entries occupy the gap before the next old-space cursor.
     groups: list[list[object]] = [[]]
-    for entry in replay:
+    for entry in branch:
+        if entry.type == "message":
+            approval_calls.update(
+                {
+                    request["request_id"]: request["tool_call"]
+                    for request in entry.data.get("approval_requests", [])
+                }
+            )
         if entry.type == "message" and is_passive_harness_message(
             entry.data["message"]
         ):

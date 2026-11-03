@@ -1245,6 +1245,54 @@ async def test_session_history_records_controller_disconnect_approval_abort(
         await _close(server, writer)
 
 
+def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> None:
+    class Snapshot(tuple):
+        iterations = 0
+
+        def __iter__(self):
+            type(self).iterations += 1
+            return super().__iter__()
+
+    entries = Snapshot(
+        (
+            SimpleNamespace(
+                id="message-1",
+                type="message",
+                data={"message": {"role": "user", "content": [{"type": "text", "text": "one"}]}},
+            ),
+            SimpleNamespace(
+                id="message-2",
+                type="message",
+                data={"message": {"role": "assistant", "content": [{"type": "text", "text": "two"}]}},
+            ),
+        )
+    )
+    calls = 0
+
+    class Store:
+        def active_branch_snapshot(self):
+            nonlocal calls
+            calls += 1
+            return entries
+
+        def replay(self):
+            raise AssertionError("session_history must not replay the store")
+
+        @property
+        def entries(self):
+            raise AssertionError("session_history must not read store.entries")
+
+        def messages(self):
+            raise AssertionError("session_history must not read store.messages()")
+
+    runtime = SimpleNamespace(opened=SimpleNamespace(store=Store()))
+    result = ergonomics_module.history(runtime, {}, include_delivery_id=False)
+
+    assert [row["id"] for row in result["messages"]] == ["message-1", "message-2"]
+    assert calls == 1
+    assert Snapshot.iterations == 1
+
+
 @pytest.mark.asyncio
 async def test_session_history_keeps_main_durable_entry_cursor_space(
     tmp_path: Path,
@@ -1283,7 +1331,22 @@ async def test_session_history_keeps_main_durable_entry_cursor_space(
         if not _named_events(frames, "agent_end"):
             await _frames_until_event(reader, "agent_end")
 
+        store.append_compaction_marker(
+            "evicted history fixture",
+            1,
+            2,
+            kind="evict",
+            view=[
+                {
+                    "seq": 1,
+                    "message": Message(
+                        MessageRole.ASSISTANT, [TextContent("evicted")]
+                    ).to_dict(),
+                }
+            ],
+        )
         pages: dict[int, list[dict[str, Any]]] = {}
+        wire_pages: dict[int, bytes] = {}
         forward: list[dict[str, Any]] = []
         offset = 0
         while True:
@@ -1297,10 +1360,33 @@ async def test_session_history_keeps_main_durable_entry_cursor_space(
                 )
             )[-1]["result"]
             pages[offset] = page["messages"]
+            wire_pages[offset] = json.dumps(
+                page, sort_keys=True, separators=(",", ":")
+            ).encode()
             forward.extend(page["messages"])
             if page["next_offset"] is None:
                 break
             offset = page["next_offset"]
+
+        repeated_wire_pages: dict[int, bytes] = {}
+        offset = 0
+        while True:
+            page = (
+                await _request(
+                    reader,
+                    writer,
+                    f"repeat-{offset}",
+                    "session_history",
+                    {"session_id": session_id, "offset": offset},
+                )
+            )[-1]["result"]
+            repeated_wire_pages[offset] = json.dumps(
+                page, sort_keys=True, separators=(",", ":")
+            ).encode()
+            if page["next_offset"] is None:
+                break
+            offset = page["next_offset"]
+        assert repeated_wire_pages == wire_pages
 
         # origin/main issues offset 8 here: six prefixes, the user message,
         # and the assistant approval anchor. It must resume at the resolution.
