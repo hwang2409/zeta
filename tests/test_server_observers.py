@@ -494,10 +494,32 @@ async def test_observer_list_and_history_reads_run_off_loop(tmp_path: Path) -> N
     await _request(controller_reader, controller_writer, 1, "hello", {"protocol_version": "1.2"})
     await _request(controller_reader, controller_writer, 2, "new_session", {"provider": "codex"})
     reader, writer = await _observer(server)
+    started = threading.Event()
+    release = threading.Event()
+    ping_done = threading.Event()
+    answered_while_held: list[bool] = []
+    original = server.runtime.manager.list_sessions_read_only
+
+    def gated_list():
+        started.set()
+        # On the event loop this wait blocks the controller's ping; in the
+        # observer worker it does not. Bounded so a regression cannot hang.
+        release.wait(TIMEOUT)
+        answered_while_held.append(ping_done.is_set())
+        return original()
+
+    server.runtime.manager.list_sessions_read_only = gated_list
     try:
-        response = (await _request(reader, writer, 3, "status"))[-1]
-        assert "session" in response["result"]
+        listing = asyncio.create_task(_request(reader, writer, 3, "list_sessions"))
+        await _wait_thread(started)
+        await _request(controller_reader, controller_writer, 4, "ping")
+        ping_done.set()
+        release.set()
+        response = (await asyncio.wait_for(listing, TIMEOUT))[-1]
+        assert "sessions" in response["result"]
+        assert answered_while_held == [True]
     finally:
+        release.set()
         await _close(server, controller_writer); writer.close(); await writer.wait_closed()
 
 

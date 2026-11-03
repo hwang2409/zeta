@@ -257,17 +257,6 @@ class ConnectionRegistry:
         self._observers.clear()
         self._controller = None
 
-    def close(self) -> None:
-        self._closed = True
-        with self._read_condition:
-            self._read_stopping = True
-            self._read_condition.notify_all()
-        for state in tuple(self._connections.values()):
-            if state.writer_task is not None:
-                state.writer_task.cancel()
-        self._connections.clear()
-        self._observers.clear()
-        self._controller = None
 def capture_observer_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str | None, object]:
     runtime = client.server.runtime
     if method in {"session_tree", "session_history"}:
@@ -287,7 +276,8 @@ def capture_observer_read(client: Any, method: str, params: dict[str, Any]) -> t
     if method == "session_settings":
         return runtime.session_id, ergonomics.settings(runtime)
     if method == "list_sessions":
-        return None, tuple(runtime.list_sessions_read_only())
+        # The scan opens every session: hand it to the read worker, not the loop.
+        return None, runtime.list_sessions_read_only
     raise ProtocolError(-32601, "method not found")
 
 
@@ -297,8 +287,10 @@ def read_observer(method: str, target: tuple[str | None, object], params: dict[s
         store = status.pop("store", None)
         status["compaction_markers"] = store.compaction_marker_count() if store is not None else 0
         return status
-    if method in {"model_catalog", "session_settings", "list_sessions"}:
-        return target[1] if method != "list_sessions" else {"sessions": [item.to_dict() for item in target[1]]}
+    if method == "list_sessions":
+        return {"sessions": [item.to_dict() for item in target[1]()]}
+    if method in {"model_catalog", "session_settings"}:
+        return target[1]
     store = target[1]
     runtime = type("ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()})()
     if method == "session_tree":
