@@ -55,7 +55,9 @@ class DeliveryRequests:
         duplicate = self._duplicate(delivery_id)
         if duplicate is not None:
             return duplicate
-        control._reject_if_unhealthy()
+        reject_if_unhealthy = getattr(control, "_reject_if_unhealthy", None)
+        if reject_if_unhealthy is not None:
+            reject_if_unhealthy()
         if control.turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
         value = control._model_inputs.resolve(
@@ -125,7 +127,9 @@ class DeliveryRequests:
         duplicate = self._duplicate(delivery_id)
         if duplicate is not None:
             return duplicate
-        control._reject_if_unhealthy()
+        reject_if_unhealthy = getattr(control, "_reject_if_unhealthy", None)
+        if reject_if_unhealthy is not None:
+            reject_if_unhealthy()
         if not control.turn_busy():
             raise ProtocolError(-32005, "no turn is running")
         text = _required_string(params, "text")
@@ -269,6 +273,11 @@ async def _deliver_after_commit(
                     if not canceled:
                         canceled = True
                         task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    break
             if not task.cancelled():
                 error = task.exception()
     finally:

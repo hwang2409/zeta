@@ -254,10 +254,8 @@ class ServeControl:
             if record.settlement is not None and not record.settlement.done()
         ]:
             await asyncio.gather(*tasks, return_exceptions=True)
-
     async def controller_claimed(self) -> None:
         await self._attach_pending_notifications()
-
     async def controller_released(self) -> None:
         await self._terminate_pending_approvals(suppress_write_errors=True)
         if self._turn_task is not None and not self._turn_task.done():
@@ -269,11 +267,9 @@ class ServeControl:
             await asyncio.gather(self._turn_task, return_exceptions=True)
         self._turn_task = None
         self._approvals.prune_ended()
-
     async def close(self) -> None:
         self.closing = True
         await self.controller_released()
-
     async def user_message(
         self,
         text: str,
@@ -290,8 +286,7 @@ class ServeControl:
                 "attachments": attachments or [],
             }
             if delivery_id is not None and {
-                "delivery_id",
-                "user_message_delivery_id",
+                "delivery_id", "user_message_delivery_id"
             } <= features:
                 fields["delivery_id"] = delivery_id
             await self._notify(
@@ -301,7 +296,6 @@ class ServeControl:
                 self.server.runtime.session_id,
                 **fields,
             )
-
     async def _run_blocking(self, job: Callable[[], object]) -> object:
         if self.closing:
             return await asyncio.to_thread(job)
@@ -309,10 +303,8 @@ class ServeControl:
         if registry is None:
             raise RuntimeError("serve control worker is unavailable")
         return await registry.run_blocking(job)
-
     def _approval_transition(self, event: str, record: _ApprovalRecord, disposition: str) -> None:
         self._approvals.transition(event, record=record, disposition=disposition)
-
     def _new_record(self, target: _ApprovalTarget) -> _ApprovalRecord:
         self._approval_token += 1
         record = _ApprovalRecord(
@@ -325,7 +317,6 @@ class ServeControl:
         )
         self._approval_records[target.key] = record
         return record
-
     def register_delegated(
         self,
         request: ApprovalRequest,
@@ -366,7 +357,6 @@ class ServeControl:
             record.settlement = asyncio.create_task(
                 self._settle_record(record, "abort", reason)
             )
-
     def cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
         settlements: list[asyncio.Task[object]] = []
         for key, record in tuple(self._approval_records.items()):

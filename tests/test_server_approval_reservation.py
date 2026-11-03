@@ -792,6 +792,112 @@ async def test_observer_persistent_approval_failure_keeps_legacy_status_shape(
 
 
 @pytest.mark.asyncio
+async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutation_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, call = await _approval_server(tmp_path)
+    try:
+        store = server.runtime.opened.store
+        session_id = server.runtime.session_id
+        store.append_many(
+            [
+                (
+                    "client_delivery",
+                    {
+                        "delivery_id": "evicted-id",
+                        "method": "send",
+                        "status": "delivered",
+                        "outcome": {"accepted": True, "session_id": session_id},
+                    },
+                ),
+                *[
+                    (
+                        "client_delivery",
+                        {
+                            "delivery_id": f"delivery-filler-{index}",
+                            "method": "steer",
+                            "status": "queued",
+                            "outcome": {"accepted": True},
+                        },
+                    )
+                    for index in range(1_000)
+                ],
+                (
+                    "client_delivery",
+                    {
+                        "delivery_id": "retained-send",
+                        "method": "send",
+                        "status": "delivered",
+                        "outcome": {"accepted": True, "session_id": session_id},
+                    },
+                ),
+                (
+                    "client_delivery",
+                    {
+                        "delivery_id": "retained-steer",
+                        "method": "steer",
+                        "status": "queued",
+                        "outcome": {"accepted": True},
+                    },
+                ),
+            ]
+        )
+        await _make_unhealthy(server, call, monkeypatch)
+        features = frozenset({"delivery_id"})
+        deliveries = server.control.deliveries
+        effects: list[str] = []
+
+        async def record_message(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            effects.append("message")
+
+        monkeypatch.setattr(server.control, "user_message", record_message)
+        monkeypatch.setattr(
+            server.control, "start_turn", lambda *args, **kwargs: effects.append("turn")
+        )
+        assert server.runtime.loop is not None
+        monkeypatch.setattr(
+            server.runtime.loop, "steer", lambda *args, **kwargs: effects.append("steer")
+        )
+
+        assert await deliveries.send(
+            {"text": "retry", "delivery_id": "retained-send"}, features
+        ) == {"accepted": True, "session_id": session_id, "duplicate": True}
+        assert await deliveries.steer(
+            {"text": "retry", "delivery_id": "retained-steer"}, features
+        ) == {"accepted": True, "duplicate": True}
+        for method, params in (
+            ("send", {"text": "retry", "delivery_id": "evicted-id"}),
+            ("steer", {"text": "retry", "delivery_id": "evicted-id"}),
+        ):
+            with pytest.raises(ProtocolError) as error:
+                await getattr(deliveries, method)(params, features)
+            assert error.value.code == -32010
+        assert deliveries.status({"delivery_id": "retained-send"}, features)["status"] == "delivered"
+        assert deliveries.status({"delivery_id": "evicted-id"}, features)["status"] == "evicted"
+        assert deliveries.status({"delivery_id": "unknown"}, features)["status"] == "unknown"
+        for params in (
+            {"text": "new", "delivery_id": "new-id"},
+            {"text": "unkeyed"},
+        ):
+            with pytest.raises(ProtocolError) as error:
+                await deliveries.send(params, features)
+            assert error.value.code == -32000
+        assert effects == []
+
+        response = (await _request(
+            reader, writer, 90, "resume", {"session_id": session_id}
+        ))[-1]
+        assert "result" in response
+        assert not server.control.unhealthy()
+        result = await deliveries.send({"text": "recovered", "delivery_id": "recovered-id"}, features)
+        assert result == {"accepted": True, "session_id": session_id}
+        assert effects == ["message", "turn"]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_unhealthy_same_session_resume_reopens_and_clears_after_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
