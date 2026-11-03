@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from uuid import uuid4
 
-from ..core.approval import ApprovalRequest
+from ..core.approval import ApprovalPolicy, ApprovalRequest
 
 ApprovalKey = str | tuple[str, str]
 
@@ -113,3 +114,30 @@ class ApprovalLifecycle:
         self._by_key.clear()
         self._wires_by_key.clear()
         self._keys_by_wire.clear()
+
+
+def durable_end_data(
+    policy: ApprovalPolicy | None, key: object, data: dict[str, object] | None
+) -> dict[str, object]:
+    """Add the durable decision (and the abort reason) to an approval end."""
+    data = dict(data or {})
+    if policy is not None and isinstance(key, str):
+        state = policy.durable_decision(key)
+        if state is not None:
+            data.setdefault("decision", state)
+            if state == "abort" and "reason" not in data:
+                data["reason"] = "turn_canceled"
+    return data
+
+
+def abort_pending(
+    policy: ApprovalPolicy | None, foreground_only: bool, reason: str
+) -> None:
+    """Abort the policy's pending approvals with one durable reason."""
+    if policy is None:
+        return
+    for request in policy.pending_requests():
+        if foreground_only and request.child_instance_id is not None:
+            continue
+        with contextlib.suppress(ValueError, RuntimeError):
+            policy.abort(request.key, reason=reason)

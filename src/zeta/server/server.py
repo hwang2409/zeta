@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import functools
 import os
 import socket
 import stat
@@ -29,6 +30,7 @@ from . import (
     model_selection,
     slash_commands,
 )
+from . import approval_lifecycle as approvals
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
 from .delivery import DeliveryRequests, TurnOutcome
 from .model_inputs import PendingModelInputs
@@ -680,18 +682,13 @@ class _Client:
             if turn_task is not None and not turn_task.done():
                 self._turn_cancel_outcome = outcome
 
-        async def terminate_turn_approvals(
-            *, foreground_only: bool = False
-        ) -> None:
-            await self._terminate_pending_approvals(
-                foreground_only=foreground_only, reason="turn_canceled"
-            )
-
         aborted = await abort_scope.abort_active_turn(
             turn_task,
             scope=scope,
             loop=self.server.runtime.loop,
-            terminate_approvals=terminate_turn_approvals,
+            terminate_approvals=functools.partial(
+                self._terminate_pending_approvals, reason="turn_canceled"
+            ),
             before_cancel=mark_canceled,
         )
         if aborted:
@@ -1129,14 +1126,7 @@ class _Client:
         data: dict[str, object] | None = None,
         suppress_write_errors: bool = False,
     ) -> None:
-        data = dict(data or {})
-        policy = self.server.runtime.policy
-        if policy is not None and isinstance(key, str):
-            state = policy.durable_decision(key)
-            if state is not None:
-                data.setdefault("decision", state)
-                if state == "abort" and "reason" not in data:
-                    data["reason"] = "turn_canceled"
+        data = approvals.durable_end_data(self.server.runtime.policy, key, data)
         payload = self._approvals.end(key, data=data)
         if payload is None:
             return
@@ -1165,13 +1155,7 @@ class _Client:
         suppress_write_errors: bool = False,
         reason: str = "controller_disconnected",
     ) -> None:
-        policy = self.server.runtime.policy
-        if policy is not None:
-            for request in policy.pending_requests():
-                if foreground_only and request.child_instance_id is not None:
-                    continue
-                with contextlib.suppress(ValueError, RuntimeError):
-                    policy.abort(request.key, reason=reason)
+        approvals.abort_pending(self.server.runtime.policy, foreground_only, reason)
         for key in self._approvals.active_keys():
             if foreground_only and not isinstance(key, str):
                 continue
