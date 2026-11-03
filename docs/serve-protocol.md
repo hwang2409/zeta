@@ -990,11 +990,18 @@ error code and message. Provider status and origin remain internal.
   and returns the tree. Selecting the current leaf is a no-op. Invalid heads
   return `-32602`. Fork and switch affect conversation state, not workspace files.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
-  `messages` and `next_offset` (null at the end), eight messages per page. Each
-  message has `id`, `role`, `content`, and optional `tool_result`. Durable
-  approval lifecycle rows use `event: approval_request` and `event:
-  approval_end` with the same fields as the live events, at the transcript
-  position of the anchored request and resolution. Text and tool
+  `messages` and `next_offset` (null at the end). The cursor and page limit count
+  the same durable message and notification entries as before; one page covers
+  eight such entries. Approval lifecycle entries between them do not change the
+  cursor value, so an offset issued by an older server resumes without a gap or
+  duplicate. All rows projected from one entry are atomic on a page. An
+  assistant approval anchor emits its message row and then its
+  `approval_request`; a resolution emits its `approval_end`. These lifecycle
+  rows use the same fields as the live events. The parent history includes only
+  lifecycle data stored in the parent session, including delegated identity.
+  Child-session transcript rows are not copied into parent history; they belong
+  to the planned `child_run_events` protocol. Each ordinary message has `id`,
+  `role`, `content`, and optional `tool_result`. Text and tool
   output previews are bounded to 8,000 bytes. Image content becomes
   `{"type":"attachment","name":"shot.png","size":123}`; base64 stays off this
   response. Tool-use content retains the existing `tool_call` shape.

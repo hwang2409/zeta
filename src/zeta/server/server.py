@@ -712,7 +712,7 @@ class _Client:
             pending = [
                 {
                     **self._approvals.observe(item),
-                    **_approval_display_fields(item),
+                    **approvals.approval_display_fields(item),
                 }
                 for item in runtime.policy.pending_requests()
             ]
@@ -1010,8 +1010,11 @@ class _Client:
             await self._notify(
                 wire_event,
                 session_id,
-                **self._approvals.observe(request),
-                **_approval_display_fields(request),
+                **self._approvals.observe(
+                    request,
+                    store=self.server.runtime.opened.store,
+                    fields=approvals.approval_display_fields(request),
+                ),
             )
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
@@ -1126,8 +1129,13 @@ class _Client:
         data: dict[str, object] | None = None,
         suppress_write_errors: bool = False,
     ) -> None:
-        data = approvals.durable_end_data(self.server.runtime.policy, key, data)
-        payload = self._approvals.end(key, data=data)
+        payload = approvals.end_durably(
+            self._approvals,
+            self.server.runtime.policy,
+            key,
+            self.server.runtime.opened.store if self.server.runtime.opened else None,
+            data,
+        )
         if payload is None:
             return
         try:
@@ -1228,22 +1236,6 @@ def _approval_key(event: StreamEvent) -> ApprovalKey:
     if isinstance(child_id, str) and raw_request_id:
         return child_id, raw_request_id
     return raw_request_id
-
-
-def _approval_display_fields(request: Any) -> dict[str, object]:
-    """The one immutable approval-display object shared with the frontend client.
-
-    Returns an ``approval_display`` wire field only when the harness resolved
-    trusted execution facts; otherwise nothing is added and the client
-    keeps its backward-compatible behavior.
-    """
-    fields: dict[str, object] = {}
-    if request.action is not None:
-        fields["approval_action"] = request.action
-    display = request.audit_display()
-    if display:
-        fields["approval_display"] = display
-    return fields
 
 
 __all__ = ["ZetaServer"]

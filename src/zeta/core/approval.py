@@ -299,6 +299,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self._delegated: dict[
             tuple[str, str], tuple[ApprovalRequest, ConversationStore]
         ] = {}
+        self._delegated_resolutions: dict[tuple[str, str], dict[str, str]] = {}
         self._ephemeral: dict[str, tuple[ApprovalRequest, str | None]] = {}
         self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
 
@@ -635,6 +636,9 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 delegated_pending[delegated_store] = pending_for_store(delegated_store)
             pending = delegated_pending[delegated_store]
             if request_id not in pending:
+                resolution = delegated_store.approval_resolution_data(request_id)
+                if resolution is not None:
+                    self._delegated_resolutions[(child_id, request_id)] = resolution
                 self._delegated.pop((child_id, request_id), None)
             else:
                 requests.append(request)
@@ -658,6 +662,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         key = (child_id, request.request_id)
         if key in self._delegated:
             return
+        self._delegated_resolutions.pop(key, None)
         self._delegated[key] = (
             ApprovalRequest(
                 request.request_id,
@@ -682,6 +687,9 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             except ValueError:
                 pass
             finally:
+                resolution = store.approval_resolution_data(request.request_id)
+                if resolution is not None:
+                    self._delegated_resolutions[key] = resolution
                 self._delegated.pop(key, None)
 
     def approve(
@@ -749,20 +757,43 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         state = store.approval_states().get(request_id)
         return _resolved_decision(state[1] if state is not None else None)
 
+    def durable_resolution(
+        self,
+        request_id: str | tuple[str, str],
+        *,
+        child_instance_id: str | None = None,
+    ) -> dict[str, str] | None:
+        key = (
+            request_id
+            if isinstance(request_id, tuple)
+            else (child_instance_id, request_id)
+            if child_instance_id is not None
+            else None
+        )
+        if key is not None and key in self._delegated_resolutions:
+            return dict(self._delegated_resolutions[key])
+        delegated = self._delegated_entry(request_id, child_instance_id)
+        store = delegated[1] if delegated is not None else self._store
+        raw_id = delegated[0].request_id if delegated is not None else request_id
+        if store is None or isinstance(raw_id, tuple):
+            return None
+        state = store.approval_states().get(raw_id)
+        if state is None or state[1] is None:
+            return None
+        if state[1] != "abort":
+            return {"request_id": raw_id, "decision": state[1]}
+        return store.approval_resolution_data(raw_id)
+
     def durable_decision(
         self,
         request_id: str | tuple[str, str],
         *,
         child_instance_id: str | None = None,
     ) -> str | None:
-        delegated = self._delegated_entry(request_id, child_instance_id)
-        if delegated is not None:
-            state = delegated[1].approval_states().get(delegated[0].request_id)
-            return None if state is None else state[1]
-        if isinstance(request_id, tuple):
-            return None
-        state = self._require_store().approval_states().get(request_id)
-        return None if state is None else state[1]
+        resolution = self.durable_resolution(
+            request_id, child_instance_id=child_instance_id
+        )
+        return None if resolution is None else resolution["decision"]
 
     def resolve(
         self,

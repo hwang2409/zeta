@@ -51,6 +51,7 @@ from ._approval_display import (
     normalize_approval_requests,
     validated_approval_display,
 )
+from ._approval_history import ApprovalHistoryStoreMixin, validate_approval_history_data
 from ._async_writes import AsyncDurableWritesMixin
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
 from ._incremental_validation import (
@@ -94,6 +95,7 @@ def _validate_approval_reason(decision: str, reason: str | None) -> None:
 
 
 class ConversationStore(
+    ApprovalHistoryStoreMixin,
     AsyncDurableWritesMixin,
     PendingPromptStoreMixin,
     ClientDeliveryMixin,
@@ -532,6 +534,8 @@ class ConversationStore(
                 if decision not in {"allow", "deny", "abort"}:
                     raise ValueError("invalid approval resolution")
                 _validate_approval_reason(decision, entry.data.get("reason"))
+            elif entry.type == "approval_history":
+                validate_approval_history_data(entry.data)
             elif entry.type == "notification":
                 kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
                 if kind in NOTIFICATION_KINDS:
