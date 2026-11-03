@@ -402,7 +402,7 @@ class ServeControl:
             )
         )
         try:
-            await record.settlement
+            resolution = await record.settlement
         except OSError as exc:
             raise ProtocolError(-32000, f"approval persistence failed: {exc}") from exc
         active = self.turn_busy()
@@ -415,13 +415,16 @@ class ServeControl:
                 self.server.runtime.state.tool_started()
             task = asyncio.create_task(self._resume_tool(core_key))
             self._turn_task = task
+        confirmed = resolution["decision"]
         result: dict[str, object] = {
             "accepted": True,
             "request_id": request_id,
-            "decision": method,
+            "decision": "approve" if confirmed == "allow" else confirmed,
         }
-        if scope != "once":
+        if scope != "once" and confirmed == decision:
             result["scope"] = scope
+        if reason := resolution.get("reason"):
+            result["reason"] = reason
         return result
 
     async def _record_for_decision(
@@ -463,60 +466,80 @@ class ServeControl:
         reason: str | None = None,
         *,
         grant: ApprovalRequest | None = None,
-    ) -> None:
+    ) -> dict[str, str]:
         token = record.token
         generation = record.generation
         target = record.target
 
-        def persist() -> tuple[bool, dict[str, str] | None]:
+        def resolve(outcome: str, outcome_reason: str | None) -> None:
+            target.store.resolve_approval(
+                target.store_request_id,
+                outcome,
+                **(
+                    {"reason": outcome_reason}
+                    if outcome == "abort" and outcome_reason
+                    else {}
+                ),
+            )
+
+        def persist() -> dict[str, str] | None:
+            write_failed = False
             try:
-                resolved = target.store.resolve_approval(
-                    target.store_request_id,
-                    decision,
-                    **({"reason": reason} if decision == "abort" and reason else {}),
+                resolve(decision, reason)
+            except OSError:
+                write_failed = True
+            try:
+                resolution = target.store.approval_resolution_data(
+                    target.store_request_id
                 )
             except OSError:
-                try:
-                    resolution = target.store.approval_resolution_data(
-                        target.store_request_id
-                    )
-                except OSError:
-                    return False, None
-                return resolution is not None, resolution
-            resolution = target.store.approval_resolution_data(target.store_request_id)
-            return resolved or resolution is not None, resolution
+                write_failed = True
+                resolution = None
+            if resolution is not None:
+                return resolution
+            if not write_failed:
+                return None
+            try:
+                resolve("abort", reason or "turn_canceled")
+                return target.store.approval_resolution_data(target.store_request_id)
+            except OSError:
+                return None
 
-        committed, resolution = await self._run_blocking(persist)
+        resolution = await self._run_blocking(persist)
         current = self._approval_records.get(target.key)
-        if (
-            current is not record
-            or generation != self._approval_generation
-            or token != record.token
-        ):
-            return
-        if not committed or resolution is None:
-            record.state = "failed"
-            with contextlib.suppress(ConnectionError, OSError):
-                await self._notify(
-                    event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
-                    self.server.runtime.session_id
-                    if self.server.runtime.opened
-                    else None,
-                    error={
-                        "code": "server_error",
-                        "message": "approval decision could not be persisted",
-                    },
-                    data={"request_id": record.wire_id},
-                )
-            loop = self.server.runtime.loop
-            if loop is not None:
-                loop.abort(steering_drop_reason=None)
+        owns_record = (
+            current is record
+            and generation == self._approval_generation
+            and token == record.token
+        )
+        if resolution is None:
+            if owns_record:
+                record.state = "failed"
+                with contextlib.suppress(ConnectionError, OSError):
+                    await self._notify(
+                        event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+                        self.server.runtime.session_id
+                        if self.server.runtime.opened
+                        else None,
+                        error={
+                            "code": "server_error",
+                            "message": "approval decision could not be persisted",
+                        },
+                        data={"request_id": record.wire_id},
+                    )
+                loop = self.server.runtime.loop
+                if loop is not None:
+                    loop.abort(steering_drop_reason=None)
+                self._approval_records.pop(target.key, None)
             raise OSError("approval decision could not be persisted")
-        if grant is not None:
+        if not owns_record:
+            return resolution
+        if grant is not None and resolution["decision"] == "allow":
             policy = self.server.runtime.policy
             if policy is not None:
                 policy.remember_allow(grant)
         await self._finish_record(record, resolution)
+        return resolution
 
     async def _finish_external(self, record: _ApprovalRecord) -> None:
         resolution = await self._run_blocking(
@@ -900,7 +923,11 @@ class ServeControl:
         def lookup() -> tuple[ToolCall, str | None] | None:
             return target.store.approval_states().get(target.store_request_id)
 
-        state = await self._run_blocking(lookup)
+        try:
+            state = await self._run_blocking(lookup)
+        except OSError:
+            await self._settle_failed_start(record)
+            return
         current = self._approval_records.get(key)
         if (
             current is not record
@@ -931,11 +958,15 @@ class ServeControl:
             request, fields=approval_display_fields(request)
         )
         if isinstance(key, tuple) and target.history_store is not None:
-            await self._run_blocking(
-                lambda: target.history_store.append_approval_history(
-                    {"event": "approval_request", **payload}
+            try:
+                await self._run_blocking(
+                    lambda: target.history_store.append_approval_history(
+                        {"event": "approval_request", **payload}
+                    )
                 )
-            )
+            except OSError:
+                await self._settle_failed_start(record)
+                return
             record.history_published = True
         current = self._approval_records.get(key)
         if (
@@ -966,6 +997,20 @@ class ServeControl:
         record.settlement = None
         record.published = True
         await self._notify(wire_event, session_id, **payload)
+
+    async def _settle_failed_start(self, record: _ApprovalRecord) -> None:
+        if self._approval_records.get(record.target.key) is not record:
+            return
+        reason = (
+            record.disposition
+            if record.disposition not in {"active", "external"}
+            else "turn_canceled"
+        )
+        record.state = "reserved"
+        record.settlement = asyncio.create_task(
+            self._settle_record(record, "abort", reason)
+        )
+        await record.settlement
 
     def _protocol_version(self) -> str:
         connections = self.server.connections
