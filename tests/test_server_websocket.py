@@ -15,7 +15,9 @@ from urllib.parse import urlencode
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser
+from zeta.protocol.types import ToolCall
 from zeta.server import ZetaServer
 from zeta.server.protocol import MAX_FRAME_BYTES
 
@@ -148,6 +150,80 @@ async def test_websocket_round_trip_uses_real_serve_runtime(tmp_path: Path) -> N
         }
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_websocket_drop_during_approval_finishes_cleanly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    with caplog.at_level(logging.ERROR):
+        await server.start()
+        reader, writer, status = await _connect(
+            server, token=server._websocket.token
+        )
+        assert status == 101
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "hello",
+                "params": {"protocol_version": "1.0"},
+            },
+        )
+        assert (await _read_json(reader))["id"] == 1
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "new_session",
+                "params": {"provider": "codex"},
+            },
+        )
+        assert (await _read_json(reader))["id"] == 2
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "send",
+                "params": {"text": "read it"},
+            },
+        )
+        while True:
+            frame = await _read_json(reader)
+            if frame.get("params", {}).get("event") == "approval_request":
+                break
+
+        writer.transport.abort()
+        for _ in range(100):
+            opened = server.runtime.opened
+            if opened is not None and any(
+                entry.type == "approval_resolution"
+                and entry.data.get("decision") == "abort"
+                for entry in opened.store.entries
+            ):
+                break
+            await asyncio.sleep(0.01)
+        await server.close()
+
+    assert opened is not None
+    assert any(
+        entry.type == "approval_resolution"
+        and entry.data.get("decision") == "abort"
+        for entry in opened.store.entries
+    )
+    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
 
 
 @pytest.mark.asyncio
