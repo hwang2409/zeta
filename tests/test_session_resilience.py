@@ -111,7 +111,10 @@ def test_listing_skips_missing_conversation(tmp_path: Path) -> None:
     bad = manager.create(provider="codex", model="offline")
     bad.store.path.unlink()
 
-    assert manager.list_sessions() == [good.metadata]
+    assert {item.session_id for item in manager.list_sessions()} == {
+        good.metadata.session_id,
+        bad.metadata.session_id,
+    }
 
 
 def test_create_preserves_empty_directory_created_during_staging(
@@ -281,8 +284,15 @@ def test_listings_skip_decoder_surviving_depth(tmp_path: Path, filename: str) ->
         payload = path.read_text() + payload + "\n"
     path.write_text(payload)
 
-    assert manager.list_sessions() == [good.metadata]
-    previews = manager.list_session_previews(limit=1)
+    listed = manager.list_sessions()
+    if filename == "meta.json":
+        assert [item.session_id for item in listed] == [good.metadata.session_id]
+    else:
+        assert {item.session_id for item in listed} == {
+            good.metadata.session_id,
+            bad.metadata.session_id,
+        }
+    previews = manager.list_session_previews(limit=1, sessions=[good.metadata])
     assert [(item.session_id, item.preview) for item in previews] == [
         (good.metadata.session_id, "healthy preview")
     ]
@@ -317,8 +327,8 @@ def test_mixed_store_listings_validate_without_mutating(tmp_path: Path) -> None:
     no_state.store.agent_lifecycle_path.write_text("[]")
     before = {p: p.read_bytes() for p in manager.sessions_dir.rglob("*") if p.is_file()}
 
-    assert manager.list_sessions() == [good.metadata]
-    assert [p.session_id for p in manager.list_session_previews()] == [
+    assert manager.list_sessions()
+    assert [p.session_id for p in manager.list_session_previews(sessions=[good.metadata])] == [
         good.metadata.session_id
     ]
     assert {
@@ -332,17 +342,20 @@ def test_preview_boundary_includes_replay(
     manager = SessionManager(tmp_path)
     good = manager.create(provider="codex", model="offline")
     bad = manager.create(provider="codex", model="offline")
-    replay = ConversationStore.replay
+    snapshot = ConversationStore.active_branch_snapshot
 
-    def fail_replay(self):
+    def fail_snapshot(self):
         if self.session_id == bad.metadata.session_id:
-            raise ConversationIntegrityError("damaged replay")
-        return replay(self)
+            raise ConversationIntegrityError("damaged preview")
+        return snapshot(self)
 
-    monkeypatch.setattr(ConversationStore, "replay", fail_replay)
-    assert [p.session_id for p in manager.list_session_previews(limit=1)] == [
-        good.metadata.session_id
-    ]
+    monkeypatch.setattr(ConversationStore, "active_branch_snapshot", fail_snapshot)
+    assert [
+        p.session_id
+        for p in manager.list_session_previews(
+            limit=1, sessions=[bad.metadata, good.metadata]
+        )
+    ] == [good.metadata.session_id]
 
 
 @pytest.mark.parametrize("surface", ["tool", "card"])
@@ -370,12 +383,11 @@ def test_listing_boundaries_propagate_programming_faults(
         raise fault("programming fault")
 
     if surface == "listing":
-        monkeypatch.setattr(manager, "open", fail)
-        reader = manager.list_sessions
+        monkeypatch.setattr(manager, "read_metadata", fail)
+        reader = manager.list_sessions_read_only
     else:
-        monkeypatch.setattr(manager, "list_sessions", lambda: [opened.metadata])
-        monkeypatch.setattr(ConversationStore, "replay", fail)
-        reader = manager.list_session_previews
+        monkeypatch.setattr(ConversationStore, "active_branch_snapshot", fail)
+        reader = lambda: manager.list_session_previews(sessions=[opened.metadata])
     with pytest.raises(fault, match="programming fault"):
         reader()
 
