@@ -180,6 +180,66 @@ async def test_serve_resume_cancel_closes_store_after_preparation_finishes(
 
 
 @pytest.mark.asyncio
+async def test_serve_resume_cancel_joins_composition_worker_before_closing_store(
+    tmp_path: Path,
+) -> None:
+    server = _server(tmp_path)
+    first = await server.runtime.create_session()
+    await server.runtime.create_session()
+    reader, writer = await _connect(server)
+    await _hello(reader, writer)
+    client = server._client
+    assert client is not None
+    opened: list[object] = []
+    compose_started = threading.Event()
+    compose_done = threading.Event()
+    worker_saw_closed: list[bool] = []
+    original_open = server.runtime.manager.open
+    original_compose = server.runtime._compose
+
+    def tracked_open(session_id: str):
+        result = original_open(session_id)
+        opened.append(result.store)
+        return result
+
+    def tracked_compose(**kwargs):
+        compose_started.set()
+        time.sleep(0.2)
+        worker_saw_closed.append(kwargs["opened"].store._closed)
+        try:
+            return original_compose(**kwargs)
+        finally:
+            compose_done.set()
+
+    server.runtime.manager.open = tracked_open
+    server.runtime._compose = tracked_compose
+    close_count = 0
+    original_close = None
+    operation = asyncio.create_task(
+        client._dispatch(2, "resume", {"session_id": first.session_id})
+    )
+    try:
+        assert await asyncio.to_thread(compose_started.wait, 2)
+        assert opened
+        original_close = opened[0].close
+
+        def tracked_close():
+            nonlocal close_count
+            close_count += 1
+            return original_close()
+
+        opened[0].close = tracked_close
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert compose_done.is_set()
+        assert worker_saw_closed == [False]
+        assert close_count == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_project_instructions_does_not_block_loop_tick(tmp_path: Path) -> None:
     server = _server(tmp_path)
     root = server.runtime.cwd

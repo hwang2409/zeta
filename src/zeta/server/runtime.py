@@ -441,50 +441,41 @@ class ServerRuntime:
             raise ValueError(
                 f"session working directory no longer exists: {metadata.cwd}"
             )
-        async def open_and_prepare() -> tuple[OpenedSession, tuple[object, object]]:
+
+        async def setup() -> RuntimeComposition:
             opened = await asyncio.to_thread(self.manager.open, session_id)
             try:
                 prepared = await asyncio.to_thread(
                     self._prepare_resumed_session, opened, session_cwd
                 )
+                config, resumed_prompt = prepared
+                return await asyncio.to_thread(
+                    self._compose,
+                    cwd=session_cwd,
+                    config=config,
+                    provider=opened.metadata.provider,
+                    model=opened.metadata.model,
+                    project_context=resumed_prompt.context,
+                    skill_catalog=resumed_prompt.skill_catalog,
+                    agent_catalog=resumed_prompt.agent_catalog,
+                    opened=opened,
+                    project_id=opened.metadata.project_id,
+                    max_turns=self._max_turns,
+                )
             except BaseException:
                 await asyncio.to_thread(opened.store.close)
                 raise
-            return opened, prepared
 
-        preparation = asyncio.create_task(open_and_prepare())
-        opened: OpenedSession | None = None
+        setup_task = asyncio.create_task(setup())
         try:
-            opened, prepared = await asyncio.shield(preparation)
-            config, resumed_prompt = prepared
-            context = resumed_prompt.context
-            skill_catalog = resumed_prompt.skill_catalog
-            agent_catalog = resumed_prompt.agent_catalog
-            composition = await asyncio.to_thread(
-                self._compose,
-                cwd=session_cwd,
-                config=config,
-                provider=opened.metadata.provider,
-                model=opened.metadata.model,
-                project_context=context,
-                skill_catalog=skill_catalog,
-                agent_catalog=agent_catalog,
-                opened=opened,
-                project_id=opened.metadata.project_id,
-                max_turns=self._max_turns,
-            )
+            composition = await asyncio.shield(setup_task)
         except asyncio.CancelledError:
             try:
-                opened, _prepared = await asyncio.shield(preparation)
-            except BaseException as preparation_error:  # noqa: BLE001
-                _ = preparation_error
+                composition = await asyncio.shield(setup_task)
+            except BaseException as setup_error:  # noqa: BLE001
+                _ = setup_error
             else:
-                await asyncio.to_thread(opened.store.close)
-            raise
-        except BaseException:
-            if opened is None:
-                opened, _prepared = await preparation
-            await asyncio.to_thread(opened.store.close)
+                await self._close_state(SessionState.from_composition(composition))
             raise
         await self._replace(composition)
         return self.metadata
