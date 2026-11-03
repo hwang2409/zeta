@@ -453,16 +453,33 @@ class _Client:
         if method == "resume":
             await self.server.control.require_idle()
             session_id = _required_string(params, "session_id")
+            unhealthy_same_session = (
+                self.server.control.unhealthy()
+                and self.server.runtime.session_id == session_id
+            )
             await self.server.control._terminate_pending_approvals()
-            self.server.control.session_replaced()
-            try:
-                await self.server.runtime.resume_session(session_id)
-            except SessionNotFoundError as exc:
-                raise ProtocolError(
-                    -32602,
-                    str(exc),
-                    {"code": "session_not_found", "session_id": session_id},
-                ) from exc
+            if unhealthy_same_session:
+                try:
+                    await self.server.runtime.resume_session(session_id, force=True)
+                except SessionNotFoundError as exc:
+                    raise ProtocolError(
+                        -32602,
+                        str(exc),
+                        {"code": "session_not_found", "session_id": session_id},
+                    ) from exc
+                except Exception as exc:  # noqa: BLE001 - preserve unhealthy state
+                    raise ProtocolError(-32000, "approval persistence failed") from exc
+                self.server.control.session_replaced()
+            else:
+                self.server.control.session_replaced()
+                try:
+                    await self.server.runtime.resume_session(session_id)
+                except SessionNotFoundError as exc:
+                    raise ProtocolError(
+                        -32602,
+                        str(exc),
+                        {"code": "session_not_found", "session_id": session_id},
+                    ) from exc
             self.server.control.clear_approvals()
             await self.server.control.controller_claimed()
             return {"session": self._session_snapshot()}

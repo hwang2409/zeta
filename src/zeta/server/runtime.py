@@ -424,9 +424,14 @@ class ServerRuntime:
         )
         return config, resumed_prompt
 
-    async def resume_session(self, session_id: str) -> SessionMetadata:
+    async def resume_session(
+        self, session_id: str, *, force: bool = False
+    ) -> SessionMetadata:
         if self._state is not None and self._state.session_id == session_id:
-            return self.metadata
+            if not force:
+                return self.metadata
+            state, self._state = self._state, None
+            await self._close_state(state)
         metadata = await asyncio.to_thread(self.manager.read_metadata, session_id)
         if metadata.provider == "fake":
             raise ValueError(REMOVED_PROVIDER_ERROR)
