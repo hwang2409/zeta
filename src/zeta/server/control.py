@@ -53,7 +53,6 @@ class _ApprovalRecord:
     request: ApprovalRequest | None = None
     published: bool = False
     settlement: asyncio.Task[object] | None = None
-    delegated_ready: asyncio.Event | None = None
 
 
 class NotificationPresentation:
@@ -319,8 +318,6 @@ class ServeControl:
         elif record.state == "starting":
             record.target = target
             record.request = exact
-            if record.delegated_ready is not None:
-                record.delegated_ready.set()
         else:
             return
         if record.disposition == "external":
@@ -345,8 +342,6 @@ class ServeControl:
                 continue
             if self._reserve(record, "child_cleanup"):
                 if record.state == "starting":
-                    if record.delegated_ready is not None:
-                        record.delegated_ready.set()
                     continue
                 record.settlement = asyncio.create_task(
                     self._settle_record(record, "abort", "child_cleanup")
@@ -891,12 +886,6 @@ class ServeControl:
         token = record.token
         generation = record.generation
         record.settlement = asyncio.current_task()
-        if isinstance(key, tuple) and record.request is None:
-            if record.delegated_ready is None:
-                record.delegated_ready = asyncio.Event()
-            await record.delegated_ready.wait()
-            if record.request is None:
-                return
         target = record.target
 
         def lookup() -> tuple[ToolCall, str | None] | None:
@@ -1022,8 +1011,6 @@ class ServeControl:
         if record.state == "starting":
             if record.disposition == "active":
                 record.disposition = "external"
-            if record.delegated_ready is not None:
-                record.delegated_ready.set()
             return
         if record.state not in {"pending", "reserved"}:
             return
@@ -1075,8 +1062,6 @@ class ServeControl:
             if not self._reserve(record, reason):
                 continue
             if record.state == "starting":
-                if record.delegated_ready is not None:
-                    record.delegated_ready.set()
                 continue
             record.settlement = asyncio.create_task(
                 self._settle_record(record, "abort", reason)
