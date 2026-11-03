@@ -5,8 +5,9 @@ import contextlib
 import json
 import threading
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 OBSERVER_REQUESTS = frozenset({
     "list_sessions", "status", "session_tree", "session_history",
@@ -154,7 +155,7 @@ class ConnectionRegistry:
                 continue
             try:
                 result = job()
-            except BaseException as exc:
+            except Exception as exc:  # noqa: BLE001 - worker must return every job failure
                 self.loop.call_soon_threadsafe(self._read_done, future, None, exc)
             else:
                 self.loop.call_soon_threadsafe(self._read_done, future, result, None)

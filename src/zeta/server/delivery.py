@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -10,7 +13,9 @@ from ..core.store._client_delivery import (
     tag_client_delivery,
     valid_client_delivery_id,
 )
+from ..model_input import ModelInputEnvelope
 from ..protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
     Message,
     MessageOrigin,
     MessageRole,
@@ -226,12 +231,6 @@ def _required_delivery_id(params: dict[str, Any]) -> str:
         )
     return value
 
-# Model-input ownership stays with delivery because it is only consumed here.
-import secrets
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from ..model_input import ModelInputEnvelope
-from ..protocol.types import MESSAGE_ORIGIN_METADATA
 
 @dataclass(frozen=True, slots=True)
 class ResolvedModelInput:

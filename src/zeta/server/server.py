@@ -29,8 +29,8 @@ from . import (
     slash_commands,
 )
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
-from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .connections import OBSERVER_READ_ONLY_CODE, OBSERVER_REQUESTS, ConnectionRegistry
+from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .notification_presentation import NotificationPresentation
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
@@ -545,7 +545,6 @@ class _Client:
         if method == "session_settings":
             return ergonomics.settings(runtime)
         raise ProtocolError(-32601, "method not found")
-
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
             raise ProtocolError(
@@ -780,7 +779,6 @@ class _Client:
             await self._event(agent_end, session_id=session_id)
             if outcome is TurnOutcome.COMPLETED:
                 self._schedule_background_wake(session_id)
-
     def _schedule_background_wake(self, session_id: str) -> None:
         if self._closed:
             return
@@ -793,7 +791,6 @@ class _Client:
         self._turn_task = asyncio.create_task(
             self._run_notification_turn(session_id)
         )
-
     async def _run_notification_turn(self, session_id: str) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -836,7 +833,6 @@ class _Client:
             await self._event(agent_end, session_id=session_id)
             if outcome is TurnOutcome.COMPLETED:
                 self._schedule_background_wake(session_id)
-
     async def _attach_pending_notifications(self) -> None:
         runtime = self.server.runtime
         loop = runtime.loop
@@ -844,7 +840,6 @@ class _Client:
             return
         if loop.notification_system_message() is not None:
             self._schedule_background_wake(runtime.session_id)
-
     async def _resume_tool(self, request_id: str) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -853,7 +848,6 @@ class _Client:
         session_id = state.session_id
         event_tasks: list[asyncio.Task[None]] = []
         agent_end: StreamEvent | None = None
-
         def emit(event: StreamEvent) -> None:
             nonlocal agent_end
             if event.type is StreamEventType.AGENT_END:
@@ -862,7 +856,6 @@ class _Client:
                 event_tasks.append(
                     asyncio.create_task(self._event(event, session_id=session_id))
                 )
-
         outcome = TurnOutcome.COMPLETED
         try:
             await loop.resume_pending_tool(

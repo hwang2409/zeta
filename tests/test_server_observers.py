@@ -5,11 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-from tests.test_server import TIMEOUT, _close, _connect, _read, _request, _socket_path
+from tests.test_server import TIMEOUT, _close, _connect, _request, _socket_path
 from zeta.server import ZetaServer
 
 
@@ -58,7 +57,7 @@ async def test_observer_hello_has_no_controller_side_effects(tmp_path: Path, mon
     calls: list[str] = []
     for name in ("set_background_event_sink", "set_memory_notice_sink", "set_background_wake_sink", "set_post_stream_provider_retry"):
         original = getattr(server.runtime, name)
-        monkeypatch.setattr(server.runtime, name, lambda *args, _name=name, **kwargs: calls.append(_name) or original(*args, **kwargs))
+        monkeypatch.setattr(server.runtime, name, lambda *args, _name=name, _original=original, **kwargs: calls.append(_name) or _original(*args, **kwargs))
     reader, writer = await _observer(server)
     try:
         assert calls == []
@@ -157,7 +156,7 @@ async def test_observer_read_workers_do_not_block_serve_loop_or_default_executor
 @pytest.mark.asyncio
 async def test_stuck_observer_read_does_not_block_serve_exit(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
-    reader, writer = await _observer(server)
+    _reader, writer = await _observer(server)
     writer.close(); await writer.wait_closed(); await server.close()
 
 
@@ -176,9 +175,9 @@ async def test_observer_list_and_history_reads_run_off_loop(tmp_path: Path) -> N
 
 
 def test_delivery_model_inputs_remain_single_use_after_move() -> None:
-    from zeta.server.delivery import PendingModelInputs
     from zeta.model_input import ModelInputEnvelope
     from zeta.protocol.types import MessageOrigin
+    from zeta.server.delivery import PendingModelInputs
 
     pending = PendingModelInputs()
     input_id = pending.register("session", ModelInputEnvelope("text", "display", MessageOrigin.USER))
