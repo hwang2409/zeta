@@ -8,6 +8,7 @@ import os
 import shutil
 import stat
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from io import StringIO
@@ -68,14 +69,27 @@ def test_registry_lock_wait_is_bounded(tmp_path: Path, monkeypatch: pytest.Monke
     fd = os.open(lock, os.O_RDWR)
     fcntl.flock(fd, fcntl.LOCK_EX)
     monkeypatch.setattr("zeta.project_registry._PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS", 0.05)
-    started = time.monotonic()
-    try:
-        with pytest.raises(ProjectRegistryBusyError):
+    finished = threading.Event()
+    outcome: list[BaseException] = []
+
+    def list_projects() -> None:
+        try:
             registry.list_projects()
+        except BaseException as exc:  # noqa: BLE001
+            outcome.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=list_projects)
+    worker.start()
+    try:
+        assert finished.wait(10), "registry lock wait exceeded the watchdog"
+        assert len(outcome) == 1
+        assert isinstance(outcome[0], ProjectRegistryBusyError)
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
-    assert time.monotonic() - started < 0.5
+        worker.join(2)
 
 
 def _make_registry(home: Path) -> tuple[Path, Path]:

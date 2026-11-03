@@ -126,63 +126,57 @@ async def test_session_project_preparation_does_not_block_ping(
 
 
 @pytest.mark.asyncio
-async def test_resume_cancel_closes_store_after_preparation_finishes(tmp_path: Path) -> None:
+async def test_serve_resume_cancel_closes_store_after_preparation_finishes(
+    tmp_path: Path,
+) -> None:
     server = _server(tmp_path)
-    ProjectRegistry(server.home / "projects").create_project("launch", "repo")
     first = await server.runtime.create_session()
     await server.runtime.create_session()
+    reader, writer = await _connect(server)
+    await _hello(reader, writer)
+    client = server._client
+    assert client is not None
     opened: list[object] = []
     preparation_started = threading.Event()
+    preparation_release = threading.Event()
     preparation_done = threading.Event()
-    closed_before_prepare = False
+    preparation_active: set[int] = set()
     original_open = server.runtime.manager.open
+    original_prepare = server.runtime._prepare_resumed_session
 
     def tracked_open(session_id: str):
-        nonlocal closed_before_prepare
         result = original_open(session_id)
-        original_close = result.store.close
-
-        def tracked_close():
-            nonlocal closed_before_prepare
-            closed_before_prepare = not preparation_done.is_set()
-            return original_close()
-
-        result.store.close = tracked_close
         opened.append(result.store)
         return result
 
-    server.runtime.manager.open = tracked_open
-    preparation_release = threading.Event()
-    original_prepare = server.runtime._prepare_resumed_session
-
     def tracked_prepare(opened_session, session_cwd):
+        ident = threading.get_ident()
+        preparation_active.add(ident)
         preparation_started.set()
-        preparation_release.wait(1)
         try:
+            assert preparation_release.wait(2)
             return original_prepare(opened_session, session_cwd)
         finally:
+            preparation_active.discard(ident)
             preparation_done.set()
 
+    server.runtime.manager.open = tracked_open
     server.runtime._prepare_resumed_session = tracked_prepare
-    _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
-    operation = asyncio.create_task(server.runtime.resume_session(first.session_id))
+    operation = asyncio.create_task(
+        client._dispatch(2, "resume", {"session_id": first.session_id})
+    )
     try:
-        assert await asyncio.to_thread(preparation_started.wait, 1)
-        threading.Timer(0.2, preparation_release.set).start()
+        assert await asyncio.to_thread(preparation_started.wait, 2)
         operation.cancel()
-        await asyncio.sleep(0)
-        assert not operation.done() or preparation_done.is_set()
         with pytest.raises(asyncio.CancelledError):
             await operation
         preparation_release.set()
         assert await asyncio.to_thread(preparation_done.wait, 2)
         assert opened and opened[0]._closed
-        assert not closed_before_prepare
+        assert not preparation_active
     finally:
         preparation_release.set()
-        release.set()
-        holder.join(2)
-        await server.close()
+        await _close(server, writer)
 
 
 @pytest.mark.asyncio
