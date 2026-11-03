@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..project_errors import (
     ProjectNotFoundError,
+    ProjectRegistryBusyError,
     ProjectRegistryError,
     UnsupportedMemoryFormatError,
 )
@@ -82,10 +83,26 @@ _KNOWN_OPTIONAL_MESSAGE_FIELDS = frozenset(
 class ProjectRequests:
     """Build bounded project views without changing project or session state."""
 
+    @classmethod
+    def for_runtime(
+        cls, *, home: Path, runtime: ServerRuntime, codec: FrameCodec
+    ) -> ProjectRequests | None:
+        registry = runtime.manager.project_registry
+        return (
+            cls(home=home, runtime=runtime, codec=codec, registry=registry)
+            if registry is not None
+            else None
+        )
+
     def __init__(
-        self, *, home: Path, runtime: ServerRuntime, codec: FrameCodec
+        self,
+        *,
+        home: Path,
+        runtime: ServerRuntime,
+        codec: FrameCodec,
+        registry: ProjectRegistry,
     ) -> None:
-        self.registry = ProjectRegistry(home / "projects")
+        self.registry = registry
         self.inbox = ProjectInbox(self.registry, sessions_root=home / "sessions")
         self.runtime = runtime
         self.codec = codec
@@ -576,6 +593,8 @@ def project_request_error(
         )
     if isinstance(error, RequestValidationError):
         return -32602, str(error), None
+    if isinstance(error, ProjectRegistryBusyError):
+        return -32000, str(error), {"code": error.code, "retryable": error.retryable}
     if isinstance(error, UnsupportedMemoryFormatError):
         return -32000, str(error), None
     return -32000, "project storage is invalid or unavailable", None

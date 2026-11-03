@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .decisions_panel import _registry_state
+
 
 @dataclass(frozen=True, slots=True)
 class ForkContext:
@@ -147,7 +149,10 @@ class ForkViewMixin:
 
         try:
             await asyncio.to_thread(
-                release_discussion_fork, self._home, self.loop.store.session_id
+                release_discussion_fork,
+                self._home,
+                self.loop.store.session_id,
+                _registry_state(self),
             )
         except (OSError, ValueError):
             pass

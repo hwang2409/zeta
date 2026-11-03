@@ -27,7 +27,11 @@ from typing import TypeVar
 
 from . import project_schema
 from .core.session_files import SessionError, atomic_publish_file, open_session_file
-from .project_errors import ProjectNotFoundError, ProjectRegistryError
+from .project_errors import (
+    ProjectNotFoundError,
+    ProjectRegistryBusyError,
+    ProjectRegistryError,
+)
 from .project_memory_history import ProjectMemoryHistoryMixin
 from .project_schema import (
     ID_HEX_LENGTH,
@@ -52,6 +56,8 @@ _PROJECT_ID = project_schema.PROJECT_ID_PATTERN
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SESSION_ROLES = {"session", "orchestrator", "worker"}
 _READ_RETRIES = 10
+_PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS = 1.0
+_PROJECT_REGISTRY_LOCK_POLL_SECONDS = 0.05
 _T = TypeVar("_T")
 
 
@@ -277,6 +283,18 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
             and current.st_ino == original.st_ino
         )
 
+    @staticmethod
+    def _acquire_lock(lock_fd: int, mode: int) -> None:
+        deadline = time.monotonic() + _PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(lock_fd, mode | fcntl.LOCK_NB)
+                return
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise ProjectRegistryBusyError() from exc
+                time.sleep(_PROJECT_REGISTRY_LOCK_POLL_SECONDS)
+
     def _read(self, operation: Callable[[int], _T]) -> _T:
         """Read one consistent registry snapshot without creating its lock."""
         for attempt in range(_READ_RETRIES):
@@ -285,7 +303,7 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                 lock_fd = self._open_lock(root_fd, create=False)
                 if lock_fd is not None:
                     try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+                        self._acquire_lock(lock_fd, fcntl.LOCK_SH)
                         return operation(root_fd)
                     finally:
                         fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -322,7 +340,7 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                     assert lock_fd is not None
                     try:
                         os.fchmod(lock_fd, 0o600)
-                        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                        self._acquire_lock(lock_fd, fcntl.LOCK_EX)
                         yield root_fd
                         return
                     finally:

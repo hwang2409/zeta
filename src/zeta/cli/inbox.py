@@ -10,7 +10,8 @@ from typing import IO
 
 from ..core.session import env_home
 from ..project_inbox import InboxError, ProjectInbox
-from ..project_registry import ProjectRegistry, ProjectRegistryError
+from ..project_registry import ProjectRegistryError
+from ..runtime.project_registry_state import project_registry
 
 
 def add_subcommand(commands: argparse._SubParsersAction) -> None:
@@ -27,7 +28,7 @@ def run(
     out = stdout or sys.stdout
     err = stderr or sys.stderr
     home = env_home()
-    registry = ProjectRegistry(home / "projects")
+    registry = project_registry(home / "projects")
     try:
         if args.project:
             try:

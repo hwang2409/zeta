@@ -92,7 +92,12 @@ class _SizedCodec(FrameCodec):
 
 def _requests(home: Path, *, frame_size: int = 16 * 1024 * 1024) -> ProjectRequests:
     runtime = SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list))
-    return ProjectRequests(home=home, runtime=runtime, codec=_SizedCodec(frame_size))
+    return ProjectRequests(
+        home=home,
+        runtime=runtime,
+        codec=_SizedCodec(frame_size),
+        registry=ProjectRegistry(home / "projects"),
+    )
 
 
 def test_project_show_v2_returns_kind_views_and_entry_counts(tmp_path: Path) -> None:

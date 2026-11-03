@@ -7332,7 +7332,7 @@ async def test_step_delivery_writer_handles_50k_rows_within_send_deadline(
 
 @pytest.mark.asyncio
 async def test_step_delivery_indexes_remain_pending_only_after_acknowledgements(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path)
     flow = pending_delivery_module.StepDeliveryFlow(store)
@@ -7355,11 +7355,19 @@ async def test_step_delivery_indexes_remain_pending_only_after_acknowledgements(
     reopened = ConversationStore(tmp_path, session_id=session_id, _must_exist=True)
     assert len(reopened._active_notifications) == 0
     assert len(reopened._active_pending_prompt_entries) == 0
+    snapshot_calls = 0
+    original_snapshot_entry = reopened._snapshot_entry
+
+    def count_snapshot_calls(entry):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return original_snapshot_entry(entry)
+
+    monkeypatch.setattr(reopened, "_snapshot_entry", count_snapshot_calls)
     flow = pending_delivery_module.StepDeliveryFlow(reopened)
-    started = asyncio.get_running_loop().time()
     for _ in range(25):
         await flow.prepare_request("terminal_fallback", [], None)
-    assert asyncio.get_running_loop().time() - started < 0.5
+    assert snapshot_calls == 0
     await asyncio.to_thread(reopened.close)
 
 
@@ -11014,6 +11022,7 @@ def test_child_startup_runs_one_git_discovery_in_repo_subdirectory(
         active_home=str(home),
         tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
         root_project_id=project.project_id,
+        project_registry=registry,
     )
 
     _child_base_system_prompt(loop, str(child_cwd))
@@ -11156,6 +11165,7 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
         active_home=str(home),
         tool_registry=parent_tools,
         root_project_id=project_a.project_id,
+        project_registry=registry,
     )
 
     prompt = _child_base_system_prompt(loop, str(child_cwd), child_tools)
