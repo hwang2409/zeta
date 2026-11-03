@@ -488,6 +488,9 @@ class SessionMetadata:
             ),
         }
 
+    def to_catalog_dict(self) -> dict[str, Any]:
+        return {**self.to_dict(), "system_prompt": self.system_prompt[:512]}
+
     def to_storage_dict(self) -> dict[str, Any]:
         return {
             **self.to_dict(),
@@ -779,7 +782,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         return sessions
 
     def list_sessions_read_only(self) -> list[SessionMetadata]:
-        """List valid sessions without repairing or changing durable state."""
+        """List valid sessions from metadata without opening conversation stores."""
         try:
             with session_root(self.sessions_dir) as root_fd:
                 names = os.listdir(root_fd)
@@ -788,9 +791,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         sessions: list[SessionMetadata] = []
         for name in names:
             try:
-                opened = self.open(name, _read_only=True)
-                opened.store.close()
-                sessions.append(opened.metadata)
+                sessions.append(self.read_metadata(name))
             except (SessionError, ConversationIntegrityError) as exc:
                 logger.warning("Skipping session %s: %s", name, exc)
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
@@ -809,7 +810,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             try:
                 opened = self.open(metadata.session_id, _read_only=True)
                 with opened.store:
-                    entries = opened.store.replay()
+                    entries = opened.store.active_branch_snapshot()
                 first_message = ""
                 for entry in entries:
                     if entry.type != "message":
@@ -828,7 +829,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                             "thinking",
                         } and isinstance(block.get("text"), str):
                             parts.append(block["text"])
-                    first_message = "".join(parts)
+                    first_message = "".join(parts)[:512]
                     break
                 previews.append(
                     SessionPreview(

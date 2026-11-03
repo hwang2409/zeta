@@ -369,7 +369,7 @@ def perform_read(
     if method == "status":
         return project_status(target[1])
     if method == "list_sessions":
-        return {"sessions": [item.to_dict() for item in target[1]()]}
+        return {"sessions": [item.to_catalog_dict() for item in target[1]()]}
     if method in {"model_catalog", "session_settings"}:
         return target[1]
     store = target[1]

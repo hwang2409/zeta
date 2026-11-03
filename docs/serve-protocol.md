@@ -159,7 +159,8 @@ connection does not receive `name` in this response. `approval_mode` is
 server will apply on the next approval, and what the frontend client reads to
 decide whether to paint the auto-approve indicator. It is `null` when the
 session has never had a default set, and clients must fall back to their own
-configured default in that case.
+configured default in that case. Catalog rows bound `system_prompt` to 512
+codepoints; the `first_message_preview` remains the same bounded display value.
 
 Server mode uses the effective launch provider after CLI and settings resolution.
 When no provider is configured, Zeta derives it from the configured model. If

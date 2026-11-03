@@ -429,7 +429,11 @@ class _Client:
                 features=self.features,
             )
         if method == "list_sessions":
-            return self._list_sessions(request_id, params)
+            assert self.server.connections is not None
+            return await self.server.connections.run_read(
+                self,
+                lambda: self._list_sessions(request_id, params),
+            )
         if method == "new_session":
             await self.server.control.require_idle()
             cwd = None
@@ -677,12 +681,11 @@ class _Client:
             assert self.projects is not None
             available = self.projects.project_sessions(params["project_id"])
         else:
-            available = (
-                self.server.runtime.list_sessions_read_only()
-                if self.role == "observer"
-                else self.server.runtime.list_sessions()
-            )
+            available = self.server.runtime.list_sessions_read_only()
         metadata = available[offset : None if limit is None else offset + limit]
+        if self.role != "observer":
+            for item in metadata:
+                self.server.runtime.manager._reconcile_project_link(item.session_id)
         previews = {
             item.session_id: item.preview
             for item in self.server.runtime.manager.list_session_previews(
@@ -691,7 +694,7 @@ class _Client:
         }
         sessions = [
             {
-                **item.to_dict(),
+                **item.to_catalog_dict(),
                 "first_message_preview": previews.get(item.session_id, ""),
             }
             for item in metadata
