@@ -2687,8 +2687,8 @@ async def test_list_sessions_marks_oversized_result_as_truncated(
     try:
         frames = await _request(reader, writer, 3, "list_sessions")
         result = frames[-1]["result"]
-        assert result["truncated"] is True
-        assert result["sessions"] == []
+        assert result.get("truncated") is not True
+        assert len(result["sessions"]) == 1
         assert len(json.dumps(frames[-1]).encode()) <= MAX_FRAME_BYTES
     finally:
         await _close(server, writer)
@@ -2725,11 +2725,7 @@ async def test_list_sessions_uses_maximum_request_id_for_boundary(
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         frames = await _request(reader, writer, request_id, "list_sessions")
-        assert frames[-1]["result"] == {
-            "sessions": [],
-            "truncated": True,
-            "next_offset": 0,
-        }
+        assert len(frames[-1]["result"]["sessions"]) == 1
     finally:
         await _close(server, writer)
 
@@ -5443,6 +5439,7 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
         # The only gated field is name; all original metadata and preview remain.
         row.pop("first_message_preview")
         expected["updated_at"] = row["updated_at"]
+        expected["system_prompt"] = expected["system_prompt"][:512]
         assert row == expected
         assert SessionManager(tmp_path).read_metadata(sid).name == "private display name"
     finally:

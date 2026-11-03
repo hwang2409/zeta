@@ -292,7 +292,7 @@ class ServerRuntime:
         self._project_registry_probed = True
 
     def list_sessions(self) -> list[SessionMetadata]:
-        return self.manager.list_sessions()
+        return self.manager.list_sessions_read_only()
 
     def list_sessions_read_only(self) -> list[SessionMetadata]:
         return self.manager.list_sessions_read_only()

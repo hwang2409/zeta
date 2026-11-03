@@ -681,7 +681,7 @@ class _Client:
             assert self.projects is not None
             available = self.projects.project_sessions(params["project_id"])
         else:
-            available = self.server.runtime.list_sessions_read_only()
+            available = self.server.runtime.list_sessions()
         metadata = available[offset : None if limit is None else offset + limit]
         if self.role != "observer":
             for item in metadata:
