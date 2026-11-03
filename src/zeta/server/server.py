@@ -665,11 +665,18 @@ class _Client:
             if turn_task is not None and not turn_task.done():
                 self._turn_cancel_outcome = outcome
 
+        async def terminate_turn_approvals(
+            *, foreground_only: bool = False
+        ) -> None:
+            await self._terminate_pending_approvals(
+                foreground_only=foreground_only, reason="turn_canceled"
+            )
+
         aborted = await abort_scope.abort_active_turn(
             turn_task,
             scope=scope,
             loop=self.server.runtime.loop,
-            terminate_approvals=self._terminate_pending_approvals,
+            terminate_approvals=terminate_turn_approvals,
             before_cancel=mark_canceled,
         )
         if aborted:
@@ -1140,6 +1147,7 @@ class _Client:
         *,
         foreground_only: bool = False,
         suppress_write_errors: bool = False,
+        reason: str = "controller_disconnected",
     ) -> None:
         policy = self.server.runtime.policy
         if policy is not None:
@@ -1147,14 +1155,14 @@ class _Client:
                 if foreground_only and request.child_instance_id is not None:
                     continue
                 with contextlib.suppress(ValueError, RuntimeError):
-                    policy.abort(request.key, reason="controller_disconnected")
+                    policy.abort(request.key, reason=reason)
         for key in self._approvals.active_keys():
             if foreground_only and not isinstance(key, str):
                 continue
             await self._end_approval(
                 key,
                 self.server.runtime.session_id if self.server.runtime.opened else None,
-                data={"reason": "controller_disconnected"},
+                data={"reason": reason},
                 suppress_write_errors=suppress_write_errors,
             )
 

@@ -173,24 +173,30 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
         if entry.type == "message"
         for request in entry.data.get("approval_requests", [])
     }
-    rows = []
-    codec = FrameCodec()
-    # Reserve the largest legal JSON-escaped request id, including the envelope.
-    request_id = "\x00" * MAX_REQUEST_ID_BYTES
-    for entry in entries[offset : offset + 8]:
+    projected = []
+    for entry in entries:
         if entry.type == "approval_resolution":
-            payload = event_contract.approval_end({
-                "request_id": entry.data["request_id"],
-                "tool_call": approval_calls.get(entry.data["request_id"]),
-                "data": {
-                    "decision": entry.data["decision"],
-                    **({"reason": entry.data["reason"]} if "reason" in entry.data else {}),
-                },
+            data = {
                 "decision": entry.data["decision"],
                 **({"reason": entry.data["reason"]} if "reason" in entry.data else {}),
-            })
-            row = {"id": entry.id, "role": "system", "event": "approval_end", **payload}
-        elif entry.type == "notification":
+            }
+            payload = event_contract.approval_end(
+                {
+                    "request_id": entry.data["request_id"],
+                    "tool_call": approval_calls.get(entry.data["request_id"]),
+                    "data": data,
+                    **(
+                        {"reason": entry.data["reason"]}
+                        if "reason" in entry.data
+                        else {}
+                    ),
+                }
+            )
+            projected.append(
+                {"id": entry.id, "role": "system", "event": "approval_end", **payload}
+            )
+            continue
+        if entry.type == "notification":
             data = entry.data
             kind = data.get("kind", "agent_completion")
             if kind == "task_exited":
@@ -200,85 +206,115 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
                 )
             else:
                 text = data.get("text", "background agent notification")
-            row = {
-                "id": entry.id,
-                "role": "system",
-                "content": [{"type": "text", "text": bounded(text, 8000)}],
-                "tool_result": None,
-                "notification": dict(data),
+            projected.append(
+                {
+                    "id": entry.id,
+                    "role": "system",
+                    "content": [{"type": "text", "text": bounded(text, 8000)}],
+                    "tool_result": None,
+                    "notification": dict(data),
+                }
+            )
+            continue
+
+        message = entry.data["message"]
+        for approval in entry.data.get("approval_requests", []):
+            payload = {
+                "request_id": approval["request_id"],
+                "tool_call": approval["tool_call"],
+                "delegated": False,
             }
-        else:
-            message = entry.data["message"]
-            for approval in entry.data.get("approval_requests", []):
-                rows.append({
+            approval_facts = approval.get("approval_facts", {})
+            if approval_facts.get("action") is not None:
+                payload["approval_action"] = approval_facts["action"]
+            if approval.get("approval_display"):
+                payload["approval_display"] = approval["approval_display"]
+            projected.append(
+                {
                     "id": entry.id,
                     "role": "system",
                     "event": "approval_request",
-                    **event_contract.approval_request(approval),
-                })
-            content = []
-            for block in message.get("content", []):
-                if block.get("type") == "image":
-                    content.append(
-                        {
-                            "type": "attachment",
-                            "name": Path(block.get("path") or "image").name,
-                            "size": block.get("size") or 0,
-                        }
-                    )
-                elif block.get("type") == "text":
-                    content.append({"type": "text", "text": bounded(block["text"], 8000)})
-                elif block.get("type") == "tool_use":
-                    call = block["tool_call"]
-                    content.append({
-                        "type": "tool_use",
-                        "tool_call": {"id": call["id"], "name": call["name"], "arguments": {}},
-                    })
-                elif block.get("type") == "thinking":
-                    body = block.get("body")
-                    if type(body) is str and body:
-                        body = bounded(body, 8000)
-                        content.append({"type": "thinking", "text": body, "body": body})
-                    else:
-                        # Preserve the old header-only row without copying the
-                        # legacy block's potentially private text.
-                        content.append({"type": "thinking", "text": ""})
-            result = message.get("tool_result")
-            if result:
-                result = {
-                    **result,
-                    "content": bounded(result.get("content", ""), 8000),
-                    "content_blocks": [],
-                    "structured_content": None,
+                    **event_contract.approval_request(payload),
                 }
-            row = {
-                "id": entry.id,
-                "role": message["role"],
-                "content": content,
-                "tool_result": result,
+            )
+        content = []
+        for block in message.get("content", []):
+            if block.get("type") == "image":
+                content.append(
+                    {
+                        "type": "attachment",
+                        "name": Path(block.get("path") or "image").name,
+                        "size": block.get("size") or 0,
+                    }
+                )
+            elif block.get("type") == "text":
+                content.append({"type": "text", "text": bounded(block["text"], 8000)})
+            elif block.get("type") == "tool_use":
+                call = block["tool_call"]
+                content.append(
+                    {
+                        "type": "tool_use",
+                        "tool_call": {
+                            "id": call["id"],
+                            "name": call["name"],
+                            "arguments": {},
+                        },
+                    }
+                )
+            elif block.get("type") == "thinking":
+                body = block.get("body")
+                if type(body) is str and body:
+                    body = bounded(body, 8000)
+                    content.append({"type": "thinking", "text": body, "body": body})
+                else:
+                    # Preserve the old header-only row without copying the
+                    # legacy block's potentially private text.
+                    content.append({"type": "thinking", "text": ""})
+        result = message.get("tool_result")
+        if result:
+            result = {
+                **result,
+                "content": bounded(result.get("content", ""), 8000),
+                "content_blocks": [],
+                "structured_content": None,
             }
-            failed_turn = _failed_turn_history(message)
-            if failed_turn is not None:
-                row["failed_turn"] = failed_turn
+        row = {
+            "id": entry.id,
+            "role": message["role"],
+            "content": content,
+            "tool_result": result,
+        }
+        failed_turn = _failed_turn_history(message)
+        if failed_turn is not None:
+            row["failed_turn"] = failed_turn
+        projected.append(row)
+
+    rows = []
+    codec = FrameCodec()
+    # Reserve the largest legal JSON-escaped request id, including the envelope.
+    request_id = "\x00" * MAX_REQUEST_ID_BYTES
+    for row in projected[offset : offset + 8]:
         next_offset = offset + len(rows) + 1
         candidate = {
             "messages": [*rows, row],
-            "next_offset": next_offset if next_offset < len(entries) else None,
+            "next_offset": next_offset if next_offset < len(projected) else None,
         }
         if not codec.response_fits(request_id, candidate):
             if rows:
                 break
             # Persisted messages can exceed a frame even after per-block bounds.
             # Keep their identity and advance the cursor instead of wedging refresh.
-            row["content"] = [{"type": "text", "text": "[history row too large; truncated]"}]
+            row["content"] = [
+                {"type": "text", "text": "[history row too large; truncated]"}
+            ]
             row["tool_result"] = None
-            if entry.type == "notification":
+            if "notification" in row:
                 row["notification"] = None
         rows.append(row)
     next_offset = offset + len(rows)
     return {
         "messages": rows,
-        "next_offset": next_offset if next_offset < len(entries) else None,
+        "next_offset": next_offset if next_offset < len(projected) else None,
     }
 
 

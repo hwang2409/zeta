@@ -635,11 +635,11 @@ on the wire.
 `approval_request` carries `request_id` and `tool_call`. It also carries
 `delegated: true` and `agent_instance_id` for delegated approvals. `approval_end`
 carries the same `request_id` as its matching `approval_request`, the tool call,
-and empty or loop-provided `data`. When an approval is aborted, `reason` may be
-present with one of `controller_disconnected`, `turn_canceled`, `timeout`,
-`shutdown`, or `child_cleanup`; `grace_expired` is reserved for reconnect work. For delegated approvals, the request ID is an
-opaque server-issued key, even when the parent and child use the same raw tool
-call ID.
+and empty or loop-provided `data`. When an approval is aborted, emitted reasons
+are `controller_disconnected`, `turn_canceled`, or `child_cleanup`. The stored
+format also accepts `timeout`, `shutdown`, and `grace_expired`, but no current
+path emits them. For delegated approvals, the request ID is an opaque
+server-issued key, even when the parent and child use the same raw tool call ID.
 
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"approval_request","session_id":"abc123","request_id":"tool-call-1","delegated":false,"tool_call":{"id":"tool-call-1","name":"bash","arguments":{"command":"ls"}}}}
