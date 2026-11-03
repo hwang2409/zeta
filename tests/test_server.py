@@ -1942,7 +1942,15 @@ async def test_resume_second_client_and_malformed_frame(tmp_path: Path) -> None:
     second_reader, second_writer = await asyncio.wait_for(
         asyncio.open_unix_connection(str(first.socket_path)), TIMEOUT
     )
-    refused = await _read(second_reader)
+    refused = (
+        await _request(
+            second_reader,
+            second_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.0"},
+        )
+    )[-1]
     assert refused["error"]["code"] == -32001
     second_writer.close()
     await asyncio.wait_for(second_writer.wait_closed(), TIMEOUT)

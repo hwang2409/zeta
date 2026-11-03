@@ -15,7 +15,9 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser
+from zeta.protocol.types import TextContent, ToolCall
 from zeta.server import ZetaServer
 from zeta.server.protocol import MAX_FRAME_BYTES
 from zeta.server.transport import _parse_subprotocol_auth
@@ -179,6 +181,96 @@ async def test_websocket_round_trip_uses_real_serve_runtime(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_websocket_drop_during_approval_finishes_cleanly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    with caplog.at_level(logging.ERROR):
+        await server.start()
+        connection = await _connect(server, token=server._websocket.token)
+        reader, writer, status = connection[:3]
+        assert status == 101
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "hello",
+                "params": {"protocol_version": "1.0"},
+            },
+        )
+        assert (await _read_json(reader))["id"] == 1
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "new_session",
+                "params": {"provider": "codex"},
+            },
+        )
+        assert (await _read_json(reader))["id"] == 2
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "send",
+                "params": {"text": "read it"},
+            },
+        )
+        while True:
+            frame = await _read_json(reader)
+            if frame.get("params", {}).get("event") == "approval_request":
+                break
+
+        writer.write(_masked_frame((1000).to_bytes(2, "big"), opcode=8))
+        await writer.drain()
+        opcode, _payload = await _read_frame(reader)
+        assert opcode == 8
+        writer.close()
+        await writer.wait_closed()
+        for _ in range(100):
+            opened = server.runtime.opened
+            if (
+                opened is not None
+                and server._client is None
+                and any(
+                    entry.type == "approval_resolution"
+                    and entry.data.get("decision") == "abort"
+                    for entry in opened.store.entries
+                )
+            ):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        await server.close()
+
+    assert opened is not None
+    assert any(
+        entry.type == "approval_resolution"
+        and entry.data.get("decision") == "abort"
+        for entry in opened.store.entries
+    )
+    assert [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+        or "exception was never retrieved" in record.getMessage().lower()
+    ] == []
+
+
+@pytest.mark.asyncio
 async def test_websocket_upgrade_requires_token_and_allowed_origin(
     tmp_path: Path,
 ) -> None:
@@ -318,10 +410,34 @@ async def test_websocket_and_unix_socket_share_single_client_limit(
                 "params": {"protocol_version": "1.0"},
             },
         )
-        await _read_json(ws_reader)
+        hello = await _read_json(ws_reader)
+        assert hello["id"] == 1
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
-        error = json.loads(await asyncio.wait_for(reader.readline(), TIMEOUT))
+        writer.write(
+            (json.dumps({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "hello",
+                "params": {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]},
+            }) + "\n").encode()
+        )
+        await writer.drain()
+        observer_hello = json.loads(await asyncio.wait_for(reader.readline(), TIMEOUT))
+        assert observer_hello["id"] == 2
+        occupied_reader, occupied_writer = await asyncio.open_unix_connection(str(server.socket_path))
+        occupied_writer.write(
+            (json.dumps({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "hello",
+                "params": {"protocol_version": "1.0"},
+            }) + "\n").encode()
+        )
+        await occupied_writer.drain()
+        error = json.loads(await asyncio.wait_for(occupied_reader.readline(), TIMEOUT))
         assert error["error"]["code"] == -32001
+        occupied_writer.close()
+        await occupied_writer.wait_closed()
         writer.close()
         await writer.wait_closed()
     finally:
