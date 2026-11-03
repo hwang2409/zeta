@@ -585,7 +585,6 @@ class ServeControl:
             else request_id
         )
         return asyncio.create_task(self._settle_canceled_approval(key, reason))
-
     async def _settle_canceled_approval(
         self, key: ApprovalKey, reason: str
     ) -> dict[str, str] | None:
@@ -622,7 +621,6 @@ class ServeControl:
             self._settle_record(record, "abort", reason)
         )
         return await record.settlement
-
     async def _finish_external(self, record: _ApprovalRecord) -> None:
         resolution = await self._run_blocking(
             lambda: record.target.store.approval_resolution_data(
@@ -633,7 +631,6 @@ class ServeControl:
             await self._finish_record(record, resolution)
         else:
             self._approval_records.pop(record.target.key, None)
-
     async def _finish_record(
         self, record: _ApprovalRecord, resolution: dict[str, str]
     ) -> None:
