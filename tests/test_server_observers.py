@@ -169,6 +169,71 @@ async def test_observer_disconnects_keep_controller_approval(
 
 
 @pytest.mark.asyncio
+async def test_controller_history_does_not_block_other_clients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    controller_reader, controller_writer = await _connect(server)
+    await _request(controller_reader, controller_writer, 1, "hello", {"protocol_version": "1.2"})
+    session_id = (await _request(
+        controller_reader, controller_writer, 2, "new_session", {"provider": "codex"}
+    ))[-1]["result"]["session"]["session_id"]
+    observer_reader, observer_writer = await _observer(
+        server, 3, features=["serve_observers", "ping"]
+    )
+    store = server.runtime.opened.store
+    entered = threading.Event()
+    release = threading.Event()
+    ping_answered = threading.Event()
+    answered_before_release: list[bool] = []
+    original_replay = store.replay
+
+    def gated_replay() -> Any:
+        entered.set()
+        assert release.wait(TIMEOUT)
+        return original_replay()
+
+    def bounded_release() -> None:
+        answered_before_release.append(ping_answered.wait(0.5))
+        release.set()
+
+    monkeypatch.setattr(store, "replay", gated_replay)
+
+    async def ping_after_history_starts() -> None:
+        await _wait_thread(entered)
+        response = (await _request(observer_reader, observer_writer, 4, "ping"))[-1]
+        assert response["result"] == {"pong": True}
+        ping_answered.set()
+
+    ping = asyncio.create_task(ping_after_history_starts())
+    watchdog = threading.Thread(target=bounded_release)
+    watchdog.start()
+    try:
+        history = await asyncio.wait_for(
+            _request(
+                controller_reader,
+                controller_writer,
+                5,
+                "session_history",
+                {"session_id": session_id},
+            ),
+            TIMEOUT,
+        )
+        await asyncio.wait_for(ping, TIMEOUT)
+        await asyncio.to_thread(watchdog.join)
+        assert history[-1]["result"]["messages"] == []
+        assert answered_before_release == [True]
+    finally:
+        release.set()
+        watchdog.join()
+        ping.cancel()
+        await asyncio.gather(ping, return_exceptions=True)
+        observer_writer.close()
+        await observer_writer.wait_closed()
+        await _close(server, controller_writer)
+
+
+@pytest.mark.asyncio
 async def test_observer_read_is_fenced_from_controller_session_switch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -463,6 +528,65 @@ async def test_observer_outbound_limits_count_and_bytes(tmp_path: Path) -> None:
         assert reader.at_eof() or writer.is_closing()
     finally:
         await _close(server, controller_writer); writer.close(); await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_session_tree_uses_one_store_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    reader, writer = await _connect(server)
+    await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+    session = (
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+    )[-1]["result"]["session"]
+    store = server.runtime.opened.store
+    first = store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("before")]), MessageOrigin.USER
+        )
+    )
+    captured = threading.Event()
+    release = threading.Event()
+    entries_property = type(store).entries
+
+    def gated_entries(target):
+        entries = entries_property.__get__(target, type(target))
+        captured.set()
+        assert release.wait(TIMEOUT)
+        return entries
+
+    monkeypatch.setattr(type(store), "entries", property(gated_entries))
+    request = asyncio.create_task(
+        _request(
+            reader,
+            writer,
+            3,
+            "session_tree",
+            {"session_id": session["session_id"]},
+        )
+    )
+    try:
+        await _wait_thread(captured)
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("after")]),
+                MessageOrigin.USER,
+            )
+        )
+    finally:
+        release.set()
+    try:
+        response = (await request)[-1]
+        assert response["result"] == {
+            "branches": [
+                {"id": first.id, "label": "before", "depth": 0, "current": True}
+            ]
+        }
+    finally:
+        await _close(server, writer)
 
 
 @pytest.mark.asyncio

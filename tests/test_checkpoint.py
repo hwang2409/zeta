@@ -166,7 +166,6 @@ def test_checkpoint_method_type_hints_resolve_conversation_entry() -> None:
         CheckpointForkMixin._default_checkpoint_label,
         CheckpointForkMixin._message_fork_label,
         CheckpointForkMixin._branch_switch_label,
-        CheckpointForkMixin._message_preview,
         CheckpointForkMixin._resolve_checkpoint,
     )
 
