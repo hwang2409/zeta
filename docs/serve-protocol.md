@@ -30,10 +30,14 @@ messages, fragmentation, ping, pong, and the close handshake. It does not
 negotiate extensions. Binary messages close with code `1003`, and messages over
 1 MiB close with code `1009`.
 
-Every serve start creates a new random bearer token. A WebSocket upgrade must
-supply it as the `token` URL query parameter. After startup, Zeta prints the
-exact connect URL once to stderr; it does not print it to stdout or write the
-token to logs. It atomically writes this discovery file with mode `0600` and
+Every serve start creates a new random bearer token. New clients should supply
+it in `Sec-WebSocket-Protocol` as `zeta.bearer.<token>`, alongside
+`zeta.v1`. The server echoes only `zeta.v1`. The legacy `token` URL query
+parameter remains supported for existing clients, but is deprecated and will be
+removed after Gamma and Fulcrum switch to the subprotocol. Until then, the
+startup WebSocket URL still includes the query token for existing manual
+connect clients. Zeta does not print the token to logs. It atomically writes this
+discovery file with mode `0600` and
 removes it on clean shutdown:
 
 ```text
@@ -41,11 +45,12 @@ $ZETA_HOME/run/serve.ws.json
 ```
 
 ```json
-{"port":8765,"token":"<random bearer token>","pid":12345,"origins":["http://127.0.0.1:5173"]}
+{"port":8765,"token":"<random bearer token>","pid":12345,"origins":["http://127.0.0.1:5173"],"ws_auth":["subprotocol","query"]}
 ```
 
 A native launcher can read this file and deliver the connection details to its
-trusted frontend. Treat the token as a secret.
+trusted frontend. `ws_auth` advertises the supported authentication methods;
+clients should prefer `subprotocol`. Treat the token as a secret.
 
 Browser upgrades also require an exact allowed `Origin`. Add each origin with a
 repeatable `--ws-origin scheme://host:port` flag. Wildcards, omitted ports,
@@ -59,7 +64,8 @@ discovery file:
 
 ```js
 const socket = new WebSocket(
-  `ws://127.0.0.1:${connection.port}/?token=${encodeURIComponent(connection.token)}`,
+  `ws://127.0.0.1:${connection.port}/`,
+  [`zeta.v1`, `zeta.bearer.${connection.token}`],
 );
 socket.addEventListener("open", () => {
   socket.send(JSON.stringify({

@@ -62,6 +62,18 @@ def validate_origins(origins: Sequence[str]) -> tuple[str, ...]:
     return tuple(validated)
 
 
+def _parse_subprotocol_auth(
+    fields: Sequence[str],
+) -> tuple[str, str | None]:
+    protocols = [item.strip() for field in fields for item in field.split(",")]
+    bearers = [item[12:] for item in protocols if item.startswith("zeta.bearer.")]
+    if not bearers:
+        return ("none", None)
+    if len(bearers) != 1 or "zeta.v1" not in protocols or not bearers[0]:
+        return ("invalid", None)
+    return ("bearer", bearers[0])
+
+
 class WebSocketServer:
     """Own the secure loopback listener and its connection-discovery file."""
 
@@ -93,6 +105,10 @@ class WebSocketServer:
             "127.0.0.1",
             self.port,
             process_request=self._authorize,
+            subprotocols=["zeta.v1"],
+            select_subprotocol=lambda _connection, protocols: (
+                "zeta.v1" if "zeta.v1" in protocols else None
+            ),
             compression=None,
             open_timeout=_UPGRADE_TIMEOUT,
             close_timeout=1,
@@ -118,8 +134,17 @@ class WebSocketServer:
     def _authorize(
         self, connection: ServerConnection, request: Request
     ) -> Response | None:
-        supplied = parse_qs(urlsplit(request.path).query, keep_blank_values=True).get(
-            "token", []
+        auth_kind, bearer = _parse_subprotocol_auth(
+            request.headers.get_all("Sec-WebSocket-Protocol")
+        )
+        if auth_kind == "invalid":
+            return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
+        supplied = (
+            [bearer]
+            if auth_kind == "bearer"
+            else parse_qs(urlsplit(request.path).query, keep_blank_values=True).get(
+                "token", []
+            )
         )
         if (
             self.token is None
@@ -274,7 +299,13 @@ def write_connection_file(
     parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     temporary = f".{path.name}.{secrets.token_hex(16)}.tmp"
     payload = json.dumps(
-        {"port": port, "token": token, "pid": os.getpid(), "origins": list(origins)},
+        {
+            "port": port,
+            "token": token,
+            "pid": os.getpid(),
+            "origins": list(origins),
+            "ws_auth": ["subprotocol", "query"],
+        },
         separators=(",", ":"),
     ).encode()
     fd = -1
