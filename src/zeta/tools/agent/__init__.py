@@ -29,12 +29,13 @@ from ...agent.receipt import (
     format_agent_stats,
     terminal_state,
 )
-from ...core.agent_progress import live_agent_lifecycle
+from ...core.agent_progress import live_agent_lifecycle, read_agent_lifecycle
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
     load_session_json,
 )
+from ...core.child_lifecycle import select_legacy_child_lifecycle
 from ...core.session_files import child_directory, read_session_file
 from ...core.store import ConversationStore
 from ...models.catalog import known_model_names
@@ -80,11 +81,8 @@ _MISSING = object()
 def _read_agent_lifecycle(path: str) -> dict[str, object]:
     if not path:
         return {}
-    live = live_agent_lifecycle(Path(path) / "agent_lifecycle.json")
-    if live is not None:
-        return live
     try:
-        value = load_session_json(Path(path) / "agent_lifecycle.json")
+        value = read_agent_lifecycle(Path(path) / "agent_lifecycle.json")
     except ConversationIntegrityError:
         return {}
     return value if type(value) is dict else {}
@@ -407,14 +405,14 @@ def _project_agent_status(
     notifications: Sequence[ConversationEntry],
     requested_handle: str | None = None,
 ) -> dict[str, StructuredContentValue]:
-    lifecycle = live_agent_lifecycle(child_path / "agent_lifecycle.json")
-    if lifecycle is None:
-        try:
-            lifecycle = load_session_json(
-                _read_child_file(store, child_path, "agent_lifecycle.json")
-            )
-        except (OSError, ValueError) as exc:
-            raise ValueError("could not read child state") from exc
+    live = live_agent_lifecycle(child_path / "agent_lifecycle.json")
+    try:
+        durable = load_session_json(
+            _read_child_file(store, child_path, "agent_lifecycle.json")
+        )
+        lifecycle = select_legacy_child_lifecycle(durable, live)
+    except (OSError, ValueError) as exc:
+        raise ValueError("could not read child state") from exc
     if type(lifecycle) is not dict:
         raise ValueError("lifecycle data is not an object")
     if lifecycle.get("handle") != handle:

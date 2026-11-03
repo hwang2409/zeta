@@ -23,11 +23,21 @@ from zeta.core.store._child_runs import (
     parse_child_run_id,
     validate_child_run_started_data,
 )
-from zeta.protocol.types import Message, MessageOrigin, MessageRole, TextContent
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolResult,
+)
 from zeta.server.ergonomics import history
 from zeta.skills import SkillCatalog
 from zeta.transcript_search.index import TranscriptIndex, TranscriptSource
 from zeta.tui.app import TUIApp
+from zeta.tui.cards.agent import AgentCard
 
 
 @pytest.mark.parametrize("run_id", ["session:4", "session:4:2", "session:4:2:9"])
@@ -290,6 +300,48 @@ def test_tui_replays_start_row_through_real_renderer(tmp_path: Path) -> None:
         store.close()
 
 
+def test_agent_card_render_bytes_are_unchanged(tmp_path: Path) -> None:
+    child = ConversationStore(tmp_path, session_id="child")
+    lifecycle = {
+        "handle": "parent:1",
+        "state": "completed",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "finished_at": "2026-01-01T00:00:01+00:00",
+        "elapsed": 1.5,
+        "turns_used": 2,
+        "tool_calls": 3,
+        "current_step": "done",
+        "depth": 1,
+        "agent_type": "general",
+        "description": "child",
+        "cwd": "/repo",
+        "final_result": "done",
+    }
+    child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+    call = ToolCall("agent-1", "agent", {"prompt": "inspect", "description": "child"})
+    rendered = AgentCard.render_receipt(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "done",
+                structured_content={
+                    "child_session_path": str(child.session_dir),
+                    "status": "completed",
+                    "turns_used": 2,
+                },
+            ),
+        )
+    )
+    assert rendered is not None
+    assert rendered.plain == (
+        "child · 2 turns · 1.5s · completed · depth 1 · "
+        "done · 2 turns · 1.5s · 3 tool calls · error=false · canceled=false"
+    )
+    child.close()
+
+
 def test_serve_session_history_ignores_start_row(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="session")
     store.append_message(_message(MessageRole.USER, "before"))
@@ -300,6 +352,16 @@ def test_serve_session_history_ignores_start_row(tmp_path: Path) -> None:
     try:
         result = history(SimpleNamespace(opened=SimpleNamespace(store=store)), {})
         rendered = json.dumps(result)
+        empty = ConversationStore(tmp_path, session_id="empty")
+        try:
+            empty_frame = history(
+                SimpleNamespace(opened=SimpleNamespace(store=empty)), {}
+            )
+            assert json.dumps(
+                empty_frame, sort_keys=True, separators=(",", ":")
+            ) == '{"messages":[],"next_offset":null}'
+        finally:
+            empty.close()
         assert "before" in rendered
         assert "after" in rendered
         assert "must stay hidden" not in rendered
