@@ -335,7 +335,11 @@ def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str 
             return None, {"session": None, "state": "idle", "explicit_finish": False, "pending_approvals": [], "usage": {}, "compaction_markers": 0}
         return runtime.session_id, {
             "session": client._session_snapshot(),
-            "state": runtime.state.status if runtime.state is not None else "idle",
+            "state": (
+                "idle"
+                if client.server.control.unhealthy() or runtime.state is None
+                else runtime.state.status
+            ),
             "explicit_finish": runtime.loop.explicit_finish if runtime.loop is not None else runtime._config(None, None).agents_explicit_finish,
             "pending_approvals": [], "usage": dict(runtime.usage), "store": runtime.opened.store,
         }

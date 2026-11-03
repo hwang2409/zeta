@@ -678,7 +678,11 @@ class _Client:
         )
         return {
             "session": session,
-            "state": runtime.state.status if runtime.state is not None else "idle",
+            "state": (
+                "idle"
+                if self.server.control.unhealthy() or runtime.state is None
+                else runtime.state.status
+            ),
             "explicit_finish": (
                 runtime.loop.explicit_finish
                 if runtime.loop is not None

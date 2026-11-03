@@ -205,7 +205,7 @@ class ServeControl:
 
     async def _pending_approvals_projection(self) -> list[dict[str, object]]:
         policy = self.server.runtime.policy
-        if policy is None:
+        if policy is None or self.unhealthy():
             return []
         foreground = policy.store
         delegated = tuple(

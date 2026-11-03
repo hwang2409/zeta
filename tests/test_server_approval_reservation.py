@@ -713,6 +713,166 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             child.close()
 
 
+async def _make_unhealthy(
+    server: ZetaServer, call: ToolCall, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await server.control._event(_start_event(call))
+    store = server.runtime.opened.store
+    monkeypatch.setattr(
+        store,
+        "resolve_approval",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
+    )
+    with pytest.raises(ProtocolError) as error:
+        await server.control.resolve_approval("approve", call.id)
+    assert error.value.code == -32000
+    assert server.control.unhealthy()
+
+
+@pytest.mark.asyncio
+async def test_protocol_1_0_persistent_approval_failure_keeps_legacy_status_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, call = await _approval_server(tmp_path)
+    try:
+        await _make_unhealthy(server, call, monkeypatch)
+        await _read_raw(reader)  # approval_request
+        event = json.loads((await _read_raw(reader)).decode())
+        assert event["method"] == "event"
+        assert event["params"]["event"] == "error"
+        assert event["params"]["error"]["code"] == "server_error"
+        response = (await _request(reader, writer, 9, "status"))[-1]
+        assert response == {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": {
+                "session": response["result"]["session"],
+                "state": "idle",
+                "explicit_finish": False,
+                "pending_approvals": [],
+                "usage": {},
+                "compaction_markers": 0,
+            },
+        }
+        assert "health" not in response["result"]
+        with pytest.raises(ProtocolError) as error:
+            await server.control.resolve_approval("approve", call.id)
+        assert error.value.code == -32000
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_observer_persistent_approval_failure_keeps_legacy_status_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _controller_reader, controller_writer, call = await _approval_server(tmp_path)
+    observer_reader, observer_writer = await asyncio.open_unix_connection(
+        str(server.socket_path)
+    )
+    await _request(
+        observer_reader,
+        observer_writer,
+        10,
+        "hello",
+        {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]},
+    )
+    try:
+        await _make_unhealthy(server, call, monkeypatch)
+        response = (await _request(observer_reader, observer_writer, 11, "status"))[-1]
+        result = response["result"]
+        assert set(result) == {"session", "state", "explicit_finish", "pending_approvals", "usage", "compaction_markers"}
+        assert result["state"] == "idle"
+        mutation = (await _request(observer_reader, observer_writer, 12, "send", {"text": "nope"}))[-1]
+        assert mutation["error"]["data"]["code"] == "observer_read_only"
+    finally:
+        await _close(server, controller_writer)
+        observer_writer.close()
+        await observer_writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_unhealthy_same_session_resume_reopens_and_clears_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, call = await _approval_server(tmp_path)
+    try:
+        await _make_unhealthy(server, call, monkeypatch)
+        session_id = server.runtime.session_id
+        old_store = server.runtime.opened.store
+        response = (await _request(reader, writer, 9, "resume", {"session_id": session_id}))[-1]
+        assert "result" in response
+        assert server.runtime.session_id == session_id
+        assert server.runtime.opened.store is not old_store
+        assert not server.control.unhealthy()
+        assert (await _request(reader, writer, 10, "send", {"text": "recovered"}))[-1]["result"]["accepted"] is True
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_unhealthy_same_session_resume_failure_does_not_clear_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, call = await _approval_server(tmp_path)
+    try:
+        await _make_unhealthy(server, call, monkeypatch)
+        session_id = server.runtime.session_id
+        monkeypatch.setattr(
+            server.runtime,
+            "_run_setup",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replay failed")),
+        )
+        response = (await _request(reader, writer, 9, "resume", {"session_id": session_id}))[-1]
+        assert response["error"]["code"] == -32000
+        assert server.control.unhealthy()
+        assert server.runtime.opened is None
+        mutation = (await _request(reader, writer, 10, "send", {"text": "blocked"}))[-1]
+        assert mutation["error"]["code"] == -32003
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["close", "setup", "install"])
+async def test_forced_resume_cancellation_at_each_boundary_is_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    server, _reader, writer, call = await _approval_server(tmp_path)
+    try:
+        await _make_unhealthy(server, call, monkeypatch)
+        runtime = server.runtime
+        session_id = runtime.session_id
+        original_close = runtime._close_state
+        original_setup = runtime._run_setup
+        cancelled = asyncio.CancelledError()
+
+        async def cancel_close(state):
+            if boundary == "close":
+                raise cancelled
+            await original_close(state)
+
+        async def cancel_setup(*args, **kwargs):
+            if boundary == "setup":
+                raise cancelled
+            return await original_setup(*args, **kwargs)
+
+        def cancel_install(state):
+            if boundary == "install":
+                raise cancelled
+
+        monkeypatch.setattr(runtime, "_close_state", cancel_close)
+        monkeypatch.setattr(runtime, "_run_setup", cancel_setup)
+        monkeypatch.setattr(runtime, "_bind_background_event_sink", cancel_install)
+        with pytest.raises(asyncio.CancelledError):
+            await runtime.resume_session(session_id, force=True)
+        assert runtime.opened is None
+        assert runtime.state is None
+        assert server.control.unhealthy()
+    finally:
+        await _close(server, writer)
+
+
 @pytest.mark.asyncio
 async def test_approval_durable_failure_is_fail_closed_and_documented(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
