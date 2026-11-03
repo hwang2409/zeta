@@ -1502,14 +1502,16 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
     monkeypatch.setattr(
         tool_spawn_module,
         "_LAUNCHER",
-        "import pathlib,time; time.sleep(0.3); "
+        "import pathlib,time; time.sleep(1.0); "
         f"pathlib.Path({str(launcher_ready)!r}).touch()\n"
         + tool_spawn_module._LAUNCHER,
     )
     command_started = tmp_path / "timeout-command-started"
+    command_finished = tmp_path / "timeout-command-finished"
     command = (
         "import pathlib,time; "
-        f"pathlib.Path({str(command_started)!r}).touch(); time.sleep(30)"
+        f"pathlib.Path({str(command_started)!r}).touch(); time.sleep(1.5); "
+        f"pathlib.Path({str(command_finished)!r}).touch()"
     )
     original_spawn = bash_module.create_tool_subprocess_shell
 
@@ -1529,12 +1531,14 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
         ToolCall(
             "bash-launcher-timeout",
             "bash",
-            {"command": _python_command(command), "timeout": 0.2},
+            {"command": _python_command(command), "timeout": 2.0},
         )
     )
 
     assert launcher_ready.exists()
-    assert result["structuredContent"]["timed_out"] is True
+    assert command_finished.exists()
+    assert result["isError"] is False
+    assert "timed_out" not in result["structuredContent"]
 
 
 @pytest.mark.asyncio
