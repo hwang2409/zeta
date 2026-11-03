@@ -276,6 +276,14 @@ class ApprovalAbortPolicy(Protocol):
 
 
 class _ServeApprovalControl(Protocol):
+    def request_approval_abort(
+        self,
+        request_id: str,
+        *,
+        child_instance_id: str | None = None,
+        reason: str = "turn_canceled",
+    ) -> Awaitable[dict[str, str] | None]: ...
+
     def register_delegated(
         self,
         request: ApprovalRequest,
@@ -325,6 +333,21 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         if self._serve_control is not None and self._serve_control is not control:
             raise RuntimeError("approval policy is already bound to serve control")
         self._serve_control = control
+
+    def _request_serve_abort(
+        self,
+        request_id: str,
+        *,
+        child_instance_id: str | None = None,
+        reason: str = "turn_canceled",
+    ) -> Awaitable[dict[str, str] | None] | None:
+        if self._serve_control is None:
+            return None
+        return self._serve_control.request_approval_abort(
+            request_id,
+            child_instance_id=child_instance_id,
+            reason=reason,
+        )
 
     @property
     def store(self) -> ConversationStore:
@@ -788,6 +811,8 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
         del execution_token, capability
+        if self._request_serve_abort(request_id) is not None:
+            return None
         delegated = self._delegated_entry(request_id, None)
         if delegated is not None:
             delegated[1].resolve_approval(delegated[0].request_id, "abort")
@@ -966,7 +991,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                     return ApprovalDecision.DENY
                 return None
             if abort_signal.is_set():
-                return self._resolve_abort_or_winner(
+                return await self._resolve_abort_or_winner(
                     tool_call.id, capability=capability
                 )
             abort_task = asyncio.create_task(abort_signal.wait())
@@ -985,7 +1010,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
             if abort_task in done:
-                return self._resolve_abort_or_winner(
+                return await self._resolve_abort_or_winner(
                     tool_call.id, capability=capability
                 )
 
@@ -994,13 +1019,19 @@ class ApprovalPolicy(ApprovalAbortPolicy):
 
         self._ephemeral.pop(request_id, None)
 
-    def _resolve_abort_or_winner(
+    async def _resolve_abort_or_winner(
         self,
         request_id: str,
         *,
         capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
-        return self.abort_or_winner(request_id, capability=capability)
+        settlement = self._request_serve_abort(request_id)
+        if settlement is None:
+            return self.abort_or_winner(request_id, capability=capability)
+        resolution = await settlement
+        return _resolved_decision(
+            resolution["decision"] if resolution is not None else None
+        )
 
     def _require_store(self) -> ConversationStore:
         if self._store is None:

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import threading
 import uuid
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,22 @@ from zeta.protocol.types import (
 from zeta.server import ZetaServer
 from zeta.server.protocol import ProtocolError
 from zeta.server.slash_commands import ServerSlashSession
+from zeta.tools.agent.approval import ChildApprovalPolicy
+
+
+class _AbortEvent:
+    def __init__(self) -> None:
+        self._event = asyncio.Event()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    async def wait(self) -> None:
+        await self._event.wait()
+
+    def set(self, **kwargs: object) -> None:
+        del kwargs
+        self._event.set()
 
 
 class _StoreGate:
@@ -510,6 +528,171 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["foreground", "delegated"])
+async def test_serve_bound_approval_writes_only_through_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    server, _reader, writer, foreground = await _approval_server(tmp_path)
+    child: ConversationStore | None = None
+    try:
+        policy = server.runtime.policy
+        assert policy is not None
+        if path == "foreground":
+            call = foreground
+            store = server.runtime.opened.store
+            await server.control._event(_start_event(call))
+            abort = partial(
+                policy.abort_or_winner,
+                call.id,
+                capability=object(),  # type: ignore[arg-type]
+            )
+        else:
+            child = ConversationStore(tmp_path / "guard-child")
+            call = ToolCall("guard-child-call", "read", {"path": "input"})
+            child.append_message_with_approval_requests(
+                Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+                [(call.id, call)],
+            )
+            child_policy = ChildApprovalPolicy(policy, child, "child", "child")
+            request = ApprovalRequest(call.id, call, child_instance_id="child")
+            policy.register_delegated(request, child, child_instance_id="child")
+            await server.control._event(
+                StreamEvent(
+                    StreamEventType.TOOL_APPROVAL_START,
+                    tool_call=call,
+                    data={"agent_instance_id": "child"},
+                ),
+                session_id="parent",
+                background=True,
+            )
+            store = child
+            abort = partial(
+                child_policy.abort_or_winner,
+                call.id,
+                capability=object(),  # type: ignore[arg-type]
+            )
+
+        writers: list[tuple[str, ...]] = []
+        original_resolve = store.resolve_approval
+
+        def record_writer(*args: object, **kwargs: object) -> bool:
+            writers.append(tuple(frame.function for frame in inspect.stack()))
+            return original_resolve(*args, **kwargs)
+
+        monkeypatch.setattr(store, "resolve_approval", record_writer)
+        assert abort() is None
+        await asyncio.sleep(0)
+        await server.control.wait_for_approval_settlement()
+
+        assert writers
+        assert all("persist" in caller for caller in writers)
+    finally:
+        await _close(server, writer)
+        if child is not None:
+            child.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["foreground", "delegated"])
+async def test_failed_settlement_cancellation_recovery_balances_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    server, _reader, writer, foreground = await _approval_server(tmp_path)
+    child: ConversationStore | None = None
+    notifications: list[str] = []
+    original_notify = server.control._notify
+
+    async def record_notify(event: str, *args: object, **kwargs: object) -> bool:
+        notifications.append(event)
+        return await original_notify(event, *args, **kwargs)
+
+    monkeypatch.setattr(server.control, "_notify", record_notify)
+    try:
+        policy = server.runtime.policy
+        assert policy is not None and server.runtime.loop is not None
+        if path == "foreground":
+            call = foreground
+            store = server.runtime.opened.store
+            authorizer = policy
+            key: str | tuple[str, str] = call.id
+        else:
+            child = ConversationStore(tmp_path / "recover-child")
+            call = ToolCall("recover-child-call", "bash", {"command": "true"})
+            authorizer = ChildApprovalPolicy(policy, child, "child", "child")
+            store = child
+            key = ("child", call.id)
+
+        capability = server.runtime.loop.tool_registry.resolve_tool_call_capability(
+            call
+        )
+        if child is not None:
+            request = authorizer.prepare(call, capability=capability)
+            assert request is not None
+            child.append_message_with_approval_requests(
+                Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+                [(call.id, call, request.audit_facts(), request.audit_display())],
+            )
+        signal = _AbortEvent()
+        authorization = asyncio.create_task(
+            authorizer.authorize(call, signal, capability=capability)
+        )
+        if path == "delegated":
+            while key not in server.control._approval_records:
+                await asyncio.sleep(0)
+        await server.control._event(
+            StreamEvent(
+                StreamEventType.TOOL_APPROVAL_START,
+                tool_call=call,
+                data={"agent_instance_id": "child"} if path == "delegated" else {},
+            ),
+            session_id="parent" if path == "delegated" else None,
+            background=path == "delegated",
+        )
+
+        original_resolve = store.resolve_approval
+        writes = 0
+
+        def fail_twice_then_recover(*args: object, **kwargs: object) -> bool:
+            nonlocal writes
+            writes += 1
+            if writes <= 2:
+                raise OSError("injected settlement failure")
+            return original_resolve(*args, **kwargs)
+
+        monkeypatch.setattr(store, "resolve_approval", fail_twice_then_recover)
+        monkeypatch.setattr(server.runtime.loop, "abort", signal.set)
+        request_id = server.control._approvals.wire_id(key)
+        with pytest.raises(ProtocolError) as error:
+            await server.control.resolve_approval("approve", request_id)
+        assert error.value.code == -32000
+        assert await asyncio.wait_for(authorization, TIMEOUT) is None
+        await server.control.wait_for_approval_settlement()
+
+        assert writes == 3
+        assert store.approval_resolution_data(call.id) == {
+            "request_id": call.id,
+            "decision": "abort",
+            "reason": "child_cleanup" if path == "delegated" else "turn_canceled",
+        }
+        assert notifications.count("approval_request") == 1
+        assert notifications.count("approval_end") == 1
+        if path == "delegated":
+            history = [
+                entry.data
+                for entry in server.runtime.opened.store.entries
+                if entry.type == "approval_history"
+            ]
+            assert [row["event"] for row in history] == [
+                "approval_request",
+                "approval_end",
+            ]
+    finally:
+        await _close(server, writer)
+        if child is not None:
+            child.close()
+
+
+@pytest.mark.asyncio
 async def test_approval_durable_failure_is_fail_closed_and_documented(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -547,7 +730,7 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
         assert aborted == [True]
         with pytest.raises(ProtocolError) as later:
             await server.control.resolve_approval("approve", call.id)
-        assert later.value.code == -32000
+        assert later.value.code == -32006
 
         call2 = ToolCall("call-committed", "read", {"path": "/tmp/committed"})
         store.append_message_with_approval_requests(
@@ -831,10 +1014,12 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
         original_resolve = store.resolve_approval
         entered = threading.Event()
         calls = 0
+        writer_paths: list[tuple[str, ...]] = []
 
         def gated_resolve(*args: object, **kwargs: object) -> bool:
             nonlocal calls
             calls += 1
+            writer_paths.append(tuple(frame.function for frame in inspect.stack()))
             entered.set()
             assert release.wait(timeout=1)
             if write_result == "raise" and calls == 1:
@@ -876,6 +1061,8 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
         )
         key = call.id if path == "foreground" else ("child", call.id)
         assert key not in server.control._approval_records
+        assert writer_paths
+        assert all("persist" in caller for caller in writer_paths)
         if path == "delegated":
             history = [
                 entry.data
