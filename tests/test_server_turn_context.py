@@ -183,7 +183,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
         )
         server.control._schedule_background_wake(server.runtime.session_id)
         assert await asyncio.to_thread(append_committed.wait, 2)
-        turn_task = server._client._turn_task
+        turn_task = server.control._turn_task
         assert turn_task is not None
         turn_task.cancel()
         release_append.set()
@@ -262,7 +262,7 @@ async def test_persisted_notification_retry_attaches_new_context_once(
         )
         server.control._schedule_background_wake(server.runtime.session_id)
         assert await asyncio.to_thread(append_committed.wait, 2)
-        turn_task = server._client._turn_task
+        turn_task = server.control._turn_task
         assert turn_task is not None
         turn_task.cancel()
         release_append.set()
