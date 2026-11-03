@@ -120,15 +120,14 @@ class ZetaServer:
         self._socket_created = False
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
-
+        self._account_warnings: tuple[str, ...] = ()
     @property
     def address(self) -> str:
         if self.port is not None:
             return f"127.0.0.1:{self.port}"
         return str(self.socket_path)
-
     async def start(self) -> None:
-        await accounts.migrate(self.home)
+        self._account_warnings = await accounts.migrate(self.home)
         if self.port is None:
             self._prepare_socket_path()
             self._server = await asyncio.start_unix_server(
@@ -149,7 +148,6 @@ class ZetaServer:
             except BaseException:
                 await self.close()
                 raise
-
     async def serve_forever(self) -> None:
         if self._server is None:
             await self.start()
@@ -511,11 +509,14 @@ class _Client:
         }
         if extended and requested is not None:
             capabilities["features"] = accepted
-        return {
+        result: dict[str, object] = {
             "protocol_version": self.protocol_version,
             "server": "zeta",
             "capabilities": capabilities,
         }
+        if self.server._account_warnings:
+            result["notices"] = list(self.server._account_warnings)
+        return result
 
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:

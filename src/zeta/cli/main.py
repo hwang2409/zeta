@@ -21,6 +21,7 @@ from ..accounts import (
     AccountStore,
     AccountUsage,
 )
+from ..accounts.login import login_named_account
 from ..accounts.usage import format_usage_lines, usage_json
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
@@ -29,7 +30,6 @@ from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
 from ..providers.factory import credential_store
-from ..providers.login import build_login_provider, pkce_values
 from ..tui.app import create_app
 from ..tui.key_bindings import TerminalRenderError
 
@@ -286,7 +286,9 @@ def build_parser() -> argparse.ArgumentParser:
         "accounts", help="manage subscription accounts"
     )
     accounts_parser.add_argument(
-        "action", nargs="?", choices=("default", "login", "refresh", "rename", "status")
+        "action",
+        nargs="?",
+        choices=("default", "login", "logout", "refresh", "rename", "status"),
     )
     accounts_parser.add_argument("account", nargs="?")
     accounts_parser.add_argument("new_label", nargs="?")
@@ -411,20 +413,13 @@ def build_parser() -> argparse.ArgumentParser:
 def _run_login(
     provider: str, label: str = "default", replace_existing: bool = False
 ) -> str | None:
-    home = account_home(env_home())
-    store = AccountStore(home)
-    with store.provider_login_lock(provider):
-        store.migrate()
-        try:
-            account = store.resolve_reference(provider, label)
-        except AccountError:
-            account = AccountId(provider, label)
-        else:
-            if not replace_existing:
-                raise AccountError(f"account {provider}:{label} already exists; use --replace")
-        return asyncio.run(
-            run_login(build_login_provider(provider, home, account.name), pkce_values)
-        )
+    return login_named_account(
+        env_home(),
+        provider,
+        label,
+        replace_existing=replace_existing,
+        login=run_login,
+    )
 
 
 def _login_label(args: argparse.Namespace) -> str:
@@ -595,6 +590,27 @@ async def _account_status(
     return status, bool(result["ok"])
 
 
+def _migration_pending_status(
+    provider: str, default: AccountId | None, *, refresh: bool
+) -> dict[str, object]:
+    status: dict[str, object] = {
+        "provider": provider,
+        "account": "default",
+        "is_default": default in {None, AccountId(provider, "default")},
+        "logged_in": None,
+        "access_token_expires_at": None,
+        "error": "migration_pending",
+        "retryable": False,
+    }
+    if refresh:
+        status["refresh"] = {
+            "ok": False,
+            "code": "migration_pending",
+            "retryable": False,
+        }
+    return status
+
+
 async def _account_statuses(
     store: AccountStore, provider: str | None, *, refresh: bool
 ) -> tuple[list[dict[str, object]], bool]:
@@ -615,27 +631,8 @@ async def _account_statuses(
         name: await asyncio.to_thread(store.default, name)
         for name in {item.account.provider for item in accounts}
     }
-    statuses: list[dict[str, object]] = [
-        {
-            "provider": name,
-            "account": "default",
-            "is_default": defaults.get(name) in {None, AccountId(name, "default")},
-            "logged_in": None,
-            "access_token_expires_at": None,
-            "error": "migration_pending",
-            "retryable": False,
-            **(
-                {
-                    "refresh": {
-                        "ok": False,
-                        "code": "migration_pending",
-                        "retryable": False,
-                    }
-                }
-                if refresh
-                else {}
-            ),
-        }
+    statuses = [
+        _migration_pending_status(name, defaults.get(name), refresh=refresh)
         for name in sorted(pending_providers)
     ]
     all_ok = bool(accounts) and not pending_providers
@@ -679,6 +676,12 @@ def _run_accounts_action(store: AccountStore, args: argparse.Namespace) -> int:
         if not args.account:
             raise AccountError("default requires provider:name")
         store.set_default(store.resolve_qualified_reference(args.account))
+        return 0
+    if args.action == "logout":
+        if not args.account:
+            raise AccountError("logout requires provider:name")
+        account = store.resolve_qualified_reference(args.account)
+        print(store.logout(account, sessions_root=env_home() / "sessions"))
         return 0
     if args.action == "refresh":
         asyncio.run(AccountUsage(store).refresh_stale())

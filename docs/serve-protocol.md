@@ -82,7 +82,11 @@ The first request must be `hello`. `protocol_version` is required and must be
 `client_version: "1.2"` so old servers accept the handshake. A 1.2 server returns
 `1.2` for that request, or the requested version for an explicit `1.1` or `1.2`.
 A legacy hello without the extra field receives `1.0` and only the legacy
-capabilities.
+capabilities. The result can also contain an optional `notices` array of startup
+warnings. Account cleanup warnings name the affected paths and advise checking
+their mode or ownership, then deleting or fixing them; paths are bounded and the
+array never contains file contents. These notices are included in every successful
+handshake while the warning remains current.
 The frontend client gates all extensions on the returned version; it never sends extension
 requests to a 1.0 server. A mismatch returns `-32002` with `requested` and `supported` fields, then closes
 the connection. Clients must not send other requests before `hello`.
@@ -986,6 +990,13 @@ error code and message. Provider status and origin remain internal.
   null `snapshot` or the normalized `version`, `captured_at`, `source`, and
   `windows` fields documented in `accounts.md`. This request is lock-free and
   never calls a provider endpoint.
+- `account_logout`: takes `session_id` and `account` (`provider:name`) and
+  requires an idle session. It removes only Zeta's local credentials and catalog
+  entry; it does not revoke the provider subscription or token. The response
+  contains the removed `account` and a safe `message`. A pinned live session or
+  child, an unknown account, or unsafe account files return `-32005`. The disk
+  operation runs off the server event loop; after cancellation, `account_list`
+  reports its final persisted result.
 - `account_refresh`: takes `session_id`, requires an idle session, and performs
   the same explicit refresh as `r` in `/accounts`: all stale accounts,
   sequentially, with the persisted 60-second per-account cooldown. Provider

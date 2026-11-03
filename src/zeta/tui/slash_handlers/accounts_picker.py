@@ -12,7 +12,7 @@ from ...accounts import AccountId
 from ...accounts.usage import UsageState, format_usage_lines
 from .. import theme
 
-HINT = "↑/↓ move · enter switch · r refresh · d set default · n rename · esc cancel"
+HINT = "↑/↓ · enter · l login · x logout · r refresh · d default · n rename · esc"
 
 
 @dataclass
@@ -24,6 +24,7 @@ class AccountsPicker:
     labels: dict[AccountId, str] | None = None
     usages: dict[AccountId, UsageState] | None = None
     refreshing: bool = False
+    logout_confirmation: AccountId | None = None
     index: int = 0
 
     @property
@@ -32,6 +33,7 @@ class AccountsPicker:
 
     def move(self, delta: int) -> None:
         self.index = (self.index + delta) % len(self.accounts)
+        self.logout_confirmation = None
 
     def _render_account_row(self, account: AccountId, position: int) -> list[Text]:
         highlighted = position == self.index
@@ -66,6 +68,13 @@ class AccountsPicker:
             rows.extend(self._render_account_row(account, position))
         if self.refreshing:
             rows.append(Text("refreshing stale accounts…", style=theme.DIM))
+        if self.logout_confirmation is not None:
+            rows.append(
+                Text(
+                    f"press x again to log out {self.logout_confirmation}",
+                    style=theme.WARNING,
+                )
+            )
         rows.append(Text(HINT, style=theme.AFFORDANCE))
         return Panel(
             Group(*rows),

@@ -7,8 +7,10 @@ import inspect
 import json
 import multiprocessing
 import os
+import signal
 import stat
 import threading
+import time
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +27,7 @@ import zeta.codex as codex_module
 import zeta.oauth as oauth_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.server.login as server_login
+from tests.support.account_processes import crash_logout, hold_account_credential_lock
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import (
@@ -567,6 +570,25 @@ def test_migration_happy_path(provider: str, tmp_path: Path) -> None:
 
 def test_migration_happy_path_anthropic(tmp_path: Path) -> None:
     test_migration_happy_path("anthropic", tmp_path)
+
+
+def test_migration_bounds_refused_directory_warnings(tmp_path: Path) -> None:
+    # a long home path (as on CI runners) must not hide the account name
+    home = tmp_path / ("h" * 150)
+    provider_root = home / "accounts" / "codex"
+    provider_root.mkdir(parents=True)
+    for index in range(20):
+        directory = provider_root / f"account-{index}"
+        directory.mkdir()
+        (directory / "oauth.json").write_text("secret")
+        os.chmod(directory, 0o755)
+
+    warnings = AccountStore(home).migrate()
+
+    assert len(warnings) == 6
+    assert all(len(warning) < 300 for warning in warnings)
+    assert "account-0" in " ".join(warnings)
+    assert warnings[-1] == "and 15 more account directories could not be cleaned up"
 
 
 def test_migration_happy_path_codex(tmp_path: Path) -> None:
@@ -1728,6 +1750,346 @@ def test_api_key_mode_skips_named_accounts(
         "system · this session uses an API key; account switching is unavailable"
     )
     opened.store.close()
+
+
+def _registered_account(home: Path, account: AccountId) -> None:
+    store = AccountStore(home)
+    with store._home() as home_fd:
+        store._register_account(home_fd, account)
+
+
+def _run_killed_logout(home: Path, account: AccountId, point: str) -> None:
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=crash_logout, args=(str(home), account, point))
+    process.start()
+    process.join(timeout=5)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=5)
+    assert process.exitcode == -signal.SIGKILL
+    process.close()
+
+
+def test_logout_crash_before_registry_commit_preserves_account(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    credential.save(tokens())
+    _registered_account(tmp_path, account)
+
+    _run_killed_logout(tmp_path, account, "before-commit")
+
+    restarted = AccountStore(tmp_path)
+    assert restarted.contains(account)
+    assert credential.path.exists()
+    assert credential.read() == tokens()
+
+
+def test_logout_crash_after_registry_commit_is_swept(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    credential.save(tokens())
+    _registered_account(tmp_path, account)
+
+    _run_killed_logout(tmp_path, account, "after-commit")
+    restarted = AccountStore(tmp_path)
+    restarted.migrate()
+
+    assert restarted.list() == []
+    assert not credential.path.parent.exists()
+    assert not (tmp_path / "account-locks" / account.provider / account.name).exists()
+
+
+def test_logout_crash_partway_through_cleanup_is_swept(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    credential.save(tokens())
+    (credential.path.parent / "usage.json").write_text("usage")
+    _registered_account(tmp_path, account)
+
+    _run_killed_logout(tmp_path, account, "partway-cleanup")
+    restarted = AccountStore(tmp_path)
+    restarted.migrate()
+
+    assert restarted.list() == []
+    assert not credential.path.parent.exists()
+    assert not (tmp_path / "account-locks" / account.provider / account.name).exists()
+
+
+def test_migrate_sweeps_round_three_logout_tombstone(tmp_path: Path) -> None:
+    path = tmp_path / "accounts" / "codex" / ".logout-deadbeef" / "oauth.json"
+    path.parent.mkdir(parents=True)
+    os.chmod(path.parent, 0o700)
+    path.write_text("secret")
+
+    AccountStore(tmp_path).migrate()
+
+    assert not path.parent.exists()
+
+
+def test_migrate_preserves_pending_login_and_completes_it(tmp_path: Path) -> None:
+    account = AccountId("codex", "pending")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    credential.save(tokens())
+    pending = credential.path.with_name("publish-pending.json")
+    pending.write_text(json.dumps({
+        "provider": account.provider,
+        "name": account.name,
+        "sha256": hashlib.sha256(credential.path.read_bytes()).hexdigest(),
+    }) + "\n")
+
+    AccountStore(tmp_path).migrate()
+    assert pending.exists()
+    assert AccountStore(tmp_path).resolve_account(account.provider, account) == account
+    assert AccountStore(tmp_path).contains(account)
+
+
+def test_migrate_never_sweeps_registered_account_during_login(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(tmp_path, account.provider, account.name)
+    credential.save(tokens())
+    _registered_account(tmp_path, account)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=hold_account_credential_lock,
+        args=(str(tmp_path), account, ready, release),
+    )
+    holder.start()
+    migration_done = threading.Event()
+
+    def migrate() -> None:
+        AccountStore(tmp_path).migrate()
+        migration_done.set()
+
+    thread = threading.Thread(target=migrate)
+    thread.start()
+    try:
+        assert ready.wait(timeout=5)
+        time.sleep(0.05)
+        release.set()
+        assert migration_done.wait(timeout=5)
+        assert credential.path.exists()
+        assert AccountStore(tmp_path).contains(account)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+        holder.join(timeout=5)
+        if holder.is_alive():
+            holder.kill()
+            holder.join(timeout=5)
+        holder.close()
+
+
+def test_cli_logout_removes_credentials_registry_default_and_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, "codex", "work").save(tokens())
+    store = AccountStore(home)
+    store.set_default(account)
+    with store.lifecycle_guard(account):
+        pass
+    monkeypatch.setattr(cli_main, "env_home", lambda: home)
+
+    assert cli_main.main(["accounts", "logout", "codex:work"]) == 0
+
+    assert capsys.readouterr().out == "logged out codex:work; cleared codex default\n"
+    assert store.list() == []
+    assert store.default("codex") is None
+    assert not store.credential_path(account).parent.exists()
+    assert not (home / "account-locks" / "codex" / "work").exists()
+
+
+def test_cli_logout_refuses_account_pinned_by_live_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, "codex", "work").save(tokens())
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    manager.record_account_selection(opened.metadata, account, boundary=0)
+    opened.store.activate_runtime_lease()
+    monkeypatch.setattr(cli_main, "env_home", lambda: home)
+    try:
+        assert cli_main.main(["accounts", "logout", "codex:work"]) == 1
+        assert "live session" in capsys.readouterr().err
+        assert AccountStore(home).contains(account)
+        assert named_account_credentials(home, "codex", "work").read() == tokens()
+    finally:
+        opened.store.close()
+
+
+def test_logout_refuses_account_pinned_by_live_child(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    pinned = AccountId("codex", "pinned")
+    current = AccountId("codex", "current")
+    for account in (pinned, current):
+        named_account_credentials(home, account.provider, account.name).save(tokens())
+    store = AccountStore(home)
+    store.set_default(current)
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    manager.record_account_selection(opened.metadata, current, boundary=0)
+    child = ConversationStore(opened.store.session_dir / "agents", session_id="1")
+    child.activate_runtime_lease()
+    child.start_agent_lifecycle(
+        handle=f"{opened.metadata.session_id}:1",
+        started_at="2026-01-01T00:00:00Z",
+        depth=1,
+        agent_type="worker",
+        description="pinned child",
+        selected_accounts={"codex": str(pinned)},
+    )
+    try:
+        with pytest.raises(AccountError, match="live session"):
+            store.logout(pinned, sessions_root=home / "sessions")
+        assert store.contains(pinned)
+    finally:
+        child.close()
+        opened.store.close()
+
+
+def test_logout_cannot_race_live_child_pin_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    named_account_credentials(home, account.provider, account.name).save(tokens())
+    store = AccountStore(home)
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    child = ConversationStore(opened.store.session_dir / "agents", session_id="1")
+    child.activate_runtime_lease()
+    scan_finished = threading.Event()
+    publish_finished = threading.Event()
+    original_scan = account_store._live_session_pins
+
+    def gated_scan(sessions_root: Path, selected: AccountId) -> bool:
+        result = original_scan(sessions_root, selected)
+        scan_finished.set()
+        publish_finished.wait(timeout=1)
+        return result
+
+    monkeypatch.setattr(account_store, "_live_session_pins", gated_scan)
+    publish_error: list[BaseException] = []
+
+    def publish_pin() -> None:
+        scan_finished.wait(timeout=5)
+        try:
+            with store.pin_guard({"codex": account}):
+                child.start_agent_lifecycle(
+                    handle=f"{opened.metadata.session_id}:1",
+                    started_at="2026-01-01T00:00:00Z",
+                    depth=1,
+                    agent_type="worker",
+                    description="racing child",
+                    selected_accounts={"codex": str(account)},
+                )
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            publish_error.append(exc)
+        finally:
+            publish_finished.set()
+
+    publisher = threading.Thread(target=publish_pin)
+    publisher.start()
+    try:
+        try:
+            store.logout(account, sessions_root=home / "sessions")
+        except AccountError:
+            pass
+        publisher.join(timeout=5)
+        assert not publisher.is_alive()
+        live_pin = child.agent_lifecycle()
+        account_exists = store.contains(account)
+        has_live_pin = bool(
+            live_pin
+            and live_pin.get("selected_accounts", {}).get("codex") == str(account)
+        )
+        assert account_exists or not has_live_pin
+        if not account_exists:
+            assert publish_error
+    finally:
+        child.close()
+        opened.store.close()
+
+
+def test_logout_refusal_does_not_delete_valid_credentials(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(home, account.provider, account.name)
+    credential.save(tokens())
+    unexpected = credential.path.parent / "unexpected.txt"
+    unexpected.write_text("keep the account unchanged")
+    store = AccountStore(home)
+
+    with pytest.raises(AccountError, match="unexpected file"):
+        store.logout(account, sessions_root=home / "sessions")
+
+    assert credential.path.exists()
+    assert unexpected.exists()
+    assert store.contains(account)
+
+
+def test_logout_refusal_preserves_account_when_credential_directory_has_unsafe_mode(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(home, account.provider, account.name)
+    credential.save(tokens())
+    os.chmod(credential.path.parent, 0o755)
+    store = AccountStore(home)
+
+    with pytest.raises(AccountError, match="unsafe permissions"):
+        store.logout(account, sessions_root=home / "sessions")
+
+    assert credential.path.exists()
+    assert store.contains(account)
+
+
+def test_logout_refusal_preserves_account_when_lock_directory_is_unsafe(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(home, account.provider, account.name)
+    credential.save(tokens())
+    unsafe = home / "account-locks" / account.provider / account.name / "unexpected"
+    unsafe.parent.mkdir(parents=True, exist_ok=True)
+    unsafe.write_text("keep the account unchanged")
+    store = AccountStore(home)
+
+    with pytest.raises(AccountError, match="unexpected file"):
+        store.logout(account, sessions_root=home / "sessions")
+
+    assert credential.path.exists()
+    assert unsafe.exists()
+    assert store.contains(account)
+
+
+def test_logout_commits_before_credential_cleanup(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    credential = named_account_credentials(home, account.provider, account.name)
+    credential.save(tokens())
+    store = AccountStore(home)
+
+    store.logout(account, sessions_root=home / "sessions")
+
+    assert not store.contains(account)
+    assert not credential.path.exists()
+
+
+def test_cli_logout_unknown_account_is_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli_main, "env_home", lambda: tmp_path)
+
+    assert cli_main.main(["accounts", "logout", "codex:missing"]) == 1
+    assert capsys.readouterr().err == "account codex:missing does not exist\n"
 
 
 def test_label_is_display_only_and_id_stays_stable(tmp_path: Path) -> None:

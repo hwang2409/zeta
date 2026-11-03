@@ -538,6 +538,8 @@ class TUIApp(
             on_picker_select=lambda: app._picker_select(),
             on_picker_cancel=lambda: app._picker_cancel(),
             on_picker_default=lambda: app.accounts_picker_default(),
+            on_picker_login=lambda: app.accounts_picker_login(),
+            on_picker_logout=lambda: app.accounts_picker_logout(),
             on_picker_rename=lambda: app.accounts_picker_rename(),
             on_picker_refresh=lambda: app.accounts_picker_refresh(),
             picker_active=lambda: app._picker_active,
@@ -1231,13 +1233,7 @@ class TUIApp(
 
 from .bootstrap import create_app, format_picker_row
 
-__all__ = [
-    "TUIApp",
-    "build_backend",
-    "create_app",
-    "format_picker_row",
-    "main",
-]
+__all__ = ["TUIApp", "build_backend", "create_app", "format_picker_row", "main"]
 
 
 def __getattr__(name: str) -> object:
