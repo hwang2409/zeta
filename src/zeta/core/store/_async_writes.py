@@ -237,7 +237,12 @@ class AsyncDurableWritesMixin:
             # Keep owner publication bounded; large or nonlinear suffixes use
             # one worker-owned state copy and an owner-thread pointer swap.
             delta = "reset"
-        state = replace(state, installed_delta=delta)
+        publication_delta = self._owned_installed_delta(delta)
+        state = replace(
+            state,
+            installed_delta=delta,
+            publication_delta=publication_delta,
+        )
         if delta == "reset":
             state = copy.deepcopy(state)
         return result, state, receipts
@@ -325,16 +330,17 @@ class AsyncDurableWritesMixin:
                 return released_log, installed_delta
             if self._transcript_generation == generation:
                 installed_delta = state.installed_delta
-                if installed_delta == "reset":
+                publication_delta = state.publication_delta
+                if publication_delta == "reset":
                     released_log = self._install_log_state(state)
                 else:
-                    entries = list(installed_delta)
+                    entries = list(publication_delta)
                     if entries:
-                        for entry in entries:
-                            accepted = self._accept_incremental_entry(entry)
-                            assert accepted
+                        self._before_incremental_state_install()
+                        self._install_validated_linear_entries(entries)
                         self._record_client_delivery_entries(entries)
                         self._transcript_generation += 1
+                    self._entry_prefix_digest = state.entry_prefix_digest
                     self._log_identity = state.log_identity
                     self._log_offset = state.log_offset
                     self._log_mtime_ns = state.log_mtime_ns

@@ -91,6 +91,7 @@ class _DetachedLogState:
     log_mtime_ns: int
     log_prefix_fingerprint: bytes
     installed_delta: InstalledEntriesDelta = ()
+    publication_delta: InstalledEntriesDelta = ()
 
 
 class ConversationLogMixin:
