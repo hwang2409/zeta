@@ -6,6 +6,7 @@ import ast
 import asyncio
 import inspect
 import json
+import os
 import threading
 import uuid
 from functools import partial
@@ -1156,6 +1157,70 @@ async def test_unhealthy_same_session_resume_failure_does_not_clear_health(
         mutation = (await _request(reader, writer, 10, "send", {"text": "blocked"}))[-1]
         assert mutation["error"]["code"] == -32003
     finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_forced_resume_cancel_during_close_finishes_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, call = await _approval_server(tmp_path)
+    old_state = server.runtime.state
+    assert old_state is not None
+    old_store = old_state.opened.store
+    session_dir = old_store.session_dir
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+    original_close = old_state.loop.close
+
+    async def gated_close(*args: object, **kwargs: object) -> tuple[str, ...]:
+        entered.set()
+        await release.wait()
+        result = await original_close(*args, **kwargs)
+        completed.set()
+        return result
+
+    monkeypatch.setattr(old_state.loop, "close", gated_close)
+    try:
+        await _make_unhealthy(server, call, monkeypatch)
+        resume = asyncio.create_task(
+            server.runtime.resume_session(old_state.session_id, force=True)
+        )
+        await asyncio.wait_for(entered.wait(), TIMEOUT)
+        resume.cancel()
+        await asyncio.sleep(0)
+        assert server.runtime.state is old_state
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await resume
+        assert completed.is_set()
+        assert server.runtime.state is None
+        assert old_store._closed
+        assert not old_state.loop._background_child_watchers
+        assert not [task for task in old_state.loop._tracked_tasks if not task.done()]
+        assert old_state.loop.step_delivery is None
+        mount_task = old_state.loop._mcp_mount_task
+        assert mount_task is None or mount_task.done()
+        reopened = server.runtime.manager.open(old_state.session_id)
+        try:
+            assert reopened.metadata.session_id == old_state.session_id
+        finally:
+            reopened.store.close()
+        fd_directory = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+        leaked_targets = []
+        for name in os.listdir(fd_directory):
+            try:
+                target = os.path.realpath(f"{fd_directory}/{name}")
+            except OSError:
+                continue
+            if target == str(session_dir) or target.startswith(f"{session_dir}{os.sep}"):
+                leaked_targets.append(target)
+        assert leaked_targets == []
+    finally:
+        release.set()
+        if not old_store._closed:
+            await server.runtime._close_state(old_state)
         await _close(server, writer)
 
 

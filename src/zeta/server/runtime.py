@@ -430,8 +430,7 @@ class ServerRuntime:
         if self._state is not None and self._state.session_id == session_id:
             if not force:
                 return self.metadata
-            state, self._state = self._state, None
-            await self._close_state(state)
+            await self.close()
         metadata = await asyncio.to_thread(self.manager.read_metadata, session_id)
         if metadata.provider == "fake":
             raise ValueError(REMOVED_PROVIDER_ERROR)
@@ -530,9 +529,18 @@ class ServerRuntime:
                 logger.info("canceled session setup was cleaned up")
 
     async def close(self) -> None:
-        state, self._state = self._state, None
+        state = self._state
         if state is not None:
-            await self._close_state(state)
+            close_task = asyncio.create_task(self._close_state(state))
+            try:
+                try:
+                    await asyncio.shield(close_task)
+                except asyncio.CancelledError:
+                    await close_task
+                    raise
+            finally:
+                if close_task.done() and self._state is state:
+                    self._state = None
         if self._setup_reapers:
             pending = asyncio.gather(*self._setup_reapers)
             try:
