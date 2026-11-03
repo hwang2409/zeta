@@ -1135,6 +1135,9 @@ negotiate a feature sees the behavior from before the feature existed.
 | `abort_scope` | `abort` accepts `scope: "session" \| "foreground"`; adds `clear_steering` |
 | `turn_context` | adds `set_turn_context` for one-shot context on the next server-started turn |
 | `delivery_id` | `send` and `steer` accept durable idempotency IDs; adds `delivery_status` |
+| `projects-memory-v2` | requires `projects`; `project_show` and `project_memory_log` return the entry-memory views |
+| `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers") |
+| `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals. it changes no output |
 
 These features are available on protocol 1.1 and 1.2. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
