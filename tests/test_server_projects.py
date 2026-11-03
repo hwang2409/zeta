@@ -240,6 +240,241 @@ async def test_serve_resume_cancel_joins_composition_worker_before_closing_store
 
 
 @pytest.mark.asyncio
+async def test_serve_create_cancel_reaps_after_compose_finishes(
+    tmp_path: Path,
+) -> None:
+    server = _server(tmp_path)
+    reader, writer = await _connect(server)
+    await _hello(reader, writer)
+    client = server._client
+    assert client is not None
+    compose_started = threading.Event()
+    compose_release = threading.Event()
+    compose_done = threading.Event()
+    worker_saw_closed: list[bool] = []
+    compositions: list[object] = []
+    close_count = 0
+    original_compose = server.runtime._compose
+
+    def tracked_compose(**kwargs):
+        nonlocal close_count
+        compose_started.set()
+        assert compose_release.wait(2)
+        composition = original_compose(**kwargs)
+        original_close = composition.opened.store.close
+
+        def tracked_close():
+            nonlocal close_count
+            close_count += 1
+            return original_close()
+
+        composition.opened.store.close = tracked_close
+        compositions.append(composition)
+        worker_saw_closed.append(composition.opened.store._closed)
+        compose_done.set()
+        return composition
+
+    server.runtime._compose = tracked_compose
+    operation = asyncio.create_task(client._dispatch(2, "new_session", {}))
+    try:
+        assert await asyncio.to_thread(compose_started.wait, 2)
+        operation.cancel()
+        compose_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, 2)
+        assert compose_done.is_set()
+        assert compositions
+        store = compositions[0].opened.store
+        assert store._closed
+        assert close_count == 1
+        assert worker_saw_closed == [False]
+        assert server.runtime.state is None
+    finally:
+        compose_release.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_resume_cancel_reaper_closes_store_after_compose(
+    tmp_path: Path,
+) -> None:
+    server = _server(tmp_path)
+    first = await server.runtime.create_session()
+    await server.runtime.create_session()
+    previous = server.runtime.session_id
+    reader, writer = await _connect(server)
+    await _hello(reader, writer)
+    client = server._client
+    assert client is not None
+    compose_started = threading.Event()
+    compose_release = threading.Event()
+    worker_saw_closed: list[bool] = []
+    opened: list[object] = []
+    close_count = 0
+    original_open = server.runtime.manager.open
+    original_compose = server.runtime._compose
+
+    def tracked_open(session_id: str):
+        result = original_open(session_id)
+        opened.append(result.store)
+        original_close = result.store.close
+
+        def tracked_close():
+            nonlocal close_count
+            close_count += 1
+            return original_close()
+
+        result.store.close = tracked_close
+        return result
+
+    def tracked_compose(**kwargs):
+        compose_started.set()
+        assert compose_release.wait(2)
+        composition = original_compose(**kwargs)
+        worker_saw_closed.append(composition.opened.store._closed)
+        return composition
+
+    server.runtime.manager.open = tracked_open
+    server.runtime._compose = tracked_compose
+    operation = asyncio.create_task(
+        client._dispatch(2, "resume", {"session_id": first.session_id})
+    )
+    try:
+        assert await asyncio.to_thread(compose_started.wait, 2)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, 2)
+        assert not compose_release.is_set()
+        assert len(server.runtime._setup_reapers) == 1
+        reaper = next(iter(server.runtime._setup_reapers))
+        compose_release.set()
+        await asyncio.wait_for(reaper, 2)
+        assert opened and opened[0]._closed
+        assert close_count == 1
+        assert worker_saw_closed == [False]
+        assert server.runtime.session_id == previous
+    finally:
+        compose_release.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_create_cancel_reaper_closes_store_after_compose(
+    tmp_path: Path,
+) -> None:
+    server = _server(tmp_path)
+    reader, writer = await _connect(server)
+    await _hello(reader, writer)
+    client = server._client
+    assert client is not None
+    compose_started = threading.Event()
+    compose_release = threading.Event()
+    worker_saw_closed: list[bool] = []
+    compositions: list[object] = []
+    close_count = 0
+    original_compose = server.runtime._compose
+
+    def tracked_compose(**kwargs):
+        nonlocal close_count
+        compose_started.set()
+        assert compose_release.wait(2)
+        composition = original_compose(**kwargs)
+        original_close = composition.opened.store.close
+
+        def tracked_close():
+            nonlocal close_count
+            close_count += 1
+            return original_close()
+
+        composition.opened.store.close = tracked_close
+        compositions.append(composition)
+        worker_saw_closed.append(composition.opened.store._closed)
+        return composition
+
+    server.runtime._compose = tracked_compose
+    operation = asyncio.create_task(client._dispatch(2, "new_session", {}))
+    try:
+        assert await asyncio.to_thread(compose_started.wait, 2)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, 2)
+        assert not compose_release.is_set()
+        assert len(server.runtime._setup_reapers) == 1
+        reaper = next(iter(server.runtime._setup_reapers))
+        compose_release.set()
+        await asyncio.wait_for(reaper, 2)
+        assert compositions and compositions[0].opened.store._closed
+        assert close_count == 1
+        assert worker_saw_closed == [False]
+        assert server.runtime.state is None
+    finally:
+        compose_release.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_shutdown_reports_blocked_setup_reaper(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    server = _server(tmp_path)
+    first = await server.runtime.create_session()
+    await server.runtime.create_session()
+    reader, writer = await _connect(server)
+    await _hello(reader, writer)
+    client = server._client
+    assert client is not None
+    compose_started = threading.Event()
+    compose_release = threading.Event()
+    compositions: list[object] = []
+    close_count = 0
+    original_compose = server.runtime._compose
+
+    def tracked_compose(**kwargs):
+        nonlocal close_count
+        compose_started.set()
+        assert compose_release.wait(10)
+        composition = original_compose(**kwargs)
+        original_close = composition.opened.store.close
+
+        def tracked_close():
+            nonlocal close_count
+            close_count += 1
+            return original_close()
+
+        composition.opened.store.close = tracked_close
+        compositions.append(composition)
+        return composition
+
+    server.runtime._compose = tracked_compose
+    operation = asyncio.create_task(
+        client._dispatch(2, "resume", {"session_id": first.session_id})
+    )
+    shutdown = False
+    try:
+        assert await asyncio.to_thread(compose_started.wait, 2)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, 2)
+        assert not compose_release.is_set()
+        await asyncio.wait_for(server.close(), 2)
+        shutdown = True
+        assert any(
+            "abandoned session setup task(s) still running at shutdown" in record.message
+            for record in caplog.records
+        )
+        compose_release.set()
+        reaper = next(iter(server.runtime._setup_reapers))
+        await asyncio.wait_for(reaper, 2)
+        assert compositions and compositions[0].opened.store._closed
+        assert close_count == 1
+        assert server.runtime.state is None
+    finally:
+        compose_release.set()
+        if not shutdown:
+            await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_project_instructions_does_not_block_loop_tick(tmp_path: Path) -> None:
     server = _server(tmp_path)
     root = server.runtime.cwd
