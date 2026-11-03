@@ -29,8 +29,8 @@ from . import (
     slash_commands,
 )
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
-from .delivery import DeliveryRequests, TurnOutcome
-from .model_inputs import PendingModelInputs
+from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
+from .connections import OBSERVER_READ_ONLY_CODE, OBSERVER_REQUESTS, ConnectionRegistry
 from .notification_presentation import NotificationPresentation
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
@@ -52,11 +52,8 @@ from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
 USER_MESSAGE_MAX_BYTES = 262_144
-
-
 class ZetaServer:
     """Serve one local client over a Unix socket or localhost TCP."""
-
     def __init__(
         self,
         *,
@@ -117,10 +114,11 @@ class ZetaServer:
         )
         self._client_active = False
         self._client: _Client | None = None
+        self.connections: ConnectionRegistry | None = None
+        self._account_warnings: tuple[str, ...] = ()
         self._socket_created = False
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
-        self._account_warnings: tuple[str, ...] = ()
     @property
     def address(self) -> str:
         if self.port is not None:
@@ -128,6 +126,7 @@ class ZetaServer:
         return str(self.socket_path)
     async def start(self) -> None:
         self._account_warnings = await accounts.migrate(self.home)
+        self.connections = ConnectionRegistry(asyncio.get_running_loop())
         if self.port is None:
             self._prepare_socket_path()
             self._server = await asyncio.start_unix_server(
@@ -154,7 +153,6 @@ class ZetaServer:
         assert self._server is not None
         async with self._server:
             await self._server.serve_forever()
-
     async def close(self) -> None:
         try:
             if self._client is not None:
@@ -162,6 +160,9 @@ class ZetaServer:
         finally:
             self._client = None
             self._client_active = False
+            if self.connections is not None:
+                await self.connections.aclose()
+                self.connections = None
             try:
                 if self._websocket is not None:
                     await self._websocket.close()
@@ -178,7 +179,6 @@ class ZetaServer:
                             if stat.S_ISSOCK(self.socket_path.stat().st_mode):
                                 self.socket_path.unlink()
                         self._socket_created = False
-
     def _prepare_socket_path(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -209,36 +209,23 @@ class ZetaServer:
         finally:
             probe.close()
         self.socket_path.unlink()
-
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        if self._client_active:
-            codec = FrameCodec()
-            await codec.write(
-                writer,
-                codec.error_response(
-                    None, -32001, "another client is already connected"
-                ),
-            )
-            writer.close()
-            await writer.wait_closed()
-            return
-        self._client_active = True
-        self._client = _Client(self, reader, writer)
-        self.runtime.set_background_event_sink(self._client._publish_background_event)
-        self.runtime.set_memory_notice_sink(self._client._publish_memory_notice)
-        self.runtime.set_background_wake_sink(self._client._schedule_background_wake)
+        registry = self.connections
+        assert registry is not None
+        client = _Client(self, reader, writer)
+        registry.register(client)
         try:
-            await self._client.run()
+            await client.run()
         finally:
-            self.runtime.set_background_event_sink(None)
-            self.runtime.set_memory_notice_sink(None)
-            self.runtime.set_background_wake_sink(None)
-            self._client = None
-            self._client_active = False
-
-
+            registry.release(client)
+            if self._client is client:
+                self.runtime.set_background_event_sink(None)
+                self.runtime.set_memory_notice_sink(None)
+                self.runtime.set_background_wake_sink(None)
+                self._client = None
+                self._client_active = False
 class _Client:
     def __init__(
         self,
@@ -251,6 +238,7 @@ class _Client:
         self.writer = writer
         self.logins = login.Logins(server.home)
         self.handshaken = False
+        self.role: str | None = None
         self.protocol_version = "1.0"
         self.features: frozenset[str] = frozenset()
         self._write_lock = asyncio.Lock()
@@ -264,7 +252,6 @@ class _Client:
         self.projects = ProjectRequests(home=server.home, runtime=server.runtime, codec=self.codec)
         self.deliveries = DeliveryRequests(self)
         self._approvals = ApprovalLifecycle()
-
     async def run(self) -> None:
         try:
             while True:
@@ -313,10 +300,8 @@ class _Client:
                     break
         finally:
             await self.close()
-
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
-
         while True:
             newline = self._read_buffer.find(b"\n")
             if newline >= 0:
@@ -340,10 +325,8 @@ class _Client:
                 self._read_buffer.clear()
                 return line
             self._read_buffer.extend(chunk)
-
     async def _discard_oversized_frame(self, prefix: bytes) -> bytes:
         """Discard an oversized line and preserve any complete later frames."""
-
         while True:
             chunk = await self.reader.read(65_536)
             if not chunk:
@@ -353,7 +336,6 @@ class _Client:
                 continue
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
-
     async def close(self) -> None:
         async with self._close_lock:
             if self._closed:
@@ -379,10 +361,22 @@ class _Client:
     ) -> object:
         if method == "hello":
             result = self._hello(params)
-            await self._attach_pending_notifications()
+            if self.role == "controller":
+                self.server._client_active = True
+                self.server._client = self
+                self.server.runtime.set_background_event_sink(self._publish_background_event)
+                self.server.runtime.set_memory_notice_sink(self._publish_memory_notice)
+                self.server.runtime.set_background_wake_sink(self._schedule_background_wake)
+                await self._attach_pending_notifications()
             return result
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
+        if self.role == "observer":
+            assert self.server.connections is not None
+            if not self.server.connections.allows(self, method, params):
+                raise ProtocolError(-32008, "method is unavailable to read-only observers", {"code": OBSERVER_READ_ONLY_CODE, "method": method})
+            if method in {"list_sessions", "status", "session_tree", "session_history", "model_catalog", "session_settings"}:
+                return await self.server.connections.run_observer_read(self, lambda: self._observer_read(method, params))
         if method in login.REQUESTS:
             if self.protocol_version == "1.0":
                 raise ProtocolError(-32601, "login is unavailable on this server")
@@ -406,6 +400,8 @@ class _Client:
             return self.projects.dispatch(
                 request_id, method, params, features=self.features
             )
+        if self.role == "observer" and method == "session_snapshot":
+            raise ProtocolError(-32601, "method not found")
         if method == "list_sessions":
             return self._list_sessions(request_id, params)
         if method == "new_session":
@@ -458,12 +454,14 @@ class _Client:
         if method == "status":
             return self._status()
         raise ProtocolError(-32601, f"method not found: {method}")
-
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:
             raise ProtocolError(-32600, "hello may only be sent once")
         version = params.get("protocol_version")
         client_version = params.get("client_version")
+        role = params.get("role", "controller")
+        if role not in {"controller", "observer"}:
+            raise ProtocolError(-32602, "role must be 'controller' or 'observer'")
         self.protocol_version = negotiate_protocol_version(version, client_version)
         requested = params.get("features")
         if requested is not None and (
@@ -476,9 +474,22 @@ class _Client:
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
         self.features = frozenset(accepted)
-        self.server.runtime.set_post_stream_provider_retry(
-            "assistant_reset" in self.features
-        )
+        if role == "observer" and (
+            self.protocol_version == "1.0" or "serve_observers" not in self.features
+        ):
+            raise ProtocolError(-32602, "observer requires protocol 1.1 and serve_observers")
+        assert self.server.connections is not None
+        try:
+            self.server.connections.claim(self, role, self.features)
+        except RuntimeError as exc:
+            if role == "observer":
+                raise ProtocolError(-32004, "observer limit reached") from exc
+            raise ProtocolError(-32001, "another client is already connected") from exc
+        self.role = role
+        if role == "controller":
+            self.server.runtime.set_post_stream_provider_retry(
+                "assistant_reset" in self.features
+            )
         self.handshaken = True
         requests = [
             "list_sessions",
@@ -503,6 +514,8 @@ class _Client:
                 requests.append("clear_steering")
             if "delivery_id" in self.features:
                 requests.append("delivery_status")
+        if role == "observer":
+            requests = sorted(OBSERVER_REQUESTS)
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],
@@ -517,18 +530,31 @@ class _Client:
         if self.server._account_warnings:
             result["notices"] = list(self.server._account_warnings)
         return result
+    def _observer_read(self, method: str, params: dict[str, Any]) -> object:
+        if method == "status":
+            return self._status()
+        if method == "list_sessions":
+            return self._list_sessions(None, params)
+        runtime = self.server.runtime
+        if method == "session_tree":
+            return ergonomics.tree(runtime)
+        if method == "session_history":
+            return ergonomics.history(runtime, params)
+        if method == "model_catalog":
+            return ergonomics.catalog(runtime)
+        if method == "session_settings":
+            return ergonomics.settings(runtime)
+        raise ProtocolError(-32601, "method not found")
 
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
             raise ProtocolError(
                 -32602, f"{param} requires the negotiated {feature} feature"
             )
-
     async def _user_message(
         self, text: str, mode: str, attachments: list[dict[str, object]] | None = None
     ) -> None:
         """Echo an accepted user message so observers can rebuild the transcript."""
-
         if "user_message_event" in self.features:
             await self._notify(
                 event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.USER_MESSAGE],
@@ -537,7 +563,6 @@ class _Client:
                 mode=mode,
                 attachments=attachments or [],
             )
-
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
         runtime = self.server.runtime
         if method in {"rename_session", "delete_session"}:
@@ -594,7 +619,6 @@ class _Client:
             if not current or current[-1].id != head:
                 store.switch_to_branch(head)
         return ergonomics.tree(runtime)
-
     async def _approval(
         self, method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
@@ -651,7 +675,6 @@ class _Client:
         if scope != "once":
             result["scope"] = scope
         return result
-
     async def _abort(self, scope: abort_scope.AbortScope = "session") -> dict[str, object]:
         session_id = self.server.runtime.session_id
         outcome = (
@@ -660,11 +683,9 @@ class _Client:
             else TurnOutcome.SESSION_CANCELED
         )
         turn_task = self._turn_task
-
         def mark_canceled() -> None:
             if turn_task is not None and not turn_task.done():
                 self._turn_cancel_outcome = outcome
-
         aborted = await abort_scope.abort_active_turn(
             turn_task,
             scope=scope,
@@ -675,7 +696,6 @@ class _Client:
         if aborted:
             await self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.TURN_ABORTED], session_id)
         return {"aborted": aborted}
-
     def _session_snapshot(self) -> dict[str, object] | None:
         runtime = self.server.runtime
         if runtime.opened is None:
@@ -684,12 +704,11 @@ class _Client:
         if runtime.policy is not None:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
-
     def _status(self) -> dict[str, object]:
         runtime = self.server.runtime
         session = self._session_snapshot()
         pending = []
-        if runtime.policy is not None:
+        if self.role != "observer" and runtime.policy is not None:
             pending = [
                 {
                     **self._approvals.observe(item),
@@ -713,7 +732,6 @@ class _Client:
                 else 0
             ),
         }
-
     async def _run_turn(
         self,
         text: str,
@@ -1065,7 +1083,11 @@ class _Client:
             self._require_feature("projects", "project_id")
             available = self.projects.project_sessions(params["project_id"])
         else:
-            available = self.server.runtime.list_sessions()
+            available = (
+                self.server.runtime.list_sessions_read_only()
+                if self.role == "observer"
+                else self.server.runtime.list_sessions()
+            )
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
             item.session_id: item.preview
@@ -1150,6 +1172,11 @@ class _Client:
             )
 
     async def _write(self, payload: bytes) -> bool:
+        if self.server.connections is None:
+            return await self._write_physical(payload)
+        return await self.server.connections.send(self, payload)
+
+    async def _write_physical(self, payload: bytes) -> bool:
         async with self._write_lock:
             return await finish_frame_write(self.codec, self.writer, payload)
 
@@ -1187,7 +1214,6 @@ def _integer(
         raise ProtocolError(-32602, f"{name} must be an integer of at least {minimum}")
     return value
 
-
 def _directory(params: dict[str, Any], name: str) -> Path:
     value = params.get(name)
     if not isinstance(value, str) or not value or not os.path.isabs(value):
@@ -1196,7 +1222,6 @@ def _directory(params: dict[str, Any], name: str) -> Path:
     if not path.is_dir():
         raise ProtocolError(-32602, f"{name} is not an existing directory: {value}")
     return path
-
 
 def _optional_string(params: dict[str, Any], name: str) -> str | None:
     value = params.get(name)
