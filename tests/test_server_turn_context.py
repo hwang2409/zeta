@@ -62,7 +62,7 @@ async def _notify(
         status="completed",
         text=f"{notification_id} done",
     )
-    server._client._schedule_background_wake(server.runtime.session_id)
+    server.control._schedule_background_wake(server.runtime.session_id)
     await _frames_until_event(reader, "agent_end")
     while server.runtime.loop.notification_turn_state != "idle":
         await asyncio.sleep(0)
@@ -181,7 +181,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
             status="completed",
             text="child-1 done",
         )
-        server._client._schedule_background_wake(server.runtime.session_id)
+        server.control._schedule_background_wake(server.runtime.session_id)
         assert await asyncio.to_thread(append_committed.wait, 2)
         turn_task = server._client._turn_task
         assert turn_task is not None
@@ -194,7 +194,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
 
         monkeypatch.setattr(type(store), "_run_durable_write", original_durable_write)
         if store.agent_notifications():
-            server._client._schedule_background_wake(server.runtime.session_id)
+            server.control._schedule_background_wake(server.runtime.session_id)
         else:
             await _request(reader, writer, 4, "send", {"text": "retry"})
         await _frames_until_event(reader, "agent_end")
@@ -260,7 +260,7 @@ async def test_persisted_notification_retry_attaches_new_context_once(
             status="completed",
             text="child-1 done",
         )
-        server._client._schedule_background_wake(server.runtime.session_id)
+        server.control._schedule_background_wake(server.runtime.session_id)
         assert await asyncio.to_thread(append_committed.wait, 2)
         turn_task = server._client._turn_task
         assert turn_task is not None
@@ -273,7 +273,7 @@ async def test_persisted_notification_retry_attaches_new_context_once(
 
         monkeypatch.setattr(type(store), "_run_durable_write", original_durable_write)
         await _request(reader, writer, 3, "set_turn_context", {"text": CONTEXT})
-        server._client._schedule_background_wake(server.runtime.session_id)
+        server.control._schedule_background_wake(server.runtime.session_id)
         await _frames_until_event(reader, "agent_end")
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
@@ -338,13 +338,13 @@ async def test_failed_persistence_releases_context_for_exactly_one_retry(
             status="completed",
             text="child-1 done",
         )
-        server._client._schedule_background_wake(server.runtime.session_id)
+        server.control._schedule_background_wake(server.runtime.session_id)
         failure = await _frames_until_event(reader, "error")
         assert "injected persistence failure" in failure[-1]["params"]["error"]["message"]
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
 
-        server._client._schedule_background_wake(server.runtime.session_id)
+        server.control._schedule_background_wake(server.runtime.session_id)
         await _frames_until_event(reader, "agent_end")
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
@@ -400,7 +400,7 @@ async def test_reconnect_keeps_context_released_after_persistence_failure(
         status="completed",
         text="child-1 done",
     )
-    server._client._schedule_background_wake(session_id)
+    server.control._schedule_background_wake(session_id)
     await _frames_until_event(reader, "error")
     while server.runtime.loop.notification_turn_state != "idle":
         await asyncio.sleep(0)
@@ -457,7 +457,7 @@ async def test_session_switch_keeps_pending_contexts_separate(
             status="completed",
             text="first attempt",
         )
-        server._client._schedule_background_wake(first_session)
+        server.control._schedule_background_wake(first_session)
         await _frames_until_event(reader, "error")
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)

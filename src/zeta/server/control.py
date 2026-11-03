@@ -1,0 +1,698 @@
+"""Logical serve turn and approval lifetime."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections.abc import Awaitable, Callable, Mapping
+from typing import TYPE_CHECKING
+
+from ..core.approval import ApprovalDecision, ApprovalRequest
+from ..protocol.types import (
+    Message,
+    MessageOrigin,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+)
+from . import abort_scope, event_contract, model_selection
+from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
+from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
+from .protocol import FrameWriteCancelled, ProtocolError, bounded
+
+if TYPE_CHECKING:
+    from .server import ZetaServer
+
+USER_MESSAGE_MAX_BYTES = 262_144
+
+NotificationSender = Callable[..., Awaitable[bool]]
+
+
+class NotificationPresentation:
+    """Publish each durable notification at most once per serve session."""
+
+    def __init__(self) -> None:
+        self._presented: set[tuple[str, str]] = set()
+
+    async def publish(
+        self,
+        session_id: str | None,
+        notification: Mapping[str, object],
+        protocol_version: str,
+        send: NotificationSender,
+    ) -> None:
+        notification_id = notification.get("notification_id")
+        key = (
+            (session_id, notification_id)
+            if isinstance(session_id, str) and isinstance(notification_id, str)
+            else None
+        )
+        if key is not None and key in self._presented:
+            return
+        if key is not None:
+            self._presented.add(key)
+        event_name = event_contract.notification_wire_event(
+            notification.get("kind", "agent_completion"), protocol_version
+        )
+        try:
+            written = await send(event_name, session_id, data=dict(notification))
+        except FrameWriteCancelled as cancelled:
+            if not cancelled.written and key is not None:
+                self._presented.discard(key)
+            raise
+        except BaseException:
+            if key is not None:
+                self._presented.discard(key)
+            raise
+        if not written and key is not None:
+            self._presented.discard(key)
+
+
+class ServeControl:
+    """Own the active semantic lifetime independently of physical clients."""
+
+    def __init__(self, server: ZetaServer) -> None:
+        self.server = server
+        self._turn_task: asyncio.Task[None] | None = None
+        self._turn_cancel_outcome: TurnOutcome | None = None
+        self._model_inputs = PendingModelInputs()
+        self.deliveries = DeliveryRequests(self)
+        self._approvals = ApprovalLifecycle()
+        self.closing = False
+
+    def start_turn(
+        self,
+        text: str,
+        user_message: Message | None = None,
+        *,
+        origin: MessageOrigin = MessageOrigin.USER,
+        persist_user_message: bool = True,
+    ) -> None:
+        self._turn_task = asyncio.create_task(
+            self._run_turn(
+                text,
+                user_message,
+                origin=origin,
+                persist_user_message=persist_user_message,
+            )
+        )
+
+    def turn_busy(self) -> bool:
+        loop = self.server.runtime.loop
+        return (self._turn_task is not None and not self._turn_task.done()) or (
+            loop is not None and loop.notification_turn_state != "idle"
+        )
+
+    async def require_idle(self) -> None:
+        if self.turn_busy():
+            raise ProtocolError(-32004, "a turn is already running")
+
+    def model_input_registrar(self, features: frozenset[str]):
+        return self._model_inputs.registrar(
+            self.server.runtime.session_id,
+            enabled="model_input_ids" in features,
+        )
+
+    def pending_approvals(self) -> list[dict[str, object]]:
+        policy = self.server.runtime.policy
+        if policy is None:
+            return []
+        return [
+            {**self._approvals.observe(item), **approval_display_fields(item)}
+            for item in policy.pending_requests()
+        ]
+
+    def clear_approvals(self) -> None:
+        self._approvals.clear()
+
+    async def controller_claimed(self) -> None:
+        await self._attach_pending_notifications()
+
+    async def controller_released(self) -> None:
+        await self._terminate_pending_approvals(suppress_write_errors=True)
+        if self._turn_task is not None and not self._turn_task.done():
+            loop = self.server.runtime.loop
+            if loop is not None:
+                loop.abort(steering_drop_reason=None)
+            self._turn_cancel_outcome = TurnOutcome.DISCONNECTED
+            self._turn_task.cancel()
+            await asyncio.gather(self._turn_task, return_exceptions=True)
+        self._turn_task = None
+        self._approvals.clear()
+
+    async def close(self) -> None:
+        self.closing = True
+        await self.controller_released()
+
+    async def user_message(
+        self,
+        text: str,
+        mode: str,
+        features: frozenset[str],
+        attachments: list[dict[str, object]] | None = None,
+    ) -> None:
+        """Echo an accepted user message so observers can rebuild the transcript."""
+        if "user_message_event" in features:
+            await self._notify(
+                event_contract.AUXILIARY_WIRE_EVENTS[
+                    event_contract.AuxiliaryEvent.USER_MESSAGE
+                ],
+                self.server.runtime.session_id,
+                text=bounded(text, USER_MESSAGE_MAX_BYTES),
+                mode=mode,
+                attachments=attachments or [],
+            )
+
+    async def resolve_approval(
+        self, method: str, request_id: str, scope: str = "once"
+    ) -> dict[str, object]:
+        policy = self.server.runtime.policy
+        loop = self.server.runtime.loop
+        if policy is None or loop is None:
+            raise ProtocolError(-32003, "no active session")
+        core_key = self._approvals.core_key(request_id)
+        pending = next(
+            (item for item in policy.pending_requests() if item.key == core_key),
+            None,
+        )
+        if (
+            scope == "always_tool"
+            and pending is not None
+            and pending.child_instance_id is not None
+        ):
+            raise ProtocolError(
+                -32602, "scope 'always_tool' is unavailable for delegated approvals"
+            )
+        if scope == "always_tool" and pending is not None:
+            try:
+                policy.remember_allow(pending)
+            except ValueError as exc:
+                raise ProtocolError(
+                    -32602, f"cannot always allow approval request: {exc}"
+                ) from exc
+        resolved = policy.resolve(
+            core_key,
+            ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY,
+        )
+        if not resolved:
+            raise ProtocolError(
+                -32006, f"approval request not found or already resolved: {request_id}"
+            )
+        if pending is not None:
+            self._approvals.observe(pending)
+        await self._end_approval(core_key, self.server.runtime.session_id)
+        active = self.turn_busy()
+        if (
+            not active
+            and isinstance(core_key, str)
+            and loop.prepare_resume_pending_tool(core_key)
+        ):
+            if self.server.runtime.state is not None:
+                self.server.runtime.state.tool_started()
+            task = asyncio.create_task(self._resume_tool(core_key))
+            self._turn_task = task
+        result: dict[str, object] = {
+            "accepted": True,
+            "request_id": request_id,
+            "decision": method,
+        }
+        if scope != "once":
+            result["scope"] = scope
+        return result
+
+    async def abort(
+        self, scope: abort_scope.AbortScope = "session"
+    ) -> dict[str, object]:
+        session_id = self.server.runtime.session_id
+        outcome = (
+            TurnOutcome.FOREGROUND_CANCELED
+            if scope == "foreground"
+            else TurnOutcome.SESSION_CANCELED
+        )
+        turn_task = self._turn_task
+
+        def mark_canceled() -> None:
+            if turn_task is not None and not turn_task.done():
+                self._turn_cancel_outcome = outcome
+
+        aborted = await abort_scope.abort_active_turn(
+            turn_task,
+            scope=scope,
+            loop=self.server.runtime.loop,
+            terminate_approvals=self._terminate_pending_approvals,
+            before_cancel=mark_canceled,
+        )
+        if aborted:
+            await self._notify(
+                event_contract.AUXILIARY_WIRE_EVENTS[
+                    event_contract.AuxiliaryEvent.TURN_ABORTED
+                ],
+                session_id,
+            )
+        return {"aborted": aborted}
+
+    async def _run_turn(
+        self,
+        text: str,
+        user_message: Message | None = None,
+        *,
+        origin: MessageOrigin = MessageOrigin.USER,
+        persist_user_message: bool = True,
+    ) -> None:
+        loop = self.server.runtime.loop
+        state = self.server.runtime.state
+        if loop is None or state is None:
+            return
+        session_id = state.session_id
+        state.turn_started()
+        outcome = TurnOutcome.COMPLETED
+        agent_end: StreamEvent | None = None
+        try:
+            async for event in loop.run_turn(
+                text,
+                origin=origin,
+                user_message=user_message,
+                persist_user_message=persist_user_message,
+            ):
+                if event.type is StreamEventType.ERROR:
+                    outcome = TurnOutcome.FAILED
+                if event.type is StreamEventType.AGENT_END:
+                    agent_end = event
+                else:
+                    await self._event(event, session_id=session_id)
+        except asyncio.CancelledError:
+            outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
+            raise
+        except Exception as exc:  # noqa: BLE001 - serialize all turn failures
+            outcome = TurnOutcome.FAILED
+            await self._notify(
+                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+                session_id,
+                error={"code": "server_error", "message": str(exc)},
+                data={},
+            )
+        finally:
+            self.deliveries.finalize_turn(
+                session_id, state, outcome, schedule_wake=agent_end is None
+            )
+        if agent_end is not None:
+            await self._event(agent_end, session_id=session_id)
+            if outcome is TurnOutcome.COMPLETED:
+                self._schedule_background_wake(session_id)
+
+    def _schedule_background_wake(self, session_id: str) -> None:
+        if self.closing:
+            return
+        loop = self.server.runtime.loop
+        state = self.server.runtime.state
+        if loop is None or state is None or state.session_id != session_id:
+            return
+        if not loop.schedule_notification_turn():
+            return
+        self._turn_task = asyncio.create_task(self._run_notification_turn(session_id))
+
+    async def _run_notification_turn(self, session_id: str) -> None:
+        loop = self.server.runtime.loop
+        state = self.server.runtime.state
+        if loop is None or state is None or state.session_id != session_id:
+            return
+        outcome = TurnOutcome.FAILED
+        started = False
+        agent_end: StreamEvent | None = None
+        try:
+            await asyncio.sleep(0.01)
+            state.turn_started()
+            started = True
+            success, agent_end = await self.server.turn_contexts.run_notification_turn(
+                session_id, loop, self._event
+            )
+            outcome = TurnOutcome.COMPLETED if success else TurnOutcome.FAILED
+        except asyncio.CancelledError:
+            outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
+            raise
+        except Exception as exc:  # noqa: BLE001 - serialize all turn failures
+            outcome = TurnOutcome.FAILED
+            await self._notify(
+                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+                session_id,
+                error={"code": "server_error", "message": str(exc)},
+                data={},
+            )
+        finally:
+            if not started and loop.notification_turn_state == "scheduled":
+                loop.cancel_scheduled_notification_turn()
+            if (
+                outcome is TurnOutcome.FOREGROUND_CANCELED
+                and loop.notification_system_message() is not None
+            ):
+                self._schedule_background_wake(session_id)
+            self.deliveries.finalize_turn(
+                session_id, state, outcome, schedule_wake=agent_end is None
+            )
+        if agent_end is not None:
+            await self._event(agent_end, session_id=session_id)
+            if outcome is TurnOutcome.COMPLETED:
+                self._schedule_background_wake(session_id)
+
+    async def _attach_pending_notifications(self) -> None:
+        runtime = self.server.runtime
+        loop = runtime.loop
+        if loop is None or runtime.state is None:
+            return
+        if loop.notification_system_message() is not None:
+            self._schedule_background_wake(runtime.session_id)
+
+    async def _resume_tool(self, request_id: str) -> None:
+        loop = self.server.runtime.loop
+        state = self.server.runtime.state
+        if loop is None or state is None:
+            return
+        session_id = state.session_id
+        event_tasks: list[asyncio.Task[None]] = []
+        agent_end: StreamEvent | None = None
+
+        def emit(event: StreamEvent) -> None:
+            nonlocal agent_end
+            if event.type is StreamEventType.AGENT_END:
+                agent_end = event
+            else:
+                event_tasks.append(
+                    asyncio.create_task(self._event(event, session_id=session_id))
+                )
+
+        outcome = TurnOutcome.COMPLETED
+        try:
+            await loop.resume_pending_tool(
+                request_id,
+                prepared=True,
+                event_sink=emit,
+            )
+        except asyncio.CancelledError:
+            outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
+            raise
+        except BaseException:
+            outcome = TurnOutcome.FAILED
+            raise
+        finally:
+            if event_tasks:
+                await asyncio.gather(*event_tasks, return_exceptions=True)
+            self.deliveries.finalize_turn(
+                session_id, state, outcome, schedule_wake=agent_end is None
+            )
+        if agent_end is not None:
+            await self._event(agent_end, session_id=session_id)
+            self._schedule_background_wake(session_id)
+
+    async def _event(
+        self,
+        event: StreamEvent,
+        *,
+        session_id: str | None = None,
+        background: bool = False,
+    ) -> None:
+        state = self.server.runtime.state
+        if session_id is None and not background and state is not None:
+            session_id = state.session_id
+        foreground = (
+            not background
+            and state is not None
+            and session_id is not None
+            and state.session_id == session_id
+        )
+        kind = event.type
+        wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
+        if kind not in {
+            StreamEventType.TOOL_APPROVAL_START,
+            StreamEventType.TOOL_APPROVAL_END,
+        }:
+            await self._end_stale_approvals(session_id)
+        if kind is StreamEventType.MESSAGE_UPDATE:
+            delta = event.delta
+            stream_kind = "assistant"
+            if isinstance(event.content, TextContent):
+                delta = event.content.text
+            elif event.content is not None:
+                delta = getattr(event.content, "text", None)
+                stream_kind = str(getattr(event.content, "type", "content"))
+            if delta:
+                await self._notify(
+                    wire_event,
+                    session_id,
+                    delta=bounded(delta),
+                    kind=stream_kind,
+                )
+            return
+        if kind is StreamEventType.MESSAGE_END:
+            if foreground and not event.data.get("truncated"):
+                await model_selection.confirm(self.server.runtime)
+            usage = event.data.get("usage")
+            if foreground and isinstance(usage, Mapping) and usage:
+                state.usage.update(usage)
+                await self._notify(
+                    event_contract.AUXILIARY_WIRE_EVENTS[
+                        event_contract.AuxiliaryEvent.USAGE
+                    ],
+                    session_id,
+                    usage=dict(usage),
+                )
+            if event.message is not None:
+                await self._notify(
+                    wire_event, session_id, **event_contract.assistant_message(event)
+                )
+            return
+        if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
+            await self._notify(
+                wire_event,
+                session_id,
+                **event_contract.tool_output(event),
+            )
+            return
+        if kind is StreamEventType.TOOL_EXECUTION_START:
+            if foreground:
+                state.tool_started()
+            await self._notify(
+                wire_event,
+                session_id,
+                **event_contract.tool_start(event),
+            )
+            return
+        if kind is StreamEventType.TOOL_EXECUTION_END:
+            if foreground:
+                state.tool_finished()
+            await self._notify(
+                wire_event,
+                session_id,
+                **event_contract.tool_end(event),
+            )
+            return
+        if kind is StreamEventType.TOOL_APPROVAL_END:
+            await self._end_approval(
+                _approval_key(event), session_id, data=dict(event.data)
+            )
+            return
+        if kind is StreamEventType.TOOL_APPROVAL_START:
+            if foreground:
+                state.tool_started()
+            raw_request_id = event.tool_call.id if event.tool_call else ""
+            child_id = event.data.get("agent_instance_id")
+            core_key: str | tuple[str, str] = (
+                (child_id, raw_request_id)
+                if isinstance(child_id, str) and raw_request_id
+                else raw_request_id
+            )
+            policy = self.server.runtime.policy
+            request = (
+                next(
+                    (
+                        item
+                        for item in policy.pending_requests()
+                        if item.key == core_key
+                    ),
+                    None,
+                )
+                if policy is not None
+                else None
+            )
+            if request is None:
+                if policy is not None:
+                    policy.deny(core_key)
+                # A live approval without its exact pending request has lost the
+                # harness-owned execution facts.  Never offer an approval based
+                # only on the provider-controlled ToolCall.
+                await self._notify(
+                    event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+                    session_id,
+                    error={
+                        "code": "approval_context_missing",
+                        "message": "approval request is unavailable; denying live approval",
+                    },
+                    data={"request_id": raw_request_id},
+                )
+                return
+            await self._notify(
+                wire_event,
+                session_id,
+                **self._approvals.observe(request),
+                **approval_display_fields(request),
+            )
+            return
+        if kind is StreamEventType.AGENT_NOTIFICATION:
+            await self.server.notification_presentations.publish(
+                session_id, event.data, self._protocol_version(), self._notify
+            )
+            return
+        if kind is StreamEventType.ERROR:
+            error = (
+                {"code": event.error.code, "message": event.error.message}
+                if event.error
+                else {"code": "unknown", "message": "unknown error"}
+            )
+            login_provider = None
+            if foreground and event.error is not None:
+                failed_provider = self.server.runtime.metadata.provider
+                offers_login = event.error.provider_error and (
+                    event.error.code == "auth_error" or event.error.status_code == 401
+                )
+                recovered = await model_selection.recover_async(
+                    self.server.runtime, event.error
+                )
+                if self._protocol_version() != "1.0":
+                    error = recovered
+                    if offers_login:
+                        login_provider = failed_provider
+            await self._notify(
+                wire_event,
+                session_id,
+                error=error,
+                data={
+                    **event.data,
+                    **({"login_provider": login_provider} if login_provider else {}),
+                },
+            )
+            return
+        if kind is StreamEventType.COMPACTION_START:
+            await self._notify(wire_event, session_id, data=dict(event.data))
+            return
+        if kind is StreamEventType.COMPACTION_END:
+            await self._notify(wire_event, session_id, data=dict(event.data))
+            return
+        if foreground and kind is StreamEventType.AGENT_END:
+            state.turn_finished()
+        await self._notify(wire_event, session_id, data=dict(event.data))
+
+    def _protocol_version(self) -> str:
+        connections = self.server.connections
+        controller = (
+            connections.current_controller() if connections is not None else None
+        )
+        return controller.protocol_version if controller is not None else "1.0"
+
+    def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
+        """Schedule child events from the loop's synchronous sink."""
+        if not self.closing:
+            asyncio.create_task(
+                self._event(event, session_id=session_id, background=True)
+            )
+
+    def _publish_memory_notice(self, session_id: str, message: str) -> None:
+        """Publish updates only when the client negotiated the optional feature."""
+        controller = (
+            self.server.connections.current_controller()
+            if self.server.connections
+            else None
+        )
+        if (
+            not self.closing
+            and controller is not None
+            and "memory_updated" in controller.features
+        ):
+            asyncio.create_task(
+                self._notify(
+                    event_contract.AUXILIARY_WIRE_EVENTS[
+                        event_contract.AuxiliaryEvent.MEMORY_UPDATED
+                    ],
+                    session_id,
+                    message=message,
+                )
+            )
+
+    async def _notify(
+        self, event: str, session_id: str | None = None, **fields: object
+    ) -> bool:
+        if session_id is None and self.server.runtime.opened is not None:
+            session_id = self.server.runtime.session_id
+        connections = self.server.connections
+        if connections is None:
+            return False
+        return await connections.publish_controller(event, session_id, **fields)
+
+    async def _end_approval(
+        self,
+        key: ApprovalKey,
+        session_id: str | None,
+        *,
+        data: dict[str, object] | None = None,
+        suppress_write_errors: bool = False,
+    ) -> None:
+        payload = self._approvals.end(key, data=data)
+        if payload is None:
+            return
+        try:
+            event = event_contract.STREAM_EVENT_WIRE_EVENTS[
+                StreamEventType.TOOL_APPROVAL_END
+            ]
+            await self._notify(event, session_id, **payload)
+        except (ConnectionError, OSError):
+            if not suppress_write_errors:
+                raise
+
+    async def _end_stale_approvals(self, session_id: str | None) -> None:
+        policy = self.server.runtime.policy
+        pending_keys = (
+            {request.key for request in policy.pending_requests()}
+            if policy is not None
+            else set()
+        )
+        for key in self._approvals.active_keys():
+            if key not in pending_keys:
+                await self._end_approval(key, session_id)
+
+    async def _terminate_pending_approvals(
+        self,
+        *,
+        foreground_only: bool = False,
+        suppress_write_errors: bool = False,
+    ) -> None:
+        policy = self.server.runtime.policy
+        if policy is not None:
+            for request in policy.pending_requests():
+                if foreground_only and request.child_instance_id is not None:
+                    continue
+                with contextlib.suppress(ValueError, RuntimeError):
+                    policy.abort(request.key)
+        for key in self._approvals.active_keys():
+            if foreground_only and not isinstance(key, str):
+                continue
+            await self._end_approval(
+                key,
+                self.server.runtime.session_id if self.server.runtime.opened else None,
+                suppress_write_errors=suppress_write_errors,
+            )
+
+
+def _approval_key(event: StreamEvent) -> ApprovalKey:
+    raw_request_id = event.tool_call.id if event.tool_call is not None else ""
+    child_id = event.data.get("agent_instance_id")
+    if isinstance(child_id, str) and raw_request_id:
+        return child_id, raw_request_id
+    return raw_request_id
+
+
+def approval_display_fields(request: ApprovalRequest) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    if request.action is not None:
+        fields["approval_action"] = request.action
+    display = request.audit_display()
+    if display:
+        fields["approval_display"] = display
+    return fields

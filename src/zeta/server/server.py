@@ -6,33 +6,21 @@ import errno
 import os
 import socket
 import stat
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
 from ..project_errors import ProjectRegistryBusyError
-from ..protocol.types import (
-    Message,
-    MessageOrigin,
-    StreamEvent,
-    StreamEventType,
-    TextContent,
-)
 from . import (
     abort_scope,
     accounts,
     ergonomics,
-    event_contract,
     login,
     model_selection,
     slash_commands,
 )
-from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
 from .connections import ConnectionRegistry
-from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
-from .notification_presentation import NotificationPresentation
+from .control import NotificationPresentation, ServeControl
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
     PROJECT_REQUESTS,
@@ -44,7 +32,6 @@ from .protocol import (
     MAX_FRAME_BYTES,
     FrameCodec,
     ProtocolError,
-    bounded,
     finish_frame_write,
     hello_result,
     negotiate_protocol_version,
@@ -53,9 +40,10 @@ from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
-USER_MESSAGE_MAX_BYTES = 262_144
+
 class ZetaServer:
     """Serve one local client over a Unix socket or localhost TCP."""
+
     def __init__(
         self,
         *,
@@ -121,11 +109,17 @@ class ZetaServer:
         self._socket_created = False
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
+        self.control = ServeControl(self)
+        self.runtime.set_background_event_sink(self.control._publish_background_event)
+        self.runtime.set_memory_notice_sink(self.control._publish_memory_notice)
+        self.runtime.set_background_wake_sink(self.control._schedule_background_wake)
+
     @property
     def address(self) -> str:
         if self.port is not None:
             return f"127.0.0.1:{self.port}"
         return str(self.socket_path)
+
     async def start(self) -> None:
         await self.runtime.initialize_project_registry()
         self._account_warnings = await accounts.migrate(self.home)
@@ -150,12 +144,14 @@ class ZetaServer:
             except BaseException:
                 await self.close()
                 raise
+
     async def serve_forever(self) -> None:
         if self._server is None:
             await self.start()
         assert self._server is not None
         async with self._server:
             await self._server.serve_forever()
+
     async def close(self) -> None:
         try:
             if self._client is not None:
@@ -175,6 +171,7 @@ class ZetaServer:
             finally:
                 self._server = None
                 try:
+                    await self.control.close()
                     await self.runtime.close()
                 finally:
                     if self.port is None and self._socket_created:
@@ -182,6 +179,7 @@ class ZetaServer:
                             if stat.S_ISSOCK(self.socket_path.stat().st_mode):
                                 self.socket_path.unlink()
                         self._socket_created = False
+
     def _prepare_socket_path(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -212,6 +210,7 @@ class ZetaServer:
         finally:
             probe.close()
         self.socket_path.unlink()
+
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -229,12 +228,11 @@ class ZetaServer:
             await client.run()
         finally:
             if self._client is client:
-                self.runtime.set_background_event_sink(None)
-                self.runtime.set_memory_notice_sink(None)
-                self.runtime.set_background_wake_sink(None)
                 self._client = None
                 self._client_active = False
             registry.release(client)
+
+
 class _Client:
     def __init__(
         self,
@@ -257,14 +255,12 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
-        self._turn_task: asyncio.Task[None] | None = None
-        self._turn_cancel_outcome: TurnOutcome | None = None
         self._read_buffer = bytearray()
-        self._model_inputs = PendingModelInputs()
         self.codec = FrameCodec()
-        self.projects = ProjectRequests.for_runtime(home=server.home, runtime=server.runtime, codec=self.codec)
-        self.deliveries = DeliveryRequests(self)
-        self._approvals = ApprovalLifecycle()
+        self.projects = ProjectRequests.for_runtime(
+            home=server.home, runtime=server.runtime, codec=self.codec
+        )
+
     async def run(self) -> None:
         try:
             while True:
@@ -284,7 +280,9 @@ class _Client:
                     continue
                 request_id = request["id"]
                 try:
-                    result = await self._dispatch(request_id, request["method"], request["params"])
+                    result = await self._dispatch(
+                        request_id, request["method"], request["params"]
+                    )
                 except ProtocolError as exc:
                     await self._write(
                         self.codec.error_response(
@@ -298,7 +296,9 @@ class _Client:
                     )
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
                     code, message, data = project_request_error(exc)
-                    await self._write(self.codec.error_response(request_id, code, message, data))
+                    await self._write(
+                        self.codec.error_response(request_id, code, message, data)
+                    )
                 except ProjectRegistryBusyError as exc:
                     await self._write(
                         self.codec.error_response(
@@ -322,6 +322,7 @@ class _Client:
                     break
         finally:
             await self.close()
+
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
         while True:
@@ -347,6 +348,7 @@ class _Client:
                 self._read_buffer.clear()
                 return line
             self._read_buffer.extend(chunk)
+
     async def _discard_oversized_frame(self, prefix: bytes) -> bytes:
         """Discard an oversized line and preserve any complete later frames."""
         while True:
@@ -358,30 +360,25 @@ class _Client:
                 continue
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
+
     async def close(self) -> None:
         async with self._close_lock:
             if self._closed:
                 return
-            if self.role == "controller":
-                self.server.runtime.set_background_event_sink(None)
-                self.server.runtime.set_memory_notice_sink(None)
-                self.server.runtime.set_background_wake_sink(None)
-                await self._terminate_pending_approvals(suppress_write_errors=True)
+            controller = self.connections.current_controller()
+            if (
+                self.role == "controller"
+                and controller is not None
+                and controller.connection is self
+            ):
+                await self.server.control.controller_released()
             await accounts.cancel_owned_switch(self)
-            if self._turn_task is not None and not self._turn_task.done():
-                loop = self.server.runtime.loop
-                if loop is not None:
-                    loop.abort(steering_drop_reason=None)
-                self._turn_cancel_outcome = TurnOutcome.DISCONNECTED
-                self._turn_task.cancel()
-                await asyncio.gather(self._turn_task, return_exceptions=True)
-            self._turn_task = None
-            self._approvals.clear()
             await self.logins.close()
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
             self._closed = True
+
     async def _route_request(
         self, method: str, params: dict[str, Any]
     ) -> tuple[bool, object]:
@@ -390,14 +387,7 @@ class _Client:
             if self.role == "controller":
                 self.server._client_active = True
                 self.server._client = self
-                self.server.runtime.set_background_event_sink(
-                    self._publish_background_event
-                )
-                self.server.runtime.set_memory_notice_sink(self._publish_memory_notice)
-                self.server.runtime.set_background_wake_sink(
-                    self._schedule_background_wake
-                )
-                await self._attach_pending_notifications()
+                await self.server.control.controller_claimed()
             return True, result
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
@@ -432,29 +422,33 @@ class _Client:
                 )
             assert self.projects is not None
             return await asyncio.to_thread(
-                self.projects.dispatch, request_id, method, params, features=self.features
+                self.projects.dispatch,
+                request_id,
+                method,
+                params,
+                features=self.features,
             )
         if method == "list_sessions":
             return self._list_sessions(request_id, params)
         if method == "new_session":
-            await self._require_idle()
+            await self.server.control.require_idle()
             cwd = None
             if "cwd" in params:
                 self._require_feature("session_cwd", "cwd")
                 cwd = _directory(params, "cwd")
-            await self._terminate_pending_approvals()
+            await self.server.control._terminate_pending_approvals()
             await self.server.runtime.create_session(
                 provider=_optional_string(params, "provider"),
                 model=_optional_string(params, "model"),
                 cwd=cwd,
             )
-            self._approvals.clear()
-            await self._attach_pending_notifications()
+            self.server.control.clear_approvals()
+            await self.server.control.controller_claimed()
             return {"session": self._session_snapshot()}
         if method == "resume":
-            await self._require_idle()
+            await self.server.control.require_idle()
             session_id = _required_string(params, "session_id")
-            await self._terminate_pending_approvals()
+            await self.server.control._terminate_pending_approvals()
             try:
                 await self.server.runtime.resume_session(session_id)
             except SessionNotFoundError as exc:
@@ -463,29 +457,36 @@ class _Client:
                     str(exc),
                     {"code": "session_not_found", "session_id": session_id},
                 ) from exc
-            self._approvals.clear()
-            await self._attach_pending_notifications()
+            self.server.control.clear_approvals()
+            await self.server.control.controller_claimed()
             return {"session": self._session_snapshot()}
         if method == "send":
-            return await self.deliveries.send(params)
+            return await self.server.control.deliveries.send(params, self.features)
         if method == "steer":
-            return await self.deliveries.steer(params)
+            return await self.server.control.deliveries.steer(params, self.features)
         if method == "delivery_status":
-            return self.deliveries.status(params)
+            return self.server.control.deliveries.status(params, self.features)
         if method == "clear_steering":
-            return abort_scope.clear_pending_steering(self.features, self.server.runtime.loop)
+            return abort_scope.clear_pending_steering(
+                self.features, self.server.runtime.loop
+            )
         if method in {"approve", "deny"}:
             scope = params.get("scope", "once")
             if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
                 raise ProtocolError(-32602, "scope must be 'once' or 'always_tool'")
             if scope == "always_tool" and method != "approve":
                 raise ProtocolError(-32602, "scope 'always_tool' requires approve")
-            return await self._approval(method, _required_string(params, "request_id"), scope)
+            return await self.server.control.resolve_approval(
+                method, _required_string(params, "request_id"), scope
+            )
         if method == "abort":
-            return await self._abort(abort_scope.parse_abort_scope(params, self.features))
+            return await self.server.control.abort(
+                abort_scope.parse_abort_scope(params, self.features)
+            )
         if method == "status":
             return self._status()
         raise ProtocolError(-32601, f"method not found: {method}")
+
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:
             raise ProtocolError(-32600, "hello may only be sent once")
@@ -499,7 +500,9 @@ class _Client:
         ):
             raise ProtocolError(-32602, "features must be an array of strings")
         extended = self.protocol_version != "1.0"
-        accepted = [item for item in FEATURES if item in (requested or ())] if extended else []
+        accepted = (
+            [item for item in FEATURES if item in (requested or ())] if extended else []
+        )
         accepted = self.server.runtime.available_project_features(accepted)
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
@@ -552,23 +555,13 @@ class _Client:
             assert isinstance(notices, list)
             notices.extend(self.server._account_warnings)
         return result
+
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
             raise ProtocolError(
                 -32602, f"{param} requires the negotiated {feature} feature"
             )
-    async def _user_message(
-        self, text: str, mode: str, attachments: list[dict[str, object]] | None = None
-    ) -> None:
-        """Echo an accepted user message so observers can rebuild the transcript."""
-        if "user_message_event" in self.features:
-            await self._notify(
-                event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.USER_MESSAGE],
-                self.server.runtime.session_id,
-                text=bounded(text, USER_MESSAGE_MAX_BYTES),
-                mode=mode,
-                attachments=attachments or [],
-            )
+
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
         runtime = self.server.runtime
         if method in {"rename_session", "delete_session"}:
@@ -577,7 +570,7 @@ class _Client:
                 method,
                 _required_string(params, "session_id"),
                 params.get("name"),
-                self._require_idle,
+                self.server.control.require_idle,
             )
         store = ergonomics.active(runtime, params)
         if method == "session_tree":
@@ -589,25 +582,34 @@ class _Client:
         if method == "session_settings":
             return ergonomics.settings(runtime)
         if method in slash_commands.READ_REQUESTS:
-            return await slash_commands.read_request(method, runtime, self._require_idle, params, self)
-        await self._require_idle()
+            return await slash_commands.read_request(
+                method, runtime, self.server.control.require_idle, params, self
+            )
+        await self.server.control.require_idle()
         if method == "slash_run":
-            register = self._model_inputs.registrar(runtime.session_id, enabled="model_input_ids" in self.features)
+            register = self.server.control.model_input_registrar(self.features)
             return await slash_commands.run_command(
                 runtime, _required_string(params, "text"), register_model_input=register
             )
         ergonomics.require_mutable(runtime)
         if method == "send_images":
             message = ergonomics.image_message(runtime, params)
-            await self._user_message(
-                params.get("text", ""), "send", ergonomics.attachment_summary(message)
+            await self.server.control.user_message(
+                params.get("text", ""),
+                "send",
+                self.features,
+                ergonomics.attachment_summary(message),
             )
-            self._turn_task = asyncio.create_task(self._run_turn(params.get("text", ""), message))
+            self.server.control.start_turn(params.get("text", ""), message)
             return {"accepted": True, "session_id": runtime.session_id}
         if method == "set_settings":
             model = _required_string(params, "model")
             mode = _required_string(params, "approval_mode")
-            if model not in ergonomics.catalog(runtime)["models"] or mode not in {"ask", "allow", "deny"}:
+            if model not in ergonomics.catalog(runtime)["models"] or mode not in {
+                "ask",
+                "allow",
+                "deny",
+            }:
                 raise ProtocolError(-32602, "invalid model or approval mode")
             await model_selection.apply_rpc(runtime, model, mode)
             return ergonomics.settings(runtime)
@@ -625,83 +627,7 @@ class _Client:
             if not current or current[-1].id != head:
                 store.switch_to_branch(head)
         return ergonomics.tree(runtime)
-    async def _approval(
-        self, method: str, request_id: str, scope: str = "once"
-    ) -> dict[str, object]:
-        policy = self.server.runtime.policy
-        loop = self.server.runtime.loop
-        if policy is None or loop is None:
-            raise ProtocolError(-32003, "no active session")
-        core_key = self._approvals.core_key(request_id)
-        pending = next(
-            (item for item in policy.pending_requests() if item.key == core_key),
-            None,
-        )
-        if (
-            scope == "always_tool"
-            and pending is not None
-            and pending.child_instance_id is not None
-        ):
-            raise ProtocolError(
-                -32602, "scope 'always_tool' is unavailable for delegated approvals"
-            )
-        if scope == "always_tool" and pending is not None:
-            try:
-                policy.remember_allow(pending)
-            except ValueError as exc:
-                raise ProtocolError(
-                    -32602, f"cannot always allow approval request: {exc}"
-                ) from exc
-        resolved = policy.resolve(
-            core_key,
-            ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY,
-        )
-        if not resolved:
-            raise ProtocolError(
-                -32006, f"approval request not found or already resolved: {request_id}"
-            )
-        if pending is not None:
-            self._approvals.observe(pending)
-        await self._end_approval(core_key, self.server.runtime.session_id)
-        active = self._turn_busy()
-        if (
-            not active
-            and isinstance(core_key, str)
-            and loop.prepare_resume_pending_tool(core_key)
-        ):
-            if self.server.runtime.state is not None:
-                self.server.runtime.state.tool_started()
-            task = asyncio.create_task(self._resume_tool(core_key))
-            self._turn_task = task
-        result: dict[str, object] = {
-            "accepted": True,
-            "request_id": request_id,
-            "decision": method,
-        }
-        if scope != "once":
-            result["scope"] = scope
-        return result
-    async def _abort(self, scope: abort_scope.AbortScope = "session") -> dict[str, object]:
-        session_id = self.server.runtime.session_id
-        outcome = (
-            TurnOutcome.FOREGROUND_CANCELED
-            if scope == "foreground"
-            else TurnOutcome.SESSION_CANCELED
-        )
-        turn_task = self._turn_task
-        def mark_canceled() -> None:
-            if turn_task is not None and not turn_task.done():
-                self._turn_cancel_outcome = outcome
-        aborted = await abort_scope.abort_active_turn(
-            turn_task,
-            scope=scope,
-            loop=self.server.runtime.loop,
-            terminate_approvals=self._terminate_pending_approvals,
-            before_cancel=mark_canceled,
-        )
-        if aborted:
-            await self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.TURN_ABORTED], session_id)
-        return {"aborted": aborted}
+
     def _session_snapshot(self) -> dict[str, object] | None:
         runtime = self.server.runtime
         if runtime.opened is None:
@@ -710,18 +636,13 @@ class _Client:
         if runtime.policy is not None:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
+
     def _status(self) -> dict[str, object]:
         runtime = self.server.runtime
         session = self._session_snapshot()
-        pending = []
-        if self.role != "observer" and runtime.policy is not None:
-            pending = [
-                {
-                    **self._approvals.observe(item),
-                    **_approval_display_fields(item),
-                }
-                for item in runtime.policy.pending_requests()
-            ]
+        pending = (
+            self.server.control.pending_approvals() if self.role != "observer" else []
+        )
         return {
             "session": session,
             "state": runtime.state.status if runtime.state is not None else "idle",
@@ -738,334 +659,6 @@ class _Client:
                 else 0
             ),
         }
-    async def _run_turn(
-        self,
-        text: str,
-        user_message: Message | None = None,
-        *,
-        origin: MessageOrigin = MessageOrigin.USER,
-        persist_user_message: bool = True,
-    ) -> None:
-        loop = self.server.runtime.loop
-        state = self.server.runtime.state
-        if loop is None or state is None:
-            return
-        session_id = state.session_id
-        state.turn_started()
-        outcome = TurnOutcome.COMPLETED
-        agent_end: StreamEvent | None = None
-        try:
-            async for event in loop.run_turn(
-                text,
-                origin=origin,
-                user_message=user_message,
-                persist_user_message=persist_user_message,
-            ):
-                if event.type is StreamEventType.ERROR:
-                    outcome = TurnOutcome.FAILED
-                if event.type is StreamEventType.AGENT_END:
-                    agent_end = event
-                else:
-                    await self._event(event, session_id=session_id)
-        except asyncio.CancelledError:
-            outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
-            raise
-        except Exception as exc:  # noqa: BLE001 - serialize all turn failures
-            outcome = TurnOutcome.FAILED
-            await self._notify(
-                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
-                session_id,
-                error={"code": "server_error", "message": str(exc)},
-                data={},
-            )
-        finally:
-            self.deliveries.finalize_turn(
-                session_id, state, outcome, schedule_wake=agent_end is None
-            )
-        if agent_end is not None:
-            await self._event(agent_end, session_id=session_id)
-            if outcome is TurnOutcome.COMPLETED:
-                self._schedule_background_wake(session_id)
-    def _schedule_background_wake(self, session_id: str) -> None:
-        if self._closed:
-            return
-        loop = self.server.runtime.loop
-        state = self.server.runtime.state
-        if loop is None or state is None or state.session_id != session_id:
-            return
-        if not loop.schedule_notification_turn():
-            return
-        self._turn_task = asyncio.create_task(
-            self._run_notification_turn(session_id)
-        )
-    async def _run_notification_turn(self, session_id: str) -> None:
-        loop = self.server.runtime.loop
-        state = self.server.runtime.state
-        if loop is None or state is None or state.session_id != session_id:
-            return
-        outcome = TurnOutcome.FAILED
-        started = False
-        agent_end: StreamEvent | None = None
-        try:
-            await asyncio.sleep(0.01)
-            state.turn_started()
-            started = True
-            success, agent_end = await self.server.turn_contexts.run_notification_turn(
-                session_id, loop, self._event
-            )
-            outcome = TurnOutcome.COMPLETED if success else TurnOutcome.FAILED
-        except asyncio.CancelledError:
-            outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
-            raise
-        except Exception as exc:  # noqa: BLE001 - serialize all turn failures
-            outcome = TurnOutcome.FAILED
-            await self._notify(
-                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
-                session_id,
-                error={"code": "server_error", "message": str(exc)},
-                data={},
-            )
-        finally:
-            if not started and loop.notification_turn_state == "scheduled":
-                loop.cancel_scheduled_notification_turn()
-            if (
-                outcome is TurnOutcome.FOREGROUND_CANCELED
-                and loop.notification_system_message() is not None
-            ):
-                self._schedule_background_wake(session_id)
-            self.deliveries.finalize_turn(
-                session_id, state, outcome, schedule_wake=agent_end is None
-            )
-        if agent_end is not None:
-            await self._event(agent_end, session_id=session_id)
-            if outcome is TurnOutcome.COMPLETED:
-                self._schedule_background_wake(session_id)
-    async def _attach_pending_notifications(self) -> None:
-        runtime = self.server.runtime
-        loop = runtime.loop
-        if loop is None or runtime.state is None:
-            return
-        if loop.notification_system_message() is not None:
-            self._schedule_background_wake(runtime.session_id)
-    async def _resume_tool(self, request_id: str) -> None:
-        loop = self.server.runtime.loop
-        state = self.server.runtime.state
-        if loop is None or state is None:
-            return
-        session_id = state.session_id
-        event_tasks: list[asyncio.Task[None]] = []
-        agent_end: StreamEvent | None = None
-        def emit(event: StreamEvent) -> None:
-            nonlocal agent_end
-            if event.type is StreamEventType.AGENT_END:
-                agent_end = event
-            else:
-                event_tasks.append(
-                    asyncio.create_task(self._event(event, session_id=session_id))
-                )
-        outcome = TurnOutcome.COMPLETED
-        try:
-            await loop.resume_pending_tool(
-                request_id,
-                prepared=True,
-                event_sink=emit,
-            )
-        except asyncio.CancelledError:
-            outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
-            raise
-        except BaseException:
-            outcome = TurnOutcome.FAILED
-            raise
-        finally:
-            if event_tasks:
-                await asyncio.gather(*event_tasks, return_exceptions=True)
-            self.deliveries.finalize_turn(
-                session_id, state, outcome, schedule_wake=agent_end is None
-            )
-        if agent_end is not None:
-            await self._event(agent_end, session_id=session_id)
-            self._schedule_background_wake(session_id)
-    async def _event(
-        self,
-        event: StreamEvent,
-        *,
-        session_id: str | None = None,
-        background: bool = False,
-    ) -> None:
-        state = self.server.runtime.state
-        if session_id is None and not background and state is not None:
-            session_id = state.session_id
-        foreground = (
-            not background
-            and state is not None
-            and session_id is not None
-            and state.session_id == session_id
-        )
-        kind = event.type
-        wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
-        if kind not in {
-            StreamEventType.TOOL_APPROVAL_START,
-            StreamEventType.TOOL_APPROVAL_END,
-        }:
-            await self._end_stale_approvals(session_id)
-        if kind is StreamEventType.MESSAGE_UPDATE:
-            delta = event.delta
-            stream_kind = "assistant"
-            if isinstance(event.content, TextContent):
-                delta = event.content.text
-            elif event.content is not None:
-                delta = getattr(event.content, "text", None)
-                stream_kind = str(getattr(event.content, "type", "content"))
-            if delta:
-                await self._notify(
-                    wire_event,
-                    session_id,
-                    delta=bounded(delta),
-                    kind=stream_kind,
-                )
-            return
-        if kind is StreamEventType.MESSAGE_END:
-            if foreground and not event.data.get("truncated"):
-                await model_selection.confirm(self.server.runtime)
-            usage = event.data.get("usage")
-            if foreground and isinstance(usage, Mapping) and usage:
-                state.usage.update(usage)
-                await self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.USAGE], session_id, usage=dict(usage))
-            if event.message is not None:
-                await self._notify(
-                    wire_event, session_id, **event_contract.assistant_message(event)
-                )
-            return
-        if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
-            await self._notify(
-                wire_event,
-                session_id,
-                **event_contract.tool_output(event),
-            )
-            return
-        if kind is StreamEventType.TOOL_EXECUTION_START:
-            if foreground:
-                state.tool_started()
-            await self._notify(
-                wire_event,
-                session_id,
-                **event_contract.tool_start(event),
-            )
-            return
-        if kind is StreamEventType.TOOL_EXECUTION_END:
-            if foreground:
-                state.tool_finished()
-            await self._notify(
-                wire_event,
-                session_id,
-                **event_contract.tool_end(event),
-            )
-            return
-        if kind is StreamEventType.TOOL_APPROVAL_END:
-            await self._end_approval(
-                _approval_key(event), session_id, data=dict(event.data)
-            )
-            return
-        if kind is StreamEventType.TOOL_APPROVAL_START:
-            if foreground:
-                state.tool_started()
-            raw_request_id = event.tool_call.id if event.tool_call else ""
-            child_id = event.data.get("agent_instance_id")
-            core_key: str | tuple[str, str] = (
-                (child_id, raw_request_id)
-                if isinstance(child_id, str) and raw_request_id
-                else raw_request_id
-            )
-            policy = self.server.runtime.policy
-            request = (
-                next(
-                    (
-                        item
-                        for item in policy.pending_requests()
-                        if item.key == core_key
-                    ),
-                    None,
-                )
-                if policy is not None
-                else None
-            )
-            if request is None:
-                if policy is not None:
-                    policy.deny(core_key)
-                # A live approval without its exact pending request has lost the
-                # harness-owned execution facts.  Never offer an approval based
-                # only on the provider-controlled ToolCall.
-                await self._notify(
-                    event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
-                    session_id,
-                    error={
-                        "code": "approval_context_missing",
-                        "message": "approval request is unavailable; denying live approval",
-                    },
-                    data={"request_id": raw_request_id},
-                )
-                return
-            await self._notify(
-                wire_event,
-                session_id,
-                **self._approvals.observe(request),
-                **_approval_display_fields(request),
-            )
-            return
-        if kind is StreamEventType.AGENT_NOTIFICATION:
-            await self.server.notification_presentations.publish(
-                session_id, event.data, self.protocol_version, self._notify
-            )
-            return
-        if kind is StreamEventType.ERROR:
-            error = (
-                {"code": event.error.code, "message": event.error.message}
-                if event.error else {"code": "unknown", "message": "unknown error"}
-            )
-            login_provider = None
-            if (foreground and event.error is not None and event.error.provider_error
-                    and (event.error.code == "auth_error" or event.error.status_code == 401)
-                    and self.protocol_version != "1.0"):
-                login_provider = self.server.runtime.metadata.provider
-            if foreground and event.error is not None:
-                recovered = await model_selection.recover_async(self.server.runtime, event.error)
-                if self.protocol_version != "1.0":
-                    error = recovered
-            await self._notify(
-                wire_event, session_id, error=error, data={**event.data, **({"login_provider": login_provider} if login_provider else {})},
-            )
-            return
-        if kind is StreamEventType.COMPACTION_START:
-            await self._notify(wire_event, session_id, data=dict(event.data))
-            return
-        if kind is StreamEventType.COMPACTION_END:
-            await self._notify(wire_event, session_id, data=dict(event.data))
-            return
-        if foreground and kind is StreamEventType.AGENT_END:
-            state.turn_finished()
-        await self._notify(
-            wire_event, session_id, data=dict(event.data)
-        )
-    def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
-        """Schedule child events from the loop's synchronous sink."""
-        if not self._closed:
-            asyncio.create_task(
-                self._event(event, session_id=session_id, background=True)
-            )
-
-    def _publish_memory_notice(self, session_id: str, message: str) -> None:
-        """Publish updates only when the client negotiated the optional feature."""
-        if not self._closed and "memory_updated" in self.features:
-            asyncio.create_task(
-                self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.MEMORY_UPDATED], session_id, message=message)
-            )
-
-    async def _notify(
-        self, event: str, session_id: str | None = None, **fields: object
-    ) -> bool:
-        if session_id is None and self.server.runtime.opened is not None:
-            session_id = self.server.runtime.session_id
-        return await self._write(self.codec.notification(event, session_id, **fields))
 
     def _list_sessions(
         self, request_id: str | int, params: dict[str, Any]
@@ -1094,7 +687,10 @@ class _Client:
             )
         }
         sessions = [
-            {**item.to_dict(), "first_message_preview": previews.get(item.session_id, "")}
+            {
+                **item.to_dict(),
+                "first_message_preview": previews.get(item.session_id, ""),
+            }
             for item in metadata
         ]
         if self.protocol_version == "1.0":
@@ -1118,57 +714,6 @@ class _Client:
         end = offset + len(page)
         return {"sessions": page, "next_offset": end if end < len(available) else None}
 
-    async def _end_approval(
-        self,
-        key: ApprovalKey,
-        session_id: str | None,
-        *,
-        data: dict[str, object] | None = None,
-        suppress_write_errors: bool = False,
-    ) -> None:
-        payload = self._approvals.end(key, data=data)
-        if payload is None:
-            return
-        try:
-            event = event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.TOOL_APPROVAL_END]
-            await self._notify(event, session_id, **payload)
-        except (ConnectionError, OSError):
-            if not suppress_write_errors:
-                raise
-
-    async def _end_stale_approvals(self, session_id: str | None) -> None:
-        policy = self.server.runtime.policy
-        pending_keys = (
-            {request.key for request in policy.pending_requests()}
-            if policy is not None
-            else set()
-        )
-        for key in self._approvals.active_keys():
-            if key not in pending_keys:
-                await self._end_approval(key, session_id)
-
-    async def _terminate_pending_approvals(
-        self,
-        *,
-        foreground_only: bool = False,
-        suppress_write_errors: bool = False,
-    ) -> None:
-        policy = self.server.runtime.policy
-        if policy is not None:
-            for request in policy.pending_requests():
-                if foreground_only and request.child_instance_id is not None:
-                    continue
-                with contextlib.suppress(ValueError, RuntimeError):
-                    policy.abort(request.key)
-        for key in self._approvals.active_keys():
-            if foreground_only and not isinstance(key, str):
-                continue
-            await self._end_approval(
-                key,
-                self.server.runtime.session_id if self.server.runtime.opened else None,
-                suppress_write_errors=suppress_write_errors,
-            )
-
     async def _write(self, payload: bytes) -> bool:
         return await self.connections.send(self, payload)
 
@@ -1176,26 +721,19 @@ class _Client:
         async with self._write_lock:
             return await finish_frame_write(self.codec, self.writer, payload)
 
-    def _turn_busy(self) -> bool:
-        loop = self.server.runtime.loop
-        return (
-            self._turn_task is not None and not self._turn_task.done()
-        ) or (loop is not None and loop.notification_turn_state != "idle")
-
-    async def _require_idle(self) -> None:
-        if self._turn_busy():
-            raise ProtocolError(-32004, "a turn is already running")
 
 def _home() -> Path:
     from ..core.session import env_home
 
     return env_home().expanduser().resolve()
 
+
 def _required_string(params: dict[str, Any], name: str) -> str:
     value = params.get(name)
     if not isinstance(value, str) or not value:
         raise ProtocolError(-32602, f"{name} must be a nonempty string")
     return value
+
 
 def _integer(
     params: dict[str, Any], name: str, default: int | None, *, minimum: int
@@ -1207,6 +745,7 @@ def _integer(
         raise ProtocolError(-32602, f"{name} must be an integer of at least {minimum}")
     return value
 
+
 def _directory(params: dict[str, Any], name: str) -> Path:
     value = params.get(name)
     if not isinstance(value, str) or not value or not os.path.isabs(value):
@@ -1216,32 +755,12 @@ def _directory(params: dict[str, Any], name: str) -> Path:
         raise ProtocolError(-32602, f"{name} is not an existing directory: {value}")
     return path
 
+
 def _optional_string(params: dict[str, Any], name: str) -> str | None:
     value = params.get(name)
     if value is not None and (not isinstance(value, str) or not value):
         raise ProtocolError(-32602, f"{name} must be a nonempty string")
     return value
 
-def _approval_key(event: StreamEvent) -> ApprovalKey:
-    raw_request_id = event.tool_call.id if event.tool_call is not None else ""
-    child_id = event.data.get("agent_instance_id")
-    if isinstance(child_id, str) and raw_request_id:
-        return child_id, raw_request_id
-    return raw_request_id
-
-def _approval_display_fields(request: Any) -> dict[str, object]:
-    """The one immutable approval-display object shared with the frontend client.
-
-    Returns an ``approval_display`` wire field only when the harness resolved
-    trusted execution facts; otherwise nothing is added and the client
-    keeps its backward-compatible behavior.
-    """
-    fields: dict[str, object] = {}
-    if request.action is not None:
-        fields["approval_action"] = request.action
-    display = request.audit_display()
-    if display:
-        fields["approval_display"] = display
-    return fields
 
 __all__ = ["ZetaServer"]

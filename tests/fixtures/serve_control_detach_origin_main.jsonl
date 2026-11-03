@@ -1,0 +1,19 @@
+{"jsonrpc":"2.0","id":3,"result":{"accepted":true,"session_id":"00000000000000000000000000000001"}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"agent_start","session_id":"00000000000000000000000000000001","data":{}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"00000000000000000000000000000001","data":{"turn":1}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"message_start","session_id":"00000000000000000000000000000001","data":{}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"assistant_message","session_id":"00000000000000000000000000000001","message":{"role":"assistant","content":[{"type":"tool_use","tool_call":{"id":"call-1","name":"bash","arguments":{"command":"printf hi"}}}]}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"approval_request","session_id":"00000000000000000000000000000001","request_id":"call-1","tool_call":{"id":"call-1","name":"bash","arguments":{"command":"printf hi"}},"delegated":false}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"sub_agent_receipt","session_id":"00000000000000000000000000000001","data":{"kind":"agent_completion","text":"background done"}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"approval_end","session_id":"00000000000000000000000000000001","request_id":"call-1","tool_call":{"id":"call-1","name":"bash","arguments":{"command":"printf hi"}},"data":{}}}
+{"jsonrpc":"2.0","id":4,"result":{"accepted":true,"request_id":"call-1","decision":"deny"}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"tool_end","session_id":"00000000000000000000000000000001","tool_call":{"id":"call-1","name":"bash","arguments":{"command":"printf hi"}},"tool_result":{"tool_call_id":"call-1","content":"tool execution denied","is_error":true,"content_blocks":[{"type":"text","text":"tool execution denied","truncated":false,"full_size":21}],"structured_content":{"error":{"tool":"bash","kind":"denied","hint":"the user denied approval; do not retry without new context","message":"tool execution denied"}}},"data":{}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"turn_end","session_id":"00000000000000000000000000000001","data":{"turn":1,"tool_calls":1}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.2","server":"zeta","capabilities":{"requests":["list_sessions","new_session","resume","send","steer","approve","deny","abort","status","rename_session","delete_session","session_tree","session_history","switch_branch","fork_message","model_catalog","session_settings","set_settings","set_compaction","send_images","slash_list","slash_run","account_list","account_logout","account_refresh","account_switch","login_start","login_status","login_cancel","login_providers"],"notifications":["event"]}}}
+{"jsonrpc":"2.0","id":2,"result":{"session":null,"state":"idle","explicit_finish":false,"pending_approvals":[],"usage":{},"compaction_markers":0}}
+{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"method not found: missing_method"}}
+{"jsonrpc":"2.0","id":5,"result":{"accepted":true,"session_id":"000000000000000000000000000003e8"}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"agent_start","session_id":"000000000000000000000000000003e8","data":{}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"000000000000000000000000000003e8","data":{"turn":1}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"turn_aborted","session_id":"000000000000000000000000000003e8"}}
+{"jsonrpc":"2.0","id":6,"result":{"aborted":true}}

@@ -26,8 +26,8 @@ from ..protocol.types import (
 from .protocol import ProtocolError
 
 if TYPE_CHECKING:
+    from .control import ServeControl
     from .runtime import SessionState
-    from .server import _Client
 
 
 class TurnOutcome(StrEnum):
@@ -41,29 +41,29 @@ class TurnOutcome(StrEnum):
 class DeliveryRequests:
     """Own feature gating, persistence, deduplication, and status queries."""
 
-    def __init__(self, client: _Client) -> None:
-        self._client = client
+    def __init__(self, control: ServeControl) -> None:
+        self._control = control
 
     async def send(self, params: dict[str, Any]) -> dict[str, object]:
-        client = self._client
-        runtime = client.server.runtime
+        control = self._control
+        runtime = control.server.runtime
         if runtime.loop is None or runtime.opened is None:
             raise ProtocolError(-32003, "no active session")
         delivery_id = self._delivery_id(params)
         duplicate = self._duplicate(delivery_id)
         if duplicate is not None:
             return duplicate
-        if client._turn_busy():
+        if control._turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
-        value = client._model_inputs.resolve(
+        value = control._model_inputs.resolve(
             runtime.session_id,
             params,
-            enabled="model_input_ids" in client.features,
+            enabled="model_input_ids" in control.features,
         )
-        await client._user_message(value.display_text, "send")
+        await control._user_message(value.display_text, "send")
         if delivery_id is None:
-            client._turn_task = asyncio.create_task(
-                client._run_turn(
+            control._turn_task = asyncio.create_task(
+                control._run_turn(
                     value.text,
                     origin=value.origin,
                     user_message=value.message,
@@ -85,8 +85,8 @@ class DeliveryRequests:
         }
 
         def start_turn() -> None:
-            client._turn_task = asyncio.create_task(
-                client._run_turn(
+            control._turn_task = asyncio.create_task(
+                control._run_turn(
                     value.text,
                     origin=value.origin,
                     user_message=message,
@@ -105,8 +105,8 @@ class DeliveryRequests:
         return outcome
 
     async def steer(self, params: dict[str, Any]) -> dict[str, object]:
-        client = self._client
-        runtime = client.server.runtime
+        control = self._control
+        runtime = control.server.runtime
         loop = runtime.loop
         if loop is None or runtime.opened is None:
             raise ProtocolError(-32003, "no active session")
@@ -114,13 +114,13 @@ class DeliveryRequests:
         duplicate = self._duplicate(delivery_id)
         if duplicate is not None:
             return duplicate
-        if not client._turn_busy():
+        if not control._turn_busy():
             raise ProtocolError(-32005, "no turn is running")
         text = _required_string(params, "text")
         message = with_message_origin(
             Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
         )
-        await client._user_message(text, "steer")
+        await control._user_message(text, "steer")
         if delivery_id is None:
             loop.steer(message)
             return {"accepted": True}
@@ -146,7 +146,7 @@ class DeliveryRequests:
     ) -> None:
         """Apply all lifecycle effects for one explicit terminal outcome."""
 
-        client = self._client
+        control = self._control
         reason = {
             TurnOutcome.COMPLETED: "turn_end",
             TurnOutcome.FAILED: "failed",
@@ -155,25 +155,25 @@ class DeliveryRequests:
         }.get(outcome)
         if reason is not None:
             state.loop.drop_pending_steering(reason)
-        client._approvals.prune_ended()
-        if client.server.runtime.state is state:
+        control._approvals.prune_ended()
+        if control.server.runtime.state is state:
             state.turn_finished()
-        if client._turn_task is asyncio.current_task():
-            client._turn_task = None
-            client._turn_cancel_outcome = None
+        if control._turn_task is asyncio.current_task():
+            control._turn_task = None
+            control._turn_cancel_outcome = None
         if (
             schedule_wake
             and outcome is TurnOutcome.COMPLETED
-            and client.server.runtime.state is state
+            and control.server.runtime.state is state
             and state.loop.notification_system_message() is not None
         ):
-            client._schedule_background_wake(session_id)
+            control._schedule_background_wake(session_id)
 
     def status(self, params: dict[str, Any]) -> dict[str, object]:
-        client = self._client
-        client._require_feature("delivery_id", "delivery_status")
+        control = self._control
+        control._require_feature("delivery_id", "delivery_status")
         delivery_id = _required_delivery_id(params)
-        runtime = client.server.runtime
+        runtime = control.server.runtime
         if runtime.opened is None:
             raise ProtocolError(-32003, "no active session")
         store = runtime.opened.store
@@ -192,11 +192,11 @@ class DeliveryRequests:
     def _delivery_id(self, params: dict[str, Any]) -> str | None:
         if "delivery_id" not in params:
             return None
-        self._client._require_feature("delivery_id", "delivery_id")
+        self._control._require_feature("delivery_id", "delivery_id")
         return _required_delivery_id(params)
 
     def _duplicate(self, delivery_id: str | None) -> dict[str, object] | None:
-        runtime = self._client.server.runtime
+        runtime = self._control.server.runtime
         if delivery_id is None or runtime.opened is None:
             return None
         store = runtime.opened.store

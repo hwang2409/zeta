@@ -235,14 +235,14 @@ async def test_controller_close_never_writes_after_registry_release(
     assert runtime_sink is not None
     close_entered = asyncio.Event()
     close_release = asyncio.Event()
-    original_terminate = client._terminate_pending_approvals
+    original_terminate = server.control._terminate_pending_approvals
 
     async def gated_terminate(*args: Any, **kwargs: Any) -> None:
         close_entered.set()
         await asyncio.wait_for(close_release.wait(), TIMEOUT)
         await original_terminate(*args, **kwargs)
 
-    monkeypatch.setattr(client, "_terminate_pending_approvals", gated_terminate)
+    monkeypatch.setattr(server.control, "_terminate_pending_approvals", gated_terminate)
     order: list[str] = []
     original_write = client._write_physical
     original_release = server.connections.release
@@ -260,7 +260,7 @@ async def test_controller_close_never_writes_after_registry_release(
     monkeypatch.setattr(server.connections, "release", registry_release)
     publication_done = asyncio.Event()
     publication_results: list[bool] = []
-    original_notify = client._notify
+    original_notify = server.control._notify
 
     async def record_notification(*args: Any, **kwargs: Any) -> bool:
         result = await original_notify(*args, **kwargs)
@@ -268,13 +268,12 @@ async def test_controller_close_never_writes_after_registry_release(
         publication_done.set()
         return result
 
-    monkeypatch.setattr(client, "_notify", record_notification)
+    monkeypatch.setattr(server.control, "_notify", record_notification)
     writer.close()
     await writer.wait_closed()
     try:
         await asyncio.wait_for(close_entered.wait(), TIMEOUT)
-        assert server.runtime._background_event_sink is None
-        # This is the sink that was installed in the runtime before close began.
+        assert server.runtime._background_event_sink is runtime_sink
         runtime_sink(server.runtime.session_id, StreamEvent(
             StreamEventType.AGENT_NOTIFICATION,
             data={"kind": "agent_completion", "text": "late"},
@@ -401,7 +400,7 @@ async def _controller_event_stream(
 
 
 @pytest.mark.asyncio
-async def test_observer_does_not_change_controller_raw_event_stream(
+async def test_controller_frames_are_byte_identical_with_observer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Generated with PYTHONPATH=<origin-main-worktree>/src after confirming zeta.__file__.
