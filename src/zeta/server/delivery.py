@@ -62,10 +62,8 @@ class DeliveryRequests:
             params,
             enabled="model_input_ids" in features,
         )
-        await control.user_message(
-            value.display_text, "send", features, delivery_id=delivery_id
-        )
         if delivery_id is None:
+            await control.user_message(value.display_text, "send", features)
             control.start_turn(
                 value.text,
                 origin=value.origin,
@@ -86,21 +84,21 @@ class DeliveryRequests:
             "session_id": runtime.session_id,
         }
 
-        def start_turn() -> None:
-            control.start_turn(
-                value.text,
-                origin=value.origin,
-                user_message=message,
-                persist_user_message=False,
-            )
-
         await runtime.opened.store.append_client_delivery_async(
             delivery_id,
             "send",
             "delivered",
             outcome,
             message=message,
-            on_persisted=start_turn,
+        )
+        await control.user_message(
+            value.display_text, "send", features, delivery_id=delivery_id
+        )
+        control.start_turn(
+            value.text,
+            origin=value.origin,
+            user_message=message,
+            persist_user_message=False,
         )
         return outcome
 
@@ -122,8 +120,8 @@ class DeliveryRequests:
         message = with_message_origin(
             Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
         )
-        await control.user_message(text, "steer", features, delivery_id=delivery_id)
         if delivery_id is None:
+            await control.user_message(text, "steer", features)
             loop.steer(message)
             return {"accepted": True}
 
@@ -134,8 +132,9 @@ class DeliveryRequests:
             "steer",
             "queued",
             outcome,
-            on_persisted=lambda: loop.steer(tagged),
         )
+        await control.user_message(text, "steer", features, delivery_id=delivery_id)
+        loop.steer(tagged)
         return outcome
 
     def finalize_turn(

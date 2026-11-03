@@ -136,6 +136,92 @@ async def test_max_turns_emits_terminal_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None:
+    backend = BlockingBackend()
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path, "-echo-order"),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "features": [
+                    "delivery_id",
+                    "user_message_event",
+                    "user_message_delivery_id",
+                ],
+            },
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        original_append = server.runtime.opened.store.append_client_delivery_async
+
+        async def fail_append(*args, **kwargs):
+            raise OSError("injected durable-write failure")
+
+        server.runtime.opened.store.append_client_delivery_async = fail_append
+        failed_send = await _request(
+            reader, writer, 3, "send", {"text": "ghost", "delivery_id": "ghost-1"}
+        )
+        assert not any(
+            frame.get("params", {}).get("event") == "user_message"
+            for frame in failed_send
+        )
+        assert failed_send[-1]["error"]["code"] == -32000
+        assert server.runtime.opened.store.client_delivery("ghost-1") is None
+
+        await _request(reader, writer, 4, "send", {"text": "active"})
+        await asyncio.wait_for(backend.started.wait(), TIMEOUT)
+        failed_steer = await _request(
+            reader,
+            writer,
+            5,
+            "steer",
+            {"text": "ghost steer", "delivery_id": "ghost-steer"},
+        )
+        assert not any(
+            frame.get("params", {}).get("event") == "user_message"
+            for frame in failed_steer
+        )
+        assert failed_steer[-1]["error"]["code"] == -32000
+        assert server.runtime.opened.store.client_delivery("ghost-steer") is None
+        backend.release.set()
+        await _event(reader, "agent_end")
+
+        server.runtime.opened.store.append_client_delivery_async = original_append
+        normal = await _request(
+            reader, writer, 6, "send", {"text": "real", "delivery_id": "real-1"}
+        )
+        echoes = [
+            frame["params"]
+            for frame in normal
+            if frame.get("params", {}).get("event") == "user_message"
+        ]
+        assert echoes == [
+            {
+                "event": "user_message",
+                "session_id": server.runtime.session_id,
+                "text": "real",
+                "mode": "send",
+                "attachments": [],
+                "delivery_id": "real-1",
+            }
+        ]
+        assert server.runtime.opened.store.client_delivery("real-1") is not None
+        backend.release.set()
+        await _event(reader, "agent_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_duplicate_send_starts_one_turn(tmp_path: Path) -> None:
     backend = BlockingBackend()
     server = ZetaServer(provider="codex",
