@@ -490,7 +490,15 @@ class _Client:
                 abort_scope.parse_abort_scope(params, self.features)
             )
         if method == "status":
-            return await self._status()
+            assert self.server.connections is not None
+            session_id = (
+                self.server.runtime.session_id
+                if self.server.runtime.opened is not None
+                else None
+            )
+            return await self.server.connections.read_status(
+                self, await self._status(), session_id
+            )
         raise ProtocolError(-32601, f"method not found: {method}")
 
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
@@ -578,11 +586,10 @@ class _Client:
                 params.get("name"),
                 self.server.control.require_idle,
             )
+        if method in {"session_tree", "session_history"}:
+            assert self.server.connections is not None
+            return await self.server.connections.read_session(self, method, params)
         store = ergonomics.active(runtime, params)
-        if method == "session_tree":
-            return ergonomics.tree(runtime)
-        if method == "session_history":
-            return ergonomics.history(runtime, params)
         if method == "model_catalog":
             return ergonomics.catalog(runtime)
         if method == "session_settings":
@@ -662,11 +669,7 @@ class _Client:
             ),
             "pending_approvals": pending,
             "usage": dict(runtime.usage),
-            "compaction_markers": (
-                runtime.opened.store.compaction_marker_count()
-                if runtime.opened is not None
-                else 0
-            ),
+            "store": runtime.opened.store if runtime.opened is not None else None,
         }
 
     def _list_sessions(
