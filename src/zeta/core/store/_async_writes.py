@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from ..checkpoints import ConversationEntry
     from ._log import InstalledEntriesDelta, _DetachedLogState
     from ._store import ConversationStore
 
@@ -200,6 +201,19 @@ class AsyncDurableWritesMixin:
         delta = self._installed_delta_from_baseline(state.log.entries, baseline)
         return replace(state, log=replace(state.log, installed_delta=delta))
 
+    @staticmethod
+    def _linear_suffix(
+        entries: list[ConversationEntry], baseline_count: int
+    ) -> bool:
+        previous = entries[baseline_count - 1] if baseline_count else None
+        for entry in entries[baseline_count:]:
+            expected_seq = previous.seq + 1 if previous is not None else 1
+            expected_parent = previous.id if previous is not None else None
+            if entry.seq != expected_seq or entry.parent_id != expected_parent:
+                return False
+            previous = entry
+        return True
+
     def _run_durable_write_with_delta(
         self: ConversationStore,
         method_name: str,
@@ -216,6 +230,10 @@ class AsyncDurableWritesMixin:
             )
         else:
             delta = self._installed_delta_from_baseline(state.entries, baseline)
+        if delta != "reset" and not self._linear_suffix(
+            state.entries, baseline[0]
+        ):
+            delta = "reset"
         state = replace(state, installed_delta=delta)
         if delta == "reset":
             state = copy.deepcopy(state)
