@@ -219,67 +219,41 @@ class ApprovalLifecycle:
             current.generation == record.generation and current.token == record.token
         )
 
-    def _apply_record_transition(
+    def _reserve_record(
         self,
-        event: Literal[
-            "reserve",
-            "reserve_starting",
-            "mark_pending",
-            "externalize",
-            "health_abort",
-            "fail",
-            "replace",
-            "close",
-        ],
+        record: ApprovalRecord,
+        disposition: str,
         *,
-        record: ApprovalRecord | None = None,
-        disposition: str | None = None,
-        health: SessionHealth | None = None,
-    ) -> ApprovalMachineState:
-        """Apply one immutable record-state change."""
-        if event in {
-            "reserve",
-            "reserve_starting",
-            "mark_pending",
-            "externalize",
-            "health_abort",
-        }:
-            if record is None:
-                raise TypeError(f"{event} requires an approval record")
-            if disposition is None:
-                raise TypeError(f"{event} requires a disposition")
-            if event == "mark_pending":
-                if record.phase != "starting" or record.disposition != "active":
-                    raise ValueError(f"cannot mark approval {record.phase} as pending")
-                self._change(record, phase="pending")
-            elif event == "externalize":
-                if record.phase != "starting" or record.disposition != "active":
-                    raise ValueError(f"cannot externalize approval {record.phase}")
-                self._change(record, disposition="external")
-            elif event == "health_abort":
-                if record.phase != "settling":
-                    raise ValueError(f"cannot update health abort from {record.phase}")
-                self._change(record, disposition=disposition)
-            elif event == "reserve_starting":
-                if record.phase != "starting" or record.disposition != "active":
-                    raise ValueError(f"cannot reserve approval {record.phase}")
-                self._change(record, disposition=disposition)
-            elif record.phase in {"starting", "pending"}:
-                self._change(record, phase="settling", disposition=disposition)
-            else:
+        keep_starting: bool = False,
+    ) -> ApprovalRecord:
+        if record.phase not in {"starting", "pending"}:
+            raise ValueError(f"cannot reserve approval {record.phase}")
+        if keep_starting:
+            if record.phase != "starting" or record.disposition != "active":
                 raise ValueError(f"cannot reserve approval {record.phase}")
-        elif event == "fail":
-            if not isinstance(health, SessionHealth):
-                raise TypeError("fail requires SessionHealth")
-            self._swap(self._state.records, health=health)
-        elif event == "replace":
-            self._swap({}, health=None, generation=self._state.generation + 1)
-            self.clear()
-        elif event == "close":
-            self._swap(self._state.records)
-        else:
-            raise ValueError(f"unknown approval lifecycle event: {event}")
-        return self._state
+            return self._change(record, disposition=disposition)
+        return self._change(record, phase="settling", disposition=disposition)
+
+    def _mark_pending(self, record: ApprovalRecord) -> ApprovalRecord:
+        if record.phase != "starting" or record.disposition != "active":
+            raise ValueError(f"cannot mark approval {record.phase} as pending")
+        return self._change(record, phase="pending")
+
+    def _externalize(self, record: ApprovalRecord) -> ApprovalRecord:
+        if record.phase != "starting" or record.disposition != "active":
+            raise ValueError(f"cannot externalize approval {record.phase}")
+        return self._change(record, disposition="external")
+
+    def _health_abort(self, record: ApprovalRecord, disposition: str) -> ApprovalRecord:
+        if record.phase != "settling":
+            raise ValueError(f"cannot update health abort from {record.phase}")
+        return self._change(record, disposition=disposition)
+
+    def _fail(self, health: SessionHealth) -> None:
+        self._swap(self._state.records, health=health)
+
+    def _replace_state(self) -> None:
+        self._swap({}, health=None, generation=self._state.generation + 1)
 
     def transition(self, event: ApprovalEvent) -> Awaitable[object]:
         """Run one typed lifecycle event, including its durable operation."""
@@ -290,7 +264,7 @@ class ApprovalLifecycle:
                 suppress_write_errors=True,
                 reason="session_closed",
             )
-            self._apply_record_transition("close")
+            self._swap(self._state.records)
             return None
 
         match event:
@@ -325,7 +299,7 @@ class ApprovalLifecycle:
                     reason=reason,
                 )
             case Replace():
-                self._apply_record_transition("replace")
+                self._replace_state()
                 return _Completed()
             case Close():
                 return close()
@@ -386,9 +360,6 @@ class ApprovalLifecycle:
 
     def prune_ended(self) -> None:
         return
-
-    def clear(self) -> None:
-        self._swap({})
 
     def pending_approvals_now(self) -> list[dict[str, object]]:
         """Return the loop-owned visible projection without touching a store."""
@@ -455,8 +426,7 @@ class ApprovalLifecycle:
         ]
 
     def clear_approvals(self) -> None:
-        self.clear()
-        self._swap({})
+        self.transition(Replace())
 
     def session_replaced(self) -> None:
         self.transition(Replace())
@@ -468,12 +438,6 @@ class ApprovalLifecycle:
             if record.settlement is not None and not record.settlement.done()
         ]:
             await asyncio.gather(*tasks, return_exceptions=True)
-
-    def _approval_transition(
-        self, event: str, record: ApprovalRecord, disposition: str
-    ) -> ApprovalRecord:
-        self._apply_record_transition(event, record=record, disposition=disposition)
-        return self._state.records.get(record.target.key, record)
 
     def _new_record(self, target: _ApprovalTarget) -> ApprovalRecord:
         token = (
@@ -530,7 +494,7 @@ class ApprovalLifecycle:
             reason = (
                 "turn_canceled" if record.disposition == "abort" else record.disposition
             )
-            record = self._approval_transition("reserve", record, reason)
+            record = self._reserve_record(record, reason)
             task = asyncio.create_task(self._settle_record(record, "abort", reason))
             self._change(record, settlement=task)
 
@@ -562,14 +526,14 @@ class ApprovalLifecycle:
         if record.phase == "starting":
             if record.disposition != "active":
                 return None
-            return self._approval_transition("reserve_starting", record, decision)
+            return self._reserve_record(record, decision, keep_starting=True)
         if record.phase != "pending":
             return None
         token = (
             max((item.token for item in self._state.records.values()), default=0) + 1
         )
         record = self._change(record, token=token)
-        return self._approval_transition("reserve", record, decision)
+        return self._reserve_record(record, decision)
 
     async def resolve_approval(
         self, method: str, request_id: str, scope: str = "once"
@@ -659,12 +623,12 @@ class ApprovalLifecycle:
             return None
         record = current
         if record.disposition != "active":
-            record = self._approval_transition("reserve", record, record.disposition)
+            record = self._reserve_record(record, record.disposition)
             await self._settle_record(record, "abort", record.disposition)
             return None
         request = policy.request_from_store(core_key, state[0])
         record = self._change(record, request=request)
-        record = self._approval_transition("mark_pending", record, "active")
+        record = self._mark_pending(record)
         record = self._change(record, published=True)
         self.observe(request)
         return record
@@ -732,12 +696,11 @@ class ApprovalLifecycle:
                 await self._finish_record(record, synthetic)
                 return synthetic
             if owns_record:
-                self._apply_record_transition(
-                    "fail",
-                    health=SessionHealth(
+                self._fail(
+                    SessionHealth(
                         "approval_persistence_failed",
                         "approval decision could not be persisted",
-                    ),
+                    )
                 )
                 with contextlib.suppress(ConnectionError, OSError):
                     await self._publish(
@@ -750,9 +713,7 @@ class ApprovalLifecycle:
                         data={"request_id": record.wire_id},
                     )
                 self._request_turn_failure()
-                record = self._approval_transition(
-                    "health_abort", record, reason or "turn_canceled"
-                )
+                record = self._health_abort(record, reason or "turn_canceled")
                 self._change(record, settlement=None)
             raise OSError("approval decision could not be persisted")
         if not owns_record:
@@ -787,7 +748,7 @@ class ApprovalLifecycle:
             and self.state.health is not None
             and (record.settlement is None or record.settlement.done())
         ):
-            record = self._approval_transition("health_abort", record, reason)
+            record = self._health_abort(record, reason)
         else:
             reserved = self._reserve(record, reason)
             if reserved is None:
@@ -961,14 +922,14 @@ class ApprovalLifecycle:
                 self._remove(target.key)
             return
         if record.disposition != "active":
-            record = self._approval_transition("reserve", record, record.disposition)
+            record = self._reserve_record(record, record.disposition)
             settlement = asyncio.create_task(
                 self._settle_record(record, "abort", record.disposition)
             )
             self._change(record, settlement=settlement)
             await settlement
             return
-        record = self._approval_transition("mark_pending", record, "active")
+        record = self._mark_pending(record)
         self._change(record, settlement=None, published=True)
         await self._publish(wire_event, session_id, **payload)
 
@@ -982,7 +943,7 @@ class ApprovalLifecycle:
             if record.disposition not in {"active", "external"}
             else "turn_canceled"
         )
-        record = self._approval_transition("reserve", record, reason)
+        record = self._reserve_record(record, reason)
         settlement = asyncio.create_task(self._settle_record(record, "abort", reason))
         self._change(record, settlement=settlement)
         await settlement
@@ -1001,7 +962,7 @@ class ApprovalLifecycle:
             return
         if record.phase == "starting":
             if record.disposition == "active":
-                self._approval_transition("externalize", record, "external")
+                self._externalize(record)
             return
         if record.phase != "pending":
             return
