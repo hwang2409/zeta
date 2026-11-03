@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -29,7 +30,11 @@ from ...agent.receipt import (
     format_agent_stats,
     terminal_state,
 )
-from ...core.agent_progress import live_agent_lifecycle, read_agent_lifecycle
+from ...core.agent_progress import (
+    live_agent_lifecycle,
+    read_agent_lifecycle,
+    remember_terminal_agent_lifecycle,
+)
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -81,8 +86,12 @@ _MISSING = object()
 def _read_agent_lifecycle(path: str) -> dict[str, object]:
     if not path:
         return {}
+    lifecycle_path = Path(path) / "agent_lifecycle.json"
+    live = live_agent_lifecycle(lifecycle_path)
+    if live is not None:
+        return live
     try:
-        value = read_agent_lifecycle(Path(path) / "agent_lifecycle.json")
+        value = read_agent_lifecycle(lifecycle_path)
     except ConversationIntegrityError:
         return {}
     return value if type(value) is dict else {}
@@ -410,9 +419,16 @@ def _project_agent_status(
         durable = load_session_json(
             _read_child_file(store, child_path, "agent_lifecycle.json")
         )
-        lifecycle = select_legacy_child_lifecycle(durable, live)
     except (OSError, ValueError) as exc:
-        raise ValueError("could not read child state") from exc
+        if live is None:
+            raise ValueError("could not read child state") from exc
+        lifecycle = live
+    else:
+        lifecycle = select_legacy_child_lifecycle(durable, live)
+        if live is not None:
+            remember_terminal_agent_lifecycle(
+                child_path / "agent_lifecycle.json", lifecycle
+            )
     if type(lifecycle) is not dict:
         raise ValueError("lifecycle data is not an object")
     if lifecycle.get("handle") != handle:
@@ -717,7 +733,7 @@ def _read_agent_status(
     if requested_handle is not None and requested_handle not in active_receipts:
         raise ValueError("unknown child handle")
     children: list[dict[str, StructuredContentValue]] = []
-    # One read for all children: this runs on the event loop.
+    # One transcript snapshot for all children; the caller runs this in a worker.
     notifications = getattr(store, "agent_notifications", lambda **_kwargs: [])(
         pending_only=False
     )
@@ -757,7 +773,8 @@ async def _agent_status(
     if requested is not None and (type(requested) is not str or not requested):
         return _agent_error("handle must be a nonempty string", max_bytes)
     try:
-        children = _read_agent_status(
+        children = await asyncio.to_thread(
+            _read_agent_status,
             registry.session_store,
             requested_handle=requested,
         )
