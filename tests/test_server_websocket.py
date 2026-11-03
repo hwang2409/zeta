@@ -234,7 +234,12 @@ async def test_websocket_drop_during_approval_finishes_cleanly(
         and entry.data.get("decision") == "abort"
         for entry in opened.store.entries
     )
-    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
+    assert [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+        or "exception was never retrieved" in record.getMessage().lower()
+    ] == []
 
 
 @pytest.mark.asyncio
