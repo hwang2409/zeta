@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..accounts import SessionAccountContext, account_provider
+from ..agent.recovery_lease import bootstrap_agent_children
 from ..config.settings import ResolvedConfig
 from ..config.tool_policy import ToolPolicy
 from ..core.approval import ApprovalDecision, ApprovalPolicy
@@ -290,6 +291,8 @@ def compose_runtime(
         loop.manager = manager
         loop.session_metadata = metadata
         loop.account_context = account_context
+        if resuming:
+            bootstrap_agent_children(loop)
         memory_reconciler = None
         if memory_enabled:
             memory_backend: CompletionBackend | None = None
