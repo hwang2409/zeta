@@ -49,6 +49,13 @@ def _mtimes(root: Path) -> dict[str, int]:
     }
 
 
+async def _await_setup_reapers(server) -> None:
+    """Wait (bounded) for the runtime-owned cleanup of canceled session setups."""
+    reapers = list(server.runtime._setup_reapers)
+    assert reapers, "a canceled setup must be handed to a reaper"
+    await asyncio.wait_for(asyncio.gather(*reapers), 2)
+
+
 def _hold_registry_lock(path: Path) -> tuple[threading.Event, threading.Event, threading.Thread]:
     acquired = threading.Event()
     release = threading.Event()
@@ -171,6 +178,7 @@ async def test_serve_resume_cancel_closes_store_after_preparation_finishes(
         preparation_release.set()
         with pytest.raises(asyncio.CancelledError):
             await operation
+        await _await_setup_reapers(server)
         assert await asyncio.to_thread(preparation_done.wait, 2)
         assert opened and opened[0]._closed
         assert not preparation_active
@@ -180,7 +188,7 @@ async def test_serve_resume_cancel_closes_store_after_preparation_finishes(
 
 
 @pytest.mark.asyncio
-async def test_serve_resume_cancel_joins_composition_worker_before_closing_store(
+async def test_serve_resume_cancel_reaper_waits_for_composition_before_closing_store(
     tmp_path: Path,
 ) -> None:
     server = _server(tmp_path)
@@ -232,6 +240,7 @@ async def test_serve_resume_cancel_joins_composition_worker_before_closing_store
         operation.cancel()
         with pytest.raises(asyncio.CancelledError):
             await operation
+        await _await_setup_reapers(server)
         assert compose_done.is_set()
         assert worker_saw_closed == [False]
         assert close_count == 1
@@ -282,6 +291,7 @@ async def test_serve_create_cancel_reaps_after_compose_finishes(
         compose_release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(operation, 2)
+        await _await_setup_reapers(server)
         assert compose_done.is_set()
         assert compositions
         store = compositions[0].opened.store
@@ -407,6 +417,55 @@ async def test_serve_create_cancel_reaper_closes_store_after_compose(
         assert close_count == 1
         assert worker_saw_closed == [False]
         assert server.runtime.state is None
+    finally:
+        compose_release.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["new_session", "resume"])
+async def test_serve_repeated_cancel_still_hands_setup_to_reaper(
+    tmp_path: Path, method: str
+) -> None:
+    server = _server(tmp_path)
+    params: dict[str, object] = {}
+    if method == "resume":
+        created = await server.runtime.create_session()
+        await server.runtime.create_session()
+        params = {"session_id": created.session_id}
+    reader, writer = await _connect(server)
+    await _hello(reader, writer)
+    client = server._client
+    assert client is not None
+    compose_started = threading.Event()
+    compose_release = threading.Event()
+    compositions: list[object] = []
+    original_compose = server.runtime._compose
+
+    def tracked_compose(**kwargs):
+        compose_started.set()
+        assert compose_release.wait(5)
+        composition = original_compose(**kwargs)
+        compositions.append(composition)
+        return composition
+
+    server.runtime._compose = tracked_compose
+    operation = asyncio.create_task(client._dispatch(2, method, params))
+    try:
+        assert await asyncio.to_thread(compose_started.wait, 2)
+        operation.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, 2)
+        assert not compose_release.is_set()
+        assert len(server.runtime._setup_reapers) == 1
+        reaper = next(iter(server.runtime._setup_reapers))
+        compose_release.set()
+        await asyncio.wait_for(reaper, 2)
+        assert len(compositions) == 1
+        assert compositions[0].opened.store._closed
     finally:
         compose_release.set()
         await _close(server, writer)

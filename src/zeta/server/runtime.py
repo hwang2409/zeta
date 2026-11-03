@@ -44,7 +44,7 @@ SessionEventSink = Callable[[str, StreamEvent], None]
 SessionWakeSink = Callable[[str], None]
 MemoryNoticeSink = Callable[[str, str], None]
 TEST_SCRIPTED_PROVIDER_ENV = "ZETA_TEST_SCRIPTED_PROVIDER"
-_SETUP_CANCEL_GRACE_SECONDS = 1.0
+_SETUP_SHUTDOWN_WAIT_SECONDS = 1.0
 logger = logging.getLogger(__name__)
 
 
@@ -499,18 +499,11 @@ class ServerRuntime:
         try:
             return await asyncio.shield(setup_task)
         except asyncio.CancelledError:
-            try:
-                composition = await asyncio.wait_for(
-                    asyncio.shield(setup_task), _SETUP_CANCEL_GRACE_SECONDS
-                )
-            except TimeoutError:
-                reaper = asyncio.create_task(self._reap_setup(setup_task))
-                self._setup_reapers.add(reaper)
-                reaper.add_done_callback(self._setup_reapers.discard)
-            except BaseException as setup_error:  # noqa: BLE001
-                logger.debug("canceled session setup ended: %s", setup_error)
-            else:
-                await self._close_state(SessionState.from_composition(composition))
+            # The reaper owns the setup from here; it closes the store once
+            # setup ends, so this cancel returns without waiting on it.
+            reaper = asyncio.create_task(self._reap_setup(setup_task))
+            self._setup_reapers.add(reaper)
+            reaper.add_done_callback(self._setup_reapers.discard)
             raise
 
     async def _reap_setup(self, setup_task: asyncio.Task[RuntimeComposition]) -> None:
@@ -524,7 +517,7 @@ class ServerRuntime:
             except BaseException:
                 logger.exception("abandoned session setup cleanup failed")
             else:
-                logger.warning("abandoned session setup was cleaned up")
+                logger.info("canceled session setup was cleaned up")
 
     async def close(self) -> None:
         state, self._state = self._state, None
@@ -534,7 +527,7 @@ class ServerRuntime:
             pending = asyncio.gather(*self._setup_reapers)
             try:
                 await asyncio.wait_for(
-                    asyncio.shield(pending), _SETUP_CANCEL_GRACE_SECONDS
+                    asyncio.shield(pending), _SETUP_SHUTDOWN_WAIT_SECONDS
                 )
             except TimeoutError:
                 logger.error(
