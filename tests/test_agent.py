@@ -7285,48 +7285,43 @@ async def test_agent_send_rewarms_50k_writer_before_commit_deadline(
 
 
 @pytest.mark.asyncio
-async def test_step_delivery_writer_handles_50k_rows_within_send_deadline(
-    tmp_path: Path,
+async def test_step_delivery_send_copies_bounded_snapshots_over_50k_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     initial = ConversationStore(tmp_path)
     session_id = initial.session_id
     _write_large_linear_store(initial, 50_000)
     store = ConversationStore(tmp_path, session_id=session_id, _must_exist=True)
+    snapshot_calls = 0
+    original_snapshot_entry = ConversationStore._snapshot_entry
+
+    def count_snapshot_calls(entry):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return original_snapshot_entry(entry)
+
+    monkeypatch.setattr(
+        ConversationStore, "_snapshot_entry", staticmethod(count_snapshot_calls)
+    )
     flow = pending_delivery_module.StepDeliveryFlow(store)
     await flow.prepare_request("terminal_fallback", [], None)
 
-    timings: dict[str, float] = {}
-
-    async def timed(name: str, operation):
-        started = asyncio.get_running_loop().time()
-        result = await operation
-        timings[name] = asyncio.get_running_loop().time() - started
-        return result
-
-    first = await timed(
-        "prompt",
-        flow.produce(
-            pending_delivery_module.PromptInput(
-                "first", MessageOrigin.AGENT_SEND, asyncio.get_running_loop().time() + 1
-            )
-        ),
+    first = await flow.produce(
+        pending_delivery_module.PromptInput(
+            "first", MessageOrigin.AGENT_SEND, None
+        )
     )
-    await timed("notification", flow.produce(_task_exit_input("large-store")))
-    staged = await timed(
-        "stage", flow.prepare_request("terminal_fallback", [], None)
-    )
+    await flow.produce(_task_exit_input("large-store"))
+    staged = await flow.prepare_request("terminal_fallback", [], None)
     assert staged.prompt_id == first.entries[0].id
-    await timed("acknowledge", flow.acknowledge_active())
-    await timed(
-        "second_prompt",
-        flow.produce(
-            pending_delivery_module.PromptInput(
-                "second", MessageOrigin.AGENT_SEND, asyncio.get_running_loop().time() + 1
-            )
-        ),
+    await flow.acknowledge_active()
+    await flow.produce(
+        pending_delivery_module.PromptInput(
+            "second", MessageOrigin.AGENT_SEND, None
+        )
     )
 
-    assert max(timings.values()) < 1
+    assert snapshot_calls <= 10
     store.close()
 
 
