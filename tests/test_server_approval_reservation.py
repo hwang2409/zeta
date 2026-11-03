@@ -35,6 +35,7 @@ from zeta.protocol.types import (
 )
 from zeta.server import ZetaServer
 from zeta.server.protocol import ProtocolError
+from zeta.server.server import LOADED_SESSION_MUTATIONS
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.tools.agent.approval import ChildApprovalPolicy
 
@@ -210,6 +211,9 @@ def _terminal_gate(
 async def _approval_server(
     tmp_path: Path,
     approval_count: int = 1,
+    *,
+    protocol_version: str = "1.0",
+    features: list[str] | None = None,
 ) -> tuple[ZetaServer, asyncio.StreamReader, asyncio.StreamWriter, ToolCall]:
     server = ZetaServer(
         home=tmp_path,
@@ -222,7 +226,10 @@ async def _approval_server(
         ),
     )
     reader, writer = await _connect(server)
-    await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+    hello: dict[str, object] = {"protocol_version": protocol_version}
+    if features is not None:
+        hello["features"] = features
+    await _request(reader, writer, 1, "hello", hello)
     await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     calls = [
         ToolCall(f"call-{index}", "read", {"path": f"/tmp/input-{index}"})
@@ -992,6 +999,74 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
         )
         assert result == {"accepted": True, "session_id": session_id}
         assert effects == ["message", "turn"]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_unhealthy_session_rejects_every_loaded_session_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    features = ["abort_scope", "delivery_id", "turn_context"]
+    server, reader, writer, call = await _approval_server(
+        tmp_path, protocol_version="1.2", features=features
+    )
+    try:
+        await _make_unhealthy(server, call, monkeypatch)
+        session_id = server.runtime.session_id
+        params_by_method: dict[str, dict[str, object]] = {
+            "abort": {},
+            "approve": {"request_id": call.id},
+            "clear_steering": {},
+            "deny": {"request_id": call.id},
+            "fork_message": {"session_id": session_id, "message_id": "missing"},
+            "rename_session": {"session_id": session_id, "name": "changed"},
+            "send": {"text": "blocked"},
+            "send_images": {"session_id": session_id, "text": "blocked", "images": []},
+            "set_compaction": {"session_id": session_id, "mode": "eviction"},
+            "set_settings": {
+                "session_id": session_id,
+                "model": server.runtime.model,
+                "approval_mode": "ask",
+            },
+            "set_turn_context": {"text": "blocked"},
+            "slash_run": {"session_id": session_id, "text": "/status"},
+            "steer": {"text": "blocked"},
+            "switch_branch": {"session_id": session_id, "head_id": "missing"},
+        }
+        assert params_by_method.keys() == LOADED_SESSION_MUTATIONS
+        old_state = server.runtime.state
+        old_metadata = server.runtime.metadata.to_dict()
+        old_entries = tuple(server.runtime.opened.store.entries)
+        for request_id, method in enumerate(LOADED_SESSION_MUTATIONS, 20):
+            response = (
+                await _request(reader, writer, request_id, method, params_by_method[method])
+            )[-1]
+            assert "error" in response, (method, response)
+            assert response["error"]["code"] == -32000, method
+            assert server.runtime.state is old_state
+            assert server.runtime.metadata.to_dict() == old_metadata
+            assert tuple(server.runtime.opened.store.entries) == old_entries
+
+        read_requests = {
+            "delivery_status": {"delivery_id": "unknown"},
+            "list_sessions": {},
+            "model_catalog": {"session_id": session_id},
+            "session_history": {"session_id": session_id},
+            "session_settings": {"session_id": session_id},
+            "session_tree": {"session_id": session_id},
+            "slash_list": {"session_id": session_id},
+            "status": {},
+        }
+        for request_id, (method, params) in enumerate(read_requests.items(), 50):
+            response = (await _request(reader, writer, request_id, method, params))[-1]
+            assert "result" in response, method
+
+        recovered = (
+            await _request(reader, writer, 70, "new_session", {"provider": "codex"})
+        )[-1]
+        assert "result" in recovered
+        assert not server.control.unhealthy()
     finally:
         await _close(server, writer)
 

@@ -41,6 +41,27 @@ from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
 
+LOADED_SESSION_MUTATIONS = frozenset(
+    {
+        "abort",
+        "approve",
+        "clear_steering",
+        "deny",
+        "fork_message",
+        "rename_session",
+        "send",
+        "send_images",
+        "set_compaction",
+        "set_settings",
+        "set_turn_context",
+        "slash_run",
+        "steer",
+        "switch_branch",
+    }
+)
+_DELIVERY_MUTATIONS = frozenset({"send", "steer"})
+
+
 class ZetaServer:
     """Serve one local client over a Unix socket or localhost TCP."""
 
@@ -404,6 +425,8 @@ class _Client:
         handled, result = await self._route_request(method, params)
         if handled:
             return result
+        if method in LOADED_SESSION_MUTATIONS and method not in _DELIVERY_MUTATIONS:
+            self.server.control._reject_if_unhealthy()
         if method in login.REQUESTS:
             if self.protocol_version == "1.0":
                 raise ProtocolError(-32601, "login is unavailable on this server")
