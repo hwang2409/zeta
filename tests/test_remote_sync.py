@@ -211,6 +211,9 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
     (opened.store.session_dir / "spill" / "oauth.json").write_text(
         "spill secret", encoding="utf-8"
     )
+    opened.store.append_child_run_started(
+        f"{opened.metadata.session_id}:2", None, "worker", "transferred child", "now"
+    )
 
     result = push_session(
         local, LocalTransport(remote), session_id=opened.metadata.session_id
@@ -228,6 +231,15 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
     assert "root transcript" in copied
     assert "written after snapshot" not in copied
     assert all(json.loads(line) for line in copied.splitlines())
+    transferred = ConversationStore(
+        remote / "sessions", session_id=result.session_id, _read_only=True
+    )
+    try:
+        assert any(
+            entry.type == "child_run_started" for entry in transferred.replay()
+        )
+    finally:
+        transferred.close()
     assert not (remote / "oauth.json").exists()
     assert not (remote / "settings.toml").exists()
     mirrored_brief = (

@@ -53,6 +53,7 @@ from ._approval_display import (
 )
 from ._approval_history import ApprovalHistoryStoreMixin, validate_approval_history_data
 from ._async_writes import AsyncDurableWritesMixin
+from ._child_runs import ChildRunStoreMixin, validate_child_run_started_data
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
 from ._incremental_validation import (
     APPROVAL_RESOLUTION_REASONS,
@@ -107,6 +108,7 @@ class ConversationStore(
     CheckpointForkMixin,
     StepDeliveryStoreMixin,
     StoreLifecycleMixin,
+    ChildRunStoreMixin,
 ):
     def __init__(
         self,
@@ -517,6 +519,8 @@ class ConversationStore(
                         raise ValueError(
                             "approval request must match an anchored tool call"
                         )
+            elif entry.type == "child_run_started":
+                validate_child_run_started_data(entry.data)
             elif entry.type == "compaction":
                 validate_compaction_data(entry.data)
             elif entry.type == "client_delivery":
