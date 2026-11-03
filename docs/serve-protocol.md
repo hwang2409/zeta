@@ -107,6 +107,12 @@ receives no echo uses no feature. A `features` value that is not an array of
 strings returns `-32602` and closes the connection. A 1.0 negotiation ignores
 `features`.
 
+When the project registry exists but cannot be read safely, `hello` returns one
+human-readable warning in `notices`. The warning names the registry path and
+reason. Project features are disabled for the server process, so `projects` and
+`projects-memory-v2` are not echoed in `capabilities.features`. A missing
+registry is a normal fresh-install state and does not add a notice.
+
 Example request:
 
 ```json

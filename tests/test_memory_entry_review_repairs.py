@@ -358,6 +358,7 @@ def test_large_version_detail_is_bounded_and_reports_paging(tmp_path: Path) -> N
         home=home,
         runtime=runtime,
         codec=_SizedCodec(1024 * 1024),
+        registry=registry,
     )
 
     result = requests.dispatch(

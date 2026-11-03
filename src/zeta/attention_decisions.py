@@ -11,7 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .attention_records import AttentionRecord, AttentionStore
+from .project_errors import ProjectRegistryError
 from .project_registry import ProjectRegistry
+from .runtime.project_registry_state import (
+    ProjectRegistryState,
+    available_project_registry,
+)
 from .session_liveness import session_is_live
 
 
@@ -23,15 +28,21 @@ class DecisionItem:
     record: AttentionRecord
 
 
-def _project_names(home: Path) -> dict[str, str]:
+def _project_names(registry: ProjectRegistry | None) -> dict[str, str]:
+    if registry is None:
+        return {}
     try:
-        projects = ProjectRegistry(home / "projects").list_projects()
-    except OSError:
+        projects = registry.list_projects()
+    except (OSError, ProjectRegistryError):
         return {}
     return {project.project_id: project.name for project in projects}
 
 
-def open_decisions(home: Path, session_id: str) -> tuple[DecisionItem, ...]:
+def open_decisions(
+    home: Path,
+    session_id: str,
+    registry_state: ProjectRegistryState | None = None,
+) -> tuple[DecisionItem, ...]:
     """Return open attention records owned by one live session.
 
     Sorted oldest first so the popup is stable and the longest-waiting decision
@@ -42,7 +53,8 @@ def open_decisions(home: Path, session_id: str) -> tuple[DecisionItem, ...]:
     session_dir = home / "sessions" / session_id
     if not session_dir.is_dir() or not session_is_live(session_dir):
         return ()
-    names = _project_names(home)
+    state = registry_state or available_project_registry(home / "projects")
+    names = _project_names(state.registry)
     items = [
         DecisionItem(
             session_id=session_id,

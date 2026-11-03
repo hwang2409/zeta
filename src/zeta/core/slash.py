@@ -1,7 +1,8 @@
 """Small input-time slash-command dispatcher."""
-
 from __future__ import annotations
 
+import asyncio
+import inspect
 import os
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -23,6 +24,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..runtime.project_registry_state import ProjectRegistryState
 from ..skills import (
     SkillCatalog,
     SkillMeta,
@@ -39,22 +41,22 @@ from .commands.custom_commands import (
     render_custom_input,
     resolve_custom_input,
 )
-from .project_context import discover_project_root, project_instructions_path
+from .project_context import (
+    discover_project_root,
+    project_instructions_command,
+)
 from .store import ConversationEntry
 
 
 class UsageCounterSource(Protocol):
     """Cumulative usage counters exposed by the context assembler."""
-
     uncached_input_tokens_this_session: int
     output_tokens_this_session: int
     cache_read_input_tokens_this_session: int
     cache_creation_input_tokens_this_session: int
-
 @dataclass(frozen=True, slots=True)
 class UsageSnapshot:
     """One completed turn's token usage."""
-
     turn: int
     input_tokens: int = 0
     output_tokens: int = 0
@@ -62,7 +64,6 @@ class UsageSnapshot:
     cache_creation_input_tokens: int = 0
     model: str | None = None
     estimated_cost_usd: float | None = None
-
     @property
     def cache_total(self) -> int:
         return (
@@ -70,17 +71,13 @@ class UsageSnapshot:
             + self.cache_read_input_tokens
             + self.cache_creation_input_tokens
         )
-
     @property
     def cache_hit_rate(self) -> float | None:
         if self.cache_total == 0:
             return None
         return self.cache_read_input_tokens / self.cache_total * 100
-
-
 class UsageTracker:
     """Keep bounded usage deltas at real turn boundaries."""
-
     def __init__(self, source: UsageCounterSource, provider: str | None = None) -> None:
         self.source = source
         self.provider = provider
@@ -89,15 +86,12 @@ class UsageTracker:
         self._history: deque[UsageSnapshot] = deque(maxlen=8)
         self._cost_by_model: dict[str, UsageSnapshot] = {}
         self._completed_turns = 0
-
     @property
     def history(self) -> tuple[UsageSnapshot, ...]:
         return tuple(self._history)
-
     @property
     def cost_by_model(self) -> tuple[UsageSnapshot, ...]:
         return tuple(self._cost_by_model.values())
-
     def record(self, event_type: StreamEventType, model: str) -> None:
         current = self._counters()
         self._record_cost_delta(current, model)
@@ -108,14 +102,11 @@ class UsageTracker:
             snapshot = usage_delta(current, self._baseline, self._completed_turns, model)
             self._history.append(snapshot)
             self._baseline = current
-
     def record_compaction(self, model: str) -> None:
         """Record direct compaction usage without adding a trend snapshot."""
-
         current = self._counters()
         self._record_cost_delta(current, model)
         self._baseline = current
-
     def _record_cost_delta(self, current: Mapping[str, int], model: str) -> None:
         snapshot = usage_delta(current, self._cost_baseline, 0, model)
         self._cost_baseline = dict(current)
@@ -571,7 +562,7 @@ class SlashSession(Protocol):
 
     def slash_tasks(self, args: str) -> str: ...
 
-    def slash_decisions(self, args: str) -> str: ...
+    def slash_decisions(self, args: str) -> str | Awaitable[str]: ...
 
     def slash_send(self, args: str) -> str | Awaitable[str]: ...
 
@@ -793,7 +784,13 @@ class SlashCommandRegistry:
     def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command, returning an awaitable for async commands."""
 
-        return self._dispatch(session, value)
+        result = self._dispatch(session, value)
+        if result is not None and inspect.isawaitable(result):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(result)
+        return result
 
     async def dispatch_async(
         self, session: SlashSession, value: str
@@ -1069,7 +1066,7 @@ def _run_tasks(session: SlashSession, args: str) -> str:
     return session.slash_tasks(args)
 
 
-def _run_decisions(session: SlashSession, args: str) -> str:
+def _run_decisions(session: SlashSession, args: str) -> str | Awaitable[str]:
     return session.slash_decisions(args)
 
 
@@ -1136,6 +1133,7 @@ def create_slash_registry(
     project_dir: str | Path | None = None,
     project_eligible: bool | None = None,
     skill_catalog: SkillCatalog,
+    project_registry_state: ProjectRegistryState | None = None,
     extra_commands: Sequence[SlashCommand] = (),
 ) -> SlashCommandRegistry:
     """Register built-ins and frontend commands before custom commands and skills."""
@@ -1161,9 +1159,13 @@ def create_slash_registry(
     registry.register(
         SlashCommand("implement", _run_implement, "implement the proposed plan")
     )
+    instruction_handler = lambda session, args: project_instructions_command(
+        session, args, private_project_root,
+        Path(effective_home).expanduser().resolve() if effective_home else None,
+        project_registry_state,
+    )
     registry.register(SlashCommand(
-        "project-instructions",
-        lambda session, args: project_instructions_path(args, private_project_root, Path(effective_home).expanduser().resolve() if effective_home else None, getattr(session, "open_project_instructions_editor", None)),
+        "project-instructions", instruction_handler,
         "open or create private project instructions in your editor",
     ))
     registry.register(

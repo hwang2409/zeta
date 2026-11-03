@@ -25,7 +25,7 @@ from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
 from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
-from ..project_registry import ProjectRegistry, ProjectRegistryError
+from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -1170,14 +1170,16 @@ def _child_base_system_prompt(
     home_hint = loop.active_home
     zeta_home = Path(home_hint) if home_hint else env_home()
     discovery = discover_project(cwd_override, user_home=zeta_home.parent)
-    registry = ProjectRegistry(zeta_home / "projects")
+    registry = loop.project_registry
     session_project = None
-    if loop.root_project_id is not None:
+    if loop.root_project_id is not None and registry is not None:
         try:
             session_project = registry.show_project(loop.root_project_id)
         except ProjectRegistryError:
             pass
-    cwd_project = resolve_project_context(discovery, registry)
+    cwd_project = (
+        resolve_project_context(discovery, registry) if registry is not None else None
+    )
     context = load_project_context(
         cwd=cwd_override,
         repo_root=discovery.primary_root or discovery.cwd,

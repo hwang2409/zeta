@@ -15,6 +15,7 @@ from ..memory.user_authorization import (
     memory_accept_preview,
 )
 from ..project_registry import ProjectRegistry, ProjectRegistryError
+from ..runtime.project_registry_state import project_registry
 
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 
@@ -86,7 +87,7 @@ def run(
 ) -> int:
     out = stdout or sys.stdout
     err = stderr or sys.stderr
-    registry = ProjectRegistry(env_home() / "projects")
+    registry = project_registry(env_home() / "projects")
     try:
         if args.project_verb == "create":
             profiles = getattr(args, "memory_profile", None) or ["zeta"]

@@ -417,6 +417,7 @@ async def test_public_migration_end_to_end_with_real_content(tmp_path: Path) -> 
         home=first,
         runtime=SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list)),
         codec=FrameCodec(),
+        registry=registry,
     ).dispatch(
         1,
         "project_show",
@@ -962,7 +963,9 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
         runtime = SimpleNamespace(
             manager=SimpleNamespace(list_sessions_read_only=list)
         )
-        ProjectRequests(home=home, runtime=runtime, codec=FrameCodec()).dispatch(
+        ProjectRequests(
+            home=home, runtime=runtime, codec=FrameCodec(), registry=registry
+        ).dispatch(
             1, "project_show", {"project_id": project_id}
         )
     elif entry_point == "sync-push":
