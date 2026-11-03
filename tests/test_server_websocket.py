@@ -17,7 +17,7 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser
-from zeta.protocol.types import ToolCall
+from zeta.protocol.types import TextContent, ToolCall
 from zeta.server import ZetaServer
 from zeta.server.protocol import MAX_FRAME_BYTES
 
@@ -157,7 +157,9 @@ async def test_websocket_drop_during_approval_finishes_cleanly(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
     server = ZetaServer(
         home=tmp_path,
         port=0,
@@ -204,16 +206,26 @@ async def test_websocket_drop_during_approval_finishes_cleanly(
             if frame.get("params", {}).get("event") == "approval_request":
                 break
 
-        writer.transport.abort()
+        writer.write(_masked_frame((1000).to_bytes(2, "big"), opcode=8))
+        await writer.drain()
+        opcode, _payload = await _read_frame(reader)
+        assert opcode == 8
+        writer.close()
+        await writer.wait_closed()
         for _ in range(100):
             opened = server.runtime.opened
-            if opened is not None and any(
-                entry.type == "approval_resolution"
-                and entry.data.get("decision") == "abort"
-                for entry in opened.store.entries
+            if (
+                opened is not None
+                and server._client is None
+                and any(
+                    entry.type == "approval_resolution"
+                    and entry.data.get("decision") == "abort"
+                    for entry in opened.store.entries
+                )
             ):
                 break
             await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
         await server.close()
 
     assert opened is not None
