@@ -267,11 +267,13 @@ async def test_parent_and_child_approval_decision_paths(
     elif outcome == "winner":
         original_resolve = decision_store.resolve_approval
 
-        def allow_when_abort_resolves(request_id: str, decision: str) -> bool:
+        def allow_when_abort_resolves(
+            request_id: str, decision: str, **kwargs: object
+        ) -> bool:
             if decision == "abort":
                 assert original_resolve(request_id, "allow")
                 return False
-            return original_resolve(request_id, decision)
+            return original_resolve(request_id, decision, **kwargs)
 
         monkeypatch.setattr(decision_store, "resolve_approval", allow_when_abort_resolves)
         registry.abort()
@@ -332,11 +334,13 @@ async def test_bound_edit_abort_arbitration_preserves_winner(
     if abort_winner == "allow":
         original_resolve = child_store.resolve_approval
 
-        def allow_when_abort_resolves(request_id: str, decision: str) -> bool:
+        def allow_when_abort_resolves(
+            request_id: str, decision: str, **kwargs: object
+        ) -> bool:
             if decision == "abort":
                 assert original_resolve(request_id, "allow")
                 return False
-            return original_resolve(request_id, decision)
+            return original_resolve(request_id, decision, **kwargs)
 
         monkeypatch.setattr(child_store, "resolve_approval", allow_when_abort_resolves)
 
@@ -643,7 +647,9 @@ async def test_allow_wins_abort_transfers_pending_binding_atomically(
     )
     original_resolve = child_store.resolve_approval
 
-    def allow_before_abort(request_id: str, decision: str) -> bool:
+    def allow_before_abort(
+        request_id: str, decision: str, **kwargs: object
+    ) -> bool:
         if decision == "abort":
             original_resolve(request_id, "allow")
         return original_resolve(request_id, decision)

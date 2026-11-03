@@ -403,7 +403,8 @@ async def _controller_event_stream(
 async def test_controller_frames_are_byte_identical_with_observer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Generated with PYTHONPATH=<origin-main-worktree>/src after confirming zeta.__file__.
+    # Generated from origin/main (PYTHONPATH=<origin-main-worktree>/src, zeta.__file__ checked)
+    # at observers slice A; the one later change is approval_end.data.decision (PR #612).
     expected = (Path(__file__).parent / "fixtures" / "server_controller_event_stream.jsonl").read_bytes()
     assert await _controller_event_stream(tmp_path, monkeypatch, observer=True) == expected
 

@@ -31,7 +31,7 @@ from zeta.providers.anthropic import build_request_payload
 from zeta.providers.codex import build_responses_payload
 from zeta.providers.ollama import _tools as ollama_tools
 from zeta.runtime.loop import AgentLoop
-from zeta.server.control import approval_display_fields
+from zeta.server.approval_lifecycle import approval_display_fields
 from zeta.skills import SkillCatalog
 from zeta.tools._action_metadata import ResolvedCapability
 from zeta.tools.agent.approval import ChildApprovalPolicy

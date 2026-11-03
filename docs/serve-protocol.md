@@ -641,9 +641,14 @@ on the wire.
 `approval_request` carries `request_id` and `tool_call`. It also carries
 `delegated: true` and `agent_instance_id` for delegated approvals. `approval_end`
 carries the same `request_id` as its matching `approval_request`, the tool call,
-and empty or loop-provided `data`. For delegated approvals, the request ID is an
-opaque server-issued key, even when the parent and child use the same raw tool
-call ID.
+and `data`. When a durable outcome is stored, `data.decision` is `allow`, `deny`,
+or `abort`, and an abort also sets `data.reason`. `data` can carry other
+loop-provided fields, and it is `{}` when there are none and no outcome is
+stored. Emitted reasons
+are `controller_disconnected`, `turn_canceled`, or `child_cleanup`. The stored
+format also accepts `grace_expired`, reserved for the approval reconnect
+grace; no current path emits it. For delegated approvals, the request ID is an opaque
+server-issued key, even when the parent and child use the same raw tool call ID.
 
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"approval_request","session_id":"abc123","request_id":"tool-call-1","delegated":false,"tool_call":{"id":"tool-call-1","name":"bash","arguments":{"command":"ls"}}}}
@@ -988,8 +993,18 @@ error code and message. Provider status and origin remain internal.
   and returns the tree. Selecting the current leaf is a no-op. Invalid heads
   return `-32602`. Fork and switch affect conversation state, not workspace files.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
-  `messages` and `next_offset` (null at the end), eight messages per page. Each
-  message has `id`, `role`, `content`, and optional `tool_result`. Text and tool
+  `messages` and `next_offset` (null at the end). The cursor and page limit count
+  the same durable message and notification entries as before; one page covers
+  eight such entries. Approval lifecycle entries between them do not change the
+  cursor value, so an offset issued by an older server resumes without a gap or
+  duplicate. All rows projected from one entry are atomic on a page. An
+  assistant approval anchor emits its message row and then its
+  `approval_request`; a resolution emits its `approval_end`. These lifecycle
+  rows use the same fields as the live events. The parent history includes only
+  lifecycle data stored in the parent session, including delegated identity.
+  Child-session transcript rows are not copied into parent history; they belong
+  to the planned `child_run_events` protocol. Each ordinary message has `id`,
+  `role`, `content`, and optional `tool_result`. Text and tool
   output previews are bounded to 8,000 bytes. Image content becomes
   `{"type":"attachment","name":"shot.png","size":123}`; base64 stays off this
   response. Tool-use content retains the existing `tool_call` shape.

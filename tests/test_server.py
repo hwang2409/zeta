@@ -29,6 +29,7 @@ import pytest
 
 import zeta.accounts.session as account_session_module
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.server.ergonomics as ergonomics_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
@@ -56,12 +57,8 @@ from zeta.protocol.types import (
 )
 from zeta.providers.ollama import OllamaBackend
 from zeta.server import ZetaServer
-from zeta.server.approval_lifecycle import ApprovalLifecycle
-from zeta.server.control import (
-    NotificationPresentation,
-    ServeControl,
-    approval_display_fields,
-)
+from zeta.server.approval_lifecycle import ApprovalLifecycle, approval_display_fields
+from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
@@ -1108,6 +1105,338 @@ async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
         await _close(server, writer)
 
 
+def _history_event_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if key not in {"id", "role"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["allow", "deny", "abort"])
+async def test_session_history_matches_live_approval_lifecycle(
+    tmp_path: Path, decision: str
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("call-1", "read", {"path": str(target)})
+    turns = [ScriptedTurn(tool_calls=[call])]
+    if decision != "abort":
+        turns.append(ScriptedTurn([TextContent("done")]))
+    backend = FakeBackend(turns)
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        live_request = await _event(reader, "approval_request")
+        method = {"allow": "approve", "deny": "deny", "abort": "abort"}[decision]
+        params = (
+            {"request_id": live_request["request_id"]} if decision != "abort" else {}
+        )
+        frames = await _request(reader, writer, 4, method, params)
+        terminal = "agent_end" if decision != "abort" else "turn_aborted"
+        if not _named_events(frames, terminal):
+            frames += await _frames_until_event(reader, terminal)
+        live_end = _named_events(frames, "approval_end")
+        assert len(live_end) == 1
+
+        history = (
+            await _request(
+                reader,
+                writer,
+                5,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        request_index = next(
+            index
+            for index, row in enumerate(history)
+            if row.get("event") == "approval_request"
+        )
+        end_index = next(
+            index
+            for index, row in enumerate(history)
+            if row.get("event") == "approval_end"
+        )
+        assert history[request_index - 1]["role"] == "assistant"
+        assert history[request_index - 1]["content"][0]["type"] == "tool_use"
+        assert end_index == request_index + 1
+        assert history[end_index + 1]["role"] == "tool_result"
+
+        expected_request = {
+            key: value for key, value in live_request.items() if key != "session_id"
+        }
+        expected_end = {
+            key: value for key, value in live_end[0].items() if key != "session_id"
+        }
+        assert _history_event_payload(history[request_index]) == expected_request
+        assert _history_event_payload(history[end_index]) == expected_end
+        assert history[end_index]["data"]["decision"] == decision
+        if decision == "abort":
+            assert history[end_index]["reason"] == "turn_canceled"
+            assert history[end_index]["data"]["reason"] == "turn_canceled"
+        else:
+            assert "reason" not in history[end_index]
+            assert "reason" not in history[end_index]["data"]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_history_records_controller_disconnect_approval_abort(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    await _request(reader, writer, 3, "send", {"text": "read it"})
+    await _event(reader, "approval_request")
+    writer.close()
+    await writer.wait_closed()
+    try:
+        # The approval aborts first; the old controller releases only after
+        # its turn is canceled. Reconnect after the release, as a client must.
+        for _ in range(500):
+            if not server._client_active:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("controller was not released after disconnect")
+        assert server.runtime.policy is not None
+        assert not server.runtime.policy.pending_requests()
+
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        hello = await _request(
+            reader,
+            writer,
+            4,
+            "hello",
+            {"protocol_version": "1.0", "client_version": "1.1"},
+        )
+        assert hello[-1]["result"]["protocol_version"] == "1.1"
+        history = (
+            await _request(
+                reader,
+                writer,
+                5,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        approval_end = next(
+            row for row in history if row.get("event") == "approval_end"
+        )
+        assert approval_end["reason"] == "controller_disconnected"
+        assert approval_end["data"] == {
+            "decision": "abort",
+            "reason": "controller_disconnected",
+        }
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_history_keeps_main_durable_entry_cursor_space(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("call-1", "read", {"path": str(target)})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        store = server.runtime.opened.store
+        for index in range(6):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"prefix {index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        frames = await _request(
+            reader,
+            writer,
+            4,
+            "approve",
+            {"request_id": approval["request_id"]},
+        )
+        if not _named_events(frames, "agent_end"):
+            await _frames_until_event(reader, "agent_end")
+
+        pages: dict[int, list[dict[str, Any]]] = {}
+        forward: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = (
+                await _request(
+                    reader,
+                    writer,
+                    f"page-{offset}",
+                    "session_history",
+                    {"session_id": session_id, "offset": offset},
+                )
+            )[-1]["result"]
+            pages[offset] = page["messages"]
+            forward.extend(page["messages"])
+            if page["next_offset"] is None:
+                break
+            offset = page["next_offset"]
+
+        # origin/main issues offset 8 here: six prefixes, the user message,
+        # and the assistant approval anchor. It must resume at the resolution.
+        assert pages[0][-2]["role"] == "assistant"
+        assert pages[0][-2]["content"][0]["type"] == "tool_use"
+        assert pages[0][-1]["event"] == "approval_request"
+        assert pages[8][0]["event"] == "approval_end"
+        backward_pages = {}
+        for page_offset in reversed(tuple(pages)):
+            backward_pages[page_offset] = (
+                await _request(
+                    reader,
+                    writer,
+                    f"back-{page_offset}",
+                    "session_history",
+                    {"session_id": session_id, "offset": page_offset},
+                )
+            )[-1]["result"]["messages"]
+        backward = [row for page_offset in pages for row in backward_pages[page_offset]]
+        assert backward == forward
+        assert len(
+            {(row["id"], row.get("event"), row["role"]) for row in forward}
+        ) == len(forward)
+
+        for invalid in (-1, "8"):
+            error = (
+                await _request(
+                    reader,
+                    writer,
+                    f"invalid-{invalid}",
+                    "session_history",
+                    {"session_id": session_id, "offset": invalid},
+                )
+            )[-1]["error"]
+            assert error["code"] == -32602
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_limit", range(1, 6))
+async def test_session_history_never_splits_approval_anchor_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, page_limit: int
+) -> None:
+    monkeypatch.setattr(
+        ergonomics_module, "HISTORY_PAGE_ENTRIES", page_limit, raising=False
+    )
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        store = server.runtime.opened.store
+        for index in range(6):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"prefix {index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        frames = await _request(
+            reader, writer, 4, "approve", {"request_id": approval["request_id"]}
+        )
+        if not _named_events(frames, "agent_end"):
+            await _frames_until_event(reader, "agent_end")
+
+        offset = 0
+        saw_request = False
+        while True:
+            page = (
+                await _request(
+                    reader,
+                    writer,
+                    f"page-{offset}",
+                    "session_history",
+                    {"session_id": session_id, "offset": offset},
+                )
+            )[-1]["result"]
+            for index, row in enumerate(page["messages"]):
+                if row.get("event") != "approval_request":
+                    continue
+                saw_request = True
+                assert index > 0
+                assert page["messages"][index - 1]["role"] == "assistant"
+                assert page["messages"][index - 1]["id"] == row["id"]
+            if page["next_offset"] is None:
+                break
+            assert page["next_offset"] - offset <= page_limit
+            offset = page["next_offset"]
+        assert saw_request
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_history_loads_legacy_approval_abort_without_reason(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        call = ToolCall("legacy-call", "read", {"path": "legacy.txt"})
+        store = server.runtime.opened.store
+        store.append_approval_request(call.id, call)
+        store.append_approval_resolution(call.id, "abort")
+        reopened = SessionManager(tmp_path).open(session_id).store
+        assert "reason" not in reopened.entries[-1].data
+
+        history = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        approval_end = next(
+            row for row in history if row.get("event") == "approval_end"
+        )
+        assert approval_end["data"] == {"decision": "abort"}
+        assert "reason" not in approval_end
+    finally:
+        await _close(server, writer)
+
+
 @pytest.mark.asyncio
 async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
@@ -1258,6 +1587,98 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         frames = await _request(reader, writer, 4, "status")
         ends = _named_events(frames, "approval_end")
         assert [event["request_id"] for event in ends] == [approval["request_id"]]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resolution", "expected_decision", "expected_reason"),
+    [("deny", "deny", None), ("cleanup", "abort", "child_cleanup")],
+)
+async def test_delegated_approval_history_and_live_end_keep_durable_identity(
+    tmp_path: Path,
+    resolution: str,
+    expected_decision: str,
+    expected_reason: str | None,
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    agent = ToolCall(
+        "agent-one",
+        "agent",
+        {"prompt": "read", "description": "child", "background": True},
+    )
+    child_call = ToolCall("child-call", "read", {"path": str(target)})
+    backend = DelegatedApprovalBackend(agent, child_call, child_prompt="read")
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        live_request = await _event(reader, "approval_request")
+        assert live_request["delegated"] is True
+        history = (
+            await _request(
+                reader,
+                writer,
+                "pending-history",
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        durable_request = next(
+            row for row in history if row.get("event") == "approval_request"
+        )
+        assert _history_event_payload(durable_request) == {
+            key: value for key, value in live_request.items() if key != "session_id"
+        }
+
+        if resolution == "deny":
+            frames = await _request(
+                reader,
+                writer,
+                4,
+                "deny",
+                {"request_id": live_request["request_id"]},
+            )
+        else:
+            assert server.runtime.loop is not None
+            assert server.runtime.loop._background_owner.cancel(
+                live_request["agent_instance_id"]
+            )
+            await server.runtime.loop._background_owner.wait()
+            frames = await _request(reader, writer, 4, "status")
+            if not _named_events(frames, "approval_end"):
+                frames += await _frames_until_event(reader, "approval_end")
+        live_end = _named_events(frames, "approval_end")
+        assert len(live_end) == 1
+        assert live_end[0]["request_id"] == live_request["request_id"]
+        assert live_end[0]["data"]["decision"] == expected_decision
+        if expected_reason is None:
+            assert "reason" not in live_end[0]
+            assert "reason" not in live_end[0]["data"]
+        else:
+            assert live_end[0]["reason"] == expected_reason
+            assert live_end[0]["data"]["reason"] == expected_reason
+
+        history = (
+            await _request(
+                reader,
+                writer,
+                "resolved-history",
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        durable_end = next(row for row in history if row.get("event") == "approval_end")
+        assert _history_event_payload(durable_end) == {
+            key: value for key, value in live_end[0].items() if key != "session_id"
+        }
     finally:
         await _close(server, writer)
 

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import functools
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING
 
-from ..core.approval import ApprovalDecision, ApprovalRequest
+from ..core.approval import ApprovalDecision
 from ..protocol.types import (
     Message,
     MessageOrigin,
@@ -16,7 +16,8 @@ from ..protocol.types import (
     TextContent,
 )
 from . import abort_scope, event_contract, model_selection
-from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
+from . import approval_lifecycle as approvals
+from .approval_lifecycle import ApprovalKey, ApprovalLifecycle, approval_display_fields
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .protocol import FrameWriteCancelled, ProtocolError, bounded
 
@@ -239,7 +240,9 @@ class ServeControl:
             turn_task,
             scope=scope,
             loop=self.server.runtime.loop,
-            terminate_approvals=self._terminate_pending_approvals,
+            terminate_approvals=functools.partial(
+                self._terminate_pending_approvals, reason="turn_canceled"
+            ),
             before_cancel=mark_canceled,
         )
         if aborted:
@@ -532,8 +535,11 @@ class ServeControl:
             await self._notify(
                 wire_event,
                 session_id,
-                **self._approvals.observe(request),
-                **approval_display_fields(request),
+                **self._approvals.observe(
+                    request,
+                    store=self.server.runtime.opened.store,
+                    fields=approval_display_fields(request),
+                ),
             )
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
@@ -634,7 +640,13 @@ class ServeControl:
         data: dict[str, object] | None = None,
         suppress_write_errors: bool = False,
     ) -> None:
-        payload = self._approvals.end(key, data=data)
+        payload = approvals.end_durably(
+            self._approvals,
+            self.server.runtime.policy,
+            key,
+            self.server.runtime.opened.store if self.server.runtime.opened else None,
+            data,
+        )
         if payload is None:
             return
         try:
@@ -662,20 +674,16 @@ class ServeControl:
         *,
         foreground_only: bool = False,
         suppress_write_errors: bool = False,
+        reason: str = "controller_disconnected",
     ) -> None:
-        policy = self.server.runtime.policy
-        if policy is not None:
-            for request in policy.pending_requests():
-                if foreground_only and request.child_instance_id is not None:
-                    continue
-                with contextlib.suppress(ValueError, RuntimeError):
-                    policy.abort(request.key)
+        approvals.abort_pending(self.server.runtime.policy, foreground_only, reason)
         for key in self._approvals.active_keys():
             if foreground_only and not isinstance(key, str):
                 continue
             await self._end_approval(
                 key,
                 self.server.runtime.session_id if self.server.runtime.opened else None,
+                data={"reason": reason},
                 suppress_write_errors=suppress_write_errors,
             )
 
@@ -686,13 +694,3 @@ def _approval_key(event: StreamEvent) -> ApprovalKey:
     if isinstance(child_id, str) and raw_request_id:
         return child_id, raw_request_id
     return raw_request_id
-
-
-def approval_display_fields(request: ApprovalRequest) -> dict[str, object]:
-    fields: dict[str, object] = {}
-    if request.action is not None:
-        fields["approval_action"] = request.action
-    display = request.audit_display()
-    if display:
-        fields["approval_display"] = display
-    return fields

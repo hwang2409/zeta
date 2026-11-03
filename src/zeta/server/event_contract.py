@@ -69,6 +69,14 @@ def tool_output(event: StreamEvent) -> dict[str, object]:
     }
 
 
+def approval_request(payload: Mapping[str, object]) -> dict[str, object]:
+    return dict(payload)
+
+
+def approval_end(payload: Mapping[str, object]) -> dict[str, object]:
+    return dict(payload)
+
+
 def tool_end(event: StreamEvent) -> dict[str, object]:
     return {
         "tool_call": _tool_call(event),
