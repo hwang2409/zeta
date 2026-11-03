@@ -27,8 +27,11 @@ from .core.session_files import (
 )
 from .core.store.prompt_composition import clone_prompt_composition
 from .project_inbox import ProjectInbox
-from .project_registry import ProjectRegistry
 from .protocol.types import Message, MessageRole, TextContent, ToolUseContent
+from .runtime.project_registry_state import (
+    ProjectRegistryState,
+    available_project_registry,
+)
 
 ATTENTION_FORK_POLICY = ToolPolicy.create(
     (
@@ -87,9 +90,11 @@ def validate_attention_fork(
     current_session_id: str,
     current_project_id: str | None,
     directory_fd: int,
+    registry_state: ProjectRegistryState | None = None,
 ) -> ValidatedAttentionFork:
     """Bind fork metadata to its source record, anchor, project, and current session."""
-    manager = SessionManager(home)
+    state = registry_state or available_project_registry(Path(home) / "projects")
+    manager = SessionManager(home, project_registry_state=state)
     current_dir = manager.sessions_dir / current_session_id
     fork = read_attention_fork(current_dir, directory_fd=directory_fd)
     if fork is None or current_project_id is None:
@@ -117,7 +122,12 @@ def attention_decision_message_id(attention_id: str) -> str:
 
 
 def deliver_attention_decision(
-    home: Path, record: AttentionRecord, decision: str, *, from_session: str
+    home: Path,
+    record: AttentionRecord,
+    decision: str,
+    *,
+    from_session: str,
+    registry_state: ProjectRegistryState | None = None,
 ) -> tuple[str, AttentionRecord, bool]:
     """Deliver and resolve one decision through the shared resolution seam."""
     decision = decision.strip()
@@ -125,10 +135,11 @@ def deliver_attention_decision(
         raise ValueError("decision must be nonempty")
     message_id = attention_decision_message_id(record.id)
     store = AttentionStore(Path(home) / "sessions" / record.session_id)
-    inbox = ProjectInbox(
-        ProjectRegistry(Path(home) / "projects"),
-        sessions_root=Path(home) / "sessions",
-    )
+    state = registry_state or available_project_registry(Path(home) / "projects")
+    registry = state.registry
+    if registry is None:
+        raise ValueError("project registry is unavailable")
+    inbox = ProjectInbox(registry, sessions_root=Path(home) / "sessions")
 
     def send(current: AttentionRecord) -> None:
         if current.project_id is None:
@@ -158,7 +169,11 @@ def deliver_attention_decision(
     return message_id, resolved, already_resolved
 
 
-def release_discussion_fork(home: Path, fork_session_id: str) -> str:
+def release_discussion_fork(
+    home: Path,
+    fork_session_id: str,
+    registry_state: ProjectRegistryState | None = None,
+) -> str:
     """Leave a discussion fork and return its source orchestrator session id.
 
     When the item is still open (no decision was sent), the source record's
@@ -167,7 +182,8 @@ def release_discussion_fork(home: Path, fork_session_id: str) -> str:
     on disk, exactly like a reopened fork today; it is unbound, not live, and
     already excluded from project search.
     """
-    manager = SessionManager(home)
+    state = registry_state or available_project_registry(Path(home) / "projects")
+    manager = SessionManager(home, project_registry_state=state)
     fork = read_attention_fork(manager.sessions_dir / fork_session_id)
     if fork is None:
         raise ValueError("session is not a discussion fork")
@@ -348,10 +364,14 @@ def _create_fork_session(
 
 
 def create_discussion_fork(
-    home: Path, source_session_id: str, attention_id: str
+    home: Path,
+    source_session_id: str,
+    attention_id: str,
+    registry_state: ProjectRegistryState | None = None,
 ) -> str:
     """Create or reuse the read-only discussion fork for one attention record."""
-    manager = SessionManager(home)
+    state = registry_state or available_project_registry(Path(home) / "projects")
+    manager = SessionManager(home, project_registry_state=state)
     source = manager.open(source_session_id, _read_only=True)
     try:
         attention_store = AttentionStore(source.store.session_dir)

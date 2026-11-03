@@ -10,8 +10,8 @@ from ...attention_forks import (
     validate_attention_fork,
 )
 from ...attention_records import AttentionStore
-from ...core.session import SessionManager
 from ...protocol.types import StructuredToolResult
+from ...runtime.project_registry_state import ProjectRegistryState
 from .._results import _success_result, text_block
 from ..registry import ToolRegistry
 
@@ -30,14 +30,18 @@ async def _resolve_attention(
 ) -> StructuredToolResult:
     store = registry.session_store
     home = store.session_dir.parent.parent
-    metadata = SessionManager(home).read_metadata(store.session_id)
     if registry.project_registry is None:
         raise ValueError("resolve_attention is available only in an attention fork")
-    validated = validate_attention_fork(
+    state = registry.project_registry_state or ProjectRegistryState(
+        registry.project_registry
+    )
+    validated = await asyncio.to_thread(
+        validate_attention_fork,
         home=home,
         current_session_id=store.session_id,
-        current_project_id=metadata.project_id,
+        current_project_id=registry.project_id,
         directory_fd=store.directory_fd,
+        registry_state=state,
     )
     message_id, record, already_resolved = await asyncio.to_thread(
         deliver_attention_decision,
@@ -45,6 +49,7 @@ async def _resolve_attention(
         validated.record,
         arguments["decision"],
         from_session=store.session_id,
+        registry_state=state,
     )
     if already_resolved:
         return _success_result(

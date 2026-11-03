@@ -15,6 +15,10 @@ from pathlib import Path
 
 from prompt_toolkit.document import Document
 
+from ...runtime.project_registry_state import (
+    ProjectRegistryState,
+    available_project_registry,
+)
 from ..cards.decisions import DecisionsPanel
 from ..composer import FullScreenPromptSession
 from ..overlay import OverlayControl
@@ -24,6 +28,20 @@ from ..overlay import OverlayControl
 # without busy-polling.
 _POLL_INTERVAL = 2.0
 _PANEL_REFRESH_INTERVAL = 0.5
+
+
+def _registry_state(app: object) -> ProjectRegistryState:
+    loop = app.loop
+    tool_registry = getattr(loop, "tool_registry", None)
+    state = getattr(tool_registry, "project_registry_state", None)
+    if state is not None:
+        return state
+    registry = getattr(loop, "project_registry", None)
+    return (
+        ProjectRegistryState(registry)
+        if registry is not None
+        else available_project_registry(app._home / "projects")
+    )
 
 
 class DecisionsMixin:
@@ -61,11 +79,16 @@ class DecisionsMixin:
     def decisions_panel_active(self) -> bool:
         return self._decisions_panel_open and self._full_screen_active()
 
-    def slash_decisions(self, args: str) -> str:
+    async def slash_decisions(self, args: str) -> str:
         del args
         from ...attention_decisions import open_decisions
 
-        items = open_decisions(self._home, self._decisions_session_id)
+        items = await asyncio.to_thread(
+            open_decisions,
+            self._home,
+            self._decisions_session_id,
+            _registry_state(self),
+        )
         if not items:
             return "no open decisions"
         lines = ["open decisions:"]
@@ -99,7 +122,10 @@ class DecisionsMixin:
 
         try:
             items = await asyncio.to_thread(
-                open_decisions, self._home, self._decisions_session_id
+                open_decisions,
+                self._home,
+                self._decisions_session_id,
+                _registry_state(self),
             )
         except OSError:
             return
@@ -238,6 +264,7 @@ class DecisionsMixin:
                     record,
                     decision,
                     from_session=self.loop.store.session_id,
+                    registry_state=_registry_state(self),
                 )
             except (OSError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
@@ -262,7 +289,11 @@ class DecisionsMixin:
 
             try:
                 fork_id = await asyncio.to_thread(
-                    create_discussion_fork, self._home, source_id, attention_id
+                    create_discussion_fork,
+                    self._home,
+                    source_id,
+                    attention_id,
+                    _registry_state(self),
                 )
             except (OSError, ValueError) as exc:
                 self._decisions_switching = False

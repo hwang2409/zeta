@@ -11022,6 +11022,7 @@ def test_child_startup_runs_one_git_discovery_in_repo_subdirectory(
         active_home=str(home),
         tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
         root_project_id=project.project_id,
+        project_registry=registry,
     )
 
     _child_base_system_prompt(loop, str(child_cwd))
@@ -11164,6 +11165,7 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
         active_home=str(home),
         tool_registry=parent_tools,
         root_project_id=project_a.project_id,
+        project_registry=registry,
     )
 
     prompt = _child_base_system_prompt(loop, str(child_cwd), child_tools)

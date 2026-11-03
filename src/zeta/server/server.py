@@ -12,6 +12,7 @@ from typing import Any
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
+from ..project_errors import ProjectRegistryBusyError
 from ..protocol.types import (
     Message,
     MessageOrigin,
@@ -45,6 +46,7 @@ from .protocol import (
     ProtocolError,
     bounded,
     finish_frame_write,
+    hello_result,
     negotiate_protocol_version,
 )
 from .runtime import BackendFactory, ServerRuntime
@@ -127,6 +129,7 @@ class ZetaServer:
             return f"127.0.0.1:{self.port}"
         return str(self.socket_path)
     async def start(self) -> None:
+        await self.runtime.initialize_project_registry()
         self._account_warnings = await accounts.migrate(self.home)
         if self.port is None:
             self._prepare_socket_path()
@@ -238,7 +241,6 @@ class ZetaServer:
             self._client = None
             self._client_active = False
 
-
 class _Client:
     def __init__(
         self,
@@ -261,7 +263,7 @@ class _Client:
         self._read_buffer = bytearray()
         self._model_inputs = PendingModelInputs()
         self.codec = FrameCodec()
-        self.projects = ProjectRequests(home=server.home, runtime=server.runtime, codec=self.codec)
+        self.projects = ProjectRequests.for_runtime(home=server.home, runtime=server.runtime, codec=self.codec)
         self.deliveries = DeliveryRequests(self)
         self._approvals = ApprovalLifecycle()
 
@@ -299,6 +301,15 @@ class _Client:
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
                     code, message, data = project_request_error(exc)
                     await self._write(self.codec.error_response(request_id, code, message, data))
+                except ProjectRegistryBusyError as exc:
+                    await self._write(
+                        self.codec.error_response(
+                            request_id,
+                            -32000,
+                            str(exc),
+                            {"code": exc.code, "retryable": exc.retryable},
+                        )
+                    )
                 except (SessionError, ValueError) as exc:
                     await self._write(
                         self.codec.error_response(request_id, -32602, str(exc))
@@ -403,8 +414,9 @@ class _Client:
                 raise ProtocolError(
                     -32601, f"{method} requires the negotiated projects feature"
                 )
-            return self.projects.dispatch(
-                request_id, method, params, features=self.features
+            assert self.projects is not None
+            return await asyncio.to_thread(
+                self.projects.dispatch, request_id, method, params, features=self.features
             )
         if method == "list_sessions":
             return self._list_sessions(request_id, params)
@@ -473,6 +485,7 @@ class _Client:
             raise ProtocolError(-32602, "features must be an array of strings")
         extended = self.protocol_version != "1.0"
         accepted = [item for item in FEATURES if item in (requested or ())] if extended else []
+        accepted = self.server.runtime.available_project_features(accepted)
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
         self.features = frozenset(accepted)
@@ -509,13 +522,15 @@ class _Client:
         }
         if extended and requested is not None:
             capabilities["features"] = accepted
-        result: dict[str, object] = {
-            "protocol_version": self.protocol_version,
-            "server": "zeta",
-            "capabilities": capabilities,
-        }
+        result = hello_result(
+            self.protocol_version,
+            capabilities,
+            self.server.runtime.project_registry_warning,
+        )
         if self.server._account_warnings:
-            result["notices"] = list(self.server._account_warnings)
+            notices = result.setdefault("notices", [])
+            assert isinstance(notices, list)
+            notices.extend(self.server._account_warnings)
         return result
 
     def _require_feature(self, feature: str, param: str) -> None:
@@ -1063,6 +1078,7 @@ class _Client:
         limit = _integer(params, "limit", None, minimum=1)
         if "project_id" in params:
             self._require_feature("projects", "project_id")
+            assert self.projects is not None
             available = self.projects.project_sessions(params["project_id"])
         else:
             available = self.server.runtime.list_sessions()

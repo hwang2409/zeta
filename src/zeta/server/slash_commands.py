@@ -269,6 +269,8 @@ class ServerSlashSession:
         if project_id is None:
             return "memory: no associated project"
         registry = runtime.manager.project_registry
+        if registry is None:
+            return "memory: project registry unavailable"
         loop = getattr(runtime, "loop", None)
         reconciler = loop.memory_reconciler if loop is not None else None
         return run_memory_command(
@@ -359,6 +361,7 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
         zeta_home=runtime.home,
         project_dir=project_dir,
         skill_catalog=catalog,
+        project_registry_state=runtime.manager.project_registry_state,
         extra_commands=(
             SlashCommand("accounts", lambda session, args: session.slash_accounts(args), "list or label accounts"),
         ),
@@ -388,7 +391,7 @@ async def list_commands(runtime: ServerRuntime) -> dict[str, object]:
 
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
-    registry = build_registry(runtime)
+    registry = await asyncio.to_thread(build_registry, runtime)
     entries = _entries_from_registry(registry)
     return {
         "commands": [entry.to_dict() for entry in entries],
@@ -432,7 +435,7 @@ async def run_command(
         return {"kind": "client_only", "name": name}
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
-    registry = build_registry(runtime)
+    registry = await asyncio.to_thread(build_registry, runtime)
     if name in CLIENT_ONLY_BUILTINS:
         return {"kind": "client_only", "name": name}
     # Prompt macros expand to user input rather than dispatch through a handler.

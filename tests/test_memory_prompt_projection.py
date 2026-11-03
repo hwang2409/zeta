@@ -321,6 +321,7 @@ def test_fresh_cwd_child_loads_current_memory(tmp_path: Path, monkeypatch: pytes
         active_home=str(home),
         tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
         root_project_id=project_id,
+        project_registry=registry,
     )
 
     child_prompt = _child_base_system_prompt(loop, str(workspace))

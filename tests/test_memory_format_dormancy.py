@@ -174,7 +174,9 @@ def test_format_two_views_are_available_after_per_project_activation(
     runtime = SimpleNamespace(
         manager=SimpleNamespace(list_sessions_read_only=list)
     )
-    requests = ProjectRequests(home=home, runtime=runtime, codec=FrameCodec())
+    requests = ProjectRequests(
+        home=home, runtime=runtime, codec=FrameCodec(), registry=registry
+    )
     for method in ("project_show", "project_memory_log"):
         with pytest.raises(UnsupportedMemoryFormatError, match=UNSUPPORTED_FORMAT_2):
             requests.dispatch(1, method, {"project_id": project_id})
