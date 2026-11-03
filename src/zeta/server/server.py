@@ -110,6 +110,7 @@ class ZetaServer:
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.control = ServeControl(self)
+        self.runtime.set_approval_control_binder(self.control.bind_policy)
         self.runtime.set_background_event_sink(self.control._publish_background_event)
         self.runtime.set_memory_notice_sink(self.control._publish_memory_notice)
         self.runtime.set_background_wake_sink(self.control._schedule_background_wake)
@@ -159,21 +160,24 @@ class ZetaServer:
         finally:
             self._client = None
             self._client_active = False
-            if self.connections is not None:
-                await self.connections.aclose()
-                self.connections = None
             try:
-                if self._websocket is not None:
-                    await self._websocket.close()
-                if self._server is not None:
-                    self._server.close()
-                    await self._server.wait_closed()
-            finally:
-                self._server = None
+                await self.control.close()
                 try:
-                    await self.control.close()
                     await self.runtime.close()
                 finally:
+                    await self.control.wait_for_approval_settlement()
+            finally:
+                if self.connections is not None:
+                    await self.connections.aclose()
+                    self.connections = None
+                try:
+                    if self._websocket is not None:
+                        await self._websocket.close()
+                    if self._server is not None:
+                        self._server.close()
+                        await self._server.wait_closed()
+                finally:
+                    self._server = None
                     if self.port is None and self._socket_created:
                         with contextlib.suppress(FileNotFoundError):
                             if stat.S_ISSOCK(self.socket_path.stat().st_mode):
@@ -437,6 +441,7 @@ class _Client:
                 self._require_feature("session_cwd", "cwd")
                 cwd = _directory(params, "cwd")
             await self.server.control._terminate_pending_approvals()
+            self.server.control.session_replaced()
             await self.server.runtime.create_session(
                 provider=_optional_string(params, "provider"),
                 model=_optional_string(params, "model"),
@@ -449,6 +454,7 @@ class _Client:
             await self.server.control.require_idle()
             session_id = _required_string(params, "session_id")
             await self.server.control._terminate_pending_approvals()
+            self.server.control.session_replaced()
             try:
                 await self.server.runtime.resume_session(session_id)
             except SessionNotFoundError as exc:
@@ -484,7 +490,7 @@ class _Client:
                 abort_scope.parse_abort_scope(params, self.features)
             )
         if method == "status":
-            return self._status()
+            return await self._status()
         raise ProtocolError(-32601, f"method not found: {method}")
 
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
@@ -589,9 +595,12 @@ class _Client:
         if method == "slash_run":
             register = self.server.control.model_input_registrar(self.features)
             return await slash_commands.run_command(
-                runtime, _required_string(params, "text"), register_model_input=register
+                runtime,
+                _required_string(params, "text"),
+                register_model_input=register,
+                approval_control=self.server.control,
             )
-        ergonomics.require_mutable(runtime)
+        ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
         if method == "send_images":
             message = ergonomics.image_message(runtime, params)
             await self.server.control.user_message(
@@ -637,11 +646,11 @@ class _Client:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
 
-    def _status(self) -> dict[str, object]:
+    async def _status(self) -> dict[str, object]:
         runtime = self.server.runtime
         session = self._session_snapshot()
         pending = (
-            self.server.control.pending_approvals() if self.role != "observer" else []
+            await self.server.control.pending_approvals() if self.role != "observer" else []
         )
         return {
             "session": session,

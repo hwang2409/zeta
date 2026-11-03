@@ -13,6 +13,7 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
@@ -89,6 +90,11 @@ class SlashCommandInfo:
         }
 
 
+class _ApprovalProjection(Protocol):
+    def pending_approval_labels(self) -> tuple[str, ...]: ...
+    def has_pending_approvals(self) -> bool: ...
+
+
 class ServerSlashSession:
     """Session shim over ``ServerRuntime`` for the shared slash dispatcher.
 
@@ -97,8 +103,9 @@ class ServerSlashSession:
     so the shared dispatcher never leaks half-executed state.
     """
 
-    def __init__(self, runtime: ServerRuntime) -> None:
+    def __init__(self, runtime: ServerRuntime, approval_control: _ApprovalProjection | None = None) -> None:
         self._runtime = runtime
+        self._approval_control = approval_control
 
     # --- runnable server-side ---
 
@@ -110,10 +117,7 @@ class ServerSlashSession:
             raise ProtocolError(-32003, "no active session")
         assembler = loop.context_assembler
         child_usage = assembler.descendant_usage
-        pending = tuple(
-            f"{request.key} ({request.label or request.tool_call.name})"
-            for request in (runtime.policy.pending_requests() if runtime.policy else ())
-        )
+        pending = self._approval_control.pending_approval_labels() if self._approval_control is not None else ()
         items = loop.store.todo_items()
         return SlashStatus(
             session_id=opened.metadata.session_id,
@@ -404,6 +408,7 @@ async def run_command(
     text: str,
     *,
     register_model_input: Callable[[ModelInputEnvelope], str] | None = None,
+    approval_control: _ApprovalProjection | None = None,
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
@@ -426,7 +431,7 @@ async def run_command(
         # the store or settings while background children are still running
         # or an approval is outstanding. Read-only calls (`/status`,
         # `/help`, argless `/model`) stay guard-free.
-        ergonomics.require_mutable(runtime)
+        ergonomics.require_mutable(runtime, approval_control is not None and approval_control.has_pending_approvals())
     if name == "model" and not tail.strip():
         # Argless `/model` opens the client's picker surface (Settings on
         # the frontend client) rather than returning a bare text notice — the doc
@@ -447,7 +452,7 @@ async def run_command(
             return {"kind": "client_only", "name": name}
         envelope = registry.input_for_model(text)
         return _model_input_result(envelope, register_model_input)
-    session = ServerSlashSession(runtime)
+    session = ServerSlashSession(runtime, approval_control)
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": "unknown", "name": name}

@@ -43,6 +43,7 @@ BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]
 SessionEventSink = Callable[[str, StreamEvent], None]
 SessionWakeSink = Callable[[str], None]
 MemoryNoticeSink = Callable[[str, str], None]
+ApprovalControlBinder = Callable[[ApprovalPolicy], None]
 TEST_SCRIPTED_PROVIDER_ENV = "ZETA_TEST_SCRIPTED_PROVIDER"
 _SETUP_SHUTDOWN_WAIT_SECONDS = 1.0
 logger = logging.getLogger(__name__)
@@ -198,6 +199,7 @@ class ServerRuntime:
         self._state: SessionState | None = None
         self._background_event_sink: SessionEventSink | None = None
         self._background_wake_sink: SessionWakeSink | None = None
+        self._approval_control_binder: ApprovalControlBinder | None = None
         self._memory_notice_sink: MemoryNoticeSink | None = None
         self._post_stream_provider_retry = False
         self._setup_reapers: set[asyncio.Task[None]] = set()
@@ -313,6 +315,9 @@ class ServerRuntime:
         self._post_stream_provider_retry = enabled
         if self._state is not None:
             self._state.loop.post_stream_provider_retry = enabled
+
+    def set_approval_control_binder(self, binder: ApprovalControlBinder) -> None:
+        self._approval_control_binder = binder
 
     def set_background_event_sink(self, sink: SessionEventSink | None) -> None:
         """Attach the current frontend to child-agent progress events."""
@@ -540,6 +545,8 @@ class ServerRuntime:
         try:
             await self.close()
             self._state = state
+            if self._approval_control_binder is not None:
+                self._approval_control_binder(state.policy)
             self._bind_background_event_sink(state)
             await state.loop.activate()
             if self._require_tools:

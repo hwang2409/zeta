@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -396,11 +396,11 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         self._pending_bindings.pop(request_id, None)
         return decision
 
-    def cleanup(self) -> None:
+    def cleanup(self) -> Awaitable[object] | None:
         self._execution_bindings.clear()
         self._pending_bindings.clear()
         self._denial_reasons.clear()
-        self.parent.cleanup_delegated(self.child_instance_id)
+        return self.parent.cleanup_delegated(self.child_instance_id)
 
 
 def _approval_decision(value: str | None) -> ApprovalDecision | None:

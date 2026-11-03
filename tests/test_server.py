@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import weakref
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -2156,10 +2157,8 @@ async def test_foreground_abort_only_ends_foreground_approval(
             foreground["request_id"]
         ]
         assert delegated_request.key in server.control._approvals.active_keys()
-        assert any(
-            request.key == delegated_request.key
-            for request in server.runtime.policy.pending_requests()
-        )
+        assert delegated_request.key in server.control._approval_records
+        assert server.runtime.policy._delegated == {}
         assert not child_task.done()
     finally:
         await _close(server, writer)
@@ -2921,10 +2920,14 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
     tmp_path: Path,
 ) -> None:
     policy = ApprovalPolicy(store=ConversationStore(tmp_path))
-    client = object.__new__(ServeControl)
-    client.server = SimpleNamespace(
-        runtime=SimpleNamespace(policy=policy, state=None)
+    client = ServeControl(
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
     )
+
+    async def run_blocking(job: Callable[[], object]) -> object:
+        return job()
+
+    client._run_blocking = run_blocking
     notifications: list[tuple[str, dict[str, object]]] = []
 
     async def notify(

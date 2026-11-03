@@ -95,12 +95,12 @@ def active(runtime: ServerRuntime, params: dict):
     return runtime.opened.store
 
 
-def require_mutable(runtime: ServerRuntime) -> None:
+def require_mutable(runtime: ServerRuntime, has_pending_approvals: bool = False) -> None:
     loop = runtime.loop
     if loop is not None and (
         loop.background_children_running
         or loop.store.has_outstanding_tool_calls(loop.store.replay())
-        or (runtime.policy is not None and runtime.policy.pending_requests())
+        or has_pending_approvals
     ):
         raise ProtocolError(-32004, "finish pending tools and background agents first")
 

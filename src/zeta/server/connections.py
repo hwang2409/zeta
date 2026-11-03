@@ -192,17 +192,21 @@ class ConnectionRegistry:
             await state.connection._write_physical(error)
         await state.connection.close()
 
+    async def run_blocking(self, callable: Callable[[], Any]) -> Any:
+        """Run one store or observer read away from the event loop."""
+        future = self.loop.create_future()
+        with self._read_condition:
+            if self._read_stopping:
+                raise RuntimeError("connection worker is closed")
+            self._read_jobs.append((callable, future))
+            self._read_condition.notify()
+        return await future
+
     async def run_observer_read(self, connection: Any, callable: Callable[[], Any]) -> Any:
         state = self._connections.get(connection)
         if state is None or state.role != "observer":
             raise RuntimeError("observer is not connected")
-        future = self.loop.create_future()
-        with self._read_condition:
-            if self._read_stopping:
-                raise RuntimeError("observer reads are closed")
-            self._read_jobs.append((callable, future))
-            self._read_condition.notify()
-        return await future
+        return await self.run_blocking(callable)
 
     def _read_worker(self) -> None:
         while True:

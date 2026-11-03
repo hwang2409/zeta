@@ -492,6 +492,14 @@ server executes the pending tool through the existing loop seam.
 {"jsonrpc":"2.0","id":8,"result":{"accepted":true,"request_id":"tool-call-2","decision":"approve","scope":"always_tool"}}
 ```
 
+Approval decisions are acknowledged only after their durable row is confirmed.
+If the write fails and an authoritative read finds no terminal row, the server
+fails closed: it returns `-32000`, emits one `server_error`, cancels the affected
+turn, and does not emit a false `approval_end`. The request remains a terminal
+in-memory tombstone for the session, so later decisions return `-32006`. If the
+authoritative read finds that the requested decision was durable despite the
+write error, the server completes it once as a normal success.
+
 ### `abort`
 
 Params: optional `scope` with the `abort_scope` feature. It is `"session"`
