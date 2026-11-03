@@ -186,18 +186,18 @@ async def test_controller_history_does_not_block_other_clients(
     release = threading.Event()
     ping_answered = threading.Event()
     answered_before_release: list[bool] = []
-    original_replay = store.replay
+    original_snapshot = store.active_branch_snapshot
 
-    def gated_replay() -> Any:
+    def gated_snapshot() -> Any:
         entered.set()
         assert release.wait(TIMEOUT)
-        return original_replay()
+        return original_snapshot()
 
     def bounded_release() -> None:
         answered_before_release.append(ping_answered.wait(0.5))
         release.set()
 
-    monkeypatch.setattr(store, "replay", gated_replay)
+    monkeypatch.setattr(store, "active_branch_snapshot", gated_snapshot)
 
     async def ping_after_history_starts() -> None:
         await _wait_thread(entered)
