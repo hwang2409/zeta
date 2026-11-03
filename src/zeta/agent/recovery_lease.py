@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -16,6 +17,8 @@ from ..protocol.types import ToolResult
 class AgentLoopForRecovery(Protocol):
     store: ConversationStore
     _background_owner: Any
+    _children_recovered: bool
+    _pending_child_recovery: tuple[NotificationInput, ...]
 
     def _canceled_agent_result(
         self, tool_call_id: str, **kwargs: Any
@@ -90,9 +93,7 @@ def acquire_recovery_subtree(
     )
 
 
-def recover_agent_children_on_opened_store(
-    loop: AgentLoopForRecovery,
-) -> tuple[NotificationInput, ...]:
+def bootstrap_agent_children(loop: AgentLoopForRecovery) -> None:
     """Repair restart state before the opened store reaches the event loop."""
 
     from .background import recover_agent_children
@@ -100,7 +101,30 @@ def recover_agent_children_on_opened_store(
     deliveries = recover_agent_children(loop)
     for item in deliveries:
         loop.store._commit_delivery_input(item)
-    return deliveries
+    loop._pending_child_recovery = deliveries
+    loop._children_recovered = True
+
+
+async def publish_recovered_children(loop: AgentLoopForRecovery) -> None:
+    async def publish() -> None:
+        for item in loop._pending_child_recovery:
+            await loop._background_owner.conversation_channel.produce_to(None, item)
+        loop._pending_child_recovery = ()
+
+    publication = asyncio.create_task(publish())
+    try:
+        await asyncio.shield(publication)
+    except asyncio.CancelledError:
+        await publication
+        raise
+
+
+async def activate_agent_children(loop: AgentLoopForRecovery) -> None:
+    if not loop._children_recovered:
+        await recover_agent_children_off_loop(loop)
+        loop._children_recovered = True
+    if loop._pending_child_recovery:
+        await publish_recovered_children(loop)
 
 
 async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
