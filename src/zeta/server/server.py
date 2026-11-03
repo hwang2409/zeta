@@ -29,7 +29,7 @@ from . import (
     slash_commands,
 )
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
-from .connections import OBSERVER_REQUESTS, ConnectionRegistry
+from .connections import ConnectionRegistry
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .notification_presentation import NotificationPresentation
 from .project_requests import (
@@ -369,25 +369,32 @@ class _Client:
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
             self._closed = True
-    async def _dispatch(
-        self, request_id: str | int, method: str, params: dict[str, Any]
-    ) -> object:
+    async def _route_request(
+        self, method: str, params: dict[str, Any]
+    ) -> tuple[bool, object]:
         if method == "hello":
             result = self._hello(params)
             if self.role == "controller":
                 self.server._client_active = True
                 self.server._client = self
-                self.server.runtime.set_background_event_sink(self._publish_background_event)
+                self.server.runtime.set_background_event_sink(
+                    self._publish_background_event
+                )
                 self.server.runtime.set_memory_notice_sink(self._publish_memory_notice)
-                self.server.runtime.set_background_wake_sink(self._schedule_background_wake)
+                self.server.runtime.set_background_wake_sink(
+                    self._schedule_background_wake
+                )
                 await self._attach_pending_notifications()
-            return result
+            return True, result
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
         assert self.server.connections is not None
-        handled, result = await self.server.connections.route_request(
-            self, method, params
-        )
+        return await self.server.connections.route_request(self, method, params)
+
+    async def _dispatch(
+        self, request_id: str | int, method: str, params: dict[str, Any]
+    ) -> object:
+        handled, result = await self._route_request(method, params)
         if handled:
             return result
         if method in login.REQUESTS:
@@ -413,8 +420,6 @@ class _Client:
             return self.projects.dispatch(
                 request_id, method, params, features=self.features
             )
-        if self.role == "observer" and method == "session_snapshot":
-            raise ProtocolError(-32601, "method not found")
         if method == "list_sessions":
             return self._list_sessions(request_id, params)
         if method == "new_session":
@@ -491,11 +496,7 @@ class _Client:
             self.protocol_version,
             self.features,
         )
-        self.role = role
-        if role == "controller":
-            self.server.runtime.set_post_stream_provider_retry(
-                "assistant_reset" in self.features
-            )
+        self._apply_role(role)
         self.handshaken = True
         requests = [
             "list_sessions",
@@ -520,8 +521,7 @@ class _Client:
                 requests.append("clear_steering")
             if "delivery_id" in self.features:
                 requests.append("delivery_status")
-        if role == "observer":
-            requests = sorted(OBSERVER_REQUESTS)
+        requests = self.server.connections.requests_for_role(role, requests)
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],
@@ -536,6 +536,12 @@ class _Client:
         if self.server._account_warnings:
             result["notices"] = list(self.server._account_warnings)
         return result
+    def _apply_role(self, role: str) -> None:
+        self.role = role
+        if role == "controller":
+            self.server.runtime.set_post_stream_provider_retry(
+                "assistant_reset" in self.features
+            )
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
             raise ProtocolError(

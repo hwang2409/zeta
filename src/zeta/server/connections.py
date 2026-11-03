@@ -199,6 +199,12 @@ class ConnectionRegistry:
         else:
             future.set_exception(error)
 
+    @staticmethod
+    def requests_for_role(role: str, requests: list[str]) -> list[str]:
+        if role == "observer":
+            return sorted(OBSERVER_REQUESTS)
+        return requests
+
     async def route_request(
         self, connection: Any, method: str, params: dict[str, Any]
     ) -> tuple[bool, object]:
