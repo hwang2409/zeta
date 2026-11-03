@@ -405,6 +405,111 @@ async def test_same_tick_approval_reservation_winner(
 
 
 @pytest.mark.asyncio
+async def test_always_tool_grant_waits_for_durable_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, call = await _approval_server(tmp_path)
+    try:
+        await server.control._event(_start_event(call))
+        store = server.runtime.opened.store
+        gate = _StoreGate(store, "resolve_approval")
+
+        def fail_after_gate(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            gate.thread_ids.append(threading.get_ident())
+            gate.entered.set()
+            assert gate.release.wait(timeout=1)
+            raise OSError("disk failed")
+
+        monkeypatch.setattr(store, gate.method, fail_after_gate)
+        approval = asyncio.create_task(
+            _request(
+                reader,
+                writer,
+                3,
+                "approve",
+                {"request_id": call.id, "scope": "always_tool"},
+            )
+        )
+        await _wait_thread_gate(gate)
+        assert server.runtime.policy is not None
+        assert server.runtime.policy.session_allow == frozenset()
+        gate.release.set()
+        frames = await approval
+        assert frames[-1]["error"]["code"] == -32000
+        assert server.runtime.policy.session_allow == frozenset()
+    finally:
+        gate.release.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, _foreground = await _approval_server(tmp_path)
+    child = ConversationStore(tmp_path / "child-history-race")
+    call = ToolCall("child-history-call", "read", {"path": "input"})
+    child.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
+    )
+    policy = server.runtime.policy
+    assert policy is not None
+    request = ApprovalRequest(call.id, call, child_instance_id="child")
+    events: list[str] = []
+    original_notify = server.control._notify
+
+    async def record_notify(event: str, *args: object, **kwargs: object) -> bool:
+        events.append(event)
+        return await original_notify(event, *args, **kwargs)
+
+    monkeypatch.setattr(server.control, "_notify", record_notify)
+    parent = server.runtime.opened.store
+    gate = _StoreGate(parent, "append_approval_history")
+    monkeypatch.setattr(parent, gate.method, gate.call)
+    try:
+        policy.register_delegated(request, child, child_instance_id="child")
+        start = asyncio.create_task(
+            server.control._event(
+                StreamEvent(
+                    StreamEventType.TOOL_APPROVAL_START,
+                    tool_call=call,
+                    data={"agent_instance_id": "child"},
+                ),
+                session_id="parent",
+                background=True,
+            )
+        )
+        await _wait_thread_gate(gate)
+        cleanup = policy.cleanup_delegated("child")
+        assert cleanup is not None
+        await cleanup
+        gate.release.set()
+        await start
+        await server.control.wait_for_approval_settlement()
+
+        history = [
+            entry.data
+            for entry in parent.entries
+            if entry.type == "approval_history"
+        ]
+        assert [row["event"] for row in history] == [
+            "approval_request",
+            "approval_end",
+        ]
+        assert history[-1]["data"] == {
+            "decision": "abort",
+            "reason": "child_cleanup",
+        }
+        assert events == []
+        assert server.control.pending_approvals_now() == []
+    finally:
+        gate.release.set()
+        await _close(server, writer)
+        child.close()
+
+
+@pytest.mark.asyncio
 async def test_approval_durable_failure_is_fail_closed_and_documented(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
