@@ -20,6 +20,7 @@ from tests.test_server import (
 from zeta.core.session import SessionMetadata
 from zeta.protocol.types import TextContent, ToolCall
 from zeta.server import ZetaServer
+from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
 FEATURES = [
     "session_cwd",
@@ -518,5 +519,29 @@ async def test_ping_answers_before_a_session_and_during_a_turn(tmp_path: Path) -
         await _event(reader, "assistant_delta")
         assert (await _request(reader, writer, 5, "ping"))[-1]["result"] == {"pong": True}
         await _event(reader, "agent_end")
+    finally:
+        await _close(server, writer)
+
+
+def _documented_features() -> list[str]:
+    doc = (Path(__file__).parents[1] / "docs" / "serve-protocol.md").read_text()
+    table = doc.split("| feature | effect |", 1)[1].split("\n\n", 1)[0]
+    rows = [line for line in table.splitlines() if line.startswith("| `")]
+    return [row.split("`", 2)[1] for row in rows]
+
+
+def test_every_advertised_feature_is_documented_and_every_documented_one_exists() -> None:
+    # A feature name is a promise to clients: advertise only what works, and
+    # document everything advertised.
+    assert sorted(_documented_features()) == sorted(SERVER_FEATURES)
+
+
+@pytest.mark.asyncio
+async def test_hello_advertises_approval_history_only_when_requested(tmp_path: Path) -> None:
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        hello = await _hello(reader, writer, ["approval_history"])
+        assert hello["capabilities"]["features"] == ["approval_history"]
     finally:
         await _close(server, writer)
