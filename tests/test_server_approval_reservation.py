@@ -15,11 +15,12 @@ from pathlib import Path
 import pytest
 
 import zeta.core.session as session_module
-from tests.support.fake_backend import FakeBackend
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import (
     TIMEOUT,
     _close,
     _connect,
+    _frames_until_event,
     _read_raw,
     _request,
     _socket_path,
@@ -31,6 +32,7 @@ from zeta.protocol.types import (
     MessageRole,
     StreamEvent,
     StreamEventType,
+    TextContent,
     ToolCall,
     ToolUseContent,
 )
@@ -215,6 +217,7 @@ async def _approval_server(
     *,
     protocol_version: str = "1.0",
     features: list[str] | None = None,
+    approval_reconnect_grace: int = 90,
 ) -> tuple[ZetaServer, asyncio.StreamReader, asyncio.StreamWriter, ToolCall]:
     server = ZetaServer(
         home=tmp_path,
@@ -225,6 +228,7 @@ async def _approval_server(
             FakeBackend([]),
             model or "offline",
         ),
+        approval_reconnect_grace=approval_reconnect_grace,
     )
     reader, writer = await _connect(server)
     hello: dict[str, object] = {"protocol_version": protocol_version}
@@ -1894,14 +1898,36 @@ async def _wait_controller_release(server: ZetaServer) -> None:
 async def test_approval_reconnect_drop_replay_and_approve_same_id(
     tmp_path: Path,
 ) -> None:
-    server, reader, writer, call = await _approval_server(
-        tmp_path, protocol_version="1.2", features=["approval_reconnect"]
+    target = tmp_path / "input.txt"
+    target.write_text("reconnected")
+    call = ToolCall("call-1", "read", {"path": str(target)})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
     )
-    replay_reader: asyncio.StreamReader | None = None
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            backend,
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
     replay_writer: asyncio.StreamWriter | None = None
     try:
-        await server.control._event(_start_event(call))
-        request = json.loads(await _read_raw(reader))["params"]
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.2", "features": ["approval_reconnect"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        request = (await _frames_until_event(reader, "approval_request"))[-1][
+            "params"
+        ]
         assert request["request_id"] == call.id
         writer.close()
         await writer.wait_closed()
@@ -1926,19 +1952,23 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
         status = (await _request(replay_reader, replay_writer, 11, "status"))[-1]
         assert status["result"]["pending_approvals"][0]["request_id"] == call.id
 
-        approved = (
-            await _request(
-                replay_reader,
-                replay_writer,
-                12,
-                "approve",
-                {"request_id": call.id},
-            )
-        )[-1]
-        assert approved["result"]["request_id"] == call.id
+        approved = await _request(
+            replay_reader,
+            replay_writer,
+            12,
+            "approve",
+            {"request_id": call.id},
+        )
+        assert approved[-1]["result"]["request_id"] == call.id
+        if not any(
+            frame.get("params", {}).get("event") == "agent_end"
+            for frame in approved
+        ):
+            await _frames_until_event(replay_reader, "agent_end")
         assert server.runtime.opened.store.approval_resolution_data(call.id)[
             "decision"
         ] == "allow"
+        assert len(backend.calls) == 2
     finally:
         if replay_writer is not None:
             await _close(server, replay_writer)

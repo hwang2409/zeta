@@ -20,9 +20,13 @@ from . import abort_scope, event_contract, model_selection
 from .approval_lifecycle import (
     ApprovalKey,
     ApprovalLifecycle,
+    BeginGrace,
     Cancel,
     Decide,
+    Expire,
     ExternalEnd,
+    Ready,
+    Reclaim,
     Start,
     Terminate,
 )
@@ -84,6 +88,8 @@ class ServeControl:
         self.server = server
         self._turn_task: asyncio.Task[None] | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
+        self._grace_task: asyncio.Task[None] | None = None
+        self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
         self.closing = False
@@ -158,8 +164,15 @@ class ServeControl:
 
         policy.bind_serve_control(self)
 
-    def pending_approvals_now(self) -> list[dict[str, object]]:
-        return self._approvals.pending_approvals_now()
+    def pending_approvals_now(
+        self,
+        *,
+        reconnect: bool = False,
+        include_truncated: bool = False,
+    ) -> list[dict[str, object]] | tuple[list[dict[str, object]], bool]:
+        return self._approvals.pending_approvals_now(
+            reconnect=reconnect, include_truncated=include_truncated
+        )
 
     def pending_approval_labels(self) -> tuple[str, ...]:
         return self._approvals.pending_approval_labels()
@@ -179,11 +192,54 @@ class ServeControl:
     async def wait_for_approval_settlement(self) -> None:
         await self._approvals.wait_for_approval_settlement()
 
-    async def controller_claimed(self) -> None:
+    async def controller_claimed(self, *, reconnect: bool = False) -> None:
+        task = self._grace_task
+        if task is None:
+            return
+        if self._grace_expiring:
+            await asyncio.shield(task)
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        self._grace_task = None
+        if reconnect:
+            await self._approvals.transition(Reclaim())
+        else:
+            await self._approvals.transition(Expire())
+            await self._disconnect_turn()
+
+    async def controller_ready(self, *, reconnect: bool = False) -> None:
+        if reconnect:
+            await self._approvals.transition(Ready())
         await self._attach_pending_notifications()
 
-    async def controller_released(self) -> None:
+    async def controller_released(self, *, reconnect: bool = False) -> None:
+        if reconnect and self._approvals.has_pending_approvals():
+            await self._approvals.transition(BeginGrace())
+            self._grace_task = asyncio.create_task(self._expire_grace())
+            if self.server.approval_reconnect_grace == 0:
+                await self._grace_task
+            return
         await self._terminate_pending_approvals(suppress_write_errors=True)
+        await self._disconnect_turn()
+
+    async def _expire_grace(self) -> None:
+        try:
+            await asyncio.sleep(self.server.approval_reconnect_grace)
+            self._grace_expiring = True
+            expiry = asyncio.create_task(self._approvals.transition(Expire()))
+            try:
+                await asyncio.shield(expiry)
+            except asyncio.CancelledError:
+                await expiry
+                raise
+            await self._disconnect_turn()
+        finally:
+            self._grace_expiring = False
+            if self._grace_task is asyncio.current_task():
+                self._grace_task = None
+
+    async def _disconnect_turn(self) -> None:
         if self._turn_task is not None and not self._turn_task.done():
             loop = self.server.runtime.loop
             if loop is not None:
@@ -196,6 +252,11 @@ class ServeControl:
 
     async def close(self) -> None:
         self.closing = True
+        task = self._grace_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self._grace_task = None
         await self.controller_released()
 
     async def user_message(
