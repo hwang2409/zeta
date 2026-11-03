@@ -7332,7 +7332,7 @@ async def test_step_delivery_writer_handles_50k_rows_within_send_deadline(
 
 @pytest.mark.asyncio
 async def test_step_delivery_indexes_remain_pending_only_after_acknowledgements(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path)
     flow = pending_delivery_module.StepDeliveryFlow(store)
@@ -7355,11 +7355,19 @@ async def test_step_delivery_indexes_remain_pending_only_after_acknowledgements(
     reopened = ConversationStore(tmp_path, session_id=session_id, _must_exist=True)
     assert len(reopened._active_notifications) == 0
     assert len(reopened._active_pending_prompt_entries) == 0
+    snapshot_calls = 0
+    original_snapshot_entry = reopened._snapshot_entry
+
+    def count_snapshot_calls(entry):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return original_snapshot_entry(entry)
+
+    monkeypatch.setattr(reopened, "_snapshot_entry", count_snapshot_calls)
     flow = pending_delivery_module.StepDeliveryFlow(reopened)
-    started = asyncio.get_running_loop().time()
     for _ in range(25):
         await flow.prepare_request("terminal_fallback", [], None)
-    assert asyncio.get_running_loop().time() - started < 0.5
+    assert snapshot_calls == 0
     await asyncio.to_thread(reopened.close)
 
 
