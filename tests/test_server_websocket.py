@@ -167,9 +167,8 @@ async def test_websocket_drop_during_approval_finishes_cleanly(
     )
     with caplog.at_level(logging.ERROR):
         await server.start()
-        reader, writer, status = await _connect(
-            server, token=server._websocket.token
-        )
+        connection = await _connect(server, token=server._websocket.token)
+        reader, writer, status = connection[:3]
         assert status == 101
         await _send_json(
             writer,
