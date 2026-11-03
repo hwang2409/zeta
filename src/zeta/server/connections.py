@@ -20,10 +20,18 @@ OBSERVER_READ_ONLY_CODE = "observer_read_only"
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
 
 
+@dataclass(frozen=True)
+class ControllerMetadata:
+    connection: Any
+    protocol_version: str
+    features: frozenset[str]
+
+
 @dataclass
 class _Connection:
     connection: Any
     role: str | None = None
+    protocol_version: str = "1.0"
     features: frozenset[str] = frozenset()
     queue: asyncio.Queue[tuple[bytes, asyncio.Future[bool]]] | None = None
     writer_task: asyncio.Task[None] | None = None
@@ -70,7 +78,7 @@ class ConnectionRegistry:
                 -32602, "observer requires protocol 1.1 and serve_observers"
             )
         try:
-            self._claim(connection, role, features)
+            self._claim(connection, role, protocol_version, features)
         except RuntimeError as exc:
             if role == "observer":
                 raise ProtocolError(-32004, "observer limit reached") from exc
@@ -82,7 +90,9 @@ class ConnectionRegistry:
             )
         return role
 
-    def _claim(self, connection: Any, role: str, features: frozenset[str]) -> None:
+    def _claim(
+        self, connection: Any, role: str, protocol_version: str, features: frozenset[str]
+    ) -> None:
         state = self._connections[connection]
         if state.role is not None:
             raise ValueError("connection already claimed")
@@ -97,7 +107,23 @@ class ConnectionRegistry:
             state.writer_task = asyncio.create_task(self._observer_writer(state))
             self._observers.append(state)
         state.role = role
+        state.protocol_version = protocol_version
         state.features = features
+
+    def current_controller(self) -> ControllerMetadata | None:
+        state = self._controller
+        if state is None:
+            return None
+        return ControllerMetadata(state.connection, state.protocol_version, state.features)
+
+    async def publish_controller(
+        self, event: str, session_id: str | None, **fields: object
+    ) -> bool:
+        controller = self.current_controller()
+        if controller is None:
+            return False
+        frame = controller.connection.codec.notification(event, session_id, **fields)
+        return await self.send(controller.connection, frame)
 
     def release(self, connection: Any) -> None:
         state = self._connections.pop(connection, None)
