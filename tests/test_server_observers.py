@@ -73,11 +73,21 @@ async def test_controller_frames_are_byte_identical_with_observer(tmp_path: Path
         server = ZetaServer(home=home, socket_path=_socket_path(home), provider="codex")
         reader, writer = await _connect(server)
         try:
-            await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+            request = {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2"}}
+            writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            await writer.drain()
+            hello_frame = await reader.readline()
+            assert hello_frame
             if observer:
                 extra = await _observer(server, 10)
+            request = {"jsonrpc": "2.0", "id": 2, "method": "status", "params": {}}
+            writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            await writer.drain()
+            status_frame = await reader.readline()
+            assert status_frame
+            if observer:
                 extra[1].close(); await extra[1].wait_closed()
-            return json.dumps((await _request(reader, writer, 2, "status"))[-1], sort_keys=True).encode()
+            return hello_frame + status_frame
         finally:
             await _close(server, writer)
     assert await hello(tmp_path / "base", False) == await hello(tmp_path / "observer", True)

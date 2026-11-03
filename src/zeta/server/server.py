@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import asyncio
 import contextlib
 import errno
@@ -9,7 +8,6 @@ import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
-
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
 from ..protocol.types import (
@@ -29,7 +27,13 @@ from . import (
     slash_commands,
 )
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
-from .connections import OBSERVER_READ_ONLY_CODE, OBSERVER_REQUESTS, ConnectionRegistry
+from .connections import (
+    OBSERVER_READ_ONLY_CODE,
+    OBSERVER_REQUESTS,
+    ConnectionRegistry,
+    capture_observer_read,
+    read_observer,
+)
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .notification_presentation import NotificationPresentation
 from .project_requests import (
@@ -50,7 +54,6 @@ from .protocol import (
 from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
-
 USER_MESSAGE_MAX_BYTES = 262_144
 class ZetaServer:
     """Serve one local client over a Unix socket or localhost TCP."""
@@ -215,17 +218,23 @@ class ZetaServer:
         registry = self.connections
         assert registry is not None
         client = _Client(self, reader, writer)
-        registry.register(client)
+        try:
+            registry.register(client)
+        except RuntimeError:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
         try:
             await client.run()
         finally:
-            registry.release(client)
             if self._client is client:
                 self.runtime.set_background_event_sink(None)
                 self.runtime.set_memory_notice_sink(None)
                 self.runtime.set_background_wake_sink(None)
                 self._client = None
                 self._client_active = False
+            registry.release(client)
 class _Client:
     def __init__(
         self,
@@ -236,6 +245,9 @@ class _Client:
         self.server = server
         self.reader = reader
         self.writer = writer
+        if server.connections is None:
+            server.connections = ConnectionRegistry(asyncio.get_running_loop())
+            server.connections.register(self)
         self.logins = login.Logins(server.home)
         self.handshaken = False
         self.role: str | None = None
@@ -340,7 +352,11 @@ class _Client:
         async with self._close_lock:
             if self._closed:
                 return
-            await self._terminate_pending_approvals(suppress_write_errors=True)
+            if self.role == "controller":
+                self.server.runtime.set_background_event_sink(None)
+                self.server.runtime.set_memory_notice_sink(None)
+                self.server.runtime.set_background_wake_sink(None)
+                await self._terminate_pending_approvals(suppress_write_errors=True)
             await accounts.cancel_owned_switch(self)
             if self._turn_task is not None and not self._turn_task.done():
                 loop = self.server.runtime.loop
@@ -376,7 +392,13 @@ class _Client:
             if not self.server.connections.allows(self, method, params):
                 raise ProtocolError(-32008, "method is unavailable to read-only observers", {"code": OBSERVER_READ_ONLY_CODE, "method": method})
             if method in {"list_sessions", "status", "session_tree", "session_history", "model_catalog", "session_settings"}:
-                return await self.server.connections.run_observer_read(self, lambda: self._observer_read(method, params))
+                target = capture_observer_read(self, method, params)
+                result = await self.server.connections.run_observer_read(
+                    self, lambda: read_observer(method, target, params)
+                )
+                if target[0] is not None and self.server.runtime.session_id != target[0]:
+                    raise ProtocolError(-32003, "session is not active")
+                return result
         if method in login.REQUESTS:
             if self.protocol_version == "1.0":
                 raise ProtocolError(-32601, "login is unavailable on this server")
@@ -530,21 +552,6 @@ class _Client:
         if self.server._account_warnings:
             result["notices"] = list(self.server._account_warnings)
         return result
-    def _observer_read(self, method: str, params: dict[str, Any]) -> object:
-        if method == "status":
-            return self._status()
-        if method == "list_sessions":
-            return self._list_sessions(None, params)
-        runtime = self.server.runtime
-        if method == "session_tree":
-            return ergonomics.tree(runtime)
-        if method == "session_history":
-            return ergonomics.history(runtime, params)
-        if method == "model_catalog":
-            return ergonomics.catalog(runtime)
-        if method == "session_settings":
-            return ergonomics.settings(runtime)
-        raise ProtocolError(-32601, "method not found")
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
             raise ProtocolError(
@@ -1165,8 +1172,7 @@ class _Client:
             )
 
     async def _write(self, payload: bytes) -> bool:
-        if self.server.connections is None:
-            return await self._write_physical(payload)
+        assert self.server.connections is not None
         return await self.server.connections.send(self, payload)
 
     async def _write_physical(self, payload: bytes) -> bool:
@@ -1183,19 +1189,16 @@ class _Client:
         if self._turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
 
-
 def _home() -> Path:
     from ..core.session import env_home
 
     return env_home().expanduser().resolve()
-
 
 def _required_string(params: dict[str, Any], name: str) -> str:
     value = params.get(name)
     if not isinstance(value, str) or not value:
         raise ProtocolError(-32602, f"{name} must be a nonempty string")
     return value
-
 
 def _integer(
     params: dict[str, Any], name: str, default: int | None, *, minimum: int
@@ -1222,14 +1225,12 @@ def _optional_string(params: dict[str, Any], name: str) -> str | None:
         raise ProtocolError(-32602, f"{name} must be a nonempty string")
     return value
 
-
 def _approval_key(event: StreamEvent) -> ApprovalKey:
     raw_request_id = event.tool_call.id if event.tool_call is not None else ""
     child_id = event.data.get("agent_instance_id")
     if isinstance(child_id, str) and raw_request_id:
         return child_id, raw_request_id
     return raw_request_id
-
 
 def _approval_display_fields(request: Any) -> dict[str, object]:
     """The one immutable approval-display object shared with the frontend client.
@@ -1245,6 +1246,5 @@ def _approval_display_fields(request: Any) -> dict[str, object]:
     if display:
         fields["approval_display"] = display
     return fields
-
 
 __all__ = ["ZetaServer"]

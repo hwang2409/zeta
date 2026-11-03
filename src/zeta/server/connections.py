@@ -9,11 +9,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from . import ergonomics
+from .protocol import ProtocolError
+
 OBSERVER_REQUESTS = frozenset({
     "list_sessions", "status", "session_tree", "session_history",
     "model_catalog", "session_settings", "ping", "delivery_status",
 })
 OBSERVER_READ_ONLY_CODE = "observer_read_only"
+MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
 
 
 @dataclass
@@ -45,6 +49,8 @@ class ConnectionRegistry:
     def register(self, connection: Any) -> None:
         if self._closed:
             raise RuntimeError("connection registry is closed")
+        if len(self._connections) >= MAX_CONNECTIONS:
+            raise RuntimeError("connection limit reached")
         self._connections[connection] = _Connection(connection)
 
     def claim(self, connection: Any, role: str, features: frozenset[str]) -> None:
@@ -204,3 +210,41 @@ class ConnectionRegistry:
         self._connections.clear()
         self._observers.clear()
         self._controller = None
+def capture_observer_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str | None, object]:
+    runtime = client.server.runtime
+    if method in {"session_tree", "session_history"}:
+        store = ergonomics.active(runtime, params)
+        return runtime.session_id, store
+    if method == "status":
+        if runtime.opened is None:
+            return None, {"session": None, "state": "idle", "explicit_finish": False, "pending_approvals": [], "usage": {}, "compaction_markers": 0}
+        return runtime.session_id, {
+            "session": client._session_snapshot(),
+            "state": runtime.state.status if runtime.state is not None else "idle",
+            "explicit_finish": runtime.loop.explicit_finish if runtime.loop is not None else runtime._config(None, None).agents_explicit_finish,
+            "pending_approvals": [], "usage": dict(runtime.usage), "store": runtime.opened.store,
+        }
+    if method == "model_catalog":
+        return None, ergonomics.catalog(runtime)
+    if method == "session_settings":
+        return runtime.session_id, ergonomics.settings(runtime)
+    if method == "list_sessions":
+        return None, tuple(runtime.list_sessions_read_only())
+    raise ProtocolError(-32601, "method not found")
+
+
+def read_observer(method: str, target: tuple[str | None, object], params: dict[str, Any]) -> object:
+    if method == "status":
+        status = dict(target[1])
+        store = status.pop("store", None)
+        status["compaction_markers"] = store.compaction_marker_count() if store is not None else 0
+        return status
+    if method in {"model_catalog", "session_settings", "list_sessions"}:
+        return target[1] if method != "list_sessions" else {"sessions": [item.to_dict() for item in target[1]]}
+    store = target[1]
+    runtime = type("ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()})()
+    if method == "session_tree":
+        return ergonomics.tree(runtime)
+    if method == "session_history":
+        return ergonomics.history(runtime, params)
+    raise ProtocolError(-32601, "method not found")
