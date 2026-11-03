@@ -369,9 +369,10 @@ retains full details for the 1,000 most recent accepted IDs and a compact
 lifetime. The compact index is rebuilt from the session log when the session is
 loaded. The acceptance record is durably appended in the same store transaction
 as a `send` user message. For `steer`, the durable acceptance is appended before
-the synchronous post-persistence callback adds the item to the running loop's
-queue. A failed durable append therefore does not start a turn or add steering,
-and cancellation cannot separate a completed append from its callback.
+the item is added to the running loop's queue. A failed durable append therefore
+does not start a turn or add steering. After a committed append, the user-message
+echo and the start or queue effect finish in order before request cancellation is
+reported; cancellation before a commit produces no row or effect.
 
 Repeating a retained queued or delivered ID returns the original result with
 `duplicate: true`. It does not validate changed text against the first request,

@@ -84,22 +84,34 @@ class DeliveryRequests:
             "session_id": runtime.session_id,
         }
 
-        await runtime.opened.store.append_client_delivery_async(
-            delivery_id,
-            "send",
-            "delivered",
-            outcome,
-            message=message,
-        )
-        await control.user_message(
-            value.display_text, "send", features, delivery_id=delivery_id
-        )
-        control.start_turn(
-            value.text,
-            origin=value.origin,
-            user_message=message,
-            persist_user_message=False,
-        )
+        canceled_after_commit = False
+        try:
+            await runtime.opened.store.append_client_delivery_async(
+                delivery_id,
+                "send",
+                "delivered",
+                outcome,
+                message=message,
+            )
+        except asyncio.CancelledError:
+            if runtime.opened.store.client_delivery(delivery_id) is None:
+                raise
+            canceled_after_commit = True
+
+        async def effects() -> None:
+            await control.user_message(
+                value.display_text, "send", features, delivery_id=delivery_id
+            )
+            control.start_turn(
+                value.text,
+                origin=value.origin,
+                user_message=message,
+                persist_user_message=False,
+            )
+
+        await _run_delivery_effects(effects)
+        if canceled_after_commit:
+            raise asyncio.CancelledError
         return outcome
 
     async def steer(
@@ -127,14 +139,26 @@ class DeliveryRequests:
 
         outcome: dict[str, object] = {"accepted": True}
         tagged = tag_client_delivery(message, delivery_id)
-        await runtime.opened.store.append_client_delivery_async(
-            delivery_id,
-            "steer",
-            "queued",
-            outcome,
-        )
-        await control.user_message(text, "steer", features, delivery_id=delivery_id)
-        loop.steer(tagged)
+        canceled_after_commit = False
+        try:
+            await runtime.opened.store.append_client_delivery_async(
+                delivery_id,
+                "steer",
+                "queued",
+                outcome,
+            )
+        except asyncio.CancelledError:
+            if runtime.opened.store.client_delivery(delivery_id) is None:
+                raise
+            canceled_after_commit = True
+
+        async def effects() -> None:
+            await control.user_message(text, "steer", features, delivery_id=delivery_id)
+            loop.steer(tagged)
+
+        await _run_delivery_effects(effects)
+        if canceled_after_commit:
+            raise asyncio.CancelledError
         return outcome
 
     def finalize_turn(
@@ -218,6 +242,20 @@ class DeliveryRequests:
                 {"outcome": outcome},
             )
         return None
+
+
+async def _run_delivery_effects(operation: Callable[[], Any]) -> None:
+    """Finish post-commit effects before reporting caller cancellation."""
+    task = asyncio.create_task(operation())
+    canceled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            canceled = True
+    await task
+    if canceled:
+        raise asyncio.CancelledError
 
 
 def _require_feature(
