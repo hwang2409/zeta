@@ -53,6 +53,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 import zeta.accounts.session as account_session_module
+import zeta.tui.slash_handlers as slash_handlers_module
 from tests.support.credentials import (
     anthropic_credentials,
     codex_credentials,
@@ -227,6 +228,22 @@ def _force_terminal_env(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
         monkeypatch.delenv(name, raising=False)
     for name in ("ZETA_HOME", "TERM", "COLORTERM"):
         monkeypatch.setenv(name, env[name])
+
+
+def test_account_startup_warning_uses_warning_render_path(tmp_path: Path) -> None:
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+        startup_warnings=("could not clean up account directory /secret; check its mode or ownership, then delete it or fix it",),
+    )
+
+    app._present_startup_output()
+
+    assert "/secret" in output.getvalue()
+    assert "check its mode or ownership" in output.getvalue()
 
 
 def _agent_list_session(
@@ -11952,7 +11969,10 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
         await app._run_full_screen(session)
 
     assert any("background failed" in line for line in app._transcript_lines)
-    assert "jsonl" in "\n".join(app._transcript_lines)
+    # The log path wraps inside the card on long tmp paths (macOS); compare
+    # the text without ANSI codes, card borders, and line breaks.
+    flat = re.sub(r"\x1b\[[0-9;]*m|[│\s]", "", "".join(app._transcript_lines))
+    assert "tui-errors.jsonl" in flat
     assert terminal_calls == []
     log_path = tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl"
     deadline = time.monotonic() + 1
@@ -13340,6 +13360,100 @@ async def test_accounts_refresh_does_not_block_event_loop(
         while app._accounts_picker and app._accounts_picker.refreshing:
             await asyncio.sleep(0.01)
     finally:
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_accounts_named_login_uses_supplied_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "first").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
+    )
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    logins: list[tuple[str, str]] = []
+
+    def login(_home: Path, provider: str, label: str) -> None:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        logins.append((provider, label))
+
+    monkeypatch.setattr(slash_handlers_module, "login_named_account", login)
+    try:
+        assert await app.slash_accounts("login codex personal") == "logged in as codex:personal"
+        assert logins == [("codex", "personal")]
+    finally:
+        await app.close()
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    current = AccountId("codex", "current")
+    removed = AccountId("codex", "removed")
+    for account in (current, removed):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, current)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    rendered: list[Panel] = []
+    app._presenter.print_unit = lambda renderable: rendered.append(renderable) or renderable
+    app._transcript.replace = lambda _unit, replacement: rendered.append(replacement) or replacement
+    logout = AccountStore.logout
+    off_loop_calls = 0
+
+    def checked_logout(store: AccountStore, account: AccountId, *, sessions_root: Path):
+        nonlocal off_loop_calls
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        off_loop_calls += 1
+        return logout(store, account, sessions_root=sessions_root)
+
+    monkeypatch.setattr(AccountStore, "logout", checked_logout)
+    try:
+        assert await app.slash_accounts("") == ""
+        app.accounts_picker_move(1)
+        assert app.accounts_picker_logout() is None
+        confirmation = StringIO()
+        Console(file=confirmation, force_terminal=False, width=160).print(rendered[-1])
+        assert "press x again to log out codex:removed" in Text.from_ansi(
+            confirmation.getvalue()
+        ).plain
+
+        task = app.accounts_picker_logout()
+        assert task is not None
+        await task
+
+        assert off_loop_calls == 1
+        assert not await asyncio.to_thread(AccountStore(home).contains, removed)
+    finally:
+        await app.close()
         opened.store.close()
 
 

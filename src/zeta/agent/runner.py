@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -371,6 +372,7 @@ async def _build_child_loop(
     cwd_override: Path | None,
     follow_up_loop: bool,
     description: str,
+    child_account_context: Any,
 ) -> tuple[AgentLoop, ChildApprovalPolicy | None]:
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None
@@ -397,11 +399,8 @@ async def _build_child_loop(
             cwd=cwd_override,
             image_policy=child_image_policy,
         )
-        account_context = getattr(loop, "account_context", None)
-        if account_context is not None:
-            child_registry.account_context = await asyncio.to_thread(
-                account_context.child_snapshot, child_provider
-            )
+        if child_account_context is not None:
+            child_registry.account_context = child_account_context
         loop._background_owner.store_leases.callback(
             child_registry.background_tasks.release_directory
         )
@@ -706,15 +705,47 @@ async def run_agent_tool(
             remove_pending_child_link(loop.root_session_dir, child_instance_id)
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
-    try:
-        child_store.start_agent_lifecycle(
-            handle=child_instance_id,
-            started_at=_now(),
-            depth=child_depth,
-            agent_type=preset.name,
-            description=description,
-            cwd=child_cwd,
+    account_context = getattr(loop, "account_context", None)
+    child_account_pins = (
+        await asyncio.to_thread(
+            account_context.child_snapshot, getattr(child_backend, "provider", None)
         )
+        if account_context is not None
+        else None
+    )
+    selected_accounts = (
+        child_account_pins.snapshot() if child_account_pins is not None else {}
+    )
+
+    def publish_child_lifecycle() -> None:
+        account_store = getattr(account_context, "store", None)
+        protected_accounts = {
+            provider: account
+            for provider, account in selected_accounts.items()
+            if account_store is not None and account_store.contains(account)
+        }
+        guard = (
+            account_store.pin_guard(protected_accounts)
+            if protected_accounts
+            else nullcontext()
+        )
+        with guard:
+            child_store.start_agent_lifecycle(
+                handle=child_instance_id,
+                started_at=_now(),
+                depth=child_depth,
+                agent_type=preset.name,
+                description=description,
+                cwd=child_cwd,
+                selected_accounts={
+                    provider: str(account)
+                    for provider, account in selected_accounts.items()
+                }
+                or None,
+            )
+
+    try:
+        await asyncio.to_thread(publish_child_lifecycle)
     except BaseException:
         loop._background_owner.mark_store_finished(child_store)
         loop._background_owner.release_unused_stores()
@@ -741,6 +772,7 @@ async def run_agent_tool(
             cwd_override=cwd_override,
             follow_up_loop=follow_up_loop,
             description=description,
+            child_account_context=child_account_pins,
         )
     except asyncio.CancelledError:
         raise
