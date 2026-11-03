@@ -75,6 +75,11 @@ class ConnectionRegistry:
             if role == "observer":
                 raise ProtocolError(-32004, "observer limit reached") from exc
             raise ProtocolError(-32001, "another client is already connected") from exc
+        connection.role = role
+        if role == "controller":
+            connection.server.runtime.set_post_stream_provider_retry(
+                "assistant_reset" in features
+            )
         return role
 
     def _claim(self, connection: Any, role: str, features: frozenset[str]) -> None:
