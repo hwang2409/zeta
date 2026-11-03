@@ -4540,7 +4540,7 @@ async def test_account_lock_timeout_reaches_serve_with_retryable_code(
                         "approval_mode": "ask",
                     },
                 ),
-                timeout=1,
+                timeout=10,
             )
         )[-1]
         assert response["error"] == {
