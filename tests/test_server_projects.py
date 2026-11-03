@@ -168,9 +168,9 @@ async def test_serve_resume_cancel_closes_store_after_preparation_finishes(
     try:
         assert await asyncio.to_thread(preparation_started.wait, 2)
         operation.cancel()
+        preparation_release.set()
         with pytest.raises(asyncio.CancelledError):
             await operation
-        preparation_release.set()
         assert await asyncio.to_thread(preparation_done.wait, 2)
         assert opened and opened[0]._closed
         assert not preparation_active
