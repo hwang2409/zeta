@@ -166,17 +166,47 @@ class ConnectionRegistry:
             await state.connection._write_physical(error)
         await state.connection.close()
 
-    async def run_observer_read(self, connection: Any, callable: Callable[[], Any]) -> Any:
-        state = self._connections.get(connection)
-        if state is None or state.role != "observer":
-            raise RuntimeError("observer is not connected")
+    async def run_read(
+        self,
+        connection: Any,
+        callable: Callable[[], Any],
+        *,
+        session_id: str | None = None,
+    ) -> Any:
+        if connection not in self._connections:
+            raise RuntimeError("connection is not connected")
         future = self.loop.create_future()
         with self._read_condition:
             if self._read_stopping:
-                raise RuntimeError("observer reads are closed")
+                raise RuntimeError("reads are closed")
             self._read_jobs.append((callable, future))
             self._read_condition.notify()
-        return await future
+        result = await future
+        if (
+            session_id is not None
+            and connection.server.runtime.session_id != session_id
+        ):
+            raise ProtocolError(-32003, "session is not active")
+        return result
+
+    async def read_session(
+        self, connection: Any, method: str, params: dict[str, Any]
+    ) -> object:
+        target = capture_read(connection, method, params)
+        return await self.run_read(
+            connection,
+            lambda: perform_read(method, target, params),
+            session_id=target[0],
+        )
+
+    async def read_status(
+        self, connection: Any, status: dict[str, Any], session_id: str | None
+    ) -> object:
+        return await self.run_read(
+            connection,
+            lambda: project_status(status),
+            session_id=session_id,
+        )
 
     def _read_worker(self) -> None:
         while True:
@@ -233,12 +263,14 @@ class ConnectionRegistry:
             "session_settings",
         }:
             return False, None
-        target = capture_observer_read(connection, method, params)
-        result = await self.run_observer_read(
-            connection, lambda: read_observer(method, target, params)
+        if method in {"session_tree", "session_history"}:
+            return True, await self.read_session(connection, method, params)
+        target = capture_read(connection, method, params)
+        result = await self.run_read(
+            connection,
+            lambda: perform_read(method, target, params),
+            session_id=target[0],
         )
-        if target[0] is not None and connection.server.runtime.session_id != target[0]:
-            raise ProtocolError(-32003, "session is not active")
         return True, result
 
     async def aclose(self) -> None:
@@ -257,7 +289,7 @@ class ConnectionRegistry:
         self._observers.clear()
         self._controller = None
 
-def capture_observer_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str | None, object]:
+def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str | None, object]:
     runtime = client.server.runtime
     if method in {"session_tree", "session_history"}:
         store = ergonomics.active(runtime, params)
@@ -281,12 +313,18 @@ def capture_observer_read(client: Any, method: str, params: dict[str, Any]) -> t
     raise ProtocolError(-32601, "method not found")
 
 
-def read_observer(method: str, target: tuple[str | None, object], params: dict[str, Any]) -> object:
+def project_status(target: object) -> dict[str, Any]:
+    status = dict(target)
+    store = status.pop("store", None)
+    status["compaction_markers"] = (
+        store.compaction_marker_count() if store is not None else 0
+    )
+    return status
+
+
+def perform_read(method: str, target: tuple[str | None, object], params: dict[str, Any]) -> object:
     if method == "status":
-        status = dict(target[1])
-        store = status.pop("store", None)
-        status["compaction_markers"] = store.compaction_marker_count() if store is not None else 0
-        return status
+        return project_status(target[1])
     if method == "list_sessions":
         return {"sessions": [item.to_dict() for item in target[1]()]}
     if method in {"model_catalog", "session_settings"}:
