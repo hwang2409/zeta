@@ -390,7 +390,7 @@ def test_approval_resolution_reason_is_bounded_and_abort_only(approval_root: Pat
     store.append_approval_resolution(call.id, "abort", reason="controller_disconnected")
     assert store.entries[-1].data["reason"] == "controller_disconnected"
     with pytest.raises(ValueError):
-        store.append_approval_resolution(call.id, "allow", reason="shutdown")
+        store.append_approval_resolution(call.id, "allow", reason="turn_canceled")
 
 
 def test_unknown_approval_resolution_reason_is_rejected(approval_root: Path) -> None:

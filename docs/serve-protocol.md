@@ -637,8 +637,8 @@ on the wire.
 carries the same `request_id` as its matching `approval_request`, the tool call,
 and empty or loop-provided `data`. When an approval is aborted, emitted reasons
 are `controller_disconnected`, `turn_canceled`, or `child_cleanup`. The stored
-format also accepts `timeout`, `shutdown`, and `grace_expired`, but no current
-path emits them. For delegated approvals, the request ID is an opaque
+format also accepts `grace_expired`, reserved for the approval reconnect
+grace; no current path emits it. For delegated approvals, the request ID is an opaque
 server-issued key, even when the parent and child use the same raw tool call ID.
 
 ```json

@@ -53,7 +53,10 @@ from ._approval_display import (
 )
 from ._async_writes import AsyncDurableWritesMixin
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
-from ._incremental_validation import IncrementalValidationMixin
+from ._incremental_validation import (
+    APPROVAL_RESOLUTION_REASONS,
+    IncrementalValidationMixin,
+)
 from ._lifecycle import StoreLifecycleMixin
 from ._log import ConversationLogMixin, PersistedAppend
 from ._notifications import NotificationStateMixin
@@ -79,15 +82,6 @@ from .runtime_lease import (
     StoreRuntimeLeaseMixin,
     close_store_leases,
 )
-
-APPROVAL_RESOLUTION_REASONS = {
-    "controller_disconnected",
-    "turn_canceled",
-    "timeout",
-    "shutdown",
-    "child_cleanup",
-    "grace_expired",
-}
 
 
 def _validate_approval_reason(decision: str, reason: str | None) -> None:
