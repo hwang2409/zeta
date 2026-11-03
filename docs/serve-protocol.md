@@ -641,7 +641,10 @@ on the wire.
 `approval_request` carries `request_id` and `tool_call`. It also carries
 `delegated: true` and `agent_instance_id` for delegated approvals. `approval_end`
 carries the same `request_id` as its matching `approval_request`, the tool call,
-and empty or loop-provided `data`. When an approval is aborted, emitted reasons
+and `data`. When a durable outcome is stored, `data.decision` is `allow`, `deny`,
+or `abort`, and an abort also sets `data.reason`. `data` can carry other
+loop-provided fields, and it is `{}` when there are none and no outcome is
+stored. Emitted reasons
 are `controller_disconnected`, `turn_canceled`, or `child_cleanup`. The stored
 format also accepts `grace_expired`, reserved for the approval reconnect
 grace; no current path emits it. For delegated approvals, the request ID is an opaque
