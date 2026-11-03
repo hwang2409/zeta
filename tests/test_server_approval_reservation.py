@@ -39,21 +39,67 @@ from zeta.server.slash_commands import ServerSlashSession
 from zeta.tools.agent.approval import ChildApprovalPolicy
 
 
-def test_approval_record_state_has_one_writer() -> None:
+def test_approval_lifecycle_state_has_one_writer_in_all_production_modules() -> None:
     root = Path(__file__).parents[1] / "src"
+    lifecycle_path = root / "zeta" / "server" / "approval_lifecycle.py"
+    record_fields = {
+        "target",
+        "wire_id",
+        "generation",
+        "token",
+        "phase",
+        "disposition",
+        "request",
+        "history_published",
+        "published",
+        "settlement",
+    }
     violations: list[str] = []
     for path in root.rglob("*.py"):
-        if path.name != "control.py":
-            continue
         tree = ast.parse(path.read_text(), filename=str(path))
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
         for node in ast.walk(tree):
             targets: list[ast.expr] = []
             if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
             for target in targets:
-                if isinstance(target, ast.Attribute) and target.attr in {"state", "disposition"}:
-                    violations.append(f"{path}:{target.lineno}: {target.attr}")
-    assert not violations, "approval record writes outside lifecycle: " + ", ".join(violations)
+                if not isinstance(target, ast.Attribute):
+                    continue
+                function = parents.get(node)
+                while function is not None and not isinstance(
+                    function, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    function = parents.get(function)
+                function_name = function.name if function is not None else "<module>"
+                writes_lifecycle_state = target.attr == "_state" and (
+                    path == lifecycle_path
+                    or "approval" in ast.unparse(target.value).lower()
+                )
+                if writes_lifecycle_state and not (
+                    path == lifecycle_path and function_name in {"__init__", "_swap"}
+                ):
+                    violations.append(f"{path}:{target.lineno}: writes _state")
+                owner = target.value.id if isinstance(target.value, ast.Name) else ""
+                if target.attr in record_fields and "record" in owner.lower():
+                    violations.append(
+                        f"{path}:{target.lineno}: writes approval record {target.attr}"
+                    )
+        for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+            constructor = call.func.id if isinstance(call.func, ast.Name) else ""
+            if (
+                constructor in {"ApprovalMachineState", "ApprovalRecord"}
+                and path != lifecycle_path
+            ):
+                violations.append(f"{path}:{call.lineno}: constructs {constructor}")
+    assert not violations, (
+        "approval state writes outside lifecycle swap seam: " + ", ".join(violations)
+    )
 
 
 class _AbortEvent:
@@ -516,12 +562,10 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
         )
         # the async durable-writer seam does not expose the old registry-thread gate;
         # cleanup may overlap the off-loop history append without publishing a ghost.
-        while ("child", call.id) not in server.control._approval_records:
+        while ("child", call.id) not in server.control._approvals.state.records:
             await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
-        cleanup_task = (
-            asyncio.ensure_future(cleanup) if cleanup is not None else None
-        )
+        cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
         await asyncio.gather(start, *(task for task in [cleanup_task] if task))
         await server.control.wait_for_approval_settlement()
 
@@ -653,7 +697,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             authorizer.authorize(call, signal, capability=capability)
         )
         if path == "delegated":
-            while key not in server.control._approval_records:
+            while key not in server.control._approvals.state.records:
                 await asyncio.sleep(0)
         await server.control._event(
             StreamEvent(
@@ -766,7 +810,9 @@ async def test_protocol_1_0_persistent_approval_failure_keeps_legacy_status_shap
 async def test_observer_persistent_approval_failure_keeps_legacy_status_shape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    server, _controller_reader, controller_writer, call = await _approval_server(tmp_path)
+    server, _controller_reader, controller_writer, call = await _approval_server(
+        tmp_path
+    )
     observer_reader, observer_writer = await asyncio.open_unix_connection(
         str(server.socket_path)
     )
@@ -775,15 +821,30 @@ async def test_observer_persistent_approval_failure_keeps_legacy_status_shape(
         observer_writer,
         10,
         "hello",
-        {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]},
+        {
+            "protocol_version": "1.2",
+            "role": "observer",
+            "features": ["serve_observers"],
+        },
     )
     try:
         await _make_unhealthy(server, call, monkeypatch)
         response = (await _request(observer_reader, observer_writer, 11, "status"))[-1]
         result = response["result"]
-        assert set(result) == {"session", "state", "explicit_finish", "pending_approvals", "usage", "compaction_markers"}
+        assert set(result) == {
+            "session",
+            "state",
+            "explicit_finish",
+            "pending_approvals",
+            "usage",
+            "compaction_markers",
+        }
         assert result["state"] == "idle"
-        mutation = (await _request(observer_reader, observer_writer, 12, "send", {"text": "nope"}))[-1]
+        mutation = (
+            await _request(
+                observer_reader, observer_writer, 12, "send", {"text": "nope"}
+            )
+        )[-1]
         assert mutation["error"]["data"]["code"] == "observer_read_only"
     finally:
         await _close(server, controller_writer)
@@ -857,7 +918,9 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
         )
         assert server.runtime.loop is not None
         monkeypatch.setattr(
-            server.runtime.loop, "steer", lambda *args, **kwargs: effects.append("steer")
+            server.runtime.loop,
+            "steer",
+            lambda *args, **kwargs: effects.append("steer"),
         )
 
         assert await deliveries.send(
@@ -873,9 +936,18 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
             with pytest.raises(ProtocolError) as error:
                 await getattr(deliveries, method)(params, features)
             assert error.value.code == -32010
-        assert deliveries.status({"delivery_id": "retained-send"}, features)["status"] == "delivered"
-        assert deliveries.status({"delivery_id": "evicted-id"}, features)["status"] == "evicted"
-        assert deliveries.status({"delivery_id": "unknown"}, features)["status"] == "unknown"
+        assert (
+            deliveries.status({"delivery_id": "retained-send"}, features)["status"]
+            == "delivered"
+        )
+        assert (
+            deliveries.status({"delivery_id": "evicted-id"}, features)["status"]
+            == "evicted"
+        )
+        assert (
+            deliveries.status({"delivery_id": "unknown"}, features)["status"]
+            == "unknown"
+        )
         for params in (
             {"text": "new", "delivery_id": "new-id"},
             {"text": "unkeyed"},
@@ -885,12 +957,14 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
             assert error.value.code == -32000
         assert effects == []
 
-        response = (await _request(
-            reader, writer, 90, "resume", {"session_id": session_id}
-        ))[-1]
+        response = (
+            await _request(reader, writer, 90, "resume", {"session_id": session_id})
+        )[-1]
         assert "result" in response
         assert not server.control.unhealthy()
-        result = await deliveries.send({"text": "recovered", "delivery_id": "recovered-id"}, features)
+        result = await deliveries.send(
+            {"text": "recovered", "delivery_id": "recovered-id"}, features
+        )
         assert result == {"accepted": True, "session_id": session_id}
         assert effects == ["message", "turn"]
     finally:
@@ -906,12 +980,16 @@ async def test_unhealthy_same_session_resume_reopens_and_clears_after_success(
         await _make_unhealthy(server, call, monkeypatch)
         session_id = server.runtime.session_id
         old_store = server.runtime.opened.store
-        response = (await _request(reader, writer, 9, "resume", {"session_id": session_id}))[-1]
+        response = (
+            await _request(reader, writer, 9, "resume", {"session_id": session_id})
+        )[-1]
         assert "result" in response
         assert server.runtime.session_id == session_id
         assert server.runtime.opened.store is not old_store
         assert not server.control.unhealthy()
-        assert (await _request(reader, writer, 10, "send", {"text": "recovered"}))[-1]["result"]["accepted"] is True
+        assert (await _request(reader, writer, 10, "send", {"text": "recovered"}))[-1][
+            "result"
+        ]["accepted"] is True
     finally:
         await _close(server, writer)
 
@@ -929,7 +1007,9 @@ async def test_unhealthy_same_session_resume_failure_does_not_clear_health(
             "_run_setup",
             lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replay failed")),
         )
-        response = (await _request(reader, writer, 9, "resume", {"session_id": session_id}))[-1]
+        response = (
+            await _request(reader, writer, 9, "resume", {"session_id": session_id})
+        )[-1]
         assert response["error"]["code"] == -32000
         assert server.control.unhealthy()
         assert server.runtime.opened is None
@@ -1077,9 +1157,7 @@ async def test_persistent_failure_removes_many_live_child_approvals(
             monkeypatch.setattr(
                 store,
                 "resolve_approval",
-                lambda *args, **kwargs: (_ for _ in ()).throw(
-                    OSError("disk failed")
-                ),
+                lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
             )
 
         first_key = ("child-0", "child-call-0")
@@ -1413,7 +1491,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
             requested == "always_tool" and resolution["decision"] == "allow"
         )
         key = call.id if path == "foreground" else ("child", call.id)
-        assert key not in server.control._approval_records
+        assert key not in server.control._approvals.state.records
         assert writer_paths
         assert all("persist" in caller for caller in writer_paths)
         if path == "delegated":
@@ -1465,7 +1543,7 @@ async def test_persistent_approval_failure_aborts_session_owned_children(
             "child_cleanup",
             "controller_disconnected",
         }
-        assert not server.control._approval_records
+        assert not server.control._approvals.state.records
         assert not server.control.has_pending_approvals()
     finally:
         await _close(server, writer)
@@ -1478,6 +1556,7 @@ async def test_concurrent_delegated_history_uses_store_durable_writer(
 ) -> None:
     store = ConversationStore(tmp_path / "concurrent-history")
     tool_call = ToolCall("concurrent-call", "read", {"path": "input"})
+
     async def write_pair(request_id: str) -> None:
         request = {
             "event": "approval_request",
@@ -1521,7 +1600,7 @@ async def test_approval_lifecycle_has_no_records_after_release(
         await server.control._event(_start_event(call))
         await server.control.controller_released()
         await server.control.wait_for_approval_settlement()
-        assert server.control._approval_records == {}
+        assert server.control._approvals.state.records == {}
         assert server.control._approvals.active_keys() == ()
     finally:
         await _close(server, writer)
@@ -1559,6 +1638,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
     assert policy is not None
     request = ApprovalRequest(call.id, call, child_instance_id="child")
     parent = server.runtime.opened.store
+
     async def fail_history(*args: object, **kwargs: object) -> None:
         del args, kwargs
         raise OSError("request history failed")
@@ -1577,12 +1657,10 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
                 background=True,
             )
         )
-        while ("child", call.id) not in server.control._approval_records:
+        while ("child", call.id) not in server.control._approvals.state.records:
             await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
-        cleanup_task = (
-            asyncio.ensure_future(cleanup) if cleanup is not None else None
-        )
+        cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
         await asyncio.gather(start, *(task for task in [cleanup_task] if task))
 
         assert child.approval_resolution_data(call.id) == {
@@ -1590,7 +1668,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
             "decision": "abort",
             "reason": "child_cleanup",
         }
-        assert ("child", call.id) not in server.control._approval_records
+        assert ("child", call.id) not in server.control._approvals.state.records
         history = [
             entry.data for entry in parent.entries if entry.type == "approval_history"
         ]
