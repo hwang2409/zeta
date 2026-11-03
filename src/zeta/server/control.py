@@ -270,6 +270,8 @@ class ServeControl:
             )
 
     async def _run_blocking(self, job: Callable[[], object]) -> object:
+        if self.closing:
+            return await asyncio.to_thread(job)
         registry = self.server.connections
         if registry is None:
             raise RuntimeError("serve control worker is unavailable")

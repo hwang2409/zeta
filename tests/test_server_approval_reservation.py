@@ -7,7 +7,6 @@ import json
 import threading
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -21,7 +20,7 @@ from tests.test_server import (
     _request,
     _socket_path,
 )
-from zeta.core.approval import ApprovalPolicy, ApprovalRequest
+from zeta.core.approval import ApprovalRequest
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -65,14 +64,25 @@ def _reservation_gate(
     server: ZetaServer, monkeypatch: pytest.MonkeyPatch
 ) -> asyncio.Event:
     entered = asyncio.Event()
-    original = server.control._reserve
+    reserve = getattr(server.control, "_reserve", None)
+    if reserve is not None:
 
-    def reserve(*args: object, **kwargs: object) -> bool:
-        result = original(*args, **kwargs)
-        entered.set()
-        return result
+        def gated_reserve(*args: object, **kwargs: object) -> bool:
+            result = reserve(*args, **kwargs)
+            entered.set()
+            return result
 
-    monkeypatch.setattr(server.control, "_reserve", reserve)
+        monkeypatch.setattr(server.control, "_reserve", gated_reserve)
+    else:
+        terminate = server.control._terminate_pending_approvals
+
+        async def gated_terminate(*args: object, **kwargs: object) -> None:
+            entered.set()
+            await terminate(*args, **kwargs)
+
+        monkeypatch.setattr(
+            server.control, "_terminate_pending_approvals", gated_terminate
+        )
     return entered
 
 
@@ -283,59 +293,114 @@ async def test_approval_start_disconnect_then_terminal_while_lookup_gated(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_first", [False, True])
 async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_first: bool
 ) -> None:
+    server, _reader, writer, _foreground = await _approval_server(tmp_path)
     store = ConversationStore(tmp_path / "child")
     call = ToolCall("child-call", "read", {"path": "input"})
     store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
     )
-    server = ZetaServer(home=tmp_path / "serve", port=0, provider="codex")
-    await server.start()
-    policy = ApprovalPolicy(store=ConversationStore(tmp_path / "parent"))
-    server.runtime._state = SimpleNamespace(policy=policy, loop=None, opened=None)
+    policy = server.runtime.policy
+    assert policy is not None
     request = ApprovalRequest(call.id, call, child_instance_id="child")
-    server.control.bind_policy(policy)
     policy.register_delegated(request, store, child_instance_id="child")
-    assert policy._delegated == {}
-    cleanup = policy.cleanup_delegated("child")
-    if cleanup is not None:
-        await cleanup
-    await server.control.wait_for_approval_settlement()
-    assert store.approval_resolution_data(call.id)["decision"] == "abort"
-    assert server.control.pending_approvals_now() == []
-    store.close()
-    server.runtime._state = None
-    await server.close()
+    await server.control._event(
+        StreamEvent(
+            StreamEventType.TOOL_APPROVAL_START,
+            tool_call=call,
+            data={"agent_instance_id": "child"},
+        ),
+        session_id="parent",
+        background=True,
+    )
+    wire_id = server.control._approvals.wire_id(request.key)
+    gate = _StoreGate(store, "resolve_approval")
+    monkeypatch.setattr(store, gate.method, gate.call)
+    try:
+        if cleanup_first:
+            cleanup = policy.cleanup_delegated("child")
+            assert cleanup is not None
+            await _wait_thread_gate(gate)
+            with pytest.raises(ProtocolError) as loser:
+                await server.control.resolve_approval("approve", wire_id)
+            assert loser.value.code == -32006
+            gate.release.set()
+            await cleanup
+            expected = "abort"
+        else:
+            approve = asyncio.create_task(
+                server.control.resolve_approval("approve", wire_id)
+            )
+            await _wait_thread_gate(gate)
+            assert policy.cleanup_delegated("child") is None
+            gate.release.set()
+            result = await approve
+            assert result["decision"] == "approve"
+            expected = "allow"
+        await server.control.wait_for_approval_settlement()
+        assert store.approval_resolution_data(call.id)["decision"] == expected
+        rows = [entry for entry in store.entries if entry.type == "approval_resolution"]
+        assert len(rows) == 1
+        pending = await server.control.pending_approvals()
+        assert all(item["request_id"] != wire_id for item in pending)
+        assert policy._delegated == {}
+    finally:
+        gate.release.set()
+        await _close(server, writer)
+        store.close()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("abort_first", [False, True])
 async def test_same_tick_approval_reservation_winner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, abort_first: bool
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
+    events: list[str] = []
+    original_notify = server.control._notify
+
+    async def record(event: str, *args: object, **kwargs: object) -> bool:
+        events.append(event)
+        return await original_notify(event, *args, **kwargs)
+
+    monkeypatch.setattr(server.control, "_notify", record)
     try:
         await server.control._event(_start_event(call))
         store = server.runtime.opened.store
         gate = _StoreGate(store, "resolve_approval")
         monkeypatch.setattr(store, gate.method, gate.call)
-        approve = asyncio.create_task(
-            server.control.resolve_approval("approve", call.id)
-        )
-        await _wait_thread_gate(gate)
-        abort = asyncio.create_task(server.control._terminate_pending_approvals())
-        gate.release.set()
-        results = await asyncio.gather(approve, abort, return_exceptions=True)
+        if abort_first:
+            abort = asyncio.create_task(server.control._terminate_pending_approvals())
+            await _wait_thread_gate(gate)
+            with pytest.raises(ProtocolError) as loser:
+                await server.control.resolve_approval("approve", call.id)
+            assert loser.value.code == -32006
+            gate.release.set()
+            await abort
+        else:
+            approve = asyncio.create_task(
+                server.control.resolve_approval("approve", call.id)
+            )
+            await _wait_thread_gate(gate)
+            abort = asyncio.create_task(server.control._terminate_pending_approvals())
+            assert not abort.done()
+            gate.release.set()
+            result = await approve
+            await abort
+            assert result["decision"] == "approve"
         assert gate.thread_ids != [threading.get_ident()]
-        assert sum(not isinstance(item, BaseException) for item in results) >= 1
         rows = [
             entry
             for entry in server.runtime.opened.store.entries
             if entry.type == "approval_resolution"
         ]
         assert len(rows) == 1
+        assert events.count("approval_end") == 1
     finally:
+        gate.release.set()
         await _close(server, writer)
 
 
@@ -364,6 +429,7 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
             lambda **kwargs: aborted.append(True),
         )
         store = server.runtime.opened.store
+        durable_resolve = store.resolve_approval
         monkeypatch.setattr(
             store,
             "resolve_approval",
@@ -377,6 +443,25 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
         with pytest.raises(ProtocolError) as later:
             await server.control.resolve_approval("approve", call.id)
         assert later.value.code == -32006
+
+        call2 = ToolCall("call-committed", "read", {"path": "/tmp/committed"})
+        store.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(call2)]),
+            [(call2.id, call2)],
+        )
+        await server.control._event(_start_event(call2))
+        events.clear()
+        aborted.clear()
+
+        def commit_then_fail(*args: object, **kwargs: object) -> object:
+            durable_resolve(*args, **kwargs)
+            raise OSError("acknowledgement lost")
+
+        monkeypatch.setattr(store, "resolve_approval", commit_then_fail)
+        committed = await server.control.resolve_approval("approve", call2.id)
+        assert committed["decision"] == "approve"
+        assert events == [("approval_end", None)]
+        assert aborted == []
     finally:
         await _close(server, writer)
 
@@ -407,6 +492,9 @@ async def test_legacy_status_bytes_match_main_off_loop(
         writer.write(b'{"jsonrpc":"2.0","id":9,"method":"status","params":{}}\n')
         await writer.drain()
         await _wait_thread_gate(gate)
+        responsive = asyncio.Event()
+        asyncio.get_running_loop().call_soon(responsive.set)
+        await asyncio.wait_for(responsive.wait(), TIMEOUT)
         gate.release.set()
         actual = await _read_raw(reader)
         assert gate.thread_ids != [threading.get_ident()]
@@ -435,6 +523,9 @@ async def test_legacy_disconnect_abort_is_off_loop_and_byte_identical(
         monkeypatch.setattr(store, gate.method, gate.call)
         released = asyncio.create_task(server.control.controller_released())
         await _wait_thread_gate(gate)
+        responsive = asyncio.Event()
+        asyncio.get_running_loop().call_soon(responsive.set)
+        await asyncio.wait_for(responsive.wait(), TIMEOUT)
         gate.release.set()
         await released
         assert gate.thread_ids != [threading.get_ident()]
@@ -449,32 +540,68 @@ async def test_legacy_disconnect_abort_is_off_loop_and_byte_identical(
 async def test_stale_start_worker_cannot_cross_session_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    server, _reader, writer, call = await _approval_server(tmp_path)
+    server, reader, writer, call = await _approval_server(tmp_path)
     try:
         start, gate = await _gated_start(server, call, monkeypatch)
-        server.control.session_replaced()
+        reserved = _reservation_gate(server, monkeypatch)
+        replacement = asyncio.create_task(
+            _request(reader, writer, "replace", "new_session", {"provider": "codex"})
+        )
+        await asyncio.wait_for(reserved.wait(), TIMEOUT)
         gate.release.set()
-        await asyncio.wait_for(start, TIMEOUT)
-        assert server.control.pending_approvals_now() == []
+        await asyncio.wait_for(asyncio.gather(start, replacement), TIMEOUT)
+        assert await server.control.pending_approvals() == []
     finally:
         await _close(server, writer)
 
 
-def test_serve_bound_delegated_never_touches_policy_registry(tmp_path: Path) -> None:
-    policy = ApprovalPolicy(store=ConversationStore(tmp_path / "parent"))
+@pytest.mark.asyncio
+async def test_serve_bound_delegated_never_touches_policy_registry(
+    tmp_path: Path,
+) -> None:
+    server, _reader, writer, _call = await _approval_server(tmp_path)
     child = ConversationStore(tmp_path / "child")
     call = ToolCall("child-call", "read", {"path": "input"})
-    request = ApprovalRequest(call.id, call, child_instance_id="child")
-    control = SimpleNamespace(
-        register_delegated=lambda *args: None, cleanup_delegated=lambda *args: None
+    child.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
     )
-    policy.bind_serve_control(control)
-    policy.register_delegated(request, child, child_instance_id="child")
-    assert policy._delegated == {}
-    policy.cleanup_delegated("child")
-    assert policy._delegated == {}
-    child.close()
-    policy._store.close()
+    request = ApprovalRequest(call.id, call, child_instance_id="child")
+    policy = server.runtime.policy
+    assert policy is not None
+    closed = False
+    late: ConversationStore | None = None
+    try:
+        policy.register_delegated(request, child, child_instance_id="child")
+        assert policy._delegated == {}
+        cleanup = policy.cleanup_delegated("child")
+        assert policy._delegated == {}
+        if cleanup is not None:
+            await cleanup
+
+        await _close(server, writer)
+        closed = True
+        late = ConversationStore(tmp_path / "late-child")
+        late_call = ToolCall("late-call", "read", {"path": "late"})
+        late.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(late_call)]),
+            [(late_call.id, late_call)],
+        )
+        late_request = ApprovalRequest(
+            late_call.id, late_call, child_instance_id="late-child"
+        )
+        policy.register_delegated(
+            late_request, late, child_instance_id="late-child"
+        )
+        await server.control.wait_for_approval_settlement()
+        assert late.approval_resolution_data(late_call.id)["decision"] == "abort"
+        policy.cleanup_delegated("late-child")
+        assert policy._delegated == {}
+    finally:
+        if not closed:
+            await _close(server, writer)
+        if late is not None:
+            late.close()
+        child.close()
 
 
 @pytest.mark.asyncio
