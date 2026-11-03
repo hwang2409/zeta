@@ -48,6 +48,7 @@ def test_approval_lifecycle_state_has_one_writer_in_all_production_modules() -> 
         "generation",
         "token",
         "phase",
+        "state",
         "disposition",
         "request",
         "history_published",
@@ -92,14 +93,38 @@ def test_approval_lifecycle_state_has_one_writer_in_all_production_modules() -> 
                     )
         for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
             constructor = call.func.id if isinstance(call.func, ast.Name) else ""
+            if constructor not in {"ApprovalMachineState", "ApprovalRecord"}:
+                continue
+            function = parents.get(call)
+            while function is not None and not isinstance(
+                function, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                function = parents.get(function)
+            function_name = function.name if function is not None else "<module>"
+            allowed_functions = {
+                "ApprovalMachineState": {"__init__", "_swap"},
+                "ApprovalRecord": {"_new_record"},
+            }
             if (
-                constructor in {"ApprovalMachineState", "ApprovalRecord"}
-                and path != lifecycle_path
+                path != lifecycle_path
+                or function_name not in allowed_functions[constructor]
             ):
                 violations.append(f"{path}:{call.lineno}: constructs {constructor}")
     assert not violations, (
         "approval state writes outside lifecycle swap seam: " + ", ".join(violations)
     )
+
+
+@pytest.mark.asyncio
+async def test_approval_lifecycle_transition_rejects_unknown_event(
+    tmp_path: Path,
+) -> None:
+    server, _reader, writer, _call = await _approval_server(tmp_path)
+    try:
+        with pytest.raises(AssertionError, match="unhandled approval lifecycle event"):
+            await server.control._approvals.transition(object())  # type: ignore[arg-type]
+    finally:
+        await _close(server, writer)
 
 
 class _AbortEvent:

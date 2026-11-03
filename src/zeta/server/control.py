@@ -20,6 +20,11 @@ from . import abort_scope, event_contract, model_selection
 from .approval_lifecycle import (
     ApprovalKey,
     ApprovalLifecycle,
+    Cancel,
+    Decide,
+    ExternalEnd,
+    Start,
+    Terminate,
 )
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .protocol import FrameWriteCancelled, ProtocolError, bounded
@@ -96,7 +101,7 @@ class ServeControl:
                 if self.server.runtime.opened is not None
                 else None
             ),
-            offload=self._run_blocking,
+            offload=lambda job: self._run_blocking(job),
             is_closing=lambda: self.closing,
         )
 
@@ -243,9 +248,10 @@ class ServeControl:
         loop = self.server.runtime.loop
         if loop is None:
             raise ProtocolError(-32003, "no active session")
-        result, core_key = await self._approvals.resolve_approval(
-            method, request_id, scope
+        result, core_key = await self._approvals.transition(
+            Decide(method, request_id, scope)
         )
+        assert isinstance(result, dict)
         if (
             not self.turn_busy()
             and isinstance(core_key, str)
@@ -263,8 +269,8 @@ class ServeControl:
         child_instance_id: str | None = None,
         reason: str = "turn_canceled",
     ) -> Awaitable[object]:
-        return self._approvals.request_approval_abort(
-            request_id, child_instance_id=child_instance_id, reason=reason
+        return asyncio.create_task(
+            self._approvals.transition(Cancel(request_id, child_instance_id, reason))
         )
 
     async def abort(
@@ -591,7 +597,7 @@ class ServeControl:
     async def _start_approval(
         self, event: StreamEvent, session_id: str | None, wire_event: str
     ) -> None:
-        await self._approvals._start_approval(event, session_id, wire_event)
+        await self._approvals.transition(Start(event, session_id, wire_event))
 
     def _protocol_version(self) -> str:
         connections = self.server.connections
@@ -639,14 +645,31 @@ class ServeControl:
             return False
         return await connections.publish_controller(event, session_id, **fields)
 
-    async def _end_approval(self, *args: object, **kwargs: object) -> None:
-        await self._approvals._end_approval(*args, **kwargs)
+    async def _end_approval(
+        self,
+        key: ApprovalKey,
+        session_id: str | None,
+        *,
+        data: dict[str, object],
+        suppress_write_errors: bool = False,
+    ) -> None:
+        await self._approvals.transition(
+            ExternalEnd(key, session_id, data, suppress_write_errors)
+        )
 
     async def _end_stale_approvals(self, session_id: str | None) -> None:
         await self._approvals._end_stale_approvals(session_id)
 
-    async def _terminate_pending_approvals(self, **kwargs: object) -> None:
-        await self._approvals._terminate_pending_approvals(**kwargs)
+    async def _terminate_pending_approvals(
+        self,
+        *,
+        foreground_only: bool = False,
+        suppress_write_errors: bool = False,
+        reason: str = "controller_disconnected",
+    ) -> None:
+        await self._approvals.transition(
+            Terminate(foreground_only, suppress_write_errors, reason)
+        )
 
 
 def _approval_key(event: StreamEvent) -> ApprovalKey:

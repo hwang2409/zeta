@@ -60,6 +60,88 @@ class ApprovalMachineState:
     health: SessionHealth | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class Register:
+    request: ApprovalRequest
+    store: ConversationStore
+    child_instance_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class Start:
+    stream_event: StreamEvent
+    session_id: str | None
+    wire_event: str
+
+
+@dataclass(frozen=True, slots=True)
+class Decide:
+    method: str
+    request_id: str
+    scope: str = "once"
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalEnd:
+    key: ApprovalKey
+    session_id: str | None
+    data: Mapping[str, object]
+    suppress_write_errors: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class Cancel:
+    request_id: str
+    child_instance_id: str | None = None
+    reason: str = "turn_canceled"
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupChild:
+    child_instance_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class Terminate:
+    foreground_only: bool = False
+    suppress_write_errors: bool = False
+    reason: str = "controller_disconnected"
+
+
+@dataclass(frozen=True, slots=True)
+class Replace:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Close:
+    pass
+
+
+ApprovalEvent = (
+    Register
+    | Start
+    | Decide
+    | ExternalEnd
+    | Cancel
+    | CleanupChild
+    | Terminate
+    | Replace
+    | Close
+)
+
+
+class _Completed:
+    def __init__(self, value: object = None) -> None:
+        self._value = value
+
+    def __await__(self):
+        async def result() -> object:
+            return self._value
+
+        return result().__await__()
+
+
 def approval_display_fields(request: ApprovalRequest) -> dict[str, object]:
     """Return immutable trusted display facts for an approval request."""
 
@@ -137,8 +219,24 @@ class ApprovalLifecycle:
             current.generation == record.generation and current.token == record.token
         )
 
-    def transition(self, event: str, **data: object) -> ApprovalMachineState:
-        """Apply one guarded lifecycle event and publish one immutable state."""
+    def _apply_record_transition(
+        self,
+        event: Literal[
+            "reserve",
+            "reserve_starting",
+            "mark_pending",
+            "externalize",
+            "health_abort",
+            "fail",
+            "replace",
+            "close",
+        ],
+        *,
+        record: ApprovalRecord | None = None,
+        disposition: str | None = None,
+        health: SessionHealth | None = None,
+    ) -> ApprovalMachineState:
+        """Apply one immutable record-state change."""
         if event in {
             "reserve",
             "reserve_starting",
@@ -146,11 +244,9 @@ class ApprovalLifecycle:
             "externalize",
             "health_abort",
         }:
-            record = data.get("record")
-            if not isinstance(record, ApprovalRecord):
+            if record is None:
                 raise TypeError(f"{event} requires an approval record")
-            disposition = data.get("disposition")
-            if not isinstance(disposition, str):
+            if disposition is None:
                 raise TypeError(f"{event} requires a disposition")
             if event == "mark_pending":
                 if record.phase != "starting" or record.disposition != "active":
@@ -173,7 +269,6 @@ class ApprovalLifecycle:
             else:
                 raise ValueError(f"cannot reserve approval {record.phase}")
         elif event == "fail":
-            health = data.get("health")
             if not isinstance(health, SessionHealth):
                 raise TypeError("fail requires SessionHealth")
             self._swap(self._state.records, health=health)
@@ -185,6 +280,59 @@ class ApprovalLifecycle:
         else:
             raise ValueError(f"unknown approval lifecycle event: {event}")
         return self._state
+
+    def transition(self, event: ApprovalEvent) -> Awaitable[object]:
+        """Run one typed lifecycle event, including its durable operation."""
+
+        async def close() -> object:
+            await self._terminate_approval_records(
+                foreground_only=False,
+                suppress_write_errors=True,
+                reason="session_closed",
+            )
+            self._apply_record_transition("close")
+            return None
+
+        match event:
+            case Register(request, store, child_instance_id):
+                self._register_delegated(request, store, child_instance_id)
+                return _Completed()
+            case Start(stream_event, session_id, wire_event):
+                return self._start_approval(stream_event, session_id, wire_event)
+            case Decide(method, request_id, scope):
+                return self.resolve_approval(method, request_id, scope)
+            case ExternalEnd(key, session_id, data, suppress_write_errors):
+                return self._end_approval(
+                    key,
+                    session_id,
+                    data=dict(data),
+                    suppress_write_errors=suppress_write_errors,
+                )
+            case Cancel(request_id, child_instance_id, reason):
+                key: ApprovalKey = (
+                    (child_instance_id, request_id)
+                    if child_instance_id is not None
+                    else request_id
+                )
+                return self._settle_canceled_approval(key, reason)
+            case CleanupChild(child_instance_id):
+                cleanup = self._cleanup_delegated(child_instance_id)
+                return cleanup if cleanup is not None else _Completed()
+            case Terminate(foreground_only, suppress_write_errors, reason):
+                return self._terminate_approval_records(
+                    foreground_only=foreground_only,
+                    suppress_write_errors=suppress_write_errors,
+                    reason=reason,
+                )
+            case Replace():
+                self._apply_record_transition("replace")
+                return _Completed()
+            case Close():
+                return close()
+            case _ as unreachable:
+                raise AssertionError(
+                    f"unhandled approval lifecycle event: {unreachable!r}"
+                )
 
     def observe(
         self,
@@ -311,7 +459,7 @@ class ApprovalLifecycle:
         self._swap({})
 
     def session_replaced(self) -> None:
-        self.transition("replace")
+        self.transition(Replace())
 
     async def wait_for_approval_settlement(self) -> None:
         while tasks := [
@@ -324,7 +472,7 @@ class ApprovalLifecycle:
     def _approval_transition(
         self, event: str, record: ApprovalRecord, disposition: str
     ) -> ApprovalRecord:
-        self.transition(event, record=record, disposition=disposition)
+        self._apply_record_transition(event, record=record, disposition=disposition)
         return self._state.records.get(record.target.key, record)
 
     def _new_record(self, target: _ApprovalTarget) -> ApprovalRecord:
@@ -343,6 +491,14 @@ class ApprovalLifecycle:
         )
 
     def register_delegated(
+        self,
+        request: ApprovalRequest,
+        store: ConversationStore,
+        child_instance_id: str,
+    ) -> None:
+        self.transition(Register(request, store, child_instance_id))
+
+    def _register_delegated(
         self,
         request: ApprovalRequest,
         store: ConversationStore,
@@ -379,6 +535,10 @@ class ApprovalLifecycle:
             self._change(record, settlement=task)
 
     def cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
+        cleanup = self.transition(CleanupChild(child_instance_id))
+        return None if isinstance(cleanup, _Completed) else cleanup
+
+    def _cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
         settlements: list[asyncio.Task[object]] = []
         for key, record in tuple(self._state.records.items()):
             if not isinstance(key, tuple) or key[0] != child_instance_id:
@@ -572,7 +732,7 @@ class ApprovalLifecycle:
                 await self._finish_record(record, synthetic)
                 return synthetic
             if owns_record:
-                self.transition(
+                self._apply_record_transition(
                     "fail",
                     health=SessionHealth(
                         "approval_persistence_failed",
@@ -612,12 +772,9 @@ class ApprovalLifecycle:
         reason: str = "turn_canceled",
     ) -> asyncio.Task[dict[str, str] | None]:
         """Route a serve-bound cancellation through the settlement owner."""
-        key: ApprovalKey = (
-            (child_instance_id, request_id)
-            if child_instance_id is not None
-            else request_id
-        )
-        return asyncio.create_task(self._settle_canceled_approval(key, reason))
+        settlement = self.transition(Cancel(request_id, child_instance_id, reason))
+        assert not isinstance(settlement, _Completed)
+        return asyncio.create_task(settlement)
 
     async def _settle_canceled_approval(
         self, key: ApprovalKey, reason: str
@@ -868,19 +1025,6 @@ class ApprovalLifecycle:
             )
             if resolution is not None:
                 await self._finish_record(record, resolution)
-
-    async def _terminate_pending_approvals(
-        self,
-        *,
-        foreground_only: bool = False,
-        suppress_write_errors: bool = False,
-        reason: str = "controller_disconnected",
-    ) -> None:
-        await self._terminate_approval_records(
-            foreground_only=foreground_only,
-            suppress_write_errors=suppress_write_errors,
-            reason=reason,
-        )
 
     async def _terminate_approval_records(
         self,
