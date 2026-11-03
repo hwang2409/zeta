@@ -32,8 +32,8 @@ from . import (
 )
 from . import approval_lifecycle as approvals
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
-from .delivery import DeliveryRequests, TurnOutcome
-from .model_inputs import PendingModelInputs
+from .connections import ConnectionRegistry
+from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .notification_presentation import NotificationPresentation
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
@@ -56,11 +56,8 @@ from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
 USER_MESSAGE_MAX_BYTES = 262_144
-
-
 class ZetaServer:
     """Serve one local client over a Unix socket or localhost TCP."""
-
     def __init__(
         self,
         *,
@@ -121,10 +118,11 @@ class ZetaServer:
         )
         self._client_active = False
         self._client: _Client | None = None
+        self.connections: ConnectionRegistry | None = None
+        self._account_warnings: tuple[str, ...] = ()
         self._socket_created = False
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
-        self._account_warnings: tuple[str, ...] = ()
     @property
     def address(self) -> str:
         if self.port is not None:
@@ -133,6 +131,7 @@ class ZetaServer:
     async def start(self) -> None:
         await self.runtime.initialize_project_registry()
         self._account_warnings = await accounts.migrate(self.home)
+        self.connections = ConnectionRegistry(asyncio.get_running_loop())
         if self.port is None:
             self._prepare_socket_path()
             self._server = await asyncio.start_unix_server(
@@ -159,7 +158,6 @@ class ZetaServer:
         assert self._server is not None
         async with self._server:
             await self._server.serve_forever()
-
     async def close(self) -> None:
         try:
             if self._client is not None:
@@ -167,6 +165,9 @@ class ZetaServer:
         finally:
             self._client = None
             self._client_active = False
+            if self.connections is not None:
+                await self.connections.aclose()
+                self.connections = None
             try:
                 if self._websocket is not None:
                     await self._websocket.close()
@@ -183,7 +184,6 @@ class ZetaServer:
                             if stat.S_ISSOCK(self.socket_path.stat().st_mode):
                                 self.socket_path.unlink()
                         self._socket_created = False
-
     def _prepare_socket_path(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -214,35 +214,29 @@ class ZetaServer:
         finally:
             probe.close()
         self.socket_path.unlink()
-
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        if self._client_active:
-            codec = FrameCodec()
-            await codec.write(
-                writer,
-                codec.error_response(
-                    None, -32001, "another client is already connected"
-                ),
-            )
-            writer.close()
-            await writer.wait_closed()
-            return
-        self._client_active = True
-        self._client = _Client(self, reader, writer)
-        self.runtime.set_background_event_sink(self._client._publish_background_event)
-        self.runtime.set_memory_notice_sink(self._client._publish_memory_notice)
-        self.runtime.set_background_wake_sink(self._client._schedule_background_wake)
+        registry = self.connections
+        assert registry is not None
+        client = _Client(self, reader, writer)
         try:
-            await self._client.run()
+            registry.register(client)
+        except RuntimeError:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
+        try:
+            await client.run()
         finally:
-            self.runtime.set_background_event_sink(None)
-            self.runtime.set_memory_notice_sink(None)
-            self.runtime.set_background_wake_sink(None)
-            self._client = None
-            self._client_active = False
-
+            if self._client is client:
+                self.runtime.set_background_event_sink(None)
+                self.runtime.set_memory_notice_sink(None)
+                self.runtime.set_background_wake_sink(None)
+                self._client = None
+                self._client_active = False
+            registry.release(client)
 class _Client:
     def __init__(
         self,
@@ -253,8 +247,13 @@ class _Client:
         self.server = server
         self.reader = reader
         self.writer = writer
+        if server.connections is None:
+            server.connections = ConnectionRegistry(asyncio.get_running_loop())
+            server.connections.register(self)
+        self.connections = server.connections
         self.logins = login.Logins(server.home)
         self.handshaken = False
+        self.role: str | None = None
         self.protocol_version = "1.0"
         self.features: frozenset[str] = frozenset()
         self._write_lock = asyncio.Lock()
@@ -268,7 +267,6 @@ class _Client:
         self.projects = ProjectRequests.for_runtime(home=server.home, runtime=server.runtime, codec=self.codec)
         self.deliveries = DeliveryRequests(self)
         self._approvals = ApprovalLifecycle()
-
     async def run(self) -> None:
         try:
             while True:
@@ -326,10 +324,8 @@ class _Client:
                     break
         finally:
             await self.close()
-
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
-
         while True:
             newline = self._read_buffer.find(b"\n")
             if newline >= 0:
@@ -353,10 +349,8 @@ class _Client:
                 self._read_buffer.clear()
                 return line
             self._read_buffer.extend(chunk)
-
     async def _discard_oversized_frame(self, prefix: bytes) -> bytes:
         """Discard an oversized line and preserve any complete later frames."""
-
         while True:
             chunk = await self.reader.read(65_536)
             if not chunk:
@@ -366,12 +360,15 @@ class _Client:
                 continue
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
-
     async def close(self) -> None:
         async with self._close_lock:
             if self._closed:
                 return
-            await self._terminate_pending_approvals(suppress_write_errors=True)
+            if self.role == "controller":
+                self.server.runtime.set_background_event_sink(None)
+                self.server.runtime.set_memory_notice_sink(None)
+                self.server.runtime.set_background_wake_sink(None)
+                await self._terminate_pending_approvals(suppress_write_errors=True)
             await accounts.cancel_owned_switch(self)
             if self._turn_task is not None and not self._turn_task.done():
                 loop = self.server.runtime.loop
@@ -387,15 +384,34 @@ class _Client:
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
             self._closed = True
+    async def _route_request(
+        self, method: str, params: dict[str, Any]
+    ) -> tuple[bool, object]:
+        if method == "hello":
+            result = self._hello(params)
+            if self.role == "controller":
+                self.server._client_active = True
+                self.server._client = self
+                self.server.runtime.set_background_event_sink(
+                    self._publish_background_event
+                )
+                self.server.runtime.set_memory_notice_sink(self._publish_memory_notice)
+                self.server.runtime.set_background_wake_sink(
+                    self._schedule_background_wake
+                )
+                await self._attach_pending_notifications()
+            return True, result
+        if not self.handshaken:
+            raise ProtocolError(-32002, "hello must be the first request")
+        assert self.server.connections is not None
+        return await self.server.connections.route_request(self, method, params)
+
     async def _dispatch(
         self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> object:
-        if method == "hello":
-            result = self._hello(params)
-            await self._attach_pending_notifications()
+        handled, result = await self._route_request(method, params)
+        if handled:
             return result
-        if not self.handshaken:
-            raise ProtocolError(-32002, "hello must be the first request")
         if method in login.REQUESTS:
             if self.protocol_version == "1.0":
                 raise ProtocolError(-32601, "login is unavailable on this server")
@@ -472,7 +488,6 @@ class _Client:
         if method == "status":
             return self._status()
         raise ProtocolError(-32601, f"method not found: {method}")
-
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:
             raise ProtocolError(-32600, "hello may only be sent once")
@@ -491,8 +506,12 @@ class _Client:
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
         self.features = frozenset(accepted)
-        self.server.runtime.set_post_stream_provider_retry(
-            "assistant_reset" in self.features
+        assert self.server.connections is not None
+        role = self.server.connections.negotiate_role(
+            self,
+            params.get("role", "controller"),
+            self.protocol_version,
+            self.features,
         )
         self.handshaken = True
         requests = [
@@ -518,6 +537,7 @@ class _Client:
                 requests.append("clear_steering")
             if "delivery_id" in self.features:
                 requests.append("delivery_status")
+        requests = self.server.connections.requests_for_role(role, requests)
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],
@@ -534,18 +554,15 @@ class _Client:
             assert isinstance(notices, list)
             notices.extend(self.server._account_warnings)
         return result
-
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
             raise ProtocolError(
                 -32602, f"{param} requires the negotiated {feature} feature"
             )
-
     async def _user_message(
         self, text: str, mode: str, attachments: list[dict[str, object]] | None = None
     ) -> None:
         """Echo an accepted user message so observers can rebuild the transcript."""
-
         if "user_message_event" in self.features:
             await self._notify(
                 event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.USER_MESSAGE],
@@ -554,7 +571,6 @@ class _Client:
                 mode=mode,
                 attachments=attachments or [],
             )
-
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
         runtime = self.server.runtime
         if method in {"rename_session", "delete_session"}:
@@ -611,7 +627,6 @@ class _Client:
             if not current or current[-1].id != head:
                 store.switch_to_branch(head)
         return ergonomics.tree(runtime)
-
     async def _approval(
         self, method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
@@ -668,7 +683,6 @@ class _Client:
         if scope != "once":
             result["scope"] = scope
         return result
-
     async def _abort(self, scope: abort_scope.AbortScope = "session") -> dict[str, object]:
         session_id = self.server.runtime.session_id
         outcome = (
@@ -677,11 +691,9 @@ class _Client:
             else TurnOutcome.SESSION_CANCELED
         )
         turn_task = self._turn_task
-
         def mark_canceled() -> None:
             if turn_task is not None and not turn_task.done():
                 self._turn_cancel_outcome = outcome
-
         aborted = await abort_scope.abort_active_turn(
             turn_task,
             scope=scope,
@@ -694,7 +706,6 @@ class _Client:
         if aborted:
             await self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.TURN_ABORTED], session_id)
         return {"aborted": aborted}
-
     def _session_snapshot(self) -> dict[str, object] | None:
         runtime = self.server.runtime
         if runtime.opened is None:
@@ -703,12 +714,11 @@ class _Client:
         if runtime.policy is not None:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
-
     def _status(self) -> dict[str, object]:
         runtime = self.server.runtime
         session = self._session_snapshot()
         pending = []
-        if runtime.policy is not None:
+        if self.role != "observer" and runtime.policy is not None:
             pending = [
                 {
                     **self._approvals.observe(item),
@@ -732,7 +742,6 @@ class _Client:
                 else 0
             ),
         }
-
     async def _run_turn(
         self,
         text: str,
@@ -781,7 +790,6 @@ class _Client:
             await self._event(agent_end, session_id=session_id)
             if outcome is TurnOutcome.COMPLETED:
                 self._schedule_background_wake(session_id)
-
     def _schedule_background_wake(self, session_id: str) -> None:
         if self._closed:
             return
@@ -794,7 +802,6 @@ class _Client:
         self._turn_task = asyncio.create_task(
             self._run_notification_turn(session_id)
         )
-
     async def _run_notification_turn(self, session_id: str) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -837,7 +844,6 @@ class _Client:
             await self._event(agent_end, session_id=session_id)
             if outcome is TurnOutcome.COMPLETED:
                 self._schedule_background_wake(session_id)
-
     async def _attach_pending_notifications(self) -> None:
         runtime = self.server.runtime
         loop = runtime.loop
@@ -845,7 +851,6 @@ class _Client:
             return
         if loop.notification_system_message() is not None:
             self._schedule_background_wake(runtime.session_id)
-
     async def _resume_tool(self, request_id: str) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -854,7 +859,6 @@ class _Client:
         session_id = state.session_id
         event_tasks: list[asyncio.Task[None]] = []
         agent_end: StreamEvent | None = None
-
         def emit(event: StreamEvent) -> None:
             nonlocal agent_end
             if event.type is StreamEventType.AGENT_END:
@@ -863,7 +867,6 @@ class _Client:
                 event_tasks.append(
                     asyncio.create_task(self._event(event, session_id=session_id))
                 )
-
         outcome = TurnOutcome.COMPLETED
         try:
             await loop.resume_pending_tool(
@@ -886,7 +889,6 @@ class _Client:
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id)
             self._schedule_background_wake(session_id)
-
     async def _event(
         self,
         event: StreamEvent,
@@ -1051,10 +1053,8 @@ class _Client:
         await self._notify(
             wire_event, session_id, data=dict(event.data)
         )
-
     def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
         """Schedule child events from the loop's synchronous sink."""
-
         if not self._closed:
             asyncio.create_task(
                 self._event(event, session_id=session_id, background=True)
@@ -1088,7 +1088,11 @@ class _Client:
             assert self.projects is not None
             available = self.projects.project_sessions(params["project_id"])
         else:
-            available = self.server.runtime.list_sessions()
+            available = (
+                self.server.runtime.list_sessions_read_only()
+                if self.role == "observer"
+                else self.server.runtime.list_sessions()
+            )
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
             item.session_id: item.preview
@@ -1175,6 +1179,9 @@ class _Client:
             )
 
     async def _write(self, payload: bytes) -> bool:
+        return await self.connections.send(self, payload)
+
+    async def _write_physical(self, payload: bytes) -> bool:
         async with self._write_lock:
             return await finish_frame_write(self.codec, self.writer, payload)
 
@@ -1188,19 +1195,16 @@ class _Client:
         if self._turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
 
-
 def _home() -> Path:
     from ..core.session import env_home
 
     return env_home().expanduser().resolve()
-
 
 def _required_string(params: dict[str, Any], name: str) -> str:
     value = params.get(name)
     if not isinstance(value, str) or not value:
         raise ProtocolError(-32602, f"{name} must be a nonempty string")
     return value
-
 
 def _integer(
     params: dict[str, Any], name: str, default: int | None, *, minimum: int
@@ -1212,7 +1216,6 @@ def _integer(
         raise ProtocolError(-32602, f"{name} must be an integer of at least {minimum}")
     return value
 
-
 def _directory(params: dict[str, Any], name: str) -> Path:
     value = params.get(name)
     if not isinstance(value, str) or not value or not os.path.isabs(value):
@@ -1222,13 +1225,11 @@ def _directory(params: dict[str, Any], name: str) -> Path:
         raise ProtocolError(-32602, f"{name} is not an existing directory: {value}")
     return path
 
-
 def _optional_string(params: dict[str, Any], name: str) -> str | None:
     value = params.get(name)
     if value is not None and (not isinstance(value, str) or not value):
         raise ProtocolError(-32602, f"{name} must be a nonempty string")
     return value
-
 
 def _approval_key(event: StreamEvent) -> ApprovalKey:
     raw_request_id = event.tool_call.id if event.tool_call is not None else ""
@@ -1236,6 +1237,5 @@ def _approval_key(event: StreamEvent) -> ApprovalKey:
     if isinstance(child_id, str) and raw_request_id:
         return child_id, raw_request_id
     return raw_request_id
-
 
 __all__ = ["ZetaServer"]
