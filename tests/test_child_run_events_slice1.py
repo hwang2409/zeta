@@ -84,6 +84,8 @@ def test_child_run_started_truncates_long_task_and_name_to_utf8_bytes(tmp_path: 
 def test_child_run_started_reader_rejects_out_of_bound_rows(change: dict[str, str]) -> None:
     data = {"run_id": "session:1", "parent_run_id": None, "task": "task", "started_at": "now"}
     data.update(change)
+    if change.keys() == {"run_id"}:
+        data["parent_run_id"] = data["run_id"].rpartition(":")[0]
     with pytest.raises(ValueError):
         validate_child_run_started_data(data)
 
