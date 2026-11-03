@@ -382,6 +382,45 @@ def test_preview_reads_bounded_prefix(tmp_path: Path) -> None:
     assert [item.preview for item in previews] == ["first log message"]
 
 
+@pytest.mark.parametrize("shape", ["huge_row", "unterminated", "no_user_message"])
+def test_preview_prefix_reader_stops_at_its_caps(tmp_path: Path, shape: str) -> None:
+    import time
+    import tracemalloc
+
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="codex", model="offline")
+    opened.store.append_message(Message(MessageRole.ASSISTANT, [TextContent("note")]))
+    opened.store.append_message(with_message_origin(
+        Message(MessageRole.USER, [TextContent("late user message")]),
+        MessageOrigin.USER,
+    ))
+    opened.store.close()
+    header, other_row, user_row = opened.store.path.read_bytes().splitlines(
+        keepends=True
+    )[:3]
+    bodies = {
+        # one 32 MiB row before the user message
+        "huge_row": header + b"x" * (32 << 20) + b"\n" + user_row,
+        # an unterminated log: no newline for 32 MiB
+        "unterminated": header + b"y" * (32 << 20),
+        # the user message only after 100,000 non-user rows: past the row cap
+        "no_user_message": header + other_row * 100_000 + user_row,
+    }
+    opened.store.path.write_bytes(bodies[shape])
+
+    tracemalloc.start()
+    started = time.perf_counter()
+    try:
+        previews = manager.list_session_previews(sessions=[opened.metadata])
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert [item.preview for item in previews] == [""]
+    assert peak < 2 << 20, f"preview read allocated {peak} bytes"
+    assert time.perf_counter() - started < 5
+
+
 @pytest.mark.parametrize("surface", ["tool", "card"])
 def test_child_lifecycle_readers_reject_decoder_surviving_depth(
     tmp_path: Path, surface: str

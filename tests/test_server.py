@@ -4906,7 +4906,10 @@ async def test_status_responsive_during_slow_list_sessions(tmp_path: Path) -> No
     entered = threading.Event()
     release = threading.Event()
 
+    threads: list[str] = []
+
     def blocked_catalog():
+        threads.append(threading.current_thread().name)
         entered.set()
         try:
             asyncio.get_running_loop()
@@ -4940,6 +4943,8 @@ async def test_status_responsive_during_slow_list_sessions(tmp_path: Path) -> No
         catalog = await _read(reader)
         assert catalog["id"] == 3
         assert catalog["result"]["sessions"] == []
+        # the controller catalog uses the registry's bounded read pool
+        assert threads and threads[0].startswith("zeta-read-")
     finally:
         release.set()
         status_writer.close()

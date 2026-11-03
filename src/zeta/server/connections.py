@@ -50,7 +50,7 @@ class ConnectionRegistry:
         self._read_condition = threading.Condition()
         self._read_jobs: deque[tuple[Callable[[], Any], asyncio.Future[Any]]] = deque()
         self._read_stopping = False
-        self._read_threads = [threading.Thread(target=self._read_worker, daemon=True, name=f"zeta-observer-read-{i}") for i in range(2)]
+        self._read_threads = [threading.Thread(target=self._read_worker, daemon=True, name=f"zeta-read-{i}") for i in range(2)]
         for thread in self._read_threads:
             thread.start()
 
@@ -303,8 +303,6 @@ class ConnectionRegistry:
         if method in {"session_tree", "session_history"}:
             return True, await self.read_session(connection, method, params)
         target = capture_read(connection, method, params)
-        if method == "list_sessions":
-            return True, await asyncio.to_thread(perform_read, method, target, params)
         result = await self.run_read(
             connection,
             lambda: perform_read(method, target, params),
