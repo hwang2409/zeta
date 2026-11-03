@@ -51,6 +51,7 @@ class _ApprovalRecord:
     state: Literal["starting", "pending", "reserved", "failed"] = "starting"
     disposition: str = "active"
     request: ApprovalRequest | None = None
+    history_published: bool = False
     published: bool = False
     settlement: asyncio.Task[object] | None = None
 
@@ -324,24 +325,22 @@ class ServeControl:
             record.settlement = asyncio.create_task(self._finish_external(record))
         elif record.disposition != "active" or self.closing:
             reason = (
-                "turn_canceled"
-                if record.disposition == "abort"
-                else record.disposition
+                "turn_canceled" if record.disposition == "abort" else record.disposition
             )
             record.state = "reserved"
             record.settlement = asyncio.create_task(
                 self._settle_record(record, "abort", reason)
             )
 
-    def cleanup_delegated(
-        self, child_instance_id: str
-    ) -> Awaitable[object] | None:
+    def cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
         settlements: list[asyncio.Task[object]] = []
         for key, record in tuple(self._approval_records.items()):
             if not isinstance(key, tuple) or key[0] != child_instance_id:
                 continue
             if self._reserve(record, "child_cleanup"):
                 if record.state == "starting":
+                    if record.settlement is not None:
+                        settlements.append(record.settlement)
                     continue
                 record.settlement = asyncio.create_task(
                     self._settle_record(record, "abort", "child_cleanup")
@@ -385,7 +384,7 @@ class ServeControl:
             )
         if scope == "always_tool":
             try:
-                policy.remember_allow(pending)
+                pending.always_allow_rule()
             except ValueError as exc:
                 raise ProtocolError(
                     -32602, f"cannot always allow approval request: {exc}"
@@ -395,7 +394,13 @@ class ServeControl:
             raise ProtocolError(
                 -32006, f"approval request not found or already resolved: {request_id}"
             )
-        record.settlement = asyncio.create_task(self._settle_record(record, decision))
+        record.settlement = asyncio.create_task(
+            self._settle_record(
+                record,
+                decision,
+                grant=pending if scope == "always_tool" else None,
+            )
+        )
         try:
             await record.settlement
         except OSError as exc:
@@ -456,6 +461,8 @@ class ServeControl:
         record: _ApprovalRecord,
         decision: str,
         reason: str | None = None,
+        *,
+        grant: ApprovalRequest | None = None,
     ) -> None:
         token = record.token
         generation = record.generation
@@ -505,6 +512,10 @@ class ServeControl:
             if loop is not None:
                 loop.abort(steering_drop_reason=None)
             raise OSError("approval decision could not be persisted")
+        if grant is not None:
+            policy = self.server.runtime.policy
+            if policy is not None:
+                policy.remember_allow(grant)
         await self._finish_record(record, resolution)
 
     async def _finish_external(self, record: _ApprovalRecord) -> None:
@@ -525,16 +536,14 @@ class ServeControl:
             key: value for key, value in resolution.items() if key != "request_id"
         }
         payload = self._approvals.end(record.target.key, data=data)
-        if payload is not None and record.published:
-            if (
-                isinstance(record.target.key, tuple)
-                and record.target.history_store is not None
-            ):
-                await self._run_blocking(
-                    lambda: record.target.history_store.append_approval_history(
-                        {"event": "approval_end", **payload}
-                    )
+        if payload is not None and record.history_published:
+            assert record.target.history_store is not None
+            await self._run_blocking(
+                lambda: record.target.history_store.append_approval_history(
+                    {"event": "approval_end", **payload}
                 )
+            )
+        if payload is not None and record.published:
             await self._notify(
                 event_contract.STREAM_EVENT_WIRE_EVENTS[
                     StreamEventType.TOOL_APPROVAL_END
@@ -918,6 +927,23 @@ class ServeControl:
             target.store_request_id, state[0]
         )
         record.request = request
+        payload = self._approvals.observe(
+            request, fields=approval_display_fields(request)
+        )
+        if isinstance(key, tuple) and target.history_store is not None:
+            await self._run_blocking(
+                lambda: target.history_store.append_approval_history(
+                    {"event": "approval_request", **payload}
+                )
+            )
+            record.history_published = True
+        current = self._approval_records.get(key)
+        if (
+            current is not record
+            or token != record.token
+            or generation != self._approval_generation
+        ):
+            return
         if record.disposition != "active":
             if record.disposition == "external":
                 resolution = await self._run_blocking(
@@ -938,15 +964,6 @@ class ServeControl:
             return
         record.state = "pending"
         record.settlement = None
-        payload = self._approvals.observe(
-            request, fields=approval_display_fields(request)
-        )
-        if isinstance(key, tuple) and target.history_store is not None:
-            await self._run_blocking(
-                lambda: target.history_store.append_approval_history(
-                    {"event": "approval_request", **payload}
-                )
-            )
         record.published = True
         await self._notify(wire_event, session_id, **payload)
 

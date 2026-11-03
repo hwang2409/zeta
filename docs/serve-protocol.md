@@ -1010,6 +1010,8 @@ error code and message. Provider status and origin remain internal.
   `approval_request`; a resolution emits its `approval_end`. These lifecycle
   rows use the same fields as the live events. The parent history includes only
   lifecycle data stored in the parent session, including delegated identity.
+  If delegated cleanup wins while its request row is being stored, history keeps
+  the request row followed by its `child_cleanup` end row and emits neither live event.
   Child-session transcript rows are not copied into parent history; they belong
   to the planned `child_run_events` protocol. Each ordinary message has `id`,
   `role`, `content`, and optional `tool_result`. Text and tool

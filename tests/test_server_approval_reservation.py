@@ -483,15 +483,15 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
         await _wait_thread_gate(gate)
         cleanup = policy.cleanup_delegated("child")
         assert cleanup is not None
-        await cleanup
+        cleanup_task = asyncio.ensure_future(cleanup)
+        await asyncio.sleep(0)
+        assert not cleanup_task.done()
         gate.release.set()
-        await start
+        await asyncio.gather(start, cleanup_task)
         await server.control.wait_for_approval_settlement()
 
         history = [
-            entry.data
-            for entry in parent.entries
-            if entry.type == "approval_history"
+            entry.data for entry in parent.entries if entry.type == "approval_history"
         ]
         assert [row["event"] for row in history] == [
             "approval_request",
@@ -694,9 +694,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
         late_request = ApprovalRequest(
             late_call.id, late_call, child_instance_id="late-child"
         )
-        policy.register_delegated(
-            late_request, late, child_instance_id="late-child"
-        )
+        policy.register_delegated(late_request, late, child_instance_id="late-child")
         await server.control.wait_for_approval_settlement()
         assert late.approval_resolution_data(late_call.id)["decision"] == "abort"
         policy.cleanup_delegated("late-child")
