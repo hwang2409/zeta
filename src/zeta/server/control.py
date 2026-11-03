@@ -53,6 +53,7 @@ class _ApprovalRecord:
     request: ApprovalRequest | None = None
     published: bool = False
     settlement: asyncio.Task[object] | None = None
+    delegated_ready: asyncio.Event | None = None
 
 
 class NotificationPresentation:
@@ -297,8 +298,6 @@ class ServeControl:
         child_instance_id: str,
     ) -> None:
         key: ApprovalKey = (child_instance_id, request.request_id)
-        if key in self._approval_records:
-            return
         exact = ApprovalRequest(
             request.request_id,
             request.tool_call,
@@ -313,12 +312,28 @@ class ServeControl:
             if self.server.runtime.opened is not None
             else None
         )
-        record = self._new_record(
-            _ApprovalTarget(key, store, request.request_id, exact, history_store)
-        )
-        if self.closing:
+        target = _ApprovalTarget(key, store, request.request_id, exact, history_store)
+        record = self._approval_records.get(key)
+        if record is None:
+            record = self._new_record(target)
+        elif record.state == "starting":
+            record.target = target
+            record.request = exact
+            if record.delegated_ready is not None:
+                record.delegated_ready.set()
+        else:
+            return
+        if record.disposition == "external":
+            record.settlement = asyncio.create_task(self._finish_external(record))
+        elif record.disposition != "active" or self.closing:
+            reason = (
+                "turn_canceled"
+                if record.disposition == "abort"
+                else record.disposition
+            )
+            record.state = "reserved"
             record.settlement = asyncio.create_task(
-                self._settle_record(record, "abort", "turn_canceled")
+                self._settle_record(record, "abort", reason)
             )
 
     def cleanup_delegated(
@@ -329,6 +344,10 @@ class ServeControl:
             if not isinstance(key, tuple) or key[0] != child_instance_id:
                 continue
             if self._reserve(record, "child_cleanup"):
+                if record.state == "starting":
+                    if record.delegated_ready is not None:
+                        record.delegated_ready.set()
+                    continue
                 record.settlement = asyncio.create_task(
                     self._settle_record(record, "abort", "child_cleanup")
                 )
@@ -492,6 +511,17 @@ class ServeControl:
                 loop.abort(steering_drop_reason=None)
             raise OSError("approval decision could not be persisted")
         await self._finish_record(record, resolution)
+
+    async def _finish_external(self, record: _ApprovalRecord) -> None:
+        resolution = await self._run_blocking(
+            lambda: record.target.store.approval_resolution_data(
+                record.target.store_request_id
+            )
+        )
+        if resolution is not None:
+            await self._finish_record(record, resolution)
+        else:
+            self._approval_records.pop(record.target.key, None)
 
     async def _finish_record(
         self, record: _ApprovalRecord, resolution: dict[str, str]
@@ -860,8 +890,14 @@ class ServeControl:
             )
         token = record.token
         generation = record.generation
-        target = record.target
         record.settlement = asyncio.current_task()
+        if isinstance(key, tuple) and record.request is None:
+            if record.delegated_ready is None:
+                record.delegated_ready = asyncio.Event()
+            await record.delegated_ready.wait()
+            if record.request is None:
+                return
+        target = record.target
 
         def lookup() -> tuple[ToolCall, str | None] | None:
             return target.store.approval_states().get(target.store_request_id)
@@ -986,6 +1022,8 @@ class ServeControl:
         if record.state == "starting":
             if record.disposition == "active":
                 record.disposition = "external"
+            if record.delegated_ready is not None:
+                record.delegated_ready.set()
             return
         if record.state not in {"pending", "reserved"}:
             return
@@ -1037,6 +1075,8 @@ class ServeControl:
             if not self._reserve(record, reason):
                 continue
             if record.state == "starting":
+                if record.delegated_ready is not None:
+                    record.delegated_ready.set()
                 continue
             record.settlement = asyncio.create_task(
                 self._settle_record(record, "abort", reason)
