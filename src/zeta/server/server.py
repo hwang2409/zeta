@@ -403,7 +403,6 @@ class _Client:
             raise ProtocolError(-32002, "hello must be the first request")
         assert self.server.connections is not None
         return await self.server.connections.route_request(self, method, params)
-
     async def _dispatch(
         self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> object:
@@ -1059,21 +1058,18 @@ class _Client:
             asyncio.create_task(
                 self._event(event, session_id=session_id, background=True)
             )
-
     def _publish_memory_notice(self, session_id: str, message: str) -> None:
         """Publish updates only when the client negotiated the optional feature."""
         if not self._closed and "memory_updated" in self.features:
             asyncio.create_task(
                 self._notify(event_contract.AUXILIARY_WIRE_EVENTS[event_contract.AuxiliaryEvent.MEMORY_UPDATED], session_id, message=message)
             )
-
     async def _notify(
         self, event: str, session_id: str | None = None, **fields: object
     ) -> bool:
         if session_id is None and self.server.runtime.opened is not None:
             session_id = self.server.runtime.session_id
         return await self._write(self.codec.notification(event, session_id, **fields))
-
     def _list_sessions(
         self, request_id: str | int, params: dict[str, Any]
     ) -> dict[str, object]:
@@ -1124,7 +1120,6 @@ class _Client:
             return {"sessions": page}
         end = offset + len(page)
         return {"sessions": page, "next_offset": end if end < len(available) else None}
-
     async def _end_approval(
         self,
         key: ApprovalKey,
