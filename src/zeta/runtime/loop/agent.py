@@ -16,6 +16,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
+from ...agent import recovery_lease
 from ...agent.background import BackgroundAgentOwner
 from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.durable import durable_message
@@ -34,7 +35,6 @@ from ...agent.plan_mode import (
     plan_mode_tool_schemas,
 )
 from ...agent.receipt import finalize_agent_results
-from ...agent.recovery_lease import recover_agent_children_off_loop
 from ...agent.result_payload import ChildResultPayloadMixin
 from ...agent.runner import run_agent_tool
 from ...agent.tool_results import validated_tool_result as _validated_tool_result
@@ -219,6 +219,7 @@ class AgentLoop(
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
         self._children_recovered = False
+        self._pending_child_recovery: tuple[NotificationInput, ...] = ()
         self._closed = False
         self._turn_active = False
         self._delivery_wake_pending = False
@@ -564,9 +565,7 @@ class AgentLoop(
         for item in self._pending_task_recovery:
             await self._produce_task_exit(item)
         self._pending_task_recovery = ()
-        if not self._children_recovered:
-            await recover_agent_children_off_loop(self)
-            self._children_recovered = True
+        await recovery_lease.activate_agent_children(self)
         self.session_start()
         if self.memory_reconciler is not None:
             self.memory_reconciler.activity()
