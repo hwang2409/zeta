@@ -531,6 +531,65 @@ async def test_observer_outbound_limits_count_and_bytes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_tree_uses_one_store_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    reader, writer = await _connect(server)
+    await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+    session = (
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+    )[-1]["result"]["session"]
+    store = server.runtime.opened.store
+    first = store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("before")]), MessageOrigin.USER
+        )
+    )
+    captured = threading.Event()
+    release = threading.Event()
+    entries_property = type(store).entries
+
+    def gated_entries(target):
+        entries = entries_property.__get__(target, type(target))
+        captured.set()
+        assert release.wait(TIMEOUT)
+        return entries
+
+    monkeypatch.setattr(type(store), "entries", property(gated_entries))
+    request = asyncio.create_task(
+        _request(
+            reader,
+            writer,
+            3,
+            "session_tree",
+            {"session_id": session["session_id"]},
+        )
+    )
+    try:
+        await _wait_thread(captured)
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("after")]),
+                MessageOrigin.USER,
+            )
+        )
+    finally:
+        release.set()
+    try:
+        response = (await request)[-1]
+        assert response["result"] == {
+            "branches": [
+                {"id": first.id, "label": "before", "depth": 0, "current": True}
+            ]
+        }
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_observer_read_workers_do_not_block_serve_loop_or_default_executor(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     controller_reader, controller_writer = await _connect(server)

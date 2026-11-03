@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from uuid import uuid4
 
+from ..core.checkpoints import list_branches_from_entries
 from ..core.session_files import child_directory, write_session_file
 from ..media.images import image_signature_matches
 from ..models.catalog import PROVIDER_MODELS, known_model_names
@@ -125,7 +126,7 @@ def tree(runtime: ServerRuntime) -> dict:
                 "depth": depths[branch.head.id],
                 "current": branch.is_current,
             }
-            for branch in store.list_branches()
+            for branch in list_branches_from_entries(entries)
         ]
     }
 
