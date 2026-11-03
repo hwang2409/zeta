@@ -4,13 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import TIMEOUT, _close, _connect, _request, _socket_path
-from zeta.server import ZetaServer
-from zeta.server.connections import ConnectionRegistry
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    with_message_origin,
+)
+from zeta.server import ZetaServer, ergonomics
+
+MAX_PRE_HELLO_CONNECTIONS = 10
 
 
 async def _observer(server: ZetaServer, number: int = 1, features: list[str] | None = None):
@@ -67,75 +82,332 @@ async def test_observer_hello_has_no_controller_side_effects(tmp_path: Path, mon
         writer.close(); await writer.wait_closed(); await server.close()
 
 
-@pytest.mark.asyncio
-async def test_controller_frames_are_byte_identical_with_observer(tmp_path: Path) -> None:
-    async def hello(home: Path, observer: bool) -> bytes:
-        server = ZetaServer(home=home, socket_path=_socket_path(home), provider="codex")
-        reader, writer = await _connect(server)
-        try:
-            request = {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2"}}
-            writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode())
-            await writer.drain()
-            hello_frame = await reader.readline()
-            assert hello_frame
-            if observer:
-                extra = await _observer(server, 10)
-            request = {"jsonrpc": "2.0", "id": 2, "method": "status", "params": {}}
-            writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode())
-            await writer.drain()
-            status_frame = await reader.readline()
-            assert status_frame
-            if observer:
-                extra[1].close(); await extra[1].wait_closed()
-            return hello_frame + status_frame
-        finally:
-            await _close(server, writer)
-    assert await hello(tmp_path / "base", False) == await hello(tmp_path / "observer", True)
-
-
+async def _wait_thread(event: threading.Event) -> None:
+    assert await asyncio.wait_for(asyncio.to_thread(event.wait, TIMEOUT), TIMEOUT)
 
 
 @pytest.mark.asyncio
-async def test_controller_only_raw_frames_match_origin_main(tmp_path: Path) -> None:
+async def test_observer_disconnects_keep_controller_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    controller_reader, controller_writer = await _connect(server)
+    await _request(controller_reader, controller_writer, 1, "hello", {"protocol_version": "1.2"})
+    await _request(controller_reader, controller_writer, 2, "new_session", {"provider": "codex"})
+    await _request(controller_reader, controller_writer, 3, "send", {"text": "read it"})
+    while True:
+        frame = json.loads(await asyncio.wait_for(controller_reader.readline(), TIMEOUT))
+        if frame.get("params", {}).get("event") == "approval_request":
+            break
+
+    assert server.connections is not None
+    released = asyncio.Event()
+    original_release = server.connections.release
+
+    def release(connection: Any) -> None:
+        original_release(connection)
+        released.set()
+
+    monkeypatch.setattr(server.connections, "release", release)
+    assert server.runtime.policy is not None
+    store_calls: list[tuple[str, int]] = []
+    for name in ("pending_requests", "abort"):
+        original = getattr(server.runtime.policy, name)
+
+        def record(*args: Any, _name: str = name, _original: Any = original, **kwargs: Any) -> Any:
+            store_calls.append((_name, threading.get_ident()))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(server.runtime.policy, name, record)
+
+    sockets: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
+    try:
+        observer = await _observer(server, 10)
+        observer[1].close()
+        await observer[1].wait_closed()
+        await asyncio.wait_for(released.wait(), TIMEOUT)
+
+        observers = [await _observer(server, 20 + index) for index in range(8)]
+        sockets.extend(observers)
+        rejected_reader, rejected_writer = await asyncio.open_unix_connection(str(server.socket_path))
+        rejected = (await _request(rejected_reader, rejected_writer, 40, "hello", {
+            "protocol_version": "1.2", "role": "observer", "features": ["serve_observers"],
+        }))[-1]
+        assert rejected["error"]["code"] == -32004
+        released.clear()
+        rejected_writer.close()
+        await rejected_writer.wait_closed()
+        await asyncio.wait_for(released.wait(), TIMEOUT)
+
+        released.clear()
+        _idle_reader, idle_writer = await asyncio.open_unix_connection(str(server.socket_path))
+        idle_writer.close()
+        await idle_writer.wait_closed()
+        await asyncio.wait_for(released.wait(), TIMEOUT)
+        assert store_calls == []
+
+        status = (await _request(controller_reader, controller_writer, 41, "status"))[-1]
+        assert [item["request_id"] for item in status["result"]["pending_approvals"]] == ["call-1"]
+        approved = (await _request(
+            controller_reader, controller_writer, 42, "approve", {"request_id": "call-1"}
+        ))[-1]
+        assert approved["result"]["decision"] == "approve"
+    finally:
+        for _, writer in sockets:
+            writer.close()
+            await writer.wait_closed()
+        await _close(server, controller_writer)
+
+
+@pytest.mark.asyncio
+async def test_observer_read_is_fenced_from_controller_session_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    controller_reader, controller_writer = await _connect(server)
+    await _request(controller_reader, controller_writer, 1, "hello", {"protocol_version": "1.2"})
+    session_a = (await _request(
+        controller_reader, controller_writer, 2, "new_session", {"provider": "codex"}
+    ))[-1]["result"]["session"]["session_id"]
+    await asyncio.to_thread(
+        server.runtime.opened.store.append_message,
+        with_message_origin(Message(MessageRole.USER, [TextContent("from-a")]), MessageOrigin.USER),
+    )
+    observer_reader, observer_writer = await _observer(server, 3)
+    entered = threading.Event()
+    release = threading.Event()
+    original_history = ergonomics.history
+
+    def gated_history(runtime: Any, params: dict[str, Any]) -> dict[str, Any]:
+        entered.set()
+        assert release.wait(TIMEOUT)
+        return original_history(runtime, params)
+
+    monkeypatch.setattr(ergonomics, "history", gated_history)
+    try:
+        request = asyncio.create_task(_request(
+            observer_reader, observer_writer, 4, "session_history", {"session_id": session_a}
+        ))
+        await _wait_thread(entered)
+        session_b = (await _request(
+            controller_reader, controller_writer, 5, "new_session", {"provider": "codex"}
+        ))[-1]["result"]["session"]["session_id"]
+        await asyncio.to_thread(
+            server.runtime.opened.store.append_message,
+            with_message_origin(Message(MessageRole.USER, [TextContent("from-b")]), MessageOrigin.USER),
+        )
+        release.set()
+        response = (await asyncio.wait_for(request, TIMEOUT))[-1]
+        if "error" in response:
+            assert response["error"]["code"] == -32003
+        else:
+            payload = json.dumps(response["result"])
+            assert "from-a" in payload
+            assert "from-b" not in payload
+            assert session_b != session_a
+    finally:
+        release.set()
+        observer_writer.close()
+        await observer_writer.wait_closed()
+        await _close(server, controller_writer)
+
+
+@pytest.mark.asyncio
+async def test_controller_close_never_writes_after_registry_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    reader, writer = await _connect(server)
+    await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+    await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+    assert server._client is not None and server.connections is not None
+    client = server._client
+    runtime_sink = server.runtime._background_event_sink
+    assert runtime_sink is not None
+    close_entered = asyncio.Event()
+    close_release = asyncio.Event()
+    original_terminate = client._terminate_pending_approvals
+
+    async def gated_terminate(*args: Any, **kwargs: Any) -> None:
+        close_entered.set()
+        await asyncio.wait_for(close_release.wait(), TIMEOUT)
+        await original_terminate(*args, **kwargs)
+
+    monkeypatch.setattr(client, "_terminate_pending_approvals", gated_terminate)
+    order: list[str] = []
+    original_write = client._write_physical
+    original_release = server.connections.release
+
+    async def physical_write(payload: bytes) -> bool:
+        order.append("write")
+        return await original_write(payload)
+
+    def registry_release(connection: Any) -> None:
+        if connection is client:
+            order.append("release")
+        original_release(connection)
+
+    monkeypatch.setattr(client, "_write_physical", physical_write)
+    monkeypatch.setattr(server.connections, "release", registry_release)
+    publication_done = asyncio.Event()
+    publication_results: list[bool] = []
+    original_notify = client._notify
+
+    async def record_notification(*args: Any, **kwargs: Any) -> bool:
+        result = await original_notify(*args, **kwargs)
+        publication_results.append(result)
+        publication_done.set()
+        return result
+
+    monkeypatch.setattr(client, "_notify", record_notification)
+    writer.close()
+    await writer.wait_closed()
+    try:
+        await asyncio.wait_for(close_entered.wait(), TIMEOUT)
+        assert server.runtime._background_event_sink is None
+        # This is the sink that was installed in the runtime before close began.
+        runtime_sink(server.runtime.session_id, StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={"kind": "agent_completion", "text": "late"},
+        ))
+        close_release.set()
+        await asyncio.wait_for(client._close_lock.acquire(), TIMEOUT)
+        client._close_lock.release()
+        await asyncio.wait_for(publication_done.wait(), TIMEOUT)
+        assert publication_results in ([True], [False])
+        assert "release" in order
+        assert all(
+            index < order.index("release")
+            for index, item in enumerate(order)
+            if item == "write"
+        )
+    finally:
+        close_release.set()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_hello_connections_are_bounded(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     await server.start()
-    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    sockets = [
+        await asyncio.wait_for(asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT)
+        for _ in range(MAX_PRE_HELLO_CONNECTIONS)
+    ]
+    extra_reader, extra_writer = await asyncio.wait_for(
+        asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT
+    )
     try:
-        for request in (
-            {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2", "features": ["ping"]}},
-            {"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}},
-            {"jsonrpc": "2.0", "id": 3, "method": "missing", "params": {}},
-        ):
-            writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode())
-            await writer.drain()
-        assert [await reader.readline() for _ in range(3)] == [
-            b'{"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.2","server":"zeta","capabilities":{"requests":["list_sessions","new_session","resume","send","steer","approve","deny","abort","status","rename_session","delete_session","session_tree","session_history","switch_branch","fork_message","model_catalog","session_settings","set_settings","set_compaction","send_images","slash_list","slash_run","account_list","account_logout","account_refresh","account_switch","login_start","login_status","login_cancel","login_providers","ping"],"notifications":["event"],"features":["ping"]}}}\n',
-            b'{"jsonrpc":"2.0","id":2,"result":{"pong":true}}\n',
-            b'{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"method not found: missing"}}\n',
-        ]
+        assert await asyncio.wait_for(extra_reader.read(), TIMEOUT) == b""
+        assert server.connections is not None
+        assert len(server.connections._connections) == MAX_PRE_HELLO_CONNECTIONS
     finally:
-        writer.close(); await writer.wait_closed(); await server.close()
+        extra_writer.close()
+        await extra_writer.wait_closed()
+        for _, socket_writer in sockets:
+            socket_writer.close()
+            await socket_writer.wait_closed()
+        await server.close()
+
+async def _read_raw_until(
+    reader: asyncio.StreamReader,
+    frames: list[bytes],
+    predicate: Any,
+) -> dict[str, Any]:
+    while True:
+        frame = await asyncio.wait_for(reader.readline(), TIMEOUT)
+        assert frame
+        frames.append(frame)
+        decoded = json.loads(frame)
+        if predicate(decoded):
+            return decoded
+
+
+async def _controller_event_stream(
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    observer: bool,
+) -> bytes:
+    counter = iter(range(1, 1000))
+    monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID(int=next(counter)))
+    call = ToolCall("call-1", "bash", {"command": "printf hi"})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        home=home,
+        socket_path=_socket_path(home),
+        provider="codex",
+        backend_factory=lambda provider, model, backend_home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    observer_socket: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
+    frames: list[bytes] = []
+
+    async def send(request_id: int, method: str, params: dict[str, object]) -> None:
+        writer.write((json.dumps({
+            "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
+        }, separators=(",", ":")) + "\n").encode())
+        await asyncio.wait_for(writer.drain(), TIMEOUT)
+
+    try:
+        await send(1, "hello", {"protocol_version": "1.2"})
+        await _read_raw_until(reader, frames, lambda frame: frame.get("id") == 1)
+        await send(2, "new_session", {"provider": "codex"})
+        session = await _read_raw_until(reader, frames, lambda frame: frame.get("id") == 2)
+        session_id = session["result"]["session"]["session_id"]
+        if observer:
+            observer_socket = await _observer(server, 20)
+        frames.clear()  # Compare the foreground/background event scenario, not setup metadata.
+        await send(3, "send", {"text": "use the tool"})
+        await _read_raw_until(
+            reader,
+            frames,
+            lambda frame: frame.get("params", {}).get("event") == "approval_request",
+        )
+        assert server.runtime.loop is not None
+        server.runtime.loop._publish_background_event(StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={"kind": "agent_completion", "text": "background done"},
+        ))
+        await _read_raw_until(
+            reader,
+            frames,
+            lambda frame: frame.get("params", {}).get("event") == "sub_agent_receipt",
+        )
+        await send(4, "deny", {"request_id": "call-1"})
+        await _read_raw_until(
+            reader,
+            frames,
+            lambda frame: frame.get("params", {}).get("event") == "turn_end",
+        )
+        assert session_id.encode() in b"".join(frames)
+        return b"".join(frames)
+    finally:
+        if observer_socket is not None:
+            observer_socket[1].close()
+            await observer_socket[1].wait_closed()
+        await _close(server, writer)
 
 
 @pytest.mark.asyncio
-async def test_registry_release_follows_flush_and_blocks_late_output() -> None:
-    events: list[str] = []
-    class FakeConnection:
-        async def _write_physical(self, frame: bytes) -> bool:
-            events.append(f"write:{frame!r}")
-            return True
-        async def close(self) -> None:
-            events.append("close")
-    registry = ConnectionRegistry(asyncio.get_running_loop())
-    connection = FakeConnection()
-    registry.register(connection)
-    registry.claim(connection, "controller", frozenset())
-    assert await registry.send(connection, b"frame") is True
-    registry.release(connection)
-    assert events == ["write:b'frame'"]
-    assert await registry.send(connection, b"late") is False
-    assert events == ["write:b'frame'"]
-    await registry.aclose()
+async def test_observer_does_not_change_controller_raw_event_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Generated with PYTHONPATH=<origin-main-worktree>/src after confirming zeta.__file__.
+    expected = (Path(__file__).parent / "fixtures" / "server_controller_event_stream.jsonl").read_bytes()
+    assert await _controller_event_stream(tmp_path, monkeypatch, observer=True) == expected
+
 
 @pytest.mark.asyncio
 async def test_controller_slot_releases_after_cleanup_only(tmp_path: Path) -> None:
