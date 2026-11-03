@@ -58,11 +58,11 @@ from zeta.protocol.types import (
 from zeta.providers.ollama import OllamaBackend
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import ApprovalLifecycle, approval_display_fields
+from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
 )
-from zeta.server.notification_presentation import NotificationPresentation
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
 from zeta.server.server import _Client
 from zeta.server.slash_commands import ServerSlashSession
@@ -70,6 +70,13 @@ from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 
 TIMEOUT = 3
+
+
+def _client_notifier(client: _Client):
+    async def notify(event: str, session_id: str | None = None, **fields: object) -> bool:
+        return await client._write(client.codec.notification(event, session_id, **fields))
+
+    return notify
 
 
 def _hold_registry_lock_after_start(
@@ -145,12 +152,12 @@ async def test_notification_presentation_retries_disconnected_codec_write(
     notification = {"notification_id": "notification-1"}
 
     await server.notification_presentations.publish(
-        "session-1", notification, "1.0", client._notify
+        "session-1", notification, "1.0", _client_notifier(client)
     )
     healthy = HealthyWriter()
     client.writer = healthy
     await server.notification_presentations.publish(
-        "session-1", notification, "1.0", client._notify
+        "session-1", notification, "1.0", _client_notifier(client)
     )
 
     receipts = [
@@ -184,7 +191,7 @@ async def test_notification_presentation_retries_after_cancel_before_write(
     await client._write_lock.acquire()
     blocked = asyncio.create_task(
         server.notification_presentations.publish(
-            "session-1", notification, "1.0", client._notify
+            "session-1", notification, "1.0", _client_notifier(client)
         )
     )
     while not client._write_lock._waiters:
@@ -196,7 +203,7 @@ async def test_notification_presentation_retries_after_cancel_before_write(
     assert healthy.frames == []
 
     await server.notification_presentations.publish(
-        "session-1", notification, "1.0", client._notify
+        "session-1", notification, "1.0", _client_notifier(client)
     )
 
     receipts = [
@@ -241,7 +248,7 @@ async def test_canceled_write_to_stalled_client_aborts_within_grace(
     notification = {"notification_id": "notification-1"}
     publish = asyncio.create_task(
         server.notification_presentations.publish(
-            "session-1", notification, "1.0", client._notify
+            "session-1", notification, "1.0", _client_notifier(client)
         )
     )
     while not writer.frames:
@@ -446,7 +453,7 @@ async def test_protocol_1_1_client_receives_sub_agent_receipt_for_known_kinds(
         assert hello["protocol_version"] == "1.1"
         assert server._client is not None
         for kind in NOTIFICATION_KINDS:
-            await server._client._event(
+            await server.control._event(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data={"kind": kind},
@@ -473,7 +480,7 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
         assert hello["protocol_version"] == "1.2"
         assert server._client is not None
         for kind in (*NOTIFICATION_KINDS, "future_kind"):
-            await server._client._event(
+            await server.control._event(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data={"kind": kind},
@@ -502,7 +509,7 @@ async def test_child_message_delivered_event_maps_from_background_run(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         assert server._client is not None
-        await server._client._event(
+        await server.control._event(
             StreamEvent(
                 StreamEventType.CHILD_MESSAGE_DELIVERED,
                 data={"child_label": "worker", "preview": "check the retry"},
@@ -1796,9 +1803,9 @@ async def test_lifecycle_prunes_ended_approvals(tmp_path: Path) -> None:
             await _event(reader, "agent_end")
 
         assert server._client is not None
-        assert len(server._client._approvals._by_key) == 0
-        assert len(server._client._approvals._wires_by_key) == 0
-        assert len(server._client._approvals._keys_by_wire) == 0
+        assert len(server.control._approvals._by_key) == 0
+        assert len(server.control._approvals._wires_by_key) == 0
+        assert len(server.control._approvals._keys_by_wire) == 0
     finally:
         await _close(server, writer)
 
@@ -2064,7 +2071,7 @@ async def test_abort_captures_turn_before_approval_end_write(
 
         assert server._client is not None
         client = server._client
-        original_write = client._write
+        original_write = client._write_physical
         approval_end_started = asyncio.Event()
         allow_approval_end = asyncio.Event()
 
@@ -2075,12 +2082,12 @@ async def test_abort_captures_turn_before_approval_end_write(
                 await allow_approval_end.wait()
             await original_write(payload)
 
-        client._write = pause_approval_end  # type: ignore[method-assign]
+        client._write_physical = pause_approval_end  # type: ignore[method-assign]
         abort = asyncio.create_task(
             _request(reader, writer, 4, "abort", {"scope": scope})
         )
         await asyncio.wait_for(approval_end_started.wait(), TIMEOUT)
-        while client._turn_task is not None:
+        while server.control._turn_task is not None:
             await asyncio.sleep(0)
         allow_approval_end.set()
 
@@ -2139,7 +2146,7 @@ async def test_foreground_abort_only_ends_foreground_approval(
             "background-child", child_task.cancel, child_task
         )
         assert server._client is not None
-        server._client._approvals.observe(delegated_request)
+        server.control._approvals.observe(delegated_request)
 
         frames = await _request(
             reader, writer, 4, "abort", {"scope": "foreground"}
@@ -2148,7 +2155,7 @@ async def test_foreground_abort_only_ends_foreground_approval(
         assert [event["request_id"] for event in ended] == [
             foreground["request_id"]
         ]
-        assert delegated_request.key in server._client._approvals.active_keys()
+        assert delegated_request.key in server.control._approvals.active_keys()
         assert any(
             request.key == delegated_request.key
             for request in server.runtime.policy.pending_requests()
@@ -2869,7 +2876,7 @@ async def test_serve_client_without_reset_optin_keeps_post_stream_retry_off(
 
 @pytest.mark.asyncio
 async def test_serve_emits_assistant_reset_before_retry_deltas() -> None:
-    client = object.__new__(_Client)
+    client = object.__new__(ServeControl)
     client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
     notifications: list[tuple[str, dict[str, object]]] = []
 
@@ -2914,7 +2921,7 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
     tmp_path: Path,
 ) -> None:
     policy = ApprovalPolicy(store=ConversationStore(tmp_path))
-    client = object.__new__(_Client)
+    client = object.__new__(ServeControl)
     client.server = SimpleNamespace(
         runtime=SimpleNamespace(policy=policy, state=None)
     )
@@ -2975,7 +2982,7 @@ async def test_session_switch_clears_delegated_mappings(tmp_path: Path) -> None:
     first_session = server.runtime.session_id
     try:
         assert server._client is not None
-        approvals = server._client._approvals
+        approvals = server.control._approvals
         first_wire = approvals.wire_id(("child-a", "same"))
         await _request(reader, writer, 3, "new_session", {"provider": "codex"})
         assert approvals.core_key(first_wire) == first_wire
@@ -3086,14 +3093,14 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
     reader, writer = await _ready(server)
     assert server._client is not None
     agent_end_published = asyncio.Event()
-    original_notify = server._client._notify
+    original_notify = server.control._notify
 
     async def notify(event: str, *args: object, **kwargs: object) -> None:
         await original_notify(event, *args, **kwargs)
         if event == "agent_end":
             agent_end_published.set()
 
-    monkeypatch.setattr(server._client, "_notify", notify)
+    monkeypatch.setattr(server.control, "_notify", notify)
     old_session_id = server.runtime.session_id
     assert server.runtime.opened is not None
     old_store = server.runtime.opened.store
@@ -3823,9 +3830,9 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         text="child retry done",
     )
     try:
-        client._schedule_background_wake(session_id)
+        server.control._schedule_background_wake(session_id)
         await asyncio.wait_for(published.wait(), TIMEOUT)
-        first_turn = client._turn_task
+        first_turn = server.control._turn_task
         assert first_turn is not None
         first_turn.cancel()
         release_publication.set()
@@ -3834,7 +3841,7 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
             entry.id for entry in server.runtime.opened.store.agent_notifications()
         ] == [notification.id]
 
-        client._schedule_background_wake(session_id)
+        server.control._schedule_background_wake(session_id)
         frames = await _frames_until_event(reader, "turn_end")
         receipts = [
             frame["params"]
@@ -4894,12 +4901,11 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
         })
         pending = runtime.metadata.model_fallback
         assert pending
-        client = server._client
-        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "child login", provider_error=True)),
+        await server.control._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "child login", provider_error=True)),
                             session_id=sid, background=True)
         await _event(reader, "error")
         assert runtime.metadata.model_fallback == pending
-        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("transport_error", "connection reset")),
+        await server.control._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("transport_error", "connection reset")),
                             session_id=sid)
         await _event(reader, "error")
         assert runtime.metadata.model_fallback == pending
@@ -4907,7 +4913,7 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
         await _event(reader, "agent_end")
         assert runtime.metadata.model_fallback is None
         assert SessionManager(tmp_path).open(sid).metadata.model_fallback is None
-        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "expired later", provider_error=True)),
+        await server.control._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "expired later", provider_error=True)),
                             session_id=sid)
         await _event(reader, "error")
         assert runtime.model == "gpt-5.4"
@@ -5023,7 +5029,7 @@ async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, v
         # Event persistence must retain structured information as well.
         event = StreamEvent.from_dict(StreamEvent(StreamEventType.ERROR, error=info).to_dict())
         assert event.error == info
-        await server._client._event(event, session_id=sid)
+        await server.control._event(event, session_id=sid)
         failure = (await _event(reader, "error"))["error"]
         assert set(failure) == {"code", "message"}
         if version == "1.0":
@@ -6816,7 +6822,7 @@ async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
         rejected = await _request(reader, writer, 5, "send", {"text": "user now"})
         assert rejected[-1]["error"]["code"] == -32004
         await _frames_until_event(reader, "agent_end")
-        while server._client is not None and server._client._turn_busy():
+        while server._client is not None and server.control.turn_busy():
             await asyncio.sleep(0)
 
         user_frames = await _request(
@@ -7164,7 +7170,7 @@ async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
             OAuthTokens(account.name, "refresh", 9_999_999_999),
         )
     await asyncio.to_thread(AccountStore(home).set_default, first)
-    client = object.__new__(_Client)
+    client = object.__new__(ServeControl)
     client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
     notifications: list[tuple[str, dict[str, object]]] = []
 

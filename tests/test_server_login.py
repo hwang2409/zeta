@@ -468,7 +468,7 @@ async def test_login_action_uses_failed_provider_before_model_revert(tmp_path, v
         created = await rpc(reader, writer, "new_session")
         assert "result" in created, created
         await model_selection.apply(server.runtime, "gpt-5.4", "ask")
-        await server._client._event(
+        await server.control._event(
             StreamEvent(StreamEventType.ERROR, error=ErrorInfo(
                 "http_error" if status else "auth_error", "Not a string classification hint", status, provider_error)),
             session_id=server.runtime.session_id, background=background,
