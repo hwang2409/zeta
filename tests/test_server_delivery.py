@@ -6,6 +6,7 @@ import asyncio
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1200,3 +1201,104 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
         )
     finally:
         await _close(resumed, writer)
+class _Store:
+    def __init__(self) -> None:
+        self.rows: dict[str, SimpleNamespace] = {}
+
+    async def append_client_delivery_async(
+        self, delivery_id, operation, status, outcome, **kwargs
+    ) -> None:
+        del kwargs
+        self.rows[delivery_id] = SimpleNamespace(
+            status=status, outcome=outcome, operation=operation
+        )
+
+    def client_delivery(self, delivery_id):
+        return self.rows.get(delivery_id)
+
+    def client_delivery_outcome(self, delivery_id):
+        del delivery_id
+
+
+class _Control:
+    def __init__(self, *, steer: bool = False) -> None:
+        self.store = _Store()
+        self.steer_calls = 0
+        self.start_calls = 0
+        self.echo_started = asyncio.Event()
+        self.echo_error = False
+        self.echo_stalls = False
+        self.release_echo = asyncio.Event()
+        self.loop = SimpleNamespace(steer=self._steer)
+        self.server = SimpleNamespace(
+            runtime=SimpleNamespace(
+                loop=self.loop,
+                opened=SimpleNamespace(store=self.store),
+                session_id="session",
+            )
+        )
+        self._model_inputs = SimpleNamespace(
+            resolve=lambda *args, **kwargs: SimpleNamespace(
+                text="hello",
+                display_text="hello",
+                origin=MessageOrigin.USER,
+                message=None,
+            )
+        )
+        self._steer = steer
+
+    def turn_busy(self) -> bool:
+        return self._steer
+
+    async def user_message(self, *args, **kwargs) -> None:
+        del args, kwargs
+        self.echo_started.set()
+        if self.echo_stalls:
+            await self.release_echo.wait()
+        if self.echo_error:
+            raise ConnectionError("echo failed")
+
+    def start_turn(self, *args, **kwargs) -> None:
+        del args, kwargs
+        self.start_calls += 1
+
+    def _steer(self, message) -> None:
+        del message
+        self.steer_calls += 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["send", "steer"])
+async def test_committed_delivery_runs_work_when_echo_fails(method: str) -> None:
+    control = _Control(steer=method == "steer")
+    control.echo_error = True
+    requests = DeliveryRequests(control)
+    params = {"text": "hello", "delivery_id": f"{method}-error"}
+
+    with pytest.raises(ConnectionError):
+        await getattr(requests, method)(params, frozenset({"delivery_id"}))
+
+    assert control.start_calls + control.steer_calls == 1
+    retry = await getattr(requests, method)(params, frozenset({"delivery_id"}))
+    assert retry["duplicate"] is True
+    assert control.start_calls + control.steer_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["send", "steer"])
+async def test_cancel_cleans_up_echo_and_runs_committed_work(method: str) -> None:
+    control = _Control(steer=method == "steer")
+    control.echo_stalls = True
+    requests = DeliveryRequests(control)
+    request = asyncio.create_task(
+        getattr(requests, method)(
+            {"text": "hello", "delivery_id": f"{method}-cancel"},
+            frozenset({"delivery_id", "user_message_event"}),
+        )
+    )
+    await control.echo_started.wait()
+    request.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(request, 1)
+    assert control.start_calls + control.steer_calls == 1

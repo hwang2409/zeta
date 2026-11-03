@@ -99,15 +99,17 @@ class DeliveryRequests:
             canceled_after_commit = True
 
         async def effects() -> None:
-            await control.user_message(
-                value.display_text, "send", features, delivery_id=delivery_id
-            )
-            control.start_turn(
-                value.text,
-                origin=value.origin,
-                user_message=message,
-                persist_user_message=False,
-            )
+            try:
+                await control.user_message(
+                    value.display_text, "send", features, delivery_id=delivery_id
+                )
+            finally:
+                control.start_turn(
+                    value.text,
+                    origin=value.origin,
+                    user_message=message,
+                    persist_user_message=False,
+                )
 
         await _run_delivery_effects(effects)
         if canceled_after_commit:
@@ -153,8 +155,12 @@ class DeliveryRequests:
             canceled_after_commit = True
 
         async def effects() -> None:
-            await control.user_message(text, "steer", features, delivery_id=delivery_id)
-            loop.steer(tagged)
+            try:
+                await control.user_message(
+                    text, "steer", features, delivery_id=delivery_id
+                )
+            finally:
+                loop.steer(tagged)
 
         await _run_delivery_effects(effects)
         if canceled_after_commit:
@@ -248,12 +254,20 @@ async def _run_delivery_effects(operation: Callable[[], Any]) -> None:
     """Finish post-commit effects before reporting caller cancellation."""
     task = asyncio.create_task(operation())
     canceled = False
+    cancel_sent = False
     while not task.done():
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
             canceled = True
-    await task
+            if not cancel_sent:
+                task.cancel()
+                cancel_sent = True
+    try:
+        task.result()
+    except BaseException:
+        if not canceled:
+            raise
     if canceled:
         raise asyncio.CancelledError
 

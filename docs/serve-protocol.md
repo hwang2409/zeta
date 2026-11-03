@@ -371,8 +371,9 @@ loaded. The acceptance record is durably appended in the same store transaction
 as a `send` user message. For `steer`, the durable acceptance is appended before
 the item is added to the running loop's queue. A failed durable append therefore
 does not start a turn or add steering. After a committed append, the user-message
-echo and the start or queue effect finish in order before request cancellation is
-reported; cancellation before a commit produces no row or effect.
+echo is attempted before the turn's events can reach the client, but it is best
+effort: the start or queue effect runs exactly once even if the echo fails, stalls,
+or is canceled. Cancellation before a commit produces no row or effect.
 
 Repeating a retained queued or delivered ID returns the original result with
 `duplicate: true`. It does not validate changed text against the first request,
