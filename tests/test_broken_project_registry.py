@@ -9,7 +9,6 @@ import shutil
 import stat
 import subprocess
 import threading
-import time
 from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
