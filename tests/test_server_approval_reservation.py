@@ -954,9 +954,9 @@ async def test_forced_resume_cancellation_at_each_boundary_is_clean(
         cancelled = asyncio.CancelledError()
 
         async def cancel_close(state):
+            await original_close(state)
             if boundary == "close":
                 raise cancelled
-            await original_close(state)
 
         async def cancel_setup(*args, **kwargs):
             if boundary == "setup":
